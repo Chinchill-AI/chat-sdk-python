@@ -10,8 +10,6 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 ALGORITHM = "aes-256-gcm"
 IV_LENGTH = 12
 AUTH_TAG_LENGTH = 16
@@ -39,6 +37,8 @@ def encrypt_token(plaintext: str, key: bytes) -> EncryptedTokenData:
     """
     import base64
 
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     iv = os.urandom(IV_LENGTH)
     aesgcm = AESGCM(key)
     # AESGCM.encrypt returns ciphertext + tag concatenated
@@ -65,6 +65,8 @@ def decrypt_token(encrypted: EncryptedTokenData, key: bytes) -> str:
         The decrypted plaintext token.
     """
     import base64
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     iv = base64.b64decode(encrypted.iv)
     ciphertext = base64.b64decode(encrypted.data)
