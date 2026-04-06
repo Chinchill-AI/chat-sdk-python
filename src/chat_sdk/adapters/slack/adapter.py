@@ -197,6 +197,9 @@ class SlackAdapter:
         # Channel external/shared cache
         self._external_channels: set[str] = set()
 
+        # Cache of AsyncWebClient instances keyed by bot token
+        self._client_cache: dict[str, Any] = {}
+
         # Multi-workspace OAuth fields
         self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
         self._client_secret: str | None = config.client_secret or (
@@ -258,11 +261,20 @@ class SlackAdapter:
     def _get_client(self, token: str | None = None) -> Any:
         """Return an ``AsyncWebClient`` for the given (or current) token.
 
-        The import is deferred so that ``slack_sdk`` is only required at call-time.
+        Clients are cached by token so we avoid creating a new instance on
+        every request.  The import is deferred so that ``slack_sdk`` is only
+        required at call-time.
         """
+        resolved_token = token or self._get_token()
+        cached = self._client_cache.get(resolved_token)
+        if cached is not None:
+            return cached
+
         from slack_sdk.web.async_client import AsyncWebClient
 
-        return AsyncWebClient(token=token or self._get_token())
+        client = AsyncWebClient(token=resolved_token)
+        self._client_cache[resolved_token] = client
+        return client
 
     # ------------------------------------------------------------------
     # Initialization
