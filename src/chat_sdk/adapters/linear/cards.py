@@ -123,7 +123,8 @@ def _render_text(text: TextElement) -> list[str]:
 def _render_fields(fields: FieldsElement) -> list[str]:
     """Render fields as key-value pairs."""
     return [
-        f"**{_escape_markdown(f.get('label', ''))}:** {_escape_markdown(f.get('value', ''))}" for f in fields.get("children", [])
+        f"**{_escape_markdown(f.get('label', ''))}:** {_escape_markdown(f.get('value', ''))}"
+        for f in fields.get("children", [])
     ]
 
 

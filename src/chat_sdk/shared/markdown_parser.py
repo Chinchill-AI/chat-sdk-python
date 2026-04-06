@@ -318,19 +318,13 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
     """
     items: list[Content] = []
     i = start
-    if ordered:
-        item_re = re.compile(r"^(\d+)[.)]\s+(.*)")
-    else:
-        item_re = re.compile(r"^[-*+]\s+(.*)")
+    item_re = re.compile(r"^(\d+)[.)]\s+(.*)") if ordered else re.compile(r"^[-*+]\s+(.*)")
 
     while i < len(lines):
         line = lines[i]
         m = item_re.match(line)
         if m:
-            if ordered:
-                item_text = m.group(2)
-            else:
-                item_text = m.group(1)
+            item_text = m.group(2) if ordered else m.group(1)
 
             item_children_lines = [item_text]
             i += 1

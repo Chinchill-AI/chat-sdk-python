@@ -13,7 +13,6 @@ from typing import (
     Literal,
     Protocol,
     TypedDict,
-    Union,
     runtime_checkable,
 )
 
@@ -680,10 +679,10 @@ class PostableCard:
 
 
 # Union of adapter-postable message types
-AdapterPostableMessage = Union[str, PostableRaw, PostableMarkdown, PostableAst, PostableCard, CardElement]
+AdapterPostableMessage = str | PostableRaw | PostableMarkdown | PostableAst | PostableCard | CardElement
 
 # Union of all postable message types (includes streaming)
-PostableMessage = Union[AdapterPostableMessage, AsyncIterable[Any]]
+PostableMessage = AdapterPostableMessage | AsyncIterable[Any]
 
 # =============================================================================
 # Streaming Types
@@ -717,7 +716,7 @@ class PlanUpdateChunk:
     title: str = ""
 
 
-StreamChunk = Union[MarkdownTextChunk, TaskUpdateChunk, PlanUpdateChunk]
+StreamChunk = MarkdownTextChunk | TaskUpdateChunk | PlanUpdateChunk
 
 
 @dataclass
@@ -876,7 +875,9 @@ class StateAdapter(Protocol):
     async def set(self, key: str, value: Any, ttl_ms: int | None = None) -> None: ...
     async def set_if_not_exists(self, key: str, value: Any, ttl_ms: int | None = None) -> bool: ...
     async def delete(self, key: str) -> None: ...
-    async def append_to_list(self, key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None) -> None: ...
+    async def append_to_list(
+        self, key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None
+    ) -> None: ...
     async def get_list(self, key: str) -> list[Any]: ...
     async def enqueue(self, thread_id: str, entry: QueueEntry, max_size: int) -> int: ...
     async def dequeue(self, thread_id: str) -> QueueEntry | None: ...
@@ -1279,7 +1280,9 @@ class ChatInstance(Protocol):
     def process_modal_submit(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> Awaitable[ModalResponse | None]: ...
-    def process_modal_close(self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None) -> None: ...
+    def process_modal_close(
+        self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
+    ) -> None: ...
     def process_assistant_thread_started(
         self, event: AssistantThreadStartedEvent, options: WebhookOptions | None = None
     ) -> None: ...
@@ -1287,7 +1290,9 @@ class ChatInstance(Protocol):
         self, event: AssistantContextChangedEvent, options: WebhookOptions | None = None
     ) -> None: ...
     def process_app_home_opened(self, event: AppHomeOpenedEvent, options: WebhookOptions | None = None) -> None: ...
-    def process_member_joined_channel(self, event: MemberJoinedChannelEvent, options: WebhookOptions | None = None) -> None: ...
+    def process_member_joined_channel(
+        self, event: MemberJoinedChannelEvent, options: WebhookOptions | None = None
+    ) -> None: ...
 
 
 # =============================================================================

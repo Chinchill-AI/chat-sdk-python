@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from chat_sdk.errors import ChatNotImplementedError
@@ -139,7 +139,10 @@ def _extract_message_content(
         # Simplified: store markdown as text node (no full parser in Python port)
         return (
             message.markdown,
-            {"type": "root", "children": [{"type": "paragraph", "children": [{"type": "text", "value": message.markdown}]}]},
+            {
+                "type": "root",
+                "children": [{"type": "paragraph", "children": [{"type": "text", "value": message.markdown}]}],
+            },
             list(message.attachments or []),
         )
 
@@ -538,7 +541,9 @@ class ThreadImpl:
         Posts an initial placeholder, then edits the message at intervals as
         new text arrives from the stream.
         """
-        interval_ms = options.update_interval_ms if options and options.update_interval_ms else self._streaming_update_interval_ms
+        interval_ms = (
+            options.update_interval_ms if options and options.update_interval_ms else self._streaming_update_interval_ms
+        )
         interval_s = interval_ms / 1000.0
         placeholder_text = self._fallback_streaming_placeholder_text
 
@@ -739,7 +744,7 @@ class ThreadImpl:
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.now(tz=timezone.utc),
+                date_sent=datetime.now(tz=UTC),
                 edited=False,
             ),
             attachments=attachments,

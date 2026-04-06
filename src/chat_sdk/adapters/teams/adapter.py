@@ -9,13 +9,11 @@ Python port of packages/adapter-teams/src/index.ts.
 from __future__ import annotations
 
 import base64
-import hmac
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -32,8 +30,10 @@ from chat_sdk.shared.errors import (
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
-    PermissionError as AdapterPermissionError,
     ValidationError,
+)
+from chat_sdk.shared.errors import (
+    PermissionError as AdapterPermissionError,
 )
 from chat_sdk.types import (
     ActionEvent,
@@ -71,9 +71,7 @@ ALLOWED_SERVICE_URL_PATTERNS = [
 ]
 
 # Bot Framework OpenID configuration URL for JWT verification
-BOT_FRAMEWORK_OPENID_CONFIG_URL = (
-    "https://login.botframework.com/v1/.well-known/openid-configuration"
-)
+BOT_FRAMEWORK_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openid-configuration"
 
 
 def _validate_service_url(url: str) -> None:
@@ -98,14 +96,18 @@ def _handle_teams_error(error: Any, operation: str) -> None:
     """
     if error and isinstance(error, dict):
         inner_error = error.get("innerHttpError", {})
-        status_code = inner_error.get("statusCode") or error.get("statusCode") or error.get("status") or error.get("code")
+        status_code = (
+            inner_error.get("statusCode") or error.get("statusCode") or error.get("status") or error.get("code")
+        )
 
         if status_code == 401:
             raise AuthenticationError(
                 "teams",
                 f"Authentication failed for {operation}: {error.get('message', 'unauthorized')}",
             )
-        if status_code == 403 or (isinstance(error.get("message"), str) and "permission" in error.get("message", "").lower()):
+        if status_code == 403 or (
+            isinstance(error.get("message"), str) and "permission" in error.get("message", "").lower()
+        ):
             raise AdapterPermissionError("teams", operation)
         if status_code == 404:
             raise NetworkError(
@@ -501,7 +503,7 @@ class TeamsAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromisoformat(activity["timestamp"])
                 if activity.get("timestamp")
-                else datetime.now(timezone.utc),
+                else datetime.now(UTC),
                 edited=False,
             ),
             attachments=attachments,
@@ -532,9 +534,7 @@ class TeamsAdapter:
             return False
         if from_id == self._app_id:
             return True
-        if from_id.endswith(f":{self._app_id}"):
-            return True
-        return False
+        return bool(from_id.endswith(f":{self._app_id}"))
 
     async def post_message(
         self,
@@ -780,7 +780,9 @@ class TeamsAdapter:
         encoded_conversation_id = (
             base64.urlsafe_b64encode(platform_data.conversation_id.encode("utf-8")).decode("ascii").rstrip("=")
         )
-        encoded_service_url = base64.urlsafe_b64encode(platform_data.service_url.encode("utf-8")).decode("ascii").rstrip("=")
+        encoded_service_url = (
+            base64.urlsafe_b64encode(platform_data.service_url.encode("utf-8")).decode("ascii").rstrip("=")
+        )
         return f"teams:{encoded_conversation_id}:{encoded_service_url}"
 
     def decode_thread_id(self, thread_id: str) -> TeamsThreadId:
@@ -1396,7 +1398,7 @@ class TeamsAdapter:
             ),
             metadata=MessageMetadata(
                 date_sent=(
-                    datetime.fromisoformat(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(timezone.utc)
+                    datetime.fromisoformat(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(UTC)
                 ),
                 edited=bool(msg.get("lastModifiedDateTime")),
             ),
@@ -1446,7 +1448,7 @@ class TeamsAdapter:
 
         # First pass: look for prominent text blocks
         for element in body:
-            if isinstance(element, dict) and element.get("type") == "TextBlock":
+            if isinstance(element, dict) and element.get("type") == "TextBlock":  # noqa: SIM102
                 if element.get("weight") == "bolder" or element.get("size") in ("large", "extraLarge"):
                     text = element.get("text")
                     if isinstance(text, str):
@@ -1673,7 +1675,7 @@ class TeamsAdapter:
             if self._jwks_client is None:
                 import aiohttp
 
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession() as session:  # noqa: SIM117
                     async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
                         if resp.status != 200:
                             self._logger.error("Failed to fetch Bot Framework OpenID config", {"status": resp.status})

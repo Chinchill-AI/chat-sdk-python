@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, TypedDict
 
 # Button style options
 ButtonStyle = Literal["primary", "danger", "default"]
@@ -123,16 +123,16 @@ class SectionElement(TypedDict):
 
 
 # Union of all card child element types
-CardChild = Union[
-    TextElement,
-    ImageElement,
-    DividerElement,
-    ActionsElement,
-    SectionElement,
-    FieldsElement,
-    LinkElement,
-    TableElement,
-]
+CardChild = (
+    TextElement
+    | ImageElement
+    | DividerElement
+    | ActionsElement
+    | SectionElement
+    | FieldsElement
+    | LinkElement
+    | TableElement
+)
 
 
 class CardElement(TypedDict, total=False):

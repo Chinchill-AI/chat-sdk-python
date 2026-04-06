@@ -12,7 +12,7 @@ See: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactiv
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, TypedDict
 
 from chat_sdk.adapters.whatsapp.types import WhatsAppInteractiveMessage
 from chat_sdk.cards import (
@@ -55,7 +55,7 @@ class WhatsAppCardResultText(TypedDict):
     text: str
 
 
-WhatsAppCardResult = Union[WhatsAppCardResultInteractive, WhatsAppCardResultText]
+WhatsAppCardResult = WhatsAppCardResultInteractive | WhatsAppCardResultText
 
 
 def encode_whatsapp_callback_data(action_id: str, value: str | None = None) -> str:

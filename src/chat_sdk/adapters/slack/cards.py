@@ -27,7 +27,8 @@ from chat_sdk.cards import (
     table_element_to_ascii,
 )
 from chat_sdk.modals import SelectElement
-from chat_sdk.shared import card_to_fallback_text as shared_card_to_fallback_text, create_emoji_converter, map_button_style
+from chat_sdk.shared import card_to_fallback_text as shared_card_to_fallback_text
+from chat_sdk.shared import create_emoji_converter, map_button_style
 
 # Type aliases for Slack Block Kit structures
 SlackBlock = dict[str, Any]
@@ -364,7 +365,10 @@ def convert_fields_to_block(element: FieldsElement) -> SlackBlock:
         fields.append(
             {
                 "type": "mrkdwn",
-                "text": f"*{_markdown_to_mrkdwn(convert_emoji(f['label']))}*\n{_markdown_to_mrkdwn(convert_emoji(f['value']))}",
+                "text": (
+                    f"*{_markdown_to_mrkdwn(convert_emoji(f['label']))}*"
+                    f"\n{_markdown_to_mrkdwn(convert_emoji(f['value']))}"
+                ),
             }
         )
 

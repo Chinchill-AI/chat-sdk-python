@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
@@ -135,7 +135,9 @@ class GoogleChatAdapter:
         self._pubsub_topic = config.pubsub_topic or os.environ.get("GOOGLE_CHAT_PUBSUB_TOPIC")
         self._impersonate_user = config.impersonate_user or os.environ.get("GOOGLE_CHAT_IMPERSONATE_USER")
         self._endpoint_url = config.endpoint_url
-        self._google_chat_project_number = config.google_chat_project_number or os.environ.get("GOOGLE_CHAT_PROJECT_NUMBER")
+        self._google_chat_project_number = config.google_chat_project_number or os.environ.get(
+            "GOOGLE_CHAT_PROJECT_NUMBER"
+        )
         self._pubsub_audience = config.pubsub_audience or os.environ.get("GOOGLE_CHAT_PUBSUB_AUDIENCE")
 
         # In-progress subscription creations to prevent duplicate requests
@@ -433,7 +435,9 @@ class GoogleChatAdapter:
         )
 
         if not self._pubsub_topic:
-            self._logger.warn("No pubsubTopic configured, skipping space subscription. Set GOOGLE_CHAT_PUBSUB_TOPIC env var.")
+            self._logger.warn(
+                "No pubsubTopic configured, skipping space subscription. Set GOOGLE_CHAT_PUBSUB_TOPIC env var."
+            )
             return
 
         decoded = self.decode_thread_id(thread_id)
@@ -470,7 +474,9 @@ class GoogleChatAdapter:
         # Check if we already have a valid subscription
         cached = await self._state.get(cache_key)
         if cached:
-            expire_time = cached.get("expire_time", 0) if isinstance(cached, dict) else getattr(cached, "expire_time", 0)
+            expire_time = (
+                cached.get("expire_time", 0) if isinstance(cached, dict) else getattr(cached, "expire_time", 0)
+            )
             time_until_expiry = expire_time - int(time.time() * 1000)
             if time_until_expiry > SUBSCRIPTION_REFRESH_BUFFER_MS:
                 self._logger.debug(
@@ -2270,7 +2276,7 @@ class GoogleChatAdapter:
                         last_reply_at=last_reply_at,
                     )
                 )
-                count += 1
+                count += 1  # noqa: SIM113
 
             self._logger.debug(
                 "GChat API: listThreads result",
@@ -2677,9 +2683,9 @@ def _parse_message_metadata(message: dict[str, Any]) -> Any:
         try:
             date_sent = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
-            date_sent = datetime.now(tz=timezone.utc)
+            date_sent = datetime.now(tz=UTC)
     else:
-        date_sent = datetime.now(tz=timezone.utc)
+        date_sent = datetime.now(tz=UTC)
 
     return MessageMetadata(
         date_sent=date_sent,

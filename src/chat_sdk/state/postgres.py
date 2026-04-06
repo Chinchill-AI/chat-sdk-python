@@ -139,7 +139,9 @@ class PostgresStateAdapter:
             self._pool = None  # created lazily in connect()
             resolved_url = url or os.environ.get("POSTGRES_URL") or os.environ.get("DATABASE_URL")
             if not resolved_url:
-                raise ValueError("Postgres url is required. Set POSTGRES_URL or DATABASE_URL, or provide url in options.")
+                raise ValueError(
+                    "Postgres url is required. Set POSTGRES_URL or DATABASE_URL, or provide url in options."
+                )
             self._url = resolved_url
 
     # -- lifecycle -----------------------------------------------------------
@@ -460,30 +462,29 @@ class PostgresStateAdapter:
         expires_at = _pg_timestamp_from_epoch_ms(entry.expires_at)
 
         # Wrap insert + trim in a transaction to avoid TOCTOU races
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                # Purge expired entries first
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Purge expired entries first
+            await conn.execute(
+                """DELETE FROM chat_state_queues
+                       WHERE key_prefix = $1 AND thread_id = $2 AND expires_at <= now()""",
+                self._key_prefix,
+                thread_id,
+            )
+
+            # Insert the new entry
+            await conn.execute(
+                """INSERT INTO chat_state_queues (key_prefix, thread_id, value, expires_at)
+                       VALUES ($1, $2, $3, $4)""",
+                self._key_prefix,
+                thread_id,
+                serialized,
+                expires_at,
+            )
+
+            # Trim overflow (keep newest max_size non-expired entries)
+            if max_size > 0:
                 await conn.execute(
                     """DELETE FROM chat_state_queues
-                       WHERE key_prefix = $1 AND thread_id = $2 AND expires_at <= now()""",
-                    self._key_prefix,
-                    thread_id,
-                )
-
-                # Insert the new entry
-                await conn.execute(
-                    """INSERT INTO chat_state_queues (key_prefix, thread_id, value, expires_at)
-                       VALUES ($1, $2, $3, $4)""",
-                    self._key_prefix,
-                    thread_id,
-                    serialized,
-                    expires_at,
-                )
-
-                # Trim overflow (keep newest max_size non-expired entries)
-                if max_size > 0:
-                    await conn.execute(
-                        """DELETE FROM chat_state_queues
                            WHERE key_prefix = $1 AND thread_id = $2 AND seq IN (
                              SELECT seq FROM chat_state_queues
                              WHERE key_prefix = $1 AND thread_id = $2
@@ -496,18 +497,18 @@ class PostgresStateAdapter:
                                0
                              )
                            )""",
-                        self._key_prefix,
-                        thread_id,
-                        max_size,
-                    )
-
-                # Return current non-expired depth
-                depth = await conn.fetchval(
-                    """SELECT count(*) FROM chat_state_queues
-                       WHERE key_prefix = $1 AND thread_id = $2 AND expires_at > now()""",
                     self._key_prefix,
                     thread_id,
+                    max_size,
                 )
+
+            # Return current non-expired depth
+            depth = await conn.fetchval(
+                """SELECT count(*) FROM chat_state_queues
+                       WHERE key_prefix = $1 AND thread_id = $2 AND expires_at > now()""",
+                self._key_prefix,
+                thread_id,
+            )
 
         return int(depth)
 
@@ -585,12 +586,12 @@ class PostgresStateAdapter:
 
 def _pg_timestamp_from_ms(ttl_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime ``ttl_ms`` milliseconds from now."""
-    return _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(milliseconds=ttl_ms)
+    return _dt.datetime.now(_dt.UTC) + _dt.timedelta(milliseconds=ttl_ms)
 
 
 def _pg_timestamp_from_epoch_ms(epoch_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime from an epoch-millisecond value."""
-    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.timezone.utc)
+    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.UTC)
 
 
 # ---------------------------------------------------------------------------
