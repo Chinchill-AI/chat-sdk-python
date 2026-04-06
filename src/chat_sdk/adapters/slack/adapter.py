@@ -2691,6 +2691,13 @@ class SlackAdapter:
         thread_ts: str | None = None,
     ) -> dict[str, Any]:
         """Send a request to Slack's response_url to modify an ephemeral message."""
+        # Validate response_url points to Slack (prevent SSRF)
+        from urllib.parse import urlparse
+
+        parsed = urlparse(response_url)
+        if not (parsed.scheme == "https" and parsed.hostname and parsed.hostname.endswith(".slack.com")):
+            raise ValidationError("slack", f"Invalid response_url: must be https://*.slack.com, got {response_url}")
+
         import httpx
 
         payload: dict[str, Any]
