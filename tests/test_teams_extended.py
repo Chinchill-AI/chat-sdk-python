@@ -19,7 +19,7 @@ import base64
 import json
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -43,6 +43,16 @@ from chat_sdk.shared.errors import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _skip_teams_jwt(monkeypatch):
+    """Bypass JWT verification in unit tests (no real Bot Framework tokens)."""
+    monkeypatch.setattr(
+        TeamsAdapter,
+        "_verify_bot_framework_token",
+        AsyncMock(return_value=None),
+    )
 
 
 def _make_adapter(**overrides) -> TeamsAdapter:

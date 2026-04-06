@@ -8,6 +8,7 @@ Python port of packages/adapter-discord/src/index.ts.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -178,7 +179,7 @@ class DiscordAdapter:
         # Check if this is a forwarded Gateway event (uses bot token for auth)
         gateway_token = self._get_header(request, "x-discord-gateway-token")
         if gateway_token:
-            if gateway_token != self._bot_token:
+            if not hmac.compare_digest(gateway_token, self._bot_token):
                 self._logger.warn("Invalid gateway token")
                 return self._make_response("Invalid gateway token", 401)
             self._logger.info("Discord forwarded Gateway event received")

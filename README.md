@@ -15,7 +15,8 @@ pip install chat-sdk[all]              # all adapters + state backends
 ## Quick Start
 
 ```python
-from chat_sdk import Chat, Card, Button, Actions
+from chat_sdk import Chat, Card, Button, Actions, MemoryStateAdapter
+from chat_sdk.adapters.slack import create_slack_adapter
 
 chat = Chat(
     adapters={"slack": create_slack_adapter()},

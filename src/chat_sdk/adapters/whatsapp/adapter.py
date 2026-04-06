@@ -637,10 +637,29 @@ class WhatsAppAdapter:
 
                 media_info = await meta_response.json()
 
-            # Step 2: Download the actual file
+            # Validate the download URL to prevent SSRF
+            download_url = media_info["url"]
+            parsed = urlparse(download_url)
+            if parsed.scheme != "https":
+                raise ValidationError(
+                    "whatsapp",
+                    f"Media download URL must use HTTPS, got: {parsed.scheme}",
+                )
+            host = (parsed.hostname or "").lower()
+            if not (
+                host.endswith(".facebook.com")
+                or host.endswith(".fbcdn.net")
+                or host == "facebook.com"
+                or host == "fbcdn.net"
+            ):
+                raise ValidationError(
+                    "whatsapp",
+                    f"Media download URL host is not an allowed Meta domain: {host}",
+                )
+
+            # Step 2: Download the actual file (no Bearer token -- CDN URLs are pre-signed)
             async with session.get(
-                media_info["url"],
-                headers={"Authorization": f"Bearer {self._access_token}"},
+                download_url,
             ) as data_response:
                 if data_response.status != 200:
                     self._logger.error(

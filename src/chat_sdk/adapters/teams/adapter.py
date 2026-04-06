@@ -9,11 +9,13 @@ Python port of packages/adapter-teams/src/index.ts.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -56,6 +58,33 @@ from chat_sdk.types import (
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
 MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
+
+# Allowed Microsoft Bot Framework service URL patterns (SSRF protection)
+ALLOWED_SERVICE_URL_PATTERNS = [
+    re.compile(r"^https://smba\.trafficmanager\.net/"),
+    re.compile(r"^https://[a-z0-9-]+\.botframework\.com/"),
+    re.compile(r"^https://[a-z0-9-]+\.botframework\.us/"),
+]
+
+# Bot Framework OpenID configuration URL for JWT verification
+BOT_FRAMEWORK_OPENID_CONFIG_URL = (
+    "https://login.botframework.com/v1/.well-known/openid-configuration"
+)
+
+
+def _validate_service_url(url: str) -> None:
+    """Validate that a service URL matches known Microsoft Bot Framework endpoints.
+
+    Raises :class:`~chat_sdk.shared.errors.ValidationError` if the URL is not
+    in the allow-list, preventing SSRF attacks via crafted ``serviceUrl`` values.
+    """
+    for pattern in ALLOWED_SERVICE_URL_PATTERNS:
+        if pattern.match(url):
+            return
+    raise ValidationError(
+        "teams",
+        f"Service URL is not an allowed Bot Framework endpoint: {url}",
+    )
 
 
 def _handle_teams_error(error: Any, operation: str) -> None:
@@ -132,6 +161,7 @@ class TeamsAdapter:
         self._bot_user_id: str | None = self._app_id or None
         self._access_token: str | None = None
         self._token_expiry: float = 0
+        self._jwks_client: Any | None = None  # Cached PyJWKClient for JWT verification
 
     @property
     def name(self) -> str:
@@ -169,6 +199,12 @@ class TeamsAdapter:
         """
         body = await self._get_request_body(request)
         self._logger.debug("Teams webhook raw body", {"body": body[:500] if body else ""})
+
+        # ---- JWT verification (Bot Framework tokens) ----
+        if self._app_id:
+            auth_result = await self._verify_bot_framework_token(request)
+            if auth_result is not None:
+                return auth_result
 
         try:
             activity: dict[str, Any] = json.loads(body)
@@ -1529,6 +1565,7 @@ class TeamsAdapter:
         """Send an activity to a Teams conversation via Bot Framework REST API."""
         import aiohttp  # lazy import
 
+        _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities"
 
@@ -1560,6 +1597,7 @@ class TeamsAdapter:
         """Update an activity in a Teams conversation via Bot Framework REST API."""
         import aiohttp  # lazy import
 
+        _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
 
@@ -1589,6 +1627,7 @@ class TeamsAdapter:
         """Delete an activity from a Teams conversation via Bot Framework REST API."""
         import aiohttp  # lazy import
 
+        _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
 
@@ -1605,6 +1644,58 @@ class TeamsAdapter:
                     "teams",
                     f"Teams API error: {response.status} {error_text}",
                 )
+
+    # =========================================================================
+    # JWT verification (Bot Framework)
+    # =========================================================================
+
+    async def _verify_bot_framework_token(self, request: Any) -> Any | None:
+        """Verify the JWT Bearer token from the Bot Framework.
+
+        Returns a 401 response dict if authentication fails, or ``None`` if
+        the token is valid.
+        """
+        auth_header: str | None = self._get_header(request, "authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            self._logger.warn("Missing or invalid Authorization header on Teams webhook")
+            return self._make_response("Unauthorized", 401)
+
+        token = auth_header[7:]
+        try:
+            import jwt as pyjwt
+            from jwt import PyJWKClient
+
+            # Lazily create and cache the JWKS client
+            if self._jwks_client is None:
+                import aiohttp
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
+                        openid_config = await resp.json()
+                jwks_uri = openid_config.get("jwks_uri")
+                if not jwks_uri:
+                    self._logger.error("No jwks_uri in Bot Framework OpenID config")
+                    return self._make_response("Unauthorized", 401)
+                self._jwks_client = PyJWKClient(jwks_uri)
+
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            payload = pyjwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=self._app_id,
+            )
+            self._logger.debug(
+                "Teams JWT verified",
+                {
+                    "iss": payload.get("iss"),
+                    "aud": payload.get("aud"),
+                },
+            )
+            return None  # success
+        except Exception as exc:
+            self._logger.warn(f"Teams JWT verification failed: {exc}")
+            return self._make_response("Unauthorized", 401)
 
     # =========================================================================
     # Request/Response helpers (framework-agnostic)
