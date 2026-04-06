@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -197,8 +198,9 @@ class SlackAdapter:
         # Channel external/shared cache
         self._external_channels: set[str] = set()
 
-        # Cache of AsyncWebClient instances keyed by bot token
-        self._client_cache: dict[str, Any] = {}
+        # Cache of AsyncWebClient instances keyed by bot token (LRU-bounded)
+        self._client_cache: OrderedDict[str, Any] = OrderedDict()
+        self._client_cache_max = 100  # max cached clients
 
         # Multi-workspace OAuth fields
         self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
@@ -264,17 +266,34 @@ class SlackAdapter:
         Clients are cached by token so we avoid creating a new instance on
         every request.  The import is deferred so that ``slack_sdk`` is only
         required at call-time.
+
+        When *token* is explicitly passed (even as ``""``) it is used as-is;
+        only when *token* is ``None`` do we fall back to ``_get_token()``.
         """
-        resolved_token = token or self._get_token()
-        cached = self._client_cache.get(resolved_token)
-        if cached is not None:
-            return cached
+        resolved_token = self._get_token() if token is None else token
+
+        if resolved_token in self._client_cache:
+            self._client_cache.move_to_end(resolved_token)
+            return self._client_cache[resolved_token]
 
         from slack_sdk.web.async_client import AsyncWebClient
 
         client = AsyncWebClient(token=resolved_token)
         self._client_cache[resolved_token] = client
+        if len(self._client_cache) > self._client_cache_max:
+            # Evict oldest (LRU)
+            evicted_token, evicted_client = self._client_cache.popitem(last=False)
+            # Close the evicted client's session if possible
+            try:
+                if hasattr(evicted_client, "session") and evicted_client.session:
+                    asyncio.get_running_loop().create_task(evicted_client.session.close())
+            except RuntimeError:
+                pass
         return client
+
+    def _invalidate_client(self, token: str) -> None:
+        """Remove a cached client (e.g., on token revocation)."""
+        self._client_cache.pop(token, None)
 
     # ------------------------------------------------------------------
     # Initialization
@@ -2670,17 +2689,24 @@ class SlackAdapter:
         Never returns (always raises).
         """
         slack_error = error
-        code = getattr(slack_error, "response", {})
-        if isinstance(code, dict):
-            code.get("error")
-        else:
-            getattr(getattr(slack_error, "response", None), "get", lambda *a: None)("error")
+        resp = getattr(slack_error, "response", None)
+        error_code: str | None = None
+        if isinstance(resp, dict):
+            error_code = resp.get("error")
+        elif resp is not None:
+            error_code = getattr(resp, "get", lambda *a: None)("error")
+
+        # Invalidate cached client on auth errors (token revocation / invalid_auth)
+        if error_code in ("invalid_auth", "token_revoked", "account_inactive"):
+            try:
+                token = self._get_token()
+                self._invalidate_client(token)
+            except AuthenticationError:
+                pass
 
         # Check for rate limiting
-        if hasattr(slack_error, "response"):
-            resp = slack_error.response
-            if isinstance(resp, dict) and resp.get("error") == "ratelimited":
-                raise AdapterRateLimitError("slack") from error
+        if isinstance(resp, dict) and error_code == "ratelimited":
+            raise AdapterRateLimitError("slack") from error
 
         raise error  # type: ignore[misc]
 
