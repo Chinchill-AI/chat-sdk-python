@@ -24,4 +24,4 @@ jobs:
       - name: Format check
         run: uv run ruff format --check src/
       - name: Run tests
-        run: uv run pytest tests/ -q --tb=short --cov=chat_sdk --cov-fail-under=50
+        run: uv run pytest tests/ -q --tb=short --cov=chat_sdk --cov-fail-under=70
