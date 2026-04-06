@@ -1,0 +1,693 @@
+"""Tests for Slack adapter webhook handling, thread IDs, message parsing, and API operations.
+
+Port of packages/adapter-slack/src/index.test.ts.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import time
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+try:
+    from chat_sdk.adapters.slack.adapter import SlackAdapter, create_slack_adapter
+    from chat_sdk.adapters.slack.types import SlackAdapterConfig, SlackInstallation, SlackThreadId
+    from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
+
+    _SLACK_AVAILABLE = True
+except ImportError:
+    _SLACK_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(not _SLACK_AVAILABLE, reason="Slack adapter import failed")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter(**overrides: Any) -> SlackAdapter:
+    config = SlackAdapterConfig(
+        signing_secret=overrides.pop("signing_secret", "test-signing-secret"),
+        bot_token=overrides.pop("bot_token", "xoxb-test-token"),
+        **overrides,
+    )
+    return SlackAdapter(config)
+
+
+def _slack_signature(body: str, secret: str, timestamp: int | None = None) -> tuple[str, str]:
+    """Compute Slack request signature. Returns (timestamp_str, signature)."""
+    ts = str(timestamp or int(time.time()))
+    sig_base = f"v0:{ts}:{body}"
+    sig = "v0=" + hmac.new(secret.encode(), sig_base.encode(), hashlib.sha256).hexdigest()
+    return ts, sig
+
+
+class _FakeRequest:
+    """Minimal request-like object for adapter webhook testing."""
+
+    def __init__(self, body: str, headers: dict[str, str] | None = None):
+        self.body = body.encode("utf-8")
+        self.headers = headers or {}
+
+    async def text(self) -> str:
+        return self.body.decode("utf-8")
+
+
+def _make_signed_request(
+    body: str,
+    secret: str = "test-signing-secret",
+    content_type: str = "application/json",
+    timestamp_offset: int = 0,
+) -> _FakeRequest:
+    ts, sig = _slack_signature(body, secret, int(time.time()) + timestamp_offset)
+    return _FakeRequest(
+        body,
+        {
+            "x-slack-request-timestamp": ts,
+            "x-slack-signature": sig,
+            "content-type": content_type,
+        },
+    )
+
+
+def _make_mock_state() -> MagicMock:
+    cache: dict[str, Any] = {}
+    state = MagicMock()
+    state.get = AsyncMock(side_effect=lambda k: cache.get(k))
+    state.set = AsyncMock(side_effect=lambda k, v, *a, **kw: cache.__setitem__(k, v))
+    state.delete = AsyncMock(side_effect=lambda k: cache.pop(k, None))
+    state.append_to_list = AsyncMock()
+    state.get_list = AsyncMock(return_value=[])
+    state._cache = cache
+    return state
+
+
+def _make_mock_chat(state: MagicMock) -> MagicMock:
+    chat = MagicMock()
+    chat.process_message = AsyncMock()
+    chat.handle_incoming_message = AsyncMock()
+    chat.process_reaction = AsyncMock()
+    chat.process_action = AsyncMock()
+    chat.process_modal_submit = AsyncMock()
+    chat.process_modal_close = MagicMock()
+    chat.process_slash_command = AsyncMock()
+    chat.process_member_joined_channel = AsyncMock()
+    chat.get_state = MagicMock(return_value=state)
+    chat.get_user_name = MagicMock(return_value="test-bot")
+    chat.get_logger = MagicMock(return_value=MagicMock())
+    return chat
+
+
+# ---------------------------------------------------------------------------
+# Factory function tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSlackAdapter:
+    def test_creates_instance(self):
+        adapter = _make_adapter()
+        assert isinstance(adapter, SlackAdapter)
+        assert adapter.name == "slack"
+
+    def test_default_user_name(self):
+        adapter = _make_adapter()
+        assert adapter.user_name == "bot"
+
+    def test_custom_user_name(self):
+        adapter = _make_adapter(user_name="custombot")
+        assert adapter.user_name == "custombot"
+
+    def test_stores_bot_user_id(self):
+        adapter = _make_adapter(bot_user_id="U12345")
+        assert adapter.bot_user_id == "U12345"
+
+
+# ---------------------------------------------------------------------------
+# Thread ID encoding / decoding
+# ---------------------------------------------------------------------------
+
+
+class TestThreadIdEncoding:
+    def test_encode(self):
+        adapter = _make_adapter()
+        tid = adapter.encode_thread_id(SlackThreadId(channel="C12345", thread_ts="1234567890.123456"))
+        assert tid == "slack:C12345:1234567890.123456"
+
+    def test_encode_empty_thread_ts(self):
+        adapter = _make_adapter()
+        tid = adapter.encode_thread_id(SlackThreadId(channel="C12345", thread_ts=""))
+        assert tid == "slack:C12345:"
+
+    def test_decode(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("slack:C12345:1234567890.123456")
+        assert result.channel == "C12345"
+        assert result.thread_ts == "1234567890.123456"
+
+    def test_decode_empty_thread_ts(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("slack:C12345:")
+        assert result.channel == "C12345"
+        assert result.thread_ts == ""
+
+    def test_decode_channel_only(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("slack:C12345")
+        assert result.channel == "C12345"
+        assert result.thread_ts == ""
+
+    def test_decode_invalid_raises(self):
+        adapter = _make_adapter()
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id("invalid")
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id("slack")
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id("teams:C12345:123")
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id("slack:A:B:C:D")
+
+
+# ---------------------------------------------------------------------------
+# isDM
+# ---------------------------------------------------------------------------
+
+
+class TestIsDM:
+    def test_dm_channel(self):
+        adapter = _make_adapter()
+        assert adapter.is_dm("slack:D12345:1234567890.123456") is True
+
+    def test_public_channel(self):
+        adapter = _make_adapter()
+        assert adapter.is_dm("slack:C12345:1234567890.123456") is False
+
+    def test_private_channel(self):
+        adapter = _make_adapter()
+        assert adapter.is_dm("slack:G12345:1234567890.123456") is False
+
+
+# ---------------------------------------------------------------------------
+# Signature verification
+# ---------------------------------------------------------------------------
+
+
+class TestSignatureVerification:
+    @pytest.mark.asyncio
+    async def test_rejects_missing_timestamp(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification"})
+        req = _FakeRequest(body, {"x-slack-signature": "v0=invalid", "content-type": "application/json"})
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_missing_signature(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification"})
+        req = _FakeRequest(body, {"x-slack-request-timestamp": str(int(time.time())), "content-type": "application/json"})
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_signature(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification"})
+        req = _FakeRequest(
+            body,
+            {
+                "x-slack-request-timestamp": str(int(time.time())),
+                "x-slack-signature": "v0=invalid",
+                "content-type": "application/json",
+            },
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_old_timestamp(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification"})
+        req = _make_signed_request(body, timestamp_offset=-400)
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_accepts_valid_signature(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification", "challenge": "test-challenge"})
+        req = _make_signed_request(body)
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# URL verification
+# ---------------------------------------------------------------------------
+
+
+class TestURLVerification:
+    @pytest.mark.asyncio
+    async def test_responds_to_challenge(self):
+        adapter = _make_adapter()
+        body = json.dumps({"type": "url_verification", "challenge": "test-challenge-123"})
+        req = _make_signed_request(body)
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+        resp_body = response.get("body", "")
+        if isinstance(resp_body, str):
+            parsed = json.loads(resp_body)
+        else:
+            parsed = resp_body
+        assert parsed == {"challenge": "test-challenge-123"}
+
+
+# ---------------------------------------------------------------------------
+# Event callbacks
+# ---------------------------------------------------------------------------
+
+
+class TestEventCallbacks:
+    def _make_event_request(self, event_data: dict[str, Any]) -> _FakeRequest:
+        body = json.dumps({"type": "event_callback", "event": event_data})
+        return _make_signed_request(body)
+
+    @pytest.mark.asyncio
+    async def test_handles_message_events(self):
+        adapter = _make_adapter()
+        req = self._make_event_request(
+            {
+                "type": "message",
+                "user": "U123",
+                "channel": "C456",
+                "text": "Hello world",
+                "ts": "1234567890.123456",
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_handles_app_mention_events(self):
+        adapter = _make_adapter()
+        req = self._make_event_request(
+            {
+                "type": "app_mention",
+                "user": "U123",
+                "channel": "C456",
+                "text": "<@U_BOT> hello",
+                "ts": "1234567890.123456",
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Interactive payloads (block_actions)
+# ---------------------------------------------------------------------------
+
+
+class TestInteractivePayloads:
+    def _make_interactive_req(self, payload: dict[str, Any]) -> _FakeRequest:
+        payload_str = json.dumps(payload)
+        body = f"payload={payload_str}"
+        return _make_signed_request(body, content_type="application/x-www-form-urlencoded")
+
+    @pytest.mark.asyncio
+    async def test_handles_block_actions(self):
+        adapter = _make_adapter()
+        req = self._make_interactive_req(
+            {
+                "type": "block_actions",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "container": {"type": "message", "message_ts": "1234567890.123456", "channel_id": "C456"},
+                "channel": {"id": "C456", "name": "general"},
+                "message": {"ts": "1234567890.123456", "thread_ts": "1234567890.000000"},
+                "actions": [{"type": "button", "action_id": "approve_btn", "value": "approved"}],
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_returns_400_for_missing_payload(self):
+        adapter = _make_adapter()
+        req = _make_signed_request("foo=bar", content_type="application/x-www-form-urlencoded")
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 400
+
+    @pytest.mark.asyncio
+    async def test_returns_400_for_invalid_payload_json(self):
+        adapter = _make_adapter()
+        req = _make_signed_request("payload=invalid-json", content_type="application/x-www-form-urlencoded")
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 400
+
+    @pytest.mark.asyncio
+    async def test_handles_view_submission(self):
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "view_submission",
+                "trigger_id": "trigger123",
+                "user": {"id": "U123", "username": "testuser"},
+                "view": {
+                    "id": "V123",
+                    "callback_id": "feedback_form",
+                    "private_metadata": "thread-context",
+                    "state": {"values": {}},
+                },
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_handles_view_closed(self):
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "view_closed",
+                "user": {"id": "U123", "username": "testuser"},
+                "view": {"id": "V123", "callback_id": "feedback_form", "private_metadata": "thread-context"},
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
+
+
+class TestJSONParsing:
+    @pytest.mark.asyncio
+    async def test_returns_400_for_invalid_json(self):
+        adapter = _make_adapter()
+        req = _make_signed_request("not valid json")
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 400
+
+
+# ---------------------------------------------------------------------------
+# parseMessage
+# ---------------------------------------------------------------------------
+
+
+class TestParseMessage:
+    def test_basic_message(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "user": "U123",
+            "channel": "C456",
+            "text": "Hello world",
+            "ts": "1234567890.123456",
+        }
+        msg = adapter.parse_message(event)
+        assert msg.id == "1234567890.123456"
+        assert msg.text == "Hello world"
+        assert msg.author.user_id == "U123"
+        assert msg.author.is_bot is False
+        assert msg.author.is_me is False
+
+    def test_bot_message(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "bot_id": "B123",
+            "channel": "C456",
+            "text": "Bot message",
+            "ts": "1234567890.123456",
+            "subtype": "bot_message",
+        }
+        msg = adapter.parse_message(event)
+        assert msg.author.user_id == "B123"
+        assert msg.author.is_bot is True
+
+    def test_detects_self_message(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "user": "U_BOT",
+            "channel": "C456",
+            "text": "Self message",
+            "ts": "1234567890.123456",
+        }
+        msg = adapter.parse_message(event)
+        assert msg.author.is_me is True
+
+    def test_message_with_thread_ts(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "user": "U123",
+            "channel": "C456",
+            "text": "Thread reply",
+            "ts": "1234567891.123456",
+            "thread_ts": "1234567890.123456",
+        }
+        msg = adapter.parse_message(event)
+        assert msg.thread_id == "slack:C456:1234567890.123456"
+
+    def test_message_with_files(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "user": "U123",
+            "channel": "C456",
+            "text": "Message with file",
+            "ts": "1234567890.123456",
+            "files": [
+                {
+                    "id": "F123",
+                    "mimetype": "image/png",
+                    "url_private": "https://files.slack.com/file.png",
+                    "name": "image.png",
+                    "size": 12345,
+                    "original_w": 800,
+                    "original_h": 600,
+                }
+            ],
+        }
+        msg = adapter.parse_message(event)
+        assert len(msg.attachments) == 1
+        assert msg.attachments[0].type == "image"
+        assert msg.attachments[0].name == "image.png"
+        assert msg.attachments[0].mime_type == "image/png"
+
+    def test_different_file_types(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+
+        def make_event(mimetype: str) -> dict:
+            return {
+                "type": "message",
+                "user": "U123",
+                "channel": "C456",
+                "text": "",
+                "ts": "1234567890.123456",
+                "files": [{"id": "F123", "mimetype": mimetype, "url_private": "https://example.com"}],
+            }
+
+        assert adapter.parse_message(make_event("image/jpeg")).attachments[0].type == "image"
+        assert adapter.parse_message(make_event("video/mp4")).attachments[0].type == "video"
+        assert adapter.parse_message(make_event("audio/mpeg")).attachments[0].type == "audio"
+        assert adapter.parse_message(make_event("application/pdf")).attachments[0].type == "file"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_missing_text(self):
+        adapter = _make_adapter()
+        event = {"type": "message", "user": "U123", "channel": "C456", "ts": "1234567890.123456"}
+        msg = adapter.parse_message(event)
+        assert msg.text == ""
+
+    def test_missing_user(self):
+        adapter = _make_adapter()
+        event = {"type": "message", "channel": "C456", "text": "Anonymous", "ts": "1234567890.123456"}
+        msg = adapter.parse_message(event)
+        assert msg.author.user_id == "unknown"
+
+    def test_missing_ts(self):
+        adapter = _make_adapter()
+        event = {"type": "message", "user": "U123", "channel": "C456", "text": "No timestamp"}
+        msg = adapter.parse_message(event)
+        assert msg.id == ""
+
+
+# ---------------------------------------------------------------------------
+# Date parsing
+# ---------------------------------------------------------------------------
+
+
+class TestDateParsing:
+    def test_parses_slack_timestamp(self):
+        adapter = _make_adapter()
+        event = {
+            "type": "message",
+            "user": "U123",
+            "channel": "C456",
+            "text": "Hello",
+            "ts": "1609459200.000000",  # 2021-01-01 00:00:00 UTC
+        }
+        msg = adapter.parse_message(event)
+        assert msg.metadata.date_sent is not None
+        assert msg.metadata.date_sent.year == 2021
+
+
+# ---------------------------------------------------------------------------
+# channelIdFromThreadId
+# ---------------------------------------------------------------------------
+
+
+class TestChannelIdFromThreadId:
+    def test_extracts_channel_id(self):
+        adapter = _make_adapter()
+        assert adapter.channel_id_from_thread_id("slack:C123:1234567890.000000") == "slack:C123"
+
+    def test_works_with_empty_thread_ts(self):
+        adapter = _make_adapter()
+        assert adapter.channel_id_from_thread_id("slack:C456:") == "slack:C456"
+
+
+# ---------------------------------------------------------------------------
+# Message subtype handling
+# ---------------------------------------------------------------------------
+
+
+class TestMessageSubtypes:
+    def _make_subtype_req(self, subtype: str, **event_overrides: Any) -> _FakeRequest:
+        event = {
+            "type": "message",
+            "subtype": subtype,
+            "channel": "C_CHAN",
+            "ts": "1234567890.111111",
+            **event_overrides,
+        }
+        body = json.dumps({"type": "event_callback", "team_id": "T123", "event": event})
+        return _make_signed_request(body)
+
+    @pytest.mark.asyncio
+    async def test_ignores_message_changed(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        await adapter.handle_webhook(self._make_subtype_req("message_changed"))
+        assert not chat.process_message.called
+
+    @pytest.mark.asyncio
+    async def test_ignores_message_deleted(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        await adapter.handle_webhook(self._make_subtype_req("message_deleted"))
+        assert not chat.process_message.called
+
+    @pytest.mark.asyncio
+    async def test_ignores_channel_join(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        await adapter.handle_webhook(self._make_subtype_req("channel_join", user="U_USER"))
+        assert not chat.process_message.called
+
+    @pytest.mark.asyncio
+    async def test_allows_file_share(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        await adapter.handle_webhook(
+            self._make_subtype_req(
+                "file_share",
+                user="U_USER",
+                text="Check this file",
+                thread_ts="1234567890.000000",
+                files=[
+                    {
+                        "id": "F123",
+                        "mimetype": "image/png",
+                        "url_private": "https://files.slack.com/file.png",
+                        "name": "screenshot.png",
+                        "size": 12345,
+                    }
+                ],
+            )
+        )
+        assert chat.process_message.called
+
+
+# ---------------------------------------------------------------------------
+# Multi-workspace mode
+# ---------------------------------------------------------------------------
+
+
+class TestMultiWorkspace:
+    def test_creates_adapter_without_bot_token(self):
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        assert isinstance(adapter, SlackAdapter)
+        assert adapter.name == "slack"
+
+    @pytest.mark.asyncio
+    async def test_set_installation_throws_before_initialize(self):
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        with pytest.raises(Exception, match="[Nn]ot initialized|[Aa]dapter"):
+            await adapter.set_installation("T123", SlackInstallation(bot_token="xoxb-token"))
+
+    @pytest.mark.asyncio
+    async def test_installation_roundtrip(self):
+        state = _make_mock_state()
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        await adapter.initialize(_make_mock_chat(state))
+
+        installation = SlackInstallation(
+            bot_token="xoxb-workspace-token",
+            bot_user_id="U_BOT_123",
+            team_name="Test Team",
+        )
+        await adapter.set_installation("T_TEAM_1", installation)
+        retrieved = await adapter.get_installation("T_TEAM_1")
+        assert retrieved is not None
+        assert retrieved.bot_token == "xoxb-workspace-token"
+
+    @pytest.mark.asyncio
+    async def test_get_installation_unknown_returns_none(self):
+        state = _make_mock_state()
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        await adapter.initialize(_make_mock_chat(state))
+        result = await adapter.get_installation("T_UNKNOWN")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_delete_installation(self):
+        state = _make_mock_state()
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        await adapter.initialize(_make_mock_chat(state))
+        await adapter.set_installation("T_TEAM_2", SlackInstallation(bot_token="xoxb-token"))
+        assert await adapter.get_installation("T_TEAM_2") is not None
+        await adapter.delete_installation("T_TEAM_2")
+        assert await adapter.get_installation("T_TEAM_2") is None
