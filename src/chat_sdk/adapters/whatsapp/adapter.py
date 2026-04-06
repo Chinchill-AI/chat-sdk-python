@@ -646,11 +646,14 @@ class WhatsAppAdapter:
                     f"Media download URL must use HTTPS, got: {parsed.scheme}",
                 )
             host = (parsed.hostname or "").lower()
+            allowed_suffixes = (
+                ".facebook.com", ".fbcdn.net", ".fbsbx.com",
+                ".whatsapp.net", ".whatsapp.com",
+            )
+            allowed_exact = {"facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net", "whatsapp.com"}
             if not (
-                host.endswith(".facebook.com")
-                or host.endswith(".fbcdn.net")
-                or host == "facebook.com"
-                or host == "fbcdn.net"
+                any(host.endswith(s) for s in allowed_suffixes)
+                or host in allowed_exact
             ):
                 raise ValidationError(
                     "whatsapp",

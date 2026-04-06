@@ -59,11 +59,15 @@ MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
 MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
 
-# Allowed Microsoft Bot Framework service URL patterns (SSRF protection)
+# Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
+# Covers commercial, GCC, GCCH, DoD, and sovereign cloud endpoints.
 ALLOWED_SERVICE_URL_PATTERNS = [
     re.compile(r"^https://smba\.trafficmanager\.net/"),
-    re.compile(r"^https://[a-z0-9-]+\.botframework\.com/"),
-    re.compile(r"^https://[a-z0-9-]+\.botframework\.us/"),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/"),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/"),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/"),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/"),
+    re.compile(r"^https://smba\.infra\.(gcc|gov)\.teams\.microsoft\.(com|us)/"),
 ]
 
 # Bot Framework OpenID configuration URL for JWT verification
@@ -1671,6 +1675,9 @@ class TeamsAdapter:
 
                 async with aiohttp.ClientSession() as session:
                     async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
+                        if resp.status != 200:
+                            self._logger.error("Failed to fetch Bot Framework OpenID config", {"status": resp.status})
+                            return self._make_response("Unauthorized", 401)
                         openid_config = await resp.json()
                 jwks_uri = openid_config.get("jwks_uri")
                 if not jwks_uri:
