@@ -17,7 +17,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.adapters.telegram.cards import (
@@ -53,9 +53,11 @@ from chat_sdk.shared.errors import (
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
-    PermissionError as AdapterPermissionError,
     ResourceNotFoundError,
     ValidationError,
+)
+from chat_sdk.shared.errors import (
+    PermissionError as AdapterPermissionError,
 )
 from chat_sdk.types import (
     ActionEvent,
@@ -926,7 +928,7 @@ class TelegramAdapter:
                 metadata=MessageMetadata(
                     date_sent=existing.metadata.date_sent,
                     edited=True,
-                    edited_at=datetime.now(timezone.utc),
+                    edited_at=datetime.now(UTC),
                 ),
                 attachments=existing.attachments,
                 is_mention=existing.is_mention,
@@ -1237,9 +1239,9 @@ class TelegramAdapter:
             raw=raw,
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromtimestamp(raw["date"], tz=timezone.utc),
+                date_sent=datetime.fromtimestamp(raw["date"], tz=UTC),
                 edited=edit_date is not None,
-                edited_at=(datetime.fromtimestamp(edit_date, tz=timezone.utc) if edit_date is not None else None),
+                edited_at=(datetime.fromtimestamp(edit_date, tz=UTC) if edit_date is not None else None),
             ),
             attachments=self.extract_attachments(raw),
             is_mention=self.is_bot_mentioned(raw, plain_text),

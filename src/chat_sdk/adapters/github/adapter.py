@@ -15,7 +15,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
@@ -148,7 +148,8 @@ class GitHubAdapter:
                     else:
                         self._app_credentials = {"app_id": app_id, "private_key": private_key}
                         self._logger.info(
-                            "GitHub adapter initialized in multi-tenant mode (installation ID will be extracted from webhooks)"
+                            "GitHub adapter initialized in multi-tenant mode "
+                            "(installation ID will be extracted from webhooks)"
                         )
                 else:
                     raise ValidationError(
@@ -366,7 +367,7 @@ class GitHubAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 if created_at
-                else datetime.now(tz=timezone.utc),
+                else datetime.now(tz=UTC),
                 edited=edited,
                 edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
             ),
@@ -408,7 +409,7 @@ class GitHubAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 if created_at
-                else datetime.now(tz=timezone.utc),
+                else datetime.now(tz=UTC),
                 edited=edited,
                 edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
             ),
@@ -682,7 +683,10 @@ class GitHubAdapter:
     def encode_thread_id(self, platform_data: GitHubThreadId) -> str:
         """Encode platform data into a thread ID string."""
         if platform_data.review_comment_id:
-            return f"github:{platform_data.owner}/{platform_data.repo}:{platform_data.pr_number}:rc:{platform_data.review_comment_id}"
+            return (
+                f"github:{platform_data.owner}/{platform_data.repo}"
+                f":{platform_data.pr_number}:rc:{platform_data.review_comment_id}"
+            )
         return f"github:{platform_data.owner}/{platform_data.repo}:{platform_data.pr_number}"
 
     def decode_thread_id(self, thread_id: str) -> GitHubThreadId:
@@ -762,7 +766,7 @@ class GitHubAdapter:
                 metadata=MessageMetadata(
                     date_sent=datetime.fromisoformat(pr.get("created_at", "").replace("Z", "+00:00"))
                     if pr.get("created_at")
-                    else datetime.now(tz=timezone.utc),
+                    else datetime.now(tz=UTC),
                     edited=pr.get("created_at") != pr.get("updated_at"),
                 ),
             )

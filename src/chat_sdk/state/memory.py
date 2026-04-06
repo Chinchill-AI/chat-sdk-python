@@ -16,9 +16,10 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+from chat_sdk.types import Lock, QueueEntry
+
 logger = logging.getLogger(__name__)
 
-from chat_sdk.types import Lock, QueueEntry
 
 # ---------------------------------------------------------------------------
 # Internal helpers

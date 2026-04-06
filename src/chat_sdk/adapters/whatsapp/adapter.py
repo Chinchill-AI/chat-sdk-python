@@ -15,7 +15,7 @@ import math
 import os
 import time
 from collections.abc import AsyncIterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -508,7 +508,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(inbound.get("timestamp", "0")),
-                    tz=timezone.utc,
+                    tz=UTC,
                 ),
                 edited=False,
             ),
@@ -647,14 +647,14 @@ class WhatsAppAdapter:
                 )
             host = (parsed.hostname or "").lower()
             allowed_suffixes = (
-                ".facebook.com", ".fbcdn.net", ".fbsbx.com",
-                ".whatsapp.net", ".whatsapp.com",
+                ".facebook.com",
+                ".fbcdn.net",
+                ".fbsbx.com",
+                ".whatsapp.net",
+                ".whatsapp.com",
             )
             allowed_exact = {"facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net", "whatsapp.com"}
-            if not (
-                any(host.endswith(s) for s in allowed_suffixes)
-                or host in allowed_exact
-            ):
+            if not (any(host.endswith(s) for s in allowed_suffixes) or host in allowed_exact):
                 raise ValidationError(
                     "whatsapp",
                     f"Media download URL host is not an allowed Meta domain: {host}",
@@ -803,7 +803,9 @@ class WhatsAppAdapter:
         message: AdapterPostableMessage,
     ) -> RawMessage:
         """Edit a message. Not supported by WhatsApp Cloud API."""
-        raise RuntimeError("WhatsApp does not support editing messages. Use post_message to send a new message instead.")
+        raise RuntimeError(
+            "WhatsApp does not support editing messages. Use post_message to send a new message instead."
+        )
 
     async def stream(
         self,
@@ -940,7 +942,9 @@ class WhatsAppAdapter:
 
         contact = raw.get("contact")
         contact_name = ""
-        contact_name = contact.get("profile", {}).get("name", "") or raw["message"]["from"] if contact else raw["message"]["from"]
+        contact_name = (
+            contact.get("profile", {}).get("name", "") or raw["message"]["from"] if contact else raw["message"]["from"]
+        )
 
         return Message(
             id=raw["message"]["id"],
@@ -957,7 +961,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(raw["message"].get("timestamp", "0")),
-                    tz=timezone.utc,
+                    tz=UTC,
                 ),
                 edited=False,
             ),

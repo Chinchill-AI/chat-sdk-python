@@ -66,7 +66,9 @@ class LinearAdapterAppConfig(LinearAdapterBaseConfig):
 
 
 # Union type for all config options
-LinearAdapterConfig = LinearAdapterBaseConfig | LinearAdapterAPIKeyConfig | LinearAdapterOAuthConfig | LinearAdapterAppConfig
+LinearAdapterConfig = (
+    LinearAdapterBaseConfig | LinearAdapterAPIKeyConfig | LinearAdapterOAuthConfig | LinearAdapterAppConfig
+)
 
 
 # =============================================================================

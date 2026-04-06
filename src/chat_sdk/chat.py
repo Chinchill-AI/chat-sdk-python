@@ -13,7 +13,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.channel import ChannelImpl
@@ -731,7 +731,9 @@ class Chat:
         if task is not None:
             task.add_done_callback(
                 lambda t: (
-                    self._logger.error("Message processing error", {"thread_id": thread_id, "error": str(t.exception())})
+                    self._logger.error(
+                        "Message processing error", {"thread_id": thread_id, "error": str(t.exception())}
+                    )
                     if not t.cancelled() and t.exception()
                     else None
                 )
@@ -1113,7 +1115,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=event.raw,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
                 attachments=[],
             )
             thread = self._create_thread(event.adapter, event.thread_id, dummy_message, is_subscribed)
@@ -1145,7 +1147,7 @@ class Chat:
                                 metadata=getattr(
                                     raw_fetched,
                                     "metadata",
-                                    MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                                    MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
                                 ),
                             )
                     except Exception:
@@ -1223,7 +1225,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
             ),
             is_subscribed,
         )
@@ -1252,7 +1254,8 @@ class Chat:
                     filt is full_event.emoji
                     or (isinstance(filt, str) and (filt == full_event.emoji.name or filt == full_event.raw_emoji))
                     or (
-                        isinstance(filt, EmojiValue) and (filt.name == full_event.emoji.name or filt.name == full_event.raw_emoji)
+                        isinstance(filt, EmojiValue)
+                        and (filt.name == full_event.emoji.name or filt.name == full_event.raw_emoji)
                     )
                 )
                 for filt in pat.emoji
@@ -1283,7 +1286,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
             ),
             False,
         )
@@ -1347,7 +1350,11 @@ class Chat:
 
         scope: LockScope
         if callable(self._lock_scope_config):
-            is_dm = adapter.is_dm(thread_id) if hasattr(adapter, "is_dm") and callable(getattr(adapter, "is_dm", None)) else False  # type: ignore[union-attr]
+            is_dm = (
+                adapter.is_dm(thread_id)
+                if hasattr(adapter, "is_dm") and callable(getattr(adapter, "is_dm", None))
+                else False
+            )  # type: ignore[union-attr]
             scope = await self._lock_scope_config(
                 LockScopeContext(
                     adapter=adapter,
@@ -1480,7 +1487,7 @@ class Chat:
                 )
                 return
 
-            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            now = int(datetime.now(tz=UTC).timestamp() * 1000)
             entry = QueueEntry(
                 message=message,
                 enqueued_at=now,
@@ -1498,7 +1505,7 @@ class Chat:
 
         try:
             if strategy == "debounce":
-                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                now = int(datetime.now(tz=UTC).timestamp() * 1000)
                 await self._state_adapter.enqueue(
                     lock_key,
                     QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
@@ -1555,7 +1562,7 @@ class Chat:
                 break
 
             msg = self._rehydrate_message(entry.message)
-            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            now = int(datetime.now(tz=UTC).timestamp() * 1000)
             if now > entry.expires_at:
                 self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
                 continue
@@ -1585,7 +1592,7 @@ class Chat:
                 if entry is None:
                     break
                 msg = self._rehydrate_message(entry.message)
-                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                now = int(datetime.now(tz=UTC).timestamp() * 1000)
                 if now <= entry.expires_at:
                     pending.append((msg, entry.expires_at))
                 else:
@@ -1596,7 +1603,9 @@ class Chat:
 
             extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
             if not extended:
-                self._logger.warn("Lock lost during drain processing, aborting", {"thread_id": thread_id, "lock_key": lock_key})
+                self._logger.warn(
+                    "Lock lost during drain processing, aborting", {"thread_id": thread_id, "lock_key": lock_key}
+                )
                 return
 
             latest_msg, _ = pending[-1]
@@ -1788,7 +1797,7 @@ class Chat:
             if isinstance(date_sent, str):
                 date_sent = datetime.fromisoformat(date_sent)
             elif not isinstance(date_sent, datetime):
-                date_sent = datetime.now(tz=timezone.utc)
+                date_sent = datetime.now(tz=UTC)
 
             edited_at = metadata_raw.get("edited_at")
             if isinstance(edited_at, str):
@@ -1849,7 +1858,7 @@ def _message_from_json(data: dict[str, Any]) -> Message:
     if isinstance(date_sent, str):
         date_sent = datetime.fromisoformat(date_sent)
     elif not isinstance(date_sent, datetime):
-        date_sent = datetime.now(tz=timezone.utc)
+        date_sent = datetime.now(tz=UTC)
 
     edited_at = metadata_raw.get("edited_at")
     if isinstance(edited_at, str):

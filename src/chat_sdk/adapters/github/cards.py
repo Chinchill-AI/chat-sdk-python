@@ -152,7 +152,8 @@ def _render_text(text: dict[str, Any]) -> list[str]:
 def _render_fields(fields: dict[str, Any]) -> list[str]:
     """Render fields as key-value pairs."""
     return [
-        f"**{_escape_markdown(f.get('label', ''))}:** {_escape_markdown(f.get('value', ''))}" for f in fields.get("children", [])
+        f"**{_escape_markdown(f.get('label', ''))}:** {_escape_markdown(f.get('value', ''))}"
+        for f in fields.get("children", [])
     ]
 
 

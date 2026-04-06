@@ -16,7 +16,8 @@ from chat_sdk.cards import (
     card_child_to_fallback_text,
     table_element_to_ascii,
 )
-from chat_sdk.shared import card_to_fallback_text as shared_card_to_fallback_text, create_emoji_converter
+from chat_sdk.shared import card_to_fallback_text as shared_card_to_fallback_text
+from chat_sdk.shared import create_emoji_converter
 
 # Convert emoji placeholders in text to GChat format (Unicode).
 convert_emoji = create_emoji_converter("gchat")

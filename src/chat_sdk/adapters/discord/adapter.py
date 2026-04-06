@@ -13,7 +13,7 @@ import json
 import os
 import re
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -275,7 +275,9 @@ class DiscordAdapter:
             verify_key.verify(message, bytes.fromhex(signature))
             return True
         except ImportError:
-            self._logger.error("PyNaCl is required for Discord signature verification. Install with: pip install PyNaCl")
+            self._logger.error(
+                "PyNaCl is required for Discord signature verification. Install with: pip install PyNaCl"
+            )
             return False
         except Exception as exc:
             self._logger.warn("Discord signature verification failed", {"error": str(exc)})
@@ -320,7 +322,9 @@ class DiscordAdapter:
         channel_type = channel.get("type", 0)
         is_thread = channel_type in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD)
         parent_channel_id = (
-            channel.get("parent_id", interaction_channel_id) if is_thread and channel.get("parent_id") else interaction_channel_id
+            channel.get("parent_id", interaction_channel_id)
+            if is_thread and channel.get("parent_id")
+            else interaction_channel_id
         )
 
         thread_id = self.encode_thread_id(
@@ -391,7 +395,9 @@ class DiscordAdapter:
         channel_type = channel.get("type", 0)
         is_thread = channel_type in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD)
         parent_channel_id = (
-            channel.get("parent_id", interaction_channel_id) if is_thread and channel.get("parent_id") else interaction_channel_id
+            channel.get("parent_id", interaction_channel_id)
+            if is_thread and channel.get("parent_id")
+            else interaction_channel_id
         )
 
         channel_id = self.encode_thread_id(
@@ -534,7 +540,9 @@ class DiscordAdapter:
         mentions = data.get("mentions", [])
         is_user_mentioned = data.get("is_mention", False) or any(m.get("id") == self._application_id for m in mentions)
         mention_roles = data.get("mention_roles", [])
-        is_role_mentioned = bool(self._mention_role_ids) and any(role_id in self._mention_role_ids for role_id in mention_roles)
+        is_role_mentioned = bool(self._mention_role_ids) and any(
+            role_id in self._mention_role_ids for role_id in mention_roles
+        )
         is_mentioned = is_user_mentioned or is_role_mentioned
 
         # If mentioned and not in a thread, create one
@@ -578,7 +586,7 @@ class DiscordAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromisoformat(data.get("timestamp", ""))
                 if data.get("timestamp")
-                else datetime.now(timezone.utc),
+                else datetime.now(UTC),
                 edited=False,
             ),
             attachments=[
@@ -1158,7 +1166,7 @@ class DiscordAdapter:
                 is_me=is_me,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else datetime.now(timezone.utc),
+                date_sent=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else datetime.now(UTC),
                 edited=msg.get("edited_timestamp") is not None,
                 edited_at=datetime.fromisoformat(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
             ),
@@ -1203,7 +1211,7 @@ class DiscordAdapter:
         message_id: str,
     ) -> dict[str, str]:
         """Create a Discord thread from a message."""
-        thread_name = f"Thread {datetime.now(timezone.utc).isoformat()}"
+        thread_name = f"Thread {datetime.now(UTC).isoformat()}"
 
         self._logger.debug(
             "Discord API: POST thread",

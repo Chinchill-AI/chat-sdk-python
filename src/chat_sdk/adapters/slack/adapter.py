@@ -18,7 +18,7 @@ import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -164,7 +164,9 @@ class SlackAdapter:
     def __init__(self, config: SlackAdapterConfig | None = None) -> None:
         # ContextVar replaces Node AsyncLocalStorage for per-request token context.
         # Created per-instance so multiple SlackAdapter instances don't share state.
-        self._request_context: ContextVar[RequestContext | None] = ContextVar(f"slack_request_context_{id(self)}", default=None)
+        self._request_context: ContextVar[RequestContext | None] = ContextVar(
+            f"slack_request_context_{id(self)}", default=None
+        )
         if config is None:
             config = SlackAdapterConfig()
 
@@ -197,7 +199,9 @@ class SlackAdapter:
 
         # Multi-workspace OAuth fields
         self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
-        self._client_secret: str | None = config.client_secret or (os.environ.get("SLACK_CLIENT_SECRET") if zero_config else None)
+        self._client_secret: str | None = config.client_secret or (
+            os.environ.get("SLACK_CLIENT_SECRET") if zero_config else None
+        )
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
 
         encryption_key_raw = config.encryption_key or os.environ.get("SLACK_ENCRYPTION_KEY")
@@ -387,7 +391,9 @@ class SlackAdapter:
             query = dict(parse_qs(url.split("?", 1)[1]))
             code = query.get("code", [None])[0] if isinstance(query.get("code"), list) else query.get("code")
             redirect_uri = (
-                query.get("redirect_uri", [None])[0] if isinstance(query.get("redirect_uri"), list) else query.get("redirect_uri")
+                query.get("redirect_uri", [None])[0]
+                if isinstance(query.get("redirect_uri"), list)
+                else query.get("redirect_uri")
             )
         else:
             code = None
@@ -507,7 +513,11 @@ class SlackAdapter:
             profile = user.get("profile", {})
 
             display_name = (
-                profile.get("display_name") or profile.get("real_name") or user.get("real_name") or user.get("name") or user_id
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("real_name")
+                or user.get("name")
+                or user_id
             )
             real_name = user.get("real_name") or profile.get("real_name") or display_name
 
@@ -814,7 +824,9 @@ class SlackAdapter:
         channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get("channel_id")
         message_ts = (payload.get("message") or {}).get("ts") or (payload.get("container") or {}).get("message_ts")
         thread_ts = (
-            (payload.get("message") or {}).get("thread_ts") or (payload.get("container") or {}).get("thread_ts") or message_ts
+            (payload.get("message") or {}).get("thread_ts")
+            or (payload.get("container") or {}).get("thread_ts")
+            or message_ts
         )
 
         is_view_action = (payload.get("container") or {}).get("type") == "view"
@@ -872,7 +884,9 @@ class SlackAdapter:
     # View submission / close
     # ==================================================================
 
-    async def _handle_view_submission(self, payload: dict[str, Any], options: WebhookOptions | None = None) -> dict[str, Any]:
+    async def _handle_view_submission(
+        self, payload: dict[str, Any], options: WebhookOptions | None = None
+    ) -> dict[str, Any]:
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring view submission")
             return {"body": "", "status": 200}
@@ -884,7 +898,9 @@ class SlackAdapter:
         values: dict[str, str] = {}
         for block_values in state_values.values():
             for action_id, input_val in block_values.items():
-                values[action_id] = input_val.get("value") or (input_val.get("selected_option") or {}).get("value") or ""
+                values[action_id] = (
+                    input_val.get("value") or (input_val.get("selected_option") or {}).get("value") or ""
+                )
 
         meta = decode_modal_metadata(view.get("private_metadata") or None)
         user_ref = payload.get("user", {})
@@ -1077,7 +1093,9 @@ class SlackAdapter:
         except RuntimeError:
             return  # No running event loop
         task.add_done_callback(
-            lambda t: self._logger.error("Reaction resolve error", {"error": str(t.exception())}) if t.exception() else None
+            lambda t: (
+                self._logger.error("Reaction resolve error", {"error": str(t.exception())}) if t.exception() else None
+            )
         )
         if options and options.wait_until:
             options.wait_until(task)
@@ -1399,7 +1417,9 @@ class SlackAdapter:
 
         return mention_pattern.sub(replace_mention, text)
 
-    async def _resolve_message_mentions(self, message: AdapterPostableMessage, thread_id: str) -> AdapterPostableMessage:
+    async def _resolve_message_mentions(
+        self, message: AdapterPostableMessage, thread_id: str
+    ) -> AdapterPostableMessage:
         """Pre-process outgoing message to resolve @name mentions."""
         if not self._chat:
             return message
@@ -1507,14 +1527,14 @@ class SlackAdapter:
 
         ts_str = event.get("ts", "0")
         try:
-            date_sent = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+            date_sent = datetime.fromtimestamp(float(ts_str), tz=UTC)
         except (ValueError, TypeError, OSError):
-            date_sent = datetime.now(tz=timezone.utc)
+            date_sent = datetime.now(tz=UTC)
 
         edited_at: datetime | None = None
         if event.get("edited"):
             try:
-                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=timezone.utc)
+                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=UTC)
             except (ValueError, TypeError, OSError):
                 edited_at = None
 
@@ -1549,14 +1569,14 @@ class SlackAdapter:
 
         ts_str = event.get("ts", "0")
         try:
-            date_sent = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+            date_sent = datetime.fromtimestamp(float(ts_str), tz=UTC)
         except (ValueError, TypeError, OSError):
-            date_sent = datetime.now(tz=timezone.utc)
+            date_sent = datetime.now(tz=UTC)
 
         edited_at: datetime | None = None
         if event.get("edited"):
             try:
-                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=timezone.utc)
+                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=UTC)
             except (ValueError, TypeError, OSError):
                 edited_at = None
 
@@ -2296,8 +2316,12 @@ class SlackAdapter:
 
         try:
             if direction == "forward":
-                return await self._fetch_messages_forward(channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None))
-            return await self._fetch_messages_backward(channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None))
+                return await self._fetch_messages_forward(
+                    channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None)
+                )
+            return await self._fetch_messages_backward(
+                channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None)
+            )
         except Exception as error:
             self._handle_slack_error(error)
 
@@ -2355,7 +2379,9 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.conversations_replies(channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1)
+            result = await client.conversations_replies(
+                channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1
+            )
             messages = result.get("messages", [])
             target = next((m for m in messages if m.get("ts") == message_id), None)
             if not target:
@@ -2450,7 +2476,9 @@ class SlackAdapter:
 
         return FetchResult(messages=list(messages), next_cursor=next_cursor)
 
-    async def _fetch_channel_messages_backward(self, channel: str, limit: int, cursor: str | None = None) -> FetchResult:
+    async def _fetch_channel_messages_backward(
+        self, channel: str, limit: int, cursor: str | None = None
+    ) -> FetchResult:
         client = self._get_client()
         kwargs: dict[str, Any] = {"channel": channel, "limit": limit}
         if cursor:
@@ -2510,7 +2538,7 @@ class SlackAdapter:
                 last_reply_at: datetime | None = None
                 if msg.get("latest_reply"):
                     try:
-                        last_reply_at = datetime.fromtimestamp(float(msg["latest_reply"]), tz=timezone.utc)
+                        last_reply_at = datetime.fromtimestamp(float(msg["latest_reply"]), tz=UTC)
                     except (ValueError, TypeError, OSError):
                         last_reply_at = None
 

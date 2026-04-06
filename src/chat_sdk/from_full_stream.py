@@ -54,7 +54,9 @@ async def from_full_stream(
         # AI SDK v5 uses textDelta, v6 uses text
         text_delta = event.get("textDelta") if event.get("textDelta") is not None else event.get("text_delta")
         text_content = (
-            text_delta if text_delta is not None else (event.get("text") if event.get("text") is not None else event.get("delta"))
+            text_delta
+            if text_delta is not None
+            else (event.get("text") if event.get("text") is not None else event.get("delta"))
         )
 
         if event_type == "text-delta" and isinstance(text_content, str):

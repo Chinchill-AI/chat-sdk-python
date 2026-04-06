@@ -15,7 +15,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
@@ -414,7 +414,7 @@ class LinearAdapter:
             raw=LinearRawMessage(comment=comment),
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at) if created_at else datetime.now(timezone.utc),
+                date_sent=datetime.fromisoformat(created_at) if created_at else datetime.now(UTC),
                 edited=created_at != updated_at,
                 edited_at=datetime.fromisoformat(updated_at) if (created_at != updated_at and updated_at) else None,
             ),
@@ -432,10 +432,7 @@ class LinearAdapter:
 
         # Render message to markdown
         card = extract_card(message)
-        if card:
-            body = card_to_linear_markdown(card)
-        else:
-            body = self._format_converter.render_postable(message)
+        body = card_to_linear_markdown(card) if card else self._format_converter.render_postable(message)
 
         # Convert emoji placeholders to unicode
         body = convert_emoji_placeholders(body, "linear")
@@ -496,10 +493,7 @@ class LinearAdapter:
         decoded = self.decode_thread_id(thread_id)
 
         card = extract_card(message)
-        if card:
-            body = card_to_linear_markdown(card)
-        else:
-            body = self._format_converter.render_postable(message)
+        body = card_to_linear_markdown(card) if card else self._format_converter.render_postable(message)
 
         body = convert_emoji_placeholders(body, "linear")
 
@@ -754,7 +748,7 @@ class LinearAdapter:
                 is_me=user_id == self._bot_user_id,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(node["createdAt"]) if node.get("createdAt") else datetime.now(timezone.utc),
+                date_sent=datetime.fromisoformat(node["createdAt"]) if node.get("createdAt") else datetime.now(UTC),
                 edited=node.get("createdAt") != node.get("updatedAt"),
                 edited_at=(
                     datetime.fromisoformat(node["updatedAt"])
@@ -854,7 +848,7 @@ class LinearAdapter:
             ),
             metadata=MessageMetadata(
                 date_sent=(
-                    datetime.fromisoformat(comment["created_at"]) if comment.get("created_at") else datetime.now(timezone.utc)
+                    datetime.fromisoformat(comment["created_at"]) if comment.get("created_at") else datetime.now(UTC)
                 ),
                 edited=comment.get("created_at") != comment.get("updated_at"),
                 edited_at=(

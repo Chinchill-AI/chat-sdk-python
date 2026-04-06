@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict, Union
+from typing import Literal, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -81,12 +81,9 @@ class GitHubAdapterAutoConfig(GitHubAdapterBaseConfig, total=False):
 
 
 # Union of all configuration types
-GitHubAdapterConfig = Union[
-    GitHubAdapterPATConfig,
-    GitHubAdapterAppConfig,
-    GitHubAdapterMultiTenantAppConfig,
-    GitHubAdapterAutoConfig,
-]
+GitHubAdapterConfig = (
+    GitHubAdapterPATConfig | GitHubAdapterAppConfig | GitHubAdapterMultiTenantAppConfig | GitHubAdapterAutoConfig
+)
 
 # =============================================================================
 # Thread ID
@@ -290,7 +287,7 @@ class GitHubRawReviewComment(TypedDict):
     pr_number: int
 
 
-GitHubRawMessage = Union[GitHubRawIssueComment, GitHubRawReviewComment]
+GitHubRawMessage = GitHubRawIssueComment | GitHubRawReviewComment
 
 # =============================================================================
 # GitHub API Response Types

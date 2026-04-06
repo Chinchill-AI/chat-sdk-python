@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from chat_sdk.types import (
@@ -339,7 +339,7 @@ def create_test_message(
             is_me=False,
         ),
         "metadata": MessageMetadata(
-            date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+            date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             edited=False,
         ),
         "attachments": [],
