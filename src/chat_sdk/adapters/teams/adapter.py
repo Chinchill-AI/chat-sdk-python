@@ -164,6 +164,12 @@ class TeamsAdapter:
                 "Use app_password (client secret) or federated (workload identity) authentication instead.",
             )
 
+        if not self._app_id:
+            self._logger.warn(
+                "Teams app_id is empty — webhook verification will reject all incoming requests. "
+                "Set TEAMS_APP_ID or pass app_id in config."
+            )
+
         self._bot_user_id: str | None = self._app_id or None
         self._access_token: str | None = None
         self._token_expiry: float = 0
@@ -207,10 +213,13 @@ class TeamsAdapter:
         self._logger.debug("Teams webhook raw body", {"body": body[:500] if body else ""})
 
         # ---- JWT verification (Bot Framework tokens) ----
-        if self._app_id:
-            auth_result = await self._verify_bot_framework_token(request)
-            if auth_result is not None:
-                return auth_result
+        if not self._app_id:
+            self._logger.warn("Rejecting Teams webhook: app_id is not configured, cannot verify JWT")
+            return self._make_response("Unauthorized – Teams app_id not configured", 401)
+
+        auth_result = await self._verify_bot_framework_token(request)
+        if auth_result is not None:
+            return auth_result
 
         try:
             activity: dict[str, Any] = json.loads(body)
@@ -259,10 +268,19 @@ class TeamsAdapter:
         ttl = CACHE_TTL_MS
         state = self._chat.get_state()
 
-        # Cache serviceUrl
+        # Cache serviceUrl (validate against SSRF allow-list first)
         service_url = activity.get("serviceUrl")
         if service_url and state:
-            await state.set(f"teams:serviceUrl:{user_id}", service_url, ttl)
+            try:
+                _validate_service_url(service_url)
+            except ValidationError:
+                self._logger.warn(
+                    "Refusing to cache disallowed serviceUrl",
+                    {"serviceUrl": service_url},
+                )
+                service_url = None
+            if service_url:
+                await state.set(f"teams:serviceUrl:{user_id}", service_url, ttl)
 
         # Cache tenantId
         channel_data = activity.get("channelData", {})
@@ -1112,6 +1130,8 @@ class TeamsAdapter:
         if not service_url:
             service_url = "https://smba.trafficmanager.net/teams/"
 
+        _validate_service_url(service_url)
+
         import aiohttp
 
         token = await self._get_access_token()
@@ -1693,6 +1713,7 @@ class TeamsAdapter:
                 signing_key.key,
                 algorithms=["RS256"],
                 audience=self._app_id,
+                issuer="https://api.botframework.com",
             )
             self._logger.debug(
                 "Teams JWT verified",
