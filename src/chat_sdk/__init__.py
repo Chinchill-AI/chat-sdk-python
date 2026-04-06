@@ -63,6 +63,14 @@ from chat_sdk.emoji import (
     resolve_emoji_from_slack,
 )
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError, RateLimitError
+from chat_sdk.shared.errors import (
+    AdapterRateLimitError,
+    AuthenticationError,
+    NetworkError,
+    PermissionError as AdapterPermissionError,
+    ResourceNotFoundError,
+    ValidationError,
+)
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import ConsoleLogger, Logger, LogLevel
 from chat_sdk.message_history import MessageHistoryCache, MessageHistoryConfig
@@ -226,6 +234,13 @@ __all__ = [
     "ChatNotImplementedError",
     "LockError",
     "RateLimitError",
+    # Adapter errors
+    "AdapterRateLimitError",
+    "AuthenticationError",
+    "ValidationError",
+    "NetworkError",
+    "ResourceNotFoundError",
+    "AdapterPermissionError",
     # Format converter
     "BaseFormatConverter",
     # Logger

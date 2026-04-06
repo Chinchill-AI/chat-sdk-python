@@ -145,6 +145,9 @@ class GoogleChatAdapter:
         self._warned_no_webhook_verification = False
         self._warned_no_pubsub_verification = False
 
+        # Cached JWKS client for JWT verification (lazy init on first use)
+        self._jwks_client: Any | None = None
+
         # Auth setup
         self._credentials: ServiceAccountCredentials | None = None
         self._use_adc = False
@@ -651,11 +654,10 @@ class GoogleChatAdapter:
             import jwt as pyjwt
             from jwt import PyJWKClient
 
-            # TODO: For direct Chat webhook JWTs signed by chat@system.gserviceaccount.com,
-            # use https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com
-            # Currently only supports OIDC-based verification (Pub/Sub push tokens and HTTP endpoint auth)
-            jwks_client = PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            # Lazily create and cache the JWKS client (avoid per-request instantiation)
+            if self._jwks_client is None:
+                self._jwks_client = PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
             payload = pyjwt.decode(
                 token,
                 signing_key.key,

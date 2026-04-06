@@ -461,6 +461,15 @@ class _FakeRequest:
 
 
 class TestHandleWebhook:
+    @pytest.fixture(autouse=True)
+    def _skip_jwt(self, monkeypatch):
+        """Bypass JWT verification in unit tests."""
+        monkeypatch.setattr(
+            TeamsAdapter,
+            "_verify_bot_framework_token",
+            AsyncMock(return_value=None),
+        )
+
     @pytest.mark.asyncio
     async def test_400_for_invalid_json(self):
         adapter = _make_adapter(logger=_make_logger())

@@ -1,13 +1,12 @@
-name: Publish to PyPI
+name: Publish to TestPyPI
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:  # manual trigger only
 
 jobs:
-  publish:
+  test-publish:
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: testpypi
     permissions:
       id-token: write  # trusted publishing
     steps:
@@ -15,5 +14,7 @@ jobs:
       - uses: astral-sh/setup-uv@f0ec1fc3b38f5e7cd731bb6ce540c5af426746bb  # v4
       - name: Build
         run: uv build
-      - name: Publish to PyPI
+      - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9e8454a21b30b1df74fa848  # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

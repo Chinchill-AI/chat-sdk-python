@@ -12,8 +12,7 @@ import asyncio
 import json
 import logging
 import os
-import random
-import string
+import secrets
 import time
 from typing import Any
 
@@ -27,8 +26,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _generate_token() -> str:
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=14))
-    return f"redis_{int(time.time() * 1000)}_{suffix}"
+    return f"redis_{int(time.time() * 1000)}_{secrets.token_hex(16)}"
 
 
 # ---------------------------------------------------------------------------

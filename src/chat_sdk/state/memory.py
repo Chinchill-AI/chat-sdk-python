@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-import random
-import string
+import secrets
 import time
 import warnings
 from dataclasses import dataclass
@@ -35,8 +34,7 @@ class _CachedValue:
 
 
 def _generate_token() -> str:
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=14))
-    return f"mem_{int(time.time() * 1000)}_{suffix}"
+    return f"mem_{int(time.time() * 1000)}_{secrets.token_hex(16)}"
 
 
 def _now_ms() -> float:
