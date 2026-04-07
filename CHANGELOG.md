@@ -1,28 +1,21 @@
 # Changelog
 
+## 0.0.1a6 (2026-04-07)
+
+Systematic port fidelity scan — 10 more bugs fixed.
+
+- Discord: card table fallback now renders correctly (was calling wrong function)
+- Teams: card fallback text now includes emoji conversion
+- Emoji: megaphone fixed (📢 not 📣), exclamation "!" false-match removed
+- State backends: queue dequeue reconstructs Message objects (was returning raw dict)
+- WhatsApp: callback data uses compact JSON (matches Telegram)
+- Discord/Teams: format converter handles dataclass messages
+- Emoji: from_slack strips only one colon per end (not all)
+- Types: WellKnownEmoji includes all TS entries (stop, 100, lightbulb, etc.)
+
 ## 0.0.1a5 (2026-04-07)
 
-Port fidelity release — 10 critical/high bugs fixed from systematic TS comparison.
-
-### Critical fixes
-- Slack: multi-workspace token now persists into async tasks (ContextVar fix)
-- Discord: slash command deferred responses now resolve correctly
-- Discord: file attachments no longer silently dropped
-- WhatsApp: media downloads work again (auth header restored)
-- Chat: `on_lock_conflict="force"` now works
-
-### High fixes
-- Discord: emoji normalized through resolver (reaction matching works)
-- Teams: webhook options passed to reaction events
-- Google Chat: subscription errors propagate to concurrent waiters
-- Linear: fetch_thread metadata includes both key casings
-- Streaming markdown `_remend` rewritten with proper delimiter tracking
-
-### Other improvements
-- CLAUDE.md agent guidance file
-- Parser: spaced thematic breaks (`* * *`) and trailing `#` stripping
-- BaseFormatConverter: card fallback text generation
-- All PR review comments addressed
+Port fidelity release — 10 critical/high bugs fixed.
 
 ## 0.0.1a4 (2026-04-06)
 
