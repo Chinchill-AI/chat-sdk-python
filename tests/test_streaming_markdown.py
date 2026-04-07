@@ -589,7 +589,9 @@ class TestAppendOnlyStreaming:
             r.push(chunk)
             committable = r.get_committable_text()
             # Verify monotonicity
-            assert committable.startswith(last_appended), "Monotonicity broke: committable does not start with last_appended"
+            assert committable.startswith(last_appended), (
+                "Monotonicity broke: committable does not start with last_appended"
+            )
             delta = committable[len(last_appended) :]
             if len(delta) > 0:
                 deltas.append(delta)
@@ -775,7 +777,9 @@ class TestExhaustivePrefixInvariants:
             r.push(self.COMPLEX_MARKDOWN[i])
             rendered = r.render()
             double_remended = _remend(rendered)
-            assert len(double_remended) <= len(rendered), f"render() at position {i} produced text that remend would still modify"
+            assert len(double_remended) <= len(rendered), (
+                f"render() at position {i} produced text that remend would still modify"
+            )
 
     def test_get_committable_text_output_is_always_monotonic(self):
         """get_committable_text() output is always monotonic (append-only safe)."""

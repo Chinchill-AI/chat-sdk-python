@@ -208,7 +208,9 @@ class TestDecodeThreadId:
 
     def test_comment_level_uuids(self):
         adapter = _make_adapter()
-        result = adapter.decode_thread_id("linear:2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9:c:a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        result = adapter.decode_thread_id(
+            "linear:2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9:c:a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        )
         assert result.issue_id == "2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9"
         assert result.comment_id == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 

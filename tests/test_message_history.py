@@ -56,7 +56,9 @@ def _make_mock_state() -> MagicMock:
 
     state = MagicMock()
 
-    async def _append_to_list(key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None) -> None:
+    async def _append_to_list(
+        key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None
+    ) -> None:
         if key not in lists:
             lists[key] = []
         lists[key].append(value)

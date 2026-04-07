@@ -101,7 +101,9 @@ class TestWhatsAppFromAst:
         assert "***" not in result
 
     def test_heading_with_mixed_text_and_bold(self):
-        result = converter.render_postable({"markdown": "# The Honest Answer: **It Depends!** \U0001f937\u200d\u2642\ufe0f"})
+        result = converter.render_postable(
+            {"markdown": "# The Honest Answer: **It Depends!** \U0001f937\u200d\u2642\ufe0f"}
+        )
         # Title should be a single bold span; no double-asterisks
         assert "**" not in result
 

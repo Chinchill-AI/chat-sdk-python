@@ -245,7 +245,9 @@ class TestCardClickEdgeCases:
             action_event = call_args[0][0]
             # Event may be a dict or a dataclass depending on implementation
             action_id = (
-                action_event.get("action_id") if isinstance(action_event, dict) else getattr(action_event, "action_id", None)
+                action_event.get("action_id")
+                if isinstance(action_event, dict)
+                else getattr(action_event, "action_id", None)
             )
             assert action_id == "handleApprove"
 

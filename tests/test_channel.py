@@ -266,7 +266,9 @@ class TestChannelThreads:
                 reply_count=3,
             ),
         ]
-        mock_adapter.list_threads = AsyncMock(return_value=ListThreadsResult(threads=thread_summaries, next_cursor=None))
+        mock_adapter.list_threads = AsyncMock(
+            return_value=ListThreadsResult(threads=thread_summaries, next_cursor=None)
+        )
         channel = _make_channel(mock_adapter, mock_state)
 
         collected: list[ThreadSummary] = []

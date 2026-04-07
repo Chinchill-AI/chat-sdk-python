@@ -507,7 +507,9 @@ class TestListThreads:
             "conversations_history",
             {
                 "ok": True,
-                "messages": [{"ts": f"123456789{i}.000", "text": f"T{i}", "user": "U1", "reply_count": 1} for i in range(10)],
+                "messages": [
+                    {"ts": f"123456789{i}.000", "text": f"T{i}", "user": "U1", "reply_count": 1} for i in range(10)
+                ],
                 "response_metadata": {},
             },
         )
@@ -976,7 +978,12 @@ class TestParseMessageComplex:
             "files": [
                 {"id": "F1", "mimetype": "image/png", "url_private": "https://example.com/1.png", "name": "img1.png"},
                 {"id": "F2", "mimetype": "video/mp4", "url_private": "https://example.com/1.mp4", "name": "vid1.mp4"},
-                {"id": "F3", "mimetype": "application/pdf", "url_private": "https://example.com/1.pdf", "name": "doc1.pdf"},
+                {
+                    "id": "F3",
+                    "mimetype": "application/pdf",
+                    "url_private": "https://example.com/1.pdf",
+                    "name": "doc1.pdf",
+                },
             ],
         }
         msg = adapter.parse_message(event)

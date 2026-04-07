@@ -726,43 +726,29 @@ class TestPostgresStateLocks:
         assert lock1 is not None
 
         # Should have issued exactly one query for the lock acquisition
-        lock_queries = [
-            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
-        ]
-        assert len(lock_queries) == 1, (
-            f"Expected 1 atomic upsert query, got {len(lock_queries)}: {lock_queries}"
-        )
+        lock_queries = [q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()]
+        assert len(lock_queries) == 1, f"Expected 1 atomic upsert query, got {len(lock_queries)}: {lock_queries}"
 
         # Second acquire while held: should fail in single query too
         mock_pool.executed_queries.clear()
         lock2 = await pg_state.acquire_lock("race-thread", 30_000)
         assert lock2 is None
 
-        lock_queries = [
-            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
-        ]
-        assert len(lock_queries) == 1, (
-            f"Expected 1 atomic upsert query for contended lock, got {len(lock_queries)}"
-        )
+        lock_queries = [q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()]
+        assert len(lock_queries) == 1, f"Expected 1 atomic upsert query for contended lock, got {len(lock_queries)}"
 
         # Third acquire after expiry: should succeed in single query
         mock_pool.executed_queries.clear()
         time.sleep(0.005)
         # Force-expire the lock for testing
         lock_key = ("test", "race-thread")
-        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(
-            _dt.timezone.utc
-        ) - _dt.timedelta(seconds=1)
+        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
 
         lock3 = await pg_state.acquire_lock("race-thread", 30_000)
         assert lock3 is not None
 
-        lock_queries = [
-            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
-        ]
-        assert len(lock_queries) == 1, (
-            f"Expected 1 atomic upsert query for expired lock, got {len(lock_queries)}"
-        )
+        lock_queries = [q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()]
+        assert len(lock_queries) == 1, f"Expected 1 atomic upsert query for expired lock, got {len(lock_queries)}"
 
 
 # ============================================================================

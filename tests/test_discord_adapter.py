@@ -155,7 +155,9 @@ class TestEncodeThreadId:
 
     def test_encodes_with_thread_id(self):
         adapter = _make_adapter()
-        tid = adapter.encode_thread_id(DiscordThreadId(guild_id="guild123", channel_id="channel456", thread_id="thread789"))
+        tid = adapter.encode_thread_id(
+            DiscordThreadId(guild_id="guild123", channel_id="channel456", thread_id="thread789")
+        )
         assert tid == "discord:guild123:channel456:thread789"
 
     def test_encodes_dm_channel(self):
