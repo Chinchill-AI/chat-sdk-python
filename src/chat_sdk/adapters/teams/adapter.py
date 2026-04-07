@@ -8,6 +8,7 @@ Python port of packages/adapter-teams/src/index.ts.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -1707,7 +1708,7 @@ class TeamsAdapter:
                     return self._make_response("Unauthorized", 401)
                 self._jwks_client = PyJWKClient(jwks_uri)
 
-            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            signing_key = await asyncio.to_thread(self._jwks_client.get_signing_key_from_jwt, token)
             payload = pyjwt.decode(
                 token,
                 signing_key.key,
