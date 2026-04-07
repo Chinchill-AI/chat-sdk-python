@@ -425,10 +425,6 @@ class TestGChatFixtureReplay:
         # GChat text is "@Chat SDK Demo hello" -> should contain "hello"
         assert "hello" in message.text.lower()
 
-    @pytest.mark.xfail(
-        reason="channel/gchat.json has float startIndex (0.0) -- adapter needs int coercion",
-        strict=False,
-    )
     async def test_gchat_channel_fixture(self):
         """channel/gchat.json mention should parse correctly."""
         fixture = load_fixture("channel/gchat.json")

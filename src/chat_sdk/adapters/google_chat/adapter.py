@@ -2496,6 +2496,8 @@ class GoogleChatAdapter:
                 start_index = annotation.get("startIndex")
                 length = annotation.get("length")
                 if start_index is not None and length is not None:
+                    start_index = int(start_index)
+                    length = int(length)
                     mention_text = text[start_index : start_index + length]
                     text = text[:start_index] + f"@{self._user_name}" + text[start_index + length :]
                     self._logger.debug(
