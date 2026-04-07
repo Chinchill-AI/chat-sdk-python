@@ -94,7 +94,11 @@ class TeamsFormatConverter(BaseFormatConverter):
         return parse_markdown(markdown)
 
     def render_postable(self, message: object) -> str:
-        """Override renderPostable to convert @mentions in plain strings."""
+        """Override renderPostable to convert @mentions in plain strings.
+
+        Extends the base implementation with Teams mention conversion
+        and dataclass-style message support.
+        """
         if isinstance(message, str):
             return self._convert_mentions_to_teams(message)
         if isinstance(message, dict):
@@ -104,7 +108,18 @@ class TeamsFormatConverter(BaseFormatConverter):
                 return self.from_ast(parse_markdown(message["markdown"]))
             if "ast" in message:
                 return self.from_ast(message["ast"])
-        return ""
+            if "card" in message or message.get("type") == "card":
+                return super().render_postable(message)
+            return ""
+        # Dataclass / object-style messages
+        if hasattr(message, "raw"):
+            return self._convert_mentions_to_teams(message.raw)
+        if hasattr(message, "markdown"):
+            return self.from_ast(parse_markdown(message.markdown))
+        if hasattr(message, "ast"):
+            return self.from_ast(message.ast)
+        # Fall back to base implementation for remaining cases (e.g. card objects)
+        return super().render_postable(message)
 
     def _convert_mentions_to_teams(self, text: str) -> str:
         """Convert @mentions to Teams format: @name -> <at>name</at>."""
