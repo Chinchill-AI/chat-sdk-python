@@ -196,7 +196,9 @@ class TestMultiWorkspaceSlashCommands:
         chat = _make_mock_chat(state)
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret"))
         await adapter.initialize(chat)
-        await adapter.set_installation("T_SLASH", SlackInstallation(bot_token="xoxb-slash-token", bot_user_id="U_BOT_S"))
+        await adapter.set_installation(
+            "T_SLASH", SlackInstallation(bot_token="xoxb-slash-token", bot_user_id="U_BOT_S")
+        )
 
         req = self._make_slash_request(
             {

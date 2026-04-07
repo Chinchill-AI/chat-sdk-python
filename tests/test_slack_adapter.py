@@ -21,7 +21,9 @@ try:
 except ImportError:
     _SLACK_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(not _SLACK_AVAILABLE, reason="Slack adapter import failed (missing SelectElement in cards.py)")
+pytestmark = pytest.mark.skipif(
+    not _SLACK_AVAILABLE, reason="Slack adapter import failed (missing SelectElement in cards.py)"
+)
 
 
 # ---------------------------------------------------------------------------

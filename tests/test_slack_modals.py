@@ -154,7 +154,11 @@ class TestModalToSlackView:
         modal = _modal(
             children=[
                 _text_input(
-                    id="description", label="Description", multiline=True, placeholder="Enter description...", max_length=500
+                    id="description",
+                    label="Description",
+                    multiline=True,
+                    placeholder="Enter description...",
+                    max_length=500,
                 ),
             ]
         )

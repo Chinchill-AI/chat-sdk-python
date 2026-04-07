@@ -180,7 +180,9 @@ class TestLinkPreviews:
             ),
         ]
         result = await to_ai_messages(messages)
-        assert result[0]["content"] == ("See these links\n\nLinks:\nhttps://example.com\n\nhttps://vercel.com\nTitle: Vercel")
+        assert result[0]["content"] == (
+            "See these links\n\nLinks:\nhttps://example.com\n\nhttps://vercel.com\nTitle: Vercel"
+        )
 
     @pytest.mark.asyncio
     async def test_embedded_message_links(self):
@@ -344,7 +346,9 @@ class TestAttachments:
                 attachments=[
                     Attachment(type="image", mime_type="image/png", fetch_data=await make_fetch(b"png1")),
                     Attachment(type="image", mime_type="image/jpeg", fetch_data=await make_fetch(b"jpg2")),
-                    Attachment(type="file", mime_type="text/plain", name="log.txt", fetch_data=await make_fetch(b"log content")),
+                    Attachment(
+                        type="file", mime_type="text/plain", name="log.txt", fetch_data=await make_fetch(b"log content")
+                    ),
                 ],
             ),
         ]
@@ -407,7 +411,9 @@ class TestAttachments:
                 "1",
                 "Here is a PDF",
                 attachments=[
-                    Attachment(type="file", url="https://example.com/doc.pdf", mime_type="application/pdf", name="doc.pdf"),
+                    Attachment(
+                        type="file", url="https://example.com/doc.pdf", mime_type="application/pdf", name="doc.pdf"
+                    ),
                 ],
             ),
         ]
@@ -479,7 +485,9 @@ class TestAttachments:
                 "1",
                 "Image here",
                 attachments=[
-                    Attachment(type="image", url="https://example.com/img.png", mime_type="image/png", fetch_data=fetch_data),
+                    Attachment(
+                        type="image", url="https://example.com/img.png", mime_type="image/png", fetch_data=fetch_data
+                    ),
                 ],
             ),
         ]

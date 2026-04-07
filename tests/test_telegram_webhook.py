@@ -185,7 +185,9 @@ class TestTelegramThreadIdExtended:
     def test_encode_and_decode(self):
         adapter = _make_adapter()
         assert adapter.encode_thread_id(TelegramThreadId(chat_id="-100123")) == "telegram:-100123"
-        assert adapter.encode_thread_id(TelegramThreadId(chat_id="-100123", message_thread_id=42)) == "telegram:-100123:42"
+        assert (
+            adapter.encode_thread_id(TelegramThreadId(chat_id="-100123", message_thread_id=42)) == "telegram:-100123:42"
+        )
         decoded = adapter.decode_thread_id("telegram:-100123:42")
         assert decoded.chat_id == "-100123"
         assert decoded.message_thread_id == 42

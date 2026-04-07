@@ -243,7 +243,9 @@ class TestGitHubOpenDM:
     async def test_github_has_no_open_dm(self):
         """GitHub adapter does not implement open_dm, verifying the method is absent."""
         adapter = _make_github_adapter()
-        assert not hasattr(adapter, "open_dm"), "GitHubAdapter should not implement open_dm since GitHub doesn't support DMs"
+        assert not hasattr(adapter, "open_dm"), (
+            "GitHubAdapter should not implement open_dm since GitHub doesn't support DMs"
+        )
 
 
 # ===========================================================================
@@ -480,4 +482,6 @@ class TestLinearOpenDM:
     async def test_linear_has_no_open_dm(self):
         """Linear adapter does not implement open_dm since Linear doesn't support DMs."""
         adapter = _make_linear_adapter()
-        assert not hasattr(adapter, "open_dm"), "LinearAdapter should not implement open_dm since Linear doesn't support DMs"
+        assert not hasattr(adapter, "open_dm"), (
+            "LinearAdapter should not implement open_dm since Linear doesn't support DMs"
+        )

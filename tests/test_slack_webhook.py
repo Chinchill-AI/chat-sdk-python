@@ -211,7 +211,9 @@ class TestSignatureVerification:
     async def test_rejects_missing_signature(self):
         adapter = _make_adapter()
         body = json.dumps({"type": "url_verification"})
-        req = _FakeRequest(body, {"x-slack-request-timestamp": str(int(time.time())), "content-type": "application/json"})
+        req = _FakeRequest(
+            body, {"x-slack-request-timestamp": str(int(time.time())), "content-type": "application/json"}
+        )
         response = await adapter.handle_webhook(req)
         assert response["status"] == 401
 

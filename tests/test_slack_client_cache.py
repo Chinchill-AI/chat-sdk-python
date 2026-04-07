@@ -151,7 +151,9 @@ class TestInvalidateClient:
 # ---------------------------------------------------------------------------
 
 
-def _make_slack_api_error(error_code: str, *, use_slack_response: bool = False, retry_after: str | None = None) -> Exception:
+def _make_slack_api_error(
+    error_code: str, *, use_slack_response: bool = False, retry_after: str | None = None
+) -> Exception:
     """Build a mock SlackApiError whose response contains *error_code*.
 
     When *use_slack_response* is True, the response mimics a ``SlackResponse``
@@ -216,9 +218,7 @@ class TestHandleSlackErrorEviction:
         assert "xoxb-tok" in adapter._client_cache
 
         with pytest.raises(Exception, match="invalid_auth"):
-            adapter._handle_slack_error(
-                _make_slack_api_error("invalid_auth", use_slack_response=True)
-            )
+            adapter._handle_slack_error(_make_slack_api_error("invalid_auth", use_slack_response=True))
 
         assert "xoxb-tok" not in adapter._client_cache
 
@@ -245,9 +245,7 @@ class TestHandleSlackErrorRateLimit:
 
         adapter = _make_adapter(bot_token="xoxb-tok")
         with pytest.raises(AdapterRateLimitError) as exc_info:
-            adapter._handle_slack_error(
-                _make_slack_api_error("ratelimited", use_slack_response=True, retry_after="30")
-            )
+            adapter._handle_slack_error(_make_slack_api_error("ratelimited", use_slack_response=True, retry_after="30"))
         assert exc_info.value.retry_after == 30
 
     def test_rate_limit_without_retry_after(self):
@@ -256,9 +254,7 @@ class TestHandleSlackErrorRateLimit:
 
         adapter = _make_adapter(bot_token="xoxb-tok")
         with pytest.raises(AdapterRateLimitError) as exc_info:
-            adapter._handle_slack_error(
-                _make_slack_api_error("ratelimited", use_slack_response=True)
-            )
+            adapter._handle_slack_error(_make_slack_api_error("ratelimited", use_slack_response=True))
         assert exc_info.value.retry_after is None
 
 

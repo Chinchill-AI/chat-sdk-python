@@ -378,7 +378,9 @@ class TestThreadStreaming:
             yield "Hello "
             yield TaskUpdateChunk(type="task_update", id="tool-1", title="Running bash", status="in_progress")
             yield "world"
-            yield TaskUpdateChunk(type="task_update", id="tool-1", title="Running bash", status="complete", output="Done")
+            yield TaskUpdateChunk(
+                type="task_update", id="tool-1", title="Running bash", status="complete", output="Done"
+            )
 
         result = await thread.post(mixed_stream())
 

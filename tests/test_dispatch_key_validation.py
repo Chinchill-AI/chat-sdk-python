@@ -304,7 +304,9 @@ class TestSlackDispatchKeys:
         # Check for the known camelCase bug: "privateMetadata" should be
         # "private_metadata" (this is the exact bug this test catches).
         top_keys = _collect_keys_flat(modal_obj)
-        assert "privateMetadata" not in top_keys, "camelCase key 'privateMetadata' found -- should be 'private_metadata'"
+        assert "privateMetadata" not in top_keys, (
+            "camelCase key 'privateMetadata' found -- should be 'private_metadata'"
+        )
 
         # Also verify the user sub-object uses snake_case
         user = getattr(modal_obj, "user", None) if hasattr(modal_obj, "user") else modal_obj.get("user")
