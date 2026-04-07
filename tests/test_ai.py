@@ -55,7 +55,7 @@ class TestBasicConversion:
     """Tests for basic message role mapping and filtering."""
 
     @pytest.mark.asyncio
-    async def test_maps_is_me_to_assistant(self):
+    async def test_maps_isme_to_assistant_and_others_to_user(self):
         messages = [
             create_test_message("1", "Hello bot"),
             create_test_message("2", "Hi there!", author=_bot_author()),
@@ -70,7 +70,7 @@ class TestBasicConversion:
         ]
 
     @pytest.mark.asyncio
-    async def test_filters_empty_and_whitespace(self):
+    async def test_filters_out_empty_and_whitespaceonly_text(self):
         messages = [
             create_test_message("1", "Hello"),
             create_test_message("2", ""),
@@ -96,11 +96,11 @@ class TestBasicConversion:
         assert [m["content"] for m in result] == ["First", "Second", "Third"]
 
     @pytest.mark.asyncio
-    async def test_empty_input(self):
+    async def test_returns_empty_array_for_empty_input(self):
         assert await to_ai_messages([]) == []
 
     @pytest.mark.asyncio
-    async def test_all_empty_text(self):
+    async def test_returns_empty_array_when_all_messages_have_empty_text(self):
         messages = [
             create_test_message("1", ""),
             create_test_message("2", "   "),
@@ -117,7 +117,7 @@ class TestIncludeNames:
     """Tests for includeNames option."""
 
     @pytest.mark.asyncio
-    async def test_prefix_user_messages_with_username(self):
+    async def test_prefixes_user_messages_with_username_when_includenames_is_true(self):
         messages = [
             create_test_message("1", "Hello", author=_user_author(user_name="alice")),
             create_test_message("2", "Hi!", author=_bot_author()),
@@ -141,7 +141,7 @@ class TestLinkPreviews:
     """Tests for link preview metadata appended to content."""
 
     @pytest.mark.asyncio
-    async def test_appends_link_metadata(self):
+    async def test_appends_link_preview_metadata_to_content(self):
         messages = [
             create_test_message(
                 "1",
@@ -168,7 +168,7 @@ class TestLinkPreviews:
         assert result == [{"role": "user", "content": expected}]
 
     @pytest.mark.asyncio
-    async def test_multiple_links(self):
+    async def test_appends_multiple_links(self):
         messages = [
             create_test_message(
                 "1",
@@ -185,7 +185,7 @@ class TestLinkPreviews:
         )
 
     @pytest.mark.asyncio
-    async def test_embedded_message_links(self):
+    async def test_labels_links_with_fetchmessage_as_embedded_messages(self):
         async def fetch_linked() -> Message:
             return create_test_message("linked", "linked")
 
@@ -207,7 +207,7 @@ class TestLinkPreviews:
         )
 
     @pytest.mark.asyncio
-    async def test_embedded_link_with_title(self):
+    async def test_includes_metadata_on_embedded_message_links(self):
         async def fetch_linked() -> Message:
             return create_test_message("linked", "linked")
 
@@ -232,7 +232,7 @@ class TestLinkPreviews:
         )
 
     @pytest.mark.asyncio
-    async def test_no_links_section_when_empty(self):
+    async def test_does_not_append_links_section_when_links_array_is_empty(self):
         messages = [create_test_message("1", "No links here")]
         result = await to_ai_messages(messages)
         assert result[0]["content"] == "No links here"
@@ -247,7 +247,7 @@ class TestAttachments:
     """Tests for attachment handling in to_ai_messages."""
 
     @pytest.mark.asyncio
-    async def test_image_attachment_as_file_part(self):
+    async def test_includes_image_attachments_as_image_parts(self):
         async def fetch_data() -> bytes:
             return b"jpeg-data"
 
@@ -274,7 +274,7 @@ class TestAttachments:
         assert content[1]["type"] == "file"
 
     @pytest.mark.asyncio
-    async def test_text_file_attachment(self):
+    async def test_includes_text_file_attachments_as_file_parts(self):
         async def fetch_data() -> bytes:
             return b'{"key": "value"}'
 
@@ -301,7 +301,7 @@ class TestAttachments:
         assert content[1]["type"] == "file"
 
     @pytest.mark.asyncio
-    async def test_various_text_mime_types(self):
+    async def test_supports_various_text_mime_types(self):
         mime_types = [
             "text/plain",
             "text/csv",
@@ -332,7 +332,7 @@ class TestAttachments:
             assert content[1]["type"] == "file", f"Failed for {mime_type}"
 
     @pytest.mark.asyncio
-    async def test_multiple_attachments(self):
+    async def test_includes_multiple_attachments_as_parts(self):
         async def make_fetch(data: bytes):
             async def fetch() -> bytes:
                 return data
@@ -362,7 +362,7 @@ class TestAttachments:
         assert content[3]["type"] == "file"
 
     @pytest.mark.asyncio
-    async def test_warns_on_video_attachment(self):
+    async def test_warns_on_video_attachments(self):
         on_unsupported = MagicMock()
         messages = [
             create_test_message(
@@ -383,7 +383,7 @@ class TestAttachments:
         assert on_unsupported.call_args[0][0].type == "video"
 
     @pytest.mark.asyncio
-    async def test_warns_on_audio_attachment(self):
+    async def test_warns_on_audio_attachments(self):
         on_unsupported = MagicMock()
         messages = [
             create_test_message(
@@ -404,7 +404,7 @@ class TestAttachments:
         assert on_unsupported.call_args[0][0].type == "audio"
 
     @pytest.mark.asyncio
-    async def test_skips_non_text_files_silently(self):
+    async def test_skips_nontext_file_attachments_silently(self):
         on_unsupported = MagicMock()
         messages = [
             create_test_message(
@@ -426,7 +426,7 @@ class TestAttachments:
         assert on_unsupported.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_inline_image_base64(self):
+    async def test_uses_fetchdata_to_inline_image_as_base64(self):
         raw_data = b"fake-png-data"
 
         async def fetch_data() -> bytes:
@@ -451,7 +451,7 @@ class TestAttachments:
         assert content[1]["media_type"] == "image/png"
 
     @pytest.mark.asyncio
-    async def test_inline_text_file_base64(self):
+    async def test_uses_fetchdata_to_inline_text_file_as_base64(self):
         raw_data = b"error at line 42"
 
         async def fetch_data() -> bytes:
@@ -476,7 +476,7 @@ class TestAttachments:
         assert content[1]["filename"] == "server.log"
 
     @pytest.mark.asyncio
-    async def test_skips_image_when_fetch_fails(self):
+    async def test_skips_image_when_fetchdata_fails(self):
         async def fetch_data() -> bytes:
             raise RuntimeError("network error")
 
@@ -495,7 +495,7 @@ class TestAttachments:
         assert result[0]["content"] == "Image here"
 
     @pytest.mark.asyncio
-    async def test_skips_without_url_or_fetch_data(self):
+    async def test_skips_attachments_without_url_or_fetchdata(self):
         messages = [
             create_test_message(
                 "1",
@@ -509,7 +509,7 @@ class TestAttachments:
         assert result[0]["content"] == "Uploaded something"
 
     @pytest.mark.asyncio
-    async def test_string_content_when_no_supported_attachments(self):
+    async def test_keeps_string_content_when_no_supported_attachments(self):
         messages = [
             create_test_message("1", "Just text", attachments=[]),
         ]
@@ -526,7 +526,7 @@ class TestTransformMessage:
     """Tests for the transformMessage hook."""
 
     @pytest.mark.asyncio
-    async def test_modify_text_content(self):
+    async def test_transformmessage_can_modify_text_content(self):
         messages = [create_test_message("1", "Hello <@U123>")]
         result = await to_ai_messages(
             messages,
@@ -540,7 +540,7 @@ class TestTransformMessage:
         assert result == [{"role": "user", "content": "Hello @VercelBot"}]
 
     @pytest.mark.asyncio
-    async def test_returning_none_skips_message(self):
+    async def test_transformmessage_returning_null_skips_the_message(self):
         messages = [
             create_test_message("1", "Keep this"),
             create_test_message("2", "Skip this"),
@@ -558,7 +558,7 @@ class TestTransformMessage:
         ]
 
     @pytest.mark.asyncio
-    async def test_receives_correct_source_message(self):
+    async def test_transformmessage_receives_correct_source_message(self):
         messages = [
             create_test_message("msg-1", "Hello", author=_user_author(user_name="alice")),
         ]
@@ -577,7 +577,7 @@ class TestTransformMessage:
         assert source_msg.author.user_name == "alice"
 
     @pytest.mark.asyncio
-    async def test_async_transform(self):
+    async def test_transformmessage_works_with_async_callbacks(self):
         messages = [create_test_message("1", "Original")]
 
         async def async_transform(ai_msg: AiMessage, _src: Message) -> AiMessage:
@@ -599,19 +599,19 @@ class TestMentions:
     """Tests for mention rendering in message text."""
 
     @pytest.mark.asyncio
-    async def test_at_mentions_with_display_names(self):
+    async def test_renders_mentions_with_display_names_in_message_text(self):
         messages = [create_test_message("1", "Hey @john, can you review this?")]
         result = await to_ai_messages(messages)
         assert result[0]["content"] == "Hey @john, can you review this?"
 
     @pytest.mark.asyncio
-    async def test_multiple_mentions(self):
+    async def test_renders_multiple_mentions_correctly(self):
         messages = [create_test_message("1", "@alice and @bob please look at this")]
         result = await to_ai_messages(messages)
         assert result[0]["content"] == "@alice and @bob please look at this"
 
     @pytest.mark.asyncio
-    async def test_mentions_with_include_names(self):
+    async def test_renders_mentions_with_includenames_enabled(self):
         messages = [
             create_test_message(
                 "1",
@@ -621,3 +621,143 @@ class TestMentions:
         ]
         result = await to_ai_messages(messages, ToAiMessagesOptions(include_names=True))
         assert result[0]["content"] == "[alice]: Hey @bob, thoughts?"
+
+
+# ============================================================================
+# Mixed link types (embedded + regular)
+# ============================================================================
+
+
+class TestMixedLinks:
+    """Tests for mixed embedded and regular links."""
+
+    @pytest.mark.asyncio
+    async def test_mixes_embedded_messages_and_regular_links(self):
+        async def fetch_linked() -> Message:
+            return create_test_message("linked", "linked")
+
+        messages = [
+            create_test_message(
+                "1",
+                "Check these",
+                links=[
+                    LinkPreview(
+                        url="https://team.slack.com/archives/C123/p1234567890123456",
+                        fetch_message=fetch_linked,
+                    ),
+                    LinkPreview(
+                        url="https://vercel.com",
+                        title="Vercel",
+                        site_name="Vercel",
+                    ),
+                ],
+            ),
+        ]
+        result = await to_ai_messages(messages)
+        assert result[0]["content"] == (
+            "Check these\n\nLinks:\n"
+            "[Embedded message: https://team.slack.com/archives/C123/p1234567890123456]\n\n"
+            "https://vercel.com\nTitle: Vercel\nSite: Vercel"
+        )
+
+
+# ============================================================================
+# Links with attachments
+# ============================================================================
+
+
+class TestLinksWithAttachments:
+    """Tests for link rendering when attachments are present."""
+
+    @pytest.mark.asyncio
+    async def test_includes_links_in_text_part_when_attachments_are_present(self):
+        async def fetch_data() -> bytes:
+            return b"img"
+
+        messages = [
+            create_test_message(
+                "1",
+                "Image with link",
+                links=[LinkPreview(url="https://example.com", title="Example")],
+                attachments=[
+                    Attachment(type="image", mime_type="image/png", fetch_data=fetch_data),
+                ],
+            ),
+        ]
+        result = await to_ai_messages(messages)
+        content = result[0]["content"]
+
+        assert isinstance(content, list)
+        text_part = content[0]
+        assert text_part["type"] == "text"
+        assert "Links:\nhttps://example.com" in text_part["text"]
+        assert content[1]["type"] == "file"
+
+
+# ============================================================================
+# Additional mention tests
+# ============================================================================
+
+
+class TestAdditionalMentions:
+    """Additional mention rendering tests."""
+
+    @pytest.mark.asyncio
+    async def test_renders_mentions_with_user_ids_when_display_name_unavailable(self):
+        messages = [create_test_message("1", "Hey @U456, check this")]
+        result = await to_ai_messages(messages)
+
+        assert result[0]["content"] == "Hey @U456, check this"
+        assert "<@" not in result[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_renders_mentions_in_messages_with_links(self):
+        messages = [
+            create_test_message(
+                "1",
+                "@alice shared a link",
+                links=[LinkPreview(url="https://example.com")],
+            ),
+        ]
+        result = await to_ai_messages(messages)
+
+        assert "@alice shared a link" in result[0]["content"]
+        assert "https://example.com" in result[0]["content"]
+        assert "<@" not in result[0]["content"]
+
+
+# ============================================================================
+# Transform message with attachments
+# ============================================================================
+
+
+class TestTransformMessageAttachments:
+    """Tests for transformMessage with multipart content."""
+
+    @pytest.mark.asyncio
+    async def test_transformmessage_receives_multipart_content_for_messages_with_attachments(self):
+        async def fetch_data() -> bytes:
+            return b"png-data"
+
+        messages = [
+            create_test_message(
+                "1",
+                "Image here",
+                attachments=[
+                    Attachment(type="image", mime_type="image/png", fetch_data=fetch_data),
+                ],
+            ),
+        ]
+        calls: list[tuple[Any, Any]] = []
+
+        def transform(ai_msg: AiMessage, src: Message) -> AiMessage:
+            calls.append((ai_msg, src))
+            return ai_msg
+
+        await to_ai_messages(messages, ToAiMessagesOptions(transform_message=transform))
+
+        assert len(calls) == 1
+        ai_msg = calls[0][0]
+        assert ai_msg["role"] == "user"
+        assert isinstance(ai_msg["content"], list)
+        assert len(ai_msg["content"]) == 2

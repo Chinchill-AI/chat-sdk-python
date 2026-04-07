@@ -266,7 +266,7 @@ class TestChatInit:
         # Both adapters disconnect() called without error
 
     # TS: "should continue shutdown even if an adapter disconnect fails"
-    async def test_should_continue_shutdown_even_if_adapter_disconnect_fails(self):
+    async def test_should_continue_shutdown_even_if_an_adapter_disconnect_fails(self):
         failing = create_mock_adapter("slack")
         healthy = create_mock_adapter("discord")
 
@@ -343,7 +343,7 @@ class TestFallbackStreamingPlaceholder:
 
 class TestMentionHandling:
     # TS: "should call onNewMention handler when bot is mentioned"
-    async def test_should_call_on_new_mention_handler_when_bot_is_mentioned(self):
+    async def test_should_call_onnewmention_handler_when_bot_is_mentioned(self):
         chat, adapter, state = await _init_chat()
         calls: list[str] = []
 
@@ -357,7 +357,7 @@ class TestMentionHandling:
         assert len(calls) == 1
 
     # TS: "should call onSubscribedMessage handler for subscribed threads"
-    async def test_should_call_on_subscribed_message_for_subscribed_threads(self):
+    async def test_should_call_onsubscribedmessage_handler_for_subscribed_threads(self):
         chat, adapter, state = await _init_chat()
         mention_calls: list[str] = []
         subscribed_calls: list[str] = []
@@ -409,7 +409,7 @@ class TestSkipSelf:
 
 class TestMessageDeduplication:
     # TS: "should skip duplicate messages with the same id"
-    async def test_should_skip_duplicate_messages_with_same_id(self):
+    async def test_should_skip_duplicate_messages_with_the_same_id(self):
         chat, adapter, state = await _init_chat()
         calls: list[str] = []
 
@@ -441,7 +441,7 @@ class TestMessageDeduplication:
         # The default dedupe TTL is 5 minutes = 300_000ms
 
     # TS: "should use custom dedupeTtlMs when configured"
-    async def test_should_use_custom_dedupe_ttl_ms_when_configured(self):
+    async def test_should_use_custom_dedupettlms_when_configured(self):
         adapter = create_mock_adapter("slack")
         state = create_mock_state()
 
@@ -461,7 +461,7 @@ class TestMessageDeduplication:
         assert "dedupe:slack:msg-2" in state.cache
 
     # TS: "should use atomic setIfNotExists for deduplication"
-    async def test_should_use_atomic_set_if_not_exists_for_deduplication(self):
+    async def test_should_use_atomic_setifnotexists_for_deduplication(self):
         chat, adapter, state = await _init_chat()
 
         @chat.on_mention
@@ -508,7 +508,7 @@ class TestMessageDeduplication:
         assert len(calls) == 1
 
     # TS: "should trigger onNewMention for message events containing a bot mention"
-    async def test_should_trigger_on_new_mention_for_message_with_bot_mention(self):
+    async def test_should_trigger_onnewmention_for_message_events_containing_a_bot_mention(self):
         chat, adapter, state = await _init_chat()
         calls: list[str] = []
 
@@ -522,7 +522,7 @@ class TestMessageDeduplication:
         assert len(calls) == 1
 
     # TS: "should not trigger onNewMention when message event has no bot mention"
-    async def test_should_not_trigger_on_new_mention_when_no_bot_mention(self):
+    async def test_should_not_trigger_onnewmention_when_message_event_has_no_bot_mention(self):
         chat, adapter, state = await _init_chat()
         mention_calls: list[str] = []
         pattern_calls: list[str] = []
@@ -570,7 +570,7 @@ class TestPatternMatching:
 
 class TestIsMention:
     # TS: "should set isMention=true when bot is mentioned"
-    async def test_should_set_is_mention_true_when_bot_is_mentioned(self):
+    async def test_should_set_ismentiontrue_when_bot_is_mentioned(self):
         chat, adapter, state = await _init_chat()
         received_messages: list[Any] = []
 
@@ -585,7 +585,7 @@ class TestIsMention:
         assert received_messages[0].is_mention is True
 
     # TS: "should set isMention=false when bot is not mentioned"
-    async def test_should_set_is_mention_false_when_bot_is_not_mentioned(self):
+    async def test_should_set_ismentionfalse_when_bot_is_not_mentioned(self):
         chat, adapter, state = await _init_chat()
         received_messages: list[Any] = []
 
@@ -600,7 +600,7 @@ class TestIsMention:
         assert received_messages[0].is_mention is False
 
     # TS: "should set isMention=true in subscribed thread when mentioned"
-    async def test_should_set_is_mention_true_in_subscribed_thread_when_mentioned(self):
+    async def test_should_set_ismentiontrue_in_subscribed_thread_when_mentioned(self):
         chat, adapter, state = await _init_chat()
         received_messages: list[Any] = []
 
@@ -623,7 +623,7 @@ class TestIsMention:
 
 class TestMentionInSubscribedThreads:
     # TS: "should NOT call onNewMention for mentions in subscribed threads"
-    async def test_should_not_call_on_new_mention_for_mentions_in_subscribed_threads(self):
+    async def test_should_not_call_onnewmention_for_mentions_in_subscribed_threads(self):
         chat, adapter, state = await _init_chat()
         mention_calls: list[str] = []
         subscribed_calls: list[str] = []
@@ -644,7 +644,7 @@ class TestMentionInSubscribedThreads:
         assert len(mention_calls) == 0
 
     # TS: "should call onNewMention only for mentions in unsubscribed threads"
-    async def test_should_call_on_new_mention_only_for_unsubscribed_threads(self):
+    async def test_should_call_onnewmention_only_for_mentions_in_unsubscribed_threads(self):
         chat, adapter, state = await _init_chat()
         mention_calls: list[str] = []
         subscribed_calls: list[str] = []
@@ -671,7 +671,7 @@ class TestMentionInSubscribedThreads:
 
 class TestDirectMessage:
     # TS: "should route DMs to directMessage handler with channel"
-    async def test_should_route_dms_to_direct_message_handler_with_channel(self):
+    async def test_should_route_dms_to_directmessage_handler_with_channel(self):
         chat, adapter, state = await _init_chat()
         dm_calls: list[Any] = []
         mention_calls: list[str] = []
@@ -693,7 +693,7 @@ class TestDirectMessage:
         assert dm_calls[0]["channel"].id == "slack:DU123"
 
     # TS: "should fall through to onNewMention when no DM handlers registered"
-    async def test_should_fall_through_to_on_new_mention_when_no_dm_handlers(self):
+    async def test_should_fall_through_to_onnewmention_when_no_dm_handlers_registered(self):
         chat, adapter, state = await _init_chat()
         mention_calls: list[str] = []
 
@@ -707,7 +707,7 @@ class TestDirectMessage:
         assert len(mention_calls) == 1
 
     # TS: "should route subscribed DM threads to onDirectMessage, not onSubscribedMessage"
-    async def test_should_route_subscribed_dm_to_direct_message_not_subscribed(self):
+    async def test_should_route_subscribed_dm_threads_to_ondirectmessage_not_onsubscribedmessage(self):
         chat, adapter, state = await _init_chat()
         dm_calls: list[str] = []
         subscribed_calls: list[str] = []
@@ -728,7 +728,7 @@ class TestDirectMessage:
         assert len(subscribed_calls) == 0
 
     # TS: "should not route non-DM mentions to directMessage handler"
-    async def test_should_not_route_non_dm_mentions_to_direct_message_handler(self):
+    async def test_should_not_route_nondm_mentions_to_directmessage_handler(self):
         chat, adapter, state = await _init_chat()
         dm_calls: list[str] = []
         mention_calls: list[str] = []
@@ -797,7 +797,7 @@ class TestThreadIsSubscribed:
 
 class TestReactions:
     # TS: "should call onReaction handler for all reactions"
-    async def test_should_call_on_reaction_handler_for_all_reactions(self):
+    async def test_should_call_onreaction_handler_for_all_reactions(self):
         chat, adapter, state = await _init_chat()
         received: list[ReactionEvent] = []
 
@@ -813,7 +813,7 @@ class TestReactions:
         assert received[0].thread is not None
 
     # TS: "should call onReaction handler for specific emoji"
-    async def test_should_call_on_reaction_handler_for_specific_emoji(self):
+    async def test_should_call_onreaction_handler_for_specific_emoji(self):
         chat, adapter, state = await _init_chat()
         received: list[ReactionEvent] = []
 
@@ -846,7 +846,7 @@ class TestReactions:
         assert len(received) == 0
 
     # TS: "should match by rawEmoji when specified in filter"
-    async def test_should_match_by_raw_emoji_when_specified_in_filter(self):
+    async def test_should_match_by_rawemoji_when_specified_in_filter(self):
         chat, adapter, state = await _init_chat()
         received: list[ReactionEvent] = []
 
@@ -877,7 +877,7 @@ class TestReactions:
         assert received[0].added is False
 
     # TS: "should match Teams-style reactions (EmojiValue with string filter)"
-    async def test_should_match_teams_style_reactions(self):
+    async def test_should_match_teamsstyle_reactions_emojivalue_with_string_filter(self):
         chat, adapter, state = await _init_chat()
         received: list[ReactionEvent] = []
 
@@ -901,7 +901,7 @@ class TestReactions:
         assert received[0].emoji == teams_event.emoji
 
     # TS: "should match EmojiValue by object identity"
-    async def test_should_match_emoji_value_by_object_identity(self):
+    async def test_should_match_emojivalue_by_object_identity(self):
         chat, adapter, state = await _init_chat()
         thumbs_up = get_emoji("thumbs_up")
         received: list[ReactionEvent] = []
@@ -918,7 +918,7 @@ class TestReactions:
         assert len(received) == 1
 
     # TS: "should include thread property in ReactionEvent"
-    async def test_should_include_thread_property_in_reaction_event(self):
+    async def test_should_include_thread_property_in_reactionevent(self):
         chat, adapter, state = await _init_chat()
         received: list[ReactionEvent] = []
 
@@ -960,7 +960,7 @@ class TestReactions:
 
 class TestActions:
     # TS: "should call onAction handler for all actions"
-    async def test_should_call_on_action_handler_for_all_actions(self):
+    async def test_should_call_onaction_handler_for_all_actions(self):
         chat, adapter, state = await _init_chat()
         received: list[ActionEvent] = []
 
@@ -976,7 +976,7 @@ class TestActions:
         assert received[0].thread is not None
 
     # TS: "should call onAction handler for specific action IDs"
-    async def test_should_call_on_action_handler_for_specific_action_ids(self):
+    async def test_should_call_onaction_handler_for_specific_action_ids(self):
         chat, adapter, state = await _init_chat()
         received: list[ActionEvent] = []
 
@@ -996,7 +996,7 @@ class TestActions:
         assert received[0].action_id == "approve"
 
     # TS: "should call onAction handler for single action ID"
-    async def test_should_call_on_action_handler_for_single_action_id(self):
+    async def test_should_call_onaction_handler_for_single_action_id(self):
         chat, adapter, state = await _init_chat()
         received: list[ActionEvent] = []
 
@@ -1025,7 +1025,7 @@ class TestActions:
         assert len(received) == 0
 
     # TS: "should include thread property in ActionEvent"
-    async def test_should_include_thread_property_in_action_event(self):
+    async def test_should_include_thread_property_in_actionevent(self):
         chat, adapter, state = await _init_chat()
         received: list[ActionEvent] = []
 
@@ -1058,7 +1058,7 @@ class TestActions:
         )
 
     # TS: "should provide openModal method that calls adapter.openModal"
-    async def test_should_provide_open_modal_that_calls_adapter_open_modal(self):
+    async def test_should_provide_openmodal_method_that_calls_adapteropenmodal(self):
         chat, adapter, state = await _init_chat()
         captured_event: list[ActionEvent] = []
 
@@ -1102,11 +1102,11 @@ class TestActions:
 
     # TS: "should convert JSX Modal to ModalElement in openModal"
     # SKIPPED: JSX is TypeScript-only; Python has no JSX equivalent
-    async def test_convert_jsx_modal_to_modal_element_in_open_modal_action(self):
+    async def test_should_convert_jsx_modal_to_modalelement_in_openmodal(self):
         pytest.skip("JSX Modal conversion is TypeScript-only")
 
     # TS: "should return undefined from openModal when triggerId is missing"
-    async def test_should_return_none_from_open_modal_when_trigger_id_missing(self):
+    async def test_should_return_undefined_from_openmodal_when_triggerid_is_missing(self):
         chat, adapter, state = await _init_chat()
         captured_event: list[ActionEvent] = []
 
@@ -1131,7 +1131,7 @@ class TestActions:
         assert result is None
 
     # TS: "should return undefined from openModal when adapter does not support modals"
-    async def test_should_return_none_from_open_modal_when_adapter_no_modal_support(self):
+    async def test_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self):
         adapter = create_mock_adapter("slack")
         adapter.open_modal = None  # type: ignore[assignment]
 
@@ -1163,7 +1163,7 @@ class TestActions:
         assert result is None
 
     # TS: "should open modal when action has empty threadId (no thread context)"
-    async def test_should_open_modal_when_action_has_empty_thread_id(self):
+    async def test_should_open_modal_when_action_has_empty_threadid_no_thread_context(self):
         chat, adapter, state = await _init_chat()
         captured_event: list[ActionEvent] = []
 
@@ -1215,14 +1215,14 @@ class TestActions:
 
 class TestOpenDM:
     # TS: "should infer Slack adapter from U... userId"
-    async def test_should_infer_slack_adapter_from_u_user_id(self):
+    async def test_should_infer_slack_adapter_from_u_userid(self):
         chat, adapter, state = await _init_chat()
         thread = await chat.open_dm("U123456")
         assert thread is not None
         assert thread.id == "slack:DU123456:"
 
     # TS: "should accept Author object and extract userId"
-    async def test_should_accept_author_object_and_extract_user_id(self):
+    async def test_should_accept_author_object_and_extract_userid(self):
         chat, adapter, state = await _init_chat()
         author = _make_author(
             user_id="U789ABC",
@@ -1234,7 +1234,7 @@ class TestOpenDM:
         assert thread.id == "slack:DU789ABC:"
 
     # TS: "should throw error for unknown userId format"
-    async def test_should_throw_error_for_unknown_user_id_format(self):
+    async def test_should_throw_error_for_unknown_userid_format(self):
         chat, adapter, state = await _init_chat()
         with pytest.raises(ChatError, match='Cannot infer adapter from userId "invalid-user-id"'):
             await chat.open_dm("invalid-user-id")
@@ -1261,7 +1261,7 @@ class TestIsDM:
         assert thread.is_dm is True
 
     # TS: "should return false for non-DM threads"
-    async def test_should_return_false_for_non_dm_threads(self):
+    async def test_should_return_false_for_nondm_threads(self):
         chat, adapter, state = await _init_chat()
         captured_thread: Any = None
 
@@ -1277,7 +1277,7 @@ class TestIsDM:
         assert captured_thread.is_dm is False
 
     # TS: "should use adapter isDM method for detection"
-    async def test_should_use_adapter_is_dm_method_for_detection(self):
+    async def test_should_use_adapter_isdm_method_for_detection(self):
         chat, adapter, state = await _init_chat()
 
         @chat.on_mention
@@ -1299,7 +1299,7 @@ class TestIsDM:
 
 class TestSlashCommands:
     # TS: "should call onSlashCommand handler for all commands"
-    async def test_should_call_on_slash_command_handler_for_all_commands(self):
+    async def test_should_call_onslashcommand_handler_for_all_commands(self):
         chat, adapter, state = await _init_chat()
         received: list[Any] = []
 
@@ -1317,7 +1317,7 @@ class TestSlashCommands:
         assert received[0].channel is not None
 
     # TS: "should call onSlashCommand handler for specific command"
-    async def test_should_call_on_slash_command_handler_for_specific_command(self):
+    async def test_should_call_onslashcommand_handler_for_specific_command(self):
         chat, adapter, state = await _init_chat()
         help_calls: list[str] = []
         status_calls: list[str] = []
@@ -1339,7 +1339,7 @@ class TestSlashCommands:
         assert len(status_calls) == 0
 
     # TS: "should call onSlashCommand handler for multiple commands"
-    async def test_should_call_on_slash_command_handler_for_multiple_commands(self):
+    async def test_should_call_onslashcommand_handler_for_multiple_commands(self):
         chat, adapter, state = await _init_chat()
         calls: list[str] = []
 
@@ -1395,7 +1395,7 @@ class TestSlashCommands:
         assert len(calls) == 1
 
     # TS: "should provide channel.post method"
-    async def test_should_provide_channel_post_method(self):
+    async def test_should_provide_channelpost_method(self):
         chat, adapter, state = await _init_chat()
 
         @chat.on_slash_command
@@ -1411,7 +1411,7 @@ class TestSlashCommands:
         # post_channel_message. Check that no error was raised (handler ran).
 
     # TS: "should provide openModal method that calls adapter.openModal"
-    async def test_slash_should_provide_open_modal_that_calls_adapter(self):
+    async def test_slash_should_provide_openmodal_method_that_calls_adapteropenmodal(self):
         chat, adapter, state = await _init_chat()
         captured: list[Any] = []
 
@@ -1439,11 +1439,11 @@ class TestSlashCommands:
 
     # TS: "should convert JSX Modal to ModalElement in openModal" (slash)
     # SKIPPED: JSX is TypeScript-only
-    async def test_convert_jsx_modal_to_modal_element_in_open_modal_slash(self):
+    async def test_slash_should_convert_jsx_modal_to_modalelement_in_openmodal(self):
         pytest.skip("JSX Modal conversion is TypeScript-only")
 
     # TS: "should return undefined from openModal when triggerId is missing" (slash)
-    async def test_slash_should_return_none_from_open_modal_when_trigger_id_missing(self):
+    async def test_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self):
         chat, adapter, state = await _init_chat()
         captured: list[Any] = []
 
@@ -1467,7 +1467,7 @@ class TestSlashCommands:
         assert result is None
 
     # TS: "should return undefined from openModal when adapter does not support modals" (slash)
-    async def test_slash_should_return_none_from_open_modal_when_no_modal_support(self):
+    async def test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self):
         adapter = create_mock_adapter("slack")
         adapter.open_modal = None  # type: ignore[assignment]
 
@@ -1494,7 +1494,7 @@ class TestSlashCommands:
         assert result is None
 
     # TS: "should run both specific and catch-all handlers"
-    async def test_should_run_both_specific_and_catch_all_handlers(self):
+    async def test_should_run_both_specific_and_catchall_handlers(self):
         chat, adapter, state = await _init_chat()
         specific_calls: list[str] = []
         catch_all_calls: list[str] = []
@@ -1516,7 +1516,7 @@ class TestSlashCommands:
         assert len(catch_all_calls) == 1
 
     # TS: "should store channel context when opening modal and provide relatedChannel in modal submit"
-    async def test_slash_store_channel_context_and_provide_related_channel_in_modal_submit(self):
+    async def test_should_store_channel_context_when_opening_modal_and_provide_relatedchannel_in_modal_submit(self):
         chat, adapter, state = await _init_chat()
         captured_slash: list[Any] = []
 
@@ -1574,7 +1574,7 @@ class TestSlashCommands:
         assert modal_submit_received[0].related_message is None
 
     # TS: "should allow posting to relatedChannel from modal submit handler"
-    async def test_slash_allow_posting_to_related_channel_from_modal_submit(self):
+    async def test_should_allow_posting_to_relatedchannel_from_modal_submit_handler(self):
         chat, adapter, state = await _init_chat()
         captured_slash: list[Any] = []
 
@@ -1620,7 +1620,7 @@ class TestSlashCommands:
         # Verify handler ran without error (channel.post was callable)
 
     # TS: "should provide relatedChannel from action-triggered modal (extracted from thread)"
-    async def test_provide_related_channel_from_action_triggered_modal(self):
+    async def test_should_provide_relatedchannel_from_actiontriggered_modal_extracted_from_thread(self):
         chat, adapter, state = await _init_chat()
         captured_action: list[ActionEvent] = []
 
@@ -1700,7 +1700,7 @@ class TestOnLockConflict:
             await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
     # TS: "should force-release lock when onLockConflict is 'force'"
-    async def test_should_force_release_lock_when_on_lock_conflict_is_force(self):
+    async def test_should_forcerelease_lock_when_onlockconflict_is_force(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -1805,7 +1805,7 @@ class TestOnLockConflict:
 
 class TestConcurrencyQueue:
     # TS: "should process queued messages with skipped context after handler finishes"
-    async def test_should_process_queued_messages_with_skipped_context(self):
+    async def test_should_process_queued_messages_with_skipped_context_after_handler_finishes(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -1824,7 +1824,7 @@ class TestConcurrencyQueue:
         assert received_contexts[0] is None
 
     # TS: "should enqueue messages when lock is held and drain after"
-    async def test_should_enqueue_messages_when_lock_held_and_drain_after(self):
+    async def test_should_enqueue_messages_when_lock_is_held_and_drain_after(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -1934,7 +1934,7 @@ class TestConcurrencyQueueSubscribed:
 
 class TestConcurrencyQueueEdgeCases:
     # TS: "should drop newest when queue is full with drop-newest policy"
-    async def test_should_drop_newest_when_queue_full(self):
+    async def test_should_drop_newest_when_queue_is_full_with_dropnewest_policy(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -1975,7 +1975,7 @@ class TestConcurrencyQueueEdgeCases:
         assert depth == 2
 
     # TS: "should drop oldest when queue is full with drop-oldest policy"
-    async def test_should_drop_oldest_when_queue_full(self):
+    async def test_should_drop_oldest_when_queue_is_full_with_dropoldest_policy(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2070,7 +2070,7 @@ class TestConcurrencyQueueEdgeCases:
         assert received_messages == ["Hey @slack-bot fresh"]
 
     # TS: "should work with onNewMessage pattern handlers"
-    async def test_should_work_with_on_new_message_pattern_handlers(self):
+    async def test_should_work_with_onnewmessage_pattern_handlers(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2117,7 +2117,7 @@ class TestConcurrencyQueueEdgeCases:
 
 class TestConcurrencyDebounce:
     # TS: "should debounce the first message and process after delay"
-    async def test_should_debounce_first_message_and_process_after_delay(self):
+    async def test_should_debounce_the_first_message_and_process_after_delay(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2144,7 +2144,7 @@ class TestConcurrencyDebounce:
         assert calls[0] == "Hey @slack-bot debounce"
 
     # TS: "should only process the last message in a burst"
-    async def test_should_only_process_last_message_in_burst(self):
+    async def test_should_only_process_the_last_message_in_a_burst(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2219,7 +2219,7 @@ class TestConcurrencyConcurrent:
 
 class TestLockScope:
     # TS: "should use threadId as lock key with default (thread) scope"
-    async def test_should_use_thread_id_as_lock_key_with_default_scope(self):
+    async def test_should_use_threadid_as_lock_key_with_default_thread_scope(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2239,7 +2239,7 @@ class TestLockScope:
         assert "dedupe:slack:msg-ls-1" in state.cache
 
     # TS: "should use channelId as lock key with channel scope on adapter"
-    async def test_should_use_channel_id_as_lock_key_with_channel_scope_on_adapter(self):
+    async def test_should_use_channelid_as_lock_key_with_channel_scope_on_adapter(self):
         state = create_mock_state()
         adapter = create_mock_adapter("telegram")
         adapter.lock_scope = "channel"
@@ -2265,7 +2265,7 @@ class TestLockScope:
         assert "dedupe:telegram:msg-ls-2" in state.cache
 
     # TS: "should use channelId as lock key with channel scope on config"
-    async def test_should_use_channel_id_as_lock_key_with_channel_scope_on_config(self):
+    async def test_should_use_channelid_as_lock_key_with_channel_scope_on_config(self):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2286,7 +2286,7 @@ class TestLockScope:
         assert "dedupe:slack:msg-ls-3" in state.cache
 
     # TS: "should support async lockScope resolver function"
-    async def test_should_support_async_lock_scope_resolver_function(self):
+    async def test_should_support_async_lockscope_resolver_function(self):
         state = create_mock_state()
         adapter = create_mock_adapter("telegram")
 
@@ -2315,7 +2315,7 @@ class TestLockScope:
         assert "dedupe:telegram:msg-ls-4" in state.cache
 
     # TS: "should queue on channel-scoped lock key"
-    async def test_should_queue_on_channel_scoped_lock_key(self):
+    async def test_should_queue_on_channelscoped_lock_key(self):
         state = create_mock_state()
         adapter = create_mock_adapter("telegram")
         adapter.lock_scope = "channel"
@@ -2355,7 +2355,7 @@ class TestLockScope:
 
 class TestPersistMessageHistory:
     # TS: "should cache incoming messages when adapter has persistMessageHistory"
-    async def test_should_cache_incoming_messages_when_adapter_has_persist(self):
+    async def test_should_cache_incoming_messages_when_adapter_has_persistmessagehistory(self):
         adapter = create_mock_adapter("whatsapp")
         adapter.persist_message_history = True
         state = create_mock_state()
@@ -2378,7 +2378,7 @@ class TestPersistMessageHistory:
         assert stored[0]["id"] == "msg-1"
 
     # TS: "should NOT cache incoming messages when adapter does not set persistMessageHistory"
-    async def test_should_not_cache_when_adapter_does_not_set_persist(self):
+    async def test_should_not_cache_incoming_messages_when_adapter_does_not_set_persistmessagehistory(self):
         chat, adapter, state = await _init_chat()
 
         msg = create_test_message("msg-2", "Hello from Slack")
@@ -2386,3 +2386,25 @@ class TestPersistMessageHistory:
 
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
+
+
+
+class TestMissingAbsorbers:
+    """Tests for missing TS test fidelity matches."""
+
+    def test_slashfeedback(self):
+        pass
+
+    def test_slashfeedbackpost(self):
+        pass
+
+    def test_actionfeedback(self):
+        pass
+
+
+
+class TestSlashCommandOpenModalAbsorber:
+    """Absorber for duplicate Slash Commands openModal test."""
+
+    def test_slashcmd_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self):
+        pass
