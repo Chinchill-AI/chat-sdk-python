@@ -41,3 +41,18 @@ See docs/UPSTREAM_SYNC.md for TS->Python translation patterns.
 - Markdown parser handles common cases but is not full CommonMark
 - StreamingMarkdownRenderer's _remend is simplified vs the npm `remend` library
 - No setext headings, no footnotes, no HTML nodes in the parser
+
+## Test Fidelity Verification
+
+After modifying or adding tests, run:
+```bash
+python3 scripts/verify_test_fidelity.py
+```
+This verifies every TS `it("...")` test has a matching Python `def test_...()`.
+The script must show `0 missing` before committing test changes.
+
+When porting a new TS test file:
+1. Add the mapping to `scripts/verify_test_fidelity.py` MAPPING dict
+2. Run with `--fix` to generate stubs
+3. Translate each stub by reading the TS test body line-by-line
+4. Verify with the script before committing

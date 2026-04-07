@@ -53,3 +53,16 @@ All PRs must pass `ruff check` with zero errors.
 ## License
 
 By contributing you agree that your contributions will be licensed under the MIT License.
+
+## Test Translation Process
+
+When porting tests from the TypeScript SDK:
+
+1. **Add the mapping** to `scripts/verify_test_fidelity.py`
+2. **Generate stubs**: `python3 scripts/verify_test_fidelity.py --fix`
+3. **Translate each stub** by reading the TS `it("...")` block line-by-line
+4. **Verify names match**: `python3 scripts/verify_test_fidelity.py` must show 0 missing
+5. **Run tests**: `uv run pytest tests/ -q`
+
+Test function names MUST be derivable from the TS `it("...")` description.
+Do NOT write new tests — translate the EXISTING TS tests.
