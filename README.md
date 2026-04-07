@@ -72,6 +72,18 @@ async def handle_mention(thread, message):
 | State abstraction (mem/redis/pg) | Built-in | DIY | DIY |
 | Drop down to native SDK | Yes | N/A | Partially |
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/ARCHITECTURE.md) | Module dependency graph, adapter protocol, card system, concurrency strategies, state backends, markdown pipeline, streaming pipeline |
+| [Upstream Sync](docs/UPSTREAM_SYNC.md) | How to keep the Python port in sync with the Vercel Chat TS SDK, translation patterns, known footguns |
+| [Security](docs/SECURITY.md) | Webhook verification per platform, SSRF protections, crypto details, known limitations, production audit checklist |
+| [Testing](docs/TESTING.md) | Test categories, how to run tests, how to add adapter tests, coverage gaps, dispatch key validation |
+| [Design Decisions](docs/DECISIONS.md) | Rationale for key architectural choices (hand-rolled parser, PascalCase builders, global singleton, zero deps) |
+| [Contributing](CONTRIBUTING.md) | Dev setup, code quality, PR expectations |
+| [Changelog](CHANGELOG.md) | Release history |
+
 ## Development
 
 ```bash
