@@ -167,7 +167,12 @@ class MockAdapter:
     def get_channel_visibility(self, thread_id: str) -> ChannelVisibility:
         return "unknown"
 
-    async def open_modal(self, **kwargs: Any) -> dict[str, str]:
+    async def open_modal(
+        self,
+        trigger_id: str = "",
+        modal: Any = None,
+        context_id: str | None = None,
+    ) -> dict[str, str]:
         return {"view_id": "V123"}
 
     async def fetch_channel_messages(self, channel_id: str, options: FetchOptions | None = None) -> FetchResult:
