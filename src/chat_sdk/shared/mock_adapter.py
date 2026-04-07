@@ -169,8 +169,13 @@ class MockAdapter:
 
     async def open_modal(
         self,
+<<<<<<< Updated upstream
         trigger_id: str = "",
         modal: Any = None,
+=======
+        trigger_id: str,
+        modal: Any,
+>>>>>>> Stashed changes
         context_id: str | None = None,
     ) -> dict[str, str]:
         return {"view_id": "V123"}
