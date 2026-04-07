@@ -34,6 +34,9 @@ class SlackAdapterConfig:
     logger: Logger | None = None
     # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var.
     signing_secret: str | None = None
+    # Maximum number of cached AsyncWebClient instances (LRU-bounded).
+    # Defaults to 100. Increase for large multi-workspace deployments.
+    client_cache_max: int | None = None
     # Override bot username (optional)
     user_name: str | None = None
 

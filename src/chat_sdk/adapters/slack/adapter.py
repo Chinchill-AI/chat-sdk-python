@@ -200,7 +200,7 @@ class SlackAdapter:
 
         # Cache of AsyncWebClient instances keyed by bot token (LRU-bounded)
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
-        self._client_cache_max = 100  # max cached clients
+        self._client_cache_max = config.client_cache_max or 100
 
         # Multi-workspace OAuth fields
         self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
@@ -281,14 +281,12 @@ class SlackAdapter:
         client = AsyncWebClient(token=resolved_token)
         self._client_cache[resolved_token] = client
         if len(self._client_cache) > self._client_cache_max:
-            # Evict oldest (LRU)
-            evicted_token, evicted_client = self._client_cache.popitem(last=False)
-            # Close the evicted client's session if possible
-            try:
-                if hasattr(evicted_client, "session") and evicted_client.session:
-                    asyncio.get_running_loop().create_task(evicted_client.session.close())
-            except RuntimeError:
-                pass
+            # Evict oldest (LRU).  We intentionally do NOT close the evicted
+            # client's session here because other concurrent requests may still
+            # hold a reference to the evicted AsyncWebClient instance.  The
+            # underlying aiohttp.ClientSession will be closed by the garbage
+            # collector (via __del__) once all references are released.
+            self._client_cache.popitem(last=False)
         return client
 
     def _invalidate_client(self, token: str) -> None:
@@ -2688,13 +2686,16 @@ class SlackAdapter:
 
         Never returns (always raises).
         """
-        slack_error = error
-        resp = getattr(slack_error, "response", None)
+        # slack_sdk's SlackApiError has a .response attribute (SlackResponse)
+        # SlackResponse has a .data dict and an .get() method
+        resp = getattr(error, "response", None)
         error_code: str | None = None
-        if isinstance(resp, dict):
-            error_code = resp.get("error")
-        elif resp is not None:
-            error_code = getattr(resp, "get", lambda *a: None)("error")
+        if resp is not None:
+            # SlackResponse has .data dict or direct attribute access
+            if hasattr(resp, "data") and isinstance(resp.data, dict):
+                error_code = resp.data.get("error")
+            elif isinstance(resp, dict):
+                error_code = resp.get("error")
 
         # Invalidate cached client on auth errors (token revocation / invalid_auth)
         if error_code in ("invalid_auth", "token_revoked", "account_inactive"):
@@ -2705,8 +2706,13 @@ class SlackAdapter:
                 pass
 
         # Check for rate limiting
-        if isinstance(resp, dict) and error_code == "ratelimited":
-            raise AdapterRateLimitError("slack") from error
+        if error_code == "ratelimited":
+            retry_after = None
+            if hasattr(resp, "headers"):
+                retry_after = resp.headers.get("Retry-After")
+            elif isinstance(resp, dict):
+                retry_after = resp.get("headers", {}).get("Retry-After")
+            raise AdapterRateLimitError("slack", int(retry_after) if retry_after else None) from error
 
         raise error  # type: ignore[misc]
 

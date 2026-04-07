@@ -151,10 +151,25 @@ class TestInvalidateClient:
 # ---------------------------------------------------------------------------
 
 
-def _make_slack_api_error(error_code: str) -> Exception:
-    """Build a mock SlackApiError whose response contains *error_code*."""
+def _make_slack_api_error(error_code: str, *, use_slack_response: bool = False, retry_after: str | None = None) -> Exception:
+    """Build a mock SlackApiError whose response contains *error_code*.
+
+    When *use_slack_response* is True, the response mimics a ``SlackResponse``
+    object (with ``.data`` dict and ``.headers``) instead of a plain dict.
+    """
     err = Exception(f"Slack error: {error_code}")
-    err.response = {"error": error_code}  # type: ignore[attr-defined]
+    if use_slack_response:
+
+        class _FakeSlackResponse:
+            def __init__(self):
+                self.data = {"error": error_code}
+                self.headers = {}
+                if retry_after is not None:
+                    self.headers["Retry-After"] = retry_after
+
+        err.response = _FakeSlackResponse()  # type: ignore[attr-defined]
+    else:
+        err.response = {"error": error_code}  # type: ignore[attr-defined]
     return err
 
 
@@ -193,3 +208,81 @@ class TestHandleSlackErrorEviction:
             adapter._handle_slack_error(_make_slack_api_error("channel_not_found"))
 
         assert "xoxb-tok" in adapter._client_cache, "Non-auth error should not evict the client"
+
+    def test_handle_slack_error_slack_response_object(self):
+        """Auth eviction must work when resp is a SlackResponse (not a dict)."""
+        adapter = _make_adapter(bot_token="xoxb-tok")
+        adapter._get_client("xoxb-tok")
+        assert "xoxb-tok" in adapter._client_cache
+
+        with pytest.raises(Exception, match="invalid_auth"):
+            adapter._handle_slack_error(
+                _make_slack_api_error("invalid_auth", use_slack_response=True)
+            )
+
+        assert "xoxb-tok" not in adapter._client_cache
+
+
+# ---------------------------------------------------------------------------
+# _handle_slack_error — rate limiting
+# ---------------------------------------------------------------------------
+
+
+class TestHandleSlackErrorRateLimit:
+    """_handle_slack_error should raise AdapterRateLimitError on ratelimited."""
+
+    def test_rate_limit_from_dict_response(self):
+        """Rate limit detection with a plain dict response."""
+        from chat_sdk.shared.errors import AdapterRateLimitError
+
+        adapter = _make_adapter(bot_token="xoxb-tok")
+        with pytest.raises(AdapterRateLimitError):
+            adapter._handle_slack_error(_make_slack_api_error("ratelimited"))
+
+    def test_rate_limit_from_slack_response(self):
+        """Rate limit detection with a SlackResponse-like object."""
+        from chat_sdk.shared.errors import AdapterRateLimitError
+
+        adapter = _make_adapter(bot_token="xoxb-tok")
+        with pytest.raises(AdapterRateLimitError) as exc_info:
+            adapter._handle_slack_error(
+                _make_slack_api_error("ratelimited", use_slack_response=True, retry_after="30")
+            )
+        assert exc_info.value.retry_after == 30
+
+    def test_rate_limit_without_retry_after(self):
+        """Rate limit with no Retry-After header should still raise."""
+        from chat_sdk.shared.errors import AdapterRateLimitError
+
+        adapter = _make_adapter(bot_token="xoxb-tok")
+        with pytest.raises(AdapterRateLimitError) as exc_info:
+            adapter._handle_slack_error(
+                _make_slack_api_error("ratelimited", use_slack_response=True)
+            )
+        assert exc_info.value.retry_after is None
+
+
+# ---------------------------------------------------------------------------
+# Configurable client_cache_max
+# ---------------------------------------------------------------------------
+
+
+class TestConfigurableCacheMax:
+    """client_cache_max should be configurable via SlackAdapterConfig."""
+
+    def test_default_cache_max(self):
+        """Default cache max should be 100."""
+        adapter = _make_adapter()
+        assert adapter._client_cache_max == 100
+
+    def test_custom_cache_max(self):
+        """Custom cache max should override the default."""
+        adapter = _make_adapter(client_cache_max=50)
+        assert adapter._client_cache_max == 50
+
+        # Fill to capacity + 1
+        for i in range(51):
+            adapter._get_client(f"tok-{i}")
+
+        assert len(adapter._client_cache) == 50
+        assert "tok-0" not in adapter._client_cache
