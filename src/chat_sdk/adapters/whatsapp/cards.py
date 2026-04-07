@@ -66,7 +66,7 @@ def encode_whatsapp_callback_data(action_id: str, value: str | None = None) -> s
     payload: dict[str, str] = {"a": action_id}
     if isinstance(value, str):
         payload["v"] = value
-    return f"{CALLBACK_DATA_PREFIX}{json.dumps(payload)}"
+    return f"{CALLBACK_DATA_PREFIX}{json.dumps(payload, separators=(',', ':'))}"
 
 
 def decode_whatsapp_callback_data(data: str | None = None) -> dict[str, str | None]:

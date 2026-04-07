@@ -20,6 +20,7 @@ from chat_sdk.cards import (
     SectionElement,
     TextElement,
     card_child_to_fallback_text,
+    table_element_to_ascii,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.shared.card_utils import render_gfm_table
@@ -271,9 +272,7 @@ def _child_to_fallback_text(child: CardChild) -> str | None:
     if child_type == "table":
         headers = child.get("headers", [])  # type: ignore[union-attr]
         rows = child.get("rows", [])  # type: ignore[union-attr]
-        from chat_sdk.shared.base_format_converter import table_to_ascii
-
-        return f"```\n{table_to_ascii({'type': 'table', 'children': [], 'headers': headers, 'rows': rows})}\n```"
+        return f"```\n{table_element_to_ascii(headers, rows)}\n```"
     if child_type == "divider":
         return "---"
 

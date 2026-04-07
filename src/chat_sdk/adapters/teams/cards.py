@@ -301,20 +301,9 @@ def card_to_fallback_text(card: CardElement) -> str:
     """Generate fallback text from a card element.
 
     Used when adaptive cards aren't supported.
+    Delegates to the shared implementation which handles emoji conversion
+    and renders all child types (including tables, fields, etc.) correctly.
     """
-    parts: list[str] = []
+    from chat_sdk.shared.card_utils import card_to_fallback_text as shared_card_to_fallback_text
 
-    title = card.get("title")
-    if title:
-        parts.append(f"**{_convert_emoji(title)}**")
-
-    subtitle = card.get("subtitle")
-    if subtitle:
-        parts.append(_convert_emoji(subtitle))
-
-    for child in card.get("children", []):
-        text = card_child_to_fallback_text(child)
-        if text:
-            parts.append(text)
-
-    return "\n\n".join(parts)
+    return shared_card_to_fallback_text(card, bold_format="**", line_break="\n\n", platform="teams")

@@ -242,6 +242,8 @@ class SlackFormatConverter(BaseFormatConverter):
             return f"<{node.get('url', '')}|{link_text}>"
 
         if node_type == "heading":
+            # Intentional improvement over TS SDK: Slack mrkdwn has no heading
+            # syntax, so we wrap headings in bold (*...*) for visual emphasis.
             content = "".join(self._node_to_mrkdwn(c) for c in children)
             return f"*{content}*"
 

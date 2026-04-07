@@ -308,11 +308,11 @@ class TestWhatsAppCallbackData:
 
     def test_encode_action_only(self):
         result = encode_whatsapp_callback_data("my_action")
-        assert result == 'chat:{"a": "my_action"}'
+        assert result == 'chat:{"a":"my_action"}'
 
     def test_encode_action_and_value(self):
         result = encode_whatsapp_callback_data("my_action", "some_value")
-        assert result == 'chat:{"a": "my_action", "v": "some_value"}'
+        assert result == 'chat:{"a":"my_action","v":"some_value"}'
 
     def test_decode_encoded_data(self):
         encoded = encode_whatsapp_callback_data("my_action", "some_value")

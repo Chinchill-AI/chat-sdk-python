@@ -543,10 +543,17 @@ class PostgresStateAdapter:
             return None
 
         data = json.loads(row["value"])
+        msg_data = data["message"]
+        if isinstance(msg_data, dict) and msg_data.get("_type") == "chat:Message":
+            from chat_sdk.types import Message
+
+            msg = Message.from_json(msg_data)
+        else:
+            msg = msg_data
         return QueueEntry(
             enqueued_at=data["enqueued_at"],
             expires_at=data["expires_at"],
-            message=data["message"],
+            message=msg,
         )
 
     async def queue_depth(self, thread_id: str) -> int:

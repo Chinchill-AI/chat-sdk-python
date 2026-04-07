@@ -65,7 +65,7 @@ DEFAULT_EMOJI_MAP: dict[str, EmojiFormats] = {
     "check": EmojiFormats(slack=["white_check_mark", "heavy_check_mark"], gchat=["✅", "✔️"]),
     "x": EmojiFormats(slack=["x", "heavy_multiplication_x"], gchat=["❌", "✖️"]),
     "question": EmojiFormats(slack="question", gchat=["❓", "?"]),
-    "exclamation": EmojiFormats(slack="exclamation", gchat=["❗", "!"]),
+    "exclamation": EmojiFormats(slack="exclamation", gchat="❗"),
     "warning": EmojiFormats(slack="warning", gchat="⚠️"),
     "stop": EmojiFormats(slack="octagonal_sign", gchat="🛑"),
     "info": EmojiFormats(slack="information_source", gchat="ℹ️"),
@@ -104,7 +104,7 @@ DEFAULT_EMOJI_MAP: dict[str, EmojiFormats] = {
     "key": EmojiFormats(slack="key", gchat="🔑"),
     "pin": EmojiFormats(slack="pushpin", gchat="📌"),
     "bell": EmojiFormats(slack="bell", gchat="🔔"),
-    "megaphone": EmojiFormats(slack="mega", gchat="📣"),
+    "megaphone": EmojiFormats(slack="mega", gchat="📢"),
     "loudspeaker": EmojiFormats(slack="loudspeaker", gchat="📢"),
     "speech_bubble": EmojiFormats(slack="speech_balloon", gchat="💬"),
     "clipboard": EmojiFormats(slack="clipboard", gchat="📋"),
@@ -193,7 +193,12 @@ class EmojiResolver:
 
         Returns an EmojiValue for the raw emoji if no mapping exists.
         """
-        cleaned = slack_emoji.strip(":").lower()
+        cleaned = slack_emoji.lower()
+        # Strip at most one colon from each end (avoid stripping interior colons)
+        if cleaned.startswith(":"):
+            cleaned = cleaned[1:]
+        if cleaned.endswith(":"):
+            cleaned = cleaned[:-1]
         normalized = self._slack_to_normalized.get(cleaned, slack_emoji)
         return get_emoji(normalized)
 

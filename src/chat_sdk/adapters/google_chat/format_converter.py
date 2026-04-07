@@ -112,6 +112,8 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             return f"{link_text} ({url})"
 
         if node_type == "heading":
+            # Intentional improvement over TS SDK: Google Chat has no heading
+            # syntax, so we wrap headings in bold (*...*) for visual emphasis.
             children = node.get("children", [])
             content = "".join(self._node_to_gchat(child) for child in children)
             return f"*{content}*"
