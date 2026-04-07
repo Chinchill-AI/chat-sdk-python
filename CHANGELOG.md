@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.1a7 (2026-04-03)
+
+Fixture replay tests and coverage hardening.
+
+- All fixture replay tests pass (46 tests, 28 JSON fixtures copied from TS SDK)
+- GChat: fix float startIndex in annotation parsing
+- Postgres: atomic lock upsert to eliminate TOCTOU race
+- Coverage tests added for 4 low-coverage modules
+- Documentation updates (TESTING.md, ARCHITECTURE.md)
+
 ## 0.0.1a6 (2026-04-07)
 
 Systematic port fidelity scan — 10 more bugs fixed.

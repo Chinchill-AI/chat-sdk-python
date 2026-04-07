@@ -228,15 +228,15 @@ def assert_no_camel_case_keys(d, path="", *, skip_raw=True):
 
 This test suite is a regression guard. Without it, any refactoring of adapter dispatch code could reintroduce camelCase keys without any test failure. The test runs on every CI build and takes < 1 second.
 
-## Plans: Webhook JSON Fixtures
+## Webhook JSON Fixtures (Done)
 
-The TS SDK repository contains recorded webhook JSON payloads used for testing. We plan to copy these fixtures into `tests/fixtures/` to enable:
+28 webhook JSON fixtures were copied from the TS SDK repository into `tests/fixtures/` and 46 replay tests now pass against them. The fixtures enable:
 
-1. **Cross-language parity testing**: Verify that the Python adapter produces the same normalized `Message` objects as the TS adapter for identical webhook payloads.
+1. **Cross-language parity testing**: The Python adapter produces the same normalized `Message` objects as the TS adapter for identical webhook payloads.
 2. **Platform version regression**: When platforms change their webhook format, the fixture files make it obvious what changed.
-3. **Replay tests without mocks**: Drive the full adapter pipeline with real payloads instead of hand-constructed dicts.
+3. **Replay tests without mocks**: The full adapter pipeline is driven with real payloads instead of hand-constructed dicts.
 
-The fixture format will be:
+The fixture layout:
 ```
 tests/fixtures/
   slack/
