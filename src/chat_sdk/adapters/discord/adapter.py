@@ -36,9 +36,9 @@ from chat_sdk.adapters.discord.types import (
     DiscordThreadId,
     InteractionResponseType,
 )
-from chat_sdk.emoji import convert_emoji_placeholders
+from chat_sdk.emoji import convert_emoji_placeholders, get_emoji, resolve_emoji_from_gchat
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.shared.adapter_utils import extract_card
+from chat_sdk.shared.adapter_utils import extract_card, extract_files
 from chat_sdk.shared.errors import NetworkError, ValidationError
 from chat_sdk.types import (
     ActionEvent,
@@ -50,6 +50,7 @@ from chat_sdk.types import (
     EmojiValue,
     FetchOptions,
     FetchResult,
+    FileUpload,
     FormattedContent,
     Message,
     MessageMetadata,
@@ -677,13 +678,21 @@ class DiscordAdapter:
         emoji_id = emoji_data.get("id")
         raw_emoji = f"<:{emoji_name}:{emoji_id}>" if emoji_id else emoji_name
 
+        # Normalize emoji through the emoji resolver
+        if emoji_name and not emoji_id:
+            # Standard unicode emoji -- resolve through gchat (unicode) resolver
+            normalized = resolve_emoji_from_gchat(emoji_name)
+        else:
+            # Custom emoji -- use custom:{id} key or raw name
+            normalized = get_emoji(f"custom:{emoji_id}" if emoji_id else emoji_name)
+
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
                 thread=None,
                 thread_id=thread_id,
                 message_id=data.get("message_id", ""),
-                emoji=EmojiValue(name=emoji_name),
+                emoji=normalized,
                 raw_emoji=raw_emoji,
                 added=added,
                 user=Author(
@@ -730,6 +739,43 @@ class DiscordAdapter:
         if components:
             payload["components"] = components
 
+        # --- Handle file attachments via multipart/form-data ---
+        files = extract_files(message)
+
+        # --- Resolve deferred slash-command interaction if pending ---
+        req_ctx = self._request_context.get()
+        slash_ctx = req_ctx.slash_command if req_ctx else None
+        if slash_ctx and not slash_ctx.initial_response_sent:
+            slash_ctx.initial_response_sent = True
+            self._logger.debug(
+                "Discord API: PATCH deferred interaction response",
+                {
+                    "channelId": channel_id,
+                    "contentLength": len(payload.get("content", "")),
+                    "embedCount": len(embeds),
+                    "componentCount": len(components),
+                    "fileCount": len(files),
+                },
+            )
+
+            result = await self._discord_fetch(
+                f"/webhooks/{self._application_id}/{slash_ctx.interaction_token}/messages/@original",
+                "PATCH",
+                payload,
+                files=files or None,
+            )
+
+            self._logger.debug(
+                "Discord API: PATCH deferred interaction response completed",
+                {"messageId": result.get("id") if result else None},
+            )
+
+            return RawMessage(
+                id=(result or {}).get("id", ""),
+                thread_id=thread_id,
+                raw=result or {},
+            )
+
         self._logger.debug(
             "Discord API: POST message",
             {
@@ -737,6 +783,7 @@ class DiscordAdapter:
                 "contentLength": len(payload.get("content", "")),
                 "embedCount": len(embeds),
                 "componentCount": len(components),
+                "fileCount": len(files),
             },
         )
 
@@ -744,6 +791,7 @@ class DiscordAdapter:
             f"/channels/{channel_id}/messages",
             "POST",
             payload,
+            files=files or None,
         )
 
         self._logger.debug(
@@ -1255,8 +1303,14 @@ class DiscordAdapter:
         path: str,
         method: str,
         body: Any = None,
+        files: list[FileUpload] | None = None,
     ) -> Any:
-        """Make a request to the Discord API using aiohttp (lazy import)."""
+        """Make a request to the Discord API using aiohttp (lazy import).
+
+        When *files* is provided the request uses ``multipart/form-data``
+        with a ``payload_json`` field for the JSON body and one field per
+        file attachment, matching the Discord API multipart upload spec.
+        """
         import aiohttp  # lazy import
 
         url = f"{DISCORD_API_BASE}{path}"
@@ -1264,8 +1318,25 @@ class DiscordAdapter:
             "Authorization": f"Bot {self._bot_token}",
         }
 
-        if body is not None:
-            headers["Content-Type"] = "application/json"
+        # Build request kwargs depending on whether we have file uploads
+        request_kwargs: dict[str, Any] = {}
+        if files:
+            # Multipart form-data with payload_json + file parts
+            form = aiohttp.FormData()
+            form.add_field("payload_json", json.dumps(body or {}), content_type="application/json")
+            for idx, file in enumerate(files):
+                form.add_field(
+                    f"files[{idx}]",
+                    file.data,
+                    filename=file.filename,
+                    content_type=file.mime_type or "application/octet-stream",
+                )
+            request_kwargs["data"] = form
+            # Do NOT set Content-Type header -- aiohttp sets the multipart boundary
+        else:
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                request_kwargs["json"] = body
 
         async with (
             aiohttp.ClientSession() as session,
@@ -1273,7 +1344,7 @@ class DiscordAdapter:
                 method,
                 url,
                 headers=headers,
-                json=body if body is not None else None,
+                **request_kwargs,
             ) as response,
         ):
             if not response.ok:

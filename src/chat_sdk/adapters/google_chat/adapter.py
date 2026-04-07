@@ -501,16 +501,22 @@ class GoogleChatAdapter:
                 "Subscription creation already in progress, waiting",
                 {"spaceName": space_name},
             )
-            await self._pending_subscriptions[space_name].wait()
+            pending = self._pending_subscriptions[space_name]
+            await pending["event"].wait()
+            if pending.get("error"):
+                raise pending["error"]
             return
 
         # Create the subscription
-        event = asyncio.Event()
-        self._pending_subscriptions[space_name] = event
+        pending_entry: dict[str, Any] = {"event": asyncio.Event(), "error": None}
+        self._pending_subscriptions[space_name] = pending_entry
         try:
             await self._create_space_subscription_with_cache(space_name, cache_key)
+        except Exception as e:
+            pending_entry["error"] = e
+            raise
         finally:
-            event.set()
+            pending_entry["event"].set()
             self._pending_subscriptions.pop(space_name, None)
 
     async def _create_space_subscription_with_cache(

@@ -39,6 +39,7 @@ FormattedContent = dict[str, Any]
 
 LockScope = Literal["thread", "channel"]
 ConcurrencyStrategy = Literal["drop", "queue", "debounce", "concurrent"]
+OnLockConflict = Literal["drop", "force"] | Callable[..., Awaitable[bool] | bool]
 FetchDirection = Literal["forward", "backward"]
 
 # Well-known emoji names
@@ -1252,6 +1253,7 @@ class ChatConfig:
     lock_scope: LockScope | Callable[..., LockScope | Awaitable[LockScope]] | None = None
     logger: Logger | LogLevel | None = None
     message_history: dict[str, Any] | None = None
+    on_lock_conflict: OnLockConflict | None = None
     streaming_update_interval_ms: int = 500
 
 
@@ -1373,6 +1375,16 @@ class Channel(Postable, Protocol):
         """Fetch channel metadata from the platform."""
         ...
 
+    def messages(self) -> AsyncIterable[Message]:
+        """Iterate messages newest first (backward from most recent).
+
+        Auto-paginates lazily -- only fetches pages as consumed.
+
+        Note: This is a method, not a property.  Call with ``()``:
+        ``async for msg in channel.messages(): ...``
+        """
+        ...
+
     def threads(self) -> AsyncIterable[ThreadSummary]:
         """Iterate threads in this channel, most recently active first.
 
@@ -1405,6 +1417,9 @@ class Thread(Postable, Protocol):
         """Iterate messages newest first (backward from most recent).
 
         Auto-paginates lazily -- only fetches pages as consumed.
+
+        Note: This is a method, not a property.  Call with ``()``:
+        ``async for msg in thread.messages(): ...``
         """
         ...
 
@@ -1412,6 +1427,9 @@ class Thread(Postable, Protocol):
         """Iterate messages oldest first (forward from beginning).
 
         Auto-paginates lazily.
+
+        Note: This is a method, not a property.  Call with ``()``:
+        ``async for msg in thread.all_messages(): ...``
         """
         ...
 

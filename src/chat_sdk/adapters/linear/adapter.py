@@ -785,7 +785,8 @@ class LinearAdapter:
             channel_name=f"{issue.get('identifier', '')}: {issue.get('title', '')}",
             is_dm=False,
             metadata={
-                "issue_id": decoded.issue_id,
+                "issueId": decoded.issue_id,
+                "issue_id": decoded.issue_id,  # snake_case alias for compatibility
                 "identifier": issue.get("identifier"),
                 "title": issue.get("title"),
                 "url": issue.get("url"),

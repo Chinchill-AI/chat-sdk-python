@@ -469,7 +469,8 @@ class TeamsAdapter:
                     thread=None,
                     adapter=self,
                     raw=activity,
-                )
+                ),
+                options,
             )
 
         for reaction in activity.get("reactionsRemoved", []):
@@ -485,7 +486,8 @@ class TeamsAdapter:
                     thread=None,
                     adapter=self,
                     raw=activity,
-                )
+                ),
+                options,
             )
 
     def _parse_teams_message(
