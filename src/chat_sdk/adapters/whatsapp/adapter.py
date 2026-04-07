@@ -660,9 +660,13 @@ class WhatsAppAdapter:
                     f"Media download URL host is not an allowed Meta domain: {host}",
                 )
 
-            # Step 2: Download the actual file (no Bearer token -- CDN URLs are pre-signed)
+            # Step 2: Download the actual file.
+            # The WhatsApp Cloud API requires the Bearer token for media downloads
+            # (the URL is not pre-signed). The SSRF domain validation above ensures
+            # we only send the token to legitimate Meta/WhatsApp domains.
             async with session.get(
                 download_url,
+                headers={"Authorization": f"Bearer {self._access_token}"},
             ) as data_response:
                 if data_response.status != 200:
                     self._logger.error(

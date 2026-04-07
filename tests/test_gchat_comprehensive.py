@@ -1745,7 +1745,7 @@ class TestWorkspaceEventsComprehensive:
         adapter, api, state = await _init_adapter(pubsub_topic="projects/test/topics/test")
 
         event = asyncio.Event()
-        adapter._pending_subscriptions["spaces/TEST1"] = event
+        adapter._pending_subscriptions["spaces/TEST1"] = {"event": event, "error": None}
 
         async def wait_and_set():
             await asyncio.sleep(0.01)

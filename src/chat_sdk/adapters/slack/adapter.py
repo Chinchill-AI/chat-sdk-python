@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
@@ -681,18 +682,21 @@ class SlackAdapter:
                 "headers": {"Content-Type": "application/json"},
             }
 
-        # Multi-workspace: resolve token before processing events
+        # Multi-workspace: resolve token before processing events.
+        # Use contextvars.copy_context() so the ContextVar value persists into
+        # any async tasks spawned by _process_event_payload (e.g. process_message
+        # creates a task via asyncio.create_task).  The copied context is
+        # isolated -- the ContextVar change does not leak back to the caller
+        # and does not need an explicit reset.
         if not self._default_bot_token and payload.get("type") == "event_callback":
             team_id_event = payload.get("team_id")
             if team_id_event:
                 ctx = await self._resolve_token_for_team(team_id_event)
                 if ctx:
-                    tok = self._request_context.set(ctx)
-                    try:
-                        self._process_event_payload(payload, options)
-                        return {"body": "ok", "status": 200}
-                    finally:
-                        self._request_context.reset(tok)
+                    isolated = contextvars.copy_context()
+                    isolated.run(self._request_context.set, ctx)
+                    isolated.run(self._process_event_payload, payload, options)
+                    return {"body": "ok", "status": 200}
                 self._logger.warn("Could not resolve token for team", {"teamId": team_id_event})
                 return {"body": "ok", "status": 200}
 

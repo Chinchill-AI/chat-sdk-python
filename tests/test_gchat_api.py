@@ -903,9 +903,9 @@ class TestWorkspaceEventsSubscription:
         """If a subscription is already being created, should wait rather than duplicate."""
         adapter, api, state = await _init_adapter(pubsub_topic="projects/test/topics/test")
 
-        # Simulate an in-progress subscription
+        # Simulate an in-progress subscription (dict with event + error)
         event = asyncio.Event()
-        adapter._pending_subscriptions["spaces/TEST1"] = event
+        adapter._pending_subscriptions["spaces/TEST1"] = {"event": event, "error": None}
 
         # Should wait on the event and return without creating a new one
         async def wait_and_set():

@@ -47,6 +47,7 @@ from chat_sdk.types import (
     ModalCloseEvent,
     ModalResponse,
     ModalSubmitEvent,
+    OnLockConflict,
     QueueEntry,
     ReactionEvent,
     SlashCommandEvent,
@@ -228,6 +229,7 @@ class Chat:
         self._fallback_streaming_placeholder_text = config.fallback_streaming_placeholder_text
         self._dedupe_ttl_ms = config.dedupe_ttl_ms or DEDUPE_TTL_MS
         self._lock_scope_config = config.lock_scope
+        self._on_lock_conflict: OnLockConflict | None = config.on_lock_conflict
 
         # -- Concurrency config -----------------------------------------------
         concurrency = config.concurrency
@@ -1440,11 +1442,14 @@ class Chat:
     ) -> None:
         lock = await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
         if lock is None:
-            self._logger.warn("Could not acquire lock on thread", {"thread_id": thread_id, "lock_key": lock_key})
-            raise LockError(
-                thread_id,
-                f"Could not acquire lock on thread {thread_id}. Another instance may be processing.",
-            )
+            # Lock acquisition failed -- consult on_lock_conflict policy
+            lock = await self._resolve_lock_conflict(thread_id, lock_key, message)
+            if lock is None:
+                self._logger.warn("Could not acquire lock on thread", {"thread_id": thread_id, "lock_key": lock_key})
+                raise LockError(
+                    thread_id,
+                    f"Could not acquire lock on thread {thread_id}. Another instance may be processing.",
+                )
 
         self._logger.debug("Lock acquired", {"thread_id": thread_id, "lock_key": lock_key, "token": lock.token})
         try:
@@ -1452,6 +1457,47 @@ class Chat:
         finally:
             await self._state_adapter.release_lock(lock)
             self._logger.debug("Lock released", {"thread_id": thread_id, "lock_key": lock_key})
+
+    async def _resolve_lock_conflict(
+        self,
+        thread_id: str,
+        lock_key: str,
+        message: Message,
+    ) -> Lock | None:
+        """Attempt to resolve a lock conflict based on the ``on_lock_conflict`` policy.
+
+        Returns a :class:`Lock` if the conflict was resolved and the lock
+        was successfully re-acquired, or ``None`` if the message should be
+        dropped.
+        """
+        conflict = self._on_lock_conflict
+
+        if conflict is None or conflict == "drop":
+            return None
+
+        if conflict == "force":
+            self._logger.info(
+                "Force-releasing lock due to on_lock_conflict='force'",
+                {"thread_id": thread_id, "lock_key": lock_key},
+            )
+            await self._state_adapter.force_release_lock(lock_key)
+            return await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+
+        # Callable handler -- invoke and inspect result
+        if callable(conflict):
+            result = conflict(thread_id, message)
+            # Support both sync and async callables
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                result = await result
+            if result:
+                self._logger.info(
+                    "on_lock_conflict callback returned True, force-releasing lock",
+                    {"thread_id": thread_id, "lock_key": lock_key},
+                )
+                await self._state_adapter.force_release_lock(lock_key)
+                return await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+
+        return None
 
     # -- Queue / Debounce strategy -------------------------------------------
 
