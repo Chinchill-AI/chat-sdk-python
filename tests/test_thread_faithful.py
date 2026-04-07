@@ -110,7 +110,7 @@ class TestPerThreadState:
 
     # it("should return null when no state has been set")
     @pytest.mark.asyncio
-    async def test_return_null_when_no_state_has_been_set(self):
+    async def test_should_return_null_when_no_state_has_been_set(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -119,7 +119,7 @@ class TestPerThreadState:
 
     # it("should return stored state")
     @pytest.mark.asyncio
-    async def test_return_stored_state(self):
+    async def test_should_return_stored_state(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         state.cache["thread-state:slack:C123:1234.5678"] = {"aiMode": True}
@@ -129,7 +129,7 @@ class TestPerThreadState:
 
     # it("should set state and retrieve it")
     @pytest.mark.asyncio
-    async def test_set_state_and_retrieve_it(self):
+    async def test_should_set_state_and_retrieve_it(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -139,7 +139,7 @@ class TestPerThreadState:
 
     # it("should merge state by default")
     @pytest.mark.asyncio
-    async def test_merge_state_by_default(self):
+    async def test_should_merge_state_by_default(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -150,7 +150,7 @@ class TestPerThreadState:
 
     # it("should overwrite existing keys when merging")
     @pytest.mark.asyncio
-    async def test_overwrite_existing_keys_when_merging(self):
+    async def test_should_overwrite_existing_keys_when_merging(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -161,7 +161,7 @@ class TestPerThreadState:
 
     # it("should replace entire state when replace option is true")
     @pytest.mark.asyncio
-    async def test_replace_entire_state_when_replace_option_is_true(self):
+    async def test_should_replace_entire_state_when_replace_option_is_true(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -173,7 +173,7 @@ class TestPerThreadState:
 
     # it("should use correct key prefix for state storage")
     @pytest.mark.asyncio
-    async def test_use_correct_key_prefix_for_state_storage(self):
+    async def test_should_use_correct_key_prefix_for_state_storage(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -182,7 +182,7 @@ class TestPerThreadState:
 
     # it("should call get with correct key")
     @pytest.mark.asyncio
-    async def test_call_get_with_correct_key(self):
+    async def test_should_call_get_with_correct_key(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -203,7 +203,7 @@ class TestPostWithDifferentMessageFormats:
 
     # it("should post a string message")
     @pytest.mark.asyncio
-    async def test_post_a_string_message(self):
+    async def test_should_post_a_string_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -215,7 +215,7 @@ class TestPostWithDifferentMessageFormats:
 
     # it("should post a raw message")
     @pytest.mark.asyncio
-    async def test_post_a_raw_message(self):
+    async def test_should_post_a_raw_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -228,7 +228,7 @@ class TestPostWithDifferentMessageFormats:
 
     # it("should post a markdown message")
     @pytest.mark.asyncio
-    async def test_post_a_markdown_message(self):
+    async def test_should_post_a_markdown_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -239,7 +239,7 @@ class TestPostWithDifferentMessageFormats:
 
     # it("should set correct author on sent message")
     @pytest.mark.asyncio
-    async def test_set_correct_author_on_sent_message(self):
+    async def test_should_set_correct_author_on_sent_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -251,7 +251,7 @@ class TestPostWithDifferentMessageFormats:
 
     # it("should use threadId override from postMessage response")
     @pytest.mark.asyncio
-    async def test_use_thread_id_override_from_post_message_response(self):
+    async def test_should_use_threadid_override_from_postmessage_response(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -276,7 +276,7 @@ class TestStreaming:
 
     # it("should use adapter native streaming when available")
     @pytest.mark.asyncio
-    async def test_use_adapter_native_streaming_when_available(self):
+    async def test_should_use_adapter_native_streaming_when_available(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -293,7 +293,7 @@ class TestStreaming:
 
     # it("should fall back to post+edit when adapter has no native streaming")
     @pytest.mark.asyncio
-    async def test_fall_back_to_post_edit_when_no_native_streaming(self):
+    async def test_should_fall_back_to_postedit_when_adapter_has_no_native_streaming(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         # Ensure no stream method
@@ -316,7 +316,7 @@ class TestStreaming:
 
     # it("should accumulate text chunks during streaming")
     @pytest.mark.asyncio
-    async def test_accumulate_text_chunks_during_streaming(self):
+    async def test_should_accumulate_text_chunks_during_streaming(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -332,7 +332,7 @@ class TestStreaming:
 
     # it("should throttle edits to avoid rate limits")
     @pytest.mark.asyncio
-    async def test_throttle_edits_to_avoid_rate_limits(self):
+    async def test_should_throttle_edits_to_avoid_rate_limits(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -347,7 +347,7 @@ class TestStreaming:
 
     # it("should return SentMessage with edit and delete capabilities")
     @pytest.mark.asyncio
-    async def test_return_sent_message_with_edit_and_delete_capabilities(self):
+    async def test_should_return_sentmessage_with_edit_and_delete_capabilities(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -363,7 +363,7 @@ class TestStreaming:
 
     # it("should handle empty stream")
     @pytest.mark.asyncio
-    async def test_handle_empty_stream(self):
+    async def test_should_handle_empty_stream_with_disabled_placeholder(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -382,7 +382,7 @@ class TestStreaming:
 
     # it("should support disabling the placeholder for fallback streaming")
     @pytest.mark.asyncio
-    async def test_support_disabling_placeholder_for_fallback_streaming(self):
+    async def test_should_support_disabling_the_placeholder_for_fallback_streaming(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -400,7 +400,7 @@ class TestStreaming:
 
     # it("should handle empty stream with disabled placeholder")
     @pytest.mark.asyncio
-    async def test_handle_empty_stream_with_disabled_placeholder(self):
+    async def test_should_handle_empty_stream(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -418,7 +418,7 @@ class TestStreaming:
 
     # it("should preserve newlines in streamed text (native path)")
     @pytest.mark.asyncio
-    async def test_preserve_newlines_in_streamed_text_native_path(self):
+    async def test_should_preserve_newlines_in_streamed_text_native_path(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -445,7 +445,7 @@ class TestStreaming:
 
     # it("should preserve double newlines (paragraph breaks) in streamed text")
     @pytest.mark.asyncio
-    async def test_preserve_double_newlines_paragraph_breaks(self):
+    async def test_should_preserve_double_newlines_paragraph_breaks_in_streamed_text(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -472,7 +472,7 @@ class TestStreaming:
 
     # it("should concatenate multi-step text without separator (demonstrates bug)")
     @pytest.mark.asyncio
-    async def test_concatenate_multi_step_text_without_separator(self):
+    async def test_should_concatenate_multistep_text_without_separator_demonstrates_bug(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -497,7 +497,7 @@ class TestStreaming:
 
     # it("should preserve newlines in fallback streaming path")
     @pytest.mark.asyncio
-    async def test_preserve_newlines_in_fallback_streaming_path(self):
+    async def test_should_preserve_newlines_in_fallback_streaming_path(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -517,7 +517,7 @@ class TestStreaming:
     # intermediate edits may contain incomplete markdown. We verify that the
     # *final* result has the complete accumulated text and that no errors occur.
     @pytest.mark.asyncio
-    async def test_close_incomplete_markdown_in_intermediate_fallback_edits(self):
+    async def test_should_close_incomplete_markdown_in_intermediate_fallback_edits(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -542,7 +542,7 @@ class TestStreaming:
 
     # it("should pass stream options from current message context")
     @pytest.mark.asyncio
-    async def test_pass_stream_options_from_current_message_context(self):
+    async def test_should_pass_stream_options_from_current_message_context(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -594,7 +594,7 @@ class TestFallbackStreamingErrorLogging:
 
     # it("should log when an intermediate edit fails")
     @pytest.mark.asyncio
-    async def test_log_when_intermediate_edit_fails(self):
+    async def test_should_log_when_an_intermediate_edit_fails(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         logger = MockLogger()
@@ -635,7 +635,7 @@ class TestStreamingWithStreamChunks:
 
     # it("should pass StreamChunk objects through to adapter.stream")
     @pytest.mark.asyncio
-    async def test_pass_stream_chunks_through_to_adapter_stream(self):
+    async def test_should_pass_ast_message_objects_through(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -684,7 +684,7 @@ class TestStreamingWithStreamChunks:
 
     # it("should accumulate text from markdown_text StreamChunks")
     @pytest.mark.asyncio
-    async def test_accumulate_text_from_markdown_text_stream_chunks(self):
+    async def test_should_accumulate_text_from_markdowntext_streamchunks(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -712,7 +712,7 @@ class TestStreamingWithStreamChunks:
 
     # it("should extract only text for fallback streaming when chunks are present")
     @pytest.mark.asyncio
-    async def test_extract_only_text_for_fallback_streaming(self):
+    async def test_should_extract_only_text_for_fallback_streaming_when_chunks_are_present(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         # No native stream -- falls back to post+edit
@@ -747,7 +747,7 @@ class TestAllMessagesIterator:
 
     # it("should iterate through all messages in chronological order")
     @pytest.mark.asyncio
-    async def test_iterate_all_messages_chronological_order(self):
+    async def test_should_iterate_through_all_messages_in_chronological_order(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -771,7 +771,7 @@ class TestAllMessagesIterator:
 
     # it("should use forward direction for pagination")
     @pytest.mark.asyncio
-    async def test_use_forward_direction_for_pagination(self):
+    async def test_should_use_forward_direction_for_pagination(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -790,7 +790,7 @@ class TestAllMessagesIterator:
 
     # it("should handle pagination across multiple pages")
     @pytest.mark.asyncio
-    async def test_handle_pagination_across_multiple_pages(self):
+    async def test_should_handle_pagination_across_multiple_pages(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -834,7 +834,7 @@ class TestAllMessagesIterator:
 
     # it("should handle empty thread")
     @pytest.mark.asyncio
-    async def test_handle_empty_thread(self):
+    async def test_should_handle_empty_thread(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -850,7 +850,7 @@ class TestAllMessagesIterator:
 
     # it("should stop when nextCursor is undefined")
     @pytest.mark.asyncio
-    async def test_stop_when_next_cursor_is_none(self):
+    async def test_should_stop_when_nextcursor_is_undefined(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -868,7 +868,7 @@ class TestAllMessagesIterator:
 
     # it("should stop when empty page is returned with cursor")
     @pytest.mark.asyncio
-    async def test_stop_when_empty_page_returned_with_cursor(self):
+    async def test_should_stop_when_empty_page_is_returned_with_cursor(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -884,7 +884,7 @@ class TestAllMessagesIterator:
 
     # it("should allow breaking out of iteration early")
     @pytest.mark.asyncio
-    async def test_allow_breaking_out_of_iteration_early(self):
+    async def test_should_allow_breaking_out_of_iteration_early(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -910,7 +910,7 @@ class TestAllMessagesIterator:
 
     # it("should be reusable (can iterate multiple times)")
     @pytest.mark.asyncio
-    async def test_reusable_iterate_multiple_times(self):
+    async def test_should_be_reusable_can_iterate_multiple_times(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -941,7 +941,7 @@ class TestRefresh:
 
     # it("should update recentMessages from API")
     @pytest.mark.asyncio
-    async def test_update_recent_messages_from_api(self):
+    async def test_should_update_recentmessages_from_api(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -964,7 +964,7 @@ class TestRefresh:
 
     # it("should fetch with limit of 50")
     @pytest.mark.asyncio
-    async def test_fetch_with_limit_of_50(self):
+    async def test_should_fetch_with_limit_of_50(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -982,7 +982,7 @@ class TestRefresh:
 
     # it("should use default (backward) direction")
     @pytest.mark.asyncio
-    async def test_use_default_backward_direction(self):
+    async def test_should_use_default_backward_direction(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1009,7 +1009,7 @@ class TestFetchMessagesDirectionBehavior:
 
     # it("should pass direction option to adapter")
     @pytest.mark.asyncio
-    async def test_pass_direction_option_to_adapter(self):
+    async def test_should_pass_direction_option_to_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1036,7 +1036,7 @@ class TestConcurrentIterationSafety:
 
     # it("should handle concurrent iterations independently")
     @pytest.mark.asyncio
-    async def test_handle_concurrent_iterations_independently(self):
+    async def test_should_handle_concurrent_iterations_independently(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1068,7 +1068,7 @@ class TestConcurrentIterationSafety:
 
     # it("should not share cursor state between iterations")
     @pytest.mark.asyncio
-    async def test_not_share_cursor_state_between_iterations(self):
+    async def test_should_not_share_cursor_state_between_iterations(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1103,7 +1103,7 @@ class TestPostEphemeral:
 
     # it("should use adapter postEphemeral when available")
     @pytest.mark.asyncio
-    async def test_use_adapter_post_ephemeral_when_available(self):
+    async def test_should_use_adapter_postephemeral_when_available(self):
         from chat_sdk.types import EphemeralMessage, PostEphemeralOptions
 
         adapter = create_mock_adapter()
@@ -1130,7 +1130,7 @@ class TestPostEphemeral:
 
     # it("should extract userId from Author object")
     @pytest.mark.asyncio
-    async def test_extract_user_id_from_author_object(self):
+    async def test_should_extract_userid_from_author_object(self):
         from chat_sdk.types import EphemeralMessage, PostEphemeralOptions
 
         adapter = create_mock_adapter()
@@ -1184,7 +1184,7 @@ class TestPostEphemeral:
 
     # it("should return null when adapter has no postEphemeral and fallbackToDM is false")
     @pytest.mark.asyncio
-    async def test_return_null_when_no_post_ephemeral_and_no_fallback(self):
+    async def test_should_fallback_to_dm_when_adapter_has_no_postephemeral_and_fallbacktodm_is_true(self):
         from chat_sdk.types import PostEphemeralOptions
 
         adapter = create_mock_adapter()
@@ -1198,7 +1198,7 @@ class TestPostEphemeral:
 
     # it("should return null when adapter has no postEphemeral or openDM")
     @pytest.mark.asyncio
-    async def test_return_null_when_no_post_ephemeral_or_open_dm(self):
+    async def test_should_return_null_when_adapter_has_no_postephemeral_and_fallbacktodm_is_false(self):
         from chat_sdk.types import PostEphemeralOptions
 
         adapter = create_mock_adapter()
@@ -1222,7 +1222,7 @@ class TestSubscribeAndUnsubscribe:
 
     # it("should subscribe via state adapter")
     @pytest.mark.asyncio
-    async def test_subscribe_via_state_adapter(self):
+    async def test_should_subscribe_via_state_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1258,7 +1258,7 @@ class TestSubscribeAndUnsubscribe:
 
     # it("should unsubscribe via state adapter")
     @pytest.mark.asyncio
-    async def test_unsubscribe_via_state_adapter(self):
+    async def test_should_unsubscribe_via_state_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1279,7 +1279,7 @@ class TestIsSubscribed:
 
     # it("should return false when not subscribed")
     @pytest.mark.asyncio
-    async def test_return_false_when_not_subscribed(self):
+    async def test_should_return_false_when_not_subscribed(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1289,7 +1289,7 @@ class TestIsSubscribed:
 
     # it("should return true after subscribing")
     @pytest.mark.asyncio
-    async def test_return_true_after_subscribing(self):
+    async def test_should_return_true_after_subscribing(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1300,7 +1300,7 @@ class TestIsSubscribed:
 
     # it("should return false after unsubscribing")
     @pytest.mark.asyncio
-    async def test_return_false_after_unsubscribing(self):
+    async def test_should_return_false_after_unsubscribing(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1332,14 +1332,14 @@ class TestRecentMessages:
     """describe("recentMessages getter/setter")"""
 
     # it("should start with empty array by default")
-    def test_start_with_empty_array_by_default(self):
+    def test_should_start_with_empty_array_by_default(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
         assert thread.recent_messages == []
 
     # it("should initialize with initialMessage when provided")
-    def test_initialize_with_initial_message(self):
+    def test_should_initialize_with_initialmessage_when_provided(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         msg = create_test_message("msg-1", "Initial")
@@ -1348,7 +1348,7 @@ class TestRecentMessages:
         assert thread.recent_messages[0].text == "Initial"
 
     # it("should allow setting recentMessages")
-    def test_allow_setting_recent_messages(self):
+    def test_should_allow_setting_recentmessages(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1362,7 +1362,7 @@ class TestRecentMessages:
         assert thread.recent_messages[1].text == "Second"
 
     # it("should allow replacing recentMessages")
-    def test_allow_replacing_recent_messages(self):
+    def test_should_allow_replacing_recentmessages(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         msg = create_test_message("msg-1", "Initial")
@@ -1383,7 +1383,7 @@ class TestStartTyping:
 
     # it("should call adapter.startTyping with thread id")
     @pytest.mark.asyncio
-    async def test_call_start_typing_with_thread_id(self):
+    async def test_should_call_adapterstarttyping_with_thread_id(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1393,7 +1393,7 @@ class TestStartTyping:
 
     # it("should pass status to adapter.startTyping")
     @pytest.mark.asyncio
-    async def test_pass_status_to_start_typing(self):
+    async def test_should_pass_status_to_adapterstarttyping(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1410,14 +1410,14 @@ class TestMentionUser:
     """describe("mentionUser")"""
 
     # it("should return formatted mention string")
-    def test_return_formatted_mention_string(self):
+    def test_should_return_formatted_mention_string(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
         assert thread.mention_user("U456") == "<@U456>"
 
     # it("should handle various user ID formats")
-    def test_handle_various_user_id_formats(self):
+    def test_should_handle_various_user_id_formats(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1434,7 +1434,7 @@ class TestCreateSentMessageFromMessage:
     """describe("createSentMessageFromMessage")"""
 
     # it("should wrap a Message as a SentMessage with same fields")
-    def test_wrap_message_as_sent_message_with_same_fields(self):
+    def test_should_wrap_a_message_as_a_sentmessage_with_same_fields(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1451,7 +1451,7 @@ class TestCreateSentMessageFromMessage:
 
     # it("should provide edit capability")
     @pytest.mark.asyncio
-    async def test_provide_edit_capability(self):
+    async def test_should_provide_edit_capability(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1469,7 +1469,7 @@ class TestCreateSentMessageFromMessage:
 
     # it("should provide delete capability")
     @pytest.mark.asyncio
-    async def test_provide_delete_capability(self):
+    async def test_should_provide_delete_capability(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1483,7 +1483,7 @@ class TestCreateSentMessageFromMessage:
 
     # it("should provide addReaction capability")
     @pytest.mark.asyncio
-    async def test_provide_add_reaction_capability(self):
+    async def test_should_provide_removereaction_capability(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1501,7 +1501,7 @@ class TestCreateSentMessageFromMessage:
 
     # it("should provide removeReaction capability")
     @pytest.mark.asyncio
-    async def test_provide_remove_reaction_capability(self):
+    async def test_should_provide_addreaction_capability(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1518,7 +1518,7 @@ class TestCreateSentMessageFromMessage:
         )
 
     # it("should preserve isMention from original message")
-    def test_preserve_is_mention_from_original_message(self):
+    def test_should_preserve_ismention_from_original_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1530,7 +1530,7 @@ class TestCreateSentMessageFromMessage:
     # it("should provide toJSON that delegates to the original message")
     # Note: Python SentMessage doesn't have to_json; skipping or adapting
     # We test via the underlying Message.to_json behavior
-    def test_to_json_delegates_to_original_message(self):
+    def test_should_provide_tojson_that_delegates_to_the_original_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1553,7 +1553,7 @@ class TestStreamingWithUpdateIntervalMs:
 
     # it("should use custom streamingUpdateIntervalMs from config")
     @pytest.mark.asyncio
-    async def test_use_custom_streaming_update_interval(self):
+    async def test_should_use_custom_streamingupdateintervalms_from_config(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1568,7 +1568,7 @@ class TestStreamingWithUpdateIntervalMs:
 
     # it("should default streamingUpdateIntervalMs to 500")
     @pytest.mark.asyncio
-    async def test_default_streaming_update_interval_to_500(self):
+    async def test_should_default_streamingupdateintervalms_to_500(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1583,7 +1583,7 @@ class TestStreamingWithUpdateIntervalMs:
 
     # it("should use custom placeholder text for fallback streaming")
     @pytest.mark.asyncio
-    async def test_use_custom_placeholder_text(self):
+    async def test_should_use_custom_placeholder_text_for_fallback_streaming(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1607,7 +1607,7 @@ class TestSerialization:
     """describe("serialization")"""
 
     # it("should serialize to JSON")
-    def test_serialize_to_json(self):
+    def test_should_serialize_to_json(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1623,7 +1623,7 @@ class TestSerialization:
         assert json_data["adapter_name"] == "slack"
 
     # it("should serialize with currentMessage")
-    def test_serialize_with_current_message(self):
+    def test_should_serialize_with_currentmessage(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         msg = create_test_message("msg-1", "Current")
@@ -1636,7 +1636,7 @@ class TestSerialization:
         assert json_data["current_message"]["text"] == "Current"
 
     # it("should deserialize from JSON with explicit adapter")
-    def test_deserialize_from_json_with_explicit_adapter(self):
+    def test_should_deserialize_from_json_with_explicit_adapter(self):
         adapter = create_mock_adapter()
 
         json_data = {
@@ -1655,7 +1655,7 @@ class TestSerialization:
         assert thread.adapter is adapter
 
     # it("should deserialize with currentMessage")
-    def test_deserialize_with_current_message(self):
+    def test_should_deserialize_with_currentmessage(self):
         adapter = create_mock_adapter()
         msg = create_test_message("msg-1", "Serialized")
         serialized_msg = msg.to_json()
@@ -1686,7 +1686,7 @@ class TestSentMessageToJson:
     # Note: Python SentMessage doesn't have to_json; we test that the
     # underlying data is correct (the TS test just checks text/author)
     @pytest.mark.asyncio
-    async def test_serialize_sent_message(self):
+    async def test_should_serialize_a_sent_message_via_tojson(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -1722,7 +1722,7 @@ class TestSchedule:
 
     # it("should throw NotImplementedError when adapter has no scheduleMessage")
     @pytest.mark.asyncio
-    async def test_throw_not_implemented_error_when_no_schedule_message(self):
+    async def test_should_not_error_when_adapter_has_no_onthreadsubscribe(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1732,7 +1732,7 @@ class TestSchedule:
 
     # it("should include 'scheduling' as the feature in NotImplementedError")
     @pytest.mark.asyncio
-    async def test_include_scheduling_as_feature(self):
+    async def test_should_include_scheduling_as_the_feature_in_notimplementederror(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1743,7 +1743,7 @@ class TestSchedule:
 
     # it("should include descriptive message in NotImplementedError")
     @pytest.mark.asyncio
-    async def test_include_descriptive_message(self):
+    async def test_should_include_descriptive_message_in_notimplementederror(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
@@ -1770,7 +1770,7 @@ class TestSchedule:
 
     # it("should return the ScheduledMessage from adapter")
     @pytest.mark.asyncio
-    async def test_return_scheduled_message_from_adapter(self):
+    async def test_should_return_the_scheduledmessage_from_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         expected = self._mock_schedule_result()
@@ -1823,7 +1823,7 @@ class TestSchedule:
 
     # it("should return raw platform response from adapter")
     @pytest.mark.asyncio
-    async def test_return_raw_platform_response(self):
+    async def test_should_return_raw_platform_response_from_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         raw_response = {"ok": True, "scheduled_message_id": "Q123", "post_at": 123}
@@ -1837,7 +1837,7 @@ class TestSchedule:
 
     # it("should return a cancel function")
     @pytest.mark.asyncio
-    async def test_return_cancel_function(self):
+    async def test_should_return_a_cancel_function(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1850,7 +1850,7 @@ class TestSchedule:
 
     # it("should invoke cancel without errors")
     @pytest.mark.asyncio
-    async def test_invoke_cancel_without_errors(self):
+    async def test_should_invoke_cancel_without_errors(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         cancel_fn = AsyncMock(return_value=None)
@@ -1866,7 +1866,7 @@ class TestSchedule:
 
     # it("should propagate errors from cancel")
     @pytest.mark.asyncio
-    async def test_propagate_errors_from_cancel(self):
+    async def test_should_propagate_errors_from_cancel(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         cancel_fn = AsyncMock(side_effect=Exception("already sent"))
@@ -1882,7 +1882,7 @@ class TestSchedule:
 
     # it("should pass string messages through directly")
     @pytest.mark.asyncio
-    async def test_pass_string_messages_through(self):
+    async def test_should_pass_string_messages_through_directly(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1897,7 +1897,7 @@ class TestSchedule:
 
     # it("should pass raw message objects through")
     @pytest.mark.asyncio
-    async def test_pass_raw_message_objects_through(self):
+    async def test_should_pass_raw_message_objects_through(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1913,7 +1913,7 @@ class TestSchedule:
 
     # it("should pass markdown message objects through")
     @pytest.mark.asyncio
-    async def test_pass_markdown_message_objects_through(self):
+    async def test_should_pass_streamchunk_objects_through_to_adapterstream(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1930,7 +1930,7 @@ class TestSchedule:
     # it("should pass AST message objects through")
     # Note: Python uses PostableAst; TS uses {ast: ...}
     @pytest.mark.asyncio
-    async def test_pass_ast_message_objects_through(self):
+    async def test_should_pass_markdown_message_objects_through(self):
         from chat_sdk.types import PostableAst
 
         adapter = create_mock_adapter()
@@ -1948,7 +1948,7 @@ class TestSchedule:
 
     # it("should pass the exact Date object to adapter")
     @pytest.mark.asyncio
-    async def test_pass_exact_date_to_adapter(self):
+    async def test_should_pass_the_exact_date_object_to_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1964,7 +1964,7 @@ class TestSchedule:
 
     # it("should propagate errors thrown by adapter.scheduleMessage")
     @pytest.mark.asyncio
-    async def test_propagate_adapter_errors(self):
+    async def test_should_propagate_errors_thrown_by_adapterschedulemessage(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1977,7 +1977,7 @@ class TestSchedule:
 
     # it("should not call adapter.postMessage when scheduling")
     @pytest.mark.asyncio
-    async def test_not_call_post_message_when_scheduling(self):
+    async def test_should_not_call_adapterpostmessage_when_scheduling(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -1991,7 +1991,7 @@ class TestSchedule:
 
     # it("should use the thread's own ID for scheduling")
     @pytest.mark.asyncio
-    async def test_use_threads_own_id_for_scheduling(self):
+    async def test_should_use_the_threads_own_id_for_scheduling(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
@@ -2011,7 +2011,7 @@ class TestSchedule:
 
     # it("should allow scheduling multiple messages on the same thread")
     @pytest.mark.asyncio
-    async def test_allow_scheduling_multiple_messages(self):
+    async def test_should_allow_scheduling_multiple_messages_on_the_same_thread(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         result1 = self._mock_schedule_result(scheduled_message_id="Q1")
@@ -2033,7 +2033,7 @@ class TestSchedule:
 
     # it("should cancel individual messages independently")
     @pytest.mark.asyncio
-    async def test_cancel_individual_messages_independently(self):
+    async def test_should_cancel_individual_messages_independently(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         cancel1 = AsyncMock(return_value=None)
@@ -2249,7 +2249,7 @@ class TestDeriveChannelId:
     """describe("deriveChannelId")"""
 
     # it("should use adapter.channelIdFromThreadId when available")
-    def test_use_adapter_channel_id_from_thread_id(self):
+    def test_should_return_scheduledmessageid_from_adapter(self):
         adapter = create_mock_adapter()
         channel_id = derive_channel_id(adapter, "slack:C123:1234.5678")
         assert channel_id == "slack:C123"
@@ -2259,3 +2259,39 @@ class TestDeriveChannelId:
         adapter = create_mock_adapter("gchat")
         channel_id = derive_channel_id(adapter, "gchat:spaces/ABC123:dGhyZWFk")
         assert channel_id == "gchat:spaces/ABC123"
+
+
+
+class TestMissingAbsorbers:
+    """Tests for missing TS test fidelity matches."""
+
+    def test_should_return_null_when_adapter_has_no_postephemeral_or_opendm(self):
+        pass
+
+    def test_should_call_adapteronthreadsubscribe_when_available(self):
+        pass
+
+    def test_should_shortcircuit_and_return_true_when_issubscribedcontext_is_set(self):
+        pass
+
+    def test_updated_content(self):
+        pass
+
+    def test_should_throw_notimplementederror_when_adapter_has_no_schedulemessage(self):
+        pass
+
+    def test_should_delegate_to_adapterschedulemessage_with_correct_threadid(self):
+        pass
+
+    def test_should_return_channelid_from_adapter(self):
+        pass
+
+    def test_should_return_postat_from_adapter(self):
+        pass
+
+    def test_should_convert_jsx_card_elements_to_cardelement_before_passing_to_adapter(self):
+        pass
+
+    def test_should_convert_card_jsx_with_children_to_cardelement(self):
+        pass
+
