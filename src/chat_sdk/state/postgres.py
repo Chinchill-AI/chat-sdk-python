@@ -213,34 +213,26 @@ class PostgresStateAdapter:
         self._ensure_connected()
 
         token = _generate_token()
-        expires_at = _pg_timestamp_from_ms(ttl_ms)
 
-        # Two-step approach to prevent race condition when lock just expired.
-        # Step 1: Try INSERT for new locks (no existing row).
+        # Atomic upsert: INSERT succeeds for new rows; ON CONFLICT DO UPDATE
+        # fires only when the existing row is expired (WHERE expires_at <= now()).
+        # Postgres acquires a row lock on the conflicting row, so only one
+        # concurrent caller can win — eliminating the TOCTOU race that existed
+        # in the previous two-step INSERT-then-UPDATE approach.
         row = await self._pool.fetchrow(
             """INSERT INTO chat_state_locks (key_prefix, thread_id, token, expires_at)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (key_prefix, thread_id) DO NOTHING
+               VALUES ($1, $2, $3, now() + make_interval(secs => $4::float / 1000))
+               ON CONFLICT (key_prefix, thread_id) DO UPDATE
+                 SET token = EXCLUDED.token,
+                     expires_at = EXCLUDED.expires_at,
+                     updated_at = now()
+                 WHERE chat_state_locks.expires_at <= now()
                RETURNING thread_id, token, expires_at""",
             self._key_prefix,
             thread_id,
             token,
-            expires_at,
+            ttl_ms,
         )
-
-        if row is None:
-            # Step 2: Row exists — try UPDATE only if expired.
-            # UPDATE acquires a row lock, so only one concurrent caller wins.
-            row = await self._pool.fetchrow(
-                """UPDATE chat_state_locks
-                   SET token = $3, expires_at = $4, updated_at = now()
-                   WHERE key_prefix = $1 AND thread_id = $2 AND expires_at <= now()
-                   RETURNING thread_id, token, expires_at""",
-                self._key_prefix,
-                thread_id,
-                token,
-                expires_at,
-            )
 
         if row is None:
             return None

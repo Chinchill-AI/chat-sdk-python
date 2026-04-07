@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 import pytest
-from chat_sdk.state.postgres import PostgresStateAdapter, _pg_timestamp_from_ms
+from chat_sdk.state.postgres import PostgresStateAdapter
 from chat_sdk.types import Lock, QueueEntry
 
 
@@ -276,14 +276,16 @@ class MockAsyncpgPool:
                 return _Record({"_": 1})
             return None
 
-        # -- locks: acquire (INSERT ... ON CONFLICT ... RETURNING) --
+        # -- locks: acquire (atomic upsert: INSERT ... ON CONFLICT DO UPDATE WHERE expired) --
         if "insert into chat_state_locks" in q:
-            key_prefix, thread_id, token, expires_at = args[0], args[1], args[2], args[3]
+            key_prefix, thread_id, token = args[0], args[1], args[2]
+            ttl_ms = args[3]
             lock_key = (key_prefix, thread_id)
+            expires_at = self._now() + _dt.timedelta(milliseconds=ttl_ms)
             existing = self.locks.get(lock_key)
 
             if existing is None:
-                # No existing lock -- acquire
+                # No existing row -- INSERT succeeds
                 self.locks[lock_key] = {
                     "token": token,
                     "expires_at": expires_at,
@@ -297,7 +299,7 @@ class MockAsyncpgPool:
                     }
                 )
 
-            # Existing lock present -- only overwrite if expired
+            # Row exists -- DO UPDATE fires only when expired
             if existing["expires_at"] <= self._now():
                 self.locks[lock_key] = {
                     "token": token,
@@ -312,7 +314,7 @@ class MockAsyncpgPool:
                     }
                 )
 
-            # Lock is still held
+            # Lock is still held -- DO UPDATE WHERE fails, RETURNING not fired
             return None
 
         # -- cache: get (SELECT value FROM chat_state_cache) --
@@ -703,6 +705,64 @@ class TestPostgresStateLocks:
         assert lock1 is not None
         assert lock2 is not None
         assert lock1.token != lock2.token
+
+    @pytest.mark.asyncio
+    async def test_acquire_lock_uses_single_atomic_upsert(
+        self, pg_state: PostgresStateAdapter, mock_pool: MockAsyncpgPool
+    ):
+        """Verify acquire_lock issues exactly one SQL statement (atomic upsert).
+
+        The old two-step approach (INSERT ... DO NOTHING then UPDATE ... WHERE
+        expired) had a TOCTOU race: two callers could both see the INSERT fail,
+        then both attempt the UPDATE. The fix uses a single INSERT ... ON
+        CONFLICT DO UPDATE WHERE expired, which is atomic because Postgres
+        acquires a row lock on the conflicting row.
+        """
+        # Clear any queries from fixture setup (connect / schema creation)
+        mock_pool.executed_queries.clear()
+
+        # First acquire: new row inserted
+        lock1 = await pg_state.acquire_lock("race-thread", 30_000)
+        assert lock1 is not None
+
+        # Should have issued exactly one query for the lock acquisition
+        lock_queries = [
+            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
+        ]
+        assert len(lock_queries) == 1, (
+            f"Expected 1 atomic upsert query, got {len(lock_queries)}: {lock_queries}"
+        )
+
+        # Second acquire while held: should fail in single query too
+        mock_pool.executed_queries.clear()
+        lock2 = await pg_state.acquire_lock("race-thread", 30_000)
+        assert lock2 is None
+
+        lock_queries = [
+            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
+        ]
+        assert len(lock_queries) == 1, (
+            f"Expected 1 atomic upsert query for contended lock, got {len(lock_queries)}"
+        )
+
+        # Third acquire after expiry: should succeed in single query
+        mock_pool.executed_queries.clear()
+        time.sleep(0.005)
+        # Force-expire the lock for testing
+        lock_key = ("test", "race-thread")
+        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(
+            _dt.timezone.utc
+        ) - _dt.timedelta(seconds=1)
+
+        lock3 = await pg_state.acquire_lock("race-thread", 30_000)
+        assert lock3 is not None
+
+        lock_queries = [
+            q for q in mock_pool.executed_queries if "chat_state_locks" in q.lower()
+        ]
+        assert len(lock_queries) == 1, (
+            f"Expected 1 atomic upsert query for expired lock, got {len(lock_queries)}"
+        )
 
 
 # ============================================================================
