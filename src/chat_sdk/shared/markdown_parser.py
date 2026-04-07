@@ -272,7 +272,7 @@ def _parse_inline(text: str) -> list[Content]:
 
 # Patterns used by the block parser
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
-_THEMATIC_BREAK_RE = re.compile(r"^(\*{3,}|-{3,}|_{3,})\s*$")
+_THEMATIC_BREAK_RE = re.compile(r"^([-*_]\s*){3,}\s*$")
 _FENCED_CODE_START_RE = re.compile(r"^(`{3,}|~{3,})(.*)")
 _BLOCKQUOTE_RE = re.compile(r"^>\s?(.*)")
 _ORDERED_LIST_RE = re.compile(r"^(\d+)[.)]\s+(.*)")
@@ -452,7 +452,7 @@ def parse_markdown(text: str) -> Root:
         heading_match = _HEADING_RE.match(line)
         if heading_match:
             depth = len(heading_match.group(1))
-            heading_text = heading_match.group(2).strip()
+            heading_text = heading_match.group(2).rstrip().rstrip("#").rstrip()
             children.append(make_heading(depth, _parse_inline(heading_text)))
             i += 1
             continue

@@ -182,8 +182,16 @@ class BaseFormatConverter(ABC):
             if "ast" in message:
                 return self.from_ast(message["ast"])
             if "card" in message:
-                return message.get("fallback_text") or message.get("fallbackText") or ""
+                from chat_sdk.cards import card_to_fallback_text
+
+                return card_to_fallback_text(message["card"])
             if message.get("type") == "card":
+                from chat_sdk.cards import is_card_element
+
+                if is_card_element(message):
+                    from chat_sdk.cards import card_to_fallback_text
+
+                    return card_to_fallback_text(message)
                 return ""
             return str(message)
 
@@ -195,9 +203,8 @@ class BaseFormatConverter(ABC):
         if hasattr(message, "ast"):
             return self.from_ast(message.ast)
         if hasattr(message, "card"):
-            fallback = getattr(message, "fallback_text", None)
-            if fallback:
-                return fallback
-            return ""
+            from chat_sdk.cards import card_to_fallback_text
+
+            return card_to_fallback_text(message.card)
 
         return str(message)

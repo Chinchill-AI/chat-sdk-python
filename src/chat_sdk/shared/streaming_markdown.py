@@ -32,75 +32,115 @@ INLINE_MARKER_CHARS = frozenset({"*", "~", "`", "["})
 # has unclosed constructs).
 
 
+def _strip_fenced_code(text: str) -> str:
+    """Return *text* with content between code fences replaced by empty lines.
+
+    This allows inline-marker counting to ignore literal characters inside
+    fenced code blocks (e.g. ``*`` inside a code block is not an unclosed
+    italic marker).
+    """
+    lines = text.split("\n")
+    result_lines: list[str] = []
+    in_fence = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            result_lines.append("")  # replace fence line itself
+        elif in_fence:
+            result_lines.append("")  # replace content inside fence
+        else:
+            result_lines.append(line)
+    return "\n".join(result_lines)
+
+
 def _remend(text: str) -> str:
-    """Close unclosed inline markdown constructs.
+    """Repair incomplete markdown by closing unclosed inline markers.
 
     This is a simplified Python equivalent of the ``remend`` npm package.
-    It scans for unclosed ``**``, ``*``, ``~~``, `` ` ``, and ``[`` and
-    appends the matching closers.
+    Fixes issues in the previous implementation:
+      - Dead code around ``star_count2`` (removed)
+      - ``~~`` counting confused by ``~~~`` code fences (handled by stripping)
+      - Missing ``__`` / ``_`` (underscore bold/italic) handling (added)
+      - Markers inside code blocks no longer counted as inline markers
+
+    Strategy: count *unescaped* characters for ``*`` and ``_`` (parity-based)
+    outside code fences and code spans.  Count ``~~`` substrings for
+    strikethrough.  Count backtick characters for inline code.
     """
     result = text
 
-    # --- code spans (backtick) ---
-    # Simple heuristic: if the total number of backtick characters is odd,
-    # there must be an unclosed code span -- close it with one backtick.
-    # This is idempotent: after closing, the count becomes even and no
-    # further modification is needed.
-    if result.count("`") % 2 != 0:
+    # --- code fences ---
+    # If inside an unclosed code fence, close it and return immediately.
+    in_code_fence = False
+    for line in result.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_fence = not in_code_fence
+
+    if in_code_fence:
+        result += "\n```"
+        return result
+
+    # Strip fenced code blocks so their contents don't affect inline counts.
+    outside_fences = _strip_fenced_code(result)
+
+    # --- inline code backticks ---
+    # Count total backtick characters outside code fences. If odd, one code
+    # span is unclosed -- append a single backtick.
+    backtick_count = outside_fences.count("`")
+    if backtick_count % 2 != 0:
         result += "`"
 
-    # --- bold / italic ---
-    # Count unescaped * sequences
+    # --- bold / italic (* based) ---
+    # Count total unescaped * characters outside code fences. If odd, append
+    # one to make even. This is idempotent: once the count is even, no
+    # further change occurs.
     star_count = 0
     j = 0
-    temp = result
-    while j < len(temp):
-        if temp[j] == "\\":
+    while j < len(outside_fences):
+        if outside_fences[j] == "\\":
             j += 2
             continue
-        if temp[j] == "*":
-            run = 0
-            while j < len(temp) and temp[j] == "*":
-                run += 1
-                j += 1
-            star_count += run
-            continue
+        if outside_fences[j] == "*":
+            star_count += 1
         j += 1
 
     if star_count % 2 != 0:
         result += "*"
-    # After fixing single, check for double
-    star_count2 = 0
-    k = 0
-    temp2 = result
-    while k < len(temp2):
-        if temp2[k] == "\\":
-            k += 2
-            continue
-        if temp2[k] == "*":
-            run = 0
-            while k < len(temp2) and temp2[k] == "*":
-                run += 1
-                k += 1
-            star_count2 += run
-            continue
-        k += 1
 
-    # --- strikethrough ~~  ---
-    tilde_pairs = result.count("~~")
+    # --- bold / italic (_ based) ---
+    # Same parity approach for underscore markers.
+    under_count = 0
+    j = 0
+    while j < len(outside_fences):
+        if outside_fences[j] == "\\":
+            j += 2
+            continue
+        if outside_fences[j] == "_":
+            under_count += 1
+        j += 1
+
+    if under_count % 2 != 0:
+        result += "_"
+
+    # --- strikethrough ~~ ---
+    # Count non-overlapping ``~~`` substrings outside code fences. If odd,
+    # one strikethrough is unclosed -- append ``~~``.
+    tilde_pairs = outside_fences.count("~~")
     if tilde_pairs % 2 != 0:
         result += "~~"
 
     # --- links [text](url) ---
     open_brackets = 0
     m = 0
-    while m < len(result):
-        if result[m] == "\\":
+    while m < len(outside_fences):
+        if outside_fences[m] == "\\":
             m += 2
             continue
-        if result[m] == "[":
+        if outside_fences[m] == "[":
             open_brackets += 1
-        elif result[m] == "]":
+        elif outside_fences[m] == "]":
             open_brackets -= 1
         m += 1
     if open_brackets > 0:
