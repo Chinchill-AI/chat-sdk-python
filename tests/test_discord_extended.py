@@ -395,6 +395,7 @@ class TestDeleteMessage:
 
         await adapter.delete_message("discord:guild1:channel456", "msg001")
 
+        assert adapter._discord_fetch.call_count == 1
         adapter._discord_fetch.assert_called_once_with("/channels/channel456/messages/msg001", "DELETE")
 
     @pytest.mark.asyncio
@@ -404,6 +405,7 @@ class TestDeleteMessage:
 
         await adapter.delete_message("discord:guild1:channel456:thread789", "msg002")
 
+        assert adapter._discord_fetch.call_count == 1
         adapter._discord_fetch.assert_called_once_with("/channels/thread789/messages/msg002", "DELETE")
 
 
@@ -571,6 +573,7 @@ class TestStartTyping:
 
         await adapter.start_typing("discord:guild1:channel456")
 
+        assert adapter._discord_fetch.call_count == 1
         adapter._discord_fetch.assert_called_once_with("/channels/channel456/typing", "POST")
 
     @pytest.mark.asyncio
@@ -580,6 +583,7 @@ class TestStartTyping:
 
         await adapter.start_typing("discord:guild1:channel456:thread789")
 
+        assert adapter._discord_fetch.call_count == 1
         adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
 
 

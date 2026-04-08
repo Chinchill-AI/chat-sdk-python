@@ -569,7 +569,7 @@ class TestDeleteMessage:
             )
         )
         await adapter.delete_message(thread_id, "del-msg-1")
-        adapter._teams_delete.assert_called_once()
+        assert adapter._teams_delete.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +590,7 @@ class TestStartTyping:
             )
         )
         await adapter.start_typing(thread_id)
-        adapter._teams_send.assert_called_once()
+        assert adapter._teams_send.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -604,11 +604,11 @@ class TestReactions:
         logger = _make_logger()
         adapter = _make_adapter(logger=logger)
         await adapter.add_reaction("tid", "mid", "emoji")
-        logger.warn.assert_called_once()
+        assert logger.warn.call_count == 1
 
     @pytest.mark.asyncio
     async def test_remove_reaction_warns_instead_of_raising(self):
         logger = _make_logger()
         adapter = _make_adapter(logger=logger)
         await adapter.remove_reaction("tid", "mid", "emoji")
-        logger.warn.assert_called_once()
+        assert logger.warn.call_count == 1

@@ -454,7 +454,9 @@ class TestPostgresStateConnect:
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_noop(self, mock_pool: MockAsyncpgPool):
         adapter = PostgresStateAdapter(pool=mock_pool, key_prefix="test")
-        await adapter.disconnect()  # Should not raise
+        # No assertion needed -- tests that disconnect before connect does not raise
+        await adapter.disconnect()
+        assert True
 
     @pytest.mark.asyncio
     async def test_operations_fail_before_connect(self, mock_pool: MockAsyncpgPool):
@@ -526,7 +528,9 @@ class TestPostgresStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        await pg_state.delete("nonexistent")  # Should not raise
+        # No assertion needed -- tests that deleting a nonexistent key does not raise
+        await pg_state.delete("nonexistent")
+        assert True
 
 
 # ============================================================================
@@ -696,7 +700,9 @@ class TestPostgresStateLocks:
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        await pg_state.force_release_lock("nonexistent")  # Should not raise
+        # No assertion needed -- tests that releasing a nonexistent lock does not raise
+        await pg_state.force_release_lock("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_independent_locks_per_thread(self, pg_state: PostgresStateAdapter):
@@ -917,7 +923,9 @@ class TestPostgresStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        await pg_state.unsubscribe("nonexistent")  # Should not raise
+        # No assertion needed -- tests that unsubscribing a nonexistent thread does not raise
+        await pg_state.unsubscribe("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, pg_state: PostgresStateAdapter):

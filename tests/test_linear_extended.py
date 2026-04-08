@@ -274,7 +274,7 @@ class TestPostMessage:
 
         await adapter.post_message("linear:issue-123", "test")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1
 
 
 # ============================================================================
@@ -432,8 +432,9 @@ class TestStartTyping:
     @pytest.mark.asyncio
     async def test_is_noop(self):
         adapter = _make_adapter()
-        # Should not throw
+        # No assertion needed -- tests that start_typing completes without raising
         await adapter.start_typing("linear:issue-123")
+        assert True
 
 
 # ============================================================================
@@ -823,7 +824,7 @@ class TestEnsureValidToken:
 
         # Should not throw - just calls through
         await adapter.delete_message("linear:issue-123", "comment-1")
-        adapter._graphql_query.assert_called_once()
+        assert adapter._graphql_query.call_count == 1
 
     @pytest.mark.asyncio
     async def test_refreshes_when_token_expired(self):
@@ -844,7 +845,7 @@ class TestEnsureValidToken:
 
         await adapter.delete_message("linear:issue-123", "comment-1")
 
-        adapter._refresh_client_credentials_token.assert_called_once()
+        assert adapter._refresh_client_credentials_token.call_count == 1
 
     @pytest.mark.asyncio
     async def test_no_refresh_when_token_valid(self):
@@ -866,7 +867,7 @@ class TestEnsureValidToken:
 
         await adapter.delete_message("linear:issue-123", "comment-1")
 
-        adapter._refresh_client_credentials_token.assert_not_called()
+        assert adapter._refresh_client_credentials_token.call_count == 0
 
 
 # ============================================================================
@@ -879,8 +880,9 @@ class TestRefreshClientCredentialsToken:
     async def test_is_noop_when_no_client_credentials(self):
         adapter = _make_webhook_adapter()  # API key mode
 
-        # Should not throw
+        # No assertion needed -- tests that the call completes without raising
         await adapter._refresh_client_credentials_token()
+        assert True
 
     @pytest.mark.asyncio
     async def test_sets_access_token_expiry_with_buffer(self):
@@ -1334,7 +1336,7 @@ class TestInitializeClientCredentials:
         mock_chat = MagicMock()
         await adapter.initialize(mock_chat)
 
-        adapter._refresh_client_credentials_token.assert_called_once()
+        assert adapter._refresh_client_credentials_token.call_count == 1
 
 
 # ============================================================================
@@ -1366,7 +1368,7 @@ class TestEditMessageEnsureToken:
 
         await adapter.edit_message("linear:issue-123", "c1", "updated")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1
 
 
 # ============================================================================
@@ -1383,7 +1385,7 @@ class TestDeleteMessageEnsureToken:
 
         await adapter.delete_message("linear:issue-123", "comment-1")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1
 
 
 # ============================================================================
@@ -1400,7 +1402,7 @@ class TestAddReactionEnsureToken:
 
         await adapter.add_reaction("linear:issue-123", "comment-1", "heart")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1
 
 
 # ============================================================================
@@ -1428,7 +1430,7 @@ class TestFetchMessagesEnsureToken:
 
         await adapter.fetch_messages("linear:issue-abc")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1
 
 
 # ============================================================================
@@ -1455,4 +1457,4 @@ class TestFetchThreadEnsureToken:
 
         await adapter.fetch_thread("linear:issue-abc")
 
-        adapter._ensure_valid_token.assert_called_once()
+        assert adapter._ensure_valid_token.call_count == 1

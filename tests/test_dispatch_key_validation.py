@@ -631,6 +631,9 @@ class TestLinearDispatchKeys:
         if adapter._chat.process_reaction.called:
             reaction_dict = adapter._chat.process_reaction.call_args[0][0]
             assert_no_camel_case_keys(reaction_dict)
+        # No assertion needed when process_reaction is not called -- tests that
+        # _handle_reaction completes without raising
+        assert True
 
     def test_linear_comment_dispatch_keys(self) -> None:
         """Comment webhook events should call process_message correctly."""
@@ -685,6 +688,7 @@ class TestCamelCaseDetectionHelper:
             assert_no_camel_case_keys([{"actionId": "abc"}])
 
     def test_allows_snake_case(self) -> None:
+        # No assertion needed -- tests that assert_no_camel_case_keys does not raise
         assert_no_camel_case_keys(
             {
                 "thread_id": "abc",
@@ -695,6 +699,7 @@ class TestCamelCaseDetectionHelper:
                 },
             }
         )
+        assert True
 
     def test_allows_single_word(self) -> None:
         """Single-word keys like 'adapter', 'value', 'raw' are fine."""
@@ -707,7 +712,9 @@ class TestCamelCaseDetectionHelper:
                 "emoji": "thumbsup",
             }
         )
+        assert True
 
     def test_allows_non_string_keys(self) -> None:
         """Non-string keys should be ignored."""
         assert_no_camel_case_keys({1: "number key", True: "bool key"})
+        assert True

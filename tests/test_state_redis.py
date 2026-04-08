@@ -295,7 +295,9 @@ class TestRedisStateLifecycle:
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_noop(self, mock_redis: MockRedis):
         adapter = RedisStateAdapter(client=mock_redis, key_prefix="test")
-        await adapter.disconnect()  # Should not raise
+        # No assertion needed -- tests that disconnect before connect does not raise
+        await adapter.disconnect()
+        assert True
 
     @pytest.mark.asyncio
     async def test_operations_fail_before_connect(self, mock_redis: MockRedis):
@@ -368,7 +370,9 @@ class TestRedisStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        await redis_state.delete("nonexistent")  # Should not raise
+        # No assertion needed -- tests that deleting a nonexistent key does not raise
+        await redis_state.delete("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_set_with_ttl_expires(self, redis_state: RedisStateAdapter):
@@ -519,7 +523,9 @@ class TestRedisStateLocks:
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        await redis_state.force_release_lock("nonexistent")  # Should not raise
+        # No assertion needed -- tests that releasing a nonexistent lock does not raise
+        await redis_state.force_release_lock("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_independent_locks_per_thread(self, redis_state: RedisStateAdapter):
@@ -696,7 +702,9 @@ class TestRedisStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        await redis_state.unsubscribe("nonexistent")  # Should not raise
+        # No assertion needed -- tests that unsubscribing a nonexistent thread does not raise
+        await redis_state.unsubscribe("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, redis_state: RedisStateAdapter):

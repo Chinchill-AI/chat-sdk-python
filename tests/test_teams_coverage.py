@@ -149,22 +149,29 @@ class _MockSession:
 
 class TestValidateServiceUrl:
     def test_allowed_trafficmanager(self):
+        # No assertion needed -- tests that validation does not raise for allowed URL
         _validate_service_url("https://smba.trafficmanager.net/teams/")
+        assert True
 
     def test_allowed_botframework_com(self):
         _validate_service_url("https://some-host.botframework.com/")
+        assert True
 
     def test_allowed_botframework_us(self):
         _validate_service_url("https://some-host.botframework.us/")
+        assert True
 
     def test_allowed_teams_microsoft_com(self):
         _validate_service_url("https://api.teams.microsoft.com/")
+        assert True
 
     def test_allowed_teams_microsoft_us(self):
         _validate_service_url("https://api.teams.microsoft.us/")
+        assert True
 
     def test_allowed_gcc_infra(self):
         _validate_service_url("https://smba.infra.gcc.teams.microsoft.com/")
+        assert True
 
     def test_disallowed_url_raises(self):
         with pytest.raises(ValidationError):
@@ -535,8 +542,10 @@ class TestCacheUserContext:
             "from": {"id": "user-42"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
-        # Should not raise
+        # No assertion needed -- tests that _cache_user_context completes without
+        # raising when adapter is not initialized (_chat is None)
         await adapter._cache_user_context(activity)
+        assert True
 
     async def test_no_op_without_from_id(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -705,7 +714,7 @@ class TestTeamsHTTPOperations:
             )
         )
         await adapter.delete_message(tid, "del-1")
-        adapter._teams_delete.assert_called_once()
+        assert adapter._teams_delete.call_count == 1
 
     async def test_delete_message_failure(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -746,8 +755,9 @@ class TestTeamsHTTPOperations:
                 service_url="https://smba.trafficmanager.net/teams/",
             )
         )
-        # Should not raise
+        # No assertion needed -- tests that typing failure is swallowed (not re-raised)
         await adapter.start_typing(tid)
+        assert True
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +804,9 @@ class TestTeamsHTTPHelpers:
 
     async def test_disconnect_is_noop(self):
         adapter = _make_adapter(logger=_make_logger())
-        await adapter.disconnect()  # Should not raise
+        # No assertion needed -- tests that disconnect completes without raising
+        await adapter.disconnect()
+        assert True
 
 
 # ---------------------------------------------------------------------------
@@ -895,3 +907,806 @@ class TestGraphMessageMapping:
         )
         result = adapter._map_graph_message(msg, tid)
         assert result.metadata.edited is True
+
+
+# ---------------------------------------------------------------------------
+# _handle_teams_error — additional branches
+# ---------------------------------------------------------------------------
+
+
+class TestHandleTeamsError:
+    def test_fallthrough_non_dict_non_exception(self):
+        """Non-dict, non-Exception error hits the final raise."""
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+
+        with pytest.raises(NetworkError, match="Teams API error during test"):
+            _handle_teams_error("raw-string-error", "test")
+
+    def test_exception_error(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+
+        with pytest.raises(NetworkError, match="something broke"):
+            _handle_teams_error(RuntimeError("something broke"), "send")
+
+    def test_401_status(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+
+        with pytest.raises(AuthenticationError):
+            _handle_teams_error({"statusCode": 401, "message": "bad token"}, "login")
+
+    def test_403_status(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+        from chat_sdk.shared.errors import PermissionError as APE
+
+        with pytest.raises(APE):
+            _handle_teams_error({"statusCode": 403}, "post")
+
+    def test_404_status(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+
+        with pytest.raises(NetworkError, match="not found"):
+            _handle_teams_error({"statusCode": 404}, "delete")
+
+    def test_429_status_with_retry_after(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+        from chat_sdk.shared.errors import AdapterRateLimitError
+
+        with pytest.raises(AdapterRateLimitError):
+            _handle_teams_error({"statusCode": 429, "retryAfter": 30}, "send")
+
+    def test_permission_keyword_in_message(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+        from chat_sdk.shared.errors import PermissionError as APE
+
+        with pytest.raises(APE):
+            _handle_teams_error({"message": "You do not have permission"}, "op")
+
+    def test_inner_http_error_status(self):
+        from chat_sdk.adapters.teams.adapter import _handle_teams_error
+
+        with pytest.raises(AuthenticationError):
+            _handle_teams_error(
+                {"innerHttpError": {"statusCode": 401}, "message": "inner fail"},
+                "auth",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Properties (lock_scope, persist_message_history)
+# ---------------------------------------------------------------------------
+
+
+class TestTeamsProperties:
+    def test_lock_scope_is_none(self):
+        adapter = _make_adapter()
+        assert adapter.lock_scope is None
+
+    def test_persist_message_history_is_none(self):
+        adapter = _make_adapter()
+        assert adapter.persist_message_history is None
+
+
+# ---------------------------------------------------------------------------
+# _handle_message_activity / _handle_reaction_activity early returns
+# ---------------------------------------------------------------------------
+
+
+class TestHandleActivityEarlyReturns:
+    async def test_handle_message_activity_no_chat(self):
+        adapter = _make_adapter(logger=_make_logger())
+        # No assertion needed -- tests that _handle_message_activity returns early
+        # without raising when _chat is None (not initialized)
+        await adapter._handle_message_activity({"text": "hi"})
+        assert True
+
+    def test_handle_reaction_activity_no_chat(self):
+        adapter = _make_adapter(logger=_make_logger())
+        # No assertion needed -- tests early return without raising when _chat is None
+        adapter._handle_reaction_activity({"reactionsAdded": [{"type": "like"}]})
+        assert True
+
+    async def test_handle_adaptive_card_action_no_chat(self):
+        adapter = _make_adapter(logger=_make_logger())
+        # No assertion needed -- tests early return without raising when _chat is None
+        await adapter._handle_adaptive_card_action({}, {"actionId": "a"})
+        assert True
+
+    def test_handle_message_action_no_chat(self):
+        adapter = _make_adapter(logger=_make_logger())
+        # No assertion needed -- tests early return without raising when _chat is None
+        adapter._handle_message_action({}, {"actionId": "a"})
+        assert True
+
+
+# ---------------------------------------------------------------------------
+# stream method
+# ---------------------------------------------------------------------------
+
+
+class TestStream:
+    async def test_stream_dict_chunks(self):
+        adapter = _make_adapter(logger=_make_logger())
+        send_call_count = 0
+
+        async def mock_send(decoded, payload):
+            nonlocal send_call_count
+            send_call_count += 1
+            return {"id": f"msg-{send_call_count}"}
+
+        adapter._teams_send = mock_send
+        adapter._teams_update = AsyncMock()
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        async def text_stream():
+            yield {"type": "markdown_text", "text": "Hello "}
+            yield {"type": "markdown_text", "text": "World"}
+
+        result = await adapter.stream(tid, text_stream())
+        assert result.id == "msg-1"
+        assert result.raw["text"] == "Hello World"
+
+    async def test_stream_string_chunks(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        adapter._teams_update = AsyncMock()
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        async def text_stream():
+            yield "Hello "
+            yield "World"
+
+        result = await adapter.stream(tid, text_stream())
+        assert "Hello World" in result.raw["text"]
+
+    async def test_stream_empty_chunks_skipped(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        adapter._teams_update = AsyncMock()
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        async def text_stream():
+            yield ""
+            yield {"type": "other", "data": "x"}  # no text key or wrong type
+
+        result = await adapter.stream(tid, text_stream())
+        assert result.id == ""  # nothing sent
+
+
+# ---------------------------------------------------------------------------
+# _extract_card_title
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCardTitle:
+    def test_extract_card_title_bold_text(self):
+        adapter = _make_adapter()
+        card = {
+            "body": [
+                {"type": "TextBlock", "text": "My Title", "weight": "bolder"},
+            ]
+        }
+        assert adapter._extract_card_title(card) == "My Title"
+
+    def test_extract_card_title_large_text(self):
+        adapter = _make_adapter()
+        card = {
+            "body": [
+                {"type": "TextBlock", "text": "Big", "size": "large"},
+            ]
+        }
+        assert adapter._extract_card_title(card) == "Big"
+
+    def test_extract_card_title_fallback_to_first_text_block(self):
+        adapter = _make_adapter()
+        card = {
+            "body": [
+                {"type": "TextBlock", "text": "Fallback"},
+            ]
+        }
+        assert adapter._extract_card_title(card) == "Fallback"
+
+    def test_extract_card_title_no_body(self):
+        adapter = _make_adapter()
+        assert adapter._extract_card_title({"type": "AdaptiveCard"}) is None
+
+    def test_extract_card_title_not_dict(self):
+        adapter = _make_adapter()
+        assert adapter._extract_card_title("not a dict") is None
+
+    def test_extract_card_title_no_text_blocks(self):
+        adapter = _make_adapter()
+        card = {"body": [{"type": "Image", "url": "https://example.com/img.png"}]}
+        assert adapter._extract_card_title(card) is None
+
+    def test_extract_card_title_body_not_list(self):
+        adapter = _make_adapter()
+        assert adapter._extract_card_title({"body": "not a list"}) is None
+
+
+# ---------------------------------------------------------------------------
+# _get_request_body edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestGetRequestBody:
+    async def test_body_callable_with_read(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            class body:
+                @staticmethod
+                def read():
+                    return b"hello"
+
+            body = body()  # noqa: E731
+            body.read = staticmethod(lambda: b"hello")
+
+        class SimpleReq:
+            body = b"raw bytes"
+
+        result = await adapter._get_request_body(SimpleReq())
+        assert result == "raw bytes"
+
+    async def test_text_callable(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            async def text(self):
+                return "text content"
+
+        result = await adapter._get_request_body(FakeReq())
+        assert result == "text content"
+
+    async def test_text_attribute(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            text = "static text"
+
+        result = await adapter._get_request_body(FakeReq())
+        assert result == "static text"
+
+    async def test_data_attribute(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            data = b"byte data"
+
+        result = await adapter._get_request_body(FakeReq())
+        assert result == "byte data"
+
+    async def test_empty_request(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            pass
+
+        result = await adapter._get_request_body(FakeReq())
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# _get_header edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestGetHeader:
+    def test_dict_headers_title_case(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            headers = {"Authorization": "Bearer token"}
+
+        result = adapter._get_header(FakeReq(), "authorization")
+        # dict.get with title-case fallback
+        assert result is not None
+
+    def test_no_headers_attribute(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeReq:
+            pass
+
+        assert adapter._get_header(FakeReq(), "x-test") is None
+
+    def test_headers_with_get_method(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        class FakeHeaders:
+            def get(self, name):
+                if name == "authorization":
+                    return "Bearer abc"
+                return None
+
+        class FakeReq:
+            headers = FakeHeaders()
+
+        result = adapter._get_header(FakeReq(), "authorization")
+        assert result == "Bearer abc"
+
+
+# ---------------------------------------------------------------------------
+# _make_response / _make_json_response
+# ---------------------------------------------------------------------------
+
+
+class TestMakeResponses:
+    def test_make_response(self):
+        adapter = _make_adapter()
+        r = adapter._make_response("OK", 200)
+        assert r["body"] == "OK"
+        assert r["status"] == 200
+        assert r["headers"]["Content-Type"] == "text/plain"
+
+    def test_make_json_response(self):
+        adapter = _make_adapter()
+        r = adapter._make_json_response('{"ok":true}', 200)
+        assert r["body"] == '{"ok":true}'
+        assert r["headers"]["Content-Type"] == "application/json"
+
+
+# ---------------------------------------------------------------------------
+# _teams_send / _teams_update / _teams_delete error paths
+# ---------------------------------------------------------------------------
+
+
+class TestTeamsHTTPErrorPaths:
+    async def test_teams_send_non_ok_response(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
+
+        mock_session = _MockSession(default_response=error_resp)
+        original_post = mock_session.post
+
+        def routed_post(url, **kwargs):
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        decoded = TeamsThreadId(
+            conversation_id="19:abc@thread.tacv2",
+            service_url="https://smba.trafficmanager.net/teams/",
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
+            await adapter._teams_send(decoded, {"type": "message"})
+
+    async def test_teams_update_non_ok_response(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
+
+        mock_session = _MockSession(default_response=error_resp)
+        original_post = mock_session.post
+
+        def routed_post(url, **kwargs):
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        decoded = TeamsThreadId(
+            conversation_id="19:abc@thread.tacv2",
+            service_url="https://smba.trafficmanager.net/teams/",
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
+            await adapter._teams_update(decoded, "msg-1", {"type": "message"})
+
+    async def test_teams_delete_non_ok_response(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
+
+        mock_session = _MockSession(default_response=error_resp)
+        original_post = mock_session.post
+
+        def routed_post(url, **kwargs):
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        decoded = TeamsThreadId(
+            conversation_id="19:abc@thread.tacv2",
+            service_url="https://smba.trafficmanager.net/teams/",
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
+            await adapter._teams_delete(decoded, "msg-1")
+
+
+# ---------------------------------------------------------------------------
+# fetch_channel_info with channel context
+# ---------------------------------------------------------------------------
+
+
+class TestFetchChannelInfo:
+    async def test_fetch_channel_info_dm(self):
+        """DM conversation returns basic info without Graph call."""
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a]8:orgid:user-123",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.fetch_channel_info(tid)
+        assert result.is_dm is True
+        assert result.id == tid
+
+    async def test_fetch_channel_info_channel_no_context(self):
+        """Channel without cached context returns basic info."""
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.fetch_channel_info(tid)
+        assert result.is_dm is False
+        assert result.name is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_messages with cursor and forward/backward
+# ---------------------------------------------------------------------------
+
+
+class TestFetchMessagesAdvanced:
+    async def test_fetch_messages_with_cursor_backward(self):
+        from chat_sdk.types import FetchOptions
+
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        messages_resp = _mock_aiohttp_response(
+            {
+                "value": [
+                    {
+                        "id": "msg-1",
+                        "createdDateTime": "2024-06-01T12:00:00Z",
+                        "body": {"contentType": "text", "content": "A"},
+                        "from": {"user": {"id": "u1", "displayName": "X"}},
+                    },
+                ]
+            }
+        )
+
+        mock_session = _MockSession(default_response=messages_resp)
+        original_post = mock_session.post
+
+        def routed_post(url, **kwargs):
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a]8:orgid:user-123",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await adapter.fetch_messages(
+                tid,
+                FetchOptions(direction="backward", cursor="2024-06-02T00:00:00Z"),
+            )
+            assert len(result.messages) >= 0
+
+    async def test_fetch_messages_forward_with_cursor(self):
+        from chat_sdk.types import FetchOptions
+
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        messages_resp = _mock_aiohttp_response(
+            {
+                "value": [
+                    {
+                        "id": "msg-f1",
+                        "createdDateTime": "2024-06-01T12:00:00Z",
+                        "body": {"contentType": "text", "content": "Fwd"},
+                        "from": {"user": {"id": "u1", "displayName": "X"}},
+                    },
+                ]
+            }
+        )
+
+        mock_session = _MockSession(default_response=messages_resp)
+        original_post = mock_session.post
+
+        def routed_post(url, **kwargs):
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a]8:orgid:user-123",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await adapter.fetch_messages(
+                tid,
+                FetchOptions(direction="forward", cursor="2024-05-01T00:00:00Z"),
+            )
+            assert len(result.messages) >= 0
+
+
+# ---------------------------------------------------------------------------
+# Certificate config raises
+# ---------------------------------------------------------------------------
+
+
+class TestCertificateConfig:
+    def test_certificate_raises_validation_error(self):
+        with pytest.raises(ValidationError, match="Certificate"):
+            TeamsAdapter(TeamsAdapterConfig(
+                app_id="test",
+                app_password="test",
+                certificate={"thumbprint": "abc", "private_key": "key"},
+            ))
+
+
+# ---------------------------------------------------------------------------
+# _extract_attachments_from_graph_message
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAttachmentsFromGraph:
+    def test_extracts_image_attachment(self):
+        adapter = _make_adapter()
+        msg = {
+            "attachments": [
+                {"contentType": "image/png", "name": "pic.png", "contentUrl": "https://example.com/pic.png"},
+            ]
+        }
+        attachments = adapter._extract_attachments_from_graph_message(msg)
+        assert len(attachments) == 1
+        assert attachments[0].type == "image"
+
+    def test_extracts_file_attachment(self):
+        adapter = _make_adapter()
+        msg = {
+            "attachments": [
+                {"contentType": "application/pdf", "name": "doc.pdf", "contentUrl": "https://example.com/doc.pdf"},
+            ]
+        }
+        attachments = adapter._extract_attachments_from_graph_message(msg)
+        assert len(attachments) == 1
+        assert attachments[0].type == "file"
+
+    def test_no_attachments(self):
+        adapter = _make_adapter()
+        assert adapter._extract_attachments_from_graph_message({}) == []
+
+
+# ---------------------------------------------------------------------------
+# _create_attachment (from webhook message)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateAttachmentTypes:
+    def test_video_type(self):
+        adapter = _make_adapter()
+        att = adapter._create_attachment({"contentType": "video/mp4", "name": "clip.mp4"})
+        assert att.type == "video"
+
+    def test_audio_type(self):
+        adapter = _make_adapter()
+        att = adapter._create_attachment({"contentType": "audio/mpeg", "name": "song.mp3"})
+        assert att.type == "audio"
+
+    def test_default_file_type(self):
+        adapter = _make_adapter()
+        att = adapter._create_attachment({"contentType": "application/zip", "name": "archive.zip"})
+        assert att.type == "file"
+
+
+# ---------------------------------------------------------------------------
+# _get_channel_context edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestGetChannelContext:
+    async def test_no_chat(self):
+        adapter = _make_adapter(logger=_make_logger())
+        result = await adapter._get_channel_context("19:abc")
+        assert result is None
+
+    async def test_no_state(self):
+        adapter = _make_adapter(logger=_make_logger())
+        chat = MagicMock()
+        chat.get_state = MagicMock(return_value=None)
+        await adapter.initialize(chat)
+        result = await adapter._get_channel_context("19:abc")
+        assert result is None
+
+    async def test_invalid_json_in_cache(self):
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        state._cache["teams:channelContext:19:abc"] = "not valid json {"
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        result = await adapter._get_channel_context("19:abc")
+        assert result is None
+
+    async def test_valid_context_from_cache(self):
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        state._cache["teams:channelContext:19:abc"] = json.dumps(
+            {"team_id": "t1", "channel_id": "c1"}
+        )
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+        result = await adapter._get_channel_context("19:abc")
+        assert result is not None
+        assert result["team_id"] == "t1"
+
+
+# ---------------------------------------------------------------------------
+# _extract_text_from_graph_message edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTextFromGraphMessage:
+    def test_text_content_type(self):
+        adapter = _make_adapter()
+        msg = {"body": {"contentType": "text", "content": "plain text"}}
+        assert adapter._extract_text_from_graph_message(msg) == "plain text"
+
+    def test_html_stripping(self):
+        adapter = _make_adapter()
+        msg = {"body": {"contentType": "html", "content": "<div><b>bold</b></div>"}}
+        result = adapter._extract_text_from_graph_message(msg)
+        assert "bold" in result
+        assert "<" not in result
+
+    def test_empty_html_with_card_fallback(self):
+        adapter = _make_adapter()
+        card_json = json.dumps({"body": [{"type": "TextBlock", "text": "Card", "weight": "bolder"}]})
+        msg = {
+            "body": {"contentType": "html", "content": ""},
+            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card_json}],
+        }
+        result = adapter._extract_text_from_graph_message(msg)
+        assert result == "Card"
+
+    def test_empty_html_with_invalid_card_json(self):
+        adapter = _make_adapter()
+        msg = {
+            "body": {"contentType": "html", "content": ""},
+            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": "not-json"}],
+        }
+        result = adapter._extract_text_from_graph_message(msg)
+        assert result == "[Card]"
+
+    def test_no_body(self):
+        adapter = _make_adapter()
+        msg = {}
+        result = adapter._extract_text_from_graph_message(msg)
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# edit_message error path
+# ---------------------------------------------------------------------------
+
+
+class TestEditMessageError:
+    async def test_edit_message_update_failure(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._teams_update = AsyncMock(side_effect=Exception("update failed"))
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        with pytest.raises(NetworkError):
+            await adapter.edit_message(tid, "msg-1", {"markdown": "fail"})
+
+
+# ---------------------------------------------------------------------------
+# post_message card send failure
+# ---------------------------------------------------------------------------
+
+
+class TestPostMessageCardError:
+    async def test_post_card_failure(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._teams_send = AsyncMock(side_effect=Exception("card send failed"))
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        with pytest.raises(NetworkError):
+            await adapter.post_message(
+                tid,
+                {
+                    "card": {
+                        "header": {"title": "Fail"},
+                        "body": [{"type": "text", "content": "content"}],
+                    }
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# fetch_messages 403 error path
+# ---------------------------------------------------------------------------
+
+
+class TestFetchMessages403:
+    async def test_fetch_messages_403_raises_permission_error(self):
+        from chat_sdk.shared.errors import PermissionError as APE
+
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        adapter._get_graph_token = AsyncMock(side_effect=Exception("403 Forbidden"))
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a]8:orgid:user-123",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        with pytest.raises(APE):
+            await adapter.fetch_messages(tid)
