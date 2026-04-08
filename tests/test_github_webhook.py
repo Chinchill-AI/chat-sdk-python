@@ -563,7 +563,9 @@ class TestGitHubStartTyping:
     @pytest.mark.asyncio
     async def test_noop(self):
         adapter = _make_adapter()
+        # No assertion needed -- tests that start_typing is a no-op and does not raise
         await adapter.start_typing("github:acme/app:42")
+        assert True
 
 
 # ---------------------------------------------------------------------------

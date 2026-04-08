@@ -128,6 +128,7 @@ class TestGitHubAddReaction:
 
         await adapter.add_reaction(thread_id, "100", "thumbs_up")
 
+        assert adapter._github_api_request.call_count == 1
         adapter._github_api_request.assert_called_once_with(
             "POST",
             "/repos/octocat/hello-world/issues/comments/100/reactions",
@@ -150,6 +151,7 @@ class TestGitHubAddReaction:
 
         await adapter.add_reaction(thread_id, "200", "heart")
 
+        assert adapter._github_api_request.call_count == 1
         adapter._github_api_request.assert_called_once_with(
             "POST",
             "/repos/octocat/hello-world/pulls/comments/200/reactions",

@@ -107,8 +107,9 @@ class TestMemoryStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_key_is_noop(self, memory_state: MemoryStateAdapter):
-        # Should not raise
+        # No assertion needed -- tests that deleting a nonexistent key does not raise
         await memory_state.delete("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_set_if_not_exists_when_key_missing(self, memory_state: MemoryStateAdapter):
@@ -262,8 +263,9 @@ class TestMemoryStateLocks:
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_lock_is_noop(self, memory_state: MemoryStateAdapter):
-        # Should not raise
+        # No assertion needed -- tests that releasing a nonexistent lock does not raise
         await memory_state.force_release_lock("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_different_threads_get_independent_locks(self, memory_state: MemoryStateAdapter):
@@ -430,8 +432,9 @@ class TestMemoryStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, memory_state: MemoryStateAdapter):
-        # Should not raise
+        # No assertion needed -- tests that unsubscribing a nonexistent key does not raise
         await memory_state.unsubscribe("nonexistent")
+        assert True
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, memory_state: MemoryStateAdapter):

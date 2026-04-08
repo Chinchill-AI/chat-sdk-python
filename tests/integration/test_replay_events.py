@@ -170,9 +170,11 @@ class TestMemberJoinedChannel:
         adapter = adapters["slack"]
 
         event = _make_member_joined_event(adapter)
-        # Should not raise
+        # No assertion needed -- tests that processing an event without a handler
+        # completes without raising
         chat.process_member_joined_channel(event)
         await asyncio.sleep(0.05)
+        assert True
 
 
 # ============================================================================

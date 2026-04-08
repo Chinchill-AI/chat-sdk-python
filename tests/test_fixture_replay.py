@@ -268,14 +268,16 @@ class TestSlackFixtureReplay:
     async def test_channel_mention(self):
         """channel-mention/slack.json mention should parse correctly."""
         fixture = load_fixture("channel-mention/slack.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
     # --- dm/slack.json ---
 
     async def test_dm_mention(self):
         """dm/slack.json mention should parse correctly."""
         fixture = load_fixture("dm/slack.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert message.text is not None
 
     # --- dm/slack-direct.json ---
 
@@ -283,13 +285,15 @@ class TestSlackFixtureReplay:
         """dm/slack-direct.json directDM: a non-mention DM should still trigger processing."""
         fixture = load_fixture("dm/slack-direct.json")
         message, _ = await self._send_and_assert_message(fixture, "directDM", "hello")
+        assert message.text is not None
 
     # --- channel/slack.json ---
 
     async def test_channel_mention_fixture(self):
         """channel/slack.json mention should parse correctly."""
         fixture = load_fixture("channel/slack.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
     # --- streaming/slack.json ---
 
@@ -297,11 +301,13 @@ class TestSlackFixtureReplay:
         """streaming/slack.json aiMention should parse correctly."""
         fixture = load_fixture("streaming/slack.json")
         message, _ = await self._send_and_assert_message(fixture, "aiMention", "love")
+        assert message.text is not None
 
     async def test_streaming_follow_up(self):
         """streaming/slack.json followUp should parse correctly."""
         fixture = load_fixture("streaming/slack.json")
-        await self._send_and_assert_message(fixture, "followUp")
+        message, thread_id = await self._send_and_assert_message(fixture, "followUp")
+        assert thread_id  # non-empty thread ID
 
     # --- slack-multi-workspace fixtures ---
 
@@ -314,14 +320,16 @@ class TestSlackFixtureReplay:
     async def test_multi_workspace_team2(self):
         """slack-multi-workspace/team2.json mention should parse correctly."""
         fixture = load_fixture("slack-multi-workspace/team2.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
     # --- member-joined-channel/slack.json ---
 
     async def test_member_joined_channel_mention(self):
         """member-joined-channel/slack.json mention should parse correctly."""
         fixture = load_fixture("member-joined-channel/slack.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
 
 # ===========================================================================
@@ -400,7 +408,8 @@ class TestTeamsFixtureReplay:
     async def test_channel_mention(self):
         """channel/teams.json mention should parse correctly."""
         fixture = load_fixture("channel/teams.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
     # --- dm/teams.json ---
 
@@ -421,7 +430,8 @@ class TestTeamsFixtureReplay:
     async def test_streaming_follow_up(self):
         """streaming/teams.json followUp should parse correctly."""
         fixture = load_fixture("streaming/teams.json")
-        await self._send_and_assert_message(fixture, "followUp")
+        message, thread_id = await self._send_and_assert_message(fixture, "followUp")
+        assert thread_id  # non-empty thread ID
 
 
 # ===========================================================================
@@ -519,21 +529,24 @@ class TestGChatFixtureReplay:
     async def test_channel_mention(self):
         """channel/gchat.json mention should parse correctly."""
         fixture = load_fixture("channel/gchat.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert thread_id  # non-empty thread ID
 
     # --- dm/gchat.json ---
 
     async def test_dm_mention(self):
         """dm/gchat.json mention should parse correctly."""
         fixture = load_fixture("dm/gchat.json")
-        await self._send_and_assert_message(fixture, "mention")
+        message, thread_id = await self._send_and_assert_message(fixture, "mention")
+        assert message.text is not None
 
     # --- streaming/gchat.json ---
 
     async def test_streaming_ai_mention(self):
         """streaming/gchat.json aiMention should parse correctly."""
         fixture = load_fixture("streaming/gchat.json")
-        await self._send_and_assert_message(fixture, "aiMention")
+        message, thread_id = await self._send_and_assert_message(fixture, "aiMention")
+        assert thread_id  # non-empty thread ID
 
     async def test_streaming_follow_up(self):
         """streaming/gchat.json followUp: Pub/Sub follow-up should parse correctly."""
@@ -753,6 +766,7 @@ class TestTelegramFixtureReplay:
         """telegram.json followUp: follow-up message should parse correctly."""
         fixture = load_fixture("telegram.json")
         message, _ = await self._send_and_assert_message(fixture, "followUp", "how are you")
+        assert message.text is not None
 
 
 # ===========================================================================
