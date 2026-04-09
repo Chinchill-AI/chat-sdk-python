@@ -658,6 +658,11 @@ class DiscordAdapter:
                             expired = [k for k, v in self._thread_parent_cache.items() if v.get("expires_at", 0) <= now]
                             for k in expired:
                                 del self._thread_parent_cache[k]
+                            # Hard limit: evict oldest if still over threshold
+                            if len(self._thread_parent_cache) > 1000:
+                                keys = list(self._thread_parent_cache.keys())
+                                for k in keys[: len(keys) - 1000]:
+                                    del self._thread_parent_cache[k]
                 except Exception as error:
                     self._logger.error(
                         "Failed to fetch thread parent for reaction",

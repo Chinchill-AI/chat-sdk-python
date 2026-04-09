@@ -887,11 +887,15 @@ class GitHubAdapter:
         cached token when still valid.
         """
 
-        # Purge expired entries on access
+        # Purge expired entries and enforce hard size limit
         now = time.time()
         expired_ids = [iid for iid, (_, exp) in self._installation_token_cache.items() if now >= exp]
         for iid in expired_ids:
             del self._installation_token_cache[iid]
+        if len(self._installation_token_cache) > 100:
+            keys = list(self._installation_token_cache.keys())
+            for k in keys[: len(keys) - 100]:
+                del self._installation_token_cache[k]
 
         # Check cache
         cached = self._installation_token_cache.get(installation_id)

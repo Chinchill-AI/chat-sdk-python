@@ -47,7 +47,8 @@ def check_phantoms(test_files):
     """Find tests whose only statement is `assert True`."""
     issues = []
     for fpath in test_files:
-        tree = ast.parse(open(fpath).read())
+        with open(fpath, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -74,7 +75,8 @@ def check_cross_file_duplicates(test_files):
     """Find tests with identical bodies in different files."""
     bodies = collections.defaultdict(list)
     for fpath in test_files:
-        source = open(fpath).read()
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
         tree = ast.parse(source)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -98,7 +100,8 @@ def check_magicmock_for_async(test_files):
     """Find MagicMock assigned to known async method names."""
     issues = []
     for fpath in test_files:
-        source = open(fpath).read()
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
         for i, line in enumerate(source.split("\n"), 1):
             if "MagicMock" not in line or "AsyncMock" in line:
                 continue

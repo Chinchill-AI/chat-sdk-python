@@ -626,12 +626,12 @@ class ThreadImpl:
             await self.adapter.edit_message(
                 thread_id_for_edits,
                 msg.id,
-                PostableMarkdown(markdown=accumulated),
+                PostableMarkdown(markdown=final_content),
             )
 
         sent = self._create_sent_message(
             msg.id,
-            PostableMarkdown(markdown=accumulated),
+            PostableMarkdown(markdown=final_content),
             thread_id_for_edits,
         )
         if self._message_history is not None:
