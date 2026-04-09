@@ -513,6 +513,8 @@ class ThreadImpl:
                 async for chunk in text_stream:
                     if isinstance(chunk, str):
                         accumulated += chunk
+                    elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                        accumulated += chunk.get("text", "")
                     elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                         accumulated += chunk.text
                     yield chunk
@@ -532,7 +534,9 @@ class ThreadImpl:
             async for chunk in text_stream:
                 if isinstance(chunk, str):
                     yield chunk
-                elif hasattr(chunk, "type") and chunk.type == "markdown_text":
+                elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                    yield chunk.get("text", "")
+                elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
                     yield chunk.text
                 # Skip non-text chunks in fallback mode
 
@@ -884,7 +888,7 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
 
             # Pass through known StreamChunk dict types
             if t in ("markdown_text", "task_update", "plan_update"):
-                yield item.get("text", "")
+                yield item
                 continue
 
             if t == "text-delta":

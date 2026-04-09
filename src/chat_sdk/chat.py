@@ -1515,7 +1515,7 @@ class Chat:
             # Support both sync and async callables
             if asyncio.iscoroutine(result) or asyncio.isfuture(result):
                 result = await result
-            if result == "force":
+            if result == "force" or result is True:
                 self._logger.info(
                     "on_lock_conflict callback returned 'force', force-releasing lock",
                     {"thread_id": thread_id, "lock_key": lock_key},

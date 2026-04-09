@@ -40,7 +40,8 @@ FormattedContent = dict[str, Any]
 LockScope = Literal["thread", "channel"]
 ConcurrencyStrategy = Literal["drop", "queue", "debounce", "concurrent"]
 OnLockConflict = (
-    Literal["drop", "force"] | Callable[..., Awaitable[Literal["force", "drop"]] | Literal["force", "drop"]]
+    Literal["drop", "force"]
+    | Callable[..., Awaitable[Literal["force", "drop"] | bool] | Literal["force", "drop"] | bool]
 )
 FetchDirection = Literal["forward", "backward"]
 
