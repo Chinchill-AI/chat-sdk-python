@@ -16,7 +16,6 @@ from chat_sdk.adapters.telegram.adapter import (
 from chat_sdk.adapters.telegram.types import TelegramAdapterConfig, TelegramThreadId
 from chat_sdk.shared.errors import ValidationError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

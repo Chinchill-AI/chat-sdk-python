@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -23,11 +23,9 @@ from chat_sdk.adapters.linear.adapter import (
 from chat_sdk.adapters.linear.types import (
     LinearAdapterAPIKeyConfig,
     LinearAdapterAppConfig,
-    LinearAdapterBaseConfig,
     LinearAdapterOAuthConfig,
-    LinearThreadId,
 )
-from chat_sdk.shared.errors import AuthenticationError, ValidationError
+from chat_sdk.shared.errors import ValidationError
 
 WEBHOOK_SECRET = "test-webhook-secret"
 
@@ -311,7 +309,7 @@ class TestEditMessage:
 
         assert result.id == "edited-comment-1"
         assert result.raw["comment"]["body"] == "Updated body"
-        assert result.raw["comment"]["issue_id"] == "issue-123"
+        assert result.raw["comment"]["issueId"] == "issue-123"
 
         call_args = adapter._graphql_query.call_args
         variables = call_args[0][1]
@@ -432,9 +430,8 @@ class TestStartTyping:
     @pytest.mark.asyncio
     async def test_is_noop(self):
         adapter = _make_adapter()
-        # No assertion needed -- tests that start_typing completes without raising
-        await adapter.start_typing("linear:issue-123")
-        assert True
+        result = await adapter.start_typing("linear:issue-123")
+        assert result is None
 
 
 # ============================================================================
@@ -879,10 +876,12 @@ class TestRefreshClientCredentialsToken:
     @pytest.mark.asyncio
     async def test_is_noop_when_no_client_credentials(self):
         adapter = _make_webhook_adapter()  # API key mode
+        original_token = adapter._access_token
 
-        # No assertion needed -- tests that the call completes without raising
         await adapter._refresh_client_credentials_token()
-        assert True
+
+        # Token unchanged -- the method returned early without modifying state
+        assert adapter._access_token == original_token
 
     @pytest.mark.asyncio
     async def test_sets_access_token_expiry_with_buffer(self):
@@ -915,19 +914,14 @@ class TestRefreshClientCredentialsToken:
 
         mock_session = AsyncMock()
         mock_session.post = MagicMock(return_value=mock_post_cm)
-
-        # Create mock context manager for ClientSession
-        mock_session_cm = MagicMock()
-        mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_session.closed = False
 
         # aiohttp is lazily imported inside _refresh_client_credentials_token,
         # so we patch it at the module level where it's imported
-        import importlib
         import sys
 
         mock_aiohttp = MagicMock()
-        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session_cm)
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
 
         # Temporarily replace aiohttp in sys.modules
         original = sys.modules.get("aiohttp")

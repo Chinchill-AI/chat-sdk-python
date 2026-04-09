@@ -338,8 +338,8 @@ def _convert_table_to_blocks(element: TableElement, state: dict[str, bool]) -> l
     state["used_native_table"] = True
 
     # First row is headers, subsequent rows are data
-    header_row = [{"type": "raw_text", "text": convert_emoji(h)} for h in headers]
-    data_rows = [[{"type": "raw_text", "text": convert_emoji(cell)} for cell in row] for row in rows]
+    header_row = [{"type": "raw_text", "text": convert_emoji(h) or " "} for h in headers]
+    data_rows = [[{"type": "raw_text", "text": convert_emoji(cell) or " "} for cell in row] for row in rows]
 
     return [
         {

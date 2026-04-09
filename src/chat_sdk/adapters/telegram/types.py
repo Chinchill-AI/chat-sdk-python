@@ -223,6 +223,12 @@ class TelegramMessage(TypedDict, total=False):
     """Telegram message.
 
     See https://core.telegram.org/bots/api#message
+
+    Note: The Telegram API uses ``"from"`` as the key for the sender, but
+    ``from`` is a Python reserved word and cannot be used as a TypedDict
+    field name. This TypedDict declares it as ``from_user`` instead.
+    The adapter handles this mismatch by reading both keys from the raw
+    JSON: ``raw.get("from_user") or raw.get("from")``.
     """
 
     audio: TelegramAudioFile
@@ -233,7 +239,9 @@ class TelegramMessage(TypedDict, total=False):
     document: TelegramDocumentFile
     edit_date: int
     entities: list[TelegramMessageEntity]
-    from_user: TelegramUser  # Note: 'from' is a Python keyword; mapped to 'from_user' in parsing
+    # Telegram API sends "from" but that is a Python reserved word.
+    # The adapter reads both keys: raw.get("from_user") or raw.get("from").
+    from_user: TelegramUser
     message_id: int  # required
     message_thread_id: int
     photo: list[TelegramPhotoSize]
@@ -272,7 +280,8 @@ class TelegramCallbackQuery(TypedDict, total=False):
 
     chat_instance: str  # required
     data: str
-    from_user: TelegramUser  # Note: 'from' mapped to 'from_user'  # required
+    # Telegram API sends "from" but that is a Python reserved word (see TelegramMessage).
+    from_user: TelegramUser  # required
     id: str  # required
     inline_message_id: str
     message: TelegramMessage

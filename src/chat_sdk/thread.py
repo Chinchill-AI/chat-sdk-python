@@ -10,11 +10,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
+from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
     Adapter,
@@ -136,18 +137,20 @@ def _extract_message_content(
         )
 
     if isinstance(message, PostableMarkdown):
-        # Simplified: store markdown as text node (no full parser in Python port)
+        from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown
+
+        formatted = parse_markdown(message.markdown)
+        plain = ast_to_plain_text(formatted)
         return (
-            message.markdown,
-            {
-                "type": "root",
-                "children": [{"type": "paragraph", "children": [{"type": "text", "value": message.markdown}]}],
-            },
+            plain,
+            formatted,
             list(message.attachments or []),
         )
 
     if isinstance(message, PostableCard):
-        fallback = message.fallback_text or "[card]"
+        from chat_sdk.cards import card_to_fallback_text
+
+        fallback = message.fallback_text or card_to_fallback_text(message.card) or "[card]"
         return (
             fallback,
             {"type": "root", "children": [{"type": "paragraph", "children": [{"type": "text", "value": fallback}]}]},
@@ -155,13 +158,17 @@ def _extract_message_content(
         )
 
     if hasattr(message, "ast"):
-        ast = message.ast  # type: ignore[union-attr]
-        plain = str(ast)
-        return plain, ast, list(getattr(message, "attachments", None) or [])
+        from chat_sdk.shared.markdown_parser import ast_to_plain_text
+
+        ast_dict = message.ast  # type: ignore[union-attr]
+        plain = ast_to_plain_text(ast_dict)
+        return plain, ast_dict, list(getattr(message, "attachments", None) or [])
 
     if isinstance(message, dict):
         # CardElement (dict-based)
-        fallback = "[card]"
+        from chat_sdk.cards import card_to_fallback_text
+
+        fallback = card_to_fallback_text(message) or "[card]"
         return (
             fallback,
             {"type": "root", "children": [{"type": "paragraph", "children": [{"type": "text", "value": fallback}]}]},
@@ -506,6 +513,8 @@ class ThreadImpl:
                 async for chunk in text_stream:
                     if isinstance(chunk, str):
                         accumulated += chunk
+                    elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                        accumulated += chunk.get("text", "")
                     elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                         accumulated += chunk.text
                     yield chunk
@@ -525,7 +534,9 @@ class ThreadImpl:
             async for chunk in text_stream:
                 if isinstance(chunk, str):
                     yield chunk
-                elif hasattr(chunk, "type") and chunk.type == "markdown_text":
+                elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                    yield chunk.get("text", "")
+                elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
                     yield chunk.text
                 # Skip non-text chunks in fallback mode
 
@@ -552,9 +563,9 @@ class ThreadImpl:
             msg = await self.adapter.post_message(self._id, placeholder_text)
 
         thread_id_for_edits = self._id
-        accumulated = ""
+        renderer = StreamingMarkdownRenderer()
         last_edit_content = ""
-        stopped = False
+        stop_event = asyncio.Event()
         pending_edit: asyncio.Task[None] | None = None
 
         if msg is not None:
@@ -564,38 +575,47 @@ class ThreadImpl:
         # Background edit loop
         async def _edit_loop() -> None:
             nonlocal last_edit_content
-            while not stopped and msg is not None:
-                await asyncio.sleep(interval_s)
-                if stopped or msg is None:
+            while not stop_event.is_set() and msg is not None:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+                    break  # stop was signaled
+                except asyncio.TimeoutError:  # noqa: UP041 — support Python 3.10
+                    pass  # interval elapsed, do the edit
+                if stop_event.is_set() or msg is None:
                     break
-                if accumulated != last_edit_content:
+                content = renderer.get_committable_text()
+                if content != last_edit_content:
                     try:
                         await self.adapter.edit_message(
                             thread_id_for_edits,
                             msg.id,
-                            PostableMarkdown(markdown=accumulated),
+                            PostableMarkdown(markdown=content),
                         )
-                        last_edit_content = accumulated
-                    except Exception:
+                        last_edit_content = content
+                    except Exception as exc:
                         if self._logger:
-                            self._logger.warn("fallbackStream edit failed")
+                            self._logger.warn("fallbackStream edit failed", exc)
 
         if msg is not None:
             pending_edit = asyncio.create_task(_edit_loop())
 
         try:
             async for chunk in text_stream:
-                accumulated += chunk
+                renderer.push(chunk)
                 if msg is None:
-                    msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=accumulated))
+                    content = renderer.get_committable_text()
+                    msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
                     thread_id_for_edits = msg.thread_id or self._id
-                    last_edit_content = accumulated
+                    last_edit_content = content
                     pending_edit = asyncio.create_task(_edit_loop())
         finally:
-            stopped = True
+            stop_event.set()
 
         if pending_edit is not None:
             await pending_edit
+
+        accumulated = renderer.get_text()
+        final_content = renderer.finish()
 
         # Final message
         if msg is None:
@@ -606,16 +626,16 @@ class ThreadImpl:
         # Always ensure the final content is sent, regardless of what _edit_loop did.
         # Re-check last_edit_content after awaiting pending_edit since _edit_loop
         # may have updated it concurrently.
-        if accumulated != last_edit_content:
+        if final_content != last_edit_content:
             await self.adapter.edit_message(
                 thread_id_for_edits,
                 msg.id,
-                PostableMarkdown(markdown=accumulated),
+                PostableMarkdown(markdown=final_content),
             )
 
         sent = self._create_sent_message(
             msg.id,
-            PostableMarkdown(markdown=accumulated),
+            PostableMarkdown(markdown=final_content),
             thread_id_for_edits,
         )
         if self._message_history is not None:
@@ -648,15 +668,18 @@ class ThreadImpl:
     # -- Serialization -------------------------------------------------------
 
     def to_json(self) -> dict[str, Any]:
-        """Serialize to a plain dict for external systems."""
+        """Serialize to a plain dict for external systems.
+
+        Output uses camelCase keys to match the TypeScript SDK.
+        """
         return {
             "_type": "chat:Thread",
             "id": self._id,
-            "channel_id": self._channel_id,
-            "channel_visibility": self._channel_visibility,
-            "current_message": self._current_message.to_json() if self._current_message else None,
-            "is_dm": self._is_dm,
-            "adapter_name": self.adapter.name,
+            "channelId": self._channel_id,
+            "channelVisibility": self._channel_visibility,
+            "currentMessage": self._current_message.to_json() if self._current_message else None,
+            "isDM": self._is_dm,
+            "adapterName": self.adapter.name,
         }
 
     @classmethod
@@ -667,42 +690,41 @@ class ThreadImpl:
     ) -> ThreadImpl:
         """Reconstruct a ThreadImpl from serialized JSON data.
 
+        Accepts both camelCase (canonical output of ``to_json()``) and
+        snake_case keys for backward compatibility.
         Uses lazy resolution from the Chat singleton unless an adapter is provided.
         """
+        current_msg_raw = data.get("currentMessage") or data.get("current_message")
         current_msg = None
-        if data.get("current_message"):
-            raw = data["current_message"]
-            current_msg = Message(
-                id=raw["id"],
-                thread_id=raw.get("thread_id", ""),
-                text=raw.get("text", ""),
-                formatted=raw.get("formatted", {"type": "root", "children": []}),
-                author=Author(
-                    user_id=raw["author"]["user_id"],
-                    user_name=raw["author"]["user_name"],
-                    full_name=raw["author"]["full_name"],
-                    is_bot=raw["author"]["is_bot"],
-                    is_me=raw["author"]["is_me"],
-                ),
-                metadata=MessageMetadata(
-                    date_sent=datetime.fromisoformat(raw["metadata"]["date_sent"]),
-                    edited=raw["metadata"].get("edited", False),
-                ),
-            )
+        if current_msg_raw:
+            current_msg = Message.from_json(current_msg_raw)
 
         thread = cls(
             _ThreadImplConfig(
                 id=data["id"],
-                adapter_name=data.get("adapter_name"),
-                channel_id=data.get("channel_id", ""),
-                channel_visibility=data.get("channel_visibility", "unknown"),
+                adapter_name=data.get("adapterName") or data.get("adapter_name"),
+                channel_id=data.get("channelId") or data.get("channel_id", ""),
+                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
                 current_message=current_msg,
-                is_dm=data.get("is_dm", False),
+                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
             )
         )
         if adapter is not None:
             thread._adapter = adapter
         return thread
+
+    @classmethod
+    def from_json_compat(
+        cls,
+        data: dict[str, Any],
+        adapter: Adapter | None = None,
+    ) -> ThreadImpl:
+        """Reconstruct a ThreadImpl from serialized JSON data with TS interop.
+
+        Like :meth:`from_json` but explicitly accepts both camelCase and
+        snake_case keys for cross-SDK compatibility.
+        """
+        return cls.from_json(data, adapter=adapter)
 
     # -- SentMessage construction --------------------------------------------
 
@@ -744,7 +766,7 @@ class ThreadImpl:
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.now(tz=UTC),
+                date_sent=datetime.now(tz=timezone.utc),
                 edited=False,
             ),
             attachments=attachments,
@@ -823,31 +845,64 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
     """Normalise a raw async iterable into str or StreamChunk items.
 
     Handles plain strings, AI SDK fullStream events, and StreamChunk objects.
+    Mirrors from-full-stream.ts: tracks ``finish-step`` events so that a
+    ``"\n\n"`` separator is emitted between consecutive steps.
     """
+    needs_separator = False
+    has_emitted_text = False
+
     async for item in raw_stream:
         if isinstance(item, str):
             yield item
-        elif hasattr(item, "type"):
+            continue
+
+        if hasattr(item, "type"):
             # StreamChunk or StreamEvent
-            if item.type == "text-delta":
-                yield getattr(item, "textDelta", getattr(item, "text_delta", ""))
-            elif item.type == "markdown_text" or item.type in ("task_update", "plan_update"):
+            item_type = item.type
+
+            # Pass through known StreamChunk types
+            if item_type in ("markdown_text", "task_update", "plan_update"):
                 yield item
-            else:
-                # Other events - try to extract text
-                text = getattr(item, "text", None)
-                if text:
-                    yield text
+                continue
+
+            # AI SDK v5 uses textDelta, v6 uses text; also accept delta
+            if item_type == "text-delta":
+                text_content = (
+                    getattr(item, "text", None)
+                    or getattr(item, "delta", None)
+                    or getattr(item, "textDelta", None)
+                    or getattr(item, "text_delta", None)
+                    or ""
+                )
+                if isinstance(text_content, str) and text_content:
+                    if needs_separator and has_emitted_text:
+                        yield "\n\n"
+                    needs_separator = False
+                    has_emitted_text = True
+                    yield text_content
+            elif item_type == "finish-step":
+                needs_separator = True
+
         elif isinstance(item, dict):
             t = item.get("type")
+
+            # Pass through known StreamChunk dict types
+            if t in ("markdown_text", "task_update", "plan_update"):
+                yield item
+                continue
+
             if t == "text-delta":
-                yield item.get("textDelta", item.get("text_delta", ""))
-            elif t == "markdown_text":
-                yield item.get("text", "")
-            else:
-                text = item.get("text")
-                if text:
-                    yield text
+                text_content = (
+                    item.get("text") or item.get("delta") or item.get("textDelta") or item.get("text_delta") or ""
+                )
+                if isinstance(text_content, str) and text_content:
+                    if needs_separator and has_emitted_text:
+                        yield "\n\n"
+                    needs_separator = False
+                    has_emitted_text = True
+                    yield text_content
+            elif t == "finish-step":
+                needs_separator = True
 
 
 # ---------------------------------------------------------------------------

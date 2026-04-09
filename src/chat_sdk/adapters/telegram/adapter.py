@@ -17,7 +17,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.telegram.cards import (
@@ -50,14 +50,12 @@ from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
 from chat_sdk.shared.card_utils import card_to_fallback_text
 from chat_sdk.shared.errors import (
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
     ResourceNotFoundError,
     ValidationError,
-)
-from chat_sdk.shared.errors import (
-    PermissionError as AdapterPermissionError,
 )
 from chat_sdk.types import (
     ActionEvent,
@@ -286,6 +284,9 @@ class TelegramAdapter:
         self._polling_task: asyncio.Task[None] | None = None
         self._polling_active: bool = False
 
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
+
         if self._mode not in ("auto", "webhook", "polling"):
             raise ValidationError(
                 "telegram",
@@ -424,9 +425,20 @@ class TelegramAdapter:
 
         return self._make_response("OK", 200)
 
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def disconnect(self) -> None:
-        """Disconnect the adapter and stop polling if active."""
+        """Disconnect the adapter, stop polling, and close the shared HTTP session."""
         await self.stop_polling()
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     # -- Polling -------------------------------------------------------------
 
@@ -851,7 +863,11 @@ class TelegramAdapter:
         resulting_thread_id = self.encode_thread_id(
             TelegramThreadId(
                 chat_id=str(raw_message["chat"]["id"]),
-                message_thread_id=(raw_message.get("message_thread_id") or parsed_thread.message_thread_id),
+                message_thread_id=(
+                    raw_message.get("message_thread_id")
+                    if raw_message.get("message_thread_id") is not None
+                    else parsed_thread.message_thread_id
+                ),
             )
         )
 
@@ -928,7 +944,7 @@ class TelegramAdapter:
                 metadata=MessageMetadata(
                     date_sent=existing.metadata.date_sent,
                     edited=True,
-                    edited_at=datetime.now(UTC),
+                    edited_at=datetime.now(timezone.utc),
                 ),
                 attachments=existing.attachments,
                 is_mention=existing.is_mention,
@@ -945,7 +961,11 @@ class TelegramAdapter:
         resulting_thread_id = self.encode_thread_id(
             TelegramThreadId(
                 chat_id=str(result["chat"]["id"]),
-                message_thread_id=(result.get("message_thread_id") or parsed_thread.message_thread_id),
+                message_thread_id=(
+                    result.get("message_thread_id")
+                    if result.get("message_thread_id") is not None
+                    else parsed_thread.message_thread_id
+                ),
             )
         )
 
@@ -1239,9 +1259,9 @@ class TelegramAdapter:
             raw=raw,
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromtimestamp(raw["date"], tz=UTC),
+                date_sent=datetime.fromtimestamp(raw["date"], tz=timezone.utc),
                 edited=edit_date is not None,
-                edited_at=(datetime.fromtimestamp(edit_date, tz=UTC) if edit_date is not None else None),
+                edited_at=(datetime.fromtimestamp(edit_date, tz=timezone.utc) if edit_date is not None else None),
             ),
             attachments=self.extract_attachments(raw),
             is_mention=self.is_bot_mentioned(raw, plain_text),
@@ -1355,7 +1375,8 @@ class TelegramAdapter:
         file_url = f"{self._api_base_url}/file/bot{self._bot_token}/{file_path}"
 
         try:
-            async with aiohttp.ClientSession() as session, session.get(file_url) as response:
+            session = await self._get_http_session()
+            async with session.get(file_url) as response:
                 if not response.ok:
                     raise NetworkError(
                         "telegram",
@@ -1466,7 +1487,7 @@ class TelegramAdapter:
         options: FetchOptions,
     ) -> FetchResult:
         """Paginate a list of messages according to fetch options."""
-        limit = max(1, min(getattr(options, "limit", 50) or 50, 100))
+        limit = max(1, min(getattr(options, "limit", 50) if getattr(options, "limit", 50) is not None else 50, 100))
         direction = getattr(options, "direction", "backward") or "backward"
 
         if not messages:
@@ -1738,17 +1759,17 @@ class TelegramAdapter:
             is_form = isinstance(payload, aiohttp.FormData)
 
         try:
-            async with aiohttp.ClientSession() as session:
-                if is_form:
-                    async with session.post(url, data=payload) as response:
-                        data = await self._parse_telegram_response(method, response)
-                else:
-                    async with session.post(
-                        url,
-                        json=payload or {},
-                        headers={"Content-Type": "application/json"},
-                    ) as response:
-                        data = await self._parse_telegram_response(method, response)
+            session = await self._get_http_session()
+            if is_form:
+                async with session.post(url, data=payload) as response:
+                    data = await self._parse_telegram_response(method, response)
+            else:
+                async with session.post(
+                    url,
+                    json=payload or {},
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    data = await self._parse_telegram_response(method, response)
         except (aiohttp.ClientError, OSError) as error:
             raise NetworkError(
                 "telegram",

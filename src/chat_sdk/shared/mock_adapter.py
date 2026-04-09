@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.types import (
@@ -211,6 +211,11 @@ class MockStateAdapter:
         self._locks: dict[str, Lock] = {}
         self._queues: dict[str, list[QueueEntry]] = {}
 
+        # Call recorders for verifying arguments in tests
+        self._acquire_lock_calls: list[tuple[str, int]] = []
+        self._force_release_lock_calls: list[str] = []
+        self._enqueue_calls: list[tuple[str, QueueEntry, int]] = []
+
     async def connect(self) -> None:
         pass
 
@@ -227,6 +232,7 @@ class MockStateAdapter:
         return thread_id in self._subscriptions
 
     async def acquire_lock(self, thread_id: str, ttl_ms: int) -> Lock | None:
+        self._acquire_lock_calls.append((thread_id, ttl_ms))
         if thread_id in self._locks:
             return None
         lock = Lock(
@@ -238,6 +244,7 @@ class MockStateAdapter:
         return lock
 
     async def force_release_lock(self, thread_id: str) -> None:
+        self._force_release_lock_calls.append(thread_id)
         self._locks.pop(thread_id, None)
 
     async def release_lock(self, lock: Lock) -> None:
@@ -279,6 +286,7 @@ class MockStateAdapter:
         return self.cache.get(key, [])
 
     async def enqueue(self, thread_id: str, entry: QueueEntry, max_size: int) -> int:
+        self._enqueue_calls.append((thread_id, entry, max_size))
         queue = self._queues.setdefault(thread_id, [])
         queue.append(entry)
         if len(queue) > max_size:
@@ -344,7 +352,7 @@ def create_test_message(
             is_me=False,
         ),
         "metadata": MessageMetadata(
-            date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+            date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
             edited=False,
         ),
         "attachments": [],

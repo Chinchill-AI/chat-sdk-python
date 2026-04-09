@@ -20,7 +20,6 @@ from chat_sdk.message_history import (
 )
 from chat_sdk.types import Attachment, Author, Message, MessageMetadata
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

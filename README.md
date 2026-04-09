@@ -2,7 +2,7 @@
 
 Multi-platform async chat SDK for Python. Port of [Vercel Chat](https://github.com/vercel/chat).
 
-> **Status: Alpha (0.0.1a10)** — API may change. Not yet tested in production.
+> **Status: Alpha (0.0.1a11)** — API may change. Not yet tested in production.
 
 ## Why chat-sdk?
 
@@ -66,7 +66,7 @@ async def handle_mention(thread, message):
 | Feature | chat-sdk | Raw platform SDKs | BotFramework SDK |
 |---------|----------|--------------------|------------------|
 | Multi-platform from one codebase | 8 platforms | 1 per SDK | Teams + limited |
-| Async-native (Python 3.11+) | Yes | Varies | No |
+| Async-native (Python 3.10+) | Yes | Varies | No |
 | Cross-platform cards | Card model | Platform-specific | Adaptive Cards only |
 | Thread locking / dedup | Built-in | DIY | DIY |
 | State abstraction (mem/redis/pg) | Built-in | DIY | DIY |

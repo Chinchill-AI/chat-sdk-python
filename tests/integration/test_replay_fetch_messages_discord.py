@@ -16,9 +16,9 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
 import pytest
+
 from chat_sdk.testing import MockAdapter
 from chat_sdk.types import (
     Author,
@@ -27,7 +27,6 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants

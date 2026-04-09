@@ -17,19 +17,33 @@ Python port of Vercel Chat SDK. Multi-platform async chat framework.
 - `src/chat_sdk/adapters/` -- 8 platform adapters
 - `src/chat_sdk/shared/` -- Markdown parser, format converter, streaming renderer
 - `src/chat_sdk/state/` -- Memory, Redis, Postgres backends
-- `tests/` -- 2,477+ tests
+- `tests/` -- 3,267 tests
 
-## Critical Rules
-1. **Never use `datetime.utcnow()`** -- use `datetime.now(tz=timezone.utc)`
-2. **Never use `asyncio.ensure_future`** -- use `asyncio.get_running_loop().create_task()`
-3. **Never pass raw dicts to `self._chat.process_*`** -- use typed dataclasses (ActionEvent, ReactionEvent, etc.)
-4. **Never use camelCase keys in dispatch dicts** -- always snake_case
-5. **Never use `random.choices` for security tokens** -- use `secrets.token_hex`
-6. **Never import optional deps at module level** -- lazy import inside functions
-7. **Always use `hmac.compare_digest` for signature verification** -- never `==`
-8. **Always use `is not None` for empty-string-valid fields** -- never `or`
-9. **Always validate external URLs before HTTP requests** (SSRF prevention)
-10. **Always check `extend_lock` return value** in processing loops
+## Principles
+
+1. **Every test must fail when the code is wrong.** No `assert True` stubs, no
+   bare truthiness checks when specific values are available, no MagicMock where
+   AsyncMock is needed. If a test can't catch a regression, it's not a test.
+2. **Every async call must be awaited.** Unawaited coroutines silently return
+   truthy objects. Use AsyncMock (not MagicMock) in tests to surface these.
+3. **No two tests should verify the same thing.** Duplicates inflate counts
+   without catching more bugs.
+
+## Port Rules (TS → Python)
+
+These are specific patterns that broke during the port. The principles above
+explain *why*; these explain *what to watch for*.
+
+- `datetime.utcnow()` → `datetime.now(tz=UTC)` (deprecated, naive)
+- `asyncio.ensure_future` → `loop.create_task()` (deprecated)
+- Raw dicts to `process_*` → typed dataclasses (ActionEvent, etc.)
+- camelCase dispatch keys → snake_case
+- `random.choices` for tokens → `secrets.token_hex`
+- Optional deps at module level → lazy import
+- `==` for signatures → `hmac.compare_digest`
+- `or` for empty-string-valid fields → `is not None`
+- Validate external URLs before requests (SSRF)
+- Check `extend_lock` return value in loops
 
 ## Adding a New Adapter
 See docs/ARCHITECTURE.md and CONTRIBUTING.md.
@@ -42,17 +56,12 @@ See docs/UPSTREAM_SYNC.md for TS->Python translation patterns.
 - StreamingMarkdownRenderer's _remend is simplified vs the npm `remend` library
 - No setext headings, no footnotes, no HTML nodes in the parser
 
-## Test Fidelity Verification
+## Test Quality
 
-After modifying or adding tests, run:
-```bash
-python3 scripts/verify_test_fidelity.py
-```
-This verifies every TS `it("...")` test has a matching Python `def test_...()`.
-The script must show `0 missing` before committing test changes.
+**CI runs `scripts/audit_test_quality.py` before tests.** It catches phantoms,
+async mock bugs, and cross-file duplicates. PRs that introduce hard failures
+will not pass CI.
 
-When porting a new TS test file:
-1. Add the mapping to `scripts/verify_test_fidelity.py` MAPPING dict
-2. Run with `--fix` to generate stubs
-3. Translate each stub by reading the TS test body line-by-line
-4. Verify with the script before committing
+**Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
+`it("...")` has a matching Python `def test_*()`. Name match ≠ faithful port —
+the audit script catches the quality side.

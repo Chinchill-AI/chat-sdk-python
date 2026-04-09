@@ -9,11 +9,12 @@ thread/channel creation.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.channel import ChannelImpl
@@ -53,6 +54,7 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StateAdapter,
     WebhookOptions,
+    _parse_iso,
 )
 
 # ---------------------------------------------------------------------------
@@ -168,16 +170,26 @@ async def _sleep(ms: int) -> None:
     await asyncio.sleep(ms / 1000.0)
 
 
-def _create_task(coro: Any) -> asyncio.Task[Any] | None:
+def _create_task(
+    coro: Any,
+    active_tasks: set[asyncio.Task[Any]] | None = None,
+) -> asyncio.Task[Any] | None:
     """Create an asyncio task using the running loop.
 
     Returns ``None`` when no event loop is running (e.g. called from a
     synchronous context without an active loop).  Callers should guard
     against this.
+
+    If *active_tasks* is provided the new task is added to the set and a
+    done-callback is registered to remove it when the task finishes.
     """
     try:
         loop = asyncio.get_running_loop()
-        return loop.create_task(coro)
+        task = loop.create_task(coro)
+        if active_tasks is not None:
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
+        return task
     except RuntimeError:
         # No running event loop -- cannot schedule the coroutine.
         # Close the coroutine to avoid "coroutine was never awaited" warning.
@@ -221,6 +233,10 @@ class Chat:
 
     def __init__(self, config: ChatConfig | None = None, **kwargs: Any) -> None:
         if config is None:
+            known_fields = {f.name for f in dataclasses.fields(ChatConfig)}
+            unknown = set(kwargs) - known_fields
+            if unknown:
+                raise TypeError(f"Unknown Chat config fields: {unknown}")
             config = ChatConfig(**kwargs)
         self._user_name = config.user_name
         self._state_adapter = config.state
@@ -286,6 +302,9 @@ class Chat:
         self._init_promise: asyncio.Task[None] | None = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+
+        # -- Active handler tasks (for cancellation on shutdown) --------------
+        self._active_tasks: set[asyncio.Task[Any]] = set()
 
         # -- Cached mention regex patterns (populated lazily) ----------------
         self._mention_patterns: dict[str, re.Pattern[str]] = {}
@@ -406,6 +425,14 @@ class Chat:
     async def shutdown(self) -> None:
         """Gracefully shut down all adapters and state."""
         self._logger.info("Shutting down chat instance...")
+
+        # Cancel in-flight handler tasks before tearing down adapters/state
+        for task in list(self._active_tasks):
+            task.cancel()
+        # Give tasks time to handle cancellation
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+
         tasks = []
         for adapter in self._adapters.values():
             if hasattr(adapter, "disconnect") and adapter.disconnect:  # type: ignore[union-attr]
@@ -729,7 +756,7 @@ class Chat:
             msg = await message_or_factory() if callable(message_or_factory) else message_or_factory
             await self.handle_incoming_message(adapter, thread_id, msg)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -749,7 +776,7 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         """Process an incoming reaction event."""
-        task = _create_task(self._handle_reaction_event(event))
+        task = _create_task(self._handle_reaction_event(event), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -767,7 +794,7 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         """Process an incoming action event (button click)."""
-        task = _create_task(self._handle_action_event(event))
+        task = _create_task(self._handle_action_event(event), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -841,7 +868,7 @@ class Chat:
                 if not pat.callback_ids or event.callback_id in pat.callback_ids:
                     await pat.handler(full_event)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -859,7 +886,7 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         """Process a slash command event."""
-        task = _create_task(self._handle_slash_command_event(event))
+        task = _create_task(self._handle_slash_command_event(event), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -880,7 +907,7 @@ class Chat:
             for h in self._assistant_thread_started_handlers:
                 await h(event)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -901,7 +928,7 @@ class Chat:
             for h in self._assistant_context_changed_handlers:
                 await h(event)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -922,7 +949,7 @@ class Chat:
             for h in self._app_home_opened_handlers:
                 await h(event)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -943,7 +970,7 @@ class Chat:
             for h in self._member_joined_channel_handlers:
                 await h(event)
 
-        task = _create_task(_task())
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -1035,7 +1062,7 @@ class Chat:
             "message": message.to_json() if message else None,
             "channel": channel.to_json() if channel else None,
         }
-        task = _create_task(self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS))
+        task = _create_task(self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -1117,7 +1144,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=event.raw,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
                 attachments=[],
             )
             thread = self._create_thread(event.adapter, event.thread_id, dummy_message, is_subscribed)
@@ -1149,7 +1176,7 @@ class Chat:
                                 metadata=getattr(
                                     raw_fetched,
                                     "metadata",
-                                    MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                                    MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
                                 ),
                             )
                     except Exception:
@@ -1227,7 +1254,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             ),
             is_subscribed,
         )
@@ -1288,7 +1315,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             ),
             False,
         )
@@ -1489,9 +1516,9 @@ class Chat:
             # Support both sync and async callables
             if asyncio.iscoroutine(result) or asyncio.isfuture(result):
                 result = await result
-            if result:
+            if result == "force" or result is True:
                 self._logger.info(
-                    "on_lock_conflict callback returned True, force-releasing lock",
+                    "on_lock_conflict callback returned 'force', force-releasing lock",
                     {"thread_id": thread_id, "lock_key": lock_key},
                 )
                 await self._state_adapter.force_release_lock(lock_key)
@@ -1533,7 +1560,7 @@ class Chat:
                 )
                 return
 
-            now = int(datetime.now(tz=UTC).timestamp() * 1000)
+            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
             entry = QueueEntry(
                 message=message,
                 enqueued_at=now,
@@ -1551,7 +1578,7 @@ class Chat:
 
         try:
             if strategy == "debounce":
-                now = int(datetime.now(tz=UTC).timestamp() * 1000)
+                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
                 await self._state_adapter.enqueue(
                     lock_key,
                     QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
@@ -1608,7 +1635,7 @@ class Chat:
                 break
 
             msg = self._rehydrate_message(entry.message)
-            now = int(datetime.now(tz=UTC).timestamp() * 1000)
+            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
             if now > entry.expires_at:
                 self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
                 continue
@@ -1638,7 +1665,7 @@ class Chat:
                 if entry is None:
                     break
                 msg = self._rehydrate_message(entry.message)
-                now = int(datetime.now(tz=UTC).timestamp() * 1000)
+                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
                 if now <= entry.expires_at:
                     pending.append((msg, entry.expires_at))
                 else:
@@ -1841,13 +1868,13 @@ class Chat:
             metadata_raw = raw.get("metadata", {})
             date_sent = metadata_raw.get("date_sent")
             if isinstance(date_sent, str):
-                date_sent = datetime.fromisoformat(date_sent)
+                date_sent = _parse_iso(date_sent)
             elif not isinstance(date_sent, datetime):
-                date_sent = datetime.now(tz=UTC)
+                date_sent = datetime.now(tz=timezone.utc)
 
             edited_at = metadata_raw.get("edited_at")
             if isinstance(edited_at, str):
-                edited_at = datetime.fromisoformat(edited_at)
+                edited_at = _parse_iso(edited_at)
 
             author_raw = raw.get("author", {})
             return Message(
@@ -1900,28 +1927,28 @@ def _message_from_json(data: dict[str, Any]) -> Message:
     author_raw = data.get("author", {})
     metadata_raw = data.get("metadata", {})
 
-    date_sent = metadata_raw.get("date_sent")
+    date_sent = metadata_raw.get("dateSent") or metadata_raw.get("date_sent")
     if isinstance(date_sent, str):
-        date_sent = datetime.fromisoformat(date_sent)
+        date_sent = _parse_iso(date_sent)
     elif not isinstance(date_sent, datetime):
-        date_sent = datetime.now(tz=UTC)
+        date_sent = datetime.now(tz=timezone.utc)
 
-    edited_at = metadata_raw.get("edited_at")
+    edited_at = metadata_raw.get("editedAt") or metadata_raw.get("edited_at")
     if isinstance(edited_at, str):
-        edited_at = datetime.fromisoformat(edited_at)
+        edited_at = _parse_iso(edited_at)
 
     return Message(
         id=data.get("id", ""),
-        thread_id=data.get("thread_id", ""),
+        thread_id=data.get("threadId") or data.get("thread_id", ""),
         text=data.get("text", ""),
         formatted=data.get("formatted", {"type": "root", "children": []}),
         raw=data.get("raw"),
         author=Author(
-            user_id=author_raw.get("user_id", ""),
-            user_name=author_raw.get("user_name", ""),
-            full_name=author_raw.get("full_name", ""),
-            is_bot=author_raw.get("is_bot", False),
-            is_me=author_raw.get("is_me", False),
+            user_id=author_raw.get("userId") or author_raw.get("user_id", ""),
+            user_name=author_raw.get("userName") or author_raw.get("user_name", ""),
+            full_name=author_raw.get("fullName") or author_raw.get("full_name", ""),
+            is_bot=author_raw.get("isBot") if "isBot" in author_raw else author_raw.get("is_bot", False),
+            is_me=author_raw.get("isMe") if "isMe" in author_raw else author_raw.get("is_me", False),
         ),
         metadata=MessageMetadata(
             date_sent=date_sent,
@@ -1929,7 +1956,7 @@ def _message_from_json(data: dict[str, Any]) -> Message:
             edited_at=edited_at,
         ),
         attachments=data.get("attachments", []),
-        is_mention=data.get("is_mention"),
+        is_mention=data.get("isMention") if "isMention" in data else data.get("is_mention"),
         links=data.get("links", []),
     )
 

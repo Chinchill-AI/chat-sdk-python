@@ -16,9 +16,10 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import timezone
 
 import pytest
+
 from chat_sdk.testing import MockAdapter, create_mock_adapter
 from chat_sdk.types import (
     Author,
@@ -26,10 +27,7 @@ from chat_sdk.types import (
     FetchResult,
     Message,
     MessageMetadata,
-    RawMessage,
 )
-
-from .conftest import create_chat, create_msg
 
 # ---------------------------------------------------------------------------
 # Test message fixtures
@@ -52,7 +50,7 @@ def _make_fetch_messages(
 
     Creates numbered messages (1..count) alternating between human and bot.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     messages: list[Message] = []
     for i in range(1, count + 1):

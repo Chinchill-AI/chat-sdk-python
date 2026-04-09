@@ -13,7 +13,7 @@ import json
 import os
 import re
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -60,6 +60,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -132,6 +133,9 @@ class DiscordAdapter:
             f"discord_request_context_{id(self)}", default=None
         )
         self._thread_parent_cache: dict[str, dict[str, Any]] = {}
+
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
 
         # Validate public key format
         if not HEX_64_PATTERN.match(self._public_key):
@@ -585,9 +589,9 @@ class DiscordAdapter:
                 is_me=author_data.get("id") == self._application_id,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(data.get("timestamp", ""))
+                date_sent=_parse_iso(data.get("timestamp", ""))
                 if data.get("timestamp")
-                else datetime.now(UTC),
+                else datetime.now(timezone.utc),
                 edited=False,
             ),
             attachments=[
@@ -649,6 +653,17 @@ class DiscordAdapter:
                             "parent_id": channel_info["parent_id"],
                             "expires_at": time.time() + THREAD_PARENT_CACHE_TTL,
                         }
+                        # Prevent unbounded cache growth
+                        if len(self._thread_parent_cache) > 1000:
+                            now = time.time()
+                            expired = [k for k, v in self._thread_parent_cache.items() if v.get("expires_at", 0) <= now]
+                            for k in expired:
+                                del self._thread_parent_cache[k]
+                            # Hard limit: evict oldest if still over threshold
+                            if len(self._thread_parent_cache) > 1000:
+                                keys = list(self._thread_parent_cache.keys())
+                                for k in keys[: len(keys) - 1000]:
+                                    del self._thread_parent_cache[k]
                 except Exception as error:
                     self._logger.error(
                         "Failed to fetch thread parent for reaction",
@@ -964,7 +979,7 @@ class DiscordAdapter:
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = decoded.thread_id or decoded.channel_id
 
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         direction = options.direction or "backward"
 
         params: list[str] = [f"limit={limit}"]
@@ -1179,9 +1194,20 @@ class DiscordAdapter:
             },
         )
 
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def disconnect(self) -> None:
-        """Cleanup hook. Discord HTTP Interactions adapter is stateless, so this is a no-op."""
-        self._logger.debug("Discord adapter disconnecting (no-op for HTTP interactions)")
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+        self._logger.debug("Discord adapter disconnecting")
 
     # =========================================================================
     # Private helpers
@@ -1214,9 +1240,9 @@ class DiscordAdapter:
                 is_me=is_me,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else datetime.now(UTC),
+                date_sent=_parse_iso(msg["timestamp"]) if msg.get("timestamp") else datetime.now(timezone.utc),
                 edited=msg.get("edited_timestamp") is not None,
-                edited_at=datetime.fromisoformat(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
+                edited_at=_parse_iso(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
             ),
             attachments=[
                 Attachment(
@@ -1259,7 +1285,7 @@ class DiscordAdapter:
         message_id: str,
     ) -> dict[str, str]:
         """Create a Discord thread from a message."""
-        thread_name = f"Thread {datetime.now(UTC).isoformat()}"
+        thread_name = f"Thread {datetime.now(timezone.utc).isoformat()}"
 
         self._logger.debug(
             "Discord API: POST thread",
@@ -1311,7 +1337,7 @@ class DiscordAdapter:
         with a ``payload_json`` field for the JSON body and one field per
         file attachment, matching the Discord API multipart upload spec.
         """
-        import aiohttp  # lazy import
+        import aiohttp  # lazy import (needed for FormData)
 
         url = f"{DISCORD_API_BASE}{path}"
         headers: dict[str, str] = {
@@ -1338,15 +1364,13 @@ class DiscordAdapter:
                 headers["Content-Type"] = "application/json"
                 request_kwargs["json"] = body
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.request(
-                method,
-                url,
-                headers=headers,
-                **request_kwargs,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.request(
+            method,
+            url,
+            headers=headers,
+            **request_kwargs,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 self._logger.error(

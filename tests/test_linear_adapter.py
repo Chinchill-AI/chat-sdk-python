@@ -9,11 +9,11 @@ import hashlib
 import hmac
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from chat_sdk.adapters.linear.adapter import LinearAdapter, create_linear_adapter
+from chat_sdk.adapters.linear.adapter import LinearAdapter
 from chat_sdk.adapters.linear.types import (
     LinearAdapterAPIKeyConfig,
     LinearAdapterAppConfig,
@@ -288,10 +288,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-abc123",
                 "body": "Hello from Linear!",
-                "issue_id": "issue-123",
-                "user_id": "user-456",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T12:00:00.000Z",
+                "issueId": "issue-123",
+                "userId": "user-456",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)
@@ -305,10 +305,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-abc123",
                 "body": "Edited message",
-                "issue_id": "issue-123",
-                "user_id": "user-456",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T13:00:00.000Z",
+                "issueId": "issue-123",
+                "userId": "user-456",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T13:00:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)
@@ -320,10 +320,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-empty",
                 "body": "",
-                "issue_id": "issue-1",
-                "user_id": "user-1",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T12:00:00.000Z",
+                "issueId": "issue-1",
+                "userId": "user-1",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)
@@ -336,10 +336,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-edited",
                 "body": "Updated text",
-                "issue_id": "issue-1",
-                "user_id": "user-1",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T14:30:00.000Z",
+                "issueId": "issue-1",
+                "userId": "user-1",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T14:30:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)
@@ -352,10 +352,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-unedited",
                 "body": "Original text",
-                "issue_id": "issue-1",
-                "user_id": "user-1",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T12:00:00.000Z",
+                "issueId": "issue-1",
+                "userId": "user-1",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)
@@ -367,10 +367,10 @@ class TestParseMessage:
             "comment": {
                 "id": "comment-1",
                 "body": "test",
-                "issue_id": "issue-1",
-                "user_id": "user-1",
-                "created_at": "2025-01-29T12:00:00.000Z",
-                "updated_at": "2025-01-29T12:00:00.000Z",
+                "issueId": "issue-1",
+                "userId": "user-1",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
             }
         }
         msg = adapter.parse_message(raw)

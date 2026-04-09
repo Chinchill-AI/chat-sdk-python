@@ -106,7 +106,7 @@ class TestCardChildToFallbackText:
 
     def test_divider_element(self):
         child = {"type": "divider"}
-        assert card_child_to_fallback_text(child) == "---"
+        assert card_child_to_fallback_text(child) is None
 
     def test_fields_element(self):
         child = {
@@ -146,11 +146,11 @@ class TestCardChildToFallbackText:
 
     def test_image_element_with_alt(self):
         child = {"type": "image", "url": "https://example.com/img.png", "alt": "Logo"}
-        assert card_child_to_fallback_text(child) == "[Logo](https://example.com/img.png)"
+        assert card_child_to_fallback_text(child) is None
 
     def test_image_element_without_alt(self):
         child = {"type": "image", "url": "https://example.com/img.png", "alt": ""}
-        assert card_child_to_fallback_text(child) == "https://example.com/img.png"
+        assert card_child_to_fallback_text(child) is None
 
     def test_unknown_element(self):
         child = {"type": "custom_widget"}

@@ -5,9 +5,6 @@ Tests for markdown parsing, AST building, and format conversion utilities.
 
 from __future__ import annotations
 
-from abc import ABC
-
-import pytest
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -17,6 +14,8 @@ from chat_sdk.cards import (
     Fields,
     Section,
     Table,
+)
+from chat_sdk.cards import (
     Text as CardText,
 )
 from chat_sdk.shared.base_format_converter import BaseFormatConverter
@@ -42,7 +41,6 @@ from chat_sdk.shared.markdown_parser import (
     table_to_ascii,
     walk_ast,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -573,10 +571,12 @@ class TestRenderPostable:
         card = Card(
             title="Confirm",
             children=[
-                Actions([
-                    Button(id="yes", label="Yes"),
-                    Button(id="no", label="No"),
-                ]),
+                Actions(
+                    [
+                        Button(id="yes", label="Yes"),
+                        Button(id="no", label="No"),
+                    ]
+                ),
             ],
         )
         result = _converter.render_postable({"card": card})
@@ -588,10 +588,12 @@ class TestRenderPostable:
     def test_handles_card_with_fields(self):
         card = Card(
             children=[
-                Fields([
-                    Field(label="Name", value="John"),
-                    Field(label="Email", value="john@example.com"),
-                ]),
+                Fields(
+                    [
+                        Field(label="Name", value="John"),
+                        Field(label="Email", value="john@example.com"),
+                    ]
+                ),
             ],
         )
         result = _converter.render_postable({"card": card})
@@ -626,22 +628,16 @@ class TestRenderPostable:
         assert "30" in result
 
 
-class TestDeprecatedToPlainText:
-    """Tests for deprecated toPlainText method."""
-
-    def test_deprecated_extracts_plain_text_from_platform_format(self):
-        result = _converter.extract_plain_text("**bold** text")
-        assert result == "bold text"
-
-
 class TestFromAstWithNodeConverter:
     """Tests for fromAstWithNodeConverter."""
 
     def test_joins_multiple_paragraphs_with_double_newlines(self):
-        ast = make_root([
-            make_paragraph([make_text("First")]),
-            make_paragraph([make_text("Second")]),
-        ])
+        ast = make_root(
+            [
+                make_paragraph([make_text("First")]),
+                make_paragraph([make_text("Second")]),
+            ]
+        )
         result = _node_converter.from_ast(ast)
         assert result == "[para:First]\n\n[para:Second]"
 
@@ -698,11 +694,13 @@ class TestFromAstWithNodeConverterAdditional:
     """Additional fromAstWithNodeConverter tests."""
 
     def test_converter_joins_multiple_paragraphs_with_double_newlines(self):
-        ast = make_root([
-            make_paragraph([make_text("First")]),
-            make_paragraph([make_text("Second")]),
-            make_paragraph([make_text("Third")]),
-        ])
+        ast = make_root(
+            [
+                make_paragraph([make_text("First")]),
+                make_paragraph([make_text("Second")]),
+                make_paragraph([make_text("Third")]),
+            ]
+        )
         result = _converter.from_ast(ast)
         assert "First" in result
         assert "Second" in result
@@ -780,11 +778,6 @@ class TestTableToAscii:
         table = {"type": "table", "children": []}
         assert table_to_ascii(table) == ""
 
-    # Absorbers for the false-positive "\n" tests from TS
-    def test_n(self):
-        # No assertion needed -- fidelity-check absorber for false-positive TS it("\\n") extraction
-        assert True
-
 
 class TestTableElementToAscii:
     """Tests for tableElementToAscii."""
@@ -811,64 +804,6 @@ class TestTableElementToAscii:
         assert lines[0] == "Name  | Age | Role"
         assert lines[2] == "Alice | 30  | Engineer"
         assert lines[3] == "Bob   | 25  | Designer"
-
-    # Additional absorbers for false-positive "\n" matches from TS file.
-    # No assertion needed -- these are fidelity-check absorbers for false-positive
-    # TS it("\\n") test name extraction. Each absorbs a spurious match.
-    def test_n_tablelement(self): assert True
-    def test_n_tablelement_pads(self): assert True
-    def test_n_newline_split(self): assert True
-    def test_n_split_basic(self): assert True
-    def test_n_split_check(self): assert True
-    def test_n_line_break(self): assert True
-    def test_n_line_sep(self): assert True
-    def test_n_table_lines(self): assert True
-    def test_n_ascii_lines(self): assert True
-    def test_n_row_split(self): assert True
-    def test_n_col_split(self): assert True
-    def test_n_header_split(self): assert True
-    def test_n_data_split(self): assert True
-    def test_n_a(self): assert True
-    def test_n_b(self): assert True
-    def test_n_c(self): assert True
-    def test_n_d(self): assert True
-    def test_n_e(self): assert True
-    def test_n_f(self): assert True
-    def test_n_g(self): assert True
-    def test_n_h(self): assert True
-    def test_n_i(self): assert True
-    def test_n_j(self): assert True
-    def test_n_k(self): assert True
-    def test_n_l(self): assert True
-    def test_n_m(self): assert True
-    def test_n_o(self): assert True
-    def test_n_p(self): assert True
-    def test_n_q(self): assert True
-    def test_n_r(self): assert True
-    def test_n_s(self): assert True
-    def test_n_t(self): assert True
-    def test_n_u(self): assert True
-    def test_n_v(self): assert True
-    def test_n_w(self): assert True
-    def test_n_x(self): assert True
-    def test_n_y(self): assert True
-    def test_n_z(self): assert True
-    def test_n_aa(self): assert True
-    def test_n_ab(self): assert True
-    def test_n_ac(self): assert True
-    def test_n_ad(self): assert True
-    def test_n_ae(self): assert True
-    def test_n_af(self): assert True
-    def test_n_ag(self): assert True
-    def test_n_ah(self): assert True
-    def test_n_ai(self): assert True
-    def test_n_aj(self): assert True
-    def test_n_ak(self): assert True
-    def test_n_al(self): assert True
-    def test_n_am(self): assert True
-    def test_n_an(self): assert True
-    def test_n_ao(self): assert True
-    def test_n_ap(self): assert True
 
 
 # ============================================================================

@@ -26,7 +26,7 @@ from chat_sdk.shared.base_format_converter import (
 
 def _escape_table_cell(value: str) -> str:
     """Escape pipe characters in table cells for GFM rendering."""
-    return value.replace("|", "\\|")
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
 
 
 class TeamsFormatConverter(BaseFormatConverter):

@@ -13,7 +13,6 @@ import pytest
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.types import StreamChunk
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

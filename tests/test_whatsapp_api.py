@@ -9,22 +9,19 @@ network access.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from chat_sdk.adapters.whatsapp.adapter import (
     WHATSAPP_MESSAGE_LIMIT,
     WhatsAppAdapter,
-    split_message,
 )
-from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig, WhatsAppThreadId
+from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.types import MarkdownTextChunk, StreamChunk
-
 
 # =============================================================================
 # Helpers

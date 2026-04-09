@@ -16,19 +16,17 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+
 from chat_sdk.testing import create_mock_adapter
 from chat_sdk.types import (
-    Author,
     Message,
 )
 
 from .conftest import create_chat, create_msg
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -129,7 +127,6 @@ class TestAssistantThreadStartedRouting:
         captured: list[AssistantThreadStartedEvent] = []
 
         # Simulate the handler registration pattern
-        handler_called = {"value": False}
 
         @chat.on_mention
         async def mention_handler(thread, message, context=None):
@@ -293,9 +290,10 @@ class TestAssistantContextChanged:
     async def test_does_not_crash_without_handler(self):
         """No error when context_changed fires without a handler."""
         adapter = create_mock_adapter("slack")
-        # Just creating the event without dispatching is fine
         event = _make_context_changed_event(adapter)
-        assert event is not None
+        # Event is properly constructed with expected fields
+        assert event.thread_id == f"slack:{DM_CHANNEL}:{THREAD_TS}"
+        assert event.context.channel_id == CONTEXT_CHANNEL
 
 
 # ============================================================================

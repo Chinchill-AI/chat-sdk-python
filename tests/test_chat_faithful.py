@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any
+
 import pytest
+
 from chat_sdk.chat import Chat
 from chat_sdk.emoji import get_emoji
 from chat_sdk.errors import ChatError, LockError
@@ -210,8 +212,7 @@ class TestChatInit:
     async def test_should_disconnect_adapters_during_shutdown(self):
         chat, adapter, state = await _init_chat()
         await chat.shutdown()
-        # No assertion needed -- tests that shutdown completes without raising
-        assert True
+        assert not chat._initialized
 
     # TS: "should disconnect adapter before state adapter during shutdown"
     async def test_should_disconnect_adapter_before_state_adapter_during_shutdown(self):
@@ -250,10 +251,9 @@ class TestChatInit:
         )
         local_chat = Chat(config)
         await local_chat.webhooks["slack"]("request")
-        # No assertion needed -- tests that shutdown completes without raising when
-        # adapter has no disconnect method
+        # Shutdown should complete even when adapter has no disconnect method
         await local_chat.shutdown()
-        assert True
+        assert not local_chat._initialized
 
     # TS: "should disconnect all adapters during shutdown"
     async def test_should_disconnect_all_adapters_during_shutdown(self):
@@ -266,26 +266,39 @@ class TestChatInit:
             state=state,
         )
         await chat.shutdown()
-        # No assertion needed -- tests that shutdown completes for multiple adapters
-        assert True
+        assert not chat._initialized
 
     # TS: "should continue shutdown even if an adapter disconnect fails"
     async def test_should_continue_shutdown_even_if_an_adapter_disconnect_fails(self):
         failing = create_mock_adapter("slack")
         healthy = create_mock_adapter("discord")
 
+        healthy_disconnected = False
+        original_disconnect = healthy.disconnect
+
+        async def _track_disconnect():
+            nonlocal healthy_disconnected
+            healthy_disconnected = True
+            await original_disconnect()
+
         async def _raise():
             raise RuntimeError("connection lost")
 
         failing.disconnect = _raise  # type: ignore[assignment]
+        healthy.disconnect = _track_disconnect  # type: ignore[assignment]
         state = create_mock_state()
 
         chat, _ = await _init_multi_chat(
             {"slack": failing, "discord": healthy},
             state=state,
         )
-        # Should not raise
+        # Should not raise despite failing adapter
         await chat.shutdown()
+
+        # Healthy adapter was still disconnected despite the other adapter failing
+        assert healthy_disconnected
+        # Chat instance is fully shut down
+        assert not chat._initialized
 
     # TS: "should register webhook handlers"
     async def test_should_register_webhook_handlers(self):
@@ -317,8 +330,6 @@ class TestFallbackStreamingPlaceholder:
         )
         await custom_chat.webhooks["slack"]("request")
 
-        posted: list[str] = []
-
         @custom_chat.on_mention
         async def handler(thread, message, context=None):
             async def _stream():
@@ -331,7 +342,7 @@ class TestFallbackStreamingPlaceholder:
         await custom_chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         # No placeholder "..." should have been posted
-        for tid, content in adapter._post_calls:
+        for _tid, content in adapter._post_calls:
             assert content != "..."
         # The last edit should contain "Hi"
         assert len(adapter._edit_calls) > 0
@@ -359,6 +370,7 @@ class TestMentionHandling:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-1"
 
     # TS: "should call onSubscribedMessage handler for subscribed threads"
     async def test_should_call_onsubscribedmessage_handler_for_subscribed_threads(self):
@@ -379,6 +391,7 @@ class TestMentionHandling:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(subscribed_calls) == 1
+        assert subscribed_calls[0] == "msg-1"
         assert len(mention_calls) == 0
 
 
@@ -428,6 +441,7 @@ class TestMessageDeduplication:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg2)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-1"
 
     # TS: "should use default dedupe TTL of 5 minutes"
     async def test_should_use_default_dedupe_ttl_of_5_minutes(self):
@@ -503,7 +517,7 @@ class TestMessageDeduplication:
         msg1 = create_test_message("ts-1", "Hey @slack-bot help")
         msg2 = create_test_message("ts-1", "Hey @slack-bot help")
 
-        results = await asyncio.gather(
+        await asyncio.gather(
             chat.handle_incoming_message(adapter, "slack:C123:ts-1", msg1),
             chat.handle_incoming_message(adapter, "slack:C123:ts-1", msg2),
             return_exceptions=True,
@@ -524,6 +538,7 @@ class TestMessageDeduplication:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-1"
 
     # TS: "should not trigger onNewMention when message event has no bot mention"
     async def test_should_not_trigger_onnewmention_when_message_event_has_no_bot_mention(self):
@@ -544,6 +559,7 @@ class TestMessageDeduplication:
 
         assert len(mention_calls) == 0
         assert len(pattern_calls) == 1
+        assert pattern_calls[0] == "msg-1"
 
 
 # ============================================================================
@@ -565,6 +581,7 @@ class TestPatternMatching:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-1"
 
 
 # ============================================================================
@@ -645,6 +662,7 @@ class TestMentionInSubscribedThreads:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(subscribed_calls) == 1
+        assert subscribed_calls[0] == "msg-1"
         assert len(mention_calls) == 0
 
     # TS: "should call onNewMention only for mentions in unsubscribed threads"
@@ -665,6 +683,7 @@ class TestMentionInSubscribedThreads:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(mention_calls) == 1
+        assert mention_calls[0] == "msg-1"
         assert len(subscribed_calls) == 0
 
 
@@ -709,6 +728,7 @@ class TestDirectMessage:
         await chat.handle_incoming_message(adapter, "slack:DU123:1234.5678", msg)
 
         assert len(mention_calls) == 1
+        assert mention_calls[0] == "msg-1"
 
     # TS: "should route subscribed DM threads to onDirectMessage, not onSubscribedMessage"
     async def test_should_route_subscribed_dm_threads_to_ondirectmessage_not_onsubscribedmessage(self):
@@ -729,6 +749,7 @@ class TestDirectMessage:
         await chat.handle_incoming_message(adapter, "slack:DU123:1234.5678", msg)
 
         assert len(dm_calls) == 1
+        assert dm_calls[0] == "msg-1"
         assert len(subscribed_calls) == 0
 
     # TS: "should not route non-DM mentions to directMessage handler"
@@ -749,6 +770,7 @@ class TestDirectMessage:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(mention_calls) == 1
+        assert mention_calls[0] == "msg-1"
         assert len(dm_calls) == 0
 
 
@@ -1014,6 +1036,7 @@ class TestActions:
         await asyncio.sleep(0.02)
 
         assert len(received) == 1
+        assert received[0].action_id == "approve"
 
     # TS: "should skip actions from self"
     async def test_should_skip_actions_from_self(self):
@@ -1361,6 +1384,8 @@ class TestSlashCommands:
 
         # Should be called for /status and /health, but not /help
         assert len(calls) == 2
+        assert "/status" in calls
+        assert "/health" in calls
 
     # TS: "should skip slash commands from self"
     async def test_should_skip_slash_commands_from_self(self):
@@ -1398,23 +1423,25 @@ class TestSlashCommands:
         await asyncio.sleep(0.02)
 
         assert len(calls) == 1
+        assert calls[0] == "/help"
 
     # TS: "should provide channel.post method"
     async def test_should_provide_channelpost_method(self):
         chat, adapter, state = await _init_chat()
+        post_result = None
 
         @chat.on_slash_command
         async def handler(event):
-            await event.channel.post("Hello from slash command!")
+            nonlocal post_result
+            post_result = await event.channel.post("Hello from slash command!")
 
         event = _make_slash_event(adapter, command="/help", text="")
         chat.process_slash_command(event)
         await asyncio.sleep(0.05)
 
-        # No assertion needed -- tests that channel.post in a slash handler
-        # completes without raising. Channel posts go through post_channel_message
-        # which we can't directly observe here.
-        assert True
+        # Handler ran to completion and channel.post returned a SentMessage
+        assert post_result is not None
+        assert post_result.id == "msg-1"
 
     # TS: "should provide openModal method that calls adapter.openModal"
     async def test_slash_should_provide_openmodal_method_that_calls_adapteropenmodal(self):
@@ -1605,9 +1632,12 @@ class TestSlashCommands:
         modal_context_keys = [k for k in state.cache if k.startswith("modal-context:")]
         context_id = modal_context_keys[0].split(":")[-1]
 
+        post_result = None
+
         async def _modal_handler(event):
+            nonlocal post_result
             if event.related_channel:
-                await event.related_channel.post("Thank you for your feedback!")
+                post_result = await event.related_channel.post("Thank you for your feedback!")
 
         chat.on_modal_submit("slash_feedback_post", _modal_handler)
 
@@ -1623,9 +1653,9 @@ class TestSlashCommands:
             context_id,
         )
 
-        # No assertion needed -- tests that channel.post from a modal submit handler
-        # completes without raising. The channel.post goes through post_channel_message.
-        assert True
+        # Handler ran to completion and channel.post returned a SentMessage
+        assert post_result is not None
+        assert post_result.id == "msg-1"
 
     # TS: "should provide relatedChannel from action-triggered modal (extracted from thread)"
     async def test_should_provide_relatedchannel_from_actiontriggered_modal_extracted_from_thread(self):
@@ -1730,6 +1760,11 @@ class TestOnLockConflict:
 
         assert len(calls) == 1
         assert calls[0] == "msg-lock-2"
+        # Verify force_release_lock was called with the thread_id
+        assert "slack:C123:1234.5678" in state._force_release_lock_calls
+        # Verify lock was re-acquired after force-release
+        last_acquire = state._acquire_lock_calls[-1]
+        assert last_acquire[0] == "slack:C123:1234.5678"
 
     # TS: "should support callback returning 'force'"
     async def test_should_support_callback_returning_force(self):
@@ -1753,6 +1788,7 @@ class TestOnLockConflict:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-lock-3"
 
     # TS: "should support callback returning 'drop'"
     async def test_should_support_callback_returning_drop(self):
@@ -1804,6 +1840,7 @@ class TestOnLockConflict:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "msg-lock-5"
 
 
 # ============================================================================
@@ -2218,6 +2255,7 @@ class TestConcurrencyConcurrent:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert len(calls) == 1
+        assert calls[0] == "Hey @slack-bot concurrent"
 
 
 # ============================================================================
@@ -2241,10 +2279,7 @@ class TestLockScope:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         # Lock should have been acquired on the full threadId
-        assert "slack:C123:1234.5678" in state._locks or "slack:C123:1234.5678" not in state._locks  # Lock was released
-        # Verify by checking that lock was acquired (it was acquired then released)
-        # We can check dedupe key exists instead
-        assert "dedupe:slack:msg-ls-1" in state.cache
+        assert any(key == "slack:C123:1234.5678" for key, _ttl in state._acquire_lock_calls)
 
     # TS: "should use channelId as lock key with channel scope on adapter"
     async def test_should_use_channelid_as_lock_key_with_channel_scope_on_adapter(self):
@@ -2268,9 +2303,8 @@ class TestLockScope:
         msg = create_test_message("msg-ls-2", "Hey @telegram-bot")
         await chat.handle_incoming_message(adapter, "telegram:C123:topic456", msg)
 
-        # The channel lock key should be "telegram:C123"
-        # Lock was acquired and released - verify the message was processed
-        assert "dedupe:telegram:msg-ls-2" in state.cache
+        # channelIdFromThreadId returns first two parts: "telegram:C123"
+        assert any(key == "telegram:C123" for key, _ttl in state._acquire_lock_calls)
 
     # TS: "should use channelId as lock key with channel scope on config"
     async def test_should_use_channelid_as_lock_key_with_channel_scope_on_config(self):
@@ -2291,7 +2325,7 @@ class TestLockScope:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         # channelIdFromThreadId returns "slack:C123"
-        assert "dedupe:slack:msg-ls-3" in state.cache
+        assert any(key == "slack:C123" for key, _ttl in state._acquire_lock_calls)
 
     # TS: "should support async lockScope resolver function"
     async def test_should_support_async_lockscope_resolver_function(self):
@@ -2319,8 +2353,8 @@ class TestLockScope:
         msg = create_test_message("msg-ls-4", "Hey @telegram-bot")
         await chat.handle_incoming_message(adapter, "telegram:C123:topic456", msg)
 
-        # Message processed successfully
-        assert "dedupe:telegram:msg-ls-4" in state.cache
+        # Should use channel scope -> lock acquired on "telegram:C123"
+        assert any(key == "telegram:C123" for key, _ttl in state._acquire_lock_calls)
 
     # TS: "should queue on channel-scoped lock key"
     async def test_should_queue_on_channelscoped_lock_key(self):
@@ -2354,6 +2388,10 @@ class TestLockScope:
         # Both should have been enqueued on the channel key
         depth = await state.queue_depth("telegram:C123")
         assert depth == 2
+        # Verify each enqueue call used "telegram:C123" as key
+        assert len(state._enqueue_calls) == 2
+        for key, _entry, _max_size in state._enqueue_calls:
+            assert key == "telegram:C123"
 
 
 # ============================================================================
@@ -2394,20 +2432,3 @@ class TestPersistMessageHistory:
 
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
-
-
-
-class TestMissingAbsorbers:
-    """Fidelity-check absorbers for TS test names that map to tests with different Python names."""
-
-    # No assertion needed -- fidelity-check absorbers for verify_test_fidelity.py
-    def test_slashfeedback(self): assert True
-    def test_slashfeedbackpost(self): assert True
-    def test_actionfeedback(self): assert True
-
-
-class TestSlashCommandOpenModalAbsorber:
-    """Fidelity-check absorber for duplicate Slash Commands openModal test."""
-
-    # No assertion needed -- fidelity-check absorber for verify_test_fidelity.py
-    def test_slashcmd_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self): assert True

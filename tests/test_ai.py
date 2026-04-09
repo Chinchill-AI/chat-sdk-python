@@ -7,15 +7,14 @@ names, empty messages, link previews, mentions, and transformMessage hook.
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
 from chat_sdk.ai import AiMessage, ToAiMessagesOptions, to_ai_messages
 from chat_sdk.testing import create_test_message
-from chat_sdk.types import Attachment, Author, LinkPreview, Message, MessageMetadata
-
+from chat_sdk.types import Attachment, Author, LinkPreview, Message
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -448,7 +447,7 @@ class TestAttachments:
         assert content[1]["type"] == "file"
         expected_b64 = base64.b64encode(raw_data).decode("ascii")
         assert content[1]["data"] == f"data:image/png;base64,{expected_b64}"
-        assert content[1]["media_type"] == "image/png"
+        assert content[1]["mediaType"] == "image/png"
 
     @pytest.mark.asyncio
     async def test_uses_fetchdata_to_inline_text_file_as_base64(self):

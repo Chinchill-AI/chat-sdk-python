@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+
 from chat_sdk.testing import MockAdapter
 from chat_sdk.types import (
     Author,
@@ -28,7 +29,6 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,10 +76,7 @@ class TeamsFetchableAdapter(MockAdapter):
         limit = opts.limit or 100
 
         # For backward direction, return the last N messages
-        if opts.direction == "backward":
-            messages = self._messages[-limit:]
-        else:
-            messages = self._messages[:limit]
+        messages = self._messages[-limit:] if opts.direction == "backward" else self._messages[:limit]
 
         has_more = len(self._messages) > limit
         return FetchResult(

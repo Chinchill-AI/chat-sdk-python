@@ -8,6 +8,7 @@ Python port of packages/adapter-github/src/index.ts.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -15,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
@@ -54,6 +55,7 @@ from chat_sdk.types import (
     ThreadInfo,
     ThreadSummary,
     WebhookOptions,
+    _parse_iso,
 )
 
 REVIEW_COMMENT_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+):rc:(\d+)$")
@@ -107,6 +109,10 @@ class GitHubAdapter:
         self._app_credentials: dict[str, str] | None = None
         self._installation_id: int | None = None
         self._installation_token_cache: dict[int, tuple[str, float]] = {}
+        self._token_lock = asyncio.Lock()
+
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
 
         has_explicit_auth = bool(config.get("token") or config.get("app_id") or config.get("private_key"))
 
@@ -198,6 +204,20 @@ class GitHubAdapter:
                 )
             except Exception as error:
                 self._logger.warn("Could not fetch bot user ID", {"error": str(error)})
+
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def disconnect(self) -> None:
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     async def handle_webhook(self, request: Any, options: WebhookOptions | None = None) -> Any:
         """Handle incoming webhook from GitHub."""
@@ -365,11 +385,9 @@ class GitHubAdapter:
             },
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                if created_at
-                else datetime.now(tz=UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(tz=timezone.utc),
                 edited=edited,
-                edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
+                edited_at=_parse_iso(updated_at) if edited and updated_at else None,
             ),
             attachments=[],
         )
@@ -407,11 +425,9 @@ class GitHubAdapter:
             },
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                if created_at
-                else datetime.now(tz=UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(tz=timezone.utc),
                 edited=edited,
-                edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
+                edited_at=_parse_iso(updated_at) if edited and updated_at else None,
             ),
             attachments=[],
         )
@@ -610,7 +626,8 @@ class GitHubAdapter:
     async def fetch_messages(self, thread_id: str, options: FetchOptions | None = None) -> FetchResult:
         """Fetch messages from a thread."""
         decoded = self.decode_thread_id(thread_id)
-        limit = (options.limit if options else None) or 100
+        _raw_limit = options.limit if options else None
+        limit = _raw_limit if _raw_limit is not None else 100
         direction = (options.direction if options else None) or "backward"
 
         if decoded.review_comment_id:
@@ -734,7 +751,8 @@ class GitHubAdapter:
         owner = without_prefix[:slash_idx]
         repo = without_prefix[slash_idx + 1 :]
 
-        limit = (options.limit if options else None) or 30
+        _raw_limit = options.limit if options else None
+        limit = _raw_limit if _raw_limit is not None else 30
         page = int(options.cursor) if options and options.cursor else 1
 
         pulls = await self._github_api_request(
@@ -764,9 +782,9 @@ class GitHubAdapter:
                 },
                 author=self._parse_author(pr_user),
                 metadata=MessageMetadata(
-                    date_sent=datetime.fromisoformat(pr.get("created_at", "").replace("Z", "+00:00"))
+                    date_sent=_parse_iso(pr.get("created_at", "").replace("Z", "+00:00"))
                     if pr.get("created_at")
-                    else datetime.now(tz=UTC),
+                    else datetime.now(tz=timezone.utc),
                     edited=pr.get("created_at") != pr.get("updated_at"),
                 ),
             )
@@ -774,7 +792,7 @@ class GitHubAdapter:
                 ThreadSummary(
                     id=tid,
                     root_message=root_message,
-                    last_reply_at=datetime.fromisoformat(pr.get("updated_at", "").replace("Z", "+00:00"))
+                    last_reply_at=_parse_iso(pr.get("updated_at", "").replace("Z", "+00:00"))
                     if pr.get("updated_at")
                     else None,
                 )
@@ -865,7 +883,16 @@ class GitHubAdapter:
         Caches the token until 60 seconds before expiry.  Returns the
         cached token when still valid.
         """
-        import aiohttp
+
+        # Purge expired entries and enforce hard size limit
+        now = time.time()
+        expired_ids = [iid for iid, (_, exp) in self._installation_token_cache.items() if now >= exp]
+        for iid in expired_ids:
+            del self._installation_token_cache[iid]
+        if len(self._installation_token_cache) > 100:
+            keys = list(self._installation_token_cache.keys())
+            for k in keys[: len(keys) - 100]:
+                del self._installation_token_cache[k]
 
         # Check cache
         cached = self._installation_token_cache.get(installation_id)
@@ -874,35 +901,40 @@ class GitHubAdapter:
             if time.time() < expires_at - 60:  # Refresh 60s before expiry
                 return token
 
-        app_jwt = self._generate_app_jwt()
-        url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {app_jwt}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        async with self._token_lock:
+            # Double-check after acquiring lock to avoid redundant refreshes
+            cached = self._installation_token_cache.get(installation_id)
+            if cached:
+                token, expires_at = cached
+                if time.time() < expires_at - 60:
+                    return token
 
-        async with aiohttp.ClientSession() as session, session.post(url, headers=headers) as response:
-            if response.status >= 400:
-                error_body = await response.text()
-                raise RuntimeError(f"GitHub App token exchange failed: {response.status} {error_body}")
-            data = await response.json()
+            app_jwt = self._generate_app_jwt()
+            url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {app_jwt}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
 
-        token = data["token"]
-        # Parse ISO-8601 expiry from GitHub's response
-        expires_at_str = data.get("expires_at", "")
-        if expires_at_str:
-            expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00")).timestamp()
-        else:
-            # Default: 1 hour from now (GitHub's default)
-            expires_at = time.time() + 3600
+            session = await self._get_http_session()
+            async with session.post(url, headers=headers) as response:
+                if response.status >= 400:
+                    error_body = await response.text()
+                    raise RuntimeError(f"GitHub App token exchange failed: {response.status} {error_body}")
+                data = await response.json()
 
-        self._installation_token_cache[installation_id] = (token, expires_at)
-        self._logger.debug(
-            "Obtained installation token",
-            {"installationId": installation_id, "expiresAt": expires_at_str},
-        )
-        return token
+            token = data["token"]
+            # Parse ISO-8601 expiry; default 1h if absent
+            expires_at_str = data.get("expires_at", "")
+            expires_at = _parse_iso(expires_at_str).timestamp() if expires_at_str else time.time() + 3600
+
+            self._installation_token_cache[installation_id] = (token, expires_at)
+            self._logger.debug(
+                "Obtained installation token",
+                {"installationId": installation_id, "expiresAt": expires_at_str},
+            )
+            return token
 
     async def _github_api_request(self, method: str, path: str, body: Any = None) -> Any:
         """Make a request to the GitHub API.
@@ -910,8 +942,6 @@ class GitHubAdapter:
         Supports PAT auth (``_auth_token``) and GitHub App auth
         (``_app_credentials`` with JWT -> installation token exchange).
         """
-        import aiohttp
-
         auth_token = self._auth_token
 
         # GitHub App auth: exchange JWT for installation token
@@ -935,27 +965,27 @@ class GitHubAdapter:
 
         url = f"https://api.github.com{path}" if path.startswith("/") else path
 
-        async with aiohttp.ClientSession() as session:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if body is not None:
-                kwargs["json"] = body
+        session = await self._get_http_session()
+        kwargs: dict[str, Any] = {"headers": headers}
+        if body is not None:
+            kwargs["json"] = body
 
-            async with session.request(method, url, **kwargs) as response:
-                if response.status == 204:
-                    return None
-                if response.status >= 400:
-                    error_body = await response.text()
-                    self._logger.error(
-                        "GitHub API error",
-                        {
-                            "status": response.status,
-                            "body": error_body,
-                            "path": path,
-                        },
-                    )
-                    raise RuntimeError(f"GitHub API error: {response.status} {error_body}")
+        async with session.request(method, url, **kwargs) as response:
+            if response.status == 204:
+                return None
+            if response.status >= 400:
+                error_body = await response.text()
+                self._logger.error(
+                    "GitHub API error",
+                    {
+                        "status": response.status,
+                        "body": error_body,
+                        "path": path,
+                    },
+                )
+                raise RuntimeError(f"GitHub API error: {response.status} {error_body}")
 
-                return await response.json()
+            return await response.json()
 
     async def _store_installation_id(self, owner: str, repo: str, installation_id: int) -> None:
         """Store the installation ID for a repository (multi-tenant mode)."""

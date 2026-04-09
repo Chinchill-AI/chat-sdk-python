@@ -15,7 +15,7 @@ import math
 import os
 import time
 from collections.abc import AsyncIterable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -116,6 +116,9 @@ class WhatsAppAdapter:
         self._bot_user_id: str | None = None
         self._format_converter = WhatsAppFormatConverter()
 
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
+
     @property
     def name(self) -> str:
         return self._name
@@ -141,6 +144,20 @@ class WhatsAppAdapter:
         self._chat = chat
         self._bot_user_id = self._phone_number_id
         self._logger.info("WhatsApp adapter initialized", {"phoneNumberId": self._phone_number_id})
+
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def disconnect(self) -> None:
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     async def handle_webhook(
         self,
@@ -508,7 +525,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(inbound.get("timestamp", "0")),
-                    tz=UTC,
+                    tz=timezone.utc,
                 ),
                 edited=False,
             ),
@@ -615,70 +632,69 @@ class WhatsAppAdapter:
         1. GET the media metadata to obtain the download URL
         2. GET the actual binary data from the download URL
         """
-        import aiohttp
+        session = await self._get_http_session()
 
-        async with aiohttp.ClientSession() as session:
-            # Step 1: Get the media URL
-            async with session.get(
-                f"{self._graph_api_url}/{media_id}",
-                headers={"Authorization": f"Bearer {self._access_token}"},
-            ) as meta_response:
-                if meta_response.status != 200:
-                    error_body = await meta_response.text()
-                    self._logger.error(
-                        "Failed to get media URL",
-                        {
-                            "status": meta_response.status,
-                            "body": error_body,
-                            "mediaId": media_id,
-                        },
-                    )
-                    raise RuntimeError(f"Failed to get media URL: {meta_response.status} {error_body}")
-
-                media_info = await meta_response.json()
-
-            # Validate the download URL to prevent SSRF
-            download_url = media_info["url"]
-            parsed = urlparse(download_url)
-            if parsed.scheme != "https":
-                raise ValidationError(
-                    "whatsapp",
-                    f"Media download URL must use HTTPS, got: {parsed.scheme}",
+        # Step 1: Get the media URL
+        async with session.get(
+            f"{self._graph_api_url}/{media_id}",
+            headers={"Authorization": f"Bearer {self._access_token}"},
+        ) as meta_response:
+            if meta_response.status != 200:
+                error_body = await meta_response.text()
+                self._logger.error(
+                    "Failed to get media URL",
+                    {
+                        "status": meta_response.status,
+                        "body": error_body,
+                        "mediaId": media_id,
+                    },
                 )
-            host = (parsed.hostname or "").lower()
-            allowed_suffixes = (
-                ".facebook.com",
-                ".fbcdn.net",
-                ".fbsbx.com",
-                ".whatsapp.net",
-                ".whatsapp.com",
+                raise RuntimeError(f"Failed to get media URL: {meta_response.status} {error_body}")
+
+            media_info = await meta_response.json()
+
+        # Validate the download URL to prevent SSRF
+        download_url = media_info["url"]
+        parsed = urlparse(download_url)
+        if parsed.scheme != "https":
+            raise ValidationError(
+                "whatsapp",
+                f"Media download URL must use HTTPS, got: {parsed.scheme}",
             )
-            allowed_exact = {"facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net", "whatsapp.com"}
-            if not (any(host.endswith(s) for s in allowed_suffixes) or host in allowed_exact):
-                raise ValidationError(
-                    "whatsapp",
-                    f"Media download URL host is not an allowed Meta domain: {host}",
+        host = (parsed.hostname or "").lower()
+        allowed_suffixes = (
+            ".facebook.com",
+            ".fbcdn.net",
+            ".fbsbx.com",
+            ".whatsapp.net",
+            ".whatsapp.com",
+        )
+        allowed_exact = {"facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net", "whatsapp.com"}
+        if not (any(host.endswith(s) for s in allowed_suffixes) or host in allowed_exact):
+            raise ValidationError(
+                "whatsapp",
+                f"Media download URL host is not an allowed Meta domain: {host}",
+            )
+
+        # Step 2: Download the actual file.
+        # The WhatsApp Cloud API requires the Bearer token for media downloads
+        # (the URL is not pre-signed). The SSRF domain validation above ensures
+        # we only send the token to legitimate Meta/WhatsApp domains.
+        async with session.get(
+            download_url,
+            headers={"Authorization": f"Bearer {self._access_token}"},
+        ) as data_response:
+            if data_response.status != 200:
+                self._logger.error(
+                    "Failed to download media",
+                    {
+                        "status": data_response.status,
+                        "mediaId": media_id,
+                    },
                 )
+                raise RuntimeError(f"Failed to download media: {data_response.status}")
 
-            # Step 2: Download the actual file.
-            # The WhatsApp Cloud API requires the Bearer token for media downloads
-            # (the URL is not pre-signed). The SSRF domain validation above ensures
-            # we only send the token to legitimate Meta/WhatsApp domains.
-            async with session.get(
-                download_url,
-                headers={"Authorization": f"Bearer {self._access_token}"},
-            ) as data_response:
-                if data_response.status != 200:
-                    self._logger.error(
-                        "Failed to download media",
-                        {
-                            "status": data_response.status,
-                            "mediaId": media_id,
-                        },
-                    )
-                    raise RuntimeError(f"Failed to download media: {data_response.status}")
-
-                return await data_response.read()
+            return await data_response.read()
 
     async def post_message(
         self,
@@ -965,7 +981,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(raw["message"].get("timestamp", "0")),
-                    tz=UTC,
+                    tz=timezone.utc,
                 ),
                 edited=False,
             ),
@@ -994,19 +1010,15 @@ class WhatsAppAdapter:
 
     async def _graph_api_request(self, path: str, body: Any) -> Any:
         """Make a request to the Meta Graph API."""
-        import aiohttp
-
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(
-                f"{self._graph_api_url}{path}",
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.post(
+            f"{self._graph_api_url}{path}",
+            headers={
+                "Authorization": f"Bearer {self._access_token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        ) as response:
             if response.status != 200:
                 error_body = await response.text()
                 self._logger.error(

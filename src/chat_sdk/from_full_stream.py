@@ -38,12 +38,18 @@ async def from_full_stream(
             yield event
             continue
 
-        # Skip non-dicts / non-objects
-        if event is None or not isinstance(event, dict):
+        if event is None:
             continue
 
-        event_type = event.get("type")
-        if event_type is None:
+        # Support both dict and object-style events
+        if isinstance(event, dict):
+            event_type = event.get("type", "")
+        elif hasattr(event, "type"):
+            event_type = getattr(event, "type", "")
+        else:
+            continue
+
+        if not event_type:
             continue
 
         # Pass through StreamChunk objects
@@ -52,12 +58,20 @@ async def from_full_stream(
             continue
 
         # AI SDK v5 uses textDelta, v6 uses text
-        text_delta = event.get("textDelta") if event.get("textDelta") is not None else event.get("text_delta")
-        text_content = (
-            text_delta
-            if text_delta is not None
-            else (event.get("text") if event.get("text") is not None else event.get("delta"))
-        )
+        if isinstance(event, dict):
+            text_delta = event.get("textDelta") if event.get("textDelta") is not None else event.get("text_delta")
+            text_content = (
+                text_delta
+                if text_delta is not None
+                else (event.get("text") if event.get("text") is not None else event.get("delta"))
+            )
+        else:
+            text_content = (
+                getattr(event, "text", None)
+                or getattr(event, "delta", None)
+                or getattr(event, "textDelta", None)
+                or getattr(event, "text_delta", None)
+            )
 
         if event_type == "text-delta" and isinstance(text_content, str):
             if needs_separator and has_emitted_text:

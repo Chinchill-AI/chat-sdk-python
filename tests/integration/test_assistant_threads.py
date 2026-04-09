@@ -18,7 +18,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from chat_sdk.testing import create_mock_adapter
+
 from chat_sdk.types import (
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
@@ -209,14 +209,21 @@ class TestAssistantThreadStartedErrors:
         chat, adapters, state = await create_chat()
         adapter = adapters["slack"]
 
+        handler_called = False
+
         @chat.on_assistant_thread_started
         async def handler(event):
+            nonlocal handler_called
+            handler_called = True
             raise RuntimeError("Handler exploded")
 
         event = _make_thread_started_event(adapter)
         chat.process_assistant_thread_started(event)
-        # Should not raise
+        # Give the background task time to run
         await asyncio.sleep(0.05)
+
+        # Handler was invoked (and its exception was swallowed, not propagated)
+        assert handler_called is True
 
     @pytest.mark.asyncio
     async def test_still_handles_messages_when_no_handler(self):
@@ -312,10 +319,11 @@ class TestAssistantContextChanged:
         adapter = adapters["slack"]
 
         event = _make_context_changed_event(adapter)
+        # Should complete without raising even with no handler registered
         chat.process_assistant_context_changed(event)
         await asyncio.sleep(0.05)
-        # No assertion needed -- tests that the call completes without raising
-        assert True
+        # Chat instance is still functional after the no-op dispatch
+        assert chat._initialized
 
 
 # ============================================================================

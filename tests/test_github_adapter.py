@@ -18,7 +18,6 @@ from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
 from chat_sdk.types import EmojiValue
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

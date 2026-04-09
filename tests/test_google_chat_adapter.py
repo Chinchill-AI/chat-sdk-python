@@ -19,7 +19,6 @@ from chat_sdk.adapters.google_chat.types import (
 )
 from chat_sdk.shared.errors import ValidationError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

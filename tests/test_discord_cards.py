@@ -5,8 +5,6 @@ Ported from packages/adapter-discord/src/cards.test.ts.
 
 from __future__ import annotations
 
-import pytest
-
 from chat_sdk.adapters.discord.cards import (
     BUTTON_STYLE_DANGER,
     BUTTON_STYLE_LINK,
@@ -29,7 +27,6 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
 )
-
 
 # ---------------------------------------------------------------------------
 # cardToDiscordPayload

@@ -19,6 +19,7 @@ import asyncio
 from typing import Any
 
 import pytest
+
 from chat_sdk.emoji import get_emoji
 from chat_sdk.testing import create_mock_adapter
 from chat_sdk.types import (
@@ -29,7 +30,6 @@ from chat_sdk.types import (
 )
 
 from .conftest import create_chat, create_msg
-
 
 # ============================================================================
 # Slack platform tests

@@ -16,6 +16,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.types import Lock, QueueEntry
 
 logger = logging.getLogger(__name__)
@@ -55,13 +56,15 @@ class MemoryStateAdapter:
     TTL, ordered lists, and per-thread queues.
     """
 
+    _PURGE_INTERVAL = 100  # Purge expired cache entries every N writes
+
     def __init__(self) -> None:
         self._subscriptions: set[str] = set()
         self._locks: dict[str, _MemoryLock] = {}
         self._cache: dict[str, _CachedValue] = {}
         self._queues: dict[str, list[QueueEntry]] = {}
         self._connected = False
-        self._connect_done = False
+        self._write_count = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -80,7 +83,6 @@ class MemoryStateAdapter:
         self._connected = False
         self._subscriptions.clear()
         self._locks.clear()
-        self._cache.clear()
         self._queues.clear()
 
     # -- subscriptions -------------------------------------------------------
@@ -158,6 +160,10 @@ class MemoryStateAdapter:
             value=value,
             expires_at=(_now_ms() + ttl_ms) if ttl_ms else None,
         )
+        self._write_count += 1
+        if self._write_count >= self._PURGE_INTERVAL:
+            self._purge_expired()
+            self._write_count = 0
 
     async def set_if_not_exists(self, key: str, value: Any, ttl_ms: int | None = None) -> bool:
         self._ensure_connected()
@@ -264,13 +270,20 @@ class MemoryStateAdapter:
 
     def _ensure_connected(self) -> None:
         if not self._connected:
-            raise RuntimeError("MemoryStateAdapter is not connected. Call connect() first.")
+            raise StateNotConnectedError("MemoryStateAdapter")
 
     def _clean_expired_locks(self) -> None:
         now = _now_ms()
         expired = [tid for tid, lk in self._locks.items() if lk.expires_at <= now]
         for tid in expired:
             del self._locks[tid]
+
+    def _purge_expired(self) -> None:
+        """Remove expired cache entries to prevent unbounded growth."""
+        now = _now_ms()
+        expired = [k for k, v in self._cache.items() if v.expires_at is not None and v.expires_at <= now]
+        for k in expired:
+            del self._cache[k]
 
 
 @dataclass

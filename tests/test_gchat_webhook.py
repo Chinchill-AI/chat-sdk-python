@@ -5,13 +5,11 @@ Port of packages/adapter-gchat/src/index.test.ts.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import re
-import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,7 +18,6 @@ from chat_sdk.adapters.google_chat.thread_utils import (
     GoogleChatThreadId,
     decode_thread_id,
     encode_thread_id,
-    is_dm_thread,
 )
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
@@ -67,9 +64,9 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_logger = MagicMock(return_value=MagicMock())
-    chat.process_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_message = MagicMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     return chat
 
 
@@ -198,7 +195,7 @@ class TestConstructor:
         assert adapter.user_name == "mybot"
 
     def test_no_auth_raises(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             GoogleChatAdapter(GoogleChatAdapterConfig())
 
 
@@ -240,7 +237,7 @@ class TestParseMessage:
 
     def test_no_message_payload_raises(self):
         adapter = _make_adapter()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             adapter.parse_message({})
 
     def test_bot_sender_detected(self):

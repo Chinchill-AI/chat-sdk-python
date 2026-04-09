@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+
 from chat_sdk.testing import create_mock_adapter
 
 from .conftest import create_chat, create_msg

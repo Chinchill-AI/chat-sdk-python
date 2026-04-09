@@ -33,7 +33,7 @@ class AiImagePart(TypedDict, total=False):
     """Image content part."""
 
     image: Any  # bytes | str | URL
-    media_type: str
+    mediaType: str
     type: Literal["image"]
 
 
@@ -42,7 +42,7 @@ class AiFilePart(TypedDict, total=False):
 
     data: Any  # bytes | str | URL
     filename: str
-    media_type: str
+    mediaType: str
     type: Literal["file"]
 
 
@@ -120,7 +120,7 @@ async def _attachment_to_part(att: Attachment) -> AiMessagePart | None:
                 return AiFilePart(
                     type="file",
                     data=f"data:{mime_type};base64,{b64}",
-                    media_type=mime_type,
+                    mediaType=mime_type,
                     filename=att.name or "",
                 )
             except Exception:
@@ -137,7 +137,7 @@ async def _attachment_to_part(att: Attachment) -> AiMessagePart | None:
                     type="file",
                     data=f"data:{att.mime_type};base64,{b64}",
                     filename=att.name or "",
-                    media_type=att.mime_type,
+                    mediaType=att.mime_type,
                 )
             except Exception:
                 logger.exception("toAiMessages: failed to fetch file data")

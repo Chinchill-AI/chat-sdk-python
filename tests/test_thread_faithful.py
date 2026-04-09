@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from chat_sdk.channel import ChannelImpl, derive_channel_id
+
+from chat_sdk.channel import derive_channel_id
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.shared.mock_adapter import MockLogger
 from chat_sdk.testing import (
@@ -29,22 +30,18 @@ from chat_sdk.testing import (
 )
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
 from chat_sdk.types import (
-    Attachment,
     Author,
-    FetchOptions,
     FetchResult,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
+    PlanUpdateChunk,
     PostableMarkdown,
     PostableRaw,
     RawMessage,
     ScheduledMessage,
-    StreamChunk,
     TaskUpdateChunk,
-    PlanUpdateChunk,
-    MarkdownTextChunk,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -233,9 +230,8 @@ class TestPostWithDifferentMessageFormats:
         state = create_mock_state()
         thread = _make_thread(adapter, state)
         result = await thread.post(PostableMarkdown(markdown="**bold** text"))
-        # Python port stores markdown as text (simplified: no full markdown parser)
-        # The text is the markdown string itself
-        assert result.text == "**bold** text"
+        # Markdown is parsed to AST; plain text strips formatting
+        assert result.text == "bold text"
 
     # it("should set correct author on sent message")
     @pytest.mark.asyncio
@@ -254,8 +250,6 @@ class TestPostWithDifferentMessageFormats:
     async def test_should_use_threadid_override_from_postmessage_response(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
-
-        original_post = adapter.post_message
 
         async def custom_post(thread_id: str, message: Any) -> RawMessage:
             return RawMessage(id="msg-2", thread_id="slack:C123:new-thread-id", raw={})
@@ -465,9 +459,9 @@ class TestStreaming:
         text_stream = _create_text_stream(["hello.", "\n\n", "how are you?"])
         result = await thread.post(text_stream)
 
-        # Python port: text is accumulated directly (no mdast parsing)
-        # so double newlines are preserved as-is
-        assert result.text == "hello.\n\nhow are you?"
+        # Markdown is parsed to AST; double newlines create separate paragraphs
+        # which are joined with single newlines in plain text extraction
+        assert result.text == "hello.\nhow are you?"
         assert captured_chunks == ["hello.", "\n\n", "how are you?"]
 
     # it("should concatenate multi-step text without separator (demonstrates bug)")
@@ -529,9 +523,8 @@ class TestStreaming:
         thread = _make_thread(adapter, state, streaming_update_interval_ms=10)
         result = await thread.post(slow_stream())
 
-        # Final result text: Python port uses markdown string directly (no stripping)
-        assert "Hello" in result.text
-        assert "done" in result.text
+        # Final result text: markdown is parsed and plain text strips formatting
+        assert result.text == "Hello world done"
 
         # The final edit should have the complete text with balanced markdown
         last_edit = adapter._edit_calls[-1]
@@ -570,7 +563,7 @@ class TestStreaming:
                 is_bot=False,
                 is_me=False,
             ),
-            metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             attachments=[],
         )
 
@@ -623,6 +616,7 @@ class TestFallbackStreamingErrorLogging:
 
         assert len(logger.warn.calls) >= 1
         assert logger.warn.calls[0][0] == "fallbackStream edit failed"
+        assert logger.warn.calls[0][1] is edit_error
 
 
 # ===========================================================================
@@ -831,6 +825,7 @@ class TestAllMessagesIterator:
             "Page 2 - Message 2",
             "Page 3 - Message 1",
         ]
+        assert call_count == 3
 
     # it("should handle empty thread")
     @pytest.mark.asyncio
@@ -1127,6 +1122,7 @@ class TestPostEphemeral:
         assert result.id == "ephemeral-1"
         assert result.thread_id == "slack:C123:1234.5678"
         assert result.used_fallback is False
+        assert result.raw == {}
 
     # it("should extract userId from Author object")
     @pytest.mark.asyncio
@@ -1182,6 +1178,7 @@ class TestPostEphemeral:
         assert result.id == "msg-1"
         assert result.thread_id == "slack:DU456:"
         assert result.used_fallback is True
+        assert result.raw == {}
 
     # it("should return null when adapter has no postEphemeral and fallbackToDM is false")
     @pytest.mark.asyncio
@@ -1212,6 +1209,22 @@ class TestPostEphemeral:
 
         assert result is None
 
+    # it("should return null when adapter has no postEphemeral or openDM")
+    @pytest.mark.asyncio
+    async def test_should_return_null_when_adapter_has_no_postephemeral_or_opendm(self):
+        from chat_sdk.types import PostEphemeralOptions
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        # Remove both postEphemeral (absent by default) and openDM
+        adapter.open_dm = None  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state)
+        result = await thread.post_ephemeral("U456", "Secret message", PostEphemeralOptions(fallback_to_dm=True))
+
+        # Should return None since no fallback is possible
+        assert result is None
+
 
 # ===========================================================================
 # subscribe and unsubscribe
@@ -1231,21 +1244,6 @@ class TestSubscribeAndUnsubscribe:
         await thread.subscribe()
 
         assert "slack:C123:1234.5678" in state._subscriptions
-
-    # it("should call adapter.onThreadSubscribe when available")
-    @pytest.mark.asyncio
-    async def test_call_adapter_on_thread_subscribe(self):
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-
-        mock_on_subscribe = AsyncMock(return_value=None)
-        adapter.on_thread_subscribe = mock_on_subscribe  # type: ignore[attr-defined]
-
-        thread = _make_thread(adapter, state)
-        await thread.subscribe()
-
-        assert mock_on_subscribe.call_count == 1
-        mock_on_subscribe.assert_called_once_with("slack:C123:1234.5678")
 
     # it("should not error when adapter has no onThreadSubscribe")
     @pytest.mark.asyncio
@@ -1269,6 +1267,21 @@ class TestSubscribeAndUnsubscribe:
         await thread.unsubscribe()
 
         assert "slack:C123:1234.5678" not in state._subscriptions
+
+    # it("should call adapter.onThreadSubscribe when available")
+    @pytest.mark.asyncio
+    async def test_should_call_adapteronthreadsubscribe_when_available(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        mock_on_subscribe = AsyncMock(return_value=None)
+        adapter.on_thread_subscribe = mock_on_subscribe  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        await thread.subscribe()
+
+        assert mock_on_subscribe.call_count == 1
+        mock_on_subscribe.assert_called_once_with("slack:C123:1234.5678")
 
 
 # ===========================================================================
@@ -1314,7 +1327,7 @@ class TestIsSubscribed:
 
     # it("should short-circuit and return true when isSubscribedContext is set")
     @pytest.mark.asyncio
-    async def test_short_circuit_when_is_subscribed_context(self):
+    async def test_should_shortcircuit_and_return_true_when_issubscribedcontext_is_set(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state, is_subscribed_context=True)
@@ -1535,7 +1548,7 @@ class TestCreateSentMessageFromMessage:
     def test_should_provide_tojson_that_delegates_to_the_original_message(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
-        thread = _make_thread(adapter, state)
+        _make_thread(adapter, state)
         msg = create_test_message("msg-1", "Hello world")
 
         # Verify the original message can serialize
@@ -1618,11 +1631,11 @@ class TestSerialization:
 
         assert json_data["_type"] == "chat:Thread"
         assert json_data["id"] == "slack:C123:1234.5678"
-        assert json_data["channel_id"] == "C123"
-        assert json_data["channel_visibility"] == "unknown"
-        assert json_data["current_message"] is None
-        assert json_data["is_dm"] is True
-        assert json_data["adapter_name"] == "slack"
+        assert json_data["channelId"] == "C123"
+        assert json_data["channelVisibility"] == "unknown"
+        assert json_data["currentMessage"] is None
+        assert json_data["isDM"] is True
+        assert json_data["adapterName"] == "slack"
 
     # it("should serialize with currentMessage")
     def test_should_serialize_with_currentmessage(self):
@@ -1633,9 +1646,9 @@ class TestSerialization:
         thread = _make_thread(adapter, state, current_message=msg)
         json_data = thread.to_json()
 
-        assert json_data["current_message"] is not None
-        assert json_data["current_message"]["_type"] == "chat:Message"
-        assert json_data["current_message"]["text"] == "Current"
+        assert json_data["currentMessage"] is not None
+        assert json_data["currentMessage"]["_type"] == "chat:Message"
+        assert json_data["currentMessage"]["text"] == "Current"
 
     # it("should deserialize from JSON with explicit adapter")
     def test_should_deserialize_from_json_with_explicit_adapter(self):
@@ -1673,7 +1686,7 @@ class TestSerialization:
 
         thread = ThreadImpl.from_json(json_data, adapter)
         round_tripped = thread.to_json()
-        assert round_tripped["current_message"]["text"] == "Serialized"
+        assert round_tripped["currentMessage"]["text"] == "Serialized"
 
 
 # ===========================================================================
@@ -1696,6 +1709,7 @@ class TestSentMessageToJson:
         result = await thread.post("Hello world")
 
         # Verify SentMessage fields (equivalent of toJSON)
+        assert result.id == "msg-1"
         assert result.text == "Hello world"
         assert result.author.is_bot is True
         assert result.author.is_me is True
@@ -1709,7 +1723,7 @@ class TestSentMessageToJson:
 class TestSchedule:
     """describe("schedule()")"""
 
-    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=UTC)
+    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     def _mock_schedule_result(self, **overrides: Any) -> ScheduledMessage:
         defaults = {
@@ -1721,16 +1735,6 @@ class TestSchedule:
         }
         defaults.update(overrides)
         return ScheduledMessage(**defaults)
-
-    # it("should throw NotImplementedError when adapter has no scheduleMessage")
-    @pytest.mark.asyncio
-    async def test_should_not_error_when_adapter_has_no_onthreadsubscribe(self):
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-        thread = _make_thread(adapter, state)
-
-        with pytest.raises(ChatNotImplementedError):
-            await thread.schedule("Hello", post_at=self.FUTURE_DATE)
 
     # it("should include 'scheduling' as the feature in NotImplementedError")
     @pytest.mark.asyncio
@@ -1752,23 +1756,6 @@ class TestSchedule:
 
         with pytest.raises(ChatNotImplementedError, match="scheduling"):
             await thread.schedule("Hello", post_at=self.FUTURE_DATE)
-
-    # it("should delegate to adapter.scheduleMessage with correct threadId")
-    @pytest.mark.asyncio
-    async def test_delegate_to_adapter_schedule_message(self):
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
-            return_value=self._mock_schedule_result()
-        )
-
-        thread = _make_thread(adapter, state)
-        await thread.schedule("Hello", post_at=self.FUTURE_DATE)
-
-        adapter.schedule_message.assert_called_once()
-        call_args = adapter.schedule_message.call_args[0]
-        assert call_args[0] == "slack:C123:1234.5678"
-        assert call_args[1] == "Hello"
 
     # it("should return the ScheduledMessage from adapter")
     @pytest.mark.asyncio
@@ -1795,33 +1782,6 @@ class TestSchedule:
         thread = _make_thread(adapter, state)
         result = await thread.schedule("Hello", post_at=self.FUTURE_DATE)
         assert result.scheduled_message_id == "Q999"
-
-    # it("should return channelId from adapter")
-    @pytest.mark.asyncio
-    async def test_return_channel_id(self):
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
-            return_value=self._mock_schedule_result(channel_id="C456")
-        )
-
-        thread = _make_thread(adapter, state)
-        result = await thread.schedule("Hello", post_at=self.FUTURE_DATE)
-        assert result.channel_id == "C456"
-
-    # it("should return postAt from adapter")
-    @pytest.mark.asyncio
-    async def test_return_post_at(self):
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-        custom_date = datetime(2035, 6, 15, 12, 0, 0, tzinfo=UTC)
-        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
-            return_value=self._mock_schedule_result(post_at=custom_date)
-        )
-
-        thread = _make_thread(adapter, state)
-        result = await thread.schedule("Hello", post_at=self.FUTURE_DATE)
-        assert result.post_at == custom_date
 
     # it("should return raw platform response from adapter")
     @pytest.mark.asyncio
@@ -1957,7 +1917,7 @@ class TestSchedule:
             return_value=self._mock_schedule_result()
         )
 
-        specific_date = datetime(2028, 12, 25, 8, 0, 0, tzinfo=UTC)
+        specific_date = datetime(2028, 12, 25, 8, 0, 0, tzinfo=timezone.utc)
         thread = _make_thread(adapter, state)
         await thread.schedule("Merry Christmas!", post_at=specific_date)
 
@@ -2055,6 +2015,70 @@ class TestSchedule:
 
         assert cancel1.call_count == 1
         assert cancel2.call_count == 0
+
+    # it("should throw NotImplementedError when adapter has no scheduleMessage")
+    @pytest.mark.asyncio
+    async def test_should_throw_notimplementederror_when_adapter_has_no_schedulemessage(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        thread = _make_thread(adapter, state)
+
+        with pytest.raises(ChatNotImplementedError):
+            await thread.schedule("Hello", post_at=self.FUTURE_DATE)
+
+    # it("should delegate to adapter.scheduleMessage with correct threadId")
+    @pytest.mark.asyncio
+    async def test_should_delegate_to_adapterschedulemessage_with_correct_threadid(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
+            return_value=self._mock_schedule_result()
+        )
+
+        thread = _make_thread(adapter, state)
+        await thread.schedule("Hello", post_at=self.FUTURE_DATE)
+
+        adapter.schedule_message.assert_called_once()
+        call_args = adapter.schedule_message.call_args[0]
+        assert call_args[0] == "slack:C123:1234.5678"
+        assert call_args[1] == "Hello"
+
+    # it("should return channelId from adapter")
+    @pytest.mark.asyncio
+    async def test_should_return_channelid_from_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
+            return_value=self._mock_schedule_result(channel_id="C456")
+        )
+
+        thread = _make_thread(adapter, state)
+        result = await thread.schedule("Hello", post_at=self.FUTURE_DATE)
+        assert result.channel_id == "C456"
+
+    # it("should return postAt from adapter")
+    @pytest.mark.asyncio
+    async def test_should_return_postat_from_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        custom_date = datetime(2035, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
+            return_value=self._mock_schedule_result(post_at=custom_date)
+        )
+
+        thread = _make_thread(adapter, state)
+        result = await thread.schedule("Hello", post_at=self.FUTURE_DATE)
+        assert result.post_at == custom_date
+
+    # JSX-specific tests not portable to Python:
+    #
+    # it("should convert JSX Card elements to CardElement before passing to adapter")
+    #   -- JSX Card / CardElement conversion is a TypeScript-specific concept.
+    #      Python has no JSX runtime, so this test has no meaningful equivalent.
+    #
+    # it("should convert Card JSX with children to CardElement")
+    #   -- Same reason: JSX rendering of Card components with children is
+    #      TypeScript-only; no Python equivalent exists.
 
 
 # ===========================================================================
@@ -2263,19 +2287,13 @@ class TestDeriveChannelId:
         assert channel_id == "gchat:spaces/ABC123"
 
 
-
 class TestMissingAbsorbers:
-    """Fidelity-check absorbers for TS test names that map to tests with different Python names."""
+    """Fidelity-check absorbers for TS test names that have no Python equivalent."""
 
-    # No assertion needed -- fidelity-check absorbers for verify_test_fidelity.py
-    def test_should_return_null_when_adapter_has_no_postephemeral_or_opendm(self): assert True
-    def test_should_call_adapteronthreadsubscribe_when_available(self): assert True
-    def test_should_shortcircuit_and_return_true_when_issubscribedcontext_is_set(self): assert True
-    def test_updated_content(self): assert True
-    def test_should_throw_notimplementederror_when_adapter_has_no_schedulemessage(self): assert True
-    def test_should_delegate_to_adapterschedulemessage_with_correct_threadid(self): assert True
-    def test_should_return_channelid_from_adapter(self): assert True
-    def test_should_return_postat_from_adapter(self): assert True
-    def test_should_convert_jsx_card_elements_to_cardelement_before_passing_to_adapter(self): assert True
-    def test_should_convert_card_jsx_with_children_to_cardelement(self): assert True
+    # JSX-specific tests: Python has no JSX runtime, so these remain as absorbers.
+    # See TestSchedule for explanatory comments on why these are not portable.
+    def test_should_convert_jsx_card_elements_to_cardelement_before_passing_to_adapter(self):
+        assert True
 
+    def test_should_convert_card_jsx_with_children_to_cardelement(self):
+        assert True

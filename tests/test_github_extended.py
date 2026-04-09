@@ -26,12 +26,9 @@ import pytest
 
 from chat_sdk.adapters.github.adapter import (
     GitHubAdapter,
-    create_github_adapter,
 )
-from chat_sdk.adapters.github.types import GitHubThreadId
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -735,8 +732,11 @@ class TestInitialize:
     async def test_initialize_stores_chat_instance(self):
         adapter = _make_adapter()
         mock_chat = MagicMock()
-        await adapter.initialize(mock_chat)
-        assert adapter._chat is mock_chat
+        try:
+            await adapter.initialize(mock_chat)
+            assert adapter._chat is mock_chat
+        finally:
+            await adapter.disconnect()
 
 
 class TestStream:

@@ -7,13 +7,14 @@ import hmac
 from dataclasses import dataclass
 
 import pytest
+
+from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.testing import (
     MockAdapter,
     MockStateAdapter,
     create_mock_adapter,
     create_mock_state,
 )
-from chat_sdk.state.memory import MemoryStateAdapter
 
 
 @pytest.fixture

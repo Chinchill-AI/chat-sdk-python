@@ -34,7 +34,7 @@ class TestEmojiValue:
         emoji = EmojiValue(name="fire")
         try:
             emoji.name = "ice"  # type: ignore[misc]
-            assert False, "Should have raised FrozenInstanceError"
+            raise AssertionError("Should have raised FrozenInstanceError")
         except AttributeError:
             pass
 
@@ -194,14 +194,14 @@ class TestMessage:
         data = msg.to_json()
         assert data["_type"] == "chat:Message"
         assert data["id"] == "m1"
-        assert data["thread_id"] == "t1"
+        assert data["threadId"] == "t1"
         assert data["text"] == "test"
-        assert data["author"]["user_name"] == "bob"
-        assert data["author"]["full_name"] == "Bob Jones"
-        assert data["author"]["is_me"] is True
-        assert "2024-06-15" in data["metadata"]["date_sent"]
+        assert data["author"]["userName"] == "bob"
+        assert data["author"]["fullName"] == "Bob Jones"
+        assert data["author"]["isMe"] is True
+        assert "2024-06-15" in data["metadata"]["dateSent"]
         assert data["metadata"]["edited"] is False
-        assert "edited_at" not in data["metadata"]  # omitted when None
+        assert "editedAt" not in data["metadata"]  # omitted when None
 
     def test_to_json_with_edited(self):
         sent = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -222,7 +222,7 @@ class TestMessage:
         )
         data = msg.to_json()
         assert data["metadata"]["edited"] is True
-        assert data["metadata"]["edited_at"] is not None
+        assert data["metadata"]["editedAt"] is not None
 
 
 class TestRawMessage:

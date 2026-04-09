@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
 
-
 # ---------------------------------------------------------------------------
 # fromMarkdown (markdown -> mrkdwn)
 # ---------------------------------------------------------------------------

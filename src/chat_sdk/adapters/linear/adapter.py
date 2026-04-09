@@ -15,7 +15,7 @@ import json
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
@@ -53,6 +53,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 COMMENT_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+)$")
@@ -106,6 +107,9 @@ class LinearAdapter:
         self._chat: ChatInstance | None = None
         self._bot_user_id: str | None = None
         self._format_converter = LinearFormatConverter()
+
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
 
         # Authentication state
         self._access_token: str | None = None
@@ -200,22 +204,20 @@ class LinearAdapter:
         if not self._client_credentials:
             return
 
-        import aiohttp  # lazy import
+        import aiohttp  # lazy import (needed for ClientError)
 
         try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.post(
-                    LINEAR_TOKEN_URL,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    data={
-                        "grant_type": "client_credentials",
-                        "client_id": self._client_credentials["client_id"],
-                        "client_secret": self._client_credentials["client_secret"],
-                        "scope": "read,write,comments:create,issues:create",
-                    },
-                ) as response,
-            ):
+            session = await self._get_http_session()
+            async with session.post(
+                LINEAR_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_credentials["client_id"],
+                    "client_secret": self._client_credentials["client_secret"],
+                    "scope": "read,write,comments:create,issues:create",
+                },
+            ) as response:
                 if not response.ok:
                     error_body = await response.text()
                     raise AuthenticationError(
@@ -339,13 +341,13 @@ class LinearAdapter:
         actor = payload.get("actor", {})
 
         # Skip non-issue comments
-        issue_id = data.get("issue_id") or data.get("issueId")
+        issue_id = data.get("issueId") or data.get("issue_id")
         if not issue_id:
             self._logger.debug("Ignoring non-issue comment", {"commentId": data.get("id")})
             return
 
         # Determine thread
-        parent_id = data.get("parent_id") or data.get("parentId")
+        parent_id = data.get("parentId") or data.get("parent_id")
         root_comment_id = parent_id or data.get("id")
         thread_id = self.encode_thread_id(
             LinearThreadId(
@@ -357,7 +359,7 @@ class LinearAdapter:
         message = self._build_message(data, actor, thread_id)
 
         # Skip bot's own messages
-        user_id = data.get("user_id") or data.get("userId")
+        user_id = data.get("userId") or data.get("user_id")
         if user_id == self._bot_user_id:
             self._logger.debug("Ignoring message from self", {"messageId": data.get("id")})
             return
@@ -377,7 +379,7 @@ class LinearAdapter:
             {
                 "reactionId": data.get("id"),
                 "emoji": data.get("emoji"),
-                "commentId": data.get("comment_id") or data.get("commentId"),
+                "commentId": data.get("commentId") or data.get("comment_id"),
                 "action": payload.get("action"),
                 "actorName": actor.get("name"),
             },
@@ -391,7 +393,7 @@ class LinearAdapter:
     ) -> Message:
         """Build a Message from a Linear comment and actor."""
         text = comment.get("body", "")
-        user_id = comment.get("user_id") or comment.get("userId", "")
+        user_id = comment.get("userId") or comment.get("user_id", "")
 
         author = Author(
             user_id=user_id,
@@ -403,8 +405,8 @@ class LinearAdapter:
 
         formatted = self._format_converter.to_ast(text)
 
-        created_at = comment.get("created_at") or comment.get("createdAt", "")
-        updated_at = comment.get("updated_at") or comment.get("updatedAt", "")
+        created_at = comment.get("createdAt") or comment.get("created_at", "")
+        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
 
         return Message(
             id=comment.get("id", ""),
@@ -414,9 +416,9 @@ class LinearAdapter:
             raw=LinearRawMessage(comment=comment),
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at) if created_at else datetime.now(UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(timezone.utc),
                 edited=created_at != updated_at,
-                edited_at=datetime.fromisoformat(updated_at) if (created_at != updated_at and updated_at) else None,
+                edited_at=_parse_iso(updated_at) if (created_at != updated_at and updated_at) else None,
             ),
             attachments=[],
         )
@@ -473,10 +475,10 @@ class LinearAdapter:
                 comment={
                     "id": comment_data.get("id", ""),
                     "body": comment_data.get("body", ""),
-                    "issue_id": decoded.issue_id,
-                    "user_id": self._bot_user_id or "",
-                    "created_at": comment_data.get("createdAt", ""),
-                    "updated_at": comment_data.get("updatedAt", ""),
+                    "issueId": decoded.issue_id,
+                    "userId": self._bot_user_id or "",
+                    "createdAt": comment_data.get("createdAt", ""),
+                    "updatedAt": comment_data.get("updatedAt", ""),
                     "url": comment_data.get("url"),
                 },
             ),
@@ -526,10 +528,10 @@ class LinearAdapter:
                 comment={
                     "id": comment_data.get("id", ""),
                     "body": comment_data.get("body", ""),
-                    "issue_id": decoded.issue_id,
-                    "user_id": self._bot_user_id or "",
-                    "created_at": comment_data.get("createdAt", ""),
-                    "updated_at": comment_data.get("updatedAt", ""),
+                    "issueId": decoded.issue_id,
+                    "userId": self._bot_user_id or "",
+                    "createdAt": comment_data.get("createdAt", ""),
+                    "updatedAt": comment_data.get("updatedAt", ""),
                     "url": comment_data.get("url"),
                 },
             ),
@@ -596,7 +598,7 @@ class LinearAdapter:
         if options is None:
             options = FetchOptions()
 
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
 
         if decoded.comment_id:
             return await self._fetch_comment_thread(thread_id, decoded.issue_id, decoded.comment_id, limit)
@@ -733,10 +735,10 @@ class LinearAdapter:
                 comment={
                     "id": node.get("id", ""),
                     "body": node.get("body", ""),
-                    "issue_id": issue_id,
-                    "user_id": user_id,
-                    "created_at": node.get("createdAt", ""),
-                    "updated_at": node.get("updatedAt", ""),
+                    "issueId": issue_id,
+                    "userId": user_id,
+                    "createdAt": node.get("createdAt", ""),
+                    "updatedAt": node.get("updatedAt", ""),
                     "url": node.get("url"),
                 },
             ),
@@ -748,10 +750,10 @@ class LinearAdapter:
                 is_me=user_id == self._bot_user_id,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(node["createdAt"]) if node.get("createdAt") else datetime.now(UTC),
+                date_sent=_parse_iso(node["createdAt"]) if node.get("createdAt") else datetime.now(timezone.utc),
                 edited=node.get("createdAt") != node.get("updatedAt"),
                 edited_at=(
-                    datetime.fromisoformat(node["updatedAt"])
+                    _parse_iso(node["updatedAt"])
                     if node.get("createdAt") != node.get("updatedAt") and node.get("updatedAt")
                     else None
                 ),
@@ -833,7 +835,10 @@ class LinearAdapter:
         """Parse platform message format to normalized format."""
         comment = raw.get("comment", {})
         text = comment.get("body", "")
-        user_id = comment.get("user_id") or comment.get("userId", "")
+        user_id = comment.get("userId") or comment.get("user_id", "")
+
+        created_at = comment.get("createdAt") or comment.get("created_at", "")
+        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
 
         return Message(
             id=comment.get("id", ""),
@@ -848,15 +853,9 @@ class LinearAdapter:
                 is_me=user_id == self._bot_user_id,
             ),
             metadata=MessageMetadata(
-                date_sent=(
-                    datetime.fromisoformat(comment["created_at"]) if comment.get("created_at") else datetime.now(UTC)
-                ),
-                edited=comment.get("created_at") != comment.get("updated_at"),
-                edited_at=(
-                    datetime.fromisoformat(comment["updated_at"])
-                    if comment.get("created_at") != comment.get("updated_at") and comment.get("updated_at")
-                    else None
-                ),
+                date_sent=(_parse_iso(created_at) if created_at else datetime.now(timezone.utc)),
+                edited=created_at != updated_at,
+                edited_at=(_parse_iso(updated_at) if created_at != updated_at and updated_at else None),
             ),
             attachments=[],
             raw=raw,
@@ -902,9 +901,20 @@ class LinearAdapter:
             raw={"text": accumulated},
         )
 
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def disconnect(self) -> None:
-        """Cleanup hook. Linear adapter is stateless, so this is a no-op."""
-        self._logger.debug("Linear adapter disconnecting (no-op)")
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+        self._logger.debug("Linear adapter disconnecting")
 
     def _resolve_emoji(self, emoji: EmojiValue | str) -> str:
         """Resolve an emoji value to a unicode string."""
@@ -921,8 +931,6 @@ class LinearAdapter:
         variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute a GraphQL query against the Linear API."""
-        import aiohttp  # lazy import
-
         headers = {
             "Content-Type": "application/json",
             "Authorization": self._access_token or "",
@@ -932,14 +940,12 @@ class LinearAdapter:
         if variables:
             payload["variables"] = variables
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(
-                LINEAR_API_URL,
-                headers=headers,
-                json=payload,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.post(
+            LINEAR_API_URL,
+            headers=headers,
+            json=payload,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError(

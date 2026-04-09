@@ -93,6 +93,11 @@ class _MockSession:
         self.delete_calls.append((url, kwargs))
         return self._make_method_cm()
 
+    closed = False
+
+    async def close(self):
+        self.closed = True
+
     async def __aenter__(self):
         return self
 

@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
@@ -78,7 +78,18 @@ from chat_sdk.types import (
     ThreadInfo,
     ThreadSummary,
     WebhookOptions,
+    _parse_iso,
 )
+
+# Strong-reference set for fire-and-forget tasks to prevent GC collection.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _pin_task(task: asyncio.Task[Any]) -> None:
+    """Pin a fire-and-forget task so the GC doesn't collect it."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 # How long before expiry to refresh subscriptions (1 hour)
 SUBSCRIPTION_REFRESH_BUFFER_MS = 60 * 60 * 1000
@@ -150,6 +161,9 @@ class GoogleChatAdapter:
         # Cached JWKS client for JWT verification (lazy init on first use)
         self._jwks_client: Any | None = None
 
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
+
         # Auth setup
         self._credentials: ServiceAccountCredentials | None = None
         self._use_adc = False
@@ -158,6 +172,7 @@ class GoogleChatAdapter:
         self._access_token_expires: float = 0
         self._impersonated_access_token: str | None = None
         self._impersonated_access_token_expires: float = 0
+        self._token_lock = asyncio.Lock()
 
         if config.credentials:
             self._credentials = config.credentials
@@ -216,16 +231,22 @@ class GoogleChatAdapter:
         if self._access_token and now < self._access_token_expires - 60:
             return self._access_token
 
-        if self._credentials:
-            token = await self._get_service_account_token(self._credentials, GCHAT_SCOPES)
-        elif self._use_adc:
-            token = await self._get_adc_token(GCHAT_SCOPES)
-        else:
-            raise AuthenticationError("gchat", "No auth configured")
+        async with self._token_lock:
+            # Double-check after acquiring lock to avoid redundant refreshes
+            now = time.time()
+            if self._access_token and now < self._access_token_expires - 60:
+                return self._access_token
 
-        self._access_token = token
-        self._access_token_expires = now + 3500  # ~58 minutes
-        return token
+            if self._credentials:
+                token = await self._get_service_account_token(self._credentials, GCHAT_SCOPES)
+            elif self._use_adc:
+                token = await self._get_adc_token(GCHAT_SCOPES)
+            else:
+                raise AuthenticationError("gchat", "No auth configured")
+
+            self._access_token = token
+            self._access_token_expires = now + 3500  # ~58 minutes
+            return token
 
     async def _get_impersonated_access_token(self) -> str:
         """Get an access token with user impersonation for DM/listing operations."""
@@ -233,20 +254,26 @@ class GoogleChatAdapter:
         if self._impersonated_access_token and now < self._impersonated_access_token_expires - 60:
             return self._impersonated_access_token
 
-        if self._credentials and self._impersonate_user:
-            token = await self._get_service_account_token(
-                self._credentials,
-                GCHAT_IMPERSONATION_SCOPES,
-                subject=self._impersonate_user,
-            )
-        elif self._use_adc:
-            token = await self._get_adc_token(GCHAT_IMPERSONATION_SCOPES)
-        else:
-            raise AuthenticationError("gchat", "No impersonation auth configured")
+        async with self._token_lock:
+            # Double-check after acquiring lock to avoid redundant refreshes
+            now = time.time()
+            if self._impersonated_access_token and now < self._impersonated_access_token_expires - 60:
+                return self._impersonated_access_token
 
-        self._impersonated_access_token = token
-        self._impersonated_access_token_expires = now + 3500
-        return token
+            if self._credentials and self._impersonate_user:
+                token = await self._get_service_account_token(
+                    self._credentials,
+                    GCHAT_IMPERSONATION_SCOPES,
+                    subject=self._impersonate_user,
+                )
+            elif self._use_adc:
+                token = await self._get_adc_token(GCHAT_IMPERSONATION_SCOPES)
+            else:
+                raise AuthenticationError("gchat", "No impersonation auth configured")
+
+            self._impersonated_access_token = token
+            self._impersonated_access_token_expires = now + 3500
+            return token
 
     async def _get_service_account_token(
         self,
@@ -276,16 +303,14 @@ class GoogleChatAdapter:
         )
 
         try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.post(
-                    "https://oauth2.googleapis.com/token",
-                    data={
-                        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                        "assertion": token,
-                    },
-                ) as response,
-            ):
+            session = await self._get_http_session()
+            async with session.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": token,
+                },
+            ) as response:
                 response.raise_for_status()
                 data = await response.json()
                 return data["access_token"]
@@ -317,13 +342,11 @@ class GoogleChatAdapter:
             f"?scopes={','.join(scopes)}"
         )
         try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.get(
-                    url,
-                    headers={"Metadata-Flavor": "Google"},
-                ) as response,
-            ):
+            session = await self._get_http_session()
+            async with session.get(
+                url,
+                headers={"Metadata-Flavor": "Google"},
+            ) as response:
                 response.raise_for_status()
                 data = await response.json()
                 return data["access_token"]
@@ -332,6 +355,18 @@ class GoogleChatAdapter:
                 "gchat",
                 f"Failed to obtain ADC token from metadata server: {exc}",
             ) from exc
+
+    # =========================================================================
+    # Shared HTTP session
+    # =========================================================================
+
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
 
     # =========================================================================
     # Google Chat API request helpers
@@ -358,8 +393,6 @@ class GoogleChatAdapter:
         Returns:
             JSON response as dict.
         """
-        import aiohttp
-
         if use_impersonation and self._impersonate_user:
             token = await self._get_impersonated_access_token()
         else:
@@ -372,16 +405,14 @@ class GoogleChatAdapter:
             "Content-Type": "application/json",
         }
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.request(
-                method,
-                url,
-                json=body,
-                params=params,
-                headers=headers,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.request(
+            method,
+            url,
+            json=body,
+            params=params,
+            headers=headers,
+        ) as response:
             if response.status == 204:
                 return {}
             result = await response.json()
@@ -417,7 +448,10 @@ class GoogleChatAdapter:
                 )
 
     async def disconnect(self) -> None:
-        """Disconnect the adapter (no-op for Google Chat)."""
+        """Disconnect the adapter and close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     # =========================================================================
     # Thread subscription (Workspace Events)
@@ -573,13 +607,12 @@ class GoogleChatAdapter:
                     pubsub_topic=pubsub_topic,
                 ),
                 auth_options,
+                http_session=await self._get_http_session(),
             )
 
             subscription_info = {
                 "subscription_name": result.name,
-                "expire_time": int(datetime.fromisoformat(result.expire_time.replace("Z", "+00:00")).timestamp() * 1000)
-                if result.expire_time
-                else 0,
+                "expire_time": int(_parse_iso(result.expire_time).timestamp() * 1000) if result.expire_time else 0,
             }
 
             if self._state:
@@ -607,11 +640,13 @@ class GoogleChatAdapter:
     ) -> dict[str, Any] | None:
         """Check if a subscription already exists for this space."""
         try:
-            subscriptions = await list_space_subscriptions(space_name, auth_options)
+            subscriptions = await list_space_subscriptions(
+                space_name, auth_options, http_session=await self._get_http_session()
+            )
             for sub in subscriptions:
                 expire_time_str = sub.get("expire_time", "")
                 if expire_time_str:
-                    expire_time = int(datetime.fromisoformat(expire_time_str.replace("Z", "+00:00")).timestamp() * 1000)
+                    expire_time = int(_parse_iso(expire_time_str).timestamp() * 1000)
                     if expire_time > int(time.time() * 1000) + SUBSCRIPTION_REFRESH_BUFFER_MS:
                         return {
                             "subscription_name": sub.get("name", ""),
@@ -1017,7 +1052,7 @@ class GoogleChatAdapter:
 
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(process_task())
+                _pin_task(loop.create_task(process_task()))
             except RuntimeError:
                 pass
 
@@ -1099,7 +1134,7 @@ class GoogleChatAdapter:
         else:
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(_subscribe())
+                _pin_task(loop.create_task(_subscribe()))
             except RuntimeError:
                 pass
 
@@ -1245,11 +1280,13 @@ class GoogleChatAdapter:
 
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self._user_info_cache.set(
-                        user_id,
-                        display_name,
-                        (message.get("sender") or {}).get("email"),
+                _pin_task(
+                    loop.create_task(
+                        self._user_info_cache.set(
+                            user_id,
+                            display_name,
+                            (message.get("sender") or {}).get("email"),
+                        )
                     )
                 )
             except RuntimeError:
@@ -1757,7 +1794,7 @@ class GoogleChatAdapter:
         space_name = decoded.space_name
         thread_name = decoded.thread_name
         direction = options.direction or "backward"
-        limit = options.limit or 100
+        limit = options.limit if options.limit is not None else 100
         use_impersonation = bool(self._impersonate_user)
 
         try:
@@ -2018,7 +2055,7 @@ class GoogleChatAdapter:
             )
 
         direction = options.direction or "backward"
-        limit = options.limit or 100
+        limit = options.limit if options.limit is not None else 100
         use_impersonation = bool(self._impersonate_user)
 
         try:
@@ -2208,7 +2245,7 @@ class GoogleChatAdapter:
                 f"Invalid Google Chat channel ID: {channel_id}",
             )
 
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         use_impersonation = bool(self._impersonate_user)
 
         try:
@@ -2272,7 +2309,7 @@ class GoogleChatAdapter:
                 last_reply_at: datetime | None = None
                 if create_time:
                     with contextlib.suppress(ValueError, AttributeError):
-                        last_reply_at = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+                        last_reply_at = _parse_iso(create_time)
 
                 threads.append(
                     ThreadSummary(
@@ -2486,8 +2523,12 @@ class GoogleChatAdapter:
 
                         try:
                             loop = asyncio.get_running_loop()
-                            loop.create_task(
-                                self._state.set("gchat:botUserId", self._bot_user_id, ttl_ms=30 * 24 * 60 * 60 * 1000)
+                            _pin_task(
+                                loop.create_task(
+                                    self._state.set(
+                                        "gchat:botUserId", self._bot_user_id, ttl_ms=30 * 24 * 60 * 60 * 1000
+                                    )
+                                )
                             )
                         except RuntimeError:
                             pass
@@ -2556,19 +2597,15 @@ class GoogleChatAdapter:
             adapter = self
 
             async def _fetch_data() -> bytes:
-                import aiohttp
-
                 # Prefer media.download API
                 if resource_name:
                     token = await adapter._get_access_token()
                     download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
-                    async with (
-                        aiohttp.ClientSession() as session,
-                        session.get(
-                            download_url,
-                            headers={"Authorization": f"Bearer {token}"},
-                        ) as response,
-                    ):
+                    session = await adapter._get_http_session()
+                    async with session.get(
+                        download_url,
+                        headers={"Authorization": f"Bearer {token}"},
+                    ) as response:
                         if response.status >= 400:
                             raise NetworkError(
                                 "gchat",
@@ -2579,13 +2616,11 @@ class GoogleChatAdapter:
                 # Fallback to direct URL fetch (downloadUri)
                 if url:
                     token = await adapter._get_access_token()
-                    async with (
-                        aiohttp.ClientSession() as session,
-                        session.get(
-                            url,
-                            headers={"Authorization": f"Bearer {token}"},
-                        ) as response,
-                    ):
+                    session = await adapter._get_http_session()
+                    async with session.get(
+                        url,
+                        headers={"Authorization": f"Bearer {token}"},
+                    ) as response:
                         if response.status >= 400:
                             raise NetworkError(
                                 "gchat",
@@ -2689,11 +2724,11 @@ def _parse_message_metadata(message: dict[str, Any]) -> Any:
     date_sent: datetime
     if create_time:
         try:
-            date_sent = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+            date_sent = _parse_iso(create_time)
         except (ValueError, AttributeError):
-            date_sent = datetime.now(tz=UTC)
+            date_sent = datetime.now(tz=timezone.utc)
     else:
-        date_sent = datetime.now(tz=UTC)
+        date_sent = datetime.now(tz=timezone.utc)
 
     return MessageMetadata(
         date_sent=date_sent,

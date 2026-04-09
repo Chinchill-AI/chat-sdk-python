@@ -850,9 +850,12 @@ class TestStartTyping:
         adapter, client, _ = await _init_adapter()
         client.set_response("assistant_threads_setStatus", Exception("API down"))
 
-        # No assertion needed -- tests that startTyping swallows API errors
+        # startTyping swallows the API error and returns normally
         await adapter.start_typing("slack:C123:1234567890.000000")
-        assert True
+
+        # The API call was attempted (error was caught, not avoided)
+        calls = client.get_calls("assistant_threads_setStatus")
+        assert len(calls) == 1
 
 
 # =============================================================================

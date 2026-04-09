@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
 from chat_sdk.adapters.github.adapter import (
     GitHubAdapter,
     create_github_adapter,
@@ -272,42 +273,51 @@ class TestGitHubWebhookMessageProcessing:
         adapter = _make_adapter()
         mock_chat = MagicMock()
         mock_chat.process_message = MagicMock()
-        await adapter.initialize(mock_chat)
+        try:
+            await adapter.initialize(mock_chat)
 
-        payload = _issue_comment_payload(issue={"number": 10, "title": "Bug"})
-        body = json.dumps(payload)
-        sig = _sign(body)
-        request = _make_request(body, "issue_comment", signature=sig)
-        response = await adapter.handle_webhook(request)
-        assert response["status"] == 200
+            payload = _issue_comment_payload(issue={"number": 10, "title": "Bug"})
+            body = json.dumps(payload)
+            sig = _sign(body)
+            request = _make_request(body, "issue_comment", signature=sig)
+            response = await adapter.handle_webhook(request)
+            assert response["status"] == 200
+        finally:
+            await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_issue_comment_edited_action_ignored(self):
         adapter = _make_adapter()
         mock_chat = MagicMock()
         mock_chat.process_message = MagicMock()
-        await adapter.initialize(mock_chat)
+        try:
+            await adapter.initialize(mock_chat)
 
-        payload = _issue_comment_payload(action="edited")
-        body = json.dumps(payload)
-        sig = _sign(body)
-        request = _make_request(body, "issue_comment", signature=sig)
-        response = await adapter.handle_webhook(request)
-        assert response["status"] == 200
+            payload = _issue_comment_payload(action="edited")
+            body = json.dumps(payload)
+            sig = _sign(body)
+            request = _make_request(body, "issue_comment", signature=sig)
+            response = await adapter.handle_webhook(request)
+            assert response["status"] == 200
+        finally:
+            await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_review_comment_deleted_action_ignored(self):
         adapter = _make_adapter()
         mock_chat = MagicMock()
         mock_chat.process_message = MagicMock()
-        await adapter.initialize(mock_chat)
+        try:
+            await adapter.initialize(mock_chat)
 
-        payload = _review_comment_payload(action="deleted")
-        body = json.dumps(payload)
-        sig = _sign(body)
-        request = _make_request(body, "pull_request_review_comment", signature=sig)
-        response = await adapter.handle_webhook(request)
-        assert response["status"] == 200
+            payload = _review_comment_payload(action="deleted")
+            body = json.dumps(payload)
+            sig = _sign(body)
+            request = _make_request(body, "pull_request_review_comment", signature=sig)
+            response = await adapter.handle_webhook(request)
+            assert response["status"] == 200
+        finally:
+            await adapter.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +573,8 @@ class TestGitHubStartTyping:
     @pytest.mark.asyncio
     async def test_noop(self):
         adapter = _make_adapter()
-        # No assertion needed -- tests that start_typing is a no-op and does not raise
-        await adapter.start_typing("github:acme/app:42")
-        assert True
+        result = await adapter.start_typing("github:acme/app:42")
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

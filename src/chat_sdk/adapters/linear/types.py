@@ -114,63 +114,73 @@ class LinearWebhookActor(TypedDict, total=False):
 class LinearCommentData(TypedDict, total=False):
     """Comment data from a webhook payload.
 
+    Field names use camelCase to match the Linear API JSON format.
     See: https://linear.app/developers/webhooks#webhook-payload
     """
 
     # Comment body in markdown format
     body: str
     # ISO 8601 creation date
-    created_at: str
+    createdAt: str
     # Comment UUID
     id: str
     # Issue UUID the comment is associated with
-    issue_id: str
+    issueId: str
     # Parent comment UUID (for nested/threaded replies)
-    parent_id: str
+    parentId: str
     # ISO 8601 last update date
-    updated_at: str
+    updatedAt: str
     # Direct URL to the comment
     url: str
     # User UUID who wrote the comment
-    user_id: str
+    userId: str
 
 
 class CommentWebhookPayload(TypedDict, total=False):
-    """Webhook payload for Comment events."""
+    """Webhook payload for Comment events.
+
+    Field names use camelCase to match the Linear API JSON format.
+    """
 
     action: str  # "create" | "update" | "remove"
     actor: LinearWebhookActor
-    created_at: str
+    createdAt: str
     data: LinearCommentData
-    organization_id: str
+    organizationId: str
     type: str  # "Comment"
-    updated_from: dict[str, Any]
+    updatedFrom: dict[str, Any]
     url: str
-    webhook_id: str
-    webhook_timestamp: int
+    webhookId: str
+    webhookTimestamp: int
 
 
 class LinearReactionData(TypedDict, total=False):
-    """Reaction data from a webhook payload."""
+    """Reaction data from a webhook payload.
 
-    comment_id: str
+    Field names use camelCase to match the Linear API JSON format.
+    """
+
+    commentId: str
     emoji: str
     id: str
-    user_id: str
+    userId: str
 
 
 class ReactionWebhookPayload(TypedDict, total=False):
-    """Webhook payload for Reaction events."""
+    """Webhook payload for Reaction events.
+
+    Field names use camelCase to match the Linear API JSON format.
+    """
 
     action: str
     actor: LinearWebhookActor
-    created_at: str
+    createdAt: str
     data: LinearReactionData
-    organization_id: str
+    organizationId: str
     type: str  # "Reaction"
     url: str
-    webhook_id: str
-    webhook_timestamp: int
+    webhookId: str
+    webhookTimestamp: int
 
 
 # Union type for all webhook payloads
@@ -188,4 +198,4 @@ class LinearRawMessage(TypedDict, total=False):
     # The raw comment data from webhook or API
     comment: LinearCommentData
     # Organization ID from the webhook
-    organization_id: str
+    organizationId: str

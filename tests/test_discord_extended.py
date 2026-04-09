@@ -9,7 +9,7 @@ and packages/adapter-discord/src/gateway.test.ts.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -18,7 +18,6 @@ from chat_sdk.adapters.discord.adapter import (
     CHANNEL_TYPE_GROUP_DM,
     CHANNEL_TYPE_PUBLIC_THREAD,
     DiscordAdapter,
-    create_discord_adapter,
 )
 from chat_sdk.adapters.discord.types import DiscordAdapterConfig, DiscordThreadId
 from chat_sdk.shared.errors import NetworkError, ValidationError
@@ -713,7 +712,8 @@ class TestFetchMessages:
 
         result = await adapter.fetch_messages("discord:guild1:channel456", FetchOptions(limit=10))
 
-        assert result.next_cursor is not None
+        # When results match the limit, next_cursor is the last message id (backward direction)
+        assert result.next_cursor == "msg9"
 
     @pytest.mark.asyncio
     async def test_no_next_cursor_when_fewer_results(self):
@@ -1348,7 +1348,8 @@ class TestCreateDiscordThread160004Recovery:
         adapter._discord_fetch = AsyncMock(
             side_effect=NetworkError(
                 "discord",
-                'Discord API error: 400 {"code": 160004, "message": "A thread has already been created for this message"}',
+                "Discord API error: 400"
+                ' {"code": 160004, "message": "A thread has already been created for this message"}',
             )
         )
 
@@ -1483,67 +1484,9 @@ class TestRenderFormattedAdditional:
 
 
 # ============================================================================
-# DiscordFormatConverter additional coverage
+# (Duplicate DiscordFormatConverter tests removed -- covered by
+#  test_discord_format.py)
 # ============================================================================
-
-
-class TestDiscordFormatConverterAdditional:
-    def test_to_ast_user_mentions(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        text = c.extract_plain_text("Hello <@123456789>")
-        assert text == "Hello @123456789"
-
-    def test_to_ast_channel_mentions(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        text = c.extract_plain_text("Check <#987654321>")
-        assert text == "Check #987654321"
-
-    def test_to_ast_custom_emoji(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        text = c.extract_plain_text("Nice <:thumbsup:123>")
-        assert text == "Nice :thumbsup:"
-
-    def test_to_ast_bold(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        ast = c.to_ast("**bold text**")
-        assert ast is not None
-
-    def test_to_ast_italic(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        ast = c.to_ast("*italic text*")
-        assert ast is not None
-
-    def test_from_ast_mentions_to_discord(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        ast = c.to_ast("Hello @someone")
-        result = c.from_ast(ast)
-        assert "<@someone>" in result
-
-    def test_render_postable_plain_string(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        result = c.render_postable("Hello @user")
-        assert result == "Hello <@user>"
-
-    def test_render_postable_raw_message(self):
-        from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
-
-        c = DiscordFormatConverter()
-        result = c.render_postable({"raw": "Hello @user"})
-        assert result == "Hello <@user>"
 
 
 # ============================================================================

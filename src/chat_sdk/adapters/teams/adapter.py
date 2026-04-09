@@ -13,8 +13,8 @@ import base64
 import json
 import os
 import re
-from datetime import UTC, datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, NoReturn
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -28,13 +28,11 @@ from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
 from chat_sdk.shared.errors import (
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
     ValidationError,
-)
-from chat_sdk.shared.errors import (
-    PermissionError as AdapterPermissionError,
 )
 from chat_sdk.types import (
     ActionEvent,
@@ -54,6 +52,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
@@ -90,7 +89,7 @@ def _validate_service_url(url: str) -> None:
     )
 
 
-def _handle_teams_error(error: Any, operation: str) -> None:
+def _handle_teams_error(error: Any, operation: str) -> NoReturn:
     """Convert Teams SDK errors to adapter errors and raise.
 
     Raises an appropriate AdapterError subclass based on the error shape.
@@ -100,6 +99,9 @@ def _handle_teams_error(error: Any, operation: str) -> None:
         status_code = (
             inner_error.get("statusCode") or error.get("statusCode") or error.get("status") or error.get("code")
         )
+
+        if isinstance(status_code, str) and status_code.isdigit():
+            status_code = int(status_code)
 
         if status_code == 401:
             raise AuthenticationError(
@@ -174,7 +176,11 @@ class TeamsAdapter:
         self._bot_user_id: str | None = self._app_id or None
         self._access_token: str | None = None
         self._token_expiry: float = 0
+        self._token_lock = asyncio.Lock()
         self._jwks_client: Any | None = None  # Cached PyJWKClient for JWT verification
+
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
 
     @property
     def name(self) -> str:
@@ -522,9 +528,9 @@ class TeamsAdapter:
                 is_me=is_me,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(activity["timestamp"])
+                date_sent=_parse_iso(activity["timestamp"])
                 if activity.get("timestamp")
-                else datetime.now(UTC),
+                else datetime.now(timezone.utc),
                 edited=False,
             ),
             attachments=attachments,
@@ -596,7 +602,11 @@ class TeamsAdapter:
                         "error": str(error),
                     },
                 )
-                _handle_teams_error({"message": str(error)}, "postMessage")
+                error_dict: dict[str, Any] = {"message": str(error)}
+                if hasattr(error, "status"):
+                    error_dict["statusCode"] = error.status
+                _handle_teams_error(error_dict, "postMessage")
+                raise  # unreachable: _handle_teams_error always raises
 
         # Regular text message
         text = convert_emoji_placeholders(
@@ -629,7 +639,10 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            _handle_teams_error({"message": str(error)}, "postMessage")
+            error_dict = {"message": str(error)}
+            if hasattr(error, "status"):
+                error_dict["statusCode"] = error.status
+            _handle_teams_error(error_dict, "postMessage")
             # Should not reach here due to _handle_teams_error always raising
             raise  # pragma: no cover
 
@@ -684,7 +697,11 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            _handle_teams_error({"message": str(error)}, "editMessage")
+            error_dict = {"message": str(error)}
+            if hasattr(error, "status"):
+                error_dict["statusCode"] = error.status
+            _handle_teams_error(error_dict, "editMessage")
+            raise  # unreachable: _handle_teams_error always raises
 
         return RawMessage(id=message_id, thread_id=thread_id, raw=activity_payload)
 
@@ -711,7 +728,11 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            _handle_teams_error({"message": str(error)}, "deleteMessage")
+            error_dict = {"message": str(error)}
+            if hasattr(error, "status"):
+                error_dict["statusCode"] = error.status
+            _handle_teams_error(error_dict, "deleteMessage")
+            raise  # unreachable: _handle_teams_error always raises
 
     async def add_reaction(
         self,
@@ -872,7 +893,7 @@ class TeamsAdapter:
 
         decoded = self.decode_thread_id(thread_id)
         conversation_id = decoded.conversation_id
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         cursor = options.cursor
         direction = options.direction or "backward"
 
@@ -974,7 +995,7 @@ class TeamsAdapter:
         decoded = self.decode_thread_id(channel_id)
         conversation_id = decoded.conversation_id
         base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         direction = options.direction or "backward"
 
         try:
@@ -1073,21 +1094,17 @@ class TeamsAdapter:
 
         if channel_context:
             try:
-                import aiohttp
-
                 token = await self._get_graph_token()
                 url = (
                     f"https://graph.microsoft.com/v1.0/teams/{channel_context['team_id']}"
                     f"/channels/{channel_context['channel_id']}"
                 )
 
-                async with (
-                    aiohttp.ClientSession() as session,
-                    session.get(
-                        url,
-                        headers={"Authorization": f"Bearer {token}"},
-                    ) as response,
-                ):
+                session = await self._get_http_session()
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
                     if response.ok:
                         data = await response.json()
                         return ChannelInfo(
@@ -1127,15 +1144,13 @@ class TeamsAdapter:
         tenant_id: str | None = None
 
         if state:
-            service_url = state.get(f"teams:serviceUrl:{user_id}")
-            tenant_id = state.get(f"teams:tenantId:{user_id}")
+            service_url = await state.get(f"teams:serviceUrl:{user_id}")
+            tenant_id = await state.get(f"teams:tenantId:{user_id}")
 
         if not service_url:
             service_url = "https://smba.trafficmanager.net/teams/"
 
         _validate_service_url(service_url)
-
-        import aiohttp
 
         token = await self._get_access_token()
 
@@ -1150,17 +1165,15 @@ class TeamsAdapter:
 
         url = f"{service_url}v3/conversations"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError(
@@ -1177,9 +1190,20 @@ class TeamsAdapter:
             )
         )
 
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def disconnect(self) -> None:
-        """Cleanup hook. Teams adapter is stateless per request, so this is a no-op."""
-        self._logger.debug("Teams adapter disconnecting (no-op)")
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+        self._logger.debug("Teams adapter disconnecting")
 
     # =========================================================================
     # Graph API — internal helpers
@@ -1192,7 +1216,7 @@ class TeamsAdapter:
         state = self._chat.get_state()
         if not state:
             return None
-        raw = state.get(f"teams:channelContext:{base_conversation_id}")
+        raw = await state.get(f"teams:channelContext:{base_conversation_id}")
         if raw:
             try:
                 return json.loads(raw)
@@ -1206,19 +1230,15 @@ class TeamsAdapter:
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """List messages in a chat via Microsoft Graph API."""
-        import aiohttp
-
         token = await self._get_graph_token()
         url = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                params=params,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
@@ -1232,19 +1252,15 @@ class TeamsAdapter:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         """List messages in a team channel via Microsoft Graph API."""
-        import aiohttp
-
         token = await self._get_graph_token()
         url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                params={"$top": limit},
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"$top": limit},
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
@@ -1258,26 +1274,24 @@ class TeamsAdapter:
         message_id: str,
     ) -> list[dict[str, Any]]:
         """List replies to a channel message via Microsoft Graph API."""
-        import aiohttp
-
         token = await self._get_graph_token()
         url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"
 
         all_replies: list[dict[str, Any]] = []
-        async with aiohttp.ClientSession() as session:
-            next_url: str | None = url
-            while next_url:
-                async with session.get(
-                    next_url,
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"$top": 50} if next_url == url else None,
-                ) as response:
-                    if not response.ok:
-                        error_text = await response.text()
-                        raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
-                    data = await response.json()
-                    all_replies.extend(data.get("value", []))
-                    next_url = data.get("@odata.nextLink")
+        session = await self._get_http_session()
+        next_url: str | None = url
+        while next_url:
+            async with session.get(
+                next_url,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"$top": 50} if next_url == url else None,
+            ) as response:
+                if not response.ok:
+                    error_text = await response.text()
+                    raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
+                data = await response.json()
+                all_replies.extend(data.get("value", []))
+                next_url = data.get("@odata.nextLink")
 
         return all_replies
 
@@ -1288,18 +1302,14 @@ class TeamsAdapter:
         message_id: str,
     ) -> dict[str, Any] | None:
         """Fetch a single channel message via Microsoft Graph API."""
-        import aiohttp
-
         token = await self._get_graph_token()
         url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+        ) as response:
             if not response.ok:
                 return None
             return await response.json()
@@ -1312,7 +1322,7 @@ class TeamsAdapter:
         options: FetchOptions,
     ) -> FetchResult:
         """Fetch messages from a channel thread (parent + replies)."""
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         cursor = options.cursor
         direction = options.direction or "backward"
 
@@ -1421,7 +1431,7 @@ class TeamsAdapter:
             ),
             metadata=MessageMetadata(
                 date_sent=(
-                    datetime.fromisoformat(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(UTC)
+                    _parse_iso(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(timezone.utc)
                 ),
                 edited=bool(msg.get("lastModifiedDateTime")),
             ),
@@ -1507,18 +1517,20 @@ class TeamsAdapter:
         """Get a Microsoft Graph API access token (OAuth2 client credentials)."""
         import time as _time
 
-        import aiohttp
-
         # Reuse cached token if valid
         if self._access_token and _time.time() < self._token_expiry:
             return self._access_token
 
-        tenant_id = self._app_tenant_id or "botframework.com"
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        async with self._token_lock:
+            # Double-check after acquiring lock to avoid redundant refreshes
+            if self._access_token and _time.time() < self._token_expiry:
+                return self._access_token
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(
+            tenant_id = self._app_tenant_id or "botframework.com"
+            token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+            session = await self._get_http_session()
+            async with session.post(
                 token_url,
                 data={
                     "grant_type": "client_credentials",
@@ -1526,18 +1538,17 @@ class TeamsAdapter:
                     "client_secret": self._app_password,
                     "scope": "https://graph.microsoft.com/.default",
                 },
-            ) as response,
-        ):
-            if not response.ok:
-                error_text = await response.text()
-                raise AuthenticationError(
-                    "teams",
-                    f"Failed to get Graph API token: {response.status} {error_text}",
-                )
-            data = await response.json()
-            self._access_token = data["access_token"]
-            self._token_expiry = _time.time() + data.get("expires_in", 3600) - 300
-            return self._access_token  # type: ignore[return-value]
+            ) as response:
+                if not response.ok:
+                    error_text = await response.text()
+                    raise AuthenticationError(
+                        "teams",
+                        f"Failed to get Graph API token: {response.status} {error_text}",
+                    )
+                data = await response.json()
+                self._access_token = data["access_token"]
+                self._token_expiry = _time.time() + data.get("expires_in", 3600) - 300
+                return self._access_token  # type: ignore[return-value]
 
     # =========================================================================
     # Teams Bot Framework HTTP API helpers
@@ -1550,14 +1561,19 @@ class TeamsAdapter:
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
 
-        import aiohttp  # lazy import
+        async with self._token_lock:
+            # Double-check after acquiring lock to avoid redundant refreshes
+            if self._access_token and time.time() < self._token_expiry:
+                return self._access_token
 
-        token_url = f"https://login.microsoftonline.com/{self._app_tenant_id or 'botframework.com'}/oauth2/v2.0/token"
+            import aiohttp  # lazy import (needed for ClientError)
 
-        try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.post(
+            tenant = self._app_tenant_id or "botframework.com"
+            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+            try:
+                session = await self._get_http_session()
+                async with session.post(
                     token_url,
                     data={
                         "grant_type": "client_credentials",
@@ -1565,26 +1581,25 @@ class TeamsAdapter:
                         "client_secret": self._app_password,
                         "scope": "https://api.botframework.com/.default",
                     },
-                ) as response,
-            ):
-                if not response.ok:
-                    error_text = await response.text()
-                    raise AuthenticationError(
-                        "teams",
-                        f"Failed to get access token: {response.status} {error_text}",
-                    )
-                data = await response.json()
-                self._access_token = data["access_token"]
-                self._token_expiry = time.time() + data.get("expires_in", 3600) - 300
-                return self._access_token  # type: ignore[return-value]
-        except AuthenticationError:
-            raise
-        except aiohttp.ClientError as exc:
-            raise NetworkError(
-                "teams",
-                f"Network error obtaining Bot Framework access token: {exc}",
-                exc,
-            ) from exc
+                ) as response:
+                    if not response.ok:
+                        error_text = await response.text()
+                        raise AuthenticationError(
+                            "teams",
+                            f"Failed to get access token: {response.status} {error_text}",
+                        )
+                    data = await response.json()
+                    self._access_token = data["access_token"]
+                    self._token_expiry = time.time() + data.get("expires_in", 3600) - 300
+                    return self._access_token  # type: ignore[return-value]
+            except AuthenticationError:
+                raise
+            except aiohttp.ClientError as exc:
+                raise NetworkError(
+                    "teams",
+                    f"Network error obtaining Bot Framework access token: {exc}",
+                    exc,
+                ) from exc
 
     async def _teams_send(
         self,
@@ -1592,23 +1607,19 @@ class TeamsAdapter:
         activity: dict[str, Any],
     ) -> dict[str, Any]:
         """Send an activity to a Teams conversation via Bot Framework REST API."""
-        import aiohttp  # lazy import
-
         _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=activity,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=activity,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError(
@@ -1624,23 +1635,19 @@ class TeamsAdapter:
         activity: dict[str, Any],
     ) -> None:
         """Update an activity in a Teams conversation via Bot Framework REST API."""
-        import aiohttp  # lazy import
-
         _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.put(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=activity,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.put(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=activity,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError(
@@ -1654,19 +1661,15 @@ class TeamsAdapter:
         message_id: str,
     ) -> None:
         """Delete an activity from a Teams conversation via Bot Framework REST API."""
-        import aiohttp  # lazy import
-
         _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.delete(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.delete(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 raise NetworkError(
@@ -1696,14 +1699,12 @@ class TeamsAdapter:
 
             # Lazily create and cache the JWKS client
             if self._jwks_client is None:
-                import aiohttp
-
-                async with aiohttp.ClientSession() as session:  # noqa: SIM117
-                    async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
-                        if resp.status != 200:
-                            self._logger.error("Failed to fetch Bot Framework OpenID config", {"status": resp.status})
-                            return self._make_response("Unauthorized", 401)
-                        openid_config = await resp.json()
+                session = await self._get_http_session()
+                async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
+                    if resp.status != 200:
+                        self._logger.error("Failed to fetch Bot Framework OpenID config", {"status": resp.status})
+                        return self._make_response("Unauthorized", 401)
+                    openid_config = await resp.json()
                 jwks_uri = openid_config.get("jwks_uri")
                 if not jwks_uri:
                     self._logger.error("No jwks_uri in Bot Framework OpenID config")

@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from chat_sdk.testing import MockAdapter, create_mock_adapter
+
+from chat_sdk.testing import MockAdapter
 from chat_sdk.types import (
     Author,
     FetchOptions,
@@ -26,9 +27,6 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
 )
-
-from .conftest import create_chat
-
 
 # ---------------------------------------------------------------------------
 # Constants (match TS fetch-messages fixtures)
@@ -90,7 +88,6 @@ def _build_test_messages(
     Structure: Hey, Welcome(bot), FetchResults(bot), 1..14, Thanks(bot), Thanks(bot)
     """
     messages: list[Message] = []
-    ts_base = 1710000001
 
     # "Hey" human message
     messages.append(

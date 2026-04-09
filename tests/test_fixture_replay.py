@@ -159,12 +159,12 @@ def _make_mock_chat() -> MagicMock:
     chat = MagicMock()
     chat.process_message = MagicMock()
     chat.handle_incoming_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     chat.process_modal_submit = AsyncMock()
     chat.process_modal_close = MagicMock()
-    chat.process_slash_command = AsyncMock()
-    chat.process_member_joined_channel = AsyncMock()
+    chat.process_slash_command = MagicMock()
+    chat.process_member_joined_channel = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_user_name = MagicMock(return_value="test-bot")
     chat.get_logger = MagicMock(return_value=MagicMock())
@@ -268,46 +268,54 @@ class TestSlackFixtureReplay:
     async def test_channel_mention(self):
         """channel-mention/slack.json mention should parse correctly."""
         fixture = load_fixture("channel-mention/slack.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "channel")
+        assert "C00FAKECHAN1" in thread_id
 
     # --- dm/slack.json ---
 
     async def test_dm_mention(self):
         """dm/slack.json mention should parse correctly."""
         fixture = load_fixture("dm/slack.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert message.text is not None
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "Hey")
+        assert message.author.user_id == fixture["mention"]["event"]["user"]
 
     # --- dm/slack-direct.json ---
 
     async def test_dm_direct(self):
         """dm/slack-direct.json directDM: a non-mention DM should still trigger processing."""
         fixture = load_fixture("dm/slack-direct.json")
-        message, _ = await self._send_and_assert_message(fixture, "directDM", "hello")
-        assert message.text is not None
+        message, thread_id = await self._send_and_assert_message(fixture, "directDM", "hello")
+        assert "hello hello" in message.text.lower()
+        # Thread ID should contain the DM channel ID
+        assert "D0ACX51K95H" in thread_id
+        # Author should be the human user, not the bot
+        assert message.author.user_id == fixture["directDM"]["event"]["user"]
 
     # --- channel/slack.json ---
 
     async def test_channel_mention_fixture(self):
         """channel/slack.json mention should parse correctly."""
         fixture = load_fixture("channel/slack.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "Hey")
+        assert "C00FAKECHAN1" in thread_id
 
     # --- streaming/slack.json ---
 
     async def test_streaming_ai_mention(self):
         """streaming/slack.json aiMention should parse correctly."""
         fixture = load_fixture("streaming/slack.json")
-        message, _ = await self._send_and_assert_message(fixture, "aiMention", "love")
-        assert message.text is not None
+        message, thread_id = await self._send_and_assert_message(fixture, "aiMention", "love")
+        assert "what is love" in message.text.lower()
+        # Thread ID should contain the channel ID from the fixture
+        assert "C00FAKECHAN1" in thread_id
+        # Author should be the human user
+        assert message.author.user_id == fixture["aiMention"]["event"]["user"]
 
     async def test_streaming_follow_up(self):
         """streaming/slack.json followUp should parse correctly."""
         fixture = load_fixture("streaming/slack.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "followUp")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "followUp", "Who are you")
+        assert "1767406613.568609" in thread_id
 
     # --- slack-multi-workspace fixtures ---
 
@@ -320,16 +328,16 @@ class TestSlackFixtureReplay:
     async def test_multi_workspace_team2(self):
         """slack-multi-workspace/team2.json mention should parse correctly."""
         fixture = load_fixture("slack-multi-workspace/team2.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "hello from team 2")
+        assert message.author.user_id == fixture["mention"]["event"]["user"]
 
     # --- member-joined-channel/slack.json ---
 
     async def test_member_joined_channel_mention(self):
         """member-joined-channel/slack.json mention should parse correctly."""
         fixture = load_fixture("member-joined-channel/slack.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "test")
+        assert "C00FAKECHAN1" in thread_id
 
 
 # ===========================================================================
@@ -398,18 +406,27 @@ class TestTeamsFixtureReplay:
 
     async def test_root_follow_up(self):
         """teams.json followUp: follow-up reply should parse correctly."""
+        import base64
+
         fixture = load_fixture("teams.json")
         message, thread_id = await self._send_and_assert_message(fixture, "followUp", "Hi")
-        # Thread ID should be consistent with the mention (same conversation)
-        assert thread_id, "follow-up thread_id should be non-empty"
+        # Thread ID is teams:<base64(conv_id)>:<base64(service_url)>
+        assert thread_id.startswith("teams:"), f"Expected 'teams:' prefix in thread_id '{thread_id}'"
+        # Decode the conversation segment and verify it matches the fixture
+        parts = thread_id.split(":")
+        decoded_conv = base64.b64decode(parts[1]).decode()
+        assert decoded_conv == fixture["followUp"]["conversation"]["id"]
+        # Author should match the fixture's 'from' field
+        assert message.author.user_id == fixture["followUp"]["from"]["id"]
+        assert message.author.full_name == fixture["followUp"]["from"]["name"]
 
     # --- channel/teams.json ---
 
     async def test_channel_mention(self):
         """channel/teams.json mention should parse correctly."""
         fixture = load_fixture("channel/teams.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "Hey")
+        assert message.author.user_id == fixture["mention"]["from"]["id"]
 
     # --- dm/teams.json ---
 
@@ -430,8 +447,8 @@ class TestTeamsFixtureReplay:
     async def test_streaming_follow_up(self):
         """streaming/teams.json followUp should parse correctly."""
         fixture = load_fixture("streaming/teams.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "followUp")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "followUp", "Who are you")
+        assert message.author.user_id == fixture["followUp"]["from"]["id"]
 
 
 # ===========================================================================
@@ -529,24 +546,24 @@ class TestGChatFixtureReplay:
     async def test_channel_mention(self):
         """channel/gchat.json mention should parse correctly."""
         fixture = load_fixture("channel/gchat.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "Hey")
+        assert message.author.is_bot is False
 
     # --- dm/gchat.json ---
 
     async def test_dm_mention(self):
         """dm/gchat.json mention should parse correctly."""
         fixture = load_fixture("dm/gchat.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "mention")
-        assert message.text is not None
+        message, thread_id = await self._send_and_assert_message(fixture, "mention", "hey")
+        assert message.author.is_bot is False
 
     # --- streaming/gchat.json ---
 
     async def test_streaming_ai_mention(self):
         """streaming/gchat.json aiMention should parse correctly."""
         fixture = load_fixture("streaming/gchat.json")
-        message, thread_id = await self._send_and_assert_message(fixture, "aiMention")
-        assert thread_id  # non-empty thread ID
+        message, thread_id = await self._send_and_assert_message(fixture, "aiMention", "love")
+        assert message.author.is_bot is False
 
     async def test_streaming_follow_up(self):
         """streaming/gchat.json followUp: Pub/Sub follow-up should parse correctly."""
@@ -562,6 +579,13 @@ class TestGChatFixtureReplay:
         assert result["status"] == 200
 
         assert mock_chat.process_message.called, "process_message should be called for streaming GChat follow-up"
+
+        call_args = mock_chat.process_message.call_args
+        thread_id = call_args[0][1]
+        assert thread_id, "thread_id should be non-empty for streaming GChat follow-up"
+
+        message = await _extract_message(call_args)
+        assert "who are you" in message.text.lower(), f"Expected 'who are you' in message text '{message.text}'"
 
 
 # ===========================================================================
@@ -608,28 +632,33 @@ class TestDiscordFixtureReplay:
 
         # Mock thread creation (avoids real HTTP calls to Discord API)
         mock_thread_response = {"id": "mock-thread-id-123", "name": "test-thread"}
-        with patch.object(adapter, "_create_discord_thread", new_callable=AsyncMock, return_value=mock_thread_response):
-            result = await adapter.handle_webhook(request)
+        try:
+            with patch.object(
+                adapter, "_create_discord_thread", new_callable=AsyncMock, return_value=mock_thread_response
+            ):
+                result = await adapter.handle_webhook(request)
 
-        assert result["status"] == 200
+            assert result["status"] == 200
 
-        assert mock_chat.handle_incoming_message.called, (
-            f"handle_incoming_message should be called for Discord {payload_key}"
-        )
-
-        call_args = mock_chat.handle_incoming_message.call_args
-        thread_id = call_args[0][1]
-        assert thread_id, "thread_id should be non-empty"
-
-        message = call_args[0][2]
-        assert message.text is not None
-
-        if expected_text_fragment:
-            assert expected_text_fragment.lower() in message.text.lower(), (
-                f"Expected '{expected_text_fragment}' in message text '{message.text}'"
+            assert mock_chat.handle_incoming_message.called, (
+                f"handle_incoming_message should be called for Discord {payload_key}"
             )
 
-        return message, thread_id
+            call_args = mock_chat.handle_incoming_message.call_args
+            thread_id = call_args[0][1]
+            assert thread_id, "thread_id should be non-empty"
+
+            message = call_args[0][2]
+            assert message.text is not None
+
+            if expected_text_fragment:
+                assert expected_text_fragment.lower() in message.text.lower(), (
+                    f"Expected '{expected_text_fragment}' in message text '{message.text}'"
+                )
+
+            return message, thread_id
+        finally:
+            await adapter.disconnect()
 
     # --- Root fixture (discord.json) ---
 
@@ -659,17 +688,20 @@ class TestDiscordFixtureReplay:
         body = json.dumps(payload)
         request = _discord_gateway_request(body, DISCORD_BOT_TOKEN)
 
-        with patch.object(
-            adapter,
-            "_create_discord_thread",
-            new_callable=AsyncMock,
-            return_value={"id": "mock-thread-id", "name": "test-thread"},
-        ):
-            result = await adapter.handle_webhook(request)
+        try:
+            with patch.object(
+                adapter,
+                "_create_discord_thread",
+                new_callable=AsyncMock,
+                return_value={"id": "mock-thread-id", "name": "test-thread"},
+            ):
+                result = await adapter.handle_webhook(request)
 
-        assert result["status"] == 200
-        # Subscribed messages (non-mention in-thread) should still be processed
-        assert mock_chat.handle_incoming_message.called
+            assert result["status"] == 200
+            # Subscribed messages (non-mention in-thread) should still be processed
+            assert mock_chat.handle_incoming_message.called
+        finally:
+            await adapter.disconnect()
 
     async def test_root_gateway_dm_request(self):
         """discord.json gatewayDMRequest: DM to bot should parse correctly."""
@@ -682,16 +714,19 @@ class TestDiscordFixtureReplay:
         body = json.dumps(payload)
         request = _discord_gateway_request(body, DISCORD_BOT_TOKEN)
 
-        with patch.object(
-            adapter,
-            "_create_discord_thread",
-            new_callable=AsyncMock,
-            return_value={"id": "mock-thread-id", "name": "test-thread"},
-        ):
-            result = await adapter.handle_webhook(request)
+        try:
+            with patch.object(
+                adapter,
+                "_create_discord_thread",
+                new_callable=AsyncMock,
+                return_value={"id": "mock-thread-id", "name": "test-thread"},
+            ):
+                result = await adapter.handle_webhook(request)
 
-        assert result["status"] == 200
-        assert mock_chat.handle_incoming_message.called
+            assert result["status"] == 200
+            assert mock_chat.handle_incoming_message.called
+        finally:
+            await adapter.disconnect()
 
     # --- channel/discord.json ---
 
@@ -733,24 +768,27 @@ class TestTelegramFixtureReplay:
         body = json.dumps(fixture[payload_key])
         request = _telegram_request(body)
 
-        result = await adapter.handle_webhook(request)
-        assert result["status"] == 200
+        try:
+            result = await adapter.handle_webhook(request)
+            assert result["status"] == 200
 
-        assert mock_chat.process_message.called, f"process_message should be called for Telegram {payload_key}"
+            assert mock_chat.process_message.called, f"process_message should be called for Telegram {payload_key}"
 
-        call_args = mock_chat.process_message.call_args
-        thread_id = call_args[0][1]
-        assert thread_id, "thread_id should be non-empty"
+            call_args = mock_chat.process_message.call_args
+            thread_id = call_args[0][1]
+            assert thread_id, "thread_id should be non-empty"
 
-        message = await _extract_message(call_args)
-        assert message.text is not None
+            message = await _extract_message(call_args)
+            assert message.text is not None
 
-        if expected_text_fragment:
-            assert expected_text_fragment.lower() in message.text.lower(), (
-                f"Expected '{expected_text_fragment}' in message text '{message.text}'"
-            )
+            if expected_text_fragment:
+                assert expected_text_fragment.lower() in message.text.lower(), (
+                    f"Expected '{expected_text_fragment}' in message text '{message.text}'"
+                )
 
-        return message, thread_id
+            return message, thread_id
+        finally:
+            await adapter.disconnect()
 
     # --- Root fixture (telegram.json) ---
 
@@ -765,8 +803,14 @@ class TestTelegramFixtureReplay:
     async def test_root_follow_up(self):
         """telegram.json followUp: follow-up message should parse correctly."""
         fixture = load_fixture("telegram.json")
-        message, _ = await self._send_and_assert_message(fixture, "followUp", "how are you")
-        assert message.text is not None
+        message, thread_id = await self._send_and_assert_message(fixture, "followUp", "how are you")
+        assert message.text == "how are you"
+        # Thread ID should contain the chat ID from the fixture
+        chat_id = str(fixture["followUp"]["message"]["chat"]["id"])
+        assert chat_id in thread_id, f"Expected chat id '{chat_id}' in thread_id '{thread_id}'"
+        # Author should be the Telegram user
+        assert message.author.user_name == "telegram_test_user"
+        assert message.author.is_bot is False
 
 
 # ===========================================================================

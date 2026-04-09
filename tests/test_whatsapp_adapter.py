@@ -18,7 +18,6 @@ from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig, WhatsAppThre
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

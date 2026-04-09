@@ -17,6 +17,7 @@ import time
 import uuid
 from typing import Any
 
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.types import Lock, QueueEntry
 
 _logger = logging.getLogger(__name__)
@@ -570,7 +571,7 @@ class PostgresStateAdapter:
 
     def _ensure_connected(self) -> None:
         if not self._connected:
-            raise RuntimeError("PostgresStateAdapter is not connected. Call connect() first.")
+            raise StateNotConnectedError("PostgresStateAdapter")
 
     async def _ensure_schema(self) -> None:
         """Create required tables and indexes if they do not exist."""
@@ -585,12 +586,12 @@ class PostgresStateAdapter:
 
 def _pg_timestamp_from_ms(ttl_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime ``ttl_ms`` milliseconds from now."""
-    return _dt.datetime.now(_dt.UTC) + _dt.timedelta(milliseconds=ttl_ms)
+    return _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(milliseconds=ttl_ms)
 
 
 def _pg_timestamp_from_epoch_ms(epoch_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime from an epoch-millisecond value."""
-    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.UTC)
+    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.timezone.utc)
 
 
 # ---------------------------------------------------------------------------

@@ -8,13 +8,13 @@ sismember, rpush, lpush, lrange, ltrim, llen, lpop, ping, aclose.
 
 from __future__ import annotations
 
-import json
 import time
 
 import pytest
+
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.state.redis import RedisStateAdapter
 from chat_sdk.types import Lock, QueueEntry
-
 
 # ============================================================================
 # MockRedis
@@ -40,10 +40,9 @@ class MockRedis:
     # -- helpers ---------------------------------------------------------------
 
     def _is_expired(self, key: str) -> bool:
-        if key in self._ttls:
-            if time.time() >= self._ttls[key]:
-                self._evict(key)
-                return True
+        if key in self._ttls and time.time() >= self._ttls[key]:
+            self._evict(key)
+            return True
         return False
 
     def _evict(self, key: str) -> None:
@@ -228,7 +227,7 @@ class MockRedis:
             self._set_ttl(key, ttl_ms)
             return len(self._lists[key])
 
-        raise NotImplementedError(f"MockRedis.eval: unrecognised Lua script")
+        raise NotImplementedError("MockRedis.eval: unrecognised Lua script")
 
 
 # ============================================================================
@@ -295,14 +294,13 @@ class TestRedisStateLifecycle:
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_noop(self, mock_redis: MockRedis):
         adapter = RedisStateAdapter(client=mock_redis, key_prefix="test")
-        # No assertion needed -- tests that disconnect before connect does not raise
+        # Disconnect before connect should complete without raising
         await adapter.disconnect()
-        assert True
 
     @pytest.mark.asyncio
     async def test_operations_fail_before_connect(self, mock_redis: MockRedis):
         adapter = RedisStateAdapter(client=mock_redis, key_prefix="test")
-        with pytest.raises(RuntimeError, match="not connected"):
+        with pytest.raises(StateNotConnectedError, match="not connected"):
             await adapter.get("key")
 
     @pytest.mark.asyncio
@@ -370,9 +368,8 @@ class TestRedisStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        # No assertion needed -- tests that deleting a nonexistent key does not raise
         await redis_state.delete("nonexistent")
-        assert True
+        assert await redis_state.get("nonexistent") is None
 
     @pytest.mark.asyncio
     async def test_set_with_ttl_expires(self, redis_state: RedisStateAdapter):
@@ -459,6 +456,9 @@ class TestRedisStateLocks:
         time.sleep(0.005)
         lock2 = await redis_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token.startswith("redis_")
+        assert lock2.token != lock1.token  # New lock should have a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock_allows_reacquire(self, redis_state: RedisStateAdapter):
@@ -467,6 +467,8 @@ class TestRedisStateLocks:
         await redis_state.release_lock(lock)
         lock2 = await redis_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock_wrong_token_is_noop(self, redis_state: RedisStateAdapter):
@@ -520,12 +522,16 @@ class TestRedisStateLocks:
 
         lock2 = await redis_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after force release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        # No assertion needed -- tests that releasing a nonexistent lock does not raise
         await redis_state.force_release_lock("nonexistent")
-        assert True
+        # Can still acquire a lock on the same thread after force-releasing a nonexistent one
+        lock = await redis_state.acquire_lock("nonexistent", 30_000)
+        assert lock is not None
+        assert lock.thread_id == "nonexistent"
 
     @pytest.mark.asyncio
     async def test_independent_locks_per_thread(self, redis_state: RedisStateAdapter):
@@ -702,9 +708,8 @@ class TestRedisStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, redis_state: RedisStateAdapter):
-        # No assertion needed -- tests that unsubscribing a nonexistent thread does not raise
         await redis_state.unsubscribe("nonexistent")
-        assert True
+        assert await redis_state.is_subscribed("nonexistent") is False
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, redis_state: RedisStateAdapter):

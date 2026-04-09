@@ -32,11 +32,17 @@ MAPPING = {
 
 
 def ts_name_to_python(ts_name: str) -> str:
-    """Convert a TS it("should do X") name to test_should_do_x."""
+    """Convert a TS it("should do X") name to test_should_do_x.
+
+    Returns empty string for names that reduce to nothing after
+    stripping non-alphanumeric characters (e.g. "\\n").
+    """
     name = ts_name.lower()
     name = re.sub(r"[^a-z0-9\s]", "", name)
     name = re.sub(r"\s+", "_", name.strip())
     name = re.sub(r"_+", "_", name)
+    if not name:
+        return ""
     return f"test_{name}"
 
 
@@ -53,11 +59,12 @@ def extract_ts_tests(ts_path: str) -> list[tuple[str, str, str]]:
         if desc_match:
             current_describe = desc_match.group(1)
 
-        it_match = re.search(r'it\("([^"]+)"', line)
+        it_match = re.search(r'\bit\("([^"]+)"', line)
         if it_match:
             ts_name = it_match.group(1)
             py_name = ts_name_to_python(ts_name)
-            tests.append((current_describe, ts_name, py_name))
+            if py_name:  # skip names that reduce to empty (e.g. "\\n")
+                tests.append((current_describe, ts_name, py_name))
 
     return tests
 

@@ -6,7 +6,6 @@ Port of packages/adapter-slack/src/cards.test.ts.
 from __future__ import annotations
 
 from chat_sdk.adapters.slack.cards import card_to_block_kit
-from chat_sdk.cards import card_to_fallback_text
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -20,6 +19,7 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
     Table,
+    card_to_fallback_text,
 )
 from chat_sdk.modals import RadioSelectElement, SelectElement, SelectOptionElement
 

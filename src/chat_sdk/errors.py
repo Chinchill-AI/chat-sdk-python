@@ -36,3 +36,11 @@ class RateLimitError(ChatError):
         if retry_after is not None:
             msg += f", retry after {retry_after}s"
         super().__init__(msg)
+
+
+class StateNotConnectedError(ChatError):
+    """Raised when a state adapter method is called before connect()."""
+
+    def __init__(self, adapter_name: str) -> None:
+        self.adapter_name = adapter_name
+        super().__init__(f"{adapter_name} is not connected. Call connect() first.")

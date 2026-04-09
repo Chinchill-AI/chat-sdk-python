@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from chat_sdk.shared.errors import (
     AdapterError,
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
-    PermissionError as AdapterPermissionError,
     ResourceNotFoundError,
     ValidationError,
 )

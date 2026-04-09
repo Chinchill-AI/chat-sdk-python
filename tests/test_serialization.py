@@ -10,9 +10,9 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+
 from chat_sdk.testing import (
     create_mock_adapter,
-    create_mock_state,
     create_test_message,
 )
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
@@ -23,7 +23,6 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
 )
-
 
 # ============================================================================
 # Message.to_json()
@@ -53,8 +52,8 @@ class TestMessageToJson:
         )
         data = message.to_json()
 
-        assert data["metadata"]["date_sent"] == "2024-01-15T10:30:00+00:00"
-        assert data["metadata"]["edited_at"] == "2024-01-15T11:00:00+00:00"
+        assert data["metadata"]["dateSent"] == "2024-01-15T10:30:00+00:00"
+        assert data["metadata"]["editedAt"] == "2024-01-15T11:00:00+00:00"
 
     def test_should_handle_undefined_editedat(self):
         message = create_test_message(
@@ -66,19 +65,19 @@ class TestMessageToJson:
             ),
         )
         data = message.to_json()
-        # edited_at is omitted from the dict when None (not set to null)
-        assert "edited_at" not in data["metadata"]
+        # editedAt is omitted from the dict when None (not set to null)
+        assert "editedAt" not in data["metadata"]
 
     def test_should_serialize_author_correctly(self):
         message = create_test_message("msg-1", "Test")
         data = message.to_json()
 
         assert data["author"] == {
-            "user_id": "U123",
-            "user_name": "testuser",
-            "full_name": "Test User",
-            "is_bot": False,
-            "is_me": False,
+            "userId": "U123",
+            "userName": "testuser",
+            "fullName": "Test User",
+            "isBot": False,
+            "isMe": False,
         }
 
     def test_should_serialize_attachments_without_datafetchdata(self):
@@ -109,7 +108,7 @@ class TestMessageToJson:
         assert att["type"] == "image"
         assert att["url"] == "https://example.com/image.png"
         assert att["name"] == "image.png"
-        assert att["mime_type"] == "image/png"
+        assert att["mimeType"] == "image/png"
         assert att["size"] == 1024
         assert att["width"] == 800
         assert att["height"] == 600
@@ -120,7 +119,7 @@ class TestMessageToJson:
     def test_should_serialize_ismention_flag(self):
         message = create_test_message("msg-1", "Test", is_mention=True)
         data = message.to_json()
-        assert data["is_mention"] is True
+        assert data["isMention"] is True
 
     def test_should_serialize_links_without_fetchmessage(self):
         async def fetch_linked() -> Message:
@@ -148,7 +147,7 @@ class TestMessageToJson:
         }
         assert data["links"][1] == {
             "url": "https://vercel.com",
-            "site_name": "Vercel",
+            "siteName": "Vercel",
         }
         # fetch_message should NOT be in serialized output
         assert "fetch_message" not in data["links"][0]
@@ -448,9 +447,9 @@ class TestThreadSerialization:
 
         assert data["_type"] == "chat:Thread"
         assert data["id"] == "slack:C123:1234.5678"
-        assert data["channel_id"] == "C123"
-        assert data["is_dm"] is False
-        assert data["adapter_name"] == "slack"
+        assert data["channelId"] == "C123"
+        assert data["isDM"] is False
+        assert data["adapterName"] == "slack"
 
     def test_should_roundtrip_thread_correctly_preserving_fields(self, mock_adapter, mock_state):
         original = ThreadImpl(
@@ -507,7 +506,7 @@ class TestThreadToJsonFaithful:
         data = thread.to_json()
 
         assert data["_type"] == "chat:Thread"
-        assert data["is_dm"] is True
+        assert data["isDM"] is True
 
     def test_should_serialize_external_channel_thread_correctly(self, mock_adapter, mock_state):
         thread = ThreadImpl(
@@ -522,7 +521,7 @@ class TestThreadToJsonFaithful:
         data = thread.to_json()
 
         assert data["_type"] == "chat:Thread"
-        assert data["channel_visibility"] == "external"
+        assert data["channelVisibility"] == "external"
 
     def test_should_serialize_private_channel_thread_correctly(self, mock_adapter, mock_state):
         thread = ThreadImpl(
@@ -537,7 +536,7 @@ class TestThreadToJsonFaithful:
         data = thread.to_json()
 
         assert data["_type"] == "chat:Thread"
-        assert data["channel_visibility"] == "private"
+        assert data["channelVisibility"] == "private"
 
     def test_should_serialize_workspace_channel_thread_correctly(self, mock_adapter, mock_state):
         thread = ThreadImpl(
@@ -551,7 +550,7 @@ class TestThreadToJsonFaithful:
         )
         data = thread.to_json()
 
-        assert data["channel_visibility"] == "workspace"
+        assert data["channelVisibility"] == "workspace"
 
 
 # ============================================================================
@@ -653,10 +652,10 @@ class TestThreadFromJsonFaithful:
         )
         data = original.to_json()
 
-        assert data["current_message"] is not None
-        assert data["current_message"]["_type"] == "chat:Message"
-        assert data["current_message"]["author"]["user_id"] == "U456"
-        assert data["current_message"]["raw"] == {"team_id": "T123"}
+        assert data["currentMessage"] is not None
+        assert data["currentMessage"]["_type"] == "chat:Message"
+        assert data["currentMessage"]["author"]["userId"] == "U456"
+        assert data["currentMessage"]["raw"] == {"team_id": "T123"}
 
     def test_should_roundtrip_with_currentmessage_for_streaming(self, mock_adapter, mock_state):
         current_message = create_test_message(
@@ -683,8 +682,8 @@ class TestThreadFromJsonFaithful:
         data = original.to_json()
         restored = ThreadImpl.from_json(data, adapter=mock_adapter)
 
-        assert data["current_message"]["author"]["user_id"] == "U456"
-        assert data["current_message"]["raw"] == {"team_id": "T123"}
+        assert data["currentMessage"]["author"]["userId"] == "U456"
+        assert data["currentMessage"]["raw"] == {"team_id": "T123"}
         assert restored.id == original.id
         assert restored.channel_id == original.channel_id
 
@@ -874,12 +873,12 @@ class TestThreadWorkflowSerde:
     def test_should_have_workflowserialize_static_method(self):
         # Python equivalent: to_json is an instance method
         assert hasattr(ThreadImpl, "to_json")
-        assert callable(getattr(ThreadImpl, "to_json"))
+        assert callable(ThreadImpl.to_json)
 
     def test_should_have_workflowdeserialize_static_method(self):
         # Python equivalent: from_json is a class method
         assert hasattr(ThreadImpl, "from_json")
-        assert callable(getattr(ThreadImpl, "from_json"))
+        assert callable(ThreadImpl.from_json)
 
     def test_should_serialize_via_workflowserialize(self, mock_adapter, mock_state):
         thread = ThreadImpl(
@@ -895,10 +894,10 @@ class TestThreadWorkflowSerde:
 
         assert serialized["_type"] == "chat:Thread"
         assert serialized["id"] == "slack:C123:1234.5678"
-        assert serialized["channel_id"] == "C123"
-        assert serialized["channel_visibility"] == "unknown"
-        assert serialized["is_dm"] is False
-        assert serialized["adapter_name"] == "slack"
+        assert serialized["channelId"] == "C123"
+        assert serialized["channelVisibility"] == "unknown"
+        assert serialized["isDM"] is False
+        assert serialized["adapterName"] == "slack"
 
     def test_should_deserialize_via_workflowdeserialize_with_lazy_resolution(self, mock_adapter, mock_state):
         from chat_sdk.chat import Chat
@@ -941,12 +940,12 @@ class TestMessageWorkflowSerde:
     def test_message_should_have_workflowserialize_static_method(self):
         # Python equivalent: to_json is an instance method
         assert hasattr(Message, "to_json")
-        assert callable(getattr(Message, "to_json"))
+        assert callable(Message.to_json)
 
     def test_message_should_have_workflowdeserialize_static_method(self):
         # Python equivalent: from_json is a class method
         assert hasattr(Message, "from_json")
-        assert callable(getattr(Message, "from_json"))
+        assert callable(Message.from_json)
 
     def test_message_should_serialize_via_workflowserialize(self):
         message = create_test_message("msg-1", "Hello world")
@@ -955,7 +954,7 @@ class TestMessageWorkflowSerde:
         assert serialized["_type"] == "chat:Message"
         assert serialized["id"] == "msg-1"
         assert serialized["text"] == "Hello world"
-        assert isinstance(serialized["metadata"]["date_sent"], str)
+        assert isinstance(serialized["metadata"]["dateSent"], str)
 
     def test_should_deserialize_via_workflowdeserialize(self):
         data = {

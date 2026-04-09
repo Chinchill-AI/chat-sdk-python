@@ -10,7 +10,6 @@ Mocks telegram_fetch to intercept all Bot API calls without network access.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,15 +18,13 @@ import pytest
 from chat_sdk.adapters.telegram.adapter import TelegramAdapter
 from chat_sdk.adapters.telegram.types import (
     TelegramAdapterConfig,
-    TelegramThreadId,
 )
 from chat_sdk.shared.errors import (
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
-    PermissionError as AdapterPermissionError,
     ValidationError,
 )
-
 
 # =============================================================================
 # Helpers
@@ -173,7 +170,7 @@ class TestEditMessage:
         _init_adapter(adapter)
         adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message(text="Updated"))
 
-        result = await adapter.edit_message(
+        await adapter.edit_message(
             THREAD_ID,
             COMPOSITE_MESSAGE_ID,
             {"markdown": "Updated"},
@@ -525,7 +522,12 @@ class TestHandleWebhook:
             headers = {"x-telegram-bot-api-secret-token": "my-secret"}
 
             async def text(self):
-                return '{"update_id": 1, "message": {"message_id": 1, "chat": {"id": 123, "type": "private"}, "from": {"id": 111, "is_bot": false, "first_name": "A"}, "date": 1700000000, "text": "hi"}}'
+                return (
+                    '{"update_id": 1, "message": {"message_id": 1,'
+                    ' "chat": {"id": 123, "type": "private"},'
+                    ' "from": {"id": 111, "is_bot": false, "first_name": "A"},'
+                    ' "date": 1700000000, "text": "hi"}}'
+                )
 
         result = await adapter.handle_webhook(FakeReq())
         assert result["status"] == 200
@@ -622,10 +624,10 @@ class TestProcessUpdateDispatch:
 
     def test_handle_incoming_message_no_chat(self):
         adapter = _make_adapter()
-        # No assertion needed -- tests that processing a message without _chat
-        # does not raise
-        adapter.handle_incoming_message_update(_make_telegram_message())
-        assert True
+        # When _chat is None, handle_incoming_message_update returns early without error
+        result = adapter.handle_incoming_message_update(_make_telegram_message())
+        assert result is None
+        assert adapter._chat is None
 
 
 # =============================================================================
@@ -767,12 +769,12 @@ class TestReactionHelpers:
     def test_reaction_to_emoji_value_emoji(self):
         adapter = _make_adapter()
         result = adapter.reaction_to_emoji_value({"type": "emoji", "emoji": "\ud83d\udc4d"})
-        assert result is not None
+        assert result.name == "\ud83d\udc4d"
 
     def test_reaction_to_emoji_value_custom(self):
         adapter = _make_adapter()
         result = adapter.reaction_to_emoji_value({"type": "custom_emoji", "custom_emoji_id": "456"})
-        assert result is not None
+        assert result.name == "custom:456"
 
 
 # =============================================================================
@@ -1061,9 +1063,7 @@ class TestResolvePollingConfig:
         from chat_sdk.adapters.telegram.types import TelegramLongPollingConfig
 
         adapter = _make_adapter()
-        config = adapter.resolve_polling_config(
-            TelegramLongPollingConfig(limit=50, timeout=10, delete_webhook=False)
-        )
+        config = adapter.resolve_polling_config(TelegramLongPollingConfig(limit=50, timeout=10, delete_webhook=False))
         assert config.limit == 50
         assert config.timeout == 10
         assert config.delete_webhook is False
@@ -1088,7 +1088,6 @@ class TestClampInteger:
         assert TelegramAdapter.clamp_integer(3.7, 10, 0, 100) == 3
 
     def test_nan_returns_fallback(self):
-        import math
         assert TelegramAdapter.clamp_integer(float("nan"), 10, 0, 100) == 10
 
 
@@ -1163,7 +1162,12 @@ class TestPostChannelMessage:
         adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message(text="chan"))
 
         result = await adapter.post_channel_message(THREAD_ID, {"markdown": "chan"})
-        assert result.id is not None
+        assert result.id == COMPOSITE_MESSAGE_ID
+        assert result.thread_id == THREAD_ID
+        # Verify it delegated to telegram_fetch (i.e. post_message internally)
+        adapter.telegram_fetch.assert_called_once()
+        call_args = adapter.telegram_fetch.call_args
+        assert call_args[0][0] == "sendMessage"
 
 
 # =============================================================================
@@ -1234,7 +1238,7 @@ class TestMessageHelpers:
         assert adapter.message_sequence("no-sequence") == 0
 
     def test_compare_messages_by_time(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FormattedContent, Message, MessageMetadata
 
@@ -1242,14 +1246,22 @@ class TestMessageHelpers:
         fmt: FormattedContent = {"type": "root", "children": []}
         author = Author(user_id="u", user_name="u", full_name="u", is_bot=False, is_me=False)
         a = Message(
-            id="1", thread_id=THREAD_ID, text="a", formatted=fmt, raw={},
+            id="1",
+            thread_id=THREAD_ID,
+            text="a",
+            formatted=fmt,
+            raw={},
             author=author,
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 1, tzinfo=UTC)),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         )
         b = Message(
-            id="2", thread_id=THREAD_ID, text="b", formatted=fmt, raw={},
+            id="2",
+            thread_id=THREAD_ID,
+            text="b",
+            formatted=fmt,
+            raw={},
             author=author,
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 2, tzinfo=UTC)),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 2, tzinfo=timezone.utc)),
         )
         assert adapter.compare_messages(a, b) == -1
         assert adapter.compare_messages(b, a) == 1
@@ -1269,7 +1281,7 @@ class TestPaginateMessages:
         assert result.messages == []
 
     def test_backward_pagination(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FetchOptions, Message, MessageMetadata
 
@@ -1279,9 +1291,13 @@ class TestPaginateMessages:
 
         def _msg(i: int) -> Message:
             return Message(
-                id=f"{CHAT_ID}:{i}", thread_id=THREAD_ID, text=f"msg{i}", formatted=fmt, raw={},
+                id=f"{CHAT_ID}:{i}",
+                thread_id=THREAD_ID,
+                text=f"msg{i}",
+                formatted=fmt,
+                raw={},
                 author=Author(user_id="u", user_name="u", full_name="u", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=UTC)),
+                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=timezone.utc)),
             )
 
         msgs = [_msg(i) for i in range(5)]
@@ -1291,7 +1307,7 @@ class TestPaginateMessages:
         assert result.next_cursor is not None
 
     def test_forward_pagination(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FetchOptions, Message, MessageMetadata
 
@@ -1301,9 +1317,13 @@ class TestPaginateMessages:
 
         def _msg(i: int) -> Message:
             return Message(
-                id=f"{CHAT_ID}:{i}", thread_id=THREAD_ID, text=f"msg{i}", formatted=fmt, raw={},
+                id=f"{CHAT_ID}:{i}",
+                thread_id=THREAD_ID,
+                text=f"msg{i}",
+                formatted=fmt,
+                raw={},
                 author=Author(user_id="u", user_name="u", full_name="u", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=UTC)),
+                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=timezone.utc)),
             )
 
         msgs = [_msg(i) for i in range(5)]
@@ -1369,10 +1389,8 @@ class TestDisconnect:
     async def test_disconnect_when_not_polling(self):
         adapter = _make_adapter()
         _init_adapter(adapter)
-        # No assertion needed -- tests that disconnect completes without raising
-        # when not in polling mode
+        # Disconnect completes without raising when not in polling mode
         await adapter.disconnect()
-        assert True
 
 
 # =============================================================================
@@ -1387,7 +1405,10 @@ class TestChatDisplayName:
 
     def test_private_name(self):
         adapter = _make_adapter()
-        assert adapter.chat_display_name({"id": 1, "type": "private", "first_name": "John", "last_name": "Doe"}) == "John Doe"
+        assert (
+            adapter.chat_display_name({"id": 1, "type": "private", "first_name": "John", "last_name": "Doe"})
+            == "John Doe"
+        )
 
     def test_username_fallback(self):
         adapter = _make_adapter()

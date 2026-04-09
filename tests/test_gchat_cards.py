@@ -21,7 +21,6 @@ from chat_sdk.cards import (
 )
 from chat_sdk.shared import card_to_fallback_text
 
-
 # ---------------------------------------------------------------------------
 # cardToGoogleCard
 # ---------------------------------------------------------------------------
