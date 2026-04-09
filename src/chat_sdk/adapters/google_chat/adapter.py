@@ -537,10 +537,7 @@ class GoogleChatAdapter:
             pending = self._pending_subscriptions[space_name]
             await pending["event"].wait()
             if pending.get("error"):
-                self._logger.warn(
-                    "Pending subscription failed for space, skipping",
-                    {"spaceName": space_name, "error": str(pending["error"])},
-                )
+                raise pending["error"]
             return
 
         # Create the subscription

@@ -77,7 +77,7 @@ These exist only in the Python port and have no TS equivalent:
 
 - `shared/errors.py`: Typed adapter error hierarchy (`AdapterRateLimitError`, `AuthenticationError`, `ValidationError`, `NetworkError`, `ResourceNotFoundError`, `AdapterPermissionError`). TS throws plain `Error` objects.
 - `testing/__init__.py` + `shared/mock_adapter.py`: Test utilities with `MockAdapter`, `MockStateAdapter`, `create_test_message()`.
-- `from __future__ import annotations` everywhere: Enables PEP 604 union syntax (`X | Y`) on Python 3.10.
+- `from __future__ import annotations` everywhere: Enables PEP 604 union syntax (`X | Y`) without runtime cost.
 - Input validation on adapter config dataclasses (e.g., rejecting empty `signing_secret`).
 - `ContextVar`-based request context in Slack adapter (instance variable, not class variable).
 
