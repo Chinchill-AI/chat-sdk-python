@@ -24,9 +24,17 @@ from chat_sdk.logger import Logger, LogLevel
 def _parse_iso(s: str) -> datetime:
     """Parse ISO 8601 datetime string, supporting Python 3.10+.
 
-    Python 3.10's ``fromisoformat`` doesn't accept the ``Z`` suffix.
+    Handles two Python 3.10 limitations:
+    - ``Z`` suffix not accepted (replaced with ``+00:00``)
+    - Fractional seconds limited to 6 digits (truncated from 7+)
     """
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    import re
+
+    s = s.replace("Z", "+00:00")
+    # Python 3.10 only supports up to 6 fractional digits (microseconds).
+    # Truncate any extra digits (e.g., Teams sends 7-digit nanosecond timestamps).
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    return datetime.fromisoformat(s)
 
 
 # =============================================================================
