@@ -579,7 +579,7 @@ class ThreadImpl:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
                     break  # stop was signaled
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError:  # noqa: UP041 — support Python 3.10
                     pass  # interval elapsed, do the edit
                 if stop_event.is_set() or msg is None:
                     break
