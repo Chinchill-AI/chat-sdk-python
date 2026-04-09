@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.errors import ChatNotImplementedError
@@ -444,7 +444,7 @@ class ChannelImpl:
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.now(tz=UTC),
+                date_sent=datetime.now(tz=timezone.utc),
                 edited=False,
             ),
             attachments=attachments,

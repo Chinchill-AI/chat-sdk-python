@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
@@ -55,6 +55,7 @@ from chat_sdk.types import (
     ThreadInfo,
     ThreadSummary,
     WebhookOptions,
+    _parse_iso,
 )
 
 REVIEW_COMMENT_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+):rc:(\d+)$")
@@ -384,11 +385,9 @@ class GitHubAdapter:
             },
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                if created_at
-                else datetime.now(tz=UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(tz=timezone.utc),
                 edited=edited,
-                edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
+                edited_at=_parse_iso(updated_at) if edited and updated_at else None,
             ),
             attachments=[],
         )
@@ -426,11 +425,9 @@ class GitHubAdapter:
             },
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                if created_at
-                else datetime.now(tz=UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(tz=timezone.utc),
                 edited=edited,
-                edited_at=datetime.fromisoformat(updated_at.replace("Z", "+00:00")) if edited and updated_at else None,
+                edited_at=_parse_iso(updated_at) if edited and updated_at else None,
             ),
             attachments=[],
         )
@@ -785,9 +782,9 @@ class GitHubAdapter:
                 },
                 author=self._parse_author(pr_user),
                 metadata=MessageMetadata(
-                    date_sent=datetime.fromisoformat(pr.get("created_at", "").replace("Z", "+00:00"))
+                    date_sent=_parse_iso(pr.get("created_at", "").replace("Z", "+00:00"))
                     if pr.get("created_at")
-                    else datetime.now(tz=UTC),
+                    else datetime.now(tz=timezone.utc),
                     edited=pr.get("created_at") != pr.get("updated_at"),
                 ),
             )
@@ -795,7 +792,7 @@ class GitHubAdapter:
                 ThreadSummary(
                     id=tid,
                     root_message=root_message,
-                    last_reply_at=datetime.fromisoformat(pr.get("updated_at", "").replace("Z", "+00:00"))
+                    last_reply_at=_parse_iso(pr.get("updated_at", "").replace("Z", "+00:00"))
                     if pr.get("updated_at")
                     else None,
                 )
@@ -928,13 +925,9 @@ class GitHubAdapter:
                 data = await response.json()
 
             token = data["token"]
-            # Parse ISO-8601 expiry from GitHub's response
+            # Parse ISO-8601 expiry; default 1h if absent
             expires_at_str = data.get("expires_at", "")
-            if expires_at_str:
-                expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00")).timestamp()
-            else:
-                # Default: 1 hour from now (GitHub's default)
-                expires_at = time.time() + 3600
+            expires_at = _parse_iso(expires_at_str).timestamp() if expires_at_str else time.time() + 3600
 
             self._installation_token_cache[installation_id] = (token, expires_at)
             self._logger.debug(

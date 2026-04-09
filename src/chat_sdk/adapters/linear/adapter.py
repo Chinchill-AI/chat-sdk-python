@@ -15,7 +15,7 @@ import json
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
@@ -53,6 +53,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 COMMENT_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+)$")
@@ -415,9 +416,9 @@ class LinearAdapter:
             raw=LinearRawMessage(comment=comment),
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(created_at) if created_at else datetime.now(UTC),
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(timezone.utc),
                 edited=created_at != updated_at,
-                edited_at=datetime.fromisoformat(updated_at) if (created_at != updated_at and updated_at) else None,
+                edited_at=_parse_iso(updated_at) if (created_at != updated_at and updated_at) else None,
             ),
             attachments=[],
         )
@@ -749,10 +750,10 @@ class LinearAdapter:
                 is_me=user_id == self._bot_user_id,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(node["createdAt"]) if node.get("createdAt") else datetime.now(UTC),
+                date_sent=_parse_iso(node["createdAt"]) if node.get("createdAt") else datetime.now(timezone.utc),
                 edited=node.get("createdAt") != node.get("updatedAt"),
                 edited_at=(
-                    datetime.fromisoformat(node["updatedAt"])
+                    _parse_iso(node["updatedAt"])
                     if node.get("createdAt") != node.get("updatedAt") and node.get("updatedAt")
                     else None
                 ),
@@ -852,9 +853,9 @@ class LinearAdapter:
                 is_me=user_id == self._bot_user_id,
             ),
             metadata=MessageMetadata(
-                date_sent=(datetime.fromisoformat(created_at) if created_at else datetime.now(UTC)),
+                date_sent=(_parse_iso(created_at) if created_at else datetime.now(timezone.utc)),
                 edited=created_at != updated_at,
-                edited_at=(datetime.fromisoformat(updated_at) if created_at != updated_at and updated_at else None),
+                edited_at=(_parse_iso(updated_at) if created_at != updated_at and updated_at else None),
             ),
             attachments=[],
             raw=raw,

@@ -15,7 +15,7 @@ import math
 import os
 import time
 from collections.abc import AsyncIterable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -525,7 +525,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(inbound.get("timestamp", "0")),
-                    tz=UTC,
+                    tz=timezone.utc,
                 ),
                 edited=False,
             ),
@@ -981,7 +981,7 @@ class WhatsAppAdapter:
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(raw["message"].get("timestamp", "0")),
-                    tz=UTC,
+                    tz=timezone.utc,
                 ),
                 edited=False,
             ),

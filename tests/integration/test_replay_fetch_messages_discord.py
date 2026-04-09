@@ -15,7 +15,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -97,7 +97,7 @@ def _build_discord_messages() -> list[Message]:
                 is_bot=False,
                 is_me=False,
             ),
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc), edited=False),
             attachments=[],
             links=[],
         )
@@ -118,7 +118,7 @@ def _build_discord_messages() -> list[Message]:
                 is_bot=True,
                 is_me=True,
             ),
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc), edited=False),
             attachments=[],
             links=[],
         )
@@ -139,7 +139,7 @@ def _build_discord_messages() -> list[Message]:
                 is_bot=False,
                 is_me=False,
             ),
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc), edited=False),
             attachments=[],
             links=[],
         )
@@ -160,7 +160,7 @@ def _build_discord_messages() -> list[Message]:
                 is_bot=True,
                 is_me=True,
             ),
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 3, tzinfo=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 3, tzinfo=timezone.utc), edited=False),
             attachments=[],
             links=[],
         )
@@ -182,7 +182,9 @@ def _build_discord_messages() -> list[Message]:
                     is_bot=False,
                     is_me=False,
                 ),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 4 + i, tzinfo=UTC), edited=False),
+                metadata=MessageMetadata(
+                    date_sent=datetime(2024, 1, 15, 10, 30, 4 + i, tzinfo=timezone.utc), edited=False
+                ),
                 attachments=[],
                 links=[],
             )
@@ -204,7 +206,9 @@ def _build_discord_messages() -> list[Message]:
                     is_bot=True,
                     is_me=True,
                 ),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, 15, 10, 30, 19 + k, tzinfo=UTC), edited=False),
+                metadata=MessageMetadata(
+                    date_sent=datetime(2024, 1, 15, 10, 30, 19 + k, tzinfo=timezone.utc), edited=False
+                ),
                 attachments=[],
                 links=[],
             )

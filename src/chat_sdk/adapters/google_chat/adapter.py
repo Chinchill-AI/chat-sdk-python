@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
@@ -78,6 +78,7 @@ from chat_sdk.types import (
     ThreadInfo,
     ThreadSummary,
     WebhookOptions,
+    _parse_iso,
 )
 
 # Strong-reference set for fire-and-forget tasks to prevent GC collection.
@@ -611,9 +612,7 @@ class GoogleChatAdapter:
 
             subscription_info = {
                 "subscription_name": result.name,
-                "expire_time": int(datetime.fromisoformat(result.expire_time.replace("Z", "+00:00")).timestamp() * 1000)
-                if result.expire_time
-                else 0,
+                "expire_time": int(_parse_iso(result.expire_time).timestamp() * 1000) if result.expire_time else 0,
             }
 
             if self._state:
@@ -647,7 +646,7 @@ class GoogleChatAdapter:
             for sub in subscriptions:
                 expire_time_str = sub.get("expire_time", "")
                 if expire_time_str:
-                    expire_time = int(datetime.fromisoformat(expire_time_str.replace("Z", "+00:00")).timestamp() * 1000)
+                    expire_time = int(_parse_iso(expire_time_str).timestamp() * 1000)
                     if expire_time > int(time.time() * 1000) + SUBSCRIPTION_REFRESH_BUFFER_MS:
                         return {
                             "subscription_name": sub.get("name", ""),
@@ -2310,7 +2309,7 @@ class GoogleChatAdapter:
                 last_reply_at: datetime | None = None
                 if create_time:
                     with contextlib.suppress(ValueError, AttributeError):
-                        last_reply_at = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+                        last_reply_at = _parse_iso(create_time)
 
                 threads.append(
                     ThreadSummary(
@@ -2725,11 +2724,11 @@ def _parse_message_metadata(message: dict[str, Any]) -> Any:
     date_sent: datetime
     if create_time:
         try:
-            date_sent = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+            date_sent = _parse_iso(create_time)
         except (ValueError, AttributeError):
-            date_sent = datetime.now(tz=UTC)
+            date_sent = datetime.now(tz=timezone.utc)
     else:
-        date_sent = datetime.now(tz=UTC)
+        date_sent = datetime.now(tz=timezone.utc)
 
     return MessageMetadata(
         date_sent=date_sent,

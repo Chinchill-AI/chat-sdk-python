@@ -14,7 +14,7 @@ Tests:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -105,7 +105,7 @@ def _make_message(msg_id: str, thread_id: str, text: str = "hello") -> Message:
             is_me=False,
         ),
         metadata=MessageMetadata(
-            date_sent=datetime.now(UTC),
+            date_sent=datetime.now(timezone.utc),
         ),
         attachments=[],
     )

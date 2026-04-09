@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -563,7 +563,7 @@ class TestStreaming:
                 is_bot=False,
                 is_me=False,
             ),
-            metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+            metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             attachments=[],
         )
 
@@ -1723,7 +1723,7 @@ class TestSentMessageToJson:
 class TestSchedule:
     """describe("schedule()")"""
 
-    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=UTC)
+    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     def _mock_schedule_result(self, **overrides: Any) -> ScheduledMessage:
         defaults = {
@@ -1917,7 +1917,7 @@ class TestSchedule:
             return_value=self._mock_schedule_result()
         )
 
-        specific_date = datetime(2028, 12, 25, 8, 0, 0, tzinfo=UTC)
+        specific_date = datetime(2028, 12, 25, 8, 0, 0, tzinfo=timezone.utc)
         thread = _make_thread(adapter, state)
         await thread.schedule("Merry Christmas!", post_at=specific_date)
 
@@ -2061,7 +2061,7 @@ class TestSchedule:
     async def test_should_return_postat_from_adapter(self):
         adapter = create_mock_adapter()
         state = create_mock_state()
-        custom_date = datetime(2035, 6, 15, 12, 0, 0, tzinfo=UTC)
+        custom_date = datetime(2035, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
             return_value=self._mock_schedule_result(post_at=custom_date)
         )

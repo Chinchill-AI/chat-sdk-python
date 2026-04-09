@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -1574,14 +1574,14 @@ class SlackAdapter:
 
         ts_str = event.get("ts", "0")
         try:
-            date_sent = datetime.fromtimestamp(float(ts_str), tz=UTC)
+            date_sent = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
         except (ValueError, TypeError, OSError):
-            date_sent = datetime.now(tz=UTC)
+            date_sent = datetime.now(tz=timezone.utc)
 
         edited_at: datetime | None = None
         if event.get("edited"):
             try:
-                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=UTC)
+                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=timezone.utc)
             except (ValueError, TypeError, OSError):
                 edited_at = None
 
@@ -1616,14 +1616,14 @@ class SlackAdapter:
 
         ts_str = event.get("ts", "0")
         try:
-            date_sent = datetime.fromtimestamp(float(ts_str), tz=UTC)
+            date_sent = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
         except (ValueError, TypeError, OSError):
-            date_sent = datetime.now(tz=UTC)
+            date_sent = datetime.now(tz=timezone.utc)
 
         edited_at: datetime | None = None
         if event.get("edited"):
             try:
-                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=UTC)
+                edited_at = datetime.fromtimestamp(float(event["edited"].get("ts", "0")), tz=timezone.utc)
             except (ValueError, TypeError, OSError):
                 edited_at = None
 
@@ -2585,7 +2585,7 @@ class SlackAdapter:
                 last_reply_at: datetime | None = None
                 if msg.get("latest_reply"):
                     try:
-                        last_reply_at = datetime.fromtimestamp(float(msg["latest_reply"]), tz=UTC)
+                        last_reply_at = datetime.fromtimestamp(float(msg["latest_reply"]), tz=timezone.utc)
                     except (ValueError, TypeError, OSError):
                         last_reply_at = None
 

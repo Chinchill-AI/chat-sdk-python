@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from chat_sdk.types import (
     Attachment,
@@ -111,15 +111,15 @@ class TestMessageMetadata:
     """Tests for MessageMetadata dataclass."""
 
     def test_creation_defaults(self):
-        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
         meta = MessageMetadata(date_sent=dt)
         assert meta.date_sent == dt
         assert meta.edited is False
         assert meta.edited_at is None
 
     def test_edited_message(self):
-        sent = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
-        edited = datetime(2024, 1, 15, 12, 5, 0, tzinfo=UTC)
+        sent = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        edited = datetime(2024, 1, 15, 12, 5, 0, tzinfo=timezone.utc)
         meta = MessageMetadata(date_sent=sent, edited=True, edited_at=edited)
         assert meta.edited is True
         assert meta.edited_at == edited
@@ -152,7 +152,7 @@ class TestMessage:
     """Tests for Message dataclass."""
 
     def test_creation(self):
-        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
         msg = Message(
             id="msg-001",
             thread_id="thread-001",
@@ -176,7 +176,7 @@ class TestMessage:
         assert msg.raw is None
 
     def test_to_json(self):
-        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
         msg = Message(
             id="m1",
             thread_id="t1",
@@ -204,8 +204,8 @@ class TestMessage:
         assert "editedAt" not in data["metadata"]  # omitted when None
 
     def test_to_json_with_edited(self):
-        sent = datetime(2024, 1, 1, tzinfo=UTC)
-        edited = datetime(2024, 1, 2, tzinfo=UTC)
+        sent = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        edited = datetime(2024, 1, 2, tzinfo=timezone.utc)
         msg = Message(
             id="m2",
             thread_id="t2",

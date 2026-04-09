@@ -438,12 +438,12 @@ class TestParseMessageExtended:
             "conversation": {"id": "19:abc@thread.tacv2"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
-        from datetime import UTC
+        from datetime import timezone
 
-        before = datetime.now(UTC)
+        before = datetime.now(timezone.utc)
         msg = adapter.parse_message(activity)
-        after = datetime.now(UTC)
-        # Verify the timestamp is between before and after (i.e. datetime.now(UTC))
+        after = datetime.now(timezone.utc)
+        # Verify the timestamp is between before and after (i.e. datetime.now(timezone.utc))
         assert before <= msg.metadata.date_sent <= after
 
     def test_mention_detection(self):

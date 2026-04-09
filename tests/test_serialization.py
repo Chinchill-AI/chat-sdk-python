@@ -7,7 +7,7 @@ non-serializable fields), is_mention, links, and round-trip integrity.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -45,9 +45,9 @@ class TestMessageToJson:
             "msg-1",
             "Test",
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
                 edited=True,
-                edited_at=datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),
+                edited_at=datetime(2024, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
             ),
         )
         data = message.to_json()
@@ -60,7 +60,7 @@ class TestMessageToJson:
             "msg-1",
             "Test",
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
                 edited=False,
             ),
         )
@@ -337,9 +337,9 @@ class TestRoundTrip:
             "Hello **world**",
             is_mention=True,
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
                 edited=True,
-                edited_at=datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),
+                edited_at=datetime(2024, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
             ),
             attachments=[
                 Attachment(

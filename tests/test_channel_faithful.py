@@ -11,7 +11,7 @@ TS ``channel.messages`` (property → async iterable) becomes
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -1129,7 +1129,7 @@ class TestThreadMessagesNewestFirst:
 class TestChannelSchedule:
     """describe("schedule()") from channel.test.ts"""
 
-    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=UTC)
+    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     def _mock_schedule_result(self, **overrides: Any) -> ScheduledMessage:
         defaults = {

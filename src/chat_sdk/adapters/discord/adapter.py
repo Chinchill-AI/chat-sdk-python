@@ -13,7 +13,7 @@ import json
 import os
 import re
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -60,6 +60,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -588,9 +589,9 @@ class DiscordAdapter:
                 is_me=author_data.get("id") == self._application_id,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(data.get("timestamp", ""))
+                date_sent=_parse_iso(data.get("timestamp", ""))
                 if data.get("timestamp")
-                else datetime.now(UTC),
+                else datetime.now(timezone.utc),
                 edited=False,
             ),
             attachments=[
@@ -1239,9 +1240,9 @@ class DiscordAdapter:
                 is_me=is_me,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else datetime.now(UTC),
+                date_sent=_parse_iso(msg["timestamp"]) if msg.get("timestamp") else datetime.now(timezone.utc),
                 edited=msg.get("edited_timestamp") is not None,
-                edited_at=datetime.fromisoformat(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
+                edited_at=_parse_iso(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
             ),
             attachments=[
                 Attachment(
@@ -1284,7 +1285,7 @@ class DiscordAdapter:
         message_id: str,
     ) -> dict[str, str]:
         """Create a Discord thread from a message."""
-        thread_name = f"Thread {datetime.now(UTC).isoformat()}"
+        thread_name = f"Thread {datetime.now(timezone.utc).isoformat()}"
 
         self._logger.debug(
             "Discord API: POST thread",

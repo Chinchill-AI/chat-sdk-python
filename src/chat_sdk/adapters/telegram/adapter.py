@@ -17,7 +17,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.adapters.telegram.cards import (
@@ -944,7 +944,7 @@ class TelegramAdapter:
                 metadata=MessageMetadata(
                     date_sent=existing.metadata.date_sent,
                     edited=True,
-                    edited_at=datetime.now(UTC),
+                    edited_at=datetime.now(timezone.utc),
                 ),
                 attachments=existing.attachments,
                 is_mention=existing.is_mention,
@@ -1259,9 +1259,9 @@ class TelegramAdapter:
             raw=raw,
             author=author,
             metadata=MessageMetadata(
-                date_sent=datetime.fromtimestamp(raw["date"], tz=UTC),
+                date_sent=datetime.fromtimestamp(raw["date"], tz=timezone.utc),
                 edited=edit_date is not None,
-                edited_at=(datetime.fromtimestamp(edit_date, tz=UTC) if edit_date is not None else None),
+                edited_at=(datetime.fromtimestamp(edit_date, tz=timezone.utc) if edit_date is not None else None),
             ),
             attachments=self.extract_attachments(raw),
             is_mention=self.is_bot_mentioned(raw, plain_text),

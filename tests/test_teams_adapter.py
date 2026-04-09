@@ -6,7 +6,7 @@ Ported from packages/adapter-teams/src/index.test.ts.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -325,7 +325,7 @@ class TestParseMessage:
         }
         msg = adapter.parse_message(activity)
         assert msg.metadata.edited is False
-        assert msg.metadata.date_sent == datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
+        assert msg.metadata.date_sent == datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------

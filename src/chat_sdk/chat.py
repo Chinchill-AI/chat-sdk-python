@@ -14,7 +14,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.channel import ChannelImpl
@@ -54,6 +54,7 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StateAdapter,
     WebhookOptions,
+    _parse_iso,
 )
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1144,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=event.raw,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
                 attachments=[],
             )
             thread = self._create_thread(event.adapter, event.thread_id, dummy_message, is_subscribed)
@@ -1175,7 +1176,7 @@ class Chat:
                                 metadata=getattr(
                                     raw_fetched,
                                     "metadata",
-                                    MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                                    MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
                                 ),
                             )
                     except Exception:
@@ -1253,7 +1254,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             ),
             is_subscribed,
         )
@@ -1314,7 +1315,7 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime.now(tz=UTC), edited=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
             ),
             False,
         )
@@ -1559,7 +1560,7 @@ class Chat:
                 )
                 return
 
-            now = int(datetime.now(tz=UTC).timestamp() * 1000)
+            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
             entry = QueueEntry(
                 message=message,
                 enqueued_at=now,
@@ -1577,7 +1578,7 @@ class Chat:
 
         try:
             if strategy == "debounce":
-                now = int(datetime.now(tz=UTC).timestamp() * 1000)
+                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
                 await self._state_adapter.enqueue(
                     lock_key,
                     QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
@@ -1634,7 +1635,7 @@ class Chat:
                 break
 
             msg = self._rehydrate_message(entry.message)
-            now = int(datetime.now(tz=UTC).timestamp() * 1000)
+            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
             if now > entry.expires_at:
                 self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
                 continue
@@ -1664,7 +1665,7 @@ class Chat:
                 if entry is None:
                     break
                 msg = self._rehydrate_message(entry.message)
-                now = int(datetime.now(tz=UTC).timestamp() * 1000)
+                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
                 if now <= entry.expires_at:
                     pending.append((msg, entry.expires_at))
                 else:
@@ -1867,13 +1868,13 @@ class Chat:
             metadata_raw = raw.get("metadata", {})
             date_sent = metadata_raw.get("date_sent")
             if isinstance(date_sent, str):
-                date_sent = datetime.fromisoformat(date_sent)
+                date_sent = _parse_iso(date_sent)
             elif not isinstance(date_sent, datetime):
-                date_sent = datetime.now(tz=UTC)
+                date_sent = datetime.now(tz=timezone.utc)
 
             edited_at = metadata_raw.get("edited_at")
             if isinstance(edited_at, str):
-                edited_at = datetime.fromisoformat(edited_at)
+                edited_at = _parse_iso(edited_at)
 
             author_raw = raw.get("author", {})
             return Message(
@@ -1928,13 +1929,13 @@ def _message_from_json(data: dict[str, Any]) -> Message:
 
     date_sent = metadata_raw.get("dateSent") or metadata_raw.get("date_sent")
     if isinstance(date_sent, str):
-        date_sent = datetime.fromisoformat(date_sent)
+        date_sent = _parse_iso(date_sent)
     elif not isinstance(date_sent, datetime):
-        date_sent = datetime.now(tz=UTC)
+        date_sent = datetime.now(tz=timezone.utc)
 
     edited_at = metadata_raw.get("editedAt") or metadata_raw.get("edited_at")
     if isinstance(edited_at, str):
-        edited_at = datetime.fromisoformat(edited_at)
+        edited_at = _parse_iso(edited_at)
 
     return Message(
         id=data.get("id", ""),

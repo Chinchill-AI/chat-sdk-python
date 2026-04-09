@@ -1238,7 +1238,7 @@ class TestMessageHelpers:
         assert adapter.message_sequence("no-sequence") == 0
 
     def test_compare_messages_by_time(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FormattedContent, Message, MessageMetadata
 
@@ -1252,7 +1252,7 @@ class TestMessageHelpers:
             formatted=fmt,
             raw={},
             author=author,
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 1, tzinfo=UTC)),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         )
         b = Message(
             id="2",
@@ -1261,7 +1261,7 @@ class TestMessageHelpers:
             formatted=fmt,
             raw={},
             author=author,
-            metadata=MessageMetadata(date_sent=datetime(2024, 1, 2, tzinfo=UTC)),
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 2, tzinfo=timezone.utc)),
         )
         assert adapter.compare_messages(a, b) == -1
         assert adapter.compare_messages(b, a) == 1
@@ -1281,7 +1281,7 @@ class TestPaginateMessages:
         assert result.messages == []
 
     def test_backward_pagination(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FetchOptions, Message, MessageMetadata
 
@@ -1297,7 +1297,7 @@ class TestPaginateMessages:
                 formatted=fmt,
                 raw={},
                 author=Author(user_id="u", user_name="u", full_name="u", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=UTC)),
+                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=timezone.utc)),
             )
 
         msgs = [_msg(i) for i in range(5)]
@@ -1307,7 +1307,7 @@ class TestPaginateMessages:
         assert result.next_cursor is not None
 
     def test_forward_pagination(self):
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
         from chat_sdk.types import Author, FetchOptions, Message, MessageMetadata
 
@@ -1323,7 +1323,7 @@ class TestPaginateMessages:
                 formatted=fmt,
                 raw={},
                 author=Author(user_id="u", user_name="u", full_name="u", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=UTC)),
+                metadata=MessageMetadata(date_sent=datetime(2024, 1, i + 1, tzinfo=timezone.utc)),
             )
 
         msgs = [_msg(i) for i in range(5)]

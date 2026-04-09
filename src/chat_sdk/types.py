@@ -20,6 +20,15 @@ from chat_sdk.cards import CardElement
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger, LogLevel
 
+
+def _parse_iso(s: str) -> datetime:
+    """Parse ISO 8601 datetime string, supporting Python 3.10+.
+
+    Python 3.10's ``fromisoformat`` doesn't accept the ``Z`` suffix.
+    """
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
 # =============================================================================
 # Channel Visibility
 # =============================================================================
@@ -431,13 +440,13 @@ class Message:
 
         date_sent_raw = meta.get("dateSent") or meta.get("date_sent")
         date_sent = (
-            datetime.fromisoformat(date_sent_raw)
+            _parse_iso(date_sent_raw)
             if isinstance(date_sent_raw, str)
             else (date_sent_raw if isinstance(date_sent_raw, datetime) else datetime.now())
         )
         edited_at_raw = meta.get("editedAt") or meta.get("edited_at")
         edited_at: datetime | None = (
-            datetime.fromisoformat(edited_at_raw)
+            _parse_iso(edited_at_raw)
             if isinstance(edited_at_raw, str)
             else (edited_at_raw if isinstance(edited_at_raw, datetime) else None)
         )
@@ -502,13 +511,13 @@ class Message:
 
         date_sent_raw = meta.get("date_sent") or meta.get("dateSent")
         date_sent = (
-            datetime.fromisoformat(date_sent_raw)
+            _parse_iso(date_sent_raw)
             if isinstance(date_sent_raw, str)
             else (date_sent_raw if isinstance(date_sent_raw, datetime) else datetime.now())
         )
         edited_at_raw = meta.get("edited_at") or meta.get("editedAt")
         edited_at: datetime | None = (
-            datetime.fromisoformat(edited_at_raw)
+            _parse_iso(edited_at_raw)
             if isinstance(edited_at_raw, str)
             else (edited_at_raw if isinstance(edited_at_raw, datetime) else None)
         )

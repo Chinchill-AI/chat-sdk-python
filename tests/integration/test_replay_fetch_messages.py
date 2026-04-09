@@ -16,7 +16,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import timezone
 
 import pytest
 
@@ -72,7 +72,7 @@ def _make_fetch_messages(
                     is_me=is_bot,
                 ),
                 metadata=MessageMetadata(
-                    date_sent=datetime(2024, 1, 15, 10, 30, i, tzinfo=UTC),
+                    date_sent=datetime(2024, 1, 15, 10, 30, i, tzinfo=timezone.utc),
                     edited=False,
                 ),
                 attachments=[],

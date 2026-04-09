@@ -64,7 +64,7 @@ class MockAsyncpgPool:
         return self._seq_counter
 
     def _now(self) -> _dt.datetime:
-        return _dt.datetime.now(_dt.UTC)
+        return _dt.datetime.now(_dt.timezone.utc)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -755,7 +755,7 @@ class TestPostgresStateLocks:
         time.sleep(0.005)
         # Force-expire the lock for testing
         lock_key = ("test", "race-thread")
-        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=1)
+        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
 
         lock3 = await pg_state.acquire_lock("race-thread", 30_000)
         assert lock3 is not None

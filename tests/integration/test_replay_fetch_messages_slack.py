@@ -14,7 +14,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -105,7 +105,7 @@ def _build_test_messages(
                 is_me=False,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
                 edited=False,
             ),
             attachments=[],
@@ -129,7 +129,7 @@ def _build_test_messages(
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
                 edited=False,
             ),
             attachments=[],
@@ -153,7 +153,7 @@ def _build_test_messages(
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=UTC),
+                date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
                 edited=False,
             ),
             attachments=[],
@@ -178,7 +178,7 @@ def _build_test_messages(
                     is_me=False,
                 ),
                 metadata=MessageMetadata(
-                    date_sent=datetime(2024, 1, 15, 10, 30, 2 + i, tzinfo=UTC),
+                    date_sent=datetime(2024, 1, 15, 10, 30, 2 + i, tzinfo=timezone.utc),
                     edited=False,
                 ),
                 attachments=[],
@@ -203,7 +203,7 @@ def _build_test_messages(
                     is_me=True,
                 ),
                 metadata=MessageMetadata(
-                    date_sent=datetime(2024, 1, 15, 10, 30, 17 + j, tzinfo=UTC),
+                    date_sent=datetime(2024, 1, 15, 10, 30, 17 + j, tzinfo=timezone.utc),
                     edited=False,
                 ),
                 attachments=[],

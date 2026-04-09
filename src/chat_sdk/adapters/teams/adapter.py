@@ -13,7 +13,7 @@ import base64
 import json
 import os
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, NoReturn
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
@@ -52,6 +52,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     WebhookOptions,
+    _parse_iso,
 )
 
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
@@ -527,9 +528,9 @@ class TeamsAdapter:
                 is_me=is_me,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime.fromisoformat(activity["timestamp"])
+                date_sent=_parse_iso(activity["timestamp"])
                 if activity.get("timestamp")
-                else datetime.now(UTC),
+                else datetime.now(timezone.utc),
                 edited=False,
             ),
             attachments=attachments,
@@ -1430,7 +1431,7 @@ class TeamsAdapter:
             ),
             metadata=MessageMetadata(
                 date_sent=(
-                    datetime.fromisoformat(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(UTC)
+                    _parse_iso(msg["createdDateTime"]) if msg.get("createdDateTime") else datetime.now(timezone.utc)
                 ),
                 edited=bool(msg.get("lastModifiedDateTime")),
             ),

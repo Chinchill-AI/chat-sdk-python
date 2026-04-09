@@ -586,12 +586,12 @@ class PostgresStateAdapter:
 
 def _pg_timestamp_from_ms(ttl_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime ``ttl_ms`` milliseconds from now."""
-    return _dt.datetime.now(_dt.UTC) + _dt.timedelta(milliseconds=ttl_ms)
+    return _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(milliseconds=ttl_ms)
 
 
 def _pg_timestamp_from_epoch_ms(epoch_ms: int) -> _dt.datetime:
     """Return a timezone-aware datetime from an epoch-millisecond value."""
-    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.UTC)
+    return _dt.datetime.fromtimestamp(epoch_ms / 1000, tz=_dt.timezone.utc)
 
 
 # ---------------------------------------------------------------------------
