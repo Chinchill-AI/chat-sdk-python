@@ -5,11 +5,8 @@ Ported from packages/adapter-linear/src/cards.test.ts.
 
 from __future__ import annotations
 
-import pytest
-
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown, card_to_plain_text
 from chat_sdk.cards import Card, CardLink
-
 
 # ---------------------------------------------------------------------------
 # cardToLinearMarkdown

@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+
 from chat_sdk.testing import create_mock_adapter
 from chat_sdk.types import Message
 

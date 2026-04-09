@@ -27,7 +27,7 @@ import json
 import os
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -37,11 +37,9 @@ try:
         SlackAdapter,
         _find_next_mention,
     )
-    from chat_sdk.adapters.slack.crypto import decode_key, decrypt_token, encrypt_token
     from chat_sdk.adapters.slack.types import (
         SlackAdapterConfig,
         SlackInstallation,
-        SlackThreadId,
     )
     from chat_sdk.shared.errors import AuthenticationError, ValidationError
 
@@ -830,7 +828,7 @@ class TestEncryptionEdgeCases:
         await adapter.set_installation("T_PLAIN", SlackInstallation(bot_token="xoxb-plain", bot_user_id="U_PLAIN"))
         raw = state._cache.get("slack:installation:T_PLAIN")
         assert isinstance(raw, dict)
-        assert raw["bot_token"] == "xoxb-plain"
+        assert raw["botToken"] == "xoxb-plain"
 
 
 # ---------------------------------------------------------------------------

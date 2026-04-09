@@ -14,9 +14,8 @@ Tests:
 
 from __future__ import annotations
 
-import base64
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -37,7 +36,6 @@ from chat_sdk.types import (
     MessageMetadata,
     RawMessage,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,7 +105,7 @@ def _make_message(msg_id: str, thread_id: str, text: str = "hello") -> Message:
             is_me=False,
         ),
         metadata=MessageMetadata(
-            date_sent=datetime.now(timezone.utc),
+            date_sent=datetime.now(UTC),
         ),
         attachments=[],
     )
@@ -377,7 +375,7 @@ class TestTeamsOpenDM:
         # Mock the Bot Framework token acquisition
         adapter._get_access_token = AsyncMock(return_value="fake-bot-token")
 
-        # Build a mock aiohttp module with a mock ClientSession
+        # Build a mock session for the shared HTTP session
         mock_response = AsyncMock()
         mock_response.ok = True
         mock_response.json = AsyncMock(return_value={"id": "new-conv-id"})
@@ -389,15 +387,9 @@ class TestTeamsOpenDM:
         mock_session = MagicMock()
         mock_session.post = MagicMock(return_value=mock_post_ctx)
 
-        mock_session_ctx = MagicMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+        adapter._get_http_session = AsyncMock(return_value=mock_session)
 
-        mock_aiohttp = MagicMock()
-        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session_ctx)
-
-        with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
-            thread_id = await adapter.open_dm("user-123")
+        thread_id = await adapter.open_dm("user-123")
 
         # Verify the returned thread_id decodes correctly
         decoded = adapter.decode_thread_id(thread_id)
@@ -468,7 +460,7 @@ class TestLinearStream:
         async def dict_gen():
             yield {"type": "markdown_text", "text": "chunk"}
 
-        result = await adapter.stream("linear:issue-2", dict_gen())
+        await adapter.stream("linear:issue-2", dict_gen())
 
         adapter.post_message.assert_called_once()
         assert adapter.post_message.call_args.args[1]["raw"] == "chunk"

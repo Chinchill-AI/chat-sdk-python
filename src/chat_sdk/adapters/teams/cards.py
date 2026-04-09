@@ -188,13 +188,19 @@ def _convert_actions_to_elements(element: ActionsElement) -> dict[str, Any]:
 
 def _convert_button_to_action(button: ButtonElement) -> dict[str, Any]:
     """Convert a button to an Adaptive Card Action.Submit."""
+    data: dict[str, Any] = {
+        "actionId": button.get("id", ""),
+        "value": button.get("value"),
+    }
+
+    # Add task/fetch hint for dialog-opening buttons
+    if button.get("action_type") == "modal":
+        data["msteams"] = {"type": "task/fetch"}
+
     action: dict[str, Any] = {
         "type": "Action.Submit",
         "title": _convert_emoji(button.get("label", "")),
-        "data": {
-            "actionId": button.get("id", ""),
-            "value": button.get("value"),
-        },
+        "data": data,
     }
 
     style = _map_button_style(button.get("style"))

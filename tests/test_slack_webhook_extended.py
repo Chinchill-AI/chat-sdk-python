@@ -25,9 +25,7 @@ try:
     from chat_sdk.adapters.slack.types import (
         SlackAdapterConfig,
         SlackInstallation,
-        SlackThreadId,
     )
-    from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
 
     _SLACK_AVAILABLE = True
 except ImportError:
@@ -97,17 +95,17 @@ def _make_mock_state() -> MagicMock:
 
 def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
-    chat.process_message = AsyncMock()
+    chat.process_message = MagicMock()
     chat.handle_incoming_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     chat.process_modal_submit = AsyncMock()
     chat.process_modal_close = MagicMock()
-    chat.process_slash_command = AsyncMock()
-    chat.process_member_joined_channel = AsyncMock()
-    chat.process_assistant_thread_started = AsyncMock()
-    chat.process_assistant_thread_context_changed = AsyncMock()
-    chat.process_app_home_opened = AsyncMock()
+    chat.process_slash_command = MagicMock()
+    chat.process_member_joined_channel = MagicMock()
+    chat.process_assistant_thread_started = MagicMock()
+    chat.process_assistant_thread_context_changed = MagicMock()
+    chat.process_app_home_opened = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_user_name = MagicMock(return_value="test-bot")
     chat.get_logger = MagicMock(return_value=MagicMock())
@@ -143,7 +141,7 @@ class TestMultiWorkspaceEncryption:
         raw_value = state._cache.get("slack:installation:T_ENC_1")
         assert raw_value is not None
         # The stored value should contain encrypted token data (iv/data/tag)
-        raw_token = raw_value.get("bot_token") if isinstance(raw_value, dict) else None
+        raw_token = raw_value.get("botToken") if isinstance(raw_value, dict) else None
         if isinstance(raw_token, dict):
             assert "iv" in raw_token
             assert "data" in raw_token
@@ -290,10 +288,7 @@ class TestMultiWorkspaceWebhookResolution:
         response = await adapter.handle_webhook(req)
         assert response["status"] == 200
         resp_body = response.get("body", "")
-        if isinstance(resp_body, str):
-            parsed = json.loads(resp_body)
-        else:
-            parsed = resp_body
+        parsed = json.loads(resp_body) if isinstance(resp_body, str) else resp_body
         assert parsed == {"challenge": "challenge-multi-123"}
 
 

@@ -6,13 +6,11 @@ Ported from packages/adapter-discord/src/index.test.ts.
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chat_sdk.adapters.discord.adapter import (
-    CHANNEL_TYPE_PUBLIC_THREAD,
     DiscordAdapter,
     create_discord_adapter,
 )

@@ -14,11 +14,12 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from chat_sdk.testing import MockAdapter, create_mock_adapter
+
+from chat_sdk.testing import MockAdapter
 from chat_sdk.types import (
     Author,
     FetchOptions,
@@ -26,9 +27,6 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
 )
-
-from .conftest import create_chat
-
 
 # ---------------------------------------------------------------------------
 # Constants (match TS fetch-messages fixtures)
@@ -90,7 +88,6 @@ def _build_test_messages(
     Structure: Hey, Welcome(bot), FetchResults(bot), 1..14, Thanks(bot), Thanks(bot)
     """
     messages: list[Message] = []
-    ts_base = 1710000001
 
     # "Hey" human message
     messages.append(
@@ -108,7 +105,7 @@ def _build_test_messages(
                 is_me=False,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+                date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
                 edited=False,
             ),
             attachments=[],
@@ -132,7 +129,7 @@ def _build_test_messages(
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                date_sent=datetime(2024, 1, 15, 10, 30, 1, tzinfo=UTC),
                 edited=False,
             ),
             attachments=[],
@@ -156,7 +153,7 @@ def _build_test_messages(
                 is_me=True,
             ),
             metadata=MessageMetadata(
-                date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
+                date_sent=datetime(2024, 1, 15, 10, 30, 2, tzinfo=UTC),
                 edited=False,
             ),
             attachments=[],
@@ -181,7 +178,7 @@ def _build_test_messages(
                     is_me=False,
                 ),
                 metadata=MessageMetadata(
-                    date_sent=datetime(2024, 1, 15, 10, 30, 2 + i, tzinfo=timezone.utc),
+                    date_sent=datetime(2024, 1, 15, 10, 30, 2 + i, tzinfo=UTC),
                     edited=False,
                 ),
                 attachments=[],
@@ -206,7 +203,7 @@ def _build_test_messages(
                     is_me=True,
                 ),
                 metadata=MessageMetadata(
-                    date_sent=datetime(2024, 1, 15, 10, 30, 17 + j, tzinfo=timezone.utc),
+                    date_sent=datetime(2024, 1, 15, 10, 30, 17 + j, tzinfo=UTC),
                     edited=False,
                 ),
                 attachments=[],

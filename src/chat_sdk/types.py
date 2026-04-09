@@ -39,7 +39,9 @@ FormattedContent = dict[str, Any]
 
 LockScope = Literal["thread", "channel"]
 ConcurrencyStrategy = Literal["drop", "queue", "debounce", "concurrent"]
-OnLockConflict = Literal["drop", "force"] | Callable[..., Awaitable[bool] | bool]
+OnLockConflict = (
+    Literal["drop", "force"] | Callable[..., Awaitable[Literal["force", "drop"]] | Literal["force", "drop"]]
+)
 FetchDirection = Literal["forward", "backward"]
 
 # Well-known emoji names
@@ -362,25 +364,25 @@ class Message:
         (where those keys are optional, not ``null``).
         """
         metadata: dict[str, Any] = {
-            "date_sent": self.metadata.date_sent.isoformat(),
+            "dateSent": self.metadata.date_sent.isoformat(),
             "edited": self.metadata.edited,
         }
         if self.metadata.edited_at is not None:
-            metadata["edited_at"] = self.metadata.edited_at.isoformat()
+            metadata["editedAt"] = self.metadata.edited_at.isoformat()
 
         result: dict[str, Any] = {
             "_type": "chat:Message",
             "id": self.id,
-            "thread_id": self.thread_id,
+            "threadId": self.thread_id,
             "text": self.text,
             "formatted": self.formatted,
             "raw": self.raw,
             "author": {
-                "user_id": self.author.user_id,
-                "user_name": self.author.user_name,
-                "full_name": self.author.full_name,
-                "is_bot": self.author.is_bot,
-                "is_me": self.author.is_me,
+                "userId": self.author.user_id,
+                "userName": self.author.user_name,
+                "fullName": self.author.full_name,
+                "isBot": self.author.is_bot,
+                "isMe": self.author.is_me,
             },
             "metadata": metadata,
             "attachments": [
@@ -389,7 +391,7 @@ class Message:
                         "type": att.type,
                         "url": att.url,
                         "name": att.name,
-                        "mime_type": att.mime_type,
+                        "mimeType": att.mime_type,
                         "size": att.size,
                         "width": att.width,
                         "height": att.height,
@@ -399,7 +401,7 @@ class Message:
             ],
         }
         if self.is_mention is not None:
-            result["is_mention"] = self.is_mention
+            result["isMention"] = self.is_mention
         if self.links:
             result["links"] = [
                 _strip_none(
@@ -407,8 +409,8 @@ class Message:
                         "url": link.url,
                         "title": link.title,
                         "description": link.description,
-                        "image_url": link.image_url,
-                        "site_name": link.site_name,
+                        "imageUrl": link.image_url,
+                        "siteName": link.site_name,
                     }
                 )
                 for link in self.links
@@ -420,18 +422,19 @@ class Message:
         """Reconstruct a Message from serialized JSON data.
 
         Converts ISO date strings back to ``datetime`` objects.
-        Expects canonical snake_case keys. For TypeScript SDK interop
-        with camelCase keys, use :meth:`from_json_compat`.
+        Accepts both camelCase (canonical output of ``to_json()``) and
+        snake_case keys for backward compatibility.  For explicit
+        dual-format handling see :meth:`from_json_compat`.
         """
         meta = data.get("metadata", {})
 
-        date_sent_raw = meta.get("date_sent")
+        date_sent_raw = meta.get("dateSent") or meta.get("date_sent")
         date_sent = (
             datetime.fromisoformat(date_sent_raw)
             if isinstance(date_sent_raw, str)
             else (date_sent_raw if isinstance(date_sent_raw, datetime) else datetime.now())
         )
-        edited_at_raw = meta.get("edited_at")
+        edited_at_raw = meta.get("editedAt") or meta.get("edited_at")
         edited_at: datetime | None = (
             datetime.fromisoformat(edited_at_raw)
             if isinstance(edited_at_raw, str)
@@ -444,16 +447,16 @@ class Message:
 
         return cls(
             id=data.get("id", ""),
-            thread_id=data.get("thread_id", ""),
+            thread_id=data.get("threadId") or data.get("thread_id", ""),
             text=data.get("text", ""),
             formatted=data.get("formatted", {"type": "root", "children": []}),
             raw=data.get("raw"),
             author=Author(
-                user_id=author_data.get("user_id", ""),
-                user_name=author_data.get("user_name", ""),
-                full_name=author_data.get("full_name", ""),
-                is_bot=author_data.get("is_bot", False),
-                is_me=author_data.get("is_me", False),
+                user_id=author_data.get("userId") or author_data.get("user_id", ""),
+                user_name=author_data.get("userName") or author_data.get("user_name", ""),
+                full_name=author_data.get("fullName") or author_data.get("full_name", ""),
+                is_bot=author_data.get("isBot") if "isBot" in author_data else author_data.get("is_bot", False),
+                is_me=author_data.get("isMe") if "isMe" in author_data else author_data.get("is_me", False),
             ),
             metadata=MessageMetadata(
                 date_sent=date_sent,
@@ -465,21 +468,21 @@ class Message:
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mime_type"),
+                    mime_type=att.get("mimeType") or att.get("mime_type"),
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
                 )
                 for att in attachments_data
             ],
-            is_mention=data.get("is_mention"),
+            is_mention=data.get("isMention") if "isMention" in data else data.get("is_mention"),
             links=[
                 LinkPreview(
                     url=lp.get("url", ""),
                     title=lp.get("title"),
                     description=lp.get("description"),
-                    image_url=lp.get("image_url"),
-                    site_name=lp.get("site_name"),
+                    image_url=lp.get("imageUrl") or lp.get("image_url"),
+                    site_name=lp.get("siteName") or lp.get("site_name"),
                 )
                 for lp in links_data
             ]
@@ -917,7 +920,7 @@ class ReactionEvent:
     """Reaction event data."""
 
     adapter: Adapter
-    thread: Any  # Thread
+    thread: Thread
     thread_id: str
     message_id: str
     user: Author
@@ -933,7 +936,7 @@ class ActionEvent:
     """Button click/action event data."""
 
     adapter: Adapter
-    thread: Any  # Thread | None
+    thread: Thread | None
     thread_id: str
     message_id: str
     user: Author
@@ -994,7 +997,7 @@ class SlashCommandEvent:
     """Slash command event data."""
 
     adapter: Adapter
-    channel: Any  # Channel
+    channel: Channel
     user: Author
     command: str
     text: str
@@ -1257,12 +1260,22 @@ class ChatConfig:
     adapters: dict[str, Adapter]
     state: StateAdapter
     user_name: str
+    # How to handle concurrent messages to the same thread/channel.
+    # Pass a strategy name ("drop", "queue", "debounce", "concurrent")
+    # or a full ConcurrencyConfig for fine-grained control.
     concurrency: ConcurrencyStrategy | ConcurrencyConfig | None = None
+    # Milliseconds to remember a message ID for deduplication (default 5 min).
     dedupe_ttl_ms: int = 300000
     fallback_streaming_placeholder_text: str | None = "..."
+    # Whether locks are scoped per-thread or per-channel.
+    # Can also be a callable that inspects context and returns the scope.
     lock_scope: LockScope | Callable[..., LockScope | Awaitable[LockScope]] | None = None
     logger: Logger | LogLevel | None = None
+    # Configuration dict forwarded to MessageHistoryCache
+    # (e.g. {"max_messages": 50, "persist": True}).
     message_history: dict[str, Any] | None = None
+    # What to do when a lock is already held: "drop" the new message,
+    # "force" acquire, or a callable that decides at runtime.
     on_lock_conflict: OnLockConflict | None = None
     streaming_update_interval_ms: int = 500
 

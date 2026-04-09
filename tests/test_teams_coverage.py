@@ -70,9 +70,9 @@ def _make_logger():
 def _make_mock_state() -> MagicMock:
     cache: dict[str, Any] = {}
     state = MagicMock()
-    state.get = MagicMock(side_effect=lambda k: cache.get(k))
+    state.get = AsyncMock(side_effect=lambda k: cache.get(k))
     state.set = AsyncMock(side_effect=lambda k, v, *a, **kw: cache.__setitem__(k, v))
-    state.delete = MagicMock(side_effect=lambda k: cache.pop(k, None))
+    state.delete = AsyncMock(side_effect=lambda k: cache.pop(k, None))
     state._cache = cache
     return state
 
@@ -100,6 +100,8 @@ def _mock_aiohttp_response(data: Any, status: int = 200) -> MagicMock:
 
 class _MockSession:
     """A mock aiohttp.ClientSession supporting nested context manager patterns."""
+
+    closed = False
 
     def __init__(self, responses: dict[str, MagicMock] | None = None, default_response: MagicMock | None = None):
         self._responses = responses or {}
@@ -135,6 +137,9 @@ class _MockSession:
         resp = self._responses.get(url, self._default)
         return self._make_cm(resp)
 
+    async def close(self):
+        self.closed = True
+
     async def __aenter__(self):
         return self
 
@@ -149,29 +154,23 @@ class _MockSession:
 
 class TestValidateServiceUrl:
     def test_allowed_trafficmanager(self):
-        # No assertion needed -- tests that validation does not raise for allowed URL
-        _validate_service_url("https://smba.trafficmanager.net/teams/")
-        assert True
+        # Validation completes without raising for an allowed URL
+        _validate_service_url("https://smba.trafficmanager.net/teams/")  # no exception = pass
 
     def test_allowed_botframework_com(self):
-        _validate_service_url("https://some-host.botframework.com/")
-        assert True
+        _validate_service_url("https://some-host.botframework.com/")  # no exception = pass
 
     def test_allowed_botframework_us(self):
-        _validate_service_url("https://some-host.botframework.us/")
-        assert True
+        _validate_service_url("https://some-host.botframework.us/")  # no exception = pass
 
     def test_allowed_teams_microsoft_com(self):
-        _validate_service_url("https://api.teams.microsoft.com/")
-        assert True
+        _validate_service_url("https://api.teams.microsoft.com/")  # no exception = pass
 
     def test_allowed_teams_microsoft_us(self):
-        _validate_service_url("https://api.teams.microsoft.us/")
-        assert True
+        _validate_service_url("https://api.teams.microsoft.us/")  # no exception = pass
 
     def test_allowed_gcc_infra(self):
-        _validate_service_url("https://smba.infra.gcc.teams.microsoft.com/")
-        assert True
+        _validate_service_url("https://smba.infra.gcc.teams.microsoft.com/")  # no exception = pass
 
     def test_disallowed_url_raises(self):
         with pytest.raises(ValidationError):
@@ -542,10 +541,9 @@ class TestCacheUserContext:
             "from": {"id": "user-42"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
-        # No assertion needed -- tests that _cache_user_context completes without
-        # raising when adapter is not initialized (_chat is None)
-        await adapter._cache_user_context(activity)
-        assert True
+        # Should complete without raising when adapter is not initialized (_chat is None)
+        result = await adapter._cache_user_context(activity)
+        assert result is None
 
     async def test_no_op_without_from_id(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -755,9 +753,9 @@ class TestTeamsHTTPOperations:
                 service_url="https://smba.trafficmanager.net/teams/",
             )
         )
-        # No assertion needed -- tests that typing failure is swallowed (not re-raised)
-        await adapter.start_typing(tid)
-        assert True
+        # Typing failure should be swallowed (not re-raised)
+        result = await adapter.start_typing(tid)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -804,9 +802,8 @@ class TestTeamsHTTPHelpers:
 
     async def test_disconnect_is_noop(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests that disconnect completes without raising
-        await adapter.disconnect()
-        assert True
+        result = await adapter.disconnect()
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +933,7 @@ class TestHandleTeamsError:
 
     def test_403_status(self):
         from chat_sdk.adapters.teams.adapter import _handle_teams_error
-        from chat_sdk.shared.errors import PermissionError as APE
+        from chat_sdk.shared.errors import AdapterPermissionError as APE
 
         with pytest.raises(APE):
             _handle_teams_error({"statusCode": 403}, "post")
@@ -956,7 +953,7 @@ class TestHandleTeamsError:
 
     def test_permission_keyword_in_message(self):
         from chat_sdk.adapters.teams.adapter import _handle_teams_error
-        from chat_sdk.shared.errors import PermissionError as APE
+        from chat_sdk.shared.errors import AdapterPermissionError as APE
 
         with pytest.raises(APE):
             _handle_teams_error({"message": "You do not have permission"}, "op")
@@ -994,28 +991,27 @@ class TestTeamsProperties:
 class TestHandleActivityEarlyReturns:
     async def test_handle_message_activity_no_chat(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests that _handle_message_activity returns early
-        # without raising when _chat is None (not initialized)
-        await adapter._handle_message_activity({"text": "hi"})
-        assert True
+        # _chat is None (not initialized) -- should return early without raising
+        result = await adapter._handle_message_activity({"text": "hi"})
+        assert result is None
 
     def test_handle_reaction_activity_no_chat(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests early return without raising when _chat is None
-        adapter._handle_reaction_activity({"reactionsAdded": [{"type": "like"}]})
-        assert True
+        # _chat is None -- should return early without raising
+        result = adapter._handle_reaction_activity({"reactionsAdded": [{"type": "like"}]})
+        assert result is None
 
     async def test_handle_adaptive_card_action_no_chat(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests early return without raising when _chat is None
-        await adapter._handle_adaptive_card_action({}, {"actionId": "a"})
-        assert True
+        # _chat is None -- should return early without raising
+        result = await adapter._handle_adaptive_card_action({}, {"actionId": "a"})
+        assert result is None
 
     def test_handle_message_action_no_chat(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests early return without raising when _chat is None
-        adapter._handle_message_action({}, {"actionId": "a"})
-        assert True
+        # _chat is None -- should return early without raising
+        result = adapter._handle_message_action({}, {"actionId": "a"})
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -1216,8 +1212,8 @@ class TestGetHeader:
             headers = {"Authorization": "Bearer token"}
 
         result = adapter._get_header(FakeReq(), "authorization")
-        # dict.get with title-case fallback
-        assert result is not None
+        # dict.get falls back to title-case key "Authorization"
+        assert result == "Bearer token"
 
     def test_no_headers_attribute(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -1490,11 +1486,13 @@ class TestFetchMessagesAdvanced:
 class TestCertificateConfig:
     def test_certificate_raises_validation_error(self):
         with pytest.raises(ValidationError, match="Certificate"):
-            TeamsAdapter(TeamsAdapterConfig(
-                app_id="test",
-                app_password="test",
-                certificate={"thumbprint": "abc", "private_key": "key"},
-            ))
+            TeamsAdapter(
+                TeamsAdapterConfig(
+                    app_id="test",
+                    app_password="test",
+                    certificate={"thumbprint": "abc", "private_key": "key"},
+                )
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1583,9 +1581,7 @@ class TestGetChannelContext:
     async def test_valid_context_from_cache(self):
         adapter = _make_adapter(logger=_make_logger())
         state = _make_mock_state()
-        state._cache["teams:channelContext:19:abc"] = json.dumps(
-            {"team_id": "t1", "channel_id": "c1"}
-        )
+        state._cache["teams:channelContext:19:abc"] = json.dumps({"team_id": "t1", "channel_id": "c1"})
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
         result = await adapter._get_channel_context("19:abc")
@@ -1692,7 +1688,7 @@ class TestPostMessageCardError:
 
 class TestFetchMessages403:
     async def test_fetch_messages_403_raises_permission_error(self):
-        from chat_sdk.shared.errors import PermissionError as APE
+        from chat_sdk.shared.errors import AdapterPermissionError as APE
 
         adapter = _make_adapter(logger=_make_logger())
         state = _make_mock_state()

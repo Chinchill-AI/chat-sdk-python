@@ -34,8 +34,7 @@ discord = ["pynacl>=1.5", "aiohttp>=3.9"]
 teams = ["aiohttp>=3.9"]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
-google-chat = ["aiohttp>=3.9",
-    "pyjwt[crypto]>=2.8", "google-auth>=2.0", "pyjwt>=2.8"]
+google-chat = ["aiohttp>=3.9", "pyjwt[crypto]>=2.8", "google-auth>=2.0"]
 linear = ["aiohttp>=3.9"]
 all = [
     "slack-sdk>=3.27.0",
@@ -45,7 +44,6 @@ all = [
     "cryptography>=42.0",
     "pynacl>=1.5",
     "aiohttp>=3.9",
-    "pyjwt[crypto]>=2.8",
     "google-auth>=2.0",
 ]
 

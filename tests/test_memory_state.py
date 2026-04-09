@@ -8,6 +8,8 @@ from __future__ import annotations
 import time
 
 import pytest
+
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.types import Lock, QueueEntry
 
@@ -29,7 +31,7 @@ class TestMemoryStateLifecycle:
 
         await state.disconnect()
         # After disconnect, operations should fail
-        with pytest.raises(RuntimeError, match="not connected"):
+        with pytest.raises(StateNotConnectedError, match="not connected"):
             await state.get("key")
 
     @pytest.mark.asyncio
@@ -42,23 +44,23 @@ class TestMemoryStateLifecycle:
         await state.disconnect()
 
     @pytest.mark.asyncio
-    async def test_disconnect_clears_all_state(self):
+    async def test_disconnect_clears_subscriptions_locks_queues_not_cache(self):
         state = MemoryStateAdapter()
         await state.connect()
         await state.set("key", "value")
         await state.subscribe("thread-1")
         await state.disconnect()
 
-        # Reconnect and verify everything is cleared
+        # Reconnect and verify subscriptions/locks/queues are cleared but cache persists
         await state.connect()
-        assert await state.get("key") is None
+        assert await state.get("key") == "value"
         assert await state.is_subscribed("thread-1") is False
         await state.disconnect()
 
     @pytest.mark.asyncio
     async def test_operations_fail_before_connect(self):
         state = MemoryStateAdapter()
-        with pytest.raises(RuntimeError, match="not connected"):
+        with pytest.raises(StateNotConnectedError, match="not connected"):
             await state.get("key")
 
 
@@ -107,9 +109,8 @@ class TestMemoryStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_key_is_noop(self, memory_state: MemoryStateAdapter):
-        # No assertion needed -- tests that deleting a nonexistent key does not raise
         await memory_state.delete("nonexistent")
-        assert True
+        assert await memory_state.get("nonexistent") is None
 
     @pytest.mark.asyncio
     async def test_set_if_not_exists_when_key_missing(self, memory_state: MemoryStateAdapter):
@@ -194,6 +195,9 @@ class TestMemoryStateLocks:
 
         lock2 = await memory_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != ""
+        assert lock2.token != lock1.token  # New lock should have a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock(self, memory_state: MemoryStateAdapter):
@@ -205,6 +209,8 @@ class TestMemoryStateLocks:
         # Should be able to acquire again
         lock2 = await memory_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock_with_wrong_token_is_noop(self, memory_state: MemoryStateAdapter):
@@ -260,12 +266,16 @@ class TestMemoryStateLocks:
         # Should be able to acquire again
         lock2 = await memory_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after force release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_lock_is_noop(self, memory_state: MemoryStateAdapter):
-        # No assertion needed -- tests that releasing a nonexistent lock does not raise
         await memory_state.force_release_lock("nonexistent")
-        assert True
+        # Can still acquire a lock on the same thread after force-releasing a nonexistent one
+        lock = await memory_state.acquire_lock("nonexistent", 5000)
+        assert lock is not None
+        assert lock.thread_id == "nonexistent"
 
     @pytest.mark.asyncio
     async def test_different_threads_get_independent_locks(self, memory_state: MemoryStateAdapter):
@@ -432,9 +442,8 @@ class TestMemoryStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, memory_state: MemoryStateAdapter):
-        # No assertion needed -- tests that unsubscribing a nonexistent key does not raise
         await memory_state.unsubscribe("nonexistent")
-        assert True
+        assert await memory_state.is_subscribed("nonexistent") is False
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, memory_state: MemoryStateAdapter):

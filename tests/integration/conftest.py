@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+
 from chat_sdk.chat import Chat
+from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.testing import (
     MockAdapter,
     MockLogger,
@@ -23,7 +25,6 @@ from chat_sdk.testing import (
     create_mock_state,
     create_test_message,
 )
-from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.types import (
     Author,
     ChatConfig,

@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
 from chat_sdk.adapters.google_chat.adapter import (
     GoogleChatAdapter,
 )
@@ -153,9 +154,9 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_logger = MagicMock(return_value=MagicMock())
-    chat.process_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_message = MagicMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     return chat
 
 

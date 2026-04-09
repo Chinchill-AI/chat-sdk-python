@@ -16,9 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chat_sdk.adapters.github.adapter import GitHubAdapter
-from chat_sdk.adapters.github.types import GitHubThreadId
 from chat_sdk.logger import ConsoleLogger
-
 
 # =============================================================================
 # Helpers

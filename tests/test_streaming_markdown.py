@@ -10,6 +10,7 @@ import re
 from chat_sdk.shared.streaming_markdown import (
     TABLE_ROW_RE,
     StreamingMarkdownRenderer,
+    _is_inside_code_fence,
     _remend,
 )
 
@@ -849,27 +850,20 @@ class TestExhaustivePrefixInvariants:
         # All original content must be recoverable from get_text()
         assert r.get_text() == self.COMPLEX_MARKDOWN
 
-
-
-class TestMissingAbsorbers:
-    """Fidelity-check absorbers for TS test names with different Python names."""
-
-    # No assertion needed -- fidelity-check absorbers for verify_test_fidelity.py
-    def test_getcommittabletext_is_always_clean_remend_would_not_add_markers(self): assert True
-    def test_n(self): assert True
-
-
-class TestNewlineAbsorbers:
-    """Extra absorbers for false-positive it("\\n") match."""
-
-    # No assertion needed -- fidelity-check absorbers for false-positive TS it("\\n") extraction
-    def test_n_absorber_a(self): assert True
-    def test_n_absorber_b(self): assert True
-    def test_n_absorber_c(self): assert True
-    def test_n_absorber_d(self): assert True
-    def test_n_absorber_e(self): assert True
-    def test_n_absorber_f(self): assert True
-    def test_n_absorber_g(self): assert True
-    def test_n_absorber_h(self): assert True
-    def test_n_absorber_i(self): assert True
-    def test_n_absorber_j(self): assert True
+    # TS: "getCommittableText() is always clean (remend would not add markers)"
+    def test_getcommittabletext_is_always_clean_remend_would_not_add_markers(self):
+        """get_committable_text() should never contain unclosed markers that remend would fix."""
+        r = StreamingMarkdownRenderer()
+        for i in range(len(self.COMPLEX_MARKDOWN)):
+            r.push(self.COMPLEX_MARKDOWN[i])
+            committable = r.get_committable_text()
+            if len(committable) == 0:
+                continue
+            # Skip check if we're inside a code fence (markers are literal there)
+            if _is_inside_code_fence(committable):
+                continue
+            assert len(_remend(committable)) <= len(committable), (
+                f"get_committable_text() at position {i} "
+                f'("{self.COMPLEX_MARKDOWN[: i + 1][-20:]}") has unclosed markers: '
+                f'"{committable[-40:]}"'
+            )

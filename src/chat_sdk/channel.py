@@ -356,13 +356,16 @@ class ChannelImpl:
     # -- Serialization -------------------------------------------------------
 
     def to_json(self) -> dict[str, Any]:
-        """Serialize to a plain dict for external systems."""
+        """Serialize to a plain dict for external systems.
+
+        Output uses camelCase keys to match the TypeScript SDK.
+        """
         return {
             "_type": "chat:Channel",
             "id": self._id,
-            "adapter_name": self.adapter.name,
-            "channel_visibility": self._channel_visibility,
-            "is_dm": self._is_dm,
+            "adapterName": self.adapter.name,
+            "channelVisibility": self._channel_visibility,
+            "isDM": self._is_dm,
         }
 
     @classmethod
@@ -371,18 +374,35 @@ class ChannelImpl:
         data: dict[str, Any],
         adapter: Adapter | None = None,
     ) -> ChannelImpl:
-        """Reconstruct a ChannelImpl from serialized JSON data."""
+        """Reconstruct a ChannelImpl from serialized JSON data.
+
+        Accepts both camelCase (canonical output of ``to_json()``) and
+        snake_case keys for backward compatibility.
+        """
         channel = cls(
             _ChannelImplConfigLazy(
                 id=data["id"],
-                adapter_name=data.get("adapter_name", ""),
-                channel_visibility=data.get("channel_visibility", "unknown"),
-                is_dm=data.get("is_dm", False),
+                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
+                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
+                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
             )
         )
         if adapter is not None:
             channel._adapter = adapter
         return channel
+
+    @classmethod
+    def from_json_compat(
+        cls,
+        data: dict[str, Any],
+        adapter: Adapter | None = None,
+    ) -> ChannelImpl:
+        """Reconstruct a ChannelImpl from serialized JSON data with TS interop.
+
+        Like :meth:`from_json` but explicitly accepts both camelCase and
+        snake_case keys for cross-SDK compatibility.
+        """
+        return cls.from_json(data, adapter=adapter)
 
     # -- SentMessage construction --------------------------------------------
 

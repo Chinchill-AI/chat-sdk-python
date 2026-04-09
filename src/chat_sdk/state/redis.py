@@ -16,6 +16,7 @@ import secrets
 import time
 from typing import Any
 
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.types import Lock, QueueEntry
 
 _logger = logging.getLogger(__name__)
@@ -337,7 +338,7 @@ class RedisStateAdapter:
 
     def _ensure_connected(self) -> None:
         if not self._connected:
-            raise RuntimeError("RedisStateAdapter is not connected. Call connect() first.")
+            raise StateNotConnectedError("RedisStateAdapter")
 
 
 # ---------------------------------------------------------------------------

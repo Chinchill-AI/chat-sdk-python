@@ -161,6 +161,84 @@ The `asyncio_mode = "auto"` setting means all `async def test_*` functions are a
        assert result.status == 401
    ```
 
+## Test Quality Invariants
+
+Rules learned from past bugs in the TS→Python port process:
+
+### 1. Name match ≠ faithful port
+
+The fidelity script (`scripts/verify_test_fidelity.py`) only checks that a matching
+`def test_*` exists for each TS `it("...")`. It does **not** check assertion quality.
+A test with `assert True` satisfies the fidelity checker but tests nothing.
+
+**Rule:** After porting, every test MUST have real assertions. The only acceptable
+`assert True` tests are JSX-specific ones that have no Python equivalent (currently 3).
+
+### 2. Never use `MagicMock` for async methods
+
+If the real method is `async def`, the mock **must** be `AsyncMock`. `MagicMock`
+returns a truthy Mock object instead of a coroutine. This hides missing `await` in
+production code — the test passes, but production silently gets coroutine objects
+instead of values.
+
+**Example of the bug we found:**
+```python
+# BAD — state.get is async, MagicMock returns Mock not coroutine
+state.get = MagicMock(side_effect=lambda k: cache.get(k))
+
+# GOOD
+state.get = AsyncMock(side_effect=lambda k: cache.get(k))
+```
+
+### 3. Check for duplicates before adding tests
+
+When agents work in parallel on overlapping scopes, they may write the same test
+in different files. Before committing new test files, scan for identical test names
+and bodies across the suite:
+
+```bash
+# Quick check for cross-file exact duplicates
+uv run python -c "
+import ast, os, collections
+bodies = collections.defaultdict(list)
+for root, _, files in os.walk('tests'):
+    for f in sorted(files):
+        if not f.startswith('test_') or not f.endswith('.py'): continue
+        path = os.path.join(root, f)
+        src = open(path).read()
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)): continue
+            if not node.name.startswith('test_'): continue
+            body = '\n'.join(src.split('\n')[node.lineno-1:node.end_lineno]).strip()
+            if len(body) > 50: bodies[body].append(f'{path}:{node.lineno} {node.name}')
+for body, locs in bodies.items():
+    files = set(l.split(':')[0] for l in locs)
+    if len(files) > 1:
+        print(f'DUPLICATE: {locs[0].split(\" \")[1]}')
+        for l in locs: print(f'  {l}')
+"
+```
+
+### 4. Phantom absorber audit
+
+After any test changes, run this to catch `assert True`-only tests:
+
+```bash
+uv run python -c "
+import ast, os
+for root, _, files in os.walk('tests'):
+    for f in sorted(files):
+        if not f.startswith('test_') or not f.endswith('.py'): continue
+        path = os.path.join(root, f)
+        for node in ast.walk(ast.parse(open(path).read())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)): continue
+            if not node.name.startswith('test_'): continue
+            stmts = [s for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+            if len(stmts) == 1 and isinstance(stmts[0], ast.Assert) and isinstance(stmts[0].test, ast.Constant) and stmts[0].test.value is True:
+                print(f'PHANTOM: {path}:{node.lineno} {node.name}')
+"
+```
+
 ## Known Coverage Gaps
 
 The following modules are under 60% coverage as of the initial alpha release. These are tracked for improvement:

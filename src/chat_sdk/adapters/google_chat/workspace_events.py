@@ -118,6 +118,7 @@ WorkspaceEventsAuthOptions = WorkspaceEventsAuthCredentials | WorkspaceEventsAut
 async def create_space_subscription(
     options: CreateSpaceSubscriptionOptions,
     auth: WorkspaceEventsAuthOptions,
+    http_session: Any | None = None,
 ) -> SpaceSubscriptionResult:
     """Create a Workspace Events subscription to receive all messages in a Chat space.
 
@@ -141,7 +142,6 @@ async def create_space_subscription(
             ),
         )
     """
-    import aiohttp
 
     access_token = await _get_access_token(
         auth,
@@ -149,6 +149,7 @@ async def create_space_subscription(
             "https://www.googleapis.com/auth/chat.spaces.readonly",
             "https://www.googleapis.com/auth/chat.messages.readonly",
         ],
+        http_session=http_session,
     )
 
     space_name = options.space_name
@@ -174,19 +175,21 @@ async def create_space_subscription(
 
     url = "https://workspaceevents.googleapis.com/v1/subscriptions"
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(
+    session = http_session or await _make_session()
+    try:
+        async with session.post(
             url,
             json=request_body,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
             },
-        ) as response,
-    ):
-        response.raise_for_status()
-        operation = await response.json()
+        ) as response:
+            response.raise_for_status()
+            operation = await response.json()
+    finally:
+        if not http_session:
+            await session.close()
 
     # The create operation returns a long-running operation
     if operation.get("done") and operation.get("response"):
@@ -206,31 +209,33 @@ async def create_space_subscription(
 async def list_space_subscriptions(
     space_name: str,
     auth: WorkspaceEventsAuthOptions,
+    http_session: Any | None = None,
 ) -> list[dict[str, Any]]:
     """List active subscriptions for a target resource."""
-    import aiohttp
-
     access_token = await _get_access_token(
         auth,
         scopes=[
             "https://www.googleapis.com/auth/chat.spaces.readonly",
         ],
+        http_session=http_session,
     )
 
     target_resource = f"//chat.googleapis.com/{space_name}"
     url = f'https://workspaceevents.googleapis.com/v1/subscriptions?filter=target_resource="{target_resource}"'
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.get(
+    session = http_session or await _make_session()
+    try:
+        async with session.get(
             url,
             headers={
                 "Authorization": f"Bearer {access_token}",
             },
-        ) as response,
-    ):
-        response.raise_for_status()
-        data = await response.json()
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+    finally:
+        if not http_session:
+            await session.close()
 
     return [
         {
@@ -245,29 +250,31 @@ async def list_space_subscriptions(
 async def delete_space_subscription(
     subscription_name: str,
     auth: WorkspaceEventsAuthOptions,
+    http_session: Any | None = None,
 ) -> None:
     """Delete a Workspace Events subscription."""
-    import aiohttp
-
     access_token = await _get_access_token(
         auth,
         scopes=[
             "https://www.googleapis.com/auth/chat.spaces.readonly",
         ],
+        http_session=http_session,
     )
 
     url = f"https://workspaceevents.googleapis.com/v1/{subscription_name}"
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.delete(
+    session = http_session or await _make_session()
+    try:
+        async with session.delete(
             url,
             headers={
                 "Authorization": f"Bearer {access_token}",
             },
-        ) as response,
-    ):
-        response.raise_for_status()
+        ) as response:
+            response.raise_for_status()
+    finally:
+        if not http_session:
+            await session.close()
 
 
 def decode_pub_sub_message(
@@ -312,18 +319,26 @@ def decode_pub_sub_message(
 # =============================================================================
 
 
+async def _make_session() -> Any:
+    """Create a new aiohttp.ClientSession (used when no shared session is provided)."""
+    import aiohttp
+
+    return aiohttp.ClientSession()
+
+
 async def _get_access_token(
     auth: WorkspaceEventsAuthOptions,
     scopes: list[str],
+    http_session: Any | None = None,
 ) -> str:
     """Get an access token for Google API calls.
 
     Supports service account credentials and ADC.
     """
     if isinstance(auth, WorkspaceEventsAuthCredentials):
-        return await _get_service_account_token(auth.credentials, scopes, auth.impersonate_user)
+        return await _get_service_account_token(auth.credentials, scopes, auth.impersonate_user, http_session)
     elif isinstance(auth, WorkspaceEventsAuthADC):
-        return await _get_adc_token(scopes)
+        return await _get_adc_token(scopes, http_session)
     elif isinstance(auth, dict) and "auth" in auth:
         # Custom auth - assume it provides a token directly
         custom_auth = auth["auth"]
@@ -338,11 +353,10 @@ async def _get_service_account_token(
     credentials: ServiceAccountCredentials,
     scopes: list[str],
     impersonate_user: str | None = None,
+    http_session: Any | None = None,
 ) -> str:
     """Get an access token using service account credentials (JWT flow)."""
     import time
-
-    import aiohttp
 
     # Lazy import for jwt
     import jwt as pyjwt
@@ -365,22 +379,24 @@ async def _get_service_account_token(
         algorithm="RS256",
     )
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(
+    session = http_session or await _make_session()
+    try:
+        async with session.post(
             "https://oauth2.googleapis.com/token",
             data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                 "assertion": token,
             },
-        ) as response,
-    ):
-        response.raise_for_status()
-        data = await response.json()
-        return data["access_token"]
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data["access_token"]
+    finally:
+        if not http_session:
+            await session.close()
 
 
-async def _get_adc_token(scopes: list[str]) -> str:
+async def _get_adc_token(scopes: list[str], http_session: Any | None = None) -> str:
     """Get an access token using Application Default Credentials.
 
     Uses google-auth library if available, otherwise falls back
@@ -398,17 +414,17 @@ async def _get_adc_token(scopes: list[str]) -> str:
         pass
 
     # Fallback: metadata server (GCE, Cloud Run, etc.)
-    import aiohttp
-
     url = f"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes={','.join(scopes)}"
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.get(
+    session = http_session or await _make_session()
+    try:
+        async with session.get(
             url,
             headers={"Metadata-Flavor": "Google"},
-        ) as response,
-    ):
-        response.raise_for_status()
-        data = await response.json()
-        return data["access_token"]
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data["access_token"]
+    finally:
+        if not http_session:
+            await session.close()

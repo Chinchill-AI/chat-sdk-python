@@ -3,7 +3,6 @@
 Run: python tests/fixtures/copy_fixtures.py
 """
 
-import json
 import os
 import shutil
 import sys

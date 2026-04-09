@@ -75,7 +75,7 @@ These are intentionally different from TS:
 
 These exist only in the Python port and have no TS equivalent:
 
-- `shared/errors.py`: Typed adapter error hierarchy (`AdapterRateLimitError`, `AuthenticationError`, `ValidationError`, `NetworkError`, `ResourceNotFoundError`, `PermissionError`). TS throws plain `Error` objects.
+- `shared/errors.py`: Typed adapter error hierarchy (`AdapterRateLimitError`, `AuthenticationError`, `ValidationError`, `NetworkError`, `ResourceNotFoundError`, `AdapterPermissionError`). TS throws plain `Error` objects.
 - `testing/__init__.py` + `shared/mock_adapter.py`: Test utilities with `MockAdapter`, `MockStateAdapter`, `create_test_message()`.
 - `from __future__ import annotations` everywhere: Enables PEP 604 union syntax (`X | Y`) on Python 3.10.
 - Input validation on adapter config dataclasses (e.g., rejecting empty `signing_secret`).

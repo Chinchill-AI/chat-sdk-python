@@ -90,6 +90,16 @@ from chat_sdk.types import (
     WebhookOptions,
 )
 
+# Strong-reference set for fire-and-forget tasks to prevent GC collection.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _pin_task(task: asyncio.Task[Any]) -> None:
+    """Pin a fire-and-forget task so the GC doesn't collect it."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -201,7 +211,7 @@ class SlackAdapter:
 
         # Cache of AsyncWebClient instances keyed by bot token (LRU-bounded)
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
-        self._client_cache_max = config.client_cache_max or 100
+        self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
 
         # Multi-workspace OAuth fields
         self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
@@ -346,19 +356,19 @@ class SlackAdapter:
         if self._encryption_key:
             encrypted = encrypt_token(installation.bot_token, self._encryption_key)
             data_to_store: dict[str, Any] = {
-                "bot_token": {
+                "botToken": {
                     "iv": encrypted.iv,
                     "data": encrypted.data,
                     "tag": encrypted.tag,
                 },
-                "bot_user_id": installation.bot_user_id,
-                "team_name": installation.team_name,
+                "botUserId": installation.bot_user_id,
+                "teamName": installation.team_name,
             }
         else:
             data_to_store = {
-                "bot_token": installation.bot_token,
-                "bot_user_id": installation.bot_user_id,
-                "team_name": installation.team_name,
+                "botToken": installation.bot_token,
+                "botUserId": installation.bot_user_id,
+                "teamName": installation.team_name,
             }
 
         await state.set(key, data_to_store)
@@ -382,7 +392,9 @@ class SlackAdapter:
         if not stored:
             return None
 
-        bot_token_raw = stored.get("bot_token") if isinstance(stored, dict) else None
+        bot_token_raw = (stored.get("botToken") or stored.get("bot_token")) if isinstance(stored, dict) else None
+        bot_user_id = (stored.get("botUserId") or stored.get("bot_user_id") or "") if isinstance(stored, dict) else ""
+        team_name = (stored.get("teamName") or stored.get("team_name") or "") if isinstance(stored, dict) else ""
         if self._encryption_key and is_encrypted_token_data(bot_token_raw):
             decrypted = decrypt_token(
                 EncryptedTokenData(
@@ -394,14 +406,14 @@ class SlackAdapter:
             )
             return SlackInstallation(
                 bot_token=decrypted,
-                bot_user_id=stored.get("bot_user_id"),
-                team_name=stored.get("team_name"),
+                bot_user_id=bot_user_id,
+                team_name=team_name,
             )
 
         return SlackInstallation(
             bot_token=bot_token_raw if isinstance(bot_token_raw, str) else "",
-            bot_user_id=stored.get("bot_user_id") if isinstance(stored, dict) else None,
-            team_name=stored.get("team_name") if isinstance(stored, dict) else None,
+            bot_user_id=bot_user_id,
+            team_name=team_name,
         )
 
     async def handle_oauth_callback(self, request: Any) -> dict[str, Any]:
@@ -1248,7 +1260,9 @@ class SlackAdapter:
         if user_id:
             try:
                 # Fire and forget cache invalidation
-                asyncio.get_running_loop().create_task(self._chat.get_state().delete(f"slack:user:{user_id}"))
+                _pin_task(
+                    asyncio.get_running_loop().create_task(self._chat.get_state().delete(f"slack:user:{user_id}"))
+                )
             except RuntimeError:
                 pass  # No running event loop
             except Exception as exc:
@@ -2345,7 +2359,7 @@ class SlackAdapter:
         channel = decoded.channel
         thread_ts = decoded.thread_ts
         direction = getattr(opts, "direction", "backward") or "backward"
-        limit = getattr(opts, "limit", 100) or 100
+        limit = getattr(opts, "limit", 100) if getattr(opts, "limit", 100) is not None else 100
 
         try:
             if direction == "forward":
@@ -2472,7 +2486,7 @@ class SlackAdapter:
 
         opts = options or FetchOptions()
         direction = getattr(opts, "direction", "backward") or "backward"
-        limit = getattr(opts, "limit", 100) or 100
+        limit = getattr(opts, "limit", 100) if getattr(opts, "limit", 100) is not None else 100
 
         try:
             if direction == "forward":
@@ -2548,7 +2562,7 @@ class SlackAdapter:
             raise ValidationError("slack", f"Invalid Slack channel ID: {channel_id}")
 
         opts = options or ListThreadsOptions()
-        limit = getattr(opts, "limit", 50) or 50
+        limit = getattr(opts, "limit", 50) if getattr(opts, "limit", 50) is not None else 50
 
         try:
             client = self._get_client()
@@ -2716,7 +2730,13 @@ class SlackAdapter:
                 retry_after = resp.headers.get("Retry-After")
             elif isinstance(resp, dict):
                 retry_after = resp.get("headers", {}).get("Retry-After")
-            raise AdapterRateLimitError("slack", int(retry_after) if retry_after else None) from error
+            retry_val = None
+            if retry_after:
+                try:
+                    retry_val = int(retry_after)
+                except (ValueError, TypeError):
+                    retry_val = None
+            raise AdapterRateLimitError("slack", retry_val) from error
 
         raise error  # type: ignore[misc]
 

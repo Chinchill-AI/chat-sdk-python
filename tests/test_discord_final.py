@@ -7,7 +7,6 @@ These cover gaps remaining after test_discord_adapter.py and test_discord_extend
 
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,7 +14,6 @@ import pytest
 from chat_sdk.adapters.discord.adapter import (
     CHANNEL_TYPE_DM,
     CHANNEL_TYPE_GROUP_DM,
-    CHANNEL_TYPE_PUBLIC_THREAD,
     DiscordAdapter,
 )
 from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
@@ -496,9 +494,8 @@ class TestDisconnect:
     @pytest.mark.asyncio
     async def test_disconnect_is_noop(self):
         adapter = _make_adapter(logger=_make_logger())
-        # No assertion needed -- tests that disconnect completes without raising
+        # Disconnect completes without raising
         await adapter.disconnect()
-        assert True
 
     @pytest.mark.asyncio
     async def test_disconnect_logs_debug(self):

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+
 from chat_sdk.adapters.telegram.adapter import (
     TelegramAdapter,
     apply_telegram_entities,

@@ -18,7 +18,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from chat_sdk.testing import create_mock_adapter
+
 from chat_sdk.types import (
     ActionEvent,
     Author,
@@ -26,8 +26,7 @@ from chat_sdk.types import (
     ModalSubmitEvent,
 )
 
-from .conftest import create_chat, create_msg
-
+from .conftest import create_chat
 
 # ---------------------------------------------------------------------------
 # Payload constants
@@ -72,7 +71,9 @@ REPORT_VIEW_SUBMISSION: dict[str, Any] = {
     "view": {
         "id": "V0AEWMF8C3D",
         "callback_id": "report_form",
-        "private_metadata": '{"reportType": "bug", "threadId": "slack:C0A9D9RTBMF:1771116676.529969", "reporter": "U0A8WUV28QM"}',
+        "private_metadata": (
+            '{"reportType": "bug", "threadId": "slack:C0A9D9RTBMF:1771116676.529969", "reporter": "U0A8WUV28QM"}'
+        ),
         "state": {
             "values": {
                 "title_block": {"title_input": {"type": "plain_text_input", "value": "tes"}},
@@ -200,65 +201,9 @@ class TestModalSubmission:
         assert open_modal_called is True
         assert captured[0].trigger_id == "10367455086084.10229338706656.e675a0c0dacc24a1f7b84a7a426d1197"
 
-    @pytest.mark.asyncio
-    async def test_modal_submit_has_correct_callback_id_and_view_id(self):
-        """The modal submit event has correct callback_id and view_id."""
-        chat, adapters, state = await create_chat()
-        adapter = adapters["slack"]
-        captured: list[ModalSubmitEvent] = []
-
-        @chat.on_modal_submit
-        async def handler(event):
-            captured.append(event)
-
-        event = _make_modal_submit_event(adapter)
-        await chat.process_modal_submit(event)
-
-        assert len(captured) == 1
-        assert captured[0].callback_id == "feedback_form"
-        assert captured[0].view_id == "V0AB2P1M2HX"
-
-    @pytest.mark.asyncio
-    async def test_modal_submit_has_correct_values(self):
-        """The modal submit event carries the correct form values."""
-        chat, adapters, state = await create_chat()
-        adapter = adapters["slack"]
-        captured: list[ModalSubmitEvent] = []
-
-        @chat.on_modal_submit
-        async def handler(event):
-            captured.append(event)
-
-        event = _make_modal_submit_event(
-            adapter,
-            values={"message": "Hello!", "category": "feature", "email": "user@example.com"},
-        )
-        await chat.process_modal_submit(event)
-
-        assert len(captured) == 1
-        assert captured[0].values["message"] == "Hello!"
-        assert captured[0].values["category"] == "feature"
-        assert captured[0].values["email"] == "user@example.com"
-
-    @pytest.mark.asyncio
-    async def test_modal_submit_has_correct_user(self):
-        """The modal submit event carries the correct user information."""
-        chat, adapters, state = await create_chat()
-        adapter = adapters["slack"]
-        captured: list[ModalSubmitEvent] = []
-
-        @chat.on_modal_submit
-        async def handler(event):
-            captured.append(event)
-
-        event = _make_modal_submit_event(adapter)
-        await chat.process_modal_submit(event)
-
-        assert len(captured) == 1
-        assert captured[0].user.user_id == "U00FAKEUSER2"
-        assert captured[0].user.user_name == "jane.smith"
-        assert captured[0].user.is_bot is False
-        assert captured[0].user.is_me is False
+    # (Duplicate test_modal_submit_has_correct_callback_id_and_view_id,
+    #  test_modal_submit_has_correct_values, test_modal_submit_has_correct_user
+    #  removed -- covered by test_replay_modal.py)
 
 
 # ============================================================================
@@ -412,32 +357,8 @@ class TestModalPrivateMetadata:
 class TestFilteredModalHandlers:
     """Callback ID filtering for modal handlers."""
 
-    @pytest.mark.asyncio
-    async def test_filtered_handler_only_fires_for_matching_callback_id(self):
-        """Handler with callback_id filter only fires for matching modals."""
-        chat, adapters, state = await create_chat()
-        adapter = adapters["slack"]
-        feedback_calls: list[ModalSubmitEvent] = []
-        all_calls: list[ModalSubmitEvent] = []
-
-        @chat.on_modal_submit
-        async def all_handler(event):
-            all_calls.append(event)
-
-        @chat.on_modal_submit("feedback_form")
-        async def feedback_handler(event):
-            feedback_calls.append(event)
-
-        # Matching
-        event1 = _make_modal_submit_event(adapter, callback_id="feedback_form")
-        await chat.process_modal_submit(event1)
-
-        # Non-matching
-        event2 = _make_modal_submit_event(adapter, callback_id="other_form", view_id="V_OTHER")
-        await chat.process_modal_submit(event2)
-
-        assert len(all_calls) == 2
-        assert len(feedback_calls) == 1
+    # (Duplicate test_filtered_handler_only_fires_for_matching_callback_id
+    #  removed -- covered by test_replay_modal.py)
 
     @pytest.mark.asyncio
     async def test_multiple_callback_ids_filter(self):
@@ -503,20 +424,5 @@ class TestEphemeralModalInteractions:
         assert captured[0].trigger_id is not None
         assert captured[0].message_id.startswith("ephemeral:")
 
-    @pytest.mark.asyncio
-    async def test_modal_raw_payload_preserved(self):
-        """The raw payload is preserved on the modal submit event."""
-        chat, adapters, state = await create_chat()
-        adapter = adapters["slack"]
-        captured: list[ModalSubmitEvent] = []
-
-        @chat.on_modal_submit
-        async def handler(event):
-            captured.append(event)
-
-        event = _make_modal_submit_event(adapter)
-        await chat.process_modal_submit(event)
-
-        assert len(captured) == 1
-        assert captured[0].raw is not None
-        assert captured[0].raw["type"] == "view_submission"
+    # (Duplicate test_modal_raw_payload_preserved removed --
+    #  covered by test_replay_modal.py)

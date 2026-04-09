@@ -555,14 +555,14 @@ def stringify_markdown(
     ast: Root,
     *,
     emphasis: str = "*",
-    bullet: str = "-",
+    bullet: str = "*",
 ) -> str:
     """Stringify an AST back to markdown text.
 
     Args:
         ast: Root AST node.
         emphasis: Character to use for emphasis markers (* or _).
-        bullet: Character to use for unordered list bullets (-, *, +).
+        bullet: Character to use for unordered list bullets (*, -, +).
     """
     children = ast.get("children", [])
     parts: list[str] = []
@@ -574,7 +574,7 @@ def stringify_markdown(
     return result + "\n" if result else ""
 
 
-def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "-") -> str | None:
+def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") -> str | None:
     """Stringify a single AST node to markdown."""
     node_type = node.get("type")
 

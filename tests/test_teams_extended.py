@@ -15,11 +15,10 @@ Covers:
 
 from __future__ import annotations
 
-import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,17 +27,15 @@ from chat_sdk.adapters.teams.adapter import (
     MESSAGEID_STRIP_PATTERN,
     TeamsAdapter,
     _handle_teams_error,
-    create_teams_adapter,
 )
 from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
 from chat_sdk.shared.errors import (
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
-    PermissionError,
     ValidationError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,9 +86,9 @@ class _FakeRequest:
 def _make_mock_state() -> MagicMock:
     cache: dict[str, Any] = {}
     state = MagicMock()
-    state.get = MagicMock(side_effect=lambda k: cache.get(k))
+    state.get = AsyncMock(side_effect=lambda k: cache.get(k))
     state.set = AsyncMock(side_effect=lambda k, v, *a, **kw: cache.__setitem__(k, v))
-    state.delete = MagicMock(side_effect=lambda k: cache.pop(k, None))
+    state.delete = AsyncMock(side_effect=lambda k: cache.pop(k, None))
     state._cache = cache
     return state
 
@@ -353,7 +350,7 @@ class TestErrorHandling:
             _handle_teams_error({"statusCode": 401, "message": "unauthorized"}, "postMessage")
 
     def test_403_raises_permission_error(self):
-        with pytest.raises(PermissionError):
+        with pytest.raises(AdapterPermissionError):
             _handle_teams_error({"statusCode": 403, "message": "forbidden"}, "postMessage")
 
     def test_404_raises_network_error(self):
@@ -379,7 +376,7 @@ class TestErrorHandling:
             _handle_teams_error(RuntimeError("test error"), "postMessage")
 
     def test_permission_error_from_message(self):
-        with pytest.raises(PermissionError):
+        with pytest.raises(AdapterPermissionError):
             _handle_teams_error({"message": "Permission denied for this action"}, "postMessage")
 
     def test_inner_http_error_401(self):
@@ -441,12 +438,17 @@ class TestParseMessageExtended:
             "conversation": {"id": "19:abc@thread.tacv2"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
+        from datetime import UTC
+
+        before = datetime.now(UTC)
         msg = adapter.parse_message(activity)
-        assert msg.metadata.date_sent is not None
+        after = datetime.now(UTC)
+        # Verify the timestamp is between before and after (i.e. datetime.now(UTC))
+        assert before <= msg.metadata.date_sent <= after
 
     def test_mention_detection(self):
         adapter = _make_adapter(app_id="bot-app-id")
-        chat = _make_mock_chat()
+        _make_mock_chat()
         activity = {
             "type": "message",
             "id": "msg-mention",

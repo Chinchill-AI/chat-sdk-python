@@ -5,16 +5,15 @@ Ported from packages/adapter-teams/src/index.test.ts.
 
 from __future__ import annotations
 
-import json
 import re
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chat_sdk.adapters.teams.adapter import TeamsAdapter, create_teams_adapter
 from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
-from chat_sdk.shared.errors import AuthenticationError, ValidationError
+from chat_sdk.shared.errors import ValidationError
 
 TEAMS_PREFIX_PATTERN = re.compile(r"^teams:")
 
@@ -326,7 +325,7 @@ class TestParseMessage:
         }
         msg = adapter.parse_message(activity)
         assert msg.metadata.edited is False
-        assert msg.metadata.date_sent == datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        assert msg.metadata.date_sent == datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------

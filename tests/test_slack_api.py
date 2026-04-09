@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -602,7 +602,7 @@ class TestScheduleMessage:
             {"ok": True, "scheduled_message_id": "Q1234"},
         )
 
-        future_time = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc)
+        future_time = datetime.fromtimestamp(time.time() + 3600, tz=UTC)
         result = await adapter.schedule_message(
             "slack:C123:1234567890.000000",
             "Scheduled hello",
@@ -626,7 +626,7 @@ class TestScheduleMessage:
         )
         client.set_response("chat_deleteScheduledMessage", {"ok": True})
 
-        future_time = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc)
+        future_time = datetime.fromtimestamp(time.time() + 3600, tz=UTC)
         result = await adapter.schedule_message(
             "slack:C123:1234567890.000000",
             "To cancel",
@@ -643,7 +643,7 @@ class TestScheduleMessage:
     async def test_rejects_past_time(self):
         adapter, client, _ = await _init_adapter()
 
-        past_time = datetime.fromtimestamp(time.time() - 3600, tz=timezone.utc)
+        past_time = datetime.fromtimestamp(time.time() - 3600, tz=UTC)
         with pytest.raises(ValidationError):
             await adapter.schedule_message(
                 "slack:C123:1234567890.000000",
@@ -656,7 +656,7 @@ class TestScheduleMessage:
         adapter, client, _ = await _init_adapter()
         from chat_sdk.types import FileUpload, PostableMarkdown
 
-        future_time = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc)
+        future_time = datetime.fromtimestamp(time.time() + 3600, tz=UTC)
         msg = PostableMarkdown(
             markdown="With file",
             files=[FileUpload(data=b"data", filename="test.txt")],
@@ -850,9 +850,12 @@ class TestStartTyping:
         adapter, client, _ = await _init_adapter()
         client.set_response("assistant_threads_setStatus", Exception("API down"))
 
-        # No assertion needed -- tests that startTyping swallows API errors
+        # startTyping swallows the API error and returns normally
         await adapter.start_typing("slack:C123:1234567890.000000")
-        assert True
+
+        # The API call was attempted (error was caught, not avoided)
+        calls = client.get_calls("assistant_threads_setStatus")
+        assert len(calls) == 1
 
 
 # =============================================================================

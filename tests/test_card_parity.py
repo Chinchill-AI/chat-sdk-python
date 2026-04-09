@@ -273,6 +273,6 @@ class TestCardParitySmokeTest:
         if _LINEAR_CARDS:
             converters.append(("linear", True, lambda c: card_to_linear_markdown(c)))
 
-        for name, available, converter in converters:
+        for name, _available, converter in converters:
             output = converter(card)
             assert "System Status Report" in output, f"{name} converter should include card title"

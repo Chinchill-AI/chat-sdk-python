@@ -283,7 +283,7 @@ class SlackFormatConverter(BaseFormatConverter):
             cells = [
                 {
                     "type": "raw_text",
-                    "text": "".join(self._node_to_mrkdwn(c) for c in cell.get("children", [])),
+                    "text": "".join(self._node_to_mrkdwn(c) for c in cell.get("children", [])) or " ",
                 }
                 for cell in row.get("children", [])
             ]

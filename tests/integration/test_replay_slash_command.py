@@ -11,6 +11,7 @@ import asyncio
 from typing import Any
 
 import pytest
+
 from chat_sdk.types import Author, SlashCommandEvent
 
 from .conftest import create_chat

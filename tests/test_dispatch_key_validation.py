@@ -157,7 +157,6 @@ class TestSlackDispatchKeys:
         assert isinstance(thread_id_arg, str)
         assert thread_id_arg.startswith("slack:")
 
-    @pytest.mark.anyio
     async def test_slack_reaction_dispatch_keys(self) -> None:
         """Reaction events should produce a dict with snake_case keys."""
         adapter = self._make_adapter()
@@ -241,7 +240,6 @@ class TestSlackDispatchKeys:
         # Verify NO camelCase keys anywhere
         assert_no_camel_case_keys(action_obj)
 
-    @pytest.mark.anyio
     async def test_slack_slash_command_dispatch_keys(self) -> None:
         """Slash command events should produce dicts with snake_case keys."""
         adapter = self._make_adapter()
@@ -270,7 +268,6 @@ class TestSlackDispatchKeys:
         # Verify NO camelCase keys anywhere
         assert_no_camel_case_keys(cmd_obj)
 
-    @pytest.mark.anyio
     async def test_slack_modal_submit_dispatch_keys(self) -> None:
         """View submission events should produce dicts with snake_case keys."""
         adapter = self._make_adapter()
@@ -613,8 +610,8 @@ class TestLinearDispatchKeys:
             "data": {
                 "id": "reaction-123",
                 "emoji": "\U0001f44d",
-                "comment_id": "comment-456",
-                "user_id": "user-789",
+                "commentId": "comment-456",
+                "userId": "user-789",
             },
             "actor": {
                 "id": "user-789",
@@ -631,9 +628,7 @@ class TestLinearDispatchKeys:
         if adapter._chat.process_reaction.called:
             reaction_dict = adapter._chat.process_reaction.call_args[0][0]
             assert_no_camel_case_keys(reaction_dict)
-        # No assertion needed when process_reaction is not called -- tests that
-        # _handle_reaction completes without raising
-        assert True
+        # When process_reaction is not called, _handle_reaction still completed without raising
 
     def test_linear_comment_dispatch_keys(self) -> None:
         """Comment webhook events should call process_message correctly."""
@@ -645,10 +640,10 @@ class TestLinearDispatchKeys:
             "data": {
                 "id": "comment-123",
                 "body": "Hello from Linear!",
-                "issue_id": "issue-456",
-                "user_id": "user-789",
-                "created_at": "2024-01-15T10:00:00.000Z",
-                "updated_at": "2024-01-15T10:00:00.000Z",
+                "issueId": "issue-456",
+                "userId": "user-789",
+                "createdAt": "2024-01-15T10:00:00.000Z",
+                "updatedAt": "2024-01-15T10:00:00.000Z",
             },
             "actor": {
                 "id": "user-789",
@@ -688,7 +683,7 @@ class TestCamelCaseDetectionHelper:
             assert_no_camel_case_keys([{"actionId": "abc"}])
 
     def test_allows_snake_case(self) -> None:
-        # No assertion needed -- tests that assert_no_camel_case_keys does not raise
+        # Should complete without raising for snake_case keys
         assert_no_camel_case_keys(
             {
                 "thread_id": "abc",
@@ -698,8 +693,7 @@ class TestCamelCaseDetectionHelper:
                     "user_name": "test",
                 },
             }
-        )
-        assert True
+        )  # no exception = pass
 
     def test_allows_single_word(self) -> None:
         """Single-word keys like 'adapter', 'value', 'raw' are fine."""
@@ -711,10 +705,8 @@ class TestCamelCaseDetectionHelper:
                 "user": {},
                 "emoji": "thumbsup",
             }
-        )
-        assert True
+        )  # no exception = pass
 
     def test_allows_non_string_keys(self) -> None:
         """Non-string keys should be ignored."""
-        assert_no_camel_case_keys({1: "number key", True: "bool key"})
-        assert True
+        assert_no_camel_case_keys({1: "number key", 2: "bool key"})  # no exception = pass

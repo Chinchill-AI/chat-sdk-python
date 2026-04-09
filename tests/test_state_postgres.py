@@ -9,15 +9,15 @@ which in-memory operation to perform.
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import re
 import time
 from typing import Any
 
 import pytest
+
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.state.postgres import PostgresStateAdapter
 from chat_sdk.types import Lock, QueueEntry
-
 
 # ============================================================================
 # MockAsyncpgPool
@@ -31,7 +31,7 @@ class _Record(dict):
         try:
             return self[key]
         except KeyError:
-            raise AttributeError(key)
+            raise AttributeError(key) from None
 
 
 class MockAsyncpgPool:
@@ -64,7 +64,7 @@ class MockAsyncpgPool:
         return self._seq_counter
 
     def _now(self) -> _dt.datetime:
-        return _dt.datetime.now(_dt.timezone.utc)
+        return _dt.datetime.now(_dt.UTC)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -73,11 +73,11 @@ class MockAsyncpgPool:
 
     # -- connection acquisition (for transactions) -----------------------------
 
-    def acquire(self) -> "_MockConnectionCtx":
+    def acquire(self) -> _MockConnectionCtx:
         """Return an async context manager that yields self (acts as connection)."""
         return _MockConnectionCtx(self)
 
-    def transaction(self) -> "_MockTransactionCtx":
+    def transaction(self) -> _MockTransactionCtx:
         """Return a no-op async context manager for transaction blocks."""
         return _MockTransactionCtx()
 
@@ -346,7 +346,7 @@ class MockAsyncpgPool:
         self.executed_queries.append(query)
         q = _normalise(query)
 
-        if "select 1" == q.strip():
+        if q.strip() == "select 1":
             return 1
 
         if "select count(*) from chat_state_queues" in q:
@@ -454,14 +454,13 @@ class TestPostgresStateConnect:
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_noop(self, mock_pool: MockAsyncpgPool):
         adapter = PostgresStateAdapter(pool=mock_pool, key_prefix="test")
-        # No assertion needed -- tests that disconnect before connect does not raise
+        # Disconnect before connect should complete without raising
         await adapter.disconnect()
-        assert True
 
     @pytest.mark.asyncio
     async def test_operations_fail_before_connect(self, mock_pool: MockAsyncpgPool):
         adapter = PostgresStateAdapter(pool=mock_pool, key_prefix="test")
-        with pytest.raises(RuntimeError, match="not connected"):
+        with pytest.raises(StateNotConnectedError, match="not connected"):
             await adapter.get("key")
 
     @pytest.mark.asyncio
@@ -528,9 +527,8 @@ class TestPostgresStateKV:
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        # No assertion needed -- tests that deleting a nonexistent key does not raise
         await pg_state.delete("nonexistent")
-        assert True
+        assert await pg_state.get("nonexistent") is None
 
 
 # ============================================================================
@@ -637,6 +635,9 @@ class TestPostgresStateLocks:
         time.sleep(0.005)
         lock2 = await pg_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token.startswith("pg_")
+        assert lock2.token != lock1.token  # New lock should have a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock_correct_token(self, pg_state: PostgresStateAdapter):
@@ -646,6 +647,8 @@ class TestPostgresStateLocks:
 
         lock2 = await pg_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_release_lock_wrong_token(self, pg_state: PostgresStateAdapter):
@@ -697,12 +700,16 @@ class TestPostgresStateLocks:
 
         lock2 = await pg_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
+        assert lock2.thread_id == "thread-1"
+        assert lock2.token != lock.token  # New lock after force release gets a fresh token
 
     @pytest.mark.asyncio
     async def test_force_release_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        # No assertion needed -- tests that releasing a nonexistent lock does not raise
         await pg_state.force_release_lock("nonexistent")
-        assert True
+        # Can still acquire a lock on the same thread after force-releasing a nonexistent one
+        lock = await pg_state.acquire_lock("nonexistent", 30_000)
+        assert lock is not None
+        assert lock.thread_id == "nonexistent"
 
     @pytest.mark.asyncio
     async def test_independent_locks_per_thread(self, pg_state: PostgresStateAdapter):
@@ -748,7 +755,7 @@ class TestPostgresStateLocks:
         time.sleep(0.005)
         # Force-expire the lock for testing
         lock_key = ("test", "race-thread")
-        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
+        mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=1)
 
         lock3 = await pg_state.acquire_lock("race-thread", 30_000)
         assert lock3 is not None
@@ -923,9 +930,8 @@ class TestPostgresStateSubscriptions:
 
     @pytest.mark.asyncio
     async def test_unsubscribe_nonexistent_is_noop(self, pg_state: PostgresStateAdapter):
-        # No assertion needed -- tests that unsubscribing a nonexistent thread does not raise
         await pg_state.unsubscribe("nonexistent")
-        assert True
+        assert await pg_state.is_subscribed("nonexistent") is False
 
     @pytest.mark.asyncio
     async def test_subscribe_is_idempotent(self, pg_state: PostgresStateAdapter):

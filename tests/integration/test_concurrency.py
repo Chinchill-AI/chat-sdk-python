@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+
 from chat_sdk.errors import LockError
 
 from .conftest import create_chat, create_msg

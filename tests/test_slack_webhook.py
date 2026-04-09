@@ -15,9 +15,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 try:
-    from chat_sdk.adapters.slack.adapter import SlackAdapter, create_slack_adapter
+    from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import SlackAdapterConfig, SlackInstallation, SlackThreadId
-    from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
+    from chat_sdk.shared.errors import ValidationError
 
     _SLACK_AVAILABLE = True
 except ImportError:
@@ -90,14 +90,14 @@ def _make_mock_state() -> MagicMock:
 
 def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
-    chat.process_message = AsyncMock()
+    chat.process_message = MagicMock()
     chat.handle_incoming_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     chat.process_modal_submit = AsyncMock()
     chat.process_modal_close = MagicMock()
-    chat.process_slash_command = AsyncMock()
-    chat.process_member_joined_channel = AsyncMock()
+    chat.process_slash_command = MagicMock()
+    chat.process_member_joined_channel = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_user_name = MagicMock(return_value="test-bot")
     chat.get_logger = MagicMock(return_value=MagicMock())
@@ -263,10 +263,7 @@ class TestURLVerification:
         response = await adapter.handle_webhook(req)
         assert response["status"] == 200
         resp_body = response.get("body", "")
-        if isinstance(resp_body, str):
-            parsed = json.loads(resp_body)
-        else:
-            parsed = resp_body
+        parsed = json.loads(resp_body) if isinstance(resp_body, str) else resp_body
         assert parsed == {"challenge": "test-challenge-123"}
 
 

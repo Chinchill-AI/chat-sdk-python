@@ -19,25 +19,24 @@ import hmac
 import json
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from chat_sdk.adapters.github.adapter import GitHubAdapter
-from chat_sdk.adapters.telegram.adapter import TelegramAdapter
-from chat_sdk.adapters.telegram.types import TelegramAdapterConfig
-from chat_sdk.adapters.teams.adapter import TeamsAdapter
-from chat_sdk.adapters.teams.types import TeamsAdapterConfig
-from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
-from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig
 from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
+from chat_sdk.adapters.teams.adapter import TeamsAdapter
+from chat_sdk.adapters.teams.types import TeamsAdapterConfig
+from chat_sdk.adapters.telegram.adapter import TelegramAdapter
+from chat_sdk.adapters.telegram.types import TelegramAdapterConfig
+from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
+from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.types import RawMessage
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -348,7 +347,7 @@ class TestGoogleChatStreamSignature:
             yield FakeChunk(type="markdown_text", text="middle ")
             yield "end"
 
-        result = await adapter.stream("gchat:spaces/xyz", mixed_stream())
+        await adapter.stream("gchat:spaces/xyz", mixed_stream())
 
         assert posted[0][1] == {"markdown": "Start middle end"}
 
@@ -528,7 +527,7 @@ class TestGitHubWebhookHappyPath:
         # Verify the adapter and thread_id were passed
         call_args = mock_chat.process_message.call_args[0]
         assert call_args[0] is adapter  # first arg is the adapter
-        assert "github:acme/app:42" == call_args[1]  # thread_id
+        assert call_args[1] == "github:acme/app:42"  # thread_id
 
 
 # ---------------------------------------------------------------------------

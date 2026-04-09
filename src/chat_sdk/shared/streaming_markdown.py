@@ -54,6 +54,71 @@ def _strip_fenced_code(text: str) -> str:
     return "\n".join(result_lines)
 
 
+def _close_emphasis(result: str, stripped: str, ch: str) -> str:
+    """Close unclosed bold/italic emphasis for a single marker character.
+
+    Scans *stripped* (text with code spans/fences removed) left-to-right,
+    grouping consecutive runs of *ch* into delimiter tokens.  Tracks a
+    simple open/close stack for ``ch*2`` (bold) and ``ch`` (italic),
+    then appends whatever closing sequence is needed to *result*.
+
+    The algorithm mirrors CommonMark's emphasis handling at a simplified
+    level: a run of 2+ characters opens/closes bold first, then any
+    remaining single character opens/closes italic.
+
+    To guarantee idempotency the suffix is separated from any trailing
+    marker run by a zero-width space so it cannot merge with existing
+    characters and create new openers on re-scan.
+    """
+    # Collect runs of the marker character (e.g. *, **, ***).
+    runs: list[int] = []
+    i = 0
+    while i < len(stripped):
+        if stripped[i] == "\\":
+            i += 2
+            continue
+        if stripped[i] == ch:
+            run_len = 0
+            while i < len(stripped) and stripped[i] == ch:
+                run_len += 1
+                i += 1
+            runs.append(run_len)
+        else:
+            i += 1
+
+    # Walk runs and track open bold / italic state.
+    bold_open = False
+    italic_open = False
+    for run in runs:
+        remaining = run
+        # Process pairs (bold toggles) first.
+        while remaining >= 2:
+            bold_open = not bold_open
+            remaining -= 2
+        # A leftover single character toggles italic.
+        if remaining == 1:
+            italic_open = not italic_open
+
+    if not bold_open and not italic_open:
+        return result
+
+    suffix = ""
+    # Close in reverse order: italic first (inner), then bold (outer).
+    if italic_open:
+        suffix += ch
+    if bold_open:
+        suffix += ch * 2
+
+    # If the result already ends with the marker character, inserting the
+    # suffix directly would merge with the trailing run and change the
+    # delimiter structure on re-scan (breaking idempotency).  Insert a
+    # zero-width space (U+200B) as a separator so the suffix is parsed as
+    # its own distinct run.
+    if result.endswith(ch):
+        return result + "\u200b" + suffix
+    return result + suffix
+
+
 def _remend(text: str) -> str:
     """Repair incomplete markdown by closing unclosed inline markers.
 
@@ -64,9 +129,9 @@ def _remend(text: str) -> str:
       - Missing ``__`` / ``_`` (underscore bold/italic) handling (added)
       - Markers inside code blocks no longer counted as inline markers
 
-    Strategy: count *unescaped* characters for ``*`` and ``_`` (parity-based)
-    outside code fences and code spans.  Count ``~~`` substrings for
-    strikethrough.  Count backtick characters for inline code.
+    Strategy: count ``**`` (bold) delimiter pairs first, then remaining
+    unpaired ``*`` (italic) -- likewise for ``__`` / ``_``.  Count ``~~``
+    substrings for strikethrough.  Count backtick characters for inline code.
     """
     result = text
 
@@ -93,36 +158,12 @@ def _remend(text: str) -> str:
         result += "`"
 
     # --- bold / italic (* based) ---
-    # Count total unescaped * characters outside code fences. If odd, append
-    # one to make even. This is idempotent: once the count is even, no
-    # further change occurs.
-    star_count = 0
-    j = 0
-    while j < len(outside_fences):
-        if outside_fences[j] == "\\":
-            j += 2
-            continue
-        if outside_fences[j] == "*":
-            star_count += 1
-        j += 1
-
-    if star_count % 2 != 0:
-        result += "*"
+    # Strip backtick spans so markers inside inline code are ignored.
+    stripped = re.sub(r"`[^`]*`", "", outside_fences)
+    result = _close_emphasis(result, stripped, "*")
 
     # --- bold / italic (_ based) ---
-    # Same parity approach for underscore markers.
-    under_count = 0
-    j = 0
-    while j < len(outside_fences):
-        if outside_fences[j] == "\\":
-            j += 2
-            continue
-        if outside_fences[j] == "_":
-            under_count += 1
-        j += 1
-
-    if under_count % 2 != 0:
-        result += "_"
+    result = _close_emphasis(result, stripped, "_")
 
     # --- strikethrough ~~ ---
     # Count non-overlapping ``~~`` substrings outside code fences. If odd,

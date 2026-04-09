@@ -133,6 +133,9 @@ class DiscordAdapter:
         )
         self._thread_parent_cache: dict[str, dict[str, Any]] = {}
 
+        # Shared aiohttp session for connection pooling
+        self._http_session: Any | None = None
+
         # Validate public key format
         if not HEX_64_PATTERN.match(self._public_key):
             self._logger.error(
@@ -649,6 +652,12 @@ class DiscordAdapter:
                             "parent_id": channel_info["parent_id"],
                             "expires_at": time.time() + THREAD_PARENT_CACHE_TTL,
                         }
+                        # Prevent unbounded cache growth
+                        if len(self._thread_parent_cache) > 1000:
+                            now = time.time()
+                            expired = [k for k, v in self._thread_parent_cache.items() if v.get("expires_at", 0) <= now]
+                            for k in expired:
+                                del self._thread_parent_cache[k]
                 except Exception as error:
                     self._logger.error(
                         "Failed to fetch thread parent for reaction",
@@ -964,7 +973,7 @@ class DiscordAdapter:
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = decoded.thread_id or decoded.channel_id
 
-        limit = options.limit or 50
+        limit = options.limit if options.limit is not None else 50
         direction = options.direction or "backward"
 
         params: list[str] = [f"limit={limit}"]
@@ -1179,9 +1188,20 @@ class DiscordAdapter:
             },
         )
 
+    async def _get_http_session(self) -> Any:
+        """Return the shared aiohttp session, creating it lazily if needed."""
+        import aiohttp
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def disconnect(self) -> None:
-        """Cleanup hook. Discord HTTP Interactions adapter is stateless, so this is a no-op."""
-        self._logger.debug("Discord adapter disconnecting (no-op for HTTP interactions)")
+        """Cleanup hook. Close the shared HTTP session."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+        self._logger.debug("Discord adapter disconnecting")
 
     # =========================================================================
     # Private helpers
@@ -1311,7 +1331,7 @@ class DiscordAdapter:
         with a ``payload_json`` field for the JSON body and one field per
         file attachment, matching the Discord API multipart upload spec.
         """
-        import aiohttp  # lazy import
+        import aiohttp  # lazy import (needed for FormData)
 
         url = f"{DISCORD_API_BASE}{path}"
         headers: dict[str, str] = {
@@ -1338,15 +1358,13 @@ class DiscordAdapter:
                 headers["Content-Type"] = "application/json"
                 request_kwargs["json"] = body
 
-        async with (
-            aiohttp.ClientSession() as session,
-            session.request(
-                method,
-                url,
-                headers=headers,
-                **request_kwargs,
-            ) as response,
-        ):
+        session = await self._get_http_session()
+        async with session.request(
+            method,
+            url,
+            headers=headers,
+            **request_kwargs,
+        ) as response:
             if not response.ok:
                 error_text = await response.text()
                 self._logger.error(

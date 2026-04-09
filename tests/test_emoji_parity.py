@@ -268,7 +268,7 @@ class TestEmojiParity:
         ts_entry = self.ts_map[name]
         assert name in DEFAULT_EMOJI_MAP, f"TS emoji {name!r} not in Python map"
 
-        py_formats = DEFAULT_EMOJI_MAP[name]
+        DEFAULT_EMOJI_MAP[name]
 
         # Check slack[0] matches
         if ts_entry["slack"]:

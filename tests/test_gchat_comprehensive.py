@@ -40,36 +40,26 @@ not already covered in existing Python test files:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import os
 import re
-import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
 from chat_sdk.adapters.google_chat.thread_utils import (
     GoogleChatThreadId,
-    decode_thread_id,
     encode_thread_id,
-    is_dm_thread,
 )
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
-from chat_sdk.adapters.google_chat.user_info import UserInfoCache
-from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
-from chat_sdk.types import (
-    FetchOptions,
-    ListThreadsOptions,
-)
+from chat_sdk.shared.errors import ValidationError
 
-GCHAT_PREFIX_PATTERN = re.compile(r"^gchat:")
 DM_SUFFIX_PATTERN = re.compile(r":dm$")
 
 
@@ -108,9 +98,9 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_logger = MagicMock(return_value=MagicMock())
-    chat.process_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_message = MagicMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     return chat
 
 
@@ -383,10 +373,6 @@ class TestConstructorWithADC:
         adapter = _make_adapter()
         assert adapter.user_name == "bot"
 
-    def test_custom_user_name(self):
-        adapter = _make_adapter(user_name="mybot")
-        assert adapter.user_name == "mybot"
-
 
 # ===========================================================================
 # Initialize - restore bot user ID from state
@@ -502,24 +488,14 @@ class TestParseMessageAttachmentEdgeCases:
 
 
 class TestParseMessageSenderEmail:
-    def test_parse_message_with_sender_email(self):
-        adapter = _make_adapter()
-        event = _make_message_event(
-            sender_email="alice@example.com",
-            sender_display_name="Alice",
-        )
-        msg = adapter.parse_message(event)
-        assert msg.author.full_name == "Alice"
-        assert msg.author.is_bot is False
-
     def test_parse_message_no_payload_raises(self):
         adapter = _make_adapter()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             adapter.parse_message({})
 
     def test_parse_message_empty_chat_raises(self):
         adapter = _make_adapter()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             adapter.parse_message({"chat": {}})
 
 
@@ -782,26 +758,6 @@ class TestParsePubSubMessageEdgeCases:
         assert response["status"] == 200
 
     @pytest.mark.asyncio
-    async def test_pubsub_bot_message_detected(self):
-        adapter = _make_adapter()
-        state = _make_mock_state()
-        chat = _make_mock_chat(state)
-        await adapter.initialize(chat)
-
-        pubsub = _make_pubsub_push_message(
-            {
-                "message": {
-                    "name": "spaces/ABC123/messages/msg1",
-                    "sender": {"name": "users/BOT1", "displayName": "BotUser", "type": "BOT"},
-                    "text": "Bot message",
-                    "createTime": "2024-01-01T00:00:00Z",
-                },
-            }
-        )
-        response = await adapter.handle_webhook(pubsub)
-        assert response["status"] == 200
-
-    @pytest.mark.asyncio
     async def test_pubsub_self_message_detected_when_bot_id_matches(self):
         adapter = _make_adapter()
         adapter._bot_user_id = "users/MYBOT"
@@ -873,204 +829,9 @@ class TestParsePubSubMessageEdgeCases:
 
 
 # ===========================================================================
-# postMessage - comprehensive
+# (Duplicate postMessage / editMessage / deleteMessage / addReaction /
+#  removeReaction tests removed -- covered by test_gchat_api.py)
 # ===========================================================================
-
-
-class TestPostMessageComprehensive:
-    @pytest.mark.asyncio
-    async def test_posts_text_message(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response("POST", "spaces/ABC123/messages", {"name": "spaces/ABC123/messages/new1"})
-
-        result = await adapter.post_message(tid, "Hello from bot")
-
-        assert result.id == "spaces/ABC123/messages/new1"
-        assert result.thread_id == tid
-        calls = api.get_calls("POST", "spaces/ABC123/messages")
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_posts_message_without_thread_name(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-        api.set_response("POST", "spaces/ABC123/messages", {"name": "spaces/ABC123/messages/new2"})
-
-        await adapter.post_message(tid, "Top level message")
-
-        calls = api.get_calls("POST", "spaces/ABC123/messages")
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_posts_message_with_thread_reply_option(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response("POST", "spaces/ABC123/messages", {"name": "spaces/ABC123/messages/new3"})
-
-        await adapter.post_message(tid, "Reply message")
-
-        calls = api.get_calls("POST", "spaces/ABC123/messages")
-        assert calls[0]["params"]["messageReplyOption"] == "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-
-    @pytest.mark.asyncio
-    async def test_post_message_api_error_raises(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-        api.set_response("POST", "spaces/ABC123/messages", _FakeApiError(500, "Internal error"))
-
-        with pytest.raises(_FakeApiError):
-            await adapter.post_message(tid, "Will fail")
-
-    @pytest.mark.asyncio
-    async def test_post_message_rate_limit(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-        api.set_response("POST", "spaces/ABC123/messages", _FakeApiError(429, "Rate limited"))
-
-        with pytest.raises(AdapterRateLimitError):
-            await adapter.post_message(tid, "Rate limited")
-
-
-# ===========================================================================
-# editMessage - comprehensive
-# ===========================================================================
-
-
-class TestEditMessageComprehensive:
-    @pytest.mark.asyncio
-    async def test_edits_text_message(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("PATCH", msg_id, {"name": msg_id})
-
-        result = await adapter.edit_message(tid, msg_id, "Updated text")
-
-        assert result.id == msg_id
-        assert result.thread_id == tid
-        calls = api.get_calls("PATCH", msg_id)
-        assert len(calls) == 1
-        assert calls[0]["params"]["updateMask"] == "text"
-
-    @pytest.mark.asyncio
-    async def test_edit_message_api_error(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("PATCH", msg_id, _FakeApiError(403, "Forbidden"))
-
-        with pytest.raises(_FakeApiError):
-            await adapter.edit_message(tid, msg_id, "edit")
-
-
-# ===========================================================================
-# deleteMessage - comprehensive
-# ===========================================================================
-
-
-class TestDeleteMessageComprehensive:
-    @pytest.mark.asyncio
-    async def test_deletes_message(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("DELETE", msg_id, {})
-
-        await adapter.delete_message("gchat:spaces/ABC123", msg_id)
-
-        calls = api.get_calls("DELETE", msg_id)
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_delete_message_api_error(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("DELETE", msg_id, _FakeApiError(404, "Not found"))
-
-        with pytest.raises(_FakeApiError):
-            await adapter.delete_message("gchat:spaces/ABC123", msg_id)
-
-
-# ===========================================================================
-# addReaction / removeReaction - comprehensive
-# ===========================================================================
-
-
-class TestAddReactionComprehensive:
-    @pytest.mark.asyncio
-    async def test_adds_reaction(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("POST", f"{msg_id}/reactions", {})
-
-        await adapter.add_reaction("gchat:spaces/ABC123", msg_id, "\U0001f44d")
-
-        calls = api.get_calls("POST", f"{msg_id}/reactions")
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_add_reaction_rate_limit(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("POST", f"{msg_id}/reactions", _FakeApiError(429, "Rate limited"))
-
-        with pytest.raises(AdapterRateLimitError):
-            await adapter.add_reaction("gchat:spaces/ABC123", msg_id, "\U0001f44d")
-
-
-class TestRemoveReactionComprehensive:
-    @pytest.mark.asyncio
-    async def test_removes_matching_reaction(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        react_name = f"{msg_id}/reactions/react1"
-
-        api.set_response(
-            "GET",
-            f"{msg_id}/reactions",
-            {
-                "reactions": [
-                    {"name": react_name, "emoji": {"unicode": "\U0001f44d"}},
-                    {"name": f"{msg_id}/reactions/react2", "emoji": {"unicode": "\u2764\ufe0f"}},
-                ],
-            },
-        )
-        api.set_response("DELETE", react_name, {})
-
-        await adapter.remove_reaction("gchat:spaces/ABC123", msg_id, "\U0001f44d")
-
-        delete_calls = api.get_calls("DELETE", react_name)
-        assert len(delete_calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_no_delete_when_reaction_not_found(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response("GET", f"{msg_id}/reactions", {"reactions": []})
-
-        await adapter.remove_reaction("gchat:spaces/ABC123", msg_id, "\U0001f44d")
-
-        delete_calls = api.get_calls("DELETE")
-        assert len(delete_calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_no_delete_when_emoji_does_not_match(self):
-        adapter, api, _ = await _init_adapter()
-        msg_id = "spaces/ABC123/messages/msg1"
-        api.set_response(
-            "GET",
-            f"{msg_id}/reactions",
-            {
-                "reactions": [
-                    {"name": f"{msg_id}/reactions/react1", "emoji": {"unicode": "\u2764\ufe0f"}},
-                ],
-            },
-        )
-
-        await adapter.remove_reaction("gchat:spaces/ABC123", msg_id, "\U0001f44d")
-
-        delete_calls = api.get_calls("DELETE")
-        assert len(delete_calls) == 0
 
 
 # ===========================================================================
@@ -1079,94 +840,6 @@ class TestRemoveReactionComprehensive:
 
 
 class TestFetchMessagesComprehensive:
-    @pytest.mark.asyncio
-    async def test_fetch_backward(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/msg2",
-                        "text": "Newer",
-                        "sender": {"name": "users/100", "displayName": "Alice", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:01:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/T1"},
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "text": "Older",
-                        "sender": {"name": "users/101", "displayName": "Bob", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/T1"},
-                    },
-                ],
-            },
-        )
-
-        result = await adapter.fetch_messages(tid)
-
-        assert len(result.messages) == 2
-        assert result.next_cursor is None
-
-    @pytest.mark.asyncio
-    async def test_fetch_forward(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "text": "First",
-                        "sender": {"name": "users/100", "displayName": "Alice", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/T1"},
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/msg2",
-                        "text": "Second",
-                        "sender": {"name": "users/101", "displayName": "Bob", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:01:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/T1"},
-                    },
-                ],
-            },
-        )
-
-        result = await adapter.fetch_messages(tid, FetchOptions(direction="forward"))
-
-        assert len(result.messages) == 2
-
-    @pytest.mark.asyncio
-    async def test_fetch_backward_with_pagination(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "text": "Page 1",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                    },
-                ],
-                "nextPageToken": "page2_token",
-            },
-        )
-
-        result = await adapter.fetch_messages(tid)
-
-        assert len(result.messages) == 1
-        assert result.next_cursor == "page2_token"
-
     @pytest.mark.asyncio
     async def test_fetch_empty_messages(self):
         adapter, api, _ = await _init_adapter()
@@ -1178,89 +851,13 @@ class TestFetchMessagesComprehensive:
         assert len(result.messages) == 0
         assert result.next_cursor is None
 
-    @pytest.mark.asyncio
-    async def test_fetch_forward_with_cursor(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "text": "First",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/msg2",
-                        "text": "Second (cursor start)",
-                        "sender": {"name": "users/101", "displayName": "User2", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:01:00Z",
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/msg3",
-                        "text": "Third",
-                        "sender": {"name": "users/102", "displayName": "User3", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:02:00Z",
-                    },
-                ],
-            },
-        )
-
-        result = await adapter.fetch_messages(
-            tid,
-            FetchOptions(direction="forward", cursor="spaces/ABC123/messages/msg1", limit=1),
-        )
-
-        assert len(result.messages) == 1
-        assert result.messages[0].id == "spaces/ABC123/messages/msg2"
-
 
 # ===========================================================================
-# fetchChannelMessages - comprehensive
+# fetchChannelMessages - comprehensive (unique tests only)
 # ===========================================================================
 
 
 class TestFetchChannelMessagesComprehensive:
-    @pytest.mark.asyncio
-    async def test_fetches_channel_messages_backward(self):
-        adapter, api, _ = await _init_adapter()
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/aaa.aaa",
-                        "text": "Thread root",
-                        "sender": {"name": "users/100", "displayName": "Alice", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/aaa"},
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/aaa.bbb",
-                        "text": "Thread reply (filtered out)",
-                        "sender": {"name": "users/101", "displayName": "Bob", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:01:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/aaa"},
-                    },
-                ],
-            },
-        )
-
-        result = await adapter.fetch_channel_messages("gchat:spaces/ABC123")
-
-        assert len(result.messages) >= 1
-
-    @pytest.mark.asyncio
-    async def test_invalid_channel_id_raises(self):
-        adapter, api, _ = await _init_adapter()
-
-        with pytest.raises(ValidationError):
-            await adapter.fetch_channel_messages("gchat:")
-
     @pytest.mark.asyncio
     async def test_messages_without_thread_treated_as_top_level(self):
         adapter, api, _ = await _init_adapter()
@@ -1285,74 +882,8 @@ class TestFetchChannelMessagesComprehensive:
 
 
 # ===========================================================================
-# listThreads - comprehensive
+# (Duplicate listThreads tests removed -- covered by test_gchat_api.py)
 # ===========================================================================
-
-
-class TestListThreadsComprehensive:
-    @pytest.mark.asyncio
-    async def test_lists_threads_deduplicates(self):
-        adapter, api, _ = await _init_adapter()
-        api.set_response_prefix(
-            "GET",
-            "spaces/ABC123/messages",
-            {
-                "messages": [
-                    {
-                        "name": "spaces/ABC123/messages/m1",
-                        "text": "Thread 1",
-                        "sender": {"name": "users/100", "displayName": "Alice", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/t1"},
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/m2",
-                        "text": "Thread 1 reply",
-                        "sender": {"name": "users/101", "displayName": "Bob", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:01:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/t1"},
-                    },
-                    {
-                        "name": "spaces/ABC123/messages/m3",
-                        "text": "Thread 2",
-                        "sender": {"name": "users/102", "displayName": "Carol", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:02:00Z",
-                        "thread": {"name": "spaces/ABC123/threads/t2"},
-                    },
-                ],
-            },
-        )
-
-        result = await adapter.list_threads("gchat:spaces/ABC123")
-
-        assert len(result.threads) == 2
-
-    @pytest.mark.asyncio
-    async def test_list_threads_with_limit(self):
-        adapter, api, _ = await _init_adapter()
-        msgs = []
-        for i in range(10):
-            msgs.append(
-                {
-                    "name": f"spaces/ABC123/messages/m{i}",
-                    "text": f"Thread {i}",
-                    "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                    "createTime": "2024-01-01T00:00:00Z",
-                    "thread": {"name": f"spaces/ABC123/threads/t{i}"},
-                }
-            )
-        api.set_response_prefix("GET", "spaces/ABC123/messages", {"messages": msgs})
-
-        result = await adapter.list_threads("gchat:spaces/ABC123", ListThreadsOptions(limit=3))
-
-        assert len(result.threads) == 3
-
-    @pytest.mark.asyncio
-    async def test_list_threads_invalid_channel_raises(self):
-        adapter, api, _ = await _init_adapter()
-
-        with pytest.raises(ValidationError):
-            await adapter.list_threads("gchat:")
 
 
 # ===========================================================================
@@ -1360,26 +891,7 @@ class TestListThreadsComprehensive:
 # ===========================================================================
 
 
-class TestFetchThreadComprehensive:
-    @pytest.mark.asyncio
-    async def test_fetches_thread_info(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response("GET", "spaces/ABC123", {"displayName": "General Chat"})
-
-        result = await adapter.fetch_thread(tid)
-
-        assert result.id == tid
-        assert result.channel_name == "General Chat"
-
-    @pytest.mark.asyncio
-    async def test_fetch_thread_api_error(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/UNKNOWN")
-        api.set_response("GET", "spaces/UNKNOWN", _FakeApiError(404, "Not found"))
-
-        with pytest.raises(_FakeApiError):
-            await adapter.fetch_thread(tid)
+# (Duplicate fetchThread tests removed -- covered by test_gchat_api.py)
 
 
 class TestFetchChannelInfoComprehensive:
@@ -1436,29 +948,7 @@ class TestFetchChannelInfoComprehensive:
 # ===========================================================================
 
 
-class TestOpenDMComprehensive:
-    @pytest.mark.asyncio
-    async def test_finds_existing_dm(self):
-        adapter, api, _ = await _init_adapter()
-        api.set_response("GET", "spaces:findDirectMessage", {"name": "spaces/DM_EXISTING"})
-
-        result = await adapter.open_dm("users/12345")
-
-        decoded = decode_thread_id(result)
-        assert decoded.space_name == "spaces/DM_EXISTING"
-        assert decoded.is_dm is True
-
-    @pytest.mark.asyncio
-    async def test_creates_new_dm_when_not_found(self):
-        adapter, api, _ = await _init_adapter(impersonate_user="admin@example.com")
-        api.set_response("GET", "spaces:findDirectMessage", _FakeApiError(404, "Not found"))
-        api.set_response("POST", "spaces:setup", {"name": "spaces/DM_NEW"})
-
-        result = await adapter.open_dm("users/67890")
-
-        decoded = decode_thread_id(result)
-        assert decoded.space_name == "spaces/DM_NEW"
-        assert decoded.is_dm is True
+# (Duplicate openDM tests removed -- covered by test_gchat_api.py)
 
 
 # ===========================================================================
@@ -1467,22 +957,7 @@ class TestOpenDMComprehensive:
 
 
 class TestHandleGoogleChatErrorComprehensive:
-    def test_429_raises_adapter_rate_limit(self):
-        adapter = _make_adapter()
-        with pytest.raises(AdapterRateLimitError):
-            adapter._handle_google_chat_error(_FakeApiError(429, "Too many requests"), "test")
-
-    def test_403_rethrows(self):
-        adapter = _make_adapter()
-        original = _FakeApiError(403, "Forbidden")
-        with pytest.raises(_FakeApiError):
-            adapter._handle_google_chat_error(original, "editMessage")
-
-    def test_404_rethrows(self):
-        adapter = _make_adapter()
-        original = _FakeApiError(404, "Not found")
-        with pytest.raises(_FakeApiError):
-            adapter._handle_google_chat_error(original, "deleteMessage")
+    """Unique error handling tests not covered by test_gchat_api.py."""
 
     def test_500_rethrows(self):
         adapter = _make_adapter()
@@ -1490,338 +965,12 @@ class TestHandleGoogleChatErrorComprehensive:
         with pytest.raises(_FakeApiError):
             adapter._handle_google_chat_error(original, "postMessage")
 
-    def test_logs_context_in_error(self):
-        from chat_sdk.logger import Logger
-
-        mock_logger = MagicMock(spec=Logger)
-        adapter = GoogleChatAdapter(
-            GoogleChatAdapterConfig(
-                credentials=_make_credentials(),
-                logger=mock_logger,
-            )
-        )
-
-        import contextlib
-
-        with contextlib.suppress(_FakeApiError):
-            adapter._handle_google_chat_error(_FakeApiError(500, "Fail"), "postMessage")
-
-        mock_logger.error.assert_called()
-        call_args = mock_logger.error.call_args
-        assert "postMessage" in call_args[0][0]
-
 
 # ===========================================================================
-# startTyping (no-op) / stream
+# (Duplicate startTyping / stream / postEphemeral / renderFormatted /
+#  channelIdFromThreadId / userInfoCaching / workspaceEvents /
+#  botUserIdPersistence tests removed -- covered by test_gchat_api.py)
 # ===========================================================================
-
-
-class TestStartTypingAndStream:
-    @pytest.mark.asyncio
-    async def test_start_typing_is_no_op(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-
-        await adapter.start_typing(tid)
-
-        assert len(api.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_start_typing_with_status_is_no_op(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123")
-
-        await adapter.start_typing(tid, status="Thinking...")
-
-        assert len(api.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_stream_delegates_to_post_message(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response("POST", "spaces/ABC123/messages", {"name": "spaces/ABC123/messages/streamed1"})
-
-        async def _text_stream():
-            yield "Accumulated text"
-
-        result = await adapter.stream(tid, _text_stream())
-
-        assert result.id == "spaces/ABC123/messages/streamed1"
-        calls = api.get_calls("POST", "spaces/ABC123/messages")
-        assert len(calls) == 1
-
-
-# ===========================================================================
-# postEphemeral
-# ===========================================================================
-
-
-class TestPostEphemeral:
-    @pytest.mark.asyncio
-    async def test_posts_ephemeral_message(self):
-        adapter, api, _ = await _init_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        api.set_response("POST", "spaces/ABC123/messages", {"name": "spaces/ABC123/messages/eph1"})
-
-        result = await adapter.post_ephemeral(tid, "users/100", "Ephemeral text")
-
-        assert result.id == "spaces/ABC123/messages/eph1"
-        assert result.used_fallback is False
-        calls = api.get_calls("POST", "spaces/ABC123/messages")
-        assert calls[0]["body"]["privateMessageViewer"]["name"] == "users/100"
-
-
-# ===========================================================================
-# renderFormatted
-# ===========================================================================
-
-
-class TestRenderFormattedComprehensive:
-    def test_renders_empty_ast(self):
-        adapter = _make_adapter()
-        result = adapter.render_formatted({"type": "root", "children": []})
-        assert isinstance(result, str)
-        assert result == ""
-
-    def test_renders_paragraph(self):
-        adapter = _make_adapter()
-        result = adapter.render_formatted(
-            {
-                "type": "root",
-                "children": [{"type": "paragraph", "children": [{"type": "text", "value": "Hello world"}]}],
-            }
-        )
-        assert "Hello world" in result
-
-
-# ===========================================================================
-# channelIdFromThreadId - comprehensive
-# ===========================================================================
-
-
-class TestChannelIdComprehensive:
-    def test_extracts_space_name(self):
-        adapter = _make_adapter()
-        tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
-        assert adapter.channel_id_from_thread_id(tid) == "gchat:spaces/ABC123"
-
-    def test_works_without_thread_name(self):
-        adapter = _make_adapter()
-        tid = _encode_tid("spaces/ONLY")
-        assert adapter.channel_id_from_thread_id(tid) == "gchat:spaces/ONLY"
-
-    def test_works_with_dm_thread(self):
-        adapter = _make_adapter()
-        tid = _encode_tid("spaces/DM_SPACE", is_dm=True)
-        assert adapter.channel_id_from_thread_id(tid) == "gchat:spaces/DM_SPACE"
-
-
-# ===========================================================================
-# User info caching
-# ===========================================================================
-
-
-class TestUserInfoCachingComprehensive:
-    @pytest.mark.asyncio
-    async def test_resolve_display_name_uses_provided(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        name = await cache.resolve_display_name("users/100", "Alice", None, "bot")
-
-        assert name == "Alice"
-
-    @pytest.mark.asyncio
-    async def test_resolve_display_name_falls_back_to_cache(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        await cache.set("users/100", "Cached Alice")
-
-        name = await cache.resolve_display_name("users/100", None, None, "bot")
-
-        assert name == "Cached Alice"
-
-    @pytest.mark.asyncio
-    async def test_resolve_display_name_uses_bot_name_for_self(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        name = await cache.resolve_display_name("users/BOT1", None, "users/BOT1", "mybot")
-
-        assert name == "mybot"
-
-    @pytest.mark.asyncio
-    async def test_resolve_display_name_falls_back_to_user_id(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        name = await cache.resolve_display_name("users/999", None, None, "bot")
-
-        assert name == "User 999"
-
-    @pytest.mark.asyncio
-    async def test_cache_hit_after_set(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        await cache.set("users/200", "Bob", "bob@example.com")
-        result = await cache.get("users/200")
-
-        assert result is not None
-        assert result.display_name == "Bob"
-        assert result.email == "bob@example.com"
-
-    @pytest.mark.asyncio
-    async def test_cache_miss(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        result = await cache.get("users/nonexistent")
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_ignores_unknown_display_name(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        await cache.set("users/300", "unknown")
-        result = await cache.get("users/300")
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_in_memory_cache_is_fast_path(self):
-        state = _make_mock_state()
-        cache = UserInfoCache(state, MagicMock())
-
-        await cache.set("users/400", "Carol")
-        state._storage.clear()
-
-        result = await cache.get("users/400")
-        assert result is not None
-        assert result.display_name == "Carol"
-
-
-# ===========================================================================
-# Workspace events subscription lifecycle
-# ===========================================================================
-
-
-class TestWorkspaceEventsComprehensive:
-    @pytest.mark.asyncio
-    async def test_skip_subscription_without_pubsub_topic(self):
-        adapter, api, _ = await _init_adapter()
-
-        await adapter.on_thread_subscribe(_encode_tid("spaces/ABC123"))
-
-        assert len(api.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_ensure_space_subscription_skips_without_state(self):
-        adapter = _make_adapter(pubsub_topic="projects/test/topics/test")
-        mock_api = MockGChatApi()
-        _patch_api(adapter, mock_api)
-
-        await adapter._ensure_space_subscription("spaces/ABC123")
-
-        assert len(mock_api.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_finds_existing_subscription_in_cache(self):
-        adapter, api, state = await _init_adapter(pubsub_topic="projects/test/topics/test")
-
-        cache_key = "gchat:space-sub:spaces/ABC123"
-        far_future = int(time.time() * 1000) + 24 * 60 * 60 * 1000
-        state._storage[cache_key] = {"subscription_name": "subscriptions/sub1", "expire_time": far_future}
-
-        await adapter._ensure_space_subscription("spaces/ABC123")
-
-        assert len(api.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_skips_duplicate_in_flight_subscription(self):
-        adapter, api, state = await _init_adapter(pubsub_topic="projects/test/topics/test")
-
-        event = asyncio.Event()
-        adapter._pending_subscriptions["spaces/TEST1"] = {"event": event, "error": None}
-
-        async def wait_and_set():
-            await asyncio.sleep(0.01)
-            event.set()
-
-        task = asyncio.create_task(wait_and_set())
-        await adapter._ensure_space_subscription("spaces/TEST1")
-        await task
-
-        assert len(api.calls) == 0
-
-
-# ===========================================================================
-# Bot user ID learning - persists after learning
-# ===========================================================================
-
-
-class TestBotUserIdPersistence:
-    def test_persists_bot_id_after_learning(self):
-        adapter = _make_adapter()
-
-        # First message: learn bot ID
-        event = _make_message_event(
-            message_text="@MyBot hello",
-            annotations=[
-                {
-                    "type": "USER_MENTION",
-                    "startIndex": 0,
-                    "length": 6,
-                    "userMention": {
-                        "user": {
-                            "name": "users/MY_BOT_ID",
-                            "displayName": "MyBot",
-                            "type": "BOT",
-                        },
-                        "type": "MENTION",
-                    },
-                },
-            ],
-        )
-        adapter.parse_message(event)
-
-        # Second message: detect self
-        self_event = _make_message_event(
-            sender_name="users/MY_BOT_ID",
-            sender_type="BOT",
-            sender_display_name="MyBot",
-            message_text="Hello back",
-            message_name="spaces/ABC123/messages/msg2",
-        )
-        msg = adapter.parse_message(self_event)
-        assert msg.author.is_me is True
-
-
-# ===========================================================================
-# handleWebhook - non-message event returns 200
-# ===========================================================================
-
-
-class TestHandleWebhookNonMessageEvents:
-    @pytest.mark.asyncio
-    async def test_non_message_event_returns_200(self):
-        adapter = _make_adapter()
-        state = _make_mock_state()
-        chat = _make_mock_chat(state)
-        await adapter.initialize(chat)
-
-        response = await adapter.handle_webhook({"chat": {}})
-        assert response["status"] == 200
-
-    @pytest.mark.asyncio
-    async def test_not_process_when_not_initialized(self):
-        adapter = _make_adapter()
-        event = _make_message_event()
-        response = await adapter.handle_webhook(event)
-        assert response["status"] == 200
 
 
 # ===========================================================================

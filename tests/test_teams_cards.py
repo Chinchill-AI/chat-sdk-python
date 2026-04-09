@@ -5,8 +5,6 @@ Ported from packages/adapter-teams/src/cards.test.ts.
 
 from __future__ import annotations
 
-import pytest
-
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card, card_to_fallback_text
 from chat_sdk.cards import (
     Actions,
@@ -21,7 +19,6 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
 )
-
 
 # ---------------------------------------------------------------------------
 # cardToAdaptiveCard

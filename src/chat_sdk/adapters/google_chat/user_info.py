@@ -34,6 +34,8 @@ class UserInfoCache:
     Uses both in-memory cache (fast path) and persistent state adapter.
     """
 
+    _MAX_CACHE_SIZE = 1000
+
     def __init__(
         self,
         state: StateAdapter | None,
@@ -57,6 +59,14 @@ class UserInfoCache:
 
         # Always update in-memory cache
         self._in_memory_cache[user_id] = user_info
+
+        # Evict oldest entries when cache exceeds max size
+        if len(self._in_memory_cache) > self._MAX_CACHE_SIZE:
+            # Remove the oldest entries (first inserted in dict order)
+            excess = len(self._in_memory_cache) - self._MAX_CACHE_SIZE
+            keys_to_remove = list(self._in_memory_cache.keys())[:excess]
+            for key in keys_to_remove:
+                del self._in_memory_cache[key]
 
         # Also persist to state adapter if available
         if self._state:

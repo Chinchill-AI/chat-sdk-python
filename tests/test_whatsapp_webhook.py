@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
 from chat_sdk.adapters.whatsapp.adapter import (
     WhatsAppAdapter,
     split_message,

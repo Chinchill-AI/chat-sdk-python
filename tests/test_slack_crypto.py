@@ -9,9 +9,9 @@ import base64
 import os
 
 import pytest
+from cryptography.exceptions import InvalidTag
 
 from chat_sdk.adapters.slack.crypto import (
-    EncryptedTokenData,
     decode_key,
     decrypt_token,
     encrypt_token,
@@ -46,14 +46,14 @@ class TestEncryptDecrypt:
         token = "xoxb-secret"
         encrypted = encrypt_token(token, TEST_KEY)
         wrong_key = os.urandom(32)
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidTag):
             decrypt_token(encrypted, wrong_key)
 
     def test_tampered_ciphertext_raises(self):
         token = "xoxb-secret"
         encrypted = encrypt_token(token, TEST_KEY)
         encrypted.data = base64.b64encode(b"tampered").decode("ascii")
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidTag):
             decrypt_token(encrypted, TEST_KEY)
 
 
@@ -83,7 +83,7 @@ class TestDecodeKey:
             decode_key(short_key)
 
     def test_empty_string_raises(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             decode_key("")
 
 

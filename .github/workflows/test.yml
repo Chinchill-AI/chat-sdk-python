@@ -23,5 +23,7 @@ jobs:
         run: uv run ruff check src/
       - name: Format check
         run: uv run ruff format --check src/
+      - name: Test quality audit
+        run: uv run python scripts/audit_test_quality.py
       - name: Run tests
         run: uv run pytest tests/ -q --tb=short --cov=chat_sdk --cov-fail-under=70

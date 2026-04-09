@@ -17,10 +17,10 @@ from chat_sdk.shared.card_utils import (
 )
 from chat_sdk.shared.errors import (
     AdapterError,
+    AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
     NetworkError,
-    PermissionError,
     ResourceNotFoundError,
     ValidationError,
 )
@@ -52,7 +52,7 @@ __all__ = [
     "MockLogger",
     "MockStateAdapter",
     "NetworkError",
-    "PermissionError",
+    "AdapterPermissionError",
     "PlatformName",
     "ResourceNotFoundError",
     "StreamingMarkdownRenderer",

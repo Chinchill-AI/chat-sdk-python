@@ -27,7 +27,7 @@ from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
-from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
+from chat_sdk.shared.errors import ValidationError
 
 DM_SUFFIX_PATTERN = re.compile(r":dm$")
 
@@ -67,9 +67,9 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_logger = MagicMock(return_value=MagicMock())
-    chat.process_message = AsyncMock()
-    chat.process_reaction = AsyncMock()
-    chat.process_action = AsyncMock()
+    chat.process_message = MagicMock()
+    chat.process_reaction = MagicMock()
+    chat.process_action = MagicMock()
     return chat
 
 
@@ -445,17 +445,6 @@ class TestPubSubMessageParsing:
 
 
 class TestGoogleChatErrorHandling:
-    def test_rate_limit_429_raises_adapter_rate_limit_error(self):
-        adapter = _make_adapter()
-        with pytest.raises(AdapterRateLimitError):
-            adapter._handle_google_chat_error(_FakeApiError(429, "Too many requests"), "test")
-
-    def test_non_429_rethrows_original_error(self):
-        adapter = _make_adapter()
-        original = _FakeApiError(500, "Server error")
-        with pytest.raises(_FakeApiError):
-            adapter._handle_google_chat_error(original, "test")
-
     def test_403_rethrows_original_error(self):
         adapter = _make_adapter()
         original = _FakeApiError(403, "Forbidden")
@@ -542,18 +531,6 @@ class TestConstructorConfig:
     def test_adapter_name_is_gchat(self):
         adapter = _make_adapter()
         assert adapter.name == "gchat"
-
-    def test_no_auth_raises(self):
-        with pytest.raises(Exception):
-            GoogleChatAdapter(GoogleChatAdapterConfig())
-
-    def test_default_user_name(self):
-        adapter = _make_adapter()
-        assert adapter.user_name == "bot"
-
-    def test_custom_user_name(self):
-        adapter = _make_adapter(user_name="mybot")
-        assert adapter.user_name == "mybot"
 
 
 # ---------------------------------------------------------------------------
@@ -642,10 +619,10 @@ class TestSenderEmailParsing:
 class TestNoMessagePayloadError:
     def test_parse_message_with_empty_event_raises(self):
         adapter = _make_adapter()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             adapter.parse_message({})
 
     def test_parse_message_with_empty_chat_raises(self):
         adapter = _make_adapter()
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             adapter.parse_message({"chat": {}})

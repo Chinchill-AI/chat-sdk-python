@@ -22,7 +22,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from chat_sdk.testing import create_mock_adapter
+
 from chat_sdk.types import (
     Author,
     MemberJoinedChannelEvent,
@@ -32,7 +32,6 @@ from chat_sdk.types import (
 )
 
 from .conftest import create_chat, create_msg
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -170,11 +169,10 @@ class TestMemberJoinedChannel:
         adapter = adapters["slack"]
 
         event = _make_member_joined_event(adapter)
-        # No assertion needed -- tests that processing an event without a handler
-        # completes without raising
+        # No handler registered -- processing completes silently
+        assert len(chat._member_joined_channel_handlers) == 0
         chat.process_member_joined_channel(event)
         await asyncio.sleep(0.05)
-        assert True
 
 
 # ============================================================================

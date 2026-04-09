@@ -28,6 +28,7 @@ class ButtonElement(_ButtonRequired, total=False):
     style: ButtonStyle
     value: str
     disabled: bool
+    action_type: Literal["action", "modal"] | None
 
 
 class _LinkButtonRequired(TypedDict):
@@ -254,6 +255,7 @@ def Button(
     style: ButtonStyle | None = None,
     value: str | None = None,
     disabled: bool | None = None,
+    action_type: Literal["action", "modal"] | None = None,
 ) -> ButtonElement:
     """Create a Button element.
 
@@ -261,6 +263,7 @@ def Button(
 
         Button(id="submit", label="Submit", style="primary")
         Button(id="delete", label="Delete", style="danger", value="item-123")
+        Button(id="open", label="Open", action_type="modal")
     """
     element: ButtonElement = {"type": "button", "id": id, "label": label}
     if style is not None:
@@ -269,6 +272,8 @@ def Button(
         element["value"] = value
     if disabled is not None:
         element["disabled"] = disabled
+    if action_type is not None:
+        element["action_type"] = action_type
     return element
 
 
@@ -410,7 +415,7 @@ def card_child_to_fallback_text(child: CardChild) -> str | None:
             for f in child.get("children", [])  # type: ignore[union-attr]
         )
     if child_type == "divider":
-        return "---"
+        return None
     if child_type == "table":
         return table_element_to_ascii(
             child.get("headers", []),  # type: ignore[union-attr]
@@ -424,7 +429,5 @@ def card_child_to_fallback_text(child: CardChild) -> str | None:
                 parts.append(text)
         return "\n".join(parts)
     if child_type == "image":
-        alt = child.get("alt", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
-        return f"[{alt}]({url})" if alt else url
+        return None
     return None

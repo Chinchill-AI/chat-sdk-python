@@ -17,6 +17,7 @@ import time
 import uuid
 from typing import Any
 
+from chat_sdk.errors import StateNotConnectedError
 from chat_sdk.types import Lock, QueueEntry
 
 _logger = logging.getLogger(__name__)
@@ -570,7 +571,7 @@ class PostgresStateAdapter:
 
     def _ensure_connected(self) -> None:
         if not self._connected:
-            raise RuntimeError("PostgresStateAdapter is not connected. Call connect() first.")
+            raise StateNotConnectedError("PostgresStateAdapter")
 
     async def _ensure_schema(self) -> None:
         """Create required tables and indexes if they do not exist."""

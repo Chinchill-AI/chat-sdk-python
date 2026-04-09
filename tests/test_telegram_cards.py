@@ -7,6 +7,7 @@ and emptyTelegramInlineKeyboard.
 from __future__ import annotations
 
 import pytest
+
 from chat_sdk.adapters.telegram.cards import (
     card_to_telegram_inline_keyboard,
     decode_telegram_callback_data,

@@ -48,7 +48,7 @@ class ResourceNotFoundError(AdapterError):
         self.resource_id = resource_id
 
 
-class PermissionError(AdapterError):
+class AdapterPermissionError(AdapterError):
     """Permission denied error."""
 
     def __init__(self, adapter: str, action: str, required_scope: str | None = None) -> None:

@@ -11,19 +11,13 @@ import pytest
 
 from chat_sdk.modals import (
     Modal,
-    ModalElement,
     RadioSelect,
-    RadioSelectElement,
     Select,
-    SelectElement,
     SelectOption,
-    SelectOptionElement,
     TextInput,
-    TextInputElement,
     filter_modal_children,
     is_modal_element,
 )
-
 
 # ---------------------------------------------------------------------------
 # Modal builder
