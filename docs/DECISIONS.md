@@ -130,51 +130,6 @@ The required methods from the `Adapter` protocol (18 methods) must still be impl
 
 ## Known Non-Parity with TypeScript SDK
 
-Intentional differences from the Vercel Chat TS SDK, collected in one place so they
-stay explicit instead of being rediscovered in code review.
-
-### By design (won't fix)
-
-| Area | Python behavior | TS behavior | Rationale |
-|------|----------------|-------------|-----------|
-| JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
-| Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See "Why Hand-Rolled Markdown Parser" above |
-| `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
-| `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |
-| `ast_to_plain_text` | Joins blocks with `\n` | Concatenates directly | More readable output |
-| `renderPostable` on unknown input | Returns `str(message)` | Throws `Error` | More resilient |
-| Global singleton | Same as TS (`set_chat_singleton`) | Same | Sharp edge for multi-chat; documented |
-
-### Platform-specific
-
-| Area | Python | TS | Rationale |
-|------|--------|-----|-----------|
-| Teams certificate auth | Rejected (app password only) | Supported | Low demand; can add later |
-| Teams `dialog_open_timeout_ms` config | Not implemented | Configurable | Low demand |
-| Google Chat file uploads | Ignored in message parse | Supported | API complexity; can add later |
-| Discord Gateway WebSocket | HTTP interactions only | Both HTTP and Gateway | Gateway requires persistent connection |
-
-### Serialization
-
-| Area | Python | TS |
-|------|--------|-----|
-| `to_json()` keys | camelCase (matches TS) | camelCase |
-| `from_json()` | Accepts both camelCase and snake_case | camelCase only |
-| Slack installation keys | camelCase (matches TS, with snake_case fallback) | camelCase |
-| Redis/Postgres queue entries | Different wire format (message serialized via `to_json()`) | `JSON.stringify(entry)` directly |
-
-### Coverage confidence
-
-| Module | Confidence | Gap |
-|--------|-----------|-----|
-| Core (chat/thread/channel) | High | 519 TS tests matched |
-| Slack adapter | High | Extensive replay + unit tests |
-| Discord adapter | Medium-High | Good replay coverage |
-| Teams adapter | Medium | Replay tests; JWT auth hand-rolled |
-| Telegram adapter | Medium | Good unit tests; no recorded fixtures |
-| Google Chat adapter | Medium-Low | Complex; workspace events undertested |
-| WhatsApp adapter | Medium-Low | Media download, group messages undertested |
-| GitHub adapter | Medium | PR + issue comment coverage |
-| Linear adapter | Medium | Comment + reaction coverage |
-| Redis state | Medium | Mocked; no live Redis tests |
-| Postgres state | Medium | Mocked; no live Postgres tests |
+See [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md#known-non-parity-with-typescript-sdk) for the
+full list of intentional divergences, platform gaps, serialization differences, and
+coverage confidence levels.
