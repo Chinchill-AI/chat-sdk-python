@@ -50,19 +50,23 @@ The tradeoff is that we must maintain the JWKS fetching and JWT validation code 
 
 5. **Not classes**: The builders are functions that return TypedDicts, not class constructors. Using PascalCase for class constructors is standard Python. Using it for factory functions is a deliberate style choice for this domain.
 
-## Why Global Singleton on Chat
+## Why 3-Level Chat Resolver
 
-**Decision**: `Chat` registers itself as a global singleton via `set_chat_singleton(self)`. Thread and Channel deserialization uses `get_chat_singleton()` to resolve adapters.
+**Decision**: Thread and Channel deserialization resolves the active Chat instance through a 3-level chain: explicit `chat=` parameter → `ContextVar` → process-global fallback.
 
 **Rationale**:
 
-1. **Deserialization without context**: When a `ThreadImpl` is deserialized from JSON (e.g., from Redis state, from a queued entry, from modal context), it needs to resolve its adapter by name. Without a singleton, every deserialization call would need an explicit `chat` parameter threaded through the call stack.
+1. **Explicit is best**: `ThreadImpl.from_json(data, chat=chat)` is unambiguous and needs no ambient state. Preferred for library code and multi-tenant servers.
 
-2. **Matches TS SDK**: The TS SDK uses `chat-singleton.ts` with the same pattern. Keeping the pattern identical reduces the cognitive load of syncing changes.
+2. **ContextVar for async isolation**: `chat.activate()` sets a task-local `ContextVar`. Concurrent async tasks can each have their own Chat without interference. This is the natural Python pattern for request-scoped state (same approach the Slack adapter uses for per-request auth context).
 
-3. **Single Chat instance is the normal case**: In practice, applications have exactly one `Chat` instance. The singleton is registered during initialization and remains for the lifetime of the process.
+3. **Global fallback for simplicity**: `chat.register_singleton()` sets a process-global default. This is the TS SDK's pattern and works for the common single-Chat-per-process case. Existing code using `register_singleton()` is unchanged.
 
-4. **Testing escape hatch**: `clear_chat_singleton()` and `has_chat_singleton()` are provided for test isolation. Each test can register its own singleton.
+4. **Resolution order**: `get_chat_singleton()` checks ContextVar first, then global, then raises `RuntimeError`. This means `activate()` always wins over the global, and explicit `chat=` always wins over both.
+
+5. **Testing isolation**: Each test can use `with chat.activate():` or pass `chat=` explicitly instead of fighting over a single global. `clear_chat_singleton()` is still available for cleanup.
+
+6. **Upstream sync cost is low**: The TS SDK uses a pure global. The Python resolver is a strict superset — `register_singleton()` and `get_chat_singleton()` still exist and behave identically for single-Chat usage. Upstream ports that touch deserialization paths work without modification.
 
 ## Why Zero Runtime Dependencies in Core
 

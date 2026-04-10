@@ -15,6 +15,7 @@ import asyncio
 import pytest
 
 from chat_sdk import Chat, MemoryStateAdapter
+from chat_sdk.channel import ChannelImpl
 from chat_sdk.testing import create_mock_adapter
 from chat_sdk.thread import (
     ThreadImpl,
@@ -35,6 +36,16 @@ def _thread_json(adapter_name: str = "slack") -> dict:
         "_type": "chat:Thread",
         "id": "t1",
         "channelId": f"{adapter_name}:C1",
+        "channelVisibility": "public",
+        "isDM": False,
+        "adapterName": adapter_name,
+    }
+
+
+def _channel_json(adapter_name: str = "slack") -> dict:
+    return {
+        "_type": "chat:Channel",
+        "id": f"{adapter_name}:C1",
         "channelVisibility": "public",
         "isDM": False,
         "adapterName": adapter_name,
@@ -250,3 +261,74 @@ class TestReviver:
         assert reviver("key", "plain string") == "plain string"
         assert reviver("key", 42) == 42
         assert reviver("key", {"no_type": True}) == {"no_type": True}
+
+    def test_reviver_deserializes_channel(self):
+        chat = _make_chat("slack")
+        reviver = chat.reviver()
+        data = _channel_json("slack")
+        channel = reviver("key", data)
+        assert isinstance(channel, ChannelImpl)
+        assert channel.adapter.name == "slack"
+
+    def test_reviver_channel_bound_to_specific_chat(self):
+        chat_a = _make_chat("a")
+        chat_b = _make_chat("b")
+
+        reviver_a = chat_a.reviver()
+        reviver_b = chat_b.reviver()
+
+        ch_a = reviver_a("k", _channel_json("a"))
+        ch_b = reviver_b("k", _channel_json("b"))
+
+        assert ch_a.adapter.name == "a"
+        assert ch_b.adapter.name == "b"
+
+
+class TestChannelImplResolver:
+    """Symmetric ChannelImpl coverage for the 3-level resolver."""
+
+    def setup_method(self):
+        clear_chat_singleton()
+
+    def teardown_method(self):
+        clear_chat_singleton()
+
+    def test_explicit_chat_parameter(self):
+        chat = _make_chat("slack")
+        data = _channel_json("slack")
+        channel = ChannelImpl.from_json(data, chat=chat)
+        assert channel.adapter.name == "slack"
+
+    def test_explicit_chat_beats_global(self):
+        global_chat = _make_chat("global")
+        explicit_chat = _make_chat("explicit")
+        global_chat.register_singleton()
+
+        channel = ChannelImpl.from_json(_channel_json("explicit"), chat=explicit_chat)
+        assert channel.adapter.name == "explicit"
+
+    def test_activate_resolves_channel(self):
+        chat = _make_chat("slack")
+        with chat.activate():
+            channel = ChannelImpl.from_json(_channel_json("slack"))
+            assert channel.adapter.name == "slack"
+
+    def test_explicit_chat_without_singleton(self):
+        chat = _make_chat("solo")
+        channel = ChannelImpl.from_json(_channel_json("solo"), chat=chat)
+        assert channel.adapter.name == "solo"
+
+    async def test_concurrent_channel_isolation(self):
+        chat_a = _make_chat("ca")
+        chat_b = _make_chat("cb")
+        results: dict[str, str] = {}
+
+        async def task(chat: Chat, name: str) -> None:
+            with chat.activate():
+                await asyncio.sleep(0.01)
+                channel = ChannelImpl.from_json(_channel_json(name))
+                results[name] = channel.adapter.name
+
+        await asyncio.gather(task(chat_a, "ca"), task(chat_b, "cb"))
+        assert results["ca"] == "ca"
+        assert results["cb"] == "cb"
