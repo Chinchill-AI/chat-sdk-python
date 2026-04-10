@@ -759,17 +759,19 @@ class Chat:
     def reviver(self) -> Callable[[str, Any], Any]:
         """Return a JSON reviver that deserializes Thread/Channel/Message objects.
 
-        Ensures this Chat instance is the registered singleton.
+        Uses explicit ``chat=self`` for deserialization instead of mutating
+        process-global state. Each Chat instance produces a reviver bound
+        to itself.
         """
-        self.register_singleton()
+        chat = self
 
         def _reviver(key: str, value: Any) -> Any:
             if isinstance(value, dict) and "_type" in value:
                 t = value["_type"]
                 if t == "chat:Thread":
-                    return ThreadImpl.from_json(value)
+                    return ThreadImpl.from_json(value, chat=chat)
                 if t == "chat:Channel":
-                    return ChannelImpl.from_json(value)
+                    return ChannelImpl.from_json(value, chat=chat)
                 if t == "chat:Message":
                     return _message_from_json(value)
             return value
