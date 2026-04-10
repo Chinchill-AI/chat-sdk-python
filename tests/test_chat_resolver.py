@@ -378,6 +378,40 @@ class TestChannelImplResolver:
         channel = ChannelImpl.from_json(_channel_json("solo"), chat=chat)
         assert channel.adapter.name == "solo"
 
+    def test_explicit_chat_beats_contextvar(self):
+        context_chat = _make_chat("context")
+        explicit_chat = _make_chat("explicit")
+
+        with context_chat.activate():
+            channel = ChannelImpl.from_json(_channel_json("explicit"), chat=explicit_chat)
+            assert channel.adapter.name == "explicit"
+
+    def test_mismatched_adapter_raises(self):
+        chat = _make_chat("slack")
+        with pytest.raises(RuntimeError, match='Adapter "nonexistent" not found'):
+            ChannelImpl.from_json(_channel_json("nonexistent"), chat=chat)
+
+    def test_from_json_errors_when_no_singleton(self):
+        channel = ChannelImpl.from_json(_channel_json("slack"))
+        with pytest.raises(RuntimeError, match="No Chat instance available"):
+            _ = channel.adapter
+
+    def test_eager_bind_survives_context_exit(self):
+        chat = _make_chat("slack")
+        with chat.activate():
+            channel = ChannelImpl.from_json(_channel_json("slack"))
+        assert channel.adapter.name == "slack"
+
+    def test_eager_bind_prevents_wrong_chat(self):
+        chat_a = _make_chat("a_adapter")
+        chat_b = _make_chat("b_adapter")
+
+        with chat_a.activate():
+            channel = ChannelImpl.from_json(_channel_json("a_adapter"))
+
+        with chat_b.activate():
+            assert channel.adapter.name == "a_adapter"
+
     async def test_concurrent_channel_isolation(self):
         chat_a = _make_chat("ca")
         chat_b = _make_chat("cb")
