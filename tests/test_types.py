@@ -12,6 +12,7 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
     RawMessage,
+    ThinkingChunk,
 )
 
 
@@ -237,3 +238,21 @@ class TestRawMessage:
         assert raw.id == "raw-001"
         assert raw.thread_id == "thread-001"
         assert raw.raw["platform"] == "test"
+
+
+class TestThinkingChunk:
+    """Tests for ThinkingChunk dataclass."""
+
+    def test_defaults(self):
+        chunk = ThinkingChunk()
+        assert chunk.type == "thinking"
+        assert chunk.content == ""
+
+    def test_with_content(self):
+        chunk = ThinkingChunk(content="Analyzing the user's request")
+        assert chunk.type == "thinking"
+        assert chunk.content == "Analyzing the user's request"
+
+    def test_type_is_literal(self):
+        chunk = ThinkingChunk(content="step 1")
+        assert chunk.type == "thinking"

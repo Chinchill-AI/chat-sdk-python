@@ -741,6 +741,19 @@ class TaskUpdateChunk:
 
 
 @dataclass
+class ThinkingChunk:
+    """AI reasoning/thinking display.
+
+    Used by agents that emit structured thinking events (e.g. pydantic-ai
+    ``ThinkingPart``).  Adapters can render these as context blocks (Slack),
+    Adaptive Card sections (Teams), or styled text on other platforms.
+    """
+
+    type: Literal["thinking"] = "thinking"
+    content: str = ""
+
+
+@dataclass
 class PlanUpdateChunk:
     """Plan title update."""
 
@@ -748,7 +761,7 @@ class PlanUpdateChunk:
     title: str = ""
 
 
-StreamChunk = MarkdownTextChunk | TaskUpdateChunk | PlanUpdateChunk
+StreamChunk = MarkdownTextChunk | TaskUpdateChunk | ThinkingChunk | PlanUpdateChunk
 
 
 @dataclass

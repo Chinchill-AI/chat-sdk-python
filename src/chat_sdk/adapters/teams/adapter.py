@@ -785,20 +785,33 @@ class TeamsAdapter:
         accumulated = ""
         message_id: str | None = None
 
+        thinking = ""
+
         async for chunk in text_stream:
             text = ""
             if isinstance(chunk, str):
                 text = chunk
             elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                 text = chunk.get("text", "")
+            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
+                text = getattr(chunk, "text", "")
+            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "thinking":
+                thinking = getattr(chunk, "content", "")
+                # Render thinking as italic context above the main text
+                if accumulated or not message_id:
+                    continue  # Will be included in next text update
             if not text:
                 continue
 
             accumulated += text
 
+            display_text = accumulated
+            if thinking:
+                display_text = f"*{thinking}*\n\n{accumulated}"
+
             activity_payload = {
                 "type": "message",
-                "text": accumulated,
+                "text": display_text,
                 "textFormat": "markdown",
             }
 

@@ -2057,6 +2057,8 @@ class SlackAdapter:
                     chunk_data["output"] = chunk.output  # type: ignore[union-attr]
                 if hasattr(chunk, "text"):
                     chunk_data["text"] = chunk.text  # type: ignore[union-attr]
+                if hasattr(chunk, "content"):
+                    chunk_data["content"] = chunk.content  # type: ignore[union-attr]
 
                 if first:
                     await streamer.append(chunks=[chunk_data], token=token)

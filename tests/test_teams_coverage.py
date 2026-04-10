@@ -1085,6 +1085,53 @@ class TestStream:
         result = await adapter.stream(tid, text_stream())
         assert result.id == ""  # nothing sent
 
+    async def test_stream_thinking_chunk_renders_italic(self):
+        adapter = _make_adapter(logger=_make_logger())
+        update_mock = AsyncMock()
+        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        adapter._teams_update = update_mock
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        from chat_sdk.types import ThinkingChunk
+
+        async def text_stream():
+            yield ThinkingChunk(content="Analyzing request")
+            yield "Hello "
+            yield "World"
+
+        result = await adapter.stream(tid, text_stream())
+        assert result.raw["text"] == "Hello World"
+        # The update call should have included the italic thinking prefix
+        last_update_payload = update_mock.call_args_list[-1][0][2]
+        assert "*Analyzing request*" in last_update_payload["text"]
+
+    async def test_stream_thinking_chunk_without_text_is_skipped(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        adapter._teams_update = AsyncMock()
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        from chat_sdk.types import ThinkingChunk
+
+        async def text_stream():
+            yield ThinkingChunk(content="Just thinking...")
+
+        result = await adapter.stream(tid, text_stream())
+        # No text was yielded so nothing should have been sent
+        assert result.raw["text"] == ""
+
 
 # ---------------------------------------------------------------------------
 # _extract_card_title
