@@ -84,6 +84,40 @@ class TestGlobalSingleton:
         with pytest.raises(RuntimeError, match="No Chat instance available"):
             get_chat_singleton()
 
+    def test_from_json_errors_when_no_singleton(self):
+        """from_json without chat= or singleton raises RuntimeError on adapter access."""
+        data = _thread_json("slack")
+        thread = ThreadImpl.from_json(data)
+        # Thread is created but adapter resolution fails lazily
+        with pytest.raises(RuntimeError, match="No Chat instance available"):
+            _ = thread.adapter
+
+    def test_from_json_with_mismatched_adapter_name(self):
+        """from_json with chat= but wrong adapter name returns None adapter."""
+        chat = _make_chat("slack")
+        data = _thread_json("nonexistent")
+        thread = ThreadImpl.from_json(data, chat=chat)
+        # Adapter was resolved via chat.get_adapter("nonexistent") → None
+        assert thread._adapter is None
+
+
+class TestActivateExceptionSafety:
+    """activate() context manager resets ContextVar even after exceptions."""
+
+    def setup_method(self):
+        clear_chat_singleton()
+
+    def teardown_method(self):
+        clear_chat_singleton()
+
+    def test_contextvar_reset_after_exception(self):
+        chat = _make_chat()
+        with pytest.raises(ValueError, match="test error"), chat.activate():
+            assert get_chat_singleton() is chat
+            raise ValueError("test error")
+        # ContextVar should be reset after exception
+        assert not has_chat_singleton()
+
 
 class TestContextVarActivation:
     """chat.activate() scopes resolution to the current context."""
@@ -181,22 +215,23 @@ class TestConcurrentIsolation:
     async def test_concurrent_tasks_isolated(self):
         chat_a = _make_chat("adapter_a")
         chat_b = _make_chat("adapter_b")
-        results: dict[str, str] = {}
+        results: dict[str, str | None] = {}
 
-        async def task(chat: Chat, name: str) -> None:
+        async def task(chat: Chat, adapter_name: str) -> None:
             with chat.activate():
-                # Yield to let the other task run
                 await asyncio.sleep(0.01)
                 resolved = get_chat_singleton()
-                results[name] = resolved._user_name
+                # Verify via public API: check which adapter is registered
+                a = resolved.get_adapter(adapter_name)
+                results[adapter_name] = a.name if a else None
 
         await asyncio.gather(
-            task(chat_a, "a"),
-            task(chat_b, "b"),
+            task(chat_a, "adapter_a"),
+            task(chat_b, "adapter_b"),
         )
 
-        assert results["a"] == "adapter_a-bot"
-        assert results["b"] == "adapter_b-bot"
+        assert results["adapter_a"] == "adapter_a"
+        assert results["adapter_b"] == "adapter_b"
 
     async def test_concurrent_from_json_isolated(self):
         chat_a = _make_chat("aa")
