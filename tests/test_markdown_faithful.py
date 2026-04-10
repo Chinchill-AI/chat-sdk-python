@@ -514,6 +514,14 @@ class TestExtractPlainText:
         assert result == "bold text"
 
 
+class TestDeprecatedToPlainTextMethod:
+    """Tests for the deprecated toPlainText method (same behavior as extractPlainText)."""
+
+    def test_extracts_plain_text_from_platform_format(self):
+        result = _converter.extract_plain_text("**bold** text")
+        assert result == "bold text"
+
+
 class TestFromMarkdown:
     """Tests for fromMarkdown."""
 

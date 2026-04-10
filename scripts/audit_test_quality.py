@@ -20,17 +20,43 @@ import sys
 TEST_DIR = os.path.join(os.path.dirname(__file__), os.pardir, "tests")
 
 # Async methods that must use AsyncMock, not MagicMock
-KNOWN_ASYNC_METHODS = frozenset({
-    "get", "set", "delete", "set_if_not_exists", "append_to_list", "get_list",
-    "subscribe", "unsubscribe", "is_subscribed",
-    "acquire_lock", "release_lock", "extend_lock", "force_release_lock",
-    "enqueue", "dequeue", "queue_depth", "connect", "disconnect",
-    "post_message", "edit_message", "delete_message",
-    "add_reaction", "remove_reaction", "start_typing",
-    "fetch_messages", "fetch_thread", "fetch_message",
-    "fetch_channel_info", "fetch_channel_messages",
-    "list_threads", "open_dm", "open_modal", "post_channel_message",
-})
+KNOWN_ASYNC_METHODS = frozenset(
+    {
+        "get",
+        "set",
+        "delete",
+        "set_if_not_exists",
+        "append_to_list",
+        "get_list",
+        "subscribe",
+        "unsubscribe",
+        "is_subscribed",
+        "acquire_lock",
+        "release_lock",
+        "extend_lock",
+        "force_release_lock",
+        "enqueue",
+        "dequeue",
+        "queue_depth",
+        "connect",
+        "disconnect",
+        "post_message",
+        "edit_message",
+        "delete_message",
+        "add_reaction",
+        "remove_reaction",
+        "start_typing",
+        "fetch_messages",
+        "fetch_thread",
+        "fetch_message",
+        "fetch_channel_info",
+        "fetch_channel_messages",
+        "list_threads",
+        "open_dm",
+        "open_modal",
+        "post_channel_message",
+    }
+)
 
 # JSX-specific tests that legitimately use assert True
 JSX_ABSORBER_KEYWORDS = {"jsx", "cardelement"}
@@ -54,10 +80,7 @@ def check_phantoms(test_files):
                 continue
             if not node.name.startswith("test_"):
                 continue
-            stmts = [
-                s for s in node.body
-                if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
-            ]
+            stmts = [s for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
             if (
                 len(stmts) == 1
                 and isinstance(stmts[0], ast.Assert)

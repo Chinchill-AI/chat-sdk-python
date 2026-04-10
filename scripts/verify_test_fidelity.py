@@ -11,9 +11,9 @@ Usage:
 With --fix: appends stub test functions for any missing translations.
 """
 
+import os
 import re
 import sys
-import os
 from pathlib import Path
 
 TS_ROOT = os.environ.get("TS_ROOT", "/tmp/vercel-chat")
@@ -70,13 +70,13 @@ def extract_ts_tests(ts_path: str) -> list[tuple[str, str, str]]:
     return tests
 
 
-def extract_py_tests(py_path: str) -> set[str]:
-    """Extract all test function names from a Python file."""
+def extract_py_tests(py_path: str) -> list[str]:
+    """Extract all test function names from a Python file (with duplicates)."""
     if not os.path.exists(py_path):
-        return set()
+        return []
     with open(py_path) as f:
         content = f.read()
-    return set(re.findall(r"def (test_\w+)", content))
+    return re.findall(r"def (test_\w+)", content)
 
 
 def fuzzy_match(py_name, py_tests):
@@ -106,6 +106,8 @@ def fuzzy_match(py_name, py_tests):
 
 def check_fidelity(ts_rel: str, py_rel: str) -> tuple[list, list, int]:
     """Returns (missing, extra, matched)."""
+    from collections import Counter
+
     ts_path = os.path.join(TS_ROOT, ts_rel)
     py_path = os.path.join(PY_ROOT, py_rel)
 
@@ -114,20 +116,40 @@ def check_fidelity(ts_rel: str, py_rel: str) -> tuple[list, list, int]:
 
     ts_tests = extract_ts_tests(ts_path)
     py_tests = extract_py_tests(py_path)
-    remaining_py = set(py_tests)
+    # Use Counter as a multiset so duplicate names in different classes both count
+    remaining_py = Counter(py_tests)
 
     missing = []
     matched = 0
 
+    def consume(name: str) -> bool:
+        if remaining_py.get(name, 0) > 0:
+            remaining_py[name] -= 1
+            if remaining_py[name] == 0:
+                del remaining_py[name]
+            return True
+        return False
+
+    # Pass 1: exact matches first (prevents fuzzy from stealing exact names)
+    unmatched_ts: list[tuple[str, str, str]] = []
     for describe, ts_name, py_name in ts_tests:
-        m = fuzzy_match(py_name, remaining_py)
-        if m:
+        if consume(py_name):
             matched += 1
-            remaining_py.discard(m)
+        else:
+            unmatched_ts.append((describe, ts_name, py_name))
+
+    # Pass 2: fuzzy matches for remainder
+    remaining_set = set(remaining_py.keys())
+    for describe, ts_name, py_name in unmatched_ts:
+        m = fuzzy_match(py_name, remaining_set)
+        if m and consume(m):
+            matched += 1
+            if remaining_py.get(m, 0) == 0:
+                remaining_set.discard(m)
         else:
             missing.append((describe, ts_name, py_name))
 
-    extra = sorted(remaining_py)
+    extra = sorted(remaining_py.keys())
     return missing, extra, matched
 
 
@@ -150,10 +172,10 @@ def generate_stubs(ts_rel, missing):
             lines.append(f"\n\nclass {class_name}Stubs:")
             lines.append(f'    """Stubs for: {describe}"""')
 
-        lines.append(f"")
+        lines.append("")
         lines.append(f"    async def {py_name}(self):")
         lines.append(f'        # TS: it("{ts_name}")')
-        lines.append(f"        raise NotImplementedError(\"Translate from {ts_rel}\")")
+        lines.append(f'        raise NotImplementedError("Translate from {ts_rel}")')
 
     return "\n".join(lines)
 
@@ -220,7 +242,7 @@ def main() -> int:
         )
 
         if missing:
-            for describe, ts_name, py_name in missing[:5]:
+            for describe, ts_name, _py_name in missing[:5]:
                 print(f"    MISSING: [{describe}] {ts_name}")
             if len(missing) > 5:
                 print(f"    ... and {len(missing) - 5} more")
@@ -244,8 +266,7 @@ def main() -> int:
     print(f"\n{'=' * 70}")
     if total_absorbers:
         print(
-            f"TOTAL: {total_matched}/{total_ts} matched ({pct}%),"
-            f" {total_missing} missing, {total_absorbers} absorbers"
+            f"TOTAL: {total_matched}/{total_ts} matched ({pct}%), {total_missing} missing, {total_absorbers} absorbers"
         )
         print(f"  Real tests: {real_total} | Absorbers: {total_absorbers}")
     else:
