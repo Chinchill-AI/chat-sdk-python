@@ -894,14 +894,15 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
                 yield item
                 continue
 
-            # AI SDK v5 uses textDelta, v6 uses text; also accept delta
+            # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
             if item_type == "text-delta":
-                text_content = (
-                    getattr(item, "text", None)
-                    or getattr(item, "delta", None)
-                    or getattr(item, "textDelta", None)
-                    or getattr(item, "text_delta", None)
-                    or ""
+                text_content = next(
+                    (
+                        v
+                        for k in ("text", "delta", "textDelta", "text_delta")
+                        if (v := getattr(item, k, None)) is not None
+                    ),
+                    "",
                 )
                 if isinstance(text_content, str) and text_content:
                     if needs_separator and has_emitted_text:
@@ -921,8 +922,9 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
                 continue
 
             if t == "text-delta":
-                text_content = (
-                    item.get("text") or item.get("delta") or item.get("textDelta") or item.get("text_delta") or ""
+                text_content = next(
+                    (v for k in ("text", "delta", "textDelta", "text_delta") if (v := item.get(k)) is not None),
+                    "",
                 )
                 if isinstance(text_content, str) and text_content:
                     if needs_separator and has_emitted_text:

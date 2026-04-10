@@ -28,6 +28,7 @@ MAPPING = {
     "packages/chat/src/streaming-markdown.test.ts": "tests/test_streaming_markdown.py",
     "packages/chat/src/serialization.test.ts": "tests/test_serialization.py",
     "packages/chat/src/ai.test.ts": "tests/test_ai.py",
+    "packages/chat/src/from-full-stream.test.ts": "tests/test_from_full_stream.py",
 }
 
 
@@ -79,15 +80,28 @@ def extract_py_tests(py_path: str) -> set[str]:
 
 
 def fuzzy_match(py_name, py_tests):
-    """Try to match a derived Python test name against existing tests."""
+    """Try to match a derived Python test name against existing tests.
+
+    Uses word-overlap matching: extracts significant words (>2 chars) from
+    the TS-derived name and requires at least 60% of them (minimum 2) to
+    appear in the candidate Python test name.
+    """
     if py_name in py_tests:
         return py_name
 
-    words = [w for w in py_name.replace("test_", "").split("_") if len(w) > 2][:4]
+    words = [w for w in py_name.replace("test_", "").split("_") if len(w) > 2][:6]
+    if not words:
+        return None
+    threshold = max(2, int(len(words) * 0.6))
+
+    best_match = None
+    best_score = 0
     for existing in py_tests:
-        if all(w in existing for w in words):
-            return existing
-    return None
+        score = sum(1 for w in words if w in existing)
+        if score >= threshold and score > best_score:
+            best_score = score
+            best_match = existing
+    return best_match
 
 
 def check_fidelity(ts_rel: str, py_rel: str) -> tuple[list, list, int]:

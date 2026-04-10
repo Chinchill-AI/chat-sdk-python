@@ -57,20 +57,17 @@ async def from_full_stream(
             yield event  # type: ignore[misc]
             continue
 
-        # AI SDK v5 uses textDelta, v6 uses text
+        # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
+        # Priority: text > delta > textDelta > text_delta (matches TS)
         if isinstance(event, dict):
-            text_delta = event.get("textDelta") if event.get("textDelta") is not None else event.get("text_delta")
-            text_content = (
-                text_delta
-                if text_delta is not None
-                else (event.get("text") if event.get("text") is not None else event.get("delta"))
+            text_content = next(
+                (v for k in ("text", "delta", "textDelta", "text_delta") if (v := event.get(k)) is not None),
+                None,
             )
         else:
-            text_content = (
-                getattr(event, "text", None)
-                or getattr(event, "delta", None)
-                or getattr(event, "textDelta", None)
-                or getattr(event, "text_delta", None)
+            text_content = next(
+                (v for k in ("text", "delta", "textDelta", "text_delta") if (v := getattr(event, k, None)) is not None),
+                None,
             )
 
         if event_type == "text-delta" and isinstance(text_content, str):
