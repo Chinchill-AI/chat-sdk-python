@@ -92,13 +92,12 @@ class TestGlobalSingleton:
         with pytest.raises(RuntimeError, match="No Chat instance available"):
             _ = thread.adapter
 
-    def test_from_json_with_mismatched_adapter_name(self):
-        """from_json with chat= but wrong adapter name returns None adapter."""
+    def test_from_json_with_mismatched_adapter_name_raises(self):
+        """from_json with chat= but wrong adapter name fails fast."""
         chat = _make_chat("slack")
         data = _thread_json("nonexistent")
-        thread = ThreadImpl.from_json(data, chat=chat)
-        # Adapter was resolved via chat.get_adapter("nonexistent") → None
-        assert thread._adapter is None
+        with pytest.raises(RuntimeError, match='Adapter "nonexistent" not found'):
+            ThreadImpl.from_json(data, chat=chat)
 
 
 class TestActivateExceptionSafety:
@@ -112,10 +111,11 @@ class TestActivateExceptionSafety:
 
     def test_contextvar_reset_after_exception(self):
         chat = _make_chat()
-        with pytest.raises(ValueError, match="test error"), chat.activate():
+        with chat.activate():
             assert get_chat_singleton() is chat
-            raise ValueError("test error")
-        # ContextVar should be reset after exception
+            with pytest.raises(ValueError, match="test error"):
+                raise ValueError("test error")
+        # ContextVar should be reset after activate() exits
         assert not has_chat_singleton()
 
 
@@ -265,7 +265,7 @@ class TestReviver:
 
     def test_reviver_does_not_register_singleton(self):
         chat = _make_chat()
-        _reviver = chat.reviver()
+        chat.reviver()  # invoke but don't need the return value
         # reviver() should NOT register a global singleton
         assert not has_chat_singleton()
 

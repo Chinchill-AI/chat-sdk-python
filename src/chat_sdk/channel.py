@@ -15,6 +15,7 @@ from typing import Any
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.thread import (
     _ChannelImplConfigForThread,
+    _ChatSingleton,
     _extract_message_content,
     _from_full_stream,
     _is_async_iterable,
@@ -373,7 +374,7 @@ class ChannelImpl:
         cls,
         data: dict[str, Any],
         adapter: Adapter | None = None,
-        chat: Any = None,
+        chat: _ChatSingleton | None = None,
     ) -> ChannelImpl:
         """Reconstruct a ChannelImpl from serialized JSON data.
 
@@ -397,9 +398,11 @@ class ChannelImpl:
         if adapter is not None:
             channel._adapter = adapter
         elif chat is not None:
-            adapter_name = data.get("adapterName") or data.get("adapter_name", "")
-            if adapter_name:
-                channel._adapter = chat.get_adapter(adapter_name)
+            if channel._adapter_name:
+                resolved = chat.get_adapter(channel._adapter_name)
+                if resolved is None:
+                    raise RuntimeError(f'Adapter "{channel._adapter_name}" not found in the provided Chat instance')
+                channel._adapter = resolved
             channel._state_adapter_instance = chat.get_state()
         return channel
 

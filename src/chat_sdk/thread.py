@@ -701,7 +701,7 @@ class ThreadImpl:
         cls,
         data: dict[str, Any],
         adapter: Adapter | None = None,
-        chat: Any = None,
+        chat: _ChatSingleton | None = None,
     ) -> ThreadImpl:
         """Reconstruct a ThreadImpl from serialized JSON data.
 
@@ -734,9 +734,11 @@ class ThreadImpl:
         if adapter is not None:
             thread._adapter = adapter
         elif chat is not None:
-            adapter_name = data.get("adapterName") or data.get("adapter_name")
-            if adapter_name:
-                thread._adapter = chat.get_adapter(adapter_name)
+            if thread._adapter_name:
+                resolved = chat.get_adapter(thread._adapter_name)
+                if resolved is None:
+                    raise RuntimeError(f'Adapter "{thread._adapter_name}" not found in the provided Chat instance')
+                thread._adapter = resolved
             thread._state_adapter_instance = chat.get_state()
         return thread
 
