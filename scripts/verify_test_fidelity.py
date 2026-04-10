@@ -158,11 +158,37 @@ def generate_stubs(ts_rel, missing):
     return "\n".join(lines)
 
 
+def count_absorbers(py_path: str) -> int:
+    """Count tests whose body is only `assert True` (phantom absorbers)."""
+    if not os.path.exists(py_path):
+        return 0
+    import ast
+
+    with open(py_path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    count = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        stmts = [s for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        if (
+            len(stmts) == 1
+            and isinstance(stmts[0], ast.Assert)
+            and isinstance(stmts[0].test, ast.Constant)
+            and stmts[0].test.value is True
+        ):
+            count += 1
+    return count
+
+
 def main() -> int:
     fix_mode = "--fix" in sys.argv
     total_missing = 0
     total_matched = 0
     total_ts = 0
+    total_absorbers = 0
 
     print("=" * 70)
     print("TEST FIDELITY REPORT")
@@ -176,16 +202,22 @@ def main() -> int:
 
         ts_tests = extract_ts_tests(ts_path)
         missing, extra, matched = check_fidelity(ts_rel, py_rel)
+        py_path = os.path.join(PY_ROOT, py_rel)
+        absorbers = count_absorbers(py_path)
 
         total_ts += len(ts_tests)
         total_matched += matched
         total_missing += len(missing)
+        total_absorbers += absorbers
 
+        real_tests = matched - absorbers
+        absorber_note = f" ({absorbers} absorbers)" if absorbers else ""
         status = "OK" if not missing else f"GAPS ({len(missing)})"
         print(f"\n{ts_rel}")
         print(f"  -> {py_rel}")
         print(
-            f"  TS: {len(ts_tests)} | Matched: {matched} | Missing: {len(missing)} | Extra: {len(extra)} | {status}"
+            f"  TS: {len(ts_tests)} | Matched: {matched}{absorber_note}"
+            f" | Missing: {len(missing)} | Extra: {len(extra)} | {status}"
         )
 
         if missing:
@@ -208,9 +240,17 @@ def main() -> int:
                     f.write(stubs)
                 print(f"  -> Created {py_rel} with {len(missing)} stubs")
 
+    real_total = total_matched - total_absorbers
     pct = total_matched * 100 // max(total_ts, 1)
     print(f"\n{'=' * 70}")
-    print(f"TOTAL: {total_matched}/{total_ts} matched ({pct}%), {total_missing} missing")
+    if total_absorbers:
+        print(
+            f"TOTAL: {total_matched}/{total_ts} matched ({pct}%),"
+            f" {total_missing} missing, {total_absorbers} absorbers"
+        )
+        print(f"  Real tests: {real_total} | Absorbers: {total_absorbers}")
+    else:
+        print(f"TOTAL: {total_matched}/{total_ts} matched ({pct}%), {total_missing} missing")
 
     if total_missing > 0:
         print("\nRun with --fix to generate stubs for missing tests.")
