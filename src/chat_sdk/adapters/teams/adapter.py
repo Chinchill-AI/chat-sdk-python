@@ -793,13 +793,15 @@ class TeamsAdapter:
                 text = chunk
             elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                 text = chunk.get("text", "")
-            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
-                text = getattr(chunk, "text", "")
-            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "thinking":
-                thinking = getattr(chunk, "content", "")
-                # Render thinking as italic context above the main text
-                if accumulated or not message_id:
-                    continue  # Will be included in next text update
+            elif hasattr(chunk, "type"):
+                chunk_type = getattr(chunk, "type", None)
+                if chunk_type == "markdown_text":
+                    text = getattr(chunk, "text", "")
+                elif chunk_type == "thinking":
+                    thinking = getattr(chunk, "content", "")
+                    # Render thinking as italic context above the main text
+                    if accumulated or not message_id:
+                        continue  # Will be included in next text update
             if not text:
                 continue
 
