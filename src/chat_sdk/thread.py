@@ -740,6 +740,14 @@ class ThreadImpl:
                     raise RuntimeError(f'Adapter "{thread._adapter_name}" not found in the provided Chat instance')
                 thread._adapter = resolved
             thread._state_adapter_instance = chat.get_state()
+        elif has_chat_singleton() and thread._adapter_name:
+            # Eagerly bind from the active/global chat so the thread doesn't
+            # lazily re-resolve later (which could hit a different chat).
+            active = get_chat_singleton()
+            resolved = active.get_adapter(thread._adapter_name)
+            if resolved is not None:
+                thread._adapter = resolved
+            thread._state_adapter_instance = active.get_state()
         return thread
 
     @classmethod

@@ -21,6 +21,7 @@ from chat_sdk.thread import (
     _is_async_iterable,
     _to_message,
     get_chat_singleton,
+    has_chat_singleton,
 )
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
@@ -404,6 +405,12 @@ class ChannelImpl:
                     raise RuntimeError(f'Adapter "{channel._adapter_name}" not found in the provided Chat instance')
                 channel._adapter = resolved
             channel._state_adapter_instance = chat.get_state()
+        elif has_chat_singleton() and channel._adapter_name:
+            active = get_chat_singleton()
+            resolved = active.get_adapter(channel._adapter_name)
+            if resolved is not None:
+                channel._adapter = resolved
+            channel._state_adapter_instance = active.get_state()
         return channel
 
     @classmethod

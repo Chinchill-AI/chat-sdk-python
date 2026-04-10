@@ -168,6 +168,31 @@ class TestContextVarActivation:
             assert thread.adapter is not None
             assert thread.adapter.name == "slack"
 
+    def test_from_json_eagerly_binds_so_survives_context_exit(self):
+        """Thread deserialized inside activate() keeps its binding after exit."""
+        chat = _make_chat("slack")
+
+        with chat.activate():
+            thread = ThreadImpl.from_json(_thread_json("slack"))
+            channel = ChannelImpl.from_json(_channel_json("slack"))
+
+        # After context exit, thread/channel should still work
+        # because adapter was eagerly bound during from_json
+        assert thread.adapter.name == "slack"
+        assert channel.adapter.name == "slack"
+
+    def test_from_json_eagerly_binds_prevents_wrong_chat(self):
+        """Thread deserialized under chat_a doesn't resolve to chat_b later."""
+        chat_a = _make_chat("a_adapter")
+        chat_b = _make_chat("b_adapter")
+
+        with chat_a.activate():
+            thread = ThreadImpl.from_json(_thread_json("a_adapter"))
+
+        # Now activate a different chat — thread should NOT re-resolve
+        with chat_b.activate():
+            assert thread.adapter.name == "a_adapter"  # still bound to chat_a
+
 
 class TestExplicitChatParameter:
     """Explicit chat= parameter on from_json beats all fallbacks."""

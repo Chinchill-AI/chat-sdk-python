@@ -559,7 +559,7 @@ class TestDiscordThreadParentCacheEviction:
 
         # After eviction, all 1001 expired entries should be purged,
         # leaving only the newly inserted one
-        assert len(adapter._thread_parent_cache) <= 2
+        assert len(adapter._thread_parent_cache) == 1
         assert "new-thread-channel" in adapter._thread_parent_cache
 
 

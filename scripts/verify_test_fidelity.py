@@ -210,7 +210,6 @@ def main() -> int:
         total_missing += len(missing)
         total_absorbers += absorbers
 
-        real_tests = matched - absorbers
         absorber_note = f" ({absorbers} absorbers)" if absorbers else ""
         status = "OK" if not missing else f"GAPS ({len(missing)})"
         print(f"\n{ts_rel}")
