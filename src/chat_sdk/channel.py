@@ -15,11 +15,13 @@ from typing import Any
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.thread import (
     _ChannelImplConfigForThread,
+    _ChatSingleton,
     _extract_message_content,
     _from_full_stream,
     _is_async_iterable,
     _to_message,
     get_chat_singleton,
+    has_chat_singleton,
 )
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
@@ -373,11 +375,18 @@ class ChannelImpl:
         cls,
         data: dict[str, Any],
         adapter: Adapter | None = None,
+        chat: _ChatSingleton | None = None,
     ) -> ChannelImpl:
         """Reconstruct a ChannelImpl from serialized JSON data.
 
-        Accepts both camelCase (canonical output of ``to_json()``) and
-        snake_case keys for backward compatibility.
+        Parameters
+        ----------
+        data:
+            Serialized channel dict (camelCase or snake_case keys accepted).
+        adapter:
+            Explicit adapter. Skips singleton lookup.
+        chat:
+            Explicit Chat instance for adapter/state resolution.
         """
         channel = cls(
             _ChannelImplConfigLazy(
@@ -389,6 +398,19 @@ class ChannelImpl:
         )
         if adapter is not None:
             channel._adapter = adapter
+        elif chat is not None:
+            if channel._adapter_name:
+                resolved = chat.get_adapter(channel._adapter_name)
+                if resolved is None:
+                    raise RuntimeError(f'Adapter "{channel._adapter_name}" not found in the provided Chat instance')
+                channel._adapter = resolved
+            channel._state_adapter_instance = chat.get_state()
+        elif has_chat_singleton() and channel._adapter_name:
+            active = get_chat_singleton()
+            resolved = active.get_adapter(channel._adapter_name)
+            if resolved is not None:
+                channel._adapter = resolved
+            channel._state_adapter_instance = active.get_state()
         return channel
 
     @classmethod

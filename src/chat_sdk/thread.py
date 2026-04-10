@@ -8,6 +8,7 @@ ephemeral messages, scheduled messages, thread subscription, and state managemen
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,10 +48,11 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Singleton access (mirrors chat-singleton.ts)
+# Chat resolver: ContextVar → process-global → error
 # ---------------------------------------------------------------------------
 
-_singleton: _ChatSingleton | None = None
+_default_chat: _ChatSingleton | None = None
+_active_chat: contextvars.ContextVar[_ChatSingleton | None] = contextvars.ContextVar("_active_chat", default=None)
 
 
 class _ChatSingleton:
@@ -61,23 +63,35 @@ class _ChatSingleton:
 
 
 def set_chat_singleton(chat: _ChatSingleton) -> None:
-    global _singleton
-    _singleton = chat
+    """Register *chat* as the process-global default."""
+    global _default_chat
+    _default_chat = chat
 
 
 def get_chat_singleton() -> _ChatSingleton:
-    if _singleton is None:
-        raise RuntimeError("No Chat singleton registered. Call chat.register_singleton() first.")
-    return _singleton
+    """Resolve the active Chat instance.
+
+    Resolution order:
+    1. ContextVar for the current async task (set via ``chat.activate()``)
+    2. Process-global default (set via ``set_chat_singleton()``)
+    3. Raise RuntimeError
+    """
+    ctx = _active_chat.get()
+    if ctx is not None:
+        return ctx
+    if _default_chat is not None:
+        return _default_chat
+    raise RuntimeError("No Chat instance available. Use chat.activate() or register a singleton.")
 
 
 def has_chat_singleton() -> bool:
-    return _singleton is not None
+    return _active_chat.get() is not None or _default_chat is not None
 
 
 def clear_chat_singleton() -> None:
-    global _singleton
-    _singleton = None
+    global _default_chat
+    _default_chat = None
+    _active_chat.set(None)
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +701,20 @@ class ThreadImpl:
         cls,
         data: dict[str, Any],
         adapter: Adapter | None = None,
+        chat: _ChatSingleton | None = None,
     ) -> ThreadImpl:
         """Reconstruct a ThreadImpl from serialized JSON data.
 
-        Accepts both camelCase (canonical output of ``to_json()``) and
-        snake_case keys for backward compatibility.
-        Uses lazy resolution from the Chat singleton unless an adapter is provided.
+        Parameters
+        ----------
+        data:
+            Serialized thread dict (camelCase or snake_case keys accepted).
+        adapter:
+            Explicit adapter to use. Skips singleton lookup for adapter resolution.
+        chat:
+            Explicit Chat instance. If provided, adapter and state are resolved
+            from this instance instead of the singleton. Useful in multi-chat
+            or test scenarios.
         """
         current_msg_raw = data.get("currentMessage") or data.get("current_message")
         current_msg = None
@@ -702,7 +724,7 @@ class ThreadImpl:
         thread = cls(
             _ThreadImplConfig(
                 id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name"),
+                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
                 channel_id=data.get("channelId") or data.get("channel_id", ""),
                 channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
                 current_message=current_msg,
@@ -711,6 +733,21 @@ class ThreadImpl:
         )
         if adapter is not None:
             thread._adapter = adapter
+        elif chat is not None:
+            if thread._adapter_name:
+                resolved = chat.get_adapter(thread._adapter_name)
+                if resolved is None:
+                    raise RuntimeError(f'Adapter "{thread._adapter_name}" not found in the provided Chat instance')
+                thread._adapter = resolved
+            thread._state_adapter_instance = chat.get_state()
+        elif has_chat_singleton() and thread._adapter_name:
+            # Eagerly bind from the active/global chat so the thread doesn't
+            # lazily re-resolve later (which could hit a different chat).
+            active = get_chat_singleton()
+            resolved = active.get_adapter(thread._adapter_name)
+            if resolved is not None:
+                thread._adapter = resolved
+            thread._state_adapter_instance = active.get_state()
         return thread
 
     @classmethod
@@ -865,14 +902,15 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
                 yield item
                 continue
 
-            # AI SDK v5 uses textDelta, v6 uses text; also accept delta
+            # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
             if item_type == "text-delta":
-                text_content = (
-                    getattr(item, "text", None)
-                    or getattr(item, "delta", None)
-                    or getattr(item, "textDelta", None)
-                    or getattr(item, "text_delta", None)
-                    or ""
+                text_content = next(
+                    (
+                        v
+                        for k in ("text", "delta", "textDelta", "text_delta")
+                        if (v := getattr(item, k, None)) is not None
+                    ),
+                    "",
                 )
                 if isinstance(text_content, str) and text_content:
                     if needs_separator and has_emitted_text:
@@ -892,8 +930,9 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
                 continue
 
             if t == "text-delta":
-                text_content = (
-                    item.get("text") or item.get("delta") or item.get("textDelta") or item.get("text_delta") or ""
+                text_content = next(
+                    (v for k in ("text", "delta", "textDelta", "text_delta") if (v := item.get(k)) is not None),
+                    "",
                 )
                 if isinstance(text_content, str) and text_content:
                     if needs_separator and has_emitted_text:

@@ -299,3 +299,62 @@ class TestComplexMixedStreams:
         ]
         result = await _collect(from_full_stream(_async_iter(events)))
         assert result == ["plain string", "from event", "another string"]
+
+
+# ---------------------------------------------------------------------------
+# Fidelity aliases -- map TS test names to existing Python tests
+# ---------------------------------------------------------------------------
+
+
+class TestFidelityAliases:
+    """Fidelity aliases matching TS it() names to existing test logic."""
+
+    async def test_extracts_textdelta_values(self):
+        events = [{"type": "text-delta", "textDelta": "Hello"}, {"type": "text-delta", "textDelta": " World"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["Hello", " World"]
+
+    async def test_does_not_add_trailing_separator_after_final_finishstep(self):
+        events = [{"type": "text-delta", "textDelta": "A"}, {"type": "finish-step"}]
+        result = await _collect(from_full_stream(_async_iter(events)))
+        assert result == ["A"]
+
+    async def test_skips_toolcall_and_other_nontext_events(self):
+        events = [{"type": "tool-call", "name": "x"}, {"type": "text-delta", "textDelta": "ok"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["ok"]
+
+    async def test_handles_consecutive_finishstep_events(self):
+        events = [
+            {"type": "text-delta", "textDelta": "A"},
+            {"type": "finish-step"},
+            {"type": "finish-step"},
+            {"type": "text-delta", "textDelta": "B"},
+        ]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["A", "\n\n", "B"]
+
+    async def test_does_not_inject_separator_when_finishstep_comes_before_any_text(self):
+        events = [{"type": "finish-step"}, {"type": "text-delta", "textDelta": "First"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["First"]
+
+    async def test_ignores_textdelta_with_nonstring_textdelta(self):
+        events = [{"type": "text-delta", "textDelta": 42}, {"type": "text-delta", "textDelta": None}]
+        assert await _collect(from_full_stream(_async_iter(events))) == []
+
+    async def test_extracts_textdelta_with_text_property_ai_sdk_v6(self):
+        events = [{"type": "text-delta", "text": "v6 text"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["v6 text"]
+
+    async def test_injects_separator_between_steps_with_text_property(self):
+        events = [
+            {"type": "text-delta", "text": "A"},
+            {"type": "finish-step"},
+            {"type": "text-delta", "text": "B"},
+        ]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["A", "\n\n", "B"]
+
+    async def test_prefers_text_over_textdelta_when_both_present(self):
+        events = [{"type": "text-delta", "text": "preferred", "textDelta": "fallback"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["preferred"]
+
+    async def test_ignores_invalid_events_null_primitives_missing_type(self):
+        events: list = [None, 42, True, {"no_type": 1}, {"type": "text-delta", "textDelta": "ok"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["ok"]

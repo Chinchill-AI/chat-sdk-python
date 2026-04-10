@@ -1477,7 +1477,7 @@ class TestSlashCommands:
         assert True  # unreachable -- pytest.skip raises
 
     # TS: "should return undefined from openModal when triggerId is missing" (slash)
-    async def test_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(self):
+    async def test_should_return_undefined_from_openmodal_when_triggerid_is_missing(self):
         chat, adapter, state = await _init_chat()
         captured: list[Any] = []
 

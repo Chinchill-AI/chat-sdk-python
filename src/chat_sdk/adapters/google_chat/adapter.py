@@ -2709,7 +2709,13 @@ class _GoogleApiError(Exception):
 
 
 def _random_id() -> str:
-    """Generate a short random ID similar to Math.random().toString(36).slice(2, 9)."""
+    """Generate a short random ID for cosmetic use (card widget IDs).
+
+    NOT suitable for security-sensitive purposes (lock tokens, signatures, etc.)
+    — use ``secrets.token_hex()`` for those. This uses ``random.choices`` because
+    these IDs are only used as opaque Google Chat card widget suffixes and do not
+    need to be unpredictable.
+    """
     import random
     import string
 

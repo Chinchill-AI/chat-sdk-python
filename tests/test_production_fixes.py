@@ -514,9 +514,14 @@ class TestSlackInstallationCamelCaseKeys:
 class TestDiscordThreadParentCacheEviction:
     """Discord thread parent cache should not grow unboundedly."""
 
-    def test_thread_parent_cache_eviction_on_overflow(self):
-        """When cache exceeds 1000 entries, expired entries are purged."""
-        from chat_sdk.adapters.discord.adapter import DiscordAdapter
+    async def test_thread_parent_cache_eviction_on_overflow(self):
+        """When cache exceeds 1000 entries during reaction handling, expired entries are purged."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from chat_sdk.adapters.discord.adapter import (
+            CHANNEL_TYPE_PUBLIC_THREAD,
+            DiscordAdapter,
+        )
         from chat_sdk.adapters.discord.types import DiscordAdapterConfig
 
         adapter = DiscordAdapter(
@@ -526,26 +531,36 @@ class TestDiscordThreadParentCacheEviction:
                 application_id="test-app",
             )
         )
+        adapter._chat = MagicMock()
+        adapter._bot_user_id = "bot-user"
 
-        # Fill cache with 1001 entries, all expired
+        # Fill cache with 1001 expired entries
         past = time.time() - 100
         for i in range(1001):
             adapter._thread_parent_cache[f"channel-{i}"] = {
                 "parent_id": f"parent-{i}",
                 "expires_at": past,
             }
-
         assert len(adapter._thread_parent_cache) == 1001
 
-        # The eviction check in the adapter fires when len > 1000 during
-        # webhook handling. We can verify the cache structure directly:
-        # after simulated eviction logic, expired entries should be removed.
-        now = time.time()
-        expired = [k for k, v in adapter._thread_parent_cache.items() if v.get("expires_at", 0) <= now]
-        for k in expired:
-            del adapter._thread_parent_cache[k]
+        # Trigger the production code path: _handle_forwarded_reaction fetches
+        # channel info for threads, which triggers cache insertion + eviction
+        adapter._discord_fetch = AsyncMock(return_value={"parent_id": "real-parent"})
+        await adapter._handle_forwarded_reaction(
+            {
+                "channel_id": "new-thread-channel",
+                "message_id": "msg-1",
+                "user_id": "user-1",
+                "emoji": {"name": "👍"},
+                "channel_type": CHANNEL_TYPE_PUBLIC_THREAD,
+            },
+            added=True,
+        )
 
-        assert len(adapter._thread_parent_cache) == 0
+        # After eviction, all 1001 expired entries should be purged,
+        # leaving only the newly inserted one
+        assert len(adapter._thread_parent_cache) == 1
+        assert "new-thread-channel" in adapter._thread_parent_cache
 
 
 class TestGChatUserInfoCacheEviction:
@@ -583,28 +598,27 @@ class TestGChatUserInfoCacheEviction:
 class TestGitHubInstallationTokenCachePurge:
     """GitHub installation token cache should purge expired entries."""
 
-    def test_expired_entries_purged_on_access(self):
+    async def test_expired_entries_purged_on_access(self):
+        """Calling _get_installation_token purges expired entries from the cache."""
         from chat_sdk.adapters.github.adapter import GitHubAdapter
 
         adapter = GitHubAdapter({"webhook_secret": "test-secret", "token": "pat-123"})
 
-        # Manually populate the cache with expired entries
+        # Populate cache with expired entries
         past = time.time() - 100
         for i in range(10):
             adapter._installation_token_cache[i] = (f"token-{i}", past)
 
-        # Add one valid entry
+        # Add one valid entry (expires in 1 hour, with 60s buffer = still valid)
         future = time.time() + 3600
         adapter._installation_token_cache[999] = ("valid-token", future)
 
         assert len(adapter._installation_token_cache) == 11
 
-        # The purge logic runs at the start of _get_installation_token
-        # We simulate it directly:
-        now = time.time()
-        expired_ids = [iid for iid, (_, exp) in adapter._installation_token_cache.items() if now >= exp]
-        for iid in expired_ids:
-            del adapter._installation_token_cache[iid]
+        # Call the real method — it purges expired entries at the top,
+        # then finds the valid cached token for installation_id=999
+        token = await adapter._get_installation_token(999)
 
+        assert token == "valid-token"
         assert len(adapter._installation_token_cache) == 1
         assert 999 in adapter._installation_token_cache

@@ -71,9 +71,7 @@ class TestStreamingMarkdownBasic:
         r = StreamingMarkdownRenderer()
         r.push("Hello **wor")
         result = r.render()
-        # Python _remend is simplified -- may not close all markers.
-        # Core invariant: the raw text is present and render returns something.
-        assert "Hello **wor" in result
+        assert result == "Hello **wor**"
 
     def test_should_be_idempotent_when_no_push_between_renders(self):
         r = StreamingMarkdownRenderer()
@@ -340,9 +338,8 @@ class TestGetCommittableText:
         r = StreamingMarkdownRenderer()
         r.push("Hello **wor\n")
         committable = r.get_committable_text()
-        # Python _remend is simplified: ** (even star count) is treated as clean,
-        # so the line is not held back. The text is returned as-is.
-        assert "Hello " in committable
+        # Line with unclosed ** is held back (not clean)
+        assert committable == "Hello "
 
     def test_getcommittabletext_should_release_when_bold_closes(self):
         r = StreamingMarkdownRenderer()

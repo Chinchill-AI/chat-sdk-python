@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.0.1a12 (2026-04-10)
+
+Python 3.10 support, async-safe Chat resolver, and a large correctness audit.
+
+### Upgrading
+
+**Python 3.10 is now supported.** CI tests 3.10 through 3.13.
+
+**Breaking changes** (all alpha — no stable API guarantees yet):
+
+- **Serialization keys are now camelCase** (`threadId`, `channelId`, `adapterName`) to match the TS SDK. `from_json()` accepts both camelCase and snake_case, so existing stored data still loads.
+- **`PermissionError` → `AdapterPermissionError`**: the old name shadowed Python's builtin. If you import it, update the name.
+- **`StateNotConnectedError`** replaces bare `RuntimeError` when calling state methods before `connect()`. Catch `StateNotConnectedError` instead of `RuntimeError`.
+- **`OnLockConflict` callbacks** should return `"force"` or `"drop"` (strings). Returning `True` still works for backward compat but is deprecated.
+- **`reviver()`** no longer registers a global singleton. Each reviver is bound to the Chat that created it.
+
+### New: async-safe Chat resolver
+
+Thread and Channel deserialization now supports three resolution levels:
+
+```python
+# 1. Explicit (best for library code, multi-tenant)
+thread = ThreadImpl.from_json(data, chat=my_chat)
+
+# 2. Context-local (best for tests, request scoping)
+with chat.activate():
+    thread = ThreadImpl.from_json(data)
+
+# 3. Global (existing pattern, unchanged)
+chat.register_singleton()
+thread = ThreadImpl.from_json(data)
+```
+
+Concurrent async tasks using `activate()` are fully isolated — each task resolves its own Chat without interference.
+
+### Bug fixes
+
+- Fixed streaming: intermediate edits now use the markdown renderer (was sending raw text), paragraph separators between agent steps, 500ms latency on stream end eliminated
+- Fixed all adapters: token refresh race conditions, HTTP session reuse (was creating one per request), `limit=0` no longer silently replaced by defaults
+- Fixed serialization: Slack installations now interoperate with the TS SDK, card fallback text extracted properly, AI SDK field names corrected
+- Fixed Teams: status code comparison, modal dialog buttons, table cell escaping
+- Fixed shutdown: in-flight handler tasks are cancelled, fire-and-forget tasks tracked for GC safety
+
+### Internals
+
+- 3,359 tests (up from 3,267), 0 warnings, 0 lint errors
+- Automated test quality gate in CI (`audit_test_quality.py`)
+- Comprehensive [porting guide](docs/UPSTREAM_SYNC.md) with 15 hazards and merge checklist
+- [Known non-parity](docs/UPSTREAM_SYNC.md#known-non-parity-with-typescript-sdk) documented in one place
+
 ## 0.0.1a11 (2026-04-03)
 
 Coverage and quality improvements.

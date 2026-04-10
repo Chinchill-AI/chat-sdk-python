@@ -61,7 +61,7 @@ These are intentionally different from TS:
 
 ## Architecture Decisions That Must Stay 1:1
 
-1. **Global singleton on Chat**: Required for Thread/Channel deserialization without passing adapter references through every call. Both SDKs use the same pattern.
+1. **Chat resolver**: Thread/Channel deserialization needs a Chat instance for adapter resolution. Python uses a 3-level resolver (explicit `chat=` → `ContextVar` → global fallback) rather than TS's pure global. The `register_singleton()` API is preserved for upstream parity, but `chat.activate()` and `from_json(data, chat=chat)` are preferred in Python.
 
 2. **Thread ID format**: `{adapter}:{platform_id}` (e.g., `slack:C123:1234567890.123456`). State keys depend on this format. Changing it would break cross-language state sharing in deployments that mix TS and Python bots.
 
@@ -124,135 +124,235 @@ if isinstance(message, PostableMarkdown): ...
 if hasattr(message, 'markdown'): ...
 ```
 
-## Known TS-to-Python Footguns
+## TS → Python Porting Hazards
 
-These are the specific translation mistakes that caused bugs during the original port (caught across 9 rounds of review). Every contributor should internalize this list.
+These are the highest-risk failure modes when mechanically porting changes from the TypeScript SDK into `chat-sdk-python`. Review this list before merging upstream-derived changes.
 
-### 1. `fn(x, {opts})` must become keyword args, not a dict
+### 1. Truthiness Is Not Parity
 
-```typescript
-// TS
-adapter.postMessage(threadId, message, { metadata: true });
-```
+TypeScript `||` patterns often do not translate directly to Python. In Python, `0`, `""`, and `False` are falsy, so `x or default` can silently change valid values.
 
 ```python
-# WRONG: passing a dict where keyword args are expected
-adapter.post_message(thread_id, message, {"metadata": True})
+# WRONG
+limit = options.limit or 50
 
-# RIGHT: use the dataclass/keyword pattern
-adapter.post_message(thread_id, message, metadata=True)
+# RIGHT
+limit = options.limit if options.limit is not None else 50
 ```
 
-### 2. `or` vs `is not None` for empty string preservation
+Watch for this in: pagination limits, optional IDs, empty text fields, booleans with valid `False`.
+
+Rule: use `is not None` when `0`, `""`, or `False` are valid.
+
+### 2. Snake Case Inside, Camel Case at Boundaries
+
+The TS SDK uses camelCase everywhere. Python should use snake_case internally and only translate at serialization and external API boundaries.
 
 ```python
-# WRONG: empty string is falsy in Python, so this silently drops it
-text = event.get("text") or default_text
+# WRONG
+chat.process_action({"threadId": thread_id, "messageId": message_id})
 
-# RIGHT: preserve empty strings when they are valid values
-text = event.get("text") if event.get("text") is not None else default_text
-
-# ALSO RIGHT: explicit None check
-raw = event.get("text")
-text = raw if raw is not None else default_text
+# RIGHT
+chat.process_action(ActionEvent(thread_id=thread_id, message_id=message_id, ...))
 ```
 
-This bit us in adapter dispatch where empty `text` fields (valid for action events with no text) were being replaced with defaults.
+Watch for this in: adapter dispatch objects, modal context payloads, serialized queue/state entries.
 
-### 3. camelCase keys in dispatch dicts
+Rule: internal Python objects use snake_case; wire format may use camelCase.
+
+### 3. Prefer Explicit Context Over Ambient State
+
+TS tolerates module-global resolution patterns more easily than Python. In Python, explicit context is safer and easier to test.
+
+Current resolver order:
+1. explicit `chat=` / `adapter=`
+2. `ContextVar` active chat
+3. process-global singleton
+4. error
+
+Rule: explicit object > `ContextVar` > global fallback.
+
+### 4. Convenience Helpers Must Not Reintroduce Globals
+
+After adding better resolution paths, helper APIs can still accidentally mutate global state if they register singletons internally.
+
+Example risk areas: JSON revivers, deserialization helpers, modal context restoration.
+
+Rule: helpers should pass explicit `chat=self` where possible instead of registering ambient global state.
+
+### 5. Async Task Lifecycle Is Stricter in Python
+
+TS fire-and-forget patterns do not map cleanly to Python. Bare coroutines, untracked tasks, and shutdown races cause real bugs.
 
 ```python
-# WRONG: preserving TS naming in Python dicts
-event = {"threadId": thread_id, "messageId": msg_id}
-
-# RIGHT: Python uses snake_case throughout
-event = ActionEvent(thread_id=thread_id, message_id=msg_id, ...)
-```
-
-This was a systemic bug across all adapters. The `test_dispatch_key_validation.py` test suite was written specifically to catch this. See [TESTING.md](TESTING.md) for details.
-
-### 4. `asyncio.ensure_future` vs `asyncio.create_task`
-
-```python
-# WRONG: deprecated since Python 3.10, and does not work outside async context
+# WRONG
 asyncio.ensure_future(coro)
 
-# RIGHT: explicit create_task with error handling
+# RIGHT
 task = asyncio.get_running_loop().create_task(coro)
 task.add_done_callback(lambda t: log_error(t.exception()) if t.exception() else None)
 ```
 
-The SDK's `_create_task()` helper wraps this pattern and gracefully handles the case where no event loop is running.
+Watch for: background refresh tasks, webhook-triggered async handlers, shutdown cancellation, garbage collection of unreferenced tasks.
 
-### 5. `datetime.utcnow()` vs `datetime.now(tz=timezone.utc)`
+Rule: always create, track, and clean up tasks explicitly.
+
+### 6. Context Propagation Differs From Node
+
+Node async-local patterns do not map 1:1 to Python. `ContextVar` is the right primitive, but task boundaries matter.
+
+Watch for: spawned tasks that should inherit request context, per-request auth/session state, chat resolver activation across concurrent tasks.
+
+Rule: if context matters across task creation, test it explicitly.
+
+### 7. `undefined`, `None`, and Omitted Keys Are Not Equivalent
+
+TS often distinguishes missing keys from `undefined`. Python tends to collapse these unless you are careful.
+
+Watch for: serialization output, adapter payload generation, webhook response bodies, optional config fields.
+
+Rule: omit keys when the TS contract omits them; do not blindly serialize `None`.
+
+### 8. Datetime Semantics Need Explicit UTC
+
+JS `Date` behavior hides many timezone issues. Python does not.
 
 ```python
-# WRONG: returns naive datetime, deprecated in Python 3.12
-from datetime import datetime
-now = datetime.utcnow()
+# WRONG
+datetime.utcnow()
 
-# RIGHT: timezone-aware datetime
-from datetime import UTC, datetime
-now = datetime.now(tz=UTC)
+# RIGHT
+datetime.now(tz=timezone.utc)
 ```
 
-All timestamps in the SDK use `UTC` from the `datetime` module (aliased from `timezone.utc` in Python 3.11+).
+Also: `datetime.fromisoformat()` on Python 3.10 does not accept `Z` suffix or >6 fractional digits. Use the `_parse_iso()` helper from `types.py`.
 
-### 6. Raw dicts for process_* events must use typed dataclasses
+Rule: always use timezone-aware UTC datetimes.
 
-```python
-# WRONG: plain dict loses type safety and makes key typos silent
-chat.process_action({
-    "action_id": action_id,
-    "thred_id": thread_id,  # typo goes undetected
-})
+### 9. Raw Dict Ports Are Fragile
 
-# RIGHT: typed dataclass catches typos at construction time
-chat.process_action(ActionEvent(
-    adapter=self,
-    action_id=action_id,
-    thread_id=thread_id,  # typo would be a TypeError
-    ...
-))
-```
+TS code often passes plain objects around. In Python, raw dicts make typos and shape drift easy to miss.
 
-### 7. `ContextVar` as instance variable, not class variable
+Watch for: `process_*` event calls, adapter dispatch objects, stored queue entries, modal context structures.
+
+Rule: use dataclasses / typed objects for internal event flow.
+
+### 10. Optional Dependencies Must Stay Lazy
+
+TS package imports assume installed dependencies more often than Python can.
 
 ```python
-# WRONG: shared across all instances, causes cross-request contamination
-class SlackAdapter:
-    _request_context: ContextVar[RequestContext] = ContextVar("request_context")
-
-# RIGHT: each instance gets its own ContextVar
-class SlackAdapter:
-    def __init__(self):
-        self._request_context: ContextVar[RequestContext] = ContextVar("request_context")
-```
-
-### 8. `random.choices` vs `secrets.token_hex` for security tokens
-
-```python
-# WRONG: predictable PRNG, not suitable for lock tokens
-import random
-token = ''.join(random.choices('abcdef0123456789', k=32))
-
-# RIGHT: cryptographically secure random
-import secrets
-token = secrets.token_hex(16)
-```
-
-Lock tokens must be unpredictable because they serve as proof of lock ownership. A compromised token allows unauthorized lock release.
-
-### 9. Top-level imports of optional deps must be lazy
-
-```python
-# WRONG: crashes at import time if slack-sdk is not installed
+# WRONG
 from slack_sdk.web.async_client import AsyncWebClient  # top of file
 
-# RIGHT: import inside the function/method that uses it
+# RIGHT
 def _get_client(self):
     from slack_sdk.web.async_client import AsyncWebClient
     return AsyncWebClient(token=self._bot_token)
 ```
 
-Optional dependencies (slack-sdk, pynacl, aiohttp, etc.) must only be imported inside methods of their respective adapter. Users who install `chat-sdk` without extras should not get import errors from adapters they are not using.
+Rule: no optional adapter dependency imports at module top level.
+
+### 11. Session and Connection Lifecycle Matter More in Python
+
+Ported code often starts with per-request HTTP clients. In Python async code, shared sessions plus explicit cleanup are usually the right design.
+
+Watch for: `aiohttp.ClientSession` creation in hot paths, missing `disconnect()` cleanup, token-refresh races, connection pool churn.
+
+Rule: reuse sessions, lock refresh paths, and close resources on shutdown.
+
+### 12. Security Randomness vs Cosmetic IDs
+
+Some TS code uses random-looking IDs that are only cosmetic. Others are security-sensitive.
+
+Rule: use `secrets` for lock tokens, signatures, secrets, ownership proofs. Casual random suffixes are acceptable only for non-security display IDs.
+
+### 13. Markdown Is a Known Divergence Zone
+
+The Python markdown parser and `StreamingMarkdownRenderer` are intentionally a subset and do not fully match the TS `remark` + `remend` behavior.
+
+Watch for: parser edge cases, streaming repair behavior, table buffering, plain-text fallback generation.
+
+Rule: treat markdown changes as high-risk parity work and run the markdown/streaming test suites.
+
+### 14. Core Parity Is Better Enforced Than Adapter Parity
+
+The fidelity script covers core TS tests well, but adapter behavior is much more vulnerable to drift through real webhook payloads and platform-specific behavior.
+
+Rule: for adapter changes, prefer replay fixtures and recorded payload tests over hand-built mocks whenever possible.
+
+### 15. Type Parity Does Not Guarantee Behavior Parity
+
+Matching names, signatures, and serialized shapes is necessary but not sufficient.
+
+High-risk semantic areas: concurrency strategies, debounce/queue behavior, modal context restoration, webhook verification, message/reaction self-filtering, streaming fallback behavior.
+
+Rule: behavior changes need regression tests, not just matching types.
+
+## Review Checklist for Upstream Ports
+
+Before merging an upstream-derived change, check:
+
+- [ ] Are any `or default` patterns incorrectly changing valid falsy values?
+- [ ] Did any camelCase keys leak into internal Python event/state objects?
+- [ ] Did any helper API reintroduce process-global state where explicit context is available?
+- [ ] Are all spawned tasks tracked, error-handled, and safe on shutdown?
+- [ ] Are `ContextVar`-dependent behaviors covered by tests?
+- [ ] Are optional keys omitted correctly instead of serialized as `None`?
+- [ ] Are all datetimes timezone-aware UTC?
+- [ ] Are optional deps still lazily imported?
+- [ ] Are shared HTTP sessions/tokens/caches lifecycle-safe?
+- [ ] Is any randomness security-sensitive?
+- [ ] Did markdown or streaming behavior change?
+- [ ] Does this need replay coverage rather than only unit coverage?
+
+## Known Non-Parity with TypeScript SDK
+
+Intentional differences from the Vercel Chat TS SDK, collected here so they
+stay explicit instead of being rediscovered in code review.
+
+### By design (won't fix)
+
+| Area | Python behavior | TS behavior | Rationale |
+|------|----------------|-------------|-----------|
+| JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
+| Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
+| `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
+| `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |
+| `ast_to_plain_text` | Joins blocks with `\n` | Concatenates directly | More readable output |
+| `renderPostable` on unknown input | Returns `str(message)` | Throws `Error` | More resilient |
+| Chat resolver | 3-level: explicit → ContextVar → global | Process-global singleton | See [DECISIONS.md](DECISIONS.md#why-3-level-chat-resolver) |
+
+### Platform-specific gaps
+
+| Area | Python | TS | Rationale |
+|------|--------|-----|-----------|
+| Teams certificate auth | Rejected (app password only) | Supported | Low demand; can add later |
+| Teams `dialog_open_timeout_ms` config | Not implemented | Configurable | Low demand |
+| Google Chat file uploads | Ignored in message parse | Supported | API complexity; can add later |
+| Discord Gateway WebSocket | HTTP interactions only | Both HTTP and Gateway | Gateway requires persistent connection |
+
+### Serialization differences
+
+| Area | Python | TS |
+|------|--------|-----|
+| `to_json()` keys | camelCase (matches TS) | camelCase |
+| `from_json()` | Accepts both camelCase and snake_case | camelCase only |
+| Slack installation keys | camelCase (matches TS, with snake_case fallback) | camelCase |
+| Redis/Postgres queue entries | Different wire format (message serialized via `to_json()`) | `JSON.stringify(entry)` directly |
+
+### Coverage confidence by module
+
+| Module | Confidence | Gap |
+|--------|-----------|-----|
+| Core (chat/thread/channel) | High | 519 TS tests matched |
+| Slack adapter | High | Extensive replay + unit tests |
+| Discord adapter | Medium-High | Good replay coverage |
+| Teams adapter | Medium | Replay tests; JWT auth hand-rolled |
+| Telegram adapter | Medium | Good unit tests; no recorded fixtures |
+| Google Chat adapter | Medium-Low | Complex; workspace events undertested |
+| WhatsApp adapter | Medium-Low | Media download, group messages undertested |
+| GitHub adapter | Medium | PR + issue comment coverage |
+| Linear adapter | Medium | Comment + reaction coverage |
+| Redis state | Medium | Mocked; no live Redis tests |
+| Postgres state | Medium | Mocked; no live Postgres tests |
