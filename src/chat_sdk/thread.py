@@ -724,7 +724,7 @@ class ThreadImpl:
         thread = cls(
             _ThreadImplConfig(
                 id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name"),
+                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
                 channel_id=data.get("channelId") or data.get("channel_id", ""),
                 channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
                 current_message=current_msg,
