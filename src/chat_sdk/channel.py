@@ -373,11 +373,18 @@ class ChannelImpl:
         cls,
         data: dict[str, Any],
         adapter: Adapter | None = None,
+        chat: Any = None,
     ) -> ChannelImpl:
         """Reconstruct a ChannelImpl from serialized JSON data.
 
-        Accepts both camelCase (canonical output of ``to_json()``) and
-        snake_case keys for backward compatibility.
+        Parameters
+        ----------
+        data:
+            Serialized channel dict (camelCase or snake_case keys accepted).
+        adapter:
+            Explicit adapter. Skips singleton lookup.
+        chat:
+            Explicit Chat instance for adapter/state resolution.
         """
         channel = cls(
             _ChannelImplConfigLazy(
@@ -389,6 +396,11 @@ class ChannelImpl:
         )
         if adapter is not None:
             channel._adapter = adapter
+        elif chat is not None:
+            adapter_name = data.get("adapterName") or data.get("adapter_name", "")
+            if adapter_name:
+                channel._adapter = chat.get_adapter(adapter_name)
+            channel._state_adapter_instance = chat.get_state()
         return channel
 
     @classmethod

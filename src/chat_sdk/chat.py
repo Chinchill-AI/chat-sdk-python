@@ -9,6 +9,7 @@ thread/channel creation.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import re
 import uuid
@@ -22,6 +23,7 @@ from chat_sdk.errors import ChatError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
     ThreadImpl,
+    _active_chat,
     _ThreadImplConfig,
     get_chat_singleton,
     has_chat_singleton,
@@ -198,6 +200,28 @@ def _create_task(
 
 
 # ---------------------------------------------------------------------------
+# Chat activation context manager
+# ---------------------------------------------------------------------------
+
+
+class _ChatActivation:
+    """Context manager that sets a Chat as the active instance for the current context."""
+
+    def __init__(self, chat: Chat) -> None:
+        self._chat = chat
+        self._token: contextvars.Token[Any] | None = None
+
+    def __enter__(self) -> Chat:
+        self._token = _active_chat.set(self._chat)  # type: ignore[arg-type]
+        return self._chat
+
+    def __exit__(self, *_: Any) -> None:
+        if self._token is not None:
+            _active_chat.reset(self._token)
+            self._token = None
+
+
+# ---------------------------------------------------------------------------
 # Chat class
 # ---------------------------------------------------------------------------
 
@@ -338,6 +362,22 @@ class Chat:
     @staticmethod
     def has_singleton() -> bool:
         return has_chat_singleton()
+
+    def activate(self) -> _ChatActivation:
+        """Set this Chat as the active instance for the current async context.
+
+        Usage::
+
+            with chat.activate():
+                # Thread/Channel deserialization resolves to this chat
+                thread = ThreadImpl.from_json(data)
+
+        This is preferred over ``register_singleton()`` when multiple Chat
+        instances coexist (e.g., in tests, multi-tenant servers). The
+        activation is scoped to the current :class:`contextvars.Context`,
+        so concurrent async tasks don't interfere.
+        """
+        return _ChatActivation(self)
 
     # ========================================================================
     # ChatInstance protocol implementation
