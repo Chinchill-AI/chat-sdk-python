@@ -19,10 +19,11 @@ uv run pytest tests/ --tb=short -q
 ```
 
 ## Version Mapping
-Our version tracks the upstream Vercel Chat minor version:
-- `0.25.0` = synced to upstream `4.25.0`
-- `0.25.1` = Python-only fixes on top of `4.25.0`
-- `0.26.0` = synced to upstream `4.26.0`
+Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstream_minor}[.patch]`
+- `0.4.25` = synced to upstream `4.25.0`
+- `0.4.25.1` = Python-only fix on top of `4.25.0`
+- `0.4.26` = synced to upstream `4.26.0`
+- `0.4.26a1` = alpha while porting upstream `4.26.0`
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture

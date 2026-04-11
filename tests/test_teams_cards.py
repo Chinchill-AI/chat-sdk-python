@@ -361,3 +361,144 @@ class TestCardToFallbackText:
         card = Card(title="Simple Card")
         text = card_to_fallback_text(card)
         assert text == "**Simple Card**"
+
+
+class TestTeamsCardInputEndToEnd:
+    """End-to-end: render card with Select -> submit Action.Submit -> verify process_action values."""
+
+    async def test_select_submit_round_trip(self):
+        """Card with Select renders ChoiceSet; submitted values reach process_action."""
+        from unittest.mock import MagicMock
+
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig
+
+        adapter = TeamsAdapter(
+            TeamsAdapterConfig(
+                app_id="test-app",
+                app_password="test-pass",
+            )
+        )
+        mock_chat = MagicMock()
+        adapter._chat = mock_chat
+
+        # 1. Render a card with a Select
+        card_element = Card(
+            title="Pick a color",
+            children=[
+                Actions(
+                    [
+                        Select(
+                            id="color_select",
+                            label="Color",
+                            options=[
+                                SelectOption(label="Red", value="red"),
+                                SelectOption(label="Blue", value="blue"),
+                            ],
+                        )
+                    ]
+                )
+            ],
+        )
+        adaptive = card_to_adaptive_card(card_element)
+
+        # Verify ChoiceSet was rendered
+        body = adaptive.get("body", [])
+        choice_set = next((b for b in body if b.get("type") == "Input.ChoiceSet"), None)
+        assert choice_set is not None
+        assert choice_set["id"] == "color_select"
+        assert len(choice_set["choices"]) == 2
+
+        # Verify auto-submit action exists
+        actions = adaptive.get("actions", [])
+        submit_action = next((a for a in actions if a.get("type") == "Action.Submit"), None)
+        assert submit_action is not None
+
+        # 2. Simulate Teams sending Action.Submit with the selected value
+        activity = {
+            "type": "message",
+            "from": {"id": "user-1", "name": "Test User"},
+            "conversation": {"id": "conv-1"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {
+                "actionId": AUTO_SUBMIT_ACTION_ID,
+                "color_select": "blue",
+            },
+        }
+        await adapter._handle_message_activity(activity)
+
+        # 3. Verify process_action received the selected values
+        mock_chat.process_action.assert_called_once()
+        action_event = mock_chat.process_action.call_args[0][0]
+        assert action_event.action_id == AUTO_SUBMIT_ACTION_ID
+        assert action_event.value == {"color_select": "blue"}
+        assert action_event.user.user_id == "user-1"
+
+    async def test_button_click_still_works(self):
+        """Plain button Action.Submit still passes value correctly."""
+        from unittest.mock import MagicMock
+
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig
+
+        adapter = TeamsAdapter(
+            TeamsAdapterConfig(
+                app_id="test-app",
+                app_password="test-pass",
+            )
+        )
+        mock_chat = MagicMock()
+        adapter._chat = mock_chat
+
+        activity = {
+            "type": "message",
+            "from": {"id": "user-1", "name": "Test User"},
+            "conversation": {"id": "conv-1"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {
+                "actionId": "approve_btn",
+                "value": "approved",
+            },
+        }
+        await adapter._handle_message_activity(activity)
+
+        action_event = mock_chat.process_action.call_args[0][0]
+        assert action_event.action_id == "approve_btn"
+        # Single "value" key gets unwrapped for backward compat
+        assert action_event.value == "approved"
+
+    async def test_modal_button_strips_msteams_transport_key(self):
+        """Buttons with action_type=modal include msteams metadata that must be stripped."""
+        from unittest.mock import MagicMock
+
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig
+
+        adapter = TeamsAdapter(
+            TeamsAdapterConfig(
+                app_id="test-app",
+                app_password="test-pass",
+            )
+        )
+        mock_chat = MagicMock()
+        adapter._chat = mock_chat
+
+        # Simulate payload from a modal button (has msteams transport key)
+        activity = {
+            "type": "message",
+            "from": {"id": "user-1", "name": "Test User"},
+            "conversation": {"id": "conv-1"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {
+                "actionId": "open_dialog",
+                "value": "clicked",
+                "msteams": {"type": "task/fetch"},
+            },
+        }
+        await adapter._handle_message_activity(activity)
+
+        action_event = mock_chat.process_action.call_args[0][0]
+        assert action_event.action_id == "open_dialog"
+        # msteams key should be stripped — only user value remains
+        assert action_event.value == "clicked"

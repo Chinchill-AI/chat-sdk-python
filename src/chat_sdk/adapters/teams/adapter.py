@@ -350,13 +350,40 @@ class TeamsAdapter:
 
         self._chat.process_message(self, thread_id, message, options)
 
+    # Keys injected by the SDK's card renderer or Teams transport — not user input.
+    _ACTION_TRANSPORT_KEYS = frozenset({"actionId", "msteams"})
+
+    @staticmethod
+    def _extract_action_values(action_data: dict[str, Any]) -> tuple[str, Any]:
+        """Extract action ID and submitted values from a Teams action payload.
+
+        Strips transport keys (``actionId``, ``msteams``) that are injected by
+        the SDK's card renderer or Teams infrastructure and are not user input.
+
+        For plain buttons: ``{"actionId": "btn", "value": "x"}`` → ``("btn", "x")``
+        For ChoiceSet: ``{"actionId": "__auto_submit", "sel": "opt"}`` → ``("__auto_submit", {"sel": "opt"})``
+        """
+        action_id = action_data.get("actionId", "")
+        submitted_values: Any = {k: v for k, v in action_data.items() if k not in TeamsAdapter._ACTION_TRANSPORT_KEYS}
+        # Unwrap single "value" key for plain button backward compat
+        if list(submitted_values.keys()) == ["value"]:
+            submitted_values = submitted_values["value"]
+        return action_id, submitted_values
+
     def _handle_message_action(
         self,
         activity: dict[str, Any],
         action_value: dict[str, Any],
         options: WebhookOptions | None = None,
     ) -> None:
-        """Handle Action.Submit button clicks sent as message activities."""
+        """Handle Action.Submit button clicks sent as message activities.
+
+        For plain buttons, ``action_value`` looks like ``{"actionId": "btn_id", "value": "clicked"}``.
+        For ChoiceSet (Select/RadioSelect) submissions, it looks like
+        ``{"actionId": "__auto_submit", "my_select": "option_1"}``.
+        In both cases, we pass the full dict (minus ``actionId``) as ``value``
+        so handlers receive all submitted input values.
+        """
         if not self._chat:
             return
 
@@ -370,11 +397,13 @@ class TeamsAdapter:
             )
         )
 
+        action_id, submitted_values = self._extract_action_values(action_value)
+
         from_user = activity.get("from", {})
         self._chat.process_action(
             ActionEvent(
-                action_id=action_value.get("actionId", ""),
-                value=action_value.get("value"),
+                action_id=action_id,
+                value=submitted_values,
                 user=Author(
                     user_id=from_user.get("id", "unknown"),
                     user_name=from_user.get("name", "unknown"),
@@ -411,11 +440,13 @@ class TeamsAdapter:
             )
         )
 
+        action_id, submitted_values = self._extract_action_values(action_data)
+
         from_user = activity.get("from", {})
         self._chat.process_action(
             ActionEvent(
-                action_id=action_data.get("actionId", ""),
-                value=action_data.get("value"),
+                action_id=action_id,
+                value=submitted_values,
                 user=Author(
                     user_id=from_user.get("id", "unknown"),
                     user_name=from_user.get("name", "unknown"),
