@@ -284,6 +284,13 @@ class ChannelImpl:
         """
         if is_postable_object(message):
             await self._handle_postable_object(message)
+            # Cache fallback text in history so the plan appears in channel.messages()
+            if self._message_history is not None:
+                fallback_text = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
+                fallback_msg = _to_message(
+                    self._create_sent_message("postable-obj", PostableMarkdown(markdown=fallback_text))
+                )
+                await self._message_history.append(self._id, fallback_msg)
             return message
 
         if _is_async_iterable(message):

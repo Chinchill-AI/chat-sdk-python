@@ -476,24 +476,10 @@ class GitHubAdapter:
                 {"body": body},
             )
 
-        raw: dict[str, Any] = {
-            "type": "review_comment" if decoded.review_comment_id else "issue_comment",
-            "comment": comment,
-            "repository": {
-                "id": 0,
-                "name": decoded.repo,
-                "full_name": f"{decoded.owner}/{decoded.repo}",
-                "owner": {"id": 0, "login": decoded.owner, "type": "User"},
-            },
-            "pr_number": decoded.pr_number,
-        }
-        if not decoded.review_comment_id:
-            raw["thread_type"] = decoded.type or "pr"
-
         return RawMessage(
             id=str(comment["id"]),
             thread_id=thread_id,
-            raw=raw,
+            raw=self._build_raw_message(decoded, comment),
         )
 
     async def edit_message(self, thread_id: str, message_id: str, message: AdapterPostableMessage) -> RawMessage:
@@ -518,24 +504,10 @@ class GitHubAdapter:
                 {"body": body},
             )
 
-        raw: dict[str, Any] = {
-            "type": "review_comment" if decoded.review_comment_id else "issue_comment",
-            "comment": comment,
-            "repository": {
-                "id": 0,
-                "name": decoded.repo,
-                "full_name": f"{decoded.owner}/{decoded.repo}",
-                "owner": {"id": 0, "login": decoded.owner, "type": "User"},
-            },
-            "pr_number": decoded.pr_number,
-        }
-        if not decoded.review_comment_id:
-            raw["thread_type"] = decoded.type or "pr"
-
         return RawMessage(
             id=str(comment["id"]),
             thread_id=thread_id,
-            raw=raw,
+            raw=self._build_raw_message(decoded, comment),
         )
 
     async def stream(
@@ -552,6 +524,24 @@ class GitHubAdapter:
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 text += chunk.text
         return await self.post_message(thread_id, {"markdown": text})
+
+    @staticmethod
+    def _build_raw_message(decoded: Any, comment: dict[str, Any]) -> dict[str, Any]:
+        """Build the raw message dict for post/edit responses."""
+        raw: dict[str, Any] = {
+            "type": "review_comment" if decoded.review_comment_id else "issue_comment",
+            "comment": comment,
+            "repository": {
+                "id": 0,
+                "name": decoded.repo,
+                "full_name": f"{decoded.owner}/{decoded.repo}",
+                "owner": {"id": 0, "login": decoded.owner, "type": "User"},
+            },
+            "pr_number": decoded.pr_number,
+        }
+        if not decoded.review_comment_id:
+            raw["thread_type"] = decoded.type or "pr"
+        return raw
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message."""
