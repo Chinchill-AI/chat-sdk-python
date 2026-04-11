@@ -145,8 +145,11 @@ async def post_postable_object(
     thread_id: str,
     post_fn: Any,
     logger: Logger | None = None,
-) -> None:
+) -> Any:
     """Post a PostableObject using the adapter's native support or fallback text.
+
+    Returns the ``RawMessage`` from the adapter so callers can use the
+    real message ID for history caching.
 
     Parameters
     ----------
@@ -176,6 +179,7 @@ async def post_postable_object(
     else:
         raw = await post_fn(thread_id, obj.get_fallback_text())
         obj.on_posted(_make_context(raw))
+    return raw
 
 
 # =============================================================================

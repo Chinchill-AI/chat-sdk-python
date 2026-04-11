@@ -282,10 +282,13 @@ class ChannelImpl:
         If the message is a PostableObject (e.g. Plan), it is posted via
         native adapter support or fallback text.
         """
-        # Handle PostableObject (e.g. Plan) — returned directly, not cached
-        # in message history (matches upstream TS behavior).
+        # Handle PostableObject (e.g. Plan)
         if is_postable_object(message):
-            await self._handle_postable_object(message)
+            raw = await self._handle_postable_object(message)
+            if self._message_history is not None and raw is not None:
+                fallback = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
+                sent = self._create_sent_message(raw.id, PostableMarkdown(markdown=fallback), raw.thread_id)
+                await self._message_history.append(self._id, _to_message(sent))
             return message
 
         if _is_async_iterable(message):
@@ -314,7 +317,7 @@ class ChannelImpl:
 
         return sent
 
-    async def _handle_postable_object(self, obj: Any) -> None:
+    async def _handle_postable_object(self, obj: Any) -> Any:
         """Post a PostableObject using native adapter support or fallback."""
         adapter = self.adapter
 
@@ -323,7 +326,7 @@ class ChannelImpl:
                 return await adapter.post_channel_message(thread_id, message)
             return await adapter.post_message(thread_id, message)
 
-        await post_postable_object(obj, adapter, self._id, _post_fn)
+        return await post_postable_object(obj, adapter, self._id, _post_fn)
 
     async def post_ephemeral(
         self,

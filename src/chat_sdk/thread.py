@@ -440,10 +440,15 @@ class ThreadImpl:
         or a PostableObject (e.g. Plan). PostableObjects are returned directly
         after posting so the caller can continue to mutate them.
         """
-        # Handle PostableObject (e.g. Plan) — returned directly, not cached
-        # in message history (matches upstream TS behavior).
+        # Handle PostableObject (e.g. Plan)
         if is_postable_object(message):
-            await self._handle_postable_object(message)
+            raw = await self._handle_postable_object(message)
+            # Cache in history with the real message ID (upstream skips this,
+            # but that's a gap — posted messages should appear in history).
+            if self._message_history is not None and raw is not None:
+                fallback = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
+                sent = self._create_sent_message(raw.id, PostableMarkdown(markdown=fallback), raw.thread_id)
+                await self._message_history.append(self._id, _to_message(sent))
             return message
 
         # Handle AsyncIterable (streaming)
@@ -459,9 +464,9 @@ class ThreadImpl:
 
         return result
 
-    async def _handle_postable_object(self, obj: Any) -> None:
+    async def _handle_postable_object(self, obj: Any) -> Any:
         """Post a PostableObject using native adapter support or fallback."""
-        await post_postable_object(
+        return await post_postable_object(
             obj,
             self.adapter,
             self._id,

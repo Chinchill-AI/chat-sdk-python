@@ -392,6 +392,8 @@ stay explicit instead of being rediscovered in code review.
 | `ast_to_plain_text` | Joins blocks with `\n` | Concatenates directly | More readable output |
 | `renderPostable` on unknown input | Returns `str(message)` | Throws `Error` | More resilient |
 | Chat resolver | 3-level: explicit → ContextVar → global | Process-global singleton | See [DECISIONS.md](DECISIONS.md#why-3-level-chat-resolver) |
+| PostableObject history | Cached in message history with real message ID | Not cached (skips history) | Upstream gap — posted messages should appear in thread/channel history |
+| Teams `msteams` transport key | Stripped from action values | Not stripped | Upstream gap — SDK-injected metadata should not leak to handlers |
 
 ### Platform-specific gaps
 
