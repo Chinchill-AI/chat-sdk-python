@@ -1,7 +1,7 @@
 """GitHub adapter for chat SDK.
 
-Supports both PR-level comments (Conversation tab) and review comment threads
-(Files Changed tab - line-specific).
+Supports PR-level comments (Conversation tab), review comment threads
+(Files Changed tab - line-specific), and issue comments.
 
 Python port of packages/adapter-github/src/index.ts.
 """
@@ -17,7 +17,7 @@ import re
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
 from chat_sdk.adapters.github.format_converter import GitHubFormatConverter
@@ -59,6 +59,7 @@ from chat_sdk.types import (
 )
 
 REVIEW_COMMENT_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+):rc:(\d+)$")
+ISSUE_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):issue:(\d+)$")
 PR_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+)$")
 
 # GitHub reaction content types
@@ -261,7 +262,7 @@ class GitHubAdapter:
                 await self._store_installation_id(owner_login, repo_name, installation_id)
 
         if event_type == "issue_comment":
-            if payload.get("action") == "created" and payload.get("issue", {}).get("pull_request"):
+            if payload.get("action") == "created":
                 self._handle_issue_comment(payload, installation_id, options)
         elif event_type == "pull_request_review_comment" and payload.get("action") == "created":
             self._handle_review_comment(payload, installation_id, options)
@@ -291,7 +292,7 @@ class GitHubAdapter:
         installation_id: int | None,
         options: WebhookOptions | None = None,
     ) -> None:
-        """Handle issue_comment webhook (PR-level comments)."""
+        """Handle issue_comment webhook (PR-level or issue-level comments)."""
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring comment")
             return
@@ -301,15 +302,19 @@ class GitHubAdapter:
         repository = payload["repository"]
         sender = payload["sender"]
 
+        is_pr = bool(issue.get("pull_request"))
+        thread_type: Literal["pr", "issue"] = "pr" if is_pr else "issue"
+
         thread_id = self.encode_thread_id(
             GitHubThreadId(
                 owner=repository["owner"]["login"],
                 repo=repository["name"],
                 pr_number=issue["number"],
+                type=thread_type,
             )
         )
 
-        message = self._parse_issue_comment(comment, repository, issue["number"], thread_id)
+        message = self._parse_issue_comment(comment, repository, issue["number"], thread_id, thread_type)
 
         if sender.get("id") == self._bot_user_id:
             self._logger.debug("Ignoring message from self", {"messageId": comment["id"]})
@@ -358,6 +363,7 @@ class GitHubAdapter:
         repository: dict[str, Any],
         pr_number: int,
         thread_id: str,
+        thread_type: Literal["pr", "issue"] = "pr",
     ) -> Message:
         """Parse an issue comment into a normalized Message."""
         author = self._parse_author(comment["user"])
@@ -367,22 +373,25 @@ class GitHubAdapter:
         updated_at = comment.get("updated_at", "")
         edited = created_at != updated_at
 
+        raw: dict[str, Any] = {
+            "type": "issue_comment",
+            "comment": comment,
+            "repository": {
+                "id": 0,
+                "name": repository.get("name", ""),
+                "full_name": f"{repository.get('owner', {}).get('login', '')}/{repository.get('name', '')}",
+                "owner": repository.get("owner", {}),
+            },
+            "pr_number": pr_number,
+            "thread_type": thread_type,
+        }
+
         return Message(
             id=str(comment["id"]),
             thread_id=thread_id,
             text=self._format_converter.extract_plain_text(body_text),
             formatted=self._format_converter.to_ast(body_text),
-            raw={
-                "type": "issue_comment",
-                "comment": comment,
-                "repository": {
-                    "id": 0,
-                    "name": repository.get("name", ""),
-                    "full_name": f"{repository.get('owner', {}).get('login', '')}/{repository.get('name', '')}",
-                    "owner": repository.get("owner", {}),
-                },
-                "pr_number": pr_number,
-            },
+            raw=raw,
             author=author,
             metadata=MessageMetadata(
                 date_sent=_parse_iso(created_at) if created_at else datetime.now(tz=timezone.utc),
@@ -460,27 +469,31 @@ class GitHubAdapter:
                 {"body": body},
             )
         else:
-            # PR-level thread - issue comment
+            # PR-level or issue-level thread - issue comment
             comment = await self._github_api_request(
                 "POST",
                 f"/repos/{decoded.owner}/{decoded.repo}/issues/{decoded.pr_number}/comments",
                 {"body": body},
             )
 
+        raw: dict[str, Any] = {
+            "type": "review_comment" if decoded.review_comment_id else "issue_comment",
+            "comment": comment,
+            "repository": {
+                "id": 0,
+                "name": decoded.repo,
+                "full_name": f"{decoded.owner}/{decoded.repo}",
+                "owner": {"id": 0, "login": decoded.owner, "type": "User"},
+            },
+            "pr_number": decoded.pr_number,
+        }
+        if not decoded.review_comment_id:
+            raw["thread_type"] = decoded.type or "pr"
+
         return RawMessage(
             id=str(comment["id"]),
             thread_id=thread_id,
-            raw={
-                "type": "review_comment" if decoded.review_comment_id else "issue_comment",
-                "comment": comment,
-                "repository": {
-                    "id": 0,
-                    "name": decoded.repo,
-                    "full_name": f"{decoded.owner}/{decoded.repo}",
-                    "owner": {"id": 0, "login": decoded.owner, "type": "User"},
-                },
-                "pr_number": decoded.pr_number,
-            },
+            raw=raw,
         )
 
     async def edit_message(self, thread_id: str, message_id: str, message: AdapterPostableMessage) -> RawMessage:
@@ -505,20 +518,24 @@ class GitHubAdapter:
                 {"body": body},
             )
 
+        raw: dict[str, Any] = {
+            "type": "review_comment" if decoded.review_comment_id else "issue_comment",
+            "comment": comment,
+            "repository": {
+                "id": 0,
+                "name": decoded.repo,
+                "full_name": f"{decoded.owner}/{decoded.repo}",
+                "owner": {"id": 0, "login": decoded.owner, "type": "User"},
+            },
+            "pr_number": decoded.pr_number,
+        }
+        if not decoded.review_comment_id:
+            raw["thread_type"] = decoded.type or "pr"
+
         return RawMessage(
             id=str(comment["id"]),
             thread_id=thread_id,
-            raw={
-                "type": "review_comment" if decoded.review_comment_id else "issue_comment",
-                "comment": comment,
-                "repository": {
-                    "id": 0,
-                    "name": decoded.repo,
-                    "full_name": f"{decoded.owner}/{decoded.repo}",
-                    "owner": {"id": 0, "login": decoded.owner, "type": "User"},
-                },
-                "pr_number": decoded.pr_number,
-            },
+            raw=raw,
         )
 
     async def stream(
@@ -660,6 +677,7 @@ class GitHubAdapter:
                     {"owner": {"id": 0, "login": decoded.owner, "type": "User"}, "name": decoded.repo},
                     decoded.pr_number,
                     thread_id,
+                    decoded.type or "pr",
                 )
                 for c in comments
             ]
@@ -676,6 +694,27 @@ class GitHubAdapter:
     async def fetch_thread(self, thread_id: str) -> ThreadInfo:
         """Fetch thread metadata."""
         decoded = self.decode_thread_id(thread_id)
+
+        if decoded.type == "issue":
+            issue = await self._github_api_request(
+                "GET",
+                f"/repos/{decoded.owner}/{decoded.repo}/issues/{decoded.pr_number}",
+            )
+
+            return ThreadInfo(
+                id=thread_id,
+                channel_id=f"{decoded.owner}/{decoded.repo}",
+                channel_name=f"{decoded.repo} #{decoded.pr_number}",
+                is_dm=False,
+                metadata={
+                    "owner": decoded.owner,
+                    "repo": decoded.repo,
+                    "issueNumber": decoded.pr_number,
+                    "issueTitle": issue.get("title"),
+                    "issueState": issue.get("state"),
+                    "type": "issue",
+                },
+            )
 
         pr = await self._github_api_request(
             "GET",
@@ -698,7 +737,21 @@ class GitHubAdapter:
         )
 
     def encode_thread_id(self, platform_data: GitHubThreadId) -> str:
-        """Encode platform data into a thread ID string."""
+        """Encode platform data into a thread ID string.
+
+        Thread ID formats:
+        - PR-level: ``github:{owner}/{repo}:{prNumber}``
+        - Issue-level: ``github:{owner}/{repo}:issue:{issueNumber}``
+        - Review comment: ``github:{owner}/{repo}:{prNumber}:rc:{reviewCommentId}``
+        """
+        if platform_data.type == "issue" and platform_data.review_comment_id:
+            raise ValidationError(
+                "github",
+                "Review comments are not supported on issue threads",
+            )
+
+        if platform_data.type == "issue":
+            return f"github:{platform_data.owner}/{platform_data.repo}:issue:{platform_data.pr_number}"
         if platform_data.review_comment_id:
             return (
                 f"github:{platform_data.owner}/{platform_data.repo}"
@@ -720,6 +773,16 @@ class GitHubAdapter:
                 repo=rc_match.group(2),
                 pr_number=int(rc_match.group(3)),
                 review_comment_id=int(rc_match.group(4)),
+                type="pr",
+            )
+
+        issue_match = ISSUE_THREAD_PATTERN.match(without_prefix)
+        if issue_match:
+            return GitHubThreadId(
+                owner=issue_match.group(1),
+                repo=issue_match.group(2),
+                pr_number=int(issue_match.group(3)),
+                type="issue",
             )
 
         pr_match = PR_THREAD_PATTERN.match(without_prefix)
@@ -728,6 +791,7 @@ class GitHubAdapter:
                 owner=pr_match.group(1),
                 repo=pr_match.group(2),
                 pr_number=int(pr_match.group(3)),
+                type="pr",
             )
 
         raise ValidationError("github", f"Invalid GitHub thread ID format: {thread_id}")
@@ -779,6 +843,7 @@ class GitHubAdapter:
                         "owner": {"id": 0, "login": owner, "type": "User"},
                     },
                     "pr_number": pr["number"],
+                    "thread_type": "pr",
                 },
                 author=self._parse_author(pr_user),
                 metadata=MessageMetadata(
@@ -830,14 +895,18 @@ class GitHubAdapter:
     def parse_message(self, raw: GitHubRawMessage) -> Message:
         """Parse a raw message into normalized format."""
         if raw.get("type") == "issue_comment":
+            thread_type = raw.get("thread_type", "pr") or "pr"
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
                     owner=raw["repository"]["owner"]["login"],
                     repo=raw["repository"]["name"],
                     pr_number=raw["pr_number"],
+                    type=thread_type,
                 )
             )
-            return self._parse_issue_comment(raw["comment"], raw["repository"], raw["pr_number"], thread_id)
+            return self._parse_issue_comment(
+                raw["comment"], raw["repository"], raw["pr_number"], thread_id, thread_type
+            )
         else:
             root_comment_id = raw["comment"].get("in_reply_to_id") or raw["comment"]["id"]
             thread_id = self.encode_thread_id(

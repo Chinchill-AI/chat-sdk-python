@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
+from chat_sdk.plan import is_postable_object, post_postable_object
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
@@ -431,12 +432,19 @@ class ThreadImpl:
 
     async def post(
         self,
-        message: PostableMessage,
-    ) -> SentMessage:
+        message: PostableMessage | Any,
+    ) -> SentMessage | Any:
         """Post a message to this thread.
 
-        Accepts a plain string, PostableMessage, or an AsyncIterable for streaming.
+        Accepts a plain string, PostableMessage, AsyncIterable for streaming,
+        or a PostableObject (e.g. Plan). PostableObjects are returned directly
+        after posting so the caller can continue to mutate them.
         """
+        # Handle PostableObject (e.g. Plan)
+        if is_postable_object(message):
+            await self._handle_postable_object(message)
+            return message
+
         # Handle AsyncIterable (streaming)
         if _is_async_iterable(message):
             return await self._handle_stream(message)
@@ -449,6 +457,16 @@ class ThreadImpl:
             await self._message_history.append(self._id, _to_message(result))
 
         return result
+
+    async def _handle_postable_object(self, obj: Any) -> None:
+        """Post a PostableObject using native adapter support or fallback."""
+        await post_postable_object(
+            obj,
+            self.adapter,
+            self._id,
+            lambda thread_id, message: self.adapter.post_message(thread_id, message),
+            self._logger,
+        )
 
     async def post_ephemeral(
         self,

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.errors import ChatNotImplementedError
+from chat_sdk.plan import is_postable_object, post_postable_object
 from chat_sdk.thread import (
     _ChannelImplConfigForThread,
     _ChatSingleton,
@@ -271,13 +272,20 @@ class ChannelImpl:
 
     async def post(
         self,
-        message: PostableMessage,
-    ) -> SentMessage:
+        message: PostableMessage | Any,
+    ) -> SentMessage | Any:
         """Post a message to this channel.
 
         If the message is an AsyncIterable (streaming), accumulates all text
         and posts as a single message -- channels do not support real-time streaming.
+
+        If the message is a PostableObject (e.g. Plan), it is posted via
+        native adapter support or fallback text.
         """
+        if is_postable_object(message):
+            await self._handle_postable_object(message)
+            return message
+
         if _is_async_iterable(message):
             accumulated = ""
             async for chunk in _from_full_stream(message):
@@ -303,6 +311,17 @@ class ChannelImpl:
             await self._message_history.append(self._id, _to_message(sent))
 
         return sent
+
+    async def _handle_postable_object(self, obj: Any) -> None:
+        """Post a PostableObject using native adapter support or fallback."""
+        adapter = self.adapter
+
+        async def _post_fn(thread_id: str, message: str) -> Any:
+            if hasattr(adapter, "post_channel_message") and adapter.post_channel_message:
+                return await adapter.post_channel_message(thread_id, message)
+            return await adapter.post_message(thread_id, message)
+
+        await post_postable_object(obj, adapter, self._id, _post_fn)
 
     async def post_ephemeral(
         self,

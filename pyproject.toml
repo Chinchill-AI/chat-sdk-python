@@ -1,6 +1,6 @@
 [project]
 name = "chat-sdk"
-version = "0.0.1a12"
+version = "0.25.0"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
 readme = "README.md"
 license = {text = "MIT"}

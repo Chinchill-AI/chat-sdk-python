@@ -1,23 +1,57 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of Vercel Chat SDK. Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.25.0). Multi-platform async chat framework.
 
 ## Key Commands
-- `uv sync --group dev` -- install dependencies
-- `uv run pytest tests/ -q` -- run tests
-- `uv run ruff check src/` -- lint
-- `uv run ruff format src/` -- format
+```bash
+uv sync --group dev           # install dependencies
+uv run pytest tests/ -q       # run tests
+uv run ruff check src/ tests/ scripts/  # lint
+uv run ruff format src/ tests/ scripts/ # format
+
+# Full validation — run before declaring any task done
+uv run ruff check src/ tests/ scripts/ && \
+uv run ruff format --check src/ tests/ scripts/ && \
+uv run python scripts/audit_test_quality.py && \
+uv run python scripts/verify_test_fidelity.py && \
+uv run pytest tests/ --tb=short -q
+```
+
+## Version Mapping
+Our version tracks the upstream Vercel Chat minor version:
+- `0.25.0` = synced to upstream `4.25.0`
+- `0.25.1` = Python-only fixes on top of `4.25.0`
+- `0.26.0` = synced to upstream `4.26.0`
+- `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
-- `src/chat_sdk/chat.py` -- Main Chat orchestrator (handlers, routing, concurrency)
+- `src/chat_sdk/chat.py` -- Chat orchestrator (handlers, routing, concurrency)
 - `src/chat_sdk/thread.py` -- Thread (streaming, pagination, subscriptions)
 - `src/chat_sdk/channel.py` -- Channel (thread listing, metadata)
+- `src/chat_sdk/plan.py` -- Plan (PostableObject for structured task lists)
 - `src/chat_sdk/types.py` -- All types (Message, Author, Adapter protocol)
 - `src/chat_sdk/adapters/` -- 8 platform adapters
 - `src/chat_sdk/shared/` -- Markdown parser, format converter, streaming renderer
 - `src/chat_sdk/state/` -- Memory, Redis, Postgres backends
-- `tests/` -- 3,267 tests
+- `tests/` -- 3,400+ tests
+
+### Thread ID Format
+All thread IDs follow: `{adapter}:{channel}:{thread}`
+- Slack: `slack:C123ABC:1234567890.123456`
+- Teams: `teams:{base64(conversationId)}:{base64(serviceUrl)}`
+- Google Chat: `gchat:spaces/ABC123:{base64(threadName)}`
+- Discord: `discord:{guildId}:{channelId}[:{threadId}]`
+- GitHub: `github:owner/repo:42` (PR) or `github:owner/repo:issue:42`
+
+### Message Handling Flow
+1. Platform sends webhook → adapter verifies + parses
+2. Adapter calls `chat.process_message()` (or `process_action`, etc.)
+3. Chat acquires lock, deduplicates, then routes:
+   - Subscribed thread → `on_subscribed_message` handlers
+   - @mention → `on_mention` handlers
+   - DM → `on_direct_message` handlers
+   - Pattern match → `on_message` handlers
 
 ## Principles
 
@@ -31,25 +65,22 @@ Python port of Vercel Chat SDK. Multi-platform async chat framework.
 
 ## Port Rules (TS → Python)
 
-These are specific patterns that broke during the port. The principles above
-explain *why*; these explain *what to watch for*.
+See docs/UPSTREAM_SYNC.md for the full 15-hazard guide. Key patterns:
 
-- `datetime.utcnow()` → `datetime.now(tz=UTC)` (deprecated, naive)
-- `asyncio.ensure_future` → `loop.create_task()` (deprecated)
+- `x or default` → `x if x is not None else default` (truthiness trap)
+- `datetime.utcnow()` → `datetime.now(tz=timezone.utc)` (deprecated, naive)
 - Raw dicts to `process_*` → typed dataclasses (ActionEvent, etc.)
-- camelCase dispatch keys → snake_case
+- camelCase dispatch keys → snake_case internally, camelCase at serialization boundary
 - `random.choices` for tokens → `secrets.token_hex`
-- Optional deps at module level → lazy import
+- Optional deps at module level → lazy import inside methods
 - `==` for signatures → `hmac.compare_digest`
-- `or` for empty-string-valid fields → `is not None`
 - Validate external URLs before requests (SSRF)
-- Check `extend_lock` return value in loops
-
-## Adding a New Adapter
-See docs/ARCHITECTURE.md and CONTRIBUTING.md.
+- `chat.activate()` > `register_singleton()` > error (3-level resolver)
 
 ## Upstream Sync
-See docs/UPSTREAM_SYNC.md for TS->Python translation patterns.
+
+See docs/UPSTREAM_SYNC.md for the full sync procedure, porting hazards, review
+checklist, and known non-parity list.
 
 ## Known Limitations
 - Markdown parser handles common cases but is not full CommonMark
@@ -63,5 +94,5 @@ async mock bugs, and cross-file duplicates. PRs that introduce hard failures
 will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
-`it("...")` has a matching Python `def test_*()`. Name match ≠ faithful port —
-the audit script catches the quality side.
+`it("...")` has a matching Python `def test_*()`. Must show 0 missing before
+committing test changes.

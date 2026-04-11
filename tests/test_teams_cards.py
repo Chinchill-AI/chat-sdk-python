@@ -5,7 +5,7 @@ Ported from packages/adapter-teams/src/cards.test.ts.
 
 from __future__ import annotations
 
-from chat_sdk.adapters.teams.cards import card_to_adaptive_card, card_to_fallback_text
+from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID, card_to_adaptive_card, card_to_fallback_text
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -19,6 +19,7 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
 )
+from chat_sdk.modals import RadioSelect, Select, SelectOption
 
 # ---------------------------------------------------------------------------
 # cardToAdaptiveCard
@@ -208,6 +209,117 @@ class TestCardToAdaptiveCard:
             "text": "[Click here](https://example.com)",
             "wrap": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# Select and RadioSelect in Actions
+# ---------------------------------------------------------------------------
+
+
+class TestCardToAdaptiveCardSelectAndRadioSelect:
+    """Ported from cards.test.ts: cardToAdaptiveCard with select and radio_select in Actions."""
+
+    def test_converts_select_to_compact_choice_set_input(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Select(
+                            id="color",
+                            label="Pick a color",
+                            options=[
+                                SelectOption(label="Red", value="red"),
+                                SelectOption(label="Blue", value="blue"),
+                            ],
+                            placeholder="Choose...",
+                        ),
+                    ]
+                ),
+            ],
+        )
+        adaptive = card_to_adaptive_card(card)
+
+        assert len(adaptive["body"]) == 1
+        choice_set = adaptive["body"][0]
+        assert choice_set["type"] == "Input.ChoiceSet"
+        assert choice_set["id"] == "color"
+        assert choice_set["label"] == "Pick a color"
+        assert choice_set["style"] == "compact"
+        assert choice_set["isRequired"] is True
+        assert choice_set["placeholder"] == "Choose..."
+
+        assert len(choice_set["choices"]) == 2
+        assert choice_set["choices"][0] == {"title": "Red", "value": "red"}
+        assert choice_set["choices"][1] == {"title": "Blue", "value": "blue"}
+
+        # Auto-injects submit button since there are no explicit buttons
+        assert len(adaptive["actions"]) == 1
+        assert adaptive["actions"][0] == {
+            "type": "Action.Submit",
+            "title": "Submit",
+            "data": {"actionId": AUTO_SUBMIT_ACTION_ID},
+        }
+
+    def test_converts_radio_select_to_expanded_choice_set_input(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        RadioSelect(
+                            id="plan",
+                            label="Choose Plan",
+                            options=[
+                                SelectOption(label="Free", value="free"),
+                                SelectOption(label="Pro", value="pro"),
+                            ],
+                        ),
+                    ]
+                ),
+            ],
+        )
+        adaptive = card_to_adaptive_card(card)
+
+        assert len(adaptive["body"]) == 1
+        choice_set = adaptive["body"][0]
+        assert choice_set["type"] == "Input.ChoiceSet"
+        assert choice_set["id"] == "plan"
+        assert choice_set["label"] == "Choose Plan"
+        assert choice_set["style"] == "expanded"
+        assert choice_set["isRequired"] is True
+
+        # Auto-injects submit button
+        assert len(adaptive["actions"]) == 1
+        assert adaptive["actions"][0] == {
+            "type": "Action.Submit",
+            "title": "Submit",
+            "data": {"actionId": AUTO_SUBMIT_ACTION_ID},
+        }
+
+    def test_does_not_auto_inject_submit_when_buttons_present(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Select(
+                            id="color",
+                            label="Color",
+                            options=[SelectOption(label="Red", value="red")],
+                        ),
+                        Button(id="submit", label="Submit", style="primary"),
+                    ]
+                ),
+            ],
+        )
+        adaptive = card_to_adaptive_card(card)
+
+        # Select goes to body, button goes to actions
+        assert len(adaptive["body"]) == 1
+        assert adaptive["body"][0]["type"] == "Input.ChoiceSet"
+        assert adaptive["body"][0]["id"] == "color"
+
+        assert len(adaptive["actions"]) == 1
+        assert adaptive["actions"][0]["type"] == "Action.Submit"
+        assert adaptive["actions"][0]["title"] == "Submit"
 
 
 # ---------------------------------------------------------------------------

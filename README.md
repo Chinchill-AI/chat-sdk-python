@@ -2,7 +2,7 @@
 
 Multi-platform async chat SDK for Python. Port of [Vercel Chat](https://github.com/vercel/chat).
 
-> **Status: Alpha (0.0.1a12)** — API may change. Not yet tested in production.
+> **Status: Alpha (0.25.0 — synced to [Vercel Chat 4.25.0](https://github.com/vercel/chat))** — API may change.
 
 ## Why chat-sdk?
 

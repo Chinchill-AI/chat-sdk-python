@@ -268,8 +268,8 @@ class TestGitHubWebhookMessageProcessing:
     """Issue comment / review comment processing via handleWebhook."""
 
     @pytest.mark.asyncio
-    async def test_issue_comment_not_on_pr_ignored(self):
-        """issue_comment on a plain issue (no pull_request key) is ignored."""
+    async def test_issue_comment_on_plain_issue_processed(self):
+        """issue_comment on a plain issue (no pull_request key) is processed."""
         adapter = _make_adapter()
         mock_chat = MagicMock()
         mock_chat.process_message = MagicMock()
@@ -282,6 +282,12 @@ class TestGitHubWebhookMessageProcessing:
             request = _make_request(body, "issue_comment", signature=sig)
             response = await adapter.handle_webhook(request)
             assert response["status"] == 200
+            mock_chat.process_message.assert_called_once()
+            call_args = mock_chat.process_message.call_args
+            assert call_args[0][1] == "github:acme/app:issue:10"
+            msg = call_args[0][2]
+            assert msg.id == "100"
+            assert msg.thread_id == "github:acme/app:issue:10"
         finally:
             await adapter.disconnect()
 
@@ -354,6 +360,60 @@ class TestGitHubParseMessage:
         assert msg.text == "Test comment"
         assert msg.author.user_name == "testuser"
         assert msg.author.is_bot is False
+
+    def test_issue_comment_from_issue_thread(self):
+        """Parse an issue_comment raw message from an issue thread."""
+        adapter = _make_adapter()
+        raw = {
+            "type": "issue_comment",
+            "comment": {
+                "id": 100,
+                "body": "Issue comment",
+                "user": {"id": 1, "login": "testuser", "type": "User"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/acme/app/issues/10#issuecomment-100",
+            },
+            "repository": {
+                "id": 1,
+                "name": "app",
+                "full_name": "acme/app",
+                "owner": {"id": 10, "login": "acme", "type": "User"},
+            },
+            "pr_number": 10,
+            "thread_type": "issue",
+        }
+        msg = adapter.parse_message(raw)
+        assert msg.id == "100"
+        assert msg.thread_id == "github:acme/app:issue:10"
+        assert msg.text == "Issue comment"
+        assert msg.raw["type"] == "issue_comment"
+        assert msg.raw.get("thread_type") == "issue"
+
+    def test_default_to_pr_thread_when_thread_type_omitted(self):
+        """When thread_type is omitted, default to PR thread format."""
+        adapter = _make_adapter()
+        raw = {
+            "type": "issue_comment",
+            "comment": {
+                "id": 100,
+                "body": "Test comment",
+                "user": {"id": 1, "login": "testuser", "type": "User"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/acme/app/pull/42#issuecomment-100",
+            },
+            "repository": {
+                "id": 1,
+                "name": "app",
+                "full_name": "acme/app",
+                "owner": {"id": 10, "login": "acme", "type": "User"},
+            },
+            "pr_number": 42,
+            # thread_type omitted -- should default to PR format
+        }
+        msg = adapter.parse_message(raw)
+        assert msg.thread_id == "github:acme/app:42"
 
     def test_review_comment_root(self):
         adapter = _make_adapter()
@@ -526,23 +586,84 @@ class TestGitHubThreadIdExtended:
         assert result.owner == "my-org"
         assert result.repo == "my-cool-app"
         assert result.pr_number == 42
+        assert result.type == "pr"
+
+    def test_decode_pr_thread(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("github:acme/app:123")
+        assert result.owner == "acme"
+        assert result.repo == "app"
+        assert result.pr_number == 123
+        assert result.type == "pr"
+
+    def test_decode_review_comment_thread(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("github:acme/app:123:rc:456789")
+        assert result.owner == "acme"
+        assert result.repo == "app"
+        assert result.pr_number == 123
+        assert result.type == "pr"
+        assert result.review_comment_id == 456789
+
+    def test_decode_issue_thread(self):
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("github:acme/app:issue:10")
+        assert result.owner == "acme"
+        assert result.repo == "app"
+        assert result.pr_number == 10
+        assert result.type == "issue"
+
+    def test_encode_issue_thread(self):
+        adapter = _make_adapter()
+        result = adapter.encode_thread_id(GitHubThreadId(owner="acme", repo="app", pr_number=10, type="issue"))
+        assert result == "github:acme/app:issue:10"
+
+    def test_encode_issue_thread_with_review_comment_raises(self):
+        adapter = _make_adapter()
+        with pytest.raises(ValidationError, match="Review comments are not supported on issue threads"):
+            adapter.encode_thread_id(
+                GitHubThreadId(
+                    owner="acme",
+                    repo="app",
+                    pr_number=10,
+                    type="issue",
+                    review_comment_id=999,
+                )
+            )
 
     def test_roundtrip_pr_level(self):
         adapter = _make_adapter()
-        original = GitHubThreadId(owner="vercel", repo="next.js", pr_number=99999)
+        original = GitHubThreadId(owner="vercel", repo="next.js", pr_number=99999, type="pr")
         decoded = adapter.decode_thread_id(adapter.encode_thread_id(original))
         assert decoded.owner == original.owner
         assert decoded.repo == original.repo
         assert decoded.pr_number == original.pr_number
+        assert decoded.type == "pr"
 
     def test_roundtrip_review_comment(self):
         adapter = _make_adapter()
-        original = GitHubThreadId(owner="vercel", repo="next.js", pr_number=99999, review_comment_id=123456789)
+        original = GitHubThreadId(
+            owner="vercel",
+            repo="next.js",
+            pr_number=99999,
+            review_comment_id=123456789,
+            type="pr",
+        )
         decoded = adapter.decode_thread_id(adapter.encode_thread_id(original))
         assert decoded.owner == original.owner
         assert decoded.repo == original.repo
         assert decoded.pr_number == original.pr_number
         assert decoded.review_comment_id == original.review_comment_id
+        assert decoded.type == "pr"
+
+    def test_roundtrip_issue_thread(self):
+        adapter = _make_adapter()
+        original = GitHubThreadId(owner="vercel", repo="next.js", pr_number=42, type="issue")
+        decoded = adapter.decode_thread_id(adapter.encode_thread_id(original))
+        assert decoded.owner == original.owner
+        assert decoded.repo == original.repo
+        assert decoded.pr_number == original.pr_number
+        assert decoded.type == "issue"
 
 
 # ---------------------------------------------------------------------------

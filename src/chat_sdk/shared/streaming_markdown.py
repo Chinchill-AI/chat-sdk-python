@@ -349,7 +349,7 @@ class StreamingMarkdownRenderer:
     in the adapter's ``edit_message -> render_postable -> from_ast`` pipeline.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, wrap_tables_for_append: bool = True) -> None:
         self._accumulated = ""
         self._dirty = True
         self._cached_render = ""
@@ -358,6 +358,9 @@ class StreamingMarkdownRenderer:
         self._fence_toggles = 0
         # Incomplete trailing line buffer for incremental fence tracking
         self._incomplete_line = ""
+        # When True, confirmed tables are wrapped in code fences for
+        # append-only consumers that cannot render GFM tables natively.
+        self._wrap_tables_for_append = wrap_tables_for_append
 
     # -- public API ----------------------------------------------------------
 
@@ -405,13 +408,13 @@ class StreamingMarkdownRenderer:
         """Get text safe for append-only streaming (e.g. Slack native streaming).
 
         - Holds back unconfirmed table headers until separator arrives.
-        - Wraps confirmed tables in code fences so pipes render as literal
-          text (not broken mrkdwn).
+        - Optionally wraps confirmed tables in code fences so pipes render as
+          literal text on append-only surfaces that lack native table support.
         - Holds back unclosed inline markers.
         - The final ``edit_message`` replaces everything with properly formatted text.
         """
         if self._finished:
-            return _wrap_tables_for_append(self._accumulated, close_fences=True)
+            return self._format_append_only_text(self._accumulated, close_fences=True)
 
         text = self._accumulated
         if text and not text.endswith("\n"):
@@ -420,16 +423,20 @@ class StreamingMarkdownRenderer:
 
             # If stripping puts us inside a code fence, keep the incomplete line
             if _is_inside_code_fence(without_incomplete_line):
-                return _wrap_tables_for_append(text)
+                # Still apply any configured table transformation to preserve
+                # append-only coordinate space for delta calculation.
+                return self._format_append_only_text(text)
 
             text = without_incomplete_line
 
         # Inside a user code fence: skip table holding and inline marker buffering
+        # (pipes and markers are literal inside fences), but still apply any
+        # configured table transformation to preserve coordinate space.
         if _is_inside_code_fence(text):
-            return _wrap_tables_for_append(text)
+            return self._format_append_only_text(text)
 
         committed = _get_committable_prefix(text)
-        wrapped = _wrap_tables_for_append(committed)
+        wrapped = self._format_append_only_text(committed)
 
         # If text ends inside an open table code fence,
         # skip inline marker buffering
@@ -449,6 +456,12 @@ class StreamingMarkdownRenderer:
         return self.render()
 
     # -- private helpers -----------------------------------------------------
+
+    def _format_append_only_text(self, text: str, close_fences: bool = False) -> str:
+        """Conditionally wrap tables in code fences based on configuration."""
+        if not self._wrap_tables_for_append:
+            return text
+        return _wrap_tables_for_append(text, close_fences)
 
     def _is_accumulated_inside_fence(self) -> bool:
         """O(1) check if accumulated text is inside an unclosed code fence."""

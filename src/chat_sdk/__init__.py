@@ -86,6 +86,21 @@ from chat_sdk.modals import (
     select_option,
     text_input,
 )
+from chat_sdk.plan import (
+    AddTaskOptions,
+    CompletePlanOptions,
+    Plan,
+    PlanContent,
+    PlanModel,
+    PlanModelTask,
+    PlanTask,
+    PlanTaskStatus,
+    PostableObjectContext,
+    StartPlanOptions,
+    UpdateTaskInput,
+    is_postable_object,
+    post_postable_object,
+)
 from chat_sdk.shared.base_format_converter import BaseFormatConverter
 from chat_sdk.shared.errors import (
     AdapterError,
@@ -165,11 +180,29 @@ from chat_sdk.types import (
     WellKnownEmoji,
 )
 
+# The upstream Vercel Chat version this release is synced to.
+UPSTREAM_PARITY = "4.25.0"
+
 __all__ = [
+    "UPSTREAM_PARITY",
     # Core classes
     "Chat",
     "ThreadImpl",
     "ChannelImpl",
+    # Plan / PostableObject
+    "Plan",
+    "PlanTask",
+    "PlanTaskStatus",
+    "PlanModel",
+    "PlanModelTask",
+    "PlanContent",
+    "StartPlanOptions",
+    "AddTaskOptions",
+    "UpdateTaskInput",
+    "CompletePlanOptions",
+    "PostableObjectContext",
+    "is_postable_object",
+    "post_postable_object",
     # AI
     "to_ai_messages",
     # Card builders (PascalCase primary — matches source TS SDK)

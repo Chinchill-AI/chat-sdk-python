@@ -51,9 +51,10 @@ def _slack_signature(body: str, secret: str, timestamp: int | None = None) -> tu
 class _FakeRequest:
     """Minimal request-like object for adapter webhook testing."""
 
-    def __init__(self, body: str, headers: dict[str, str] | None = None):
+    def __init__(self, body: str, headers: dict[str, str] | None = None, url: str = ""):
         self.body = body.encode("utf-8")
         self.headers = headers or {}
+        self.url = url
 
     async def text(self) -> str:
         return self.body.decode("utf-8")
@@ -690,3 +691,146 @@ class TestMultiWorkspace:
         assert await adapter.get_installation("T_TEAM_2") is not None
         await adapter.delete_installation("T_TEAM_2")
         assert await adapter.get_installation("T_TEAM_2") is None
+
+
+# ---------------------------------------------------------------------------
+# OAuth callback -- redirect_uri handling
+# ---------------------------------------------------------------------------
+
+
+def _make_oauth_adapter() -> tuple[SlackAdapter, MagicMock, AsyncMock]:
+    """Create a SlackAdapter wired for OAuth with a mocked oauth_v2_access."""
+    adapter = SlackAdapter(
+        SlackAdapterConfig(
+            signing_secret="test-signing-secret",
+            client_id="client-id",
+            client_secret="client-secret",
+        )
+    )
+    mock_access = AsyncMock(
+        return_value={
+            "ok": True,
+            "access_token": "xoxb-oauth-bot-token",
+            "bot_user_id": "U_BOT_OAUTH",
+            "team": {"id": "T_OAUTH_1", "name": "OAuth Team"},
+        }
+    )
+    # Patch the client returned by _get_client("") to have oauth_v2_access
+    mock_client = MagicMock()
+    mock_client.oauth_v2_access = mock_access
+    mock_client.auth_test = AsyncMock(
+        return_value={
+            "ok": True,
+            "user_id": "U_BOT_OAUTH",
+            "bot_id": "B_BOT",
+            "user": "bot",
+        }
+    )
+    adapter._client_cache[""] = mock_client
+    return adapter, mock_client, mock_access
+
+
+class TestOAuthRedirectUri:
+    """Port of upstream handleOAuthCallback redirect_uri tests (commit 1856198)."""
+
+    @pytest.mark.asyncio
+    async def test_exchanges_code_for_token_and_saves_installation(self):
+        adapter, _, mock_access = _make_oauth_adapter()
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest(
+            "",
+            url="https://example.com/auth/callback/slack?code=oauth-code-123",
+        )
+        result = await adapter.handle_oauth_callback(req)
+
+        assert result["team_id"] == "T_OAUTH_1"
+        stored = await adapter.get_installation("T_OAUTH_1")
+        assert stored is not None
+        assert stored.bot_token == "xoxb-oauth-bot-token"
+        mock_access.assert_called_once_with(
+            client_id="client-id",
+            client_secret="client-secret",
+            code="oauth-code-123",
+        )
+
+    @pytest.mark.asyncio
+    async def test_forwards_redirect_uri_from_callback_options(self):
+        adapter, _, mock_access = _make_oauth_adapter()
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest(
+            "",
+            url="https://example.com/auth/callback/slack?code=oauth-code-123",
+        )
+        await adapter.handle_oauth_callback(req, options={"redirect_uri": "https://example.com/install/callback"})
+
+        mock_access.assert_called_once_with(
+            client_id="client-id",
+            client_secret="client-secret",
+            code="oauth-code-123",
+            redirect_uri="https://example.com/install/callback",
+        )
+
+    @pytest.mark.asyncio
+    async def test_prefers_callback_options_redirect_uri_over_query_param(self):
+        adapter, _, mock_access = _make_oauth_adapter()
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest(
+            "",
+            url="https://example.com/auth/callback/slack?code=oauth-code-123&redirect_uri=https%3A%2F%2Fexample.com%2Fquery-callback",
+        )
+        await adapter.handle_oauth_callback(req, options={"redirect_uri": "https://example.com/explicit-callback"})
+
+        mock_access.assert_called_once_with(
+            client_id="client-id",
+            client_secret="client-secret",
+            code="oauth-code-123",
+            redirect_uri="https://example.com/explicit-callback",
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_redirect_uri_from_query_param(self):
+        adapter, _, mock_access = _make_oauth_adapter()
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest(
+            "",
+            url="https://example.com/auth/callback/slack?code=oauth-code-123&redirect_uri=https%3A%2F%2Fexample.com%2Fquery-callback",
+        )
+        await adapter.handle_oauth_callback(req)
+
+        mock_access.assert_called_once_with(
+            client_id="client-id",
+            client_secret="client-secret",
+            code="oauth-code-123",
+            redirect_uri="https://example.com/query-callback",
+        )
+
+    @pytest.mark.asyncio
+    async def test_throws_when_code_missing(self):
+        adapter, _, _ = _make_oauth_adapter()
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest("", url="https://example.com/auth/callback/slack")
+        with pytest.raises(ValidationError, match="Missing 'code'"):
+            await adapter.handle_oauth_callback(req)
+
+    @pytest.mark.asyncio
+    async def test_throws_without_client_id_and_client_secret(self):
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-secret"))
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        req = _FakeRequest(
+            "",
+            url="https://example.com/auth/callback/slack?code=abc",
+        )
+        with pytest.raises(ValidationError, match="client_id"):
+            await adapter.handle_oauth_callback(req)

@@ -566,6 +566,38 @@ class TestFetchThread:
         info = await adapter.fetch_thread(thread_id)
         assert info.metadata["review_comment_id"] == 200
 
+    @pytest.mark.asyncio
+    async def test_issue_thread_fetches_issue_metadata(self):
+        """fetch_thread for an issue thread uses the issues API, not pulls."""
+        adapter = _make_adapter()
+        adapter._github_api_request = AsyncMock(
+            return_value={
+                "title": "Bug report",
+                "state": "open",
+                "number": 10,
+            }
+        )
+
+        info = await adapter.fetch_thread("github:acme/app:issue:10")
+
+        # Verify the issues API was called (not pulls)
+        call = adapter._github_api_request.call_args
+        assert "/issues/10" in call[0][1]
+        assert "/pulls/" not in call[0][1]
+
+        assert info.id == "github:acme/app:issue:10"
+        assert info.channel_id == "acme/app"
+        assert info.channel_name == "app #10"
+        assert info.is_dm is False
+        assert info.metadata == {
+            "owner": "acme",
+            "repo": "app",
+            "issueNumber": 10,
+            "issueTitle": "Bug report",
+            "issueState": "open",
+            "type": "issue",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Error handling
