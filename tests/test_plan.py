@@ -499,3 +499,77 @@ class TestEdgeCases:
         assert task is not None
         # Check internal model has details
         assert plan._model.tasks[-1].details == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Error handling in _enqueue_edit
+# ---------------------------------------------------------------------------
+
+
+class _FailingEditAdapter(MockAdapter):
+    """MockAdapter whose edit_message raises on demand."""
+
+    def __init__(self) -> None:
+        super().__init__("failing")
+        self.fail_edit = False
+
+    async def edit_message(self, thread_id: str, message_id: str, message: Any) -> RawMessage:
+        if self.fail_edit:
+            raise RuntimeError("simulated edit failure")
+        return await super().edit_message(thread_id, message_id, message)
+
+
+class _SpyLogger:
+    """Minimal logger that records warn calls."""
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, Any]] = []
+
+    def child(self, prefix: str) -> _SpyLogger:
+        return self
+
+    def debug(self, message: str, *args: Any) -> None:
+        pass
+
+    def info(self, message: str, *args: Any) -> None:
+        pass
+
+    def warn(self, message: str, *args: Any) -> None:
+        self.warnings.append((message, args))
+
+    def error(self, message: str, *args: Any) -> None:
+        pass
+
+
+class TestEditErrorPath:
+    @pytest.mark.asyncio
+    async def test_edit_failure_is_logged_and_plan_continues(self) -> None:
+        """When adapter.edit_message raises, the error is logged and
+        the next mutation still fires successfully."""
+        adapter = _FailingEditAdapter()
+        logger = _SpyLogger()
+        thread = _make_thread(adapter=adapter)
+        plan = Plan(StartPlanOptions(initial_message="Step 1"))
+        await thread.post(plan)
+
+        # Inject the spy logger into the bound state
+        assert plan._bound is not None
+        plan._bound.logger = logger
+
+        # First mutation: edit will fail
+        adapter.fail_edit = True
+        await plan.add_task(AddTaskOptions(title="Step 2"))
+
+        # The error should have been logged
+        assert any("Failed to edit plan" in w[0] for w in logger.warnings)
+
+        # Second mutation: edit succeeds -- plan is still usable
+        adapter.fail_edit = False
+        logger.warnings.clear()
+        task = await plan.add_task(AddTaskOptions(title="Step 3"))
+        assert task is not None
+        assert task.title == "Step 3"
+        assert len(plan.tasks) == 3
+
+        # The previous-chain failure should also be logged
+        assert any("Previous plan edit failed" in w[0] for w in logger.warnings)

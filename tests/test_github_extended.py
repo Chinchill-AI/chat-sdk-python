@@ -27,6 +27,7 @@ import pytest
 from chat_sdk.adapters.github.adapter import (
     GitHubAdapter,
 )
+from chat_sdk.adapters.github.types import GitHubThreadId
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
 
@@ -586,15 +587,15 @@ class TestFetchThread:
         assert "/pulls/" not in call[0][1]
 
         assert info.id == "github:acme/app:issue:10"
-        assert info.channel_id == "acme/app"
+        assert info.channel_id == "github:acme/app"
         assert info.channel_name == "app #10"
         assert info.is_dm is False
         assert info.metadata == {
             "owner": "acme",
             "repo": "app",
-            "issueNumber": 10,
-            "issueTitle": "Bug report",
-            "issueState": "open",
+            "issue_number": 10,
+            "issue_title": "Bug report",
+            "issue_state": "open",
             "type": "issue",
         }
 
@@ -786,3 +787,22 @@ class TestStream:
         # The post should have been called with the accumulated text
         call_args = adapter._github_api_request.call_args
         assert call_args[0][2]["body"] == "Hello world"
+
+
+class TestIssueThreadChannelRoundTrip:
+    """fetch_thread().channel_id should work with channel APIs."""
+
+    async def test_issue_thread_channel_id_round_trips(self):
+        """channel_id from fetch_thread feeds into channel_id_from_thread_id."""
+        adapter = _make_adapter()
+        adapter._github_api_request = AsyncMock(return_value={"title": "Bug report", "state": "open", "number": 10})
+
+        thread_id = adapter.encode_thread_id(GitHubThreadId(owner="acme", repo="app", pr_number=10, type="issue"))
+        info = await adapter.fetch_thread(thread_id)
+
+        # channel_id should have github: prefix
+        assert info.channel_id.startswith("github:")
+
+        # channel_id should work with channel_id_from_thread_id
+        derived_channel = adapter.channel_id_from_thread_id(thread_id)
+        assert info.channel_id == derived_channel

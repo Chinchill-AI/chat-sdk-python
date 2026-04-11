@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.25.0 (2026-04-10)
+## 0.4.25 (2026-04-10)
 
-Synced to [Vercel Chat 4.25.0](https://github.com/vercel/chat). New versioning: our minor version matches the upstream minor version.
+Synced to [Vercel Chat 4.25.0](https://github.com/vercel/chat). New versioning: `0.{upstream_major}.{upstream_minor}` embeds the upstream version directly.
 
 ### New features (from upstream 4.25.0)
 - **Plan blocks**: `Plan` PostableObject for structured task lists with live updates. Post a plan to a thread, then `add_task()`, `update_task()`, and `complete()` with automatic card rendering.

@@ -4,13 +4,14 @@ How to keep `chat-sdk-python` in sync with the [Vercel Chat TS SDK](https://gith
 
 ## Version Mapping
 
-Our version number tracks the upstream Vercel Chat minor version:
+Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstream_minor}[.patch]`
 
 | Python version | Upstream version | Meaning |
 |---|---|---|
-| `0.25.0` | `4.25.0` | Synced to upstream 4.25.0 |
-| `0.25.1` | `4.25.0` | Python-only fix on top of 4.25.0 |
-| `0.26.0` | `4.26.0` | Synced to upstream 4.26.0 |
+| `0.4.25` | `4.25.0` | Synced to upstream 4.25.0 |
+| `0.4.25.1` | `4.25.0` | Python-only fix on top of 4.25.0 |
+| `0.4.25a1` | `4.25.0` | Alpha while porting 4.25.0 |
+| `0.4.26` | `4.26.0` | Synced to upstream 4.26.0 |
 
 The `UPSTREAM_PARITY` constant in `chat_sdk/__init__.py` provides programmatic access
 to the upstream version this release is synced to.
@@ -43,7 +44,7 @@ uv run python scripts/verify_test_fidelity.py
 uv run pytest tests/ --tb=short -q
 
 # 6. Update version
-#    - pyproject.toml: version = "0.26.0"
+#    - pyproject.toml: version = "0.4.26"
 #    - README.md: status line
 #    - __init__.py: UPSTREAM_PARITY = "4.26.0"
 #    - CLAUDE.md: version reference
@@ -57,10 +58,19 @@ gh pr create --title "sync: upstream v4.26.0"
 
 - [ ] New types or fields → add to `types.py`
 - [ ] New methods on Thread/Channel → add to `thread.py`/`channel.py`
-- [ ] New adapter features → update the adapter + tests
+- [ ] New adapter features → update the adapter + integration-style tests
 - [ ] New TS tests → run fidelity script, port missing tests
 - [ ] Changed behavior → verify Python matches with regression tests
 - [ ] Review the porting hazards below for each change
+- [ ] Every new `fetch_thread()` behavior → round-trip test with channel APIs
+- [ ] Every new adapter feature → at least one end-to-end test (not just unit/conversion)
+
+### Upstream behavior is one input, not source of truth
+
+If upstream tests are missing coverage for a feature, add Python-only regression
+tests. If upstream tests lock in inconsistent behavior, choose one of:
+- **Preserve parity** and document the inconsistency in the non-parity section below
+- **Intentionally diverge** and document the divergence in the non-parity section
 
 ## How to Diff Upstream Changes
 

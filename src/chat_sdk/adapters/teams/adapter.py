@@ -356,7 +356,14 @@ class TeamsAdapter:
         action_value: dict[str, Any],
         options: WebhookOptions | None = None,
     ) -> None:
-        """Handle Action.Submit button clicks sent as message activities."""
+        """Handle Action.Submit button clicks sent as message activities.
+
+        For plain buttons, ``action_value`` looks like ``{"actionId": "btn_id", "value": "clicked"}``.
+        For ChoiceSet (Select/RadioSelect) submissions, it looks like
+        ``{"actionId": "__auto_submit", "my_select": "option_1"}``.
+        In both cases, we pass the full dict (minus ``actionId``) as ``value``
+        so handlers receive all submitted input values.
+        """
         if not self._chat:
             return
 
@@ -370,11 +377,19 @@ class TeamsAdapter:
             )
         )
 
+        # Extract action_id; pass remaining keys as value so ChoiceSet
+        # input values are not dropped.
+        action_id = action_value.get("actionId", "")
+        submitted_values = {k: v for k, v in action_value.items() if k != "actionId"}
+        # If there's a single "value" key, unwrap it for simple button clicks
+        if list(submitted_values.keys()) == ["value"]:
+            submitted_values = submitted_values["value"]
+
         from_user = activity.get("from", {})
         self._chat.process_action(
             ActionEvent(
-                action_id=action_value.get("actionId", ""),
-                value=action_value.get("value"),
+                action_id=action_id,
+                value=submitted_values,
                 user=Author(
                     user_id=from_user.get("id", "unknown"),
                     user_name=from_user.get("name", "unknown"),
@@ -411,11 +426,16 @@ class TeamsAdapter:
             )
         )
 
+        action_id = action_data.get("actionId", "")
+        submitted_values = {k: v for k, v in action_data.items() if k != "actionId"}
+        if list(submitted_values.keys()) == ["value"]:
+            submitted_values = submitted_values["value"]
+
         from_user = activity.get("from", {})
         self._chat.process_action(
             ActionEvent(
-                action_id=action_data.get("actionId", ""),
-                value=action_data.get("value"),
+                action_id=action_id,
+                value=submitted_values,
                 user=Author(
                     user_id=from_user.get("id", "unknown"),
                     user_name=from_user.get("name", "unknown"),

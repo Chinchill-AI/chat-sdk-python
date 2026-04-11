@@ -9,7 +9,6 @@ any PostableObject.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -115,7 +114,8 @@ def _content_to_plain_text(content: PlanContent | None) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, dict) and "markdown" in content:
-        return content["markdown"]
+        md = content["markdown"]
+        return str(md) if md is not None else ""
     if isinstance(content, dict):
         # For ast dicts, return empty -- full rendering not needed for titles
         pass
@@ -125,7 +125,7 @@ def _content_to_plain_text(content: PlanContent | None) -> str:
 def is_postable_object(value: Any) -> bool:
     """Check if a value is a PostableObject (has the required protocol methods)."""
     return (
-        isinstance(value, object)
+        value is not None
         and hasattr(value, "kind")
         and hasattr(value, "get_fallback_text")
         and hasattr(value, "get_post_data")
@@ -419,11 +419,14 @@ class Plan:
 
         # Chain edits: wait for previous edit to finish before starting new one
         if bound.update_chain is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await bound.update_chain
+            except Exception as prev_exc:
+                if bound.logger:
+                    bound.logger.warn("Previous plan edit failed", prev_exc)
 
         try:
-            bound.update_chain = asyncio.ensure_future(_do_edit())
+            bound.update_chain = asyncio.get_running_loop().create_task(_do_edit())
             await bound.update_chain
         except Exception as exc:
             if bound.logger:

@@ -703,15 +703,15 @@ class GitHubAdapter:
 
             return ThreadInfo(
                 id=thread_id,
-                channel_id=f"{decoded.owner}/{decoded.repo}",
+                channel_id=f"github:{decoded.owner}/{decoded.repo}",
                 channel_name=f"{decoded.repo} #{decoded.pr_number}",
                 is_dm=False,
                 metadata={
                     "owner": decoded.owner,
                     "repo": decoded.repo,
-                    "issueNumber": decoded.pr_number,
-                    "issueTitle": issue.get("title"),
-                    "issueState": issue.get("state"),
+                    "issue_number": decoded.pr_number,
+                    "issue_title": issue.get("title"),
+                    "issue_state": issue.get("state"),
                     "type": "issue",
                 },
             )
