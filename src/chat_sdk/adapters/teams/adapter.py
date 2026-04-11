@@ -350,6 +350,20 @@ class TeamsAdapter:
 
         self._chat.process_message(self, thread_id, message, options)
 
+    @staticmethod
+    def _extract_action_values(action_data: dict[str, Any]) -> tuple[str, Any]:
+        """Extract action ID and submitted values from a Teams action payload.
+
+        For plain buttons: ``{"actionId": "btn", "value": "x"}`` → ``("btn", "x")``
+        For ChoiceSet: ``{"actionId": "__auto_submit", "sel": "opt"}`` → ``("__auto_submit", {"sel": "opt"})``
+        """
+        action_id = action_data.get("actionId", "")
+        submitted_values: Any = {k: v for k, v in action_data.items() if k != "actionId"}
+        # Unwrap single "value" key for plain button backward compat
+        if list(submitted_values.keys()) == ["value"]:
+            submitted_values = submitted_values["value"]
+        return action_id, submitted_values
+
     def _handle_message_action(
         self,
         activity: dict[str, Any],
@@ -377,13 +391,7 @@ class TeamsAdapter:
             )
         )
 
-        # Extract action_id; pass remaining keys as value so ChoiceSet
-        # input values are not dropped.
-        action_id = action_value.get("actionId", "")
-        submitted_values = {k: v for k, v in action_value.items() if k != "actionId"}
-        # If there's a single "value" key, unwrap it for simple button clicks
-        if list(submitted_values.keys()) == ["value"]:
-            submitted_values = submitted_values["value"]
+        action_id, submitted_values = self._extract_action_values(action_value)
 
         from_user = activity.get("from", {})
         self._chat.process_action(
@@ -426,10 +434,7 @@ class TeamsAdapter:
             )
         )
 
-        action_id = action_data.get("actionId", "")
-        submitted_values = {k: v for k, v in action_data.items() if k != "actionId"}
-        if list(submitted_values.keys()) == ["value"]:
-            submitted_values = submitted_values["value"]
+        action_id, submitted_values = self._extract_action_values(action_data)
 
         from_user = activity.get("from", {})
         self._chat.process_action(

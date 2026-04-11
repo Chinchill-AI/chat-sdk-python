@@ -12,7 +12,7 @@ Synced to [Vercel Chat 4.25.0](https://github.com/vercel/chat). New versioning: 
 - **Slack OAuth redirect fix**: `handle_oauth_callback` correctly forwards `redirect_uri` option.
 
 ### Versioning
-- Version scheme changed from `0.0.1aX` to `0.{upstream_minor}.{patch}`
+- Version scheme changed from `0.0.1aX` to `0.{upstream_major}.{upstream_minor}[.patch]`
 - `UPSTREAM_PARITY` constant in `chat_sdk.__init__` for programmatic access
 - Sync procedure documented in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)
 
