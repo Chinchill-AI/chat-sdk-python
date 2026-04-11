@@ -350,15 +350,21 @@ class TeamsAdapter:
 
         self._chat.process_message(self, thread_id, message, options)
 
+    # Keys injected by the SDK's card renderer or Teams transport — not user input.
+    _ACTION_TRANSPORT_KEYS = frozenset({"actionId", "msteams"})
+
     @staticmethod
     def _extract_action_values(action_data: dict[str, Any]) -> tuple[str, Any]:
         """Extract action ID and submitted values from a Teams action payload.
+
+        Strips transport keys (``actionId``, ``msteams``) that are injected by
+        the SDK's card renderer or Teams infrastructure and are not user input.
 
         For plain buttons: ``{"actionId": "btn", "value": "x"}`` → ``("btn", "x")``
         For ChoiceSet: ``{"actionId": "__auto_submit", "sel": "opt"}`` → ``("__auto_submit", {"sel": "opt"})``
         """
         action_id = action_data.get("actionId", "")
-        submitted_values: Any = {k: v for k, v in action_data.items() if k != "actionId"}
+        submitted_values: Any = {k: v for k, v in action_data.items() if k not in TeamsAdapter._ACTION_TRANSPORT_KEYS}
         # Unwrap single "value" key for plain button backward compat
         if list(submitted_values.keys()) == ["value"]:
             submitted_values = submitted_values["value"]

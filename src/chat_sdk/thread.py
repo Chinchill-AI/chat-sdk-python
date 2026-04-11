@@ -440,17 +440,10 @@ class ThreadImpl:
         or a PostableObject (e.g. Plan). PostableObjects are returned directly
         after posting so the caller can continue to mutate them.
         """
-        # Handle PostableObject (e.g. Plan)
+        # Handle PostableObject (e.g. Plan) — returned directly, not cached
+        # in message history (matches upstream TS behavior).
         if is_postable_object(message):
             await self._handle_postable_object(message)
-            # Cache the fallback text in message history so the plan appears
-            # in thread.messages() / all_messages() like regular posts.
-            if self._message_history is not None:
-                fallback_text = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
-                fallback_msg = _to_message(
-                    self._create_sent_message("postable-obj", PostableMarkdown(markdown=fallback_text), self._id)
-                )
-                await self._message_history.append(self._id, fallback_msg)
             return message
 
         # Handle AsyncIterable (streaming)

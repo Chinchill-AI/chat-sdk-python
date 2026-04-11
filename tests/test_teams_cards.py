@@ -467,3 +467,38 @@ class TestTeamsCardInputEndToEnd:
         assert action_event.action_id == "approve_btn"
         # Single "value" key gets unwrapped for backward compat
         assert action_event.value == "approved"
+
+    async def test_modal_button_strips_msteams_transport_key(self):
+        """Buttons with action_type=modal include msteams metadata that must be stripped."""
+        from unittest.mock import MagicMock
+
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig
+
+        adapter = TeamsAdapter(
+            TeamsAdapterConfig(
+                app_id="test-app",
+                app_password="test-pass",
+            )
+        )
+        mock_chat = MagicMock()
+        adapter._chat = mock_chat
+
+        # Simulate payload from a modal button (has msteams transport key)
+        activity = {
+            "type": "message",
+            "from": {"id": "user-1", "name": "Test User"},
+            "conversation": {"id": "conv-1"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {
+                "actionId": "open_dialog",
+                "value": "clicked",
+                "msteams": {"type": "task/fetch"},
+            },
+        }
+        await adapter._handle_message_activity(activity)
+
+        action_event = mock_chat.process_action.call_args[0][0]
+        assert action_event.action_id == "open_dialog"
+        # msteams key should be stripped — only user value remains
+        assert action_event.value == "clicked"
