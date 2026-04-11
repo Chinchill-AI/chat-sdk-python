@@ -416,8 +416,18 @@ class SlackAdapter:
             team_name=team_name,
         )
 
-    async def handle_oauth_callback(self, request: Any) -> dict[str, Any]:
+    async def handle_oauth_callback(
+        self,
+        request: Any,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Handle the Slack OAuth V2 callback.
+
+        Args:
+            request: The incoming HTTP request containing the OAuth callback.
+            options: Optional dict with ``redirect_uri`` key to send to Slack
+                during the code exchange. When provided it takes priority over
+                any ``redirect_uri`` query parameter in the callback URL.
 
         Returns ``{"team_id": ..., "installation": SlackInstallation}``.
         """
@@ -432,14 +442,14 @@ class SlackAdapter:
         if isinstance(url, str) and "?" in url:
             query = dict(parse_qs(url.split("?", 1)[1]))
             code = query.get("code", [None])[0] if isinstance(query.get("code"), list) else query.get("code")
-            redirect_uri = (
+            query_redirect_uri = (
                 query.get("redirect_uri", [None])[0]
                 if isinstance(query.get("redirect_uri"), list)
                 else query.get("redirect_uri")
             )
         else:
             code = None
-            redirect_uri = None
+            query_redirect_uri = None
 
         if not code:
             raise ValidationError(
@@ -447,13 +457,18 @@ class SlackAdapter:
                 "Missing 'code' query parameter in OAuth callback request.",
             )
 
+        # Options redirect_uri takes priority over the query param
+        redirect_uri = (options or {}).get("redirect_uri") or query_redirect_uri
+
         client = self._get_client("")
-        result = await client.oauth_v2_access(
-            client_id=self._client_id,
-            client_secret=self._client_secret,
-            code=code,
-            redirect_uri=redirect_uri,
-        )
+        kwargs: dict[str, Any] = {
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "code": code,
+        }
+        if redirect_uri:
+            kwargs["redirect_uri"] = redirect_uri
+        result = await client.oauth_v2_access(**kwargs)
 
         if not (result.get("ok") and result.get("access_token") and result.get("team", {}).get("id")):
             raise AuthenticationError(
@@ -2023,7 +2038,7 @@ class SlackAdapter:
         # Use StreamingMarkdownRenderer for safe incremental rendering
         from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 
-        renderer = StreamingMarkdownRenderer()
+        renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
         structured_chunks_supported = True
 
         async def flush_markdown_delta(delta: str) -> None:

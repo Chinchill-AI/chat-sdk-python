@@ -2,6 +2,66 @@
 
 How to keep `chat-sdk-python` in sync with the [Vercel Chat TS SDK](https://github.com/vercel/chat).
 
+## Version Mapping
+
+Our version number tracks the upstream Vercel Chat minor version:
+
+| Python version | Upstream version | Meaning |
+|---|---|---|
+| `0.25.0` | `4.25.0` | Synced to upstream 4.25.0 |
+| `0.25.1` | `4.25.0` | Python-only fix on top of 4.25.0 |
+| `0.26.0` | `4.26.0` | Synced to upstream 4.26.0 |
+
+The `UPSTREAM_PARITY` constant in `chat_sdk/__init__.py` provides programmatic access
+to the upstream version this release is synced to.
+
+## How to Sync an Upstream Release
+
+Step-by-step procedure for porting a new upstream release (e.g., `4.26.0`):
+
+```bash
+# 1. Update the TS repo and check what changed
+cd /tmp/vercel-chat && git fetch origin
+git log --oneline chat@4.25.0..chat@4.26.0 -- packages/
+
+# 2. For each commit, read the diff
+git diff chat@4.25.0..chat@4.26.0 -- packages/chat/src/
+git diff chat@4.25.0..chat@4.26.0 -- packages/adapter-slack/src/
+# ... repeat for each changed package
+
+# 3. Create a sync branch
+cd /tmp/chat-sdk-python
+git checkout -b sync/upstream-v4.26.0
+
+# 4. Port each change following the TS → Python Porting Hazards below
+
+# 5. Run full validation
+uv run ruff check src/ tests/ scripts/
+uv run ruff format --check src/ tests/ scripts/
+uv run python scripts/audit_test_quality.py
+uv run python scripts/verify_test_fidelity.py
+uv run pytest tests/ --tb=short -q
+
+# 6. Update version
+#    - pyproject.toml: version = "0.26.0"
+#    - README.md: status line
+#    - __init__.py: UPSTREAM_PARITY = "4.26.0"
+#    - CLAUDE.md: version reference
+#    - CHANGELOG.md: new entry
+
+# 7. PR, merge, publish
+gh pr create --title "sync: upstream v4.26.0"
+```
+
+### What to check for each upstream commit
+
+- [ ] New types or fields → add to `types.py`
+- [ ] New methods on Thread/Channel → add to `thread.py`/`channel.py`
+- [ ] New adapter features → update the adapter + tests
+- [ ] New TS tests → run fidelity script, port missing tests
+- [ ] Changed behavior → verify Python matches with regression tests
+- [ ] Review the porting hazards below for each change
+
 ## How to Diff Upstream Changes
 
 ```bash

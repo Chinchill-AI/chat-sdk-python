@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.25.0 (2026-04-10)
+
+Synced to [Vercel Chat 4.25.0](https://github.com/vercel/chat). New versioning: our minor version matches the upstream minor version.
+
+### New features (from upstream 4.25.0)
+- **Plan blocks**: `Plan` PostableObject for structured task lists with live updates. Post a plan to a thread, then `add_task()`, `update_task()`, and `complete()` with automatic card rendering.
+- **Streaming table option**: `StreamingMarkdownRenderer(wrap_tables_for_append=False)` disables code-fence wrapping for platforms with native table support. Slack adapter now uses this by default.
+- **Teams Select/RadioSelect**: `Select` and `RadioSelect` card elements now render as Adaptive Card `Input.ChoiceSet` with auto-injected submit button.
+- **GitHub issue threads**: `issue_comment` webhooks on plain issues (not just PRs) now create threads with format `github:owner/repo:issue:42`.
+- **Slack OAuth redirect fix**: `handle_oauth_callback` correctly forwards `redirect_uri` option.
+
+### Versioning
+- Version scheme changed from `0.0.1aX` to `0.{upstream_minor}.{patch}`
+- `UPSTREAM_PARITY` constant in `chat_sdk.__init__` for programmatic access
+- Sync procedure documented in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)
+
 ## 0.0.1a12 (2026-04-10)
 
 Python 3.10 support, async-safe Chat resolver, and a large correctness audit.

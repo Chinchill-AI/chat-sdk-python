@@ -22,9 +22,14 @@ from chat_sdk.cards import (
     card_child_to_fallback_text,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
+from chat_sdk.modals import RadioSelectElement, SelectElement
 
 ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
 ADAPTIVE_CARD_VERSION = "1.4"
+
+# Sentinel action ID for auto-injected submit buttons.
+# Used when a card has select/radio_select inputs but no submit button.
+AUTO_SUBMIT_ACTION_ID = "__auto_submit"
 
 
 def _convert_emoji(text: str) -> str:
@@ -174,16 +179,93 @@ def _convert_image_to_element(element: ImageElement) -> dict[str, Any]:
 
 
 def _convert_actions_to_elements(element: ActionsElement) -> dict[str, Any]:
-    """Convert actions to Adaptive Card actions (card-level, not inline)."""
+    """Convert actions to Adaptive Card actions (card-level, not inline).
+
+    Select and RadioSelect elements become Input.ChoiceSet body elements.
+    When inputs are present but no explicit buttons, an auto-submit
+    Action.Submit is injected (Teams inputs need an explicit submit action).
+    """
     actions: list[dict[str, Any]] = []
+    elements: list[dict[str, Any]] = []
+    has_buttons = False
+    has_inputs = False
+
     for child in element.get("children", []):
         child_type = child.get("type", "")
-        if child_type == "link-button":
-            actions.append(_convert_link_button_to_action(child))  # type: ignore[arg-type]
-        elif child_type == "button":
+        if child_type == "button":
+            has_buttons = True
             actions.append(_convert_button_to_action(child))  # type: ignore[arg-type]
+        elif child_type == "link-button":
+            actions.append(_convert_link_button_to_action(child))  # type: ignore[arg-type]
+        elif child_type == "select":
+            has_inputs = True
+            elements.append(_convert_select_to_element(child))  # type: ignore[arg-type]
+        elif child_type == "radio_select":
+            has_inputs = True
+            elements.append(_convert_radio_select_to_element(child))  # type: ignore[arg-type]
 
-    return {"elements": [], "actions": actions}
+    # Auto-inject a submit button when there are inputs but no buttons.
+    # Teams inputs don't auto-submit like Slack -- they need an Action.Submit.
+    if has_inputs and not has_buttons:
+        actions.append(
+            {
+                "type": "Action.Submit",
+                "title": "Submit",
+                "data": {"actionId": AUTO_SUBMIT_ACTION_ID},
+            }
+        )
+
+    return {"elements": elements, "actions": actions}
+
+
+def _convert_select_to_element(select: SelectElement) -> dict[str, Any]:
+    """Convert a SelectElement to an Adaptive Card Input.ChoiceSet (compact)."""
+    choices = [
+        {"title": _convert_emoji(opt.get("label", "")), "value": opt.get("value", "")}
+        for opt in select.get("options", [])
+    ]
+
+    result: dict[str, Any] = {
+        "type": "Input.ChoiceSet",
+        "id": select.get("id", ""),
+        "label": _convert_emoji(select.get("label", "")),
+        "style": "compact",
+        "isRequired": not select.get("optional", False),
+        "choices": choices,
+    }
+
+    placeholder = select.get("placeholder")
+    if placeholder:
+        result["placeholder"] = placeholder
+
+    initial_option = select.get("initial_option")
+    if initial_option:
+        result["value"] = initial_option
+
+    return result
+
+
+def _convert_radio_select_to_element(radio_select: RadioSelectElement) -> dict[str, Any]:
+    """Convert a RadioSelectElement to an Adaptive Card Input.ChoiceSet (expanded)."""
+    choices = [
+        {"title": _convert_emoji(opt.get("label", "")), "value": opt.get("value", "")}
+        for opt in radio_select.get("options", [])
+    ]
+
+    result: dict[str, Any] = {
+        "type": "Input.ChoiceSet",
+        "id": radio_select.get("id", ""),
+        "label": _convert_emoji(radio_select.get("label", "")),
+        "style": "expanded",
+        "isRequired": not radio_select.get("optional", False),
+        "choices": choices,
+    }
+
+    initial_option = radio_select.get("initial_option")
+    if initial_option:
+        result["value"] = initial_option
+
+    return result
 
 
 def _convert_button_to_action(button: ButtonElement) -> dict[str, Any]:

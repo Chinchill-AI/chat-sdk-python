@@ -713,7 +713,8 @@ class PostableCard:
 # Union of adapter-postable message types
 AdapterPostableMessage = str | PostableRaw | PostableMarkdown | PostableAst | PostableCard | CardElement
 
-# Union of all postable message types (includes streaming)
+# Union of all postable message types (includes streaming and PostableObjects)
+# PostableObject instances are detected at runtime via ``is_postable_object()``.
 PostableMessage = AdapterPostableMessage | AsyncIterable[Any]
 
 # =============================================================================

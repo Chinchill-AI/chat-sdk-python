@@ -98,13 +98,17 @@ class GitHubThreadId:
     - PR-level: Comments in the "Conversation" tab (issue_comment API)
     - Review comment: Line-specific comments in "Files changed" tab
       (pull request review comment API)
+    - Issue-level: Comments on GitHub issues (issue_comment API)
     """
 
     owner: str
     """Repository owner (user or organization)."""
 
     pr_number: int
-    """Pull request number."""
+    """Issue or pull request number.
+
+    GitHub uses a shared number space, so this works for both PRs and issues.
+    """
 
     repo: str
     """Repository name."""
@@ -113,7 +117,17 @@ class GitHubThreadId:
     """Root review comment ID for line-specific threads.
 
     If present, this is a review comment thread.
-    If absent, this is a PR-level (issue comment) thread.
+    If absent, this is a PR-level or issue-level comment thread.
+    Only valid when type is "pr" or omitted.
+    """
+
+    type: Literal["pr", "issue"] | None = None
+    """Thread context type.
+
+    - "pr": PR conversation tab or review comment thread (default)
+    - "issue": GitHub issue comment thread
+
+    Omitting this field is equivalent to "pr" for backward compatibility.
     """
 
 
@@ -269,13 +283,18 @@ class PullRequestReviewCommentWebhookPayload(TypedDict, total=False):
 # =============================================================================
 
 
-class GitHubRawIssueComment(TypedDict):
+class GitHubRawIssueComment(TypedDict, total=False):
     """Platform-specific raw message for issue comments."""
 
-    type: Literal["issue_comment"]
-    comment: GitHubIssueComment
-    repository: GitHubRepository
-    pr_number: int
+    type: Literal["issue_comment"]  # required
+    comment: GitHubIssueComment  # required
+    repository: GitHubRepository  # required
+    pr_number: int  # required
+    thread_type: Literal["pr", "issue"]
+    """Whether this comment is on a PR or a plain issue.
+
+    Defaults to "pr" when omitted for backward compatibility.
+    """
 
 
 class GitHubRawReviewComment(TypedDict):

@@ -22,12 +22,16 @@ CODE_FENCE_SPLIT_RE = re.compile(r"```|~~~")
 # ---------------------------------------------------------------------------
 
 
-def _simulate_append_stream(chunks: list[str]) -> dict[str, object]:
+def _simulate_append_stream(
+    chunks: list[str],
+    *,
+    wrap_tables_for_append: bool = True,
+) -> dict[str, object]:
     """Push chunks one at a time, computing deltas from get_committable_text().
 
     Returns dict with appendedText, finalText, and deltas list.
     """
-    r = StreamingMarkdownRenderer()
+    r = StreamingMarkdownRenderer(wrap_tables_for_append=wrap_tables_for_append)
     last_appended = ""
     deltas: list[str] = []
 
@@ -534,6 +538,26 @@ class TestAppendOnlyStreaming:
         # Intro should be outside the code fence
         assert text.index("Intro") < text.index("```")
 
+    def test_appendonly_table_can_stream_without_code_fence_when_wrapping_disabled(self):
+        result = _simulate_append_stream(
+            [
+                "Intro\n\n",
+                "| A | B |\n",
+                "|---|---|\n",
+                "| 1 | 2 |\n",
+                "| 3 | 4 |\n",
+                "\nAfter table\n",
+            ],
+            wrap_tables_for_append=False,
+        )
+        text = result["appendedText"]
+        assert isinstance(text, str)
+        assert "| A | B |" in text
+        assert "| 1 | 2 |" in text
+        assert "| 3 | 4 |" in text
+        assert "After table" in text
+        assert "```" not in text
+
     def test_appendonly_table_at_end_of_stream_is_flushed_on_finish(self):
         result = _simulate_append_stream(
             [
@@ -568,6 +592,28 @@ class TestAppendOnlyStreaming:
         assert "| c | d |" in text
         assert "Done" in text
         assert "```" in text
+
+    def test_appendonly_concatenated_deltas_equal_final_text_when_wrapping_disabled(self):
+        result = _simulate_append_stream(
+            [
+                "Hello **world**\n",
+                "\n",
+                "| H1 | H2 |\n",
+                "| - | - |\n",
+                "| a | b |\n",
+                "| c | d |\n",
+                "\nDone\n",
+            ],
+            wrap_tables_for_append=False,
+        )
+        text = result["appendedText"]
+        assert isinstance(text, str)
+        assert "Hello **world**" in text
+        assert "| H1 | H2 |" in text
+        assert "| a | b |" in text
+        assert "| c | d |" in text
+        assert "Done" in text
+        assert "```" not in text
 
     def test_appendonly_concatenated_deltas_are_monotonic_each_is_a_suffix(self):
         """Core invariant: concatenated deltas must equal final output."""
