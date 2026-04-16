@@ -622,7 +622,7 @@ class ThreadImpl:
                 if stop_event.is_set() or msg is None:
                     break
                 content = renderer.get_committable_text()
-                if content != last_edit_content:
+                if content.strip() and content != last_edit_content:
                     try:
                         await self.adapter.edit_message(
                             thread_id_for_edits,
@@ -642,10 +642,11 @@ class ThreadImpl:
                 renderer.push(chunk)
                 if msg is None:
                     content = renderer.get_committable_text()
-                    msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
-                    thread_id_for_edits = msg.thread_id or self._id
-                    last_edit_content = content
-                    pending_edit = asyncio.create_task(_edit_loop())
+                    if content.strip():
+                        msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
+                        thread_id_for_edits = msg.thread_id or self._id
+                        last_edit_content = content
+                        pending_edit = asyncio.create_task(_edit_loop())
         finally:
             stop_event.set()
 
@@ -657,14 +658,17 @@ class ThreadImpl:
 
         # Final message
         if msg is None:
-            msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=accumulated))
+            # Stream contract requires a SentMessage, so post at least a space
+            # if the stream produced only whitespace.
+            markdown = accumulated if accumulated.strip() else " "
+            msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=markdown))
             thread_id_for_edits = msg.thread_id or self._id
             last_edit_content = accumulated
 
         # Always ensure the final content is sent, regardless of what _edit_loop did.
         # Re-check last_edit_content after awaiting pending_edit since _edit_loop
         # may have updated it concurrently.
-        if final_content != last_edit_content:
+        if final_content.strip() and final_content != last_edit_content:
             await self.adapter.edit_message(
                 thread_id_for_edits,
                 msg.id,
@@ -717,7 +721,7 @@ class ThreadImpl:
             "channelVisibility": self._channel_visibility,
             "currentMessage": self._current_message.to_json() if self._current_message else None,
             "isDM": self._is_dm,
-            "adapterName": self.adapter.name,
+            "adapterName": self._adapter_name or self.adapter.name,
         }
 
     @classmethod

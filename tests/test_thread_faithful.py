@@ -367,12 +367,8 @@ class TestStreaming:
 
         # Should post initial placeholder
         assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
-        # Should edit with empty string wrapped as markdown (final content)
-        last_edit = adapter._edit_calls[-1]
-        assert last_edit[0] == "slack:C123:1234.5678"
-        assert last_edit[1] == "msg-1"
-        assert isinstance(last_edit[2], PostableMarkdown)
-        assert last_edit[2].markdown == ""
+        # Should not edit with empty content
+        assert len(adapter._edit_calls) == 0
 
     # it("should support disabling the placeholder for fallback streaming")
     @pytest.mark.asyncio
@@ -387,10 +383,12 @@ class TestStreaming:
         # Should NOT have posted "..."
         placeholder_calls = [c for c in adapter._post_calls if c[1] == "..."]
         assert len(placeholder_calls) == 0
-        # Should have final edit with "Hi"
-        last_edit = adapter._edit_calls[-1]
-        assert isinstance(last_edit[2], PostableMarkdown)
-        assert last_edit[2].markdown == "Hi"
+        # Final content is delivered through post since no mid-stream commit
+        # fired (no newline in the chunks) and the empty-content guard
+        # prevents an intermediate empty post.
+        last_post = adapter._post_calls[-1]
+        assert isinstance(last_post[1], PostableMarkdown)
+        assert last_post[1].markdown == "Hi"
 
     # it("should handle empty stream with disabled placeholder")
     @pytest.mark.asyncio
@@ -402,13 +400,54 @@ class TestStreaming:
         text_stream = _create_text_stream([])
         await thread.post(text_stream)
 
-        # Should still post a message (empty), wrapped as markdown
+        # Should post a non-empty fallback since stream must return a SentMessage
         assert len(adapter._post_calls) == 1
         posted = adapter._post_calls[0][1]
         assert isinstance(posted, PostableMarkdown)
-        assert posted.markdown == ""
-        # No edit needed since post content matches accumulated
+        assert posted.markdown == " "
         assert len(adapter._edit_calls) == 0
+
+    # it("should not post empty content when table is buffered with null placeholder")
+    @pytest.mark.asyncio
+    async def test_should_not_post_empty_content_when_table_is_buffered_with_null_placeholder(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state, fallback_streaming_placeholder_text=None)
+        text_stream = _create_text_stream(["| A | B |\n", "|---|---|\n", "| 1 | 2 |\n"])
+        await thread.post(text_stream)
+
+        for _, content in adapter._post_calls:
+            if isinstance(content, PostableMarkdown):
+                assert len(content.markdown.strip()) > 0
+
+    # it("should not edit placeholder to empty during LLM warm-up")
+    @pytest.mark.asyncio
+    async def test_should_not_edit_placeholder_to_empty_during_llm_warmup(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello world"])
+        await thread.post(text_stream)
+
+        for _, _, content in adapter._edit_calls:
+            if isinstance(content, PostableMarkdown):
+                assert len(content.markdown.strip()) > 0
+
+    # it("should not post empty content during streaming with whitespace chunks")
+    @pytest.mark.asyncio
+    async def test_should_not_post_empty_content_during_streaming_with_whitespace_chunks(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state, fallback_streaming_placeholder_text=None)
+        text_stream = _create_text_stream(["  ", "\n", "  \n"])
+        await thread.post(text_stream)
+
+        for _, content in adapter._post_calls:
+            if isinstance(content, PostableMarkdown):
+                assert len(content.markdown) > 0
 
     # it("should preserve newlines in streamed text (native path)")
     @pytest.mark.asyncio
@@ -608,9 +647,12 @@ class TestFallbackStreamingErrorLogging:
         thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
 
         async def slow_stream() -> AsyncIterator[str]:
-            yield "Hel"
+            # Newlines are required so the streaming renderer commits content
+            # mid-stream; without them the post-4.26 empty-content guard
+            # skips intermediate edits entirely.
+            yield "Hel\n"
             await asyncio.sleep(0.05)
-            yield "lo"
+            yield "lo\n"
 
         await thread.post(slow_stream())
 

@@ -105,7 +105,15 @@ class TestFromAst:
         converter = _converter()
         ast = converter.to_ast("[click here](https://example.com)")
         result = converter.from_ast(ast)
-        assert "click here (https://example.com)" in result
+        assert "<https://example.com|click here>" in result
+
+    def test_should_preserve_custom_link_labels_in_posted_messages(self):
+        # Matches the integration-tests parity case: a posted markdown link
+        # with a custom label must render as Google Chat's <url|text> syntax
+        # rather than being flattened to "text (url)".
+        converter = _converter()
+        result = converter.from_markdown("[Click here](https://example.com)")
+        assert result == "<https://example.com|Click here>"
 
     def test_blockquote(self):
         converter = _converter()

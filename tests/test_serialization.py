@@ -863,6 +863,233 @@ class TestChatReviver:
 
 
 # ============================================================================
+# Standalone reviver (no Chat instance required at import time)
+# ============================================================================
+
+
+class TestStandaloneReviver:
+    """Tests for the module-level :func:`chat_sdk.reviver` function.
+
+    Mirrors the TS ``standalone reviver()`` describe block. Python's
+    ``json.loads`` uses ``object_hook`` rather than a key/value reviver, so
+    usage differs slightly: the function is passed as ``object_hook`` and
+    receives each decoded dict.
+    """
+
+    def test_should_revive_chatthread_objects(self, mock_adapter, mock_state):
+        from chat_sdk import reviver
+        from chat_sdk.chat import Chat
+        from chat_sdk.thread import clear_chat_singleton
+
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "thread": {
+                        "_type": "chat:Thread",
+                        "id": "slack:C123:1234.5678",
+                        "channelId": "C123",
+                        "isDM": False,
+                        "adapterName": "slack",
+                    }
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert isinstance(parsed["thread"], ThreadImpl)
+            assert parsed["thread"].id == "slack:C123:1234.5678"
+        finally:
+            clear_chat_singleton()
+
+    def test_should_revive_chatmessage_objects(self, mock_adapter, mock_state):
+        from chat_sdk import reviver
+        from chat_sdk.chat import Chat
+        from chat_sdk.thread import clear_chat_singleton
+
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "message": {
+                        "_type": "chat:Message",
+                        "id": "msg-1",
+                        "threadId": "slack:C123:1234.5678",
+                        "text": "Hello",
+                        "formatted": {"type": "root", "children": []},
+                        "raw": {},
+                        "author": {
+                            "userId": "U123",
+                            "userName": "testuser",
+                            "fullName": "Test User",
+                            "isBot": False,
+                            "isMe": False,
+                        },
+                        "metadata": {
+                            "dateSent": "2024-01-15T10:30:00.000Z",
+                            "edited": False,
+                        },
+                        "attachments": [],
+                    }
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert parsed["message"].id == "msg-1"
+            assert isinstance(parsed["message"].metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_revive_both_thread_and_message_in_same_payload(self, mock_adapter, mock_state):
+        from chat_sdk import reviver
+        from chat_sdk.chat import Chat
+        from chat_sdk.thread import clear_chat_singleton
+
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "thread": {
+                        "_type": "chat:Thread",
+                        "id": "slack:C123:1234.5678",
+                        "channelId": "C123",
+                        "isDM": False,
+                        "adapterName": "slack",
+                    },
+                    "message": {
+                        "_type": "chat:Message",
+                        "id": "msg-1",
+                        "threadId": "slack:C123:1234.5678",
+                        "text": "Hello",
+                        "formatted": {"type": "root", "children": []},
+                        "raw": {},
+                        "author": {
+                            "userId": "U123",
+                            "userName": "testuser",
+                            "fullName": "Test User",
+                            "isBot": False,
+                            "isMe": False,
+                        },
+                        "metadata": {
+                            "dateSent": "2024-01-15T10:30:00.000Z",
+                            "edited": False,
+                        },
+                        "attachments": [],
+                    },
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert isinstance(parsed["thread"], ThreadImpl)
+            assert isinstance(parsed["message"].metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_leave_nonchat_objects_unchanged(self, mock_adapter, mock_state):
+        from chat_sdk import reviver
+
+        payload = json.dumps(
+            {
+                "name": "test",
+                "count": 42,
+                "nested": {"_type": "other:Type", "value": "unchanged"},
+            }
+        )
+        parsed = json.loads(payload, object_hook=reviver)
+        assert parsed["name"] == "test"
+        assert parsed["count"] == 42
+        assert parsed["nested"]["_type"] == "other:Type"
+
+    def test_should_be_usable_directly_as_json_parse_second_argument(self, mock_adapter, mock_state):
+        from chat_sdk import reviver
+        from chat_sdk.chat import Chat
+        from chat_sdk.thread import clear_chat_singleton
+
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            message_json = {
+                "_type": "chat:Message",
+                "id": "msg-direct",
+                "threadId": "slack:C123:1234.5678",
+                "text": "Direct usage",
+                "formatted": {"type": "root", "children": []},
+                "raw": {},
+                "author": {
+                    "userId": "U123",
+                    "userName": "testuser",
+                    "fullName": "Test User",
+                    "isBot": False,
+                    "isMe": False,
+                },
+                "metadata": {
+                    "dateSent": "2024-01-15T10:30:00.000Z",
+                    "edited": False,
+                },
+                "attachments": [],
+            }
+            parsed = json.loads(json.dumps(message_json), object_hook=reviver)
+            assert parsed.id == "msg-direct"
+            assert parsed.text == "Direct usage"
+            assert isinstance(parsed.metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_allow_reserialization_of_a_revived_thread_without_singleton(self):
+        from chat_sdk.thread import clear_chat_singleton
+
+        clear_chat_singleton()
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channelId": "C123",
+            "isDM": False,
+            "adapterName": "slack",
+        }
+        thread = ThreadImpl.from_json(data)
+        reserialized = thread.to_json()
+        assert reserialized["_type"] == "chat:Thread"
+        assert reserialized["adapterName"] == "slack"
+        assert reserialized["id"] == "slack:C123:1234.5678"
+
+    def test_should_allow_reserialization_of_a_revived_channel_without_singleton(self):
+        from chat_sdk.channel import ChannelImpl
+        from chat_sdk.thread import clear_chat_singleton
+
+        clear_chat_singleton()
+        data = {
+            "_type": "chat:Channel",
+            "id": "C123",
+            "isDM": False,
+            "adapterName": "slack",
+        }
+        channel = ChannelImpl.from_json(data)
+        reserialized = channel.to_json()
+        assert reserialized["_type"] == "chat:Channel"
+        assert reserialized["adapterName"] == "slack"
+        assert reserialized["id"] == "C123"
+
+
+# ============================================================================
 # @workflow/serde integration — ThreadImpl
 # ============================================================================
 

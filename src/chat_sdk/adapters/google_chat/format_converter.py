@@ -101,15 +101,13 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             return f"```\n{node.get('value', '')}\n```"
 
         if node_type == "link":
-            # Google Chat auto-detects links, so we just output the URL
+            # Google Chat supports custom link labels using <url|text> syntax.
             children = node.get("children", [])
             link_text = "".join(self._node_to_gchat(child) for child in children)
             url = node.get("url", "")
-            # If link text matches URL, just output URL
             if link_text == url:
                 return url
-            # Otherwise output "text (url)"
-            return f"{link_text} ({url})"
+            return f"<{url}|{link_text}>"
 
         if node_type == "heading":
             # Intentional improvement over TS SDK: Google Chat has no heading

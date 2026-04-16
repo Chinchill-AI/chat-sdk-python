@@ -344,11 +344,12 @@ class TestFallbackStreamingPlaceholder:
         # No placeholder "..." should have been posted
         for _tid, content in adapter._post_calls:
             assert content != "..."
-        # The last edit should contain "Hi"
-        assert len(adapter._edit_calls) > 0
-        last_edit = adapter._edit_calls[-1]
-        # last_edit is (thread_id, message_id, content)
-        assert last_edit[0] == "slack:C123:1234.5678"
+        # With placeholder=None and no-newline chunks, the post-4.26 empty-content
+        # guard defers the first commit until stream end, so the final content
+        # arrives via post rather than an intermediate edit.
+        assert len(adapter._post_calls) >= 1
+        last_post = adapter._post_calls[-1]
+        assert last_post[0] == "slack:C123:1234.5678"
 
 
 # ============================================================================

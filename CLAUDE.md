@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.25.0). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.26.0). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash

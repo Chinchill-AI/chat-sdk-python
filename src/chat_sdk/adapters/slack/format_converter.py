@@ -280,13 +280,15 @@ class SlackFormatConverter(BaseFormatConverter):
         rows_data: list[list[dict[str, str]]] = []
 
         for row in node.get("children", []):
-            cells = [
-                {
-                    "type": "raw_text",
-                    "text": "".join(self._node_to_mrkdwn(c) for c in cell.get("children", [])) or " ",
-                }
-                for cell in row.get("children", [])
-            ]
+            cells = []
+            for cell in row.get("children", []):
+                # Convert cell children to text, defaulting to a space if empty.
+                # Slack API requires table cell text to be at least 1 character.
+                # Use an explicit length check rather than a truthiness check to
+                # avoid substituting valid strings like "0".
+                raw_text = "".join(self._node_to_mrkdwn(c) for c in cell.get("children", []))
+                text = raw_text if len(raw_text) > 0 else " "
+                cells.append({"type": "raw_text", "text": text})
             rows_data.append(cells)
 
         block: SlackBlock = {"type": "table", "rows": rows_data}

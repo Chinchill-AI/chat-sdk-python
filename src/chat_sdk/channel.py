@@ -389,7 +389,7 @@ class ChannelImpl:
         return {
             "_type": "chat:Channel",
             "id": self._id,
-            "adapterName": self.adapter.name,
+            "adapterName": self._adapter_name or self.adapter.name,
             "channelVisibility": self._channel_visibility,
             "isDM": self._is_dm,
         }
