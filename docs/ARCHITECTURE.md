@@ -372,3 +372,5 @@ When an adapter does not support native streaming, `ThreadImpl._fallback_stream(
 4. After stream ends, stop the edit loop and send a final edit with the complete text
 
 The edit loop uses `asyncio.create_task()` for the background timer and checks a `stopped` flag to terminate cleanly.
+
+Empty/whitespace-only content is guarded throughout: intermediate edits with empty content are skipped (platforms reject empty bodies), and if the final content is whitespace-only the placeholder is cleared to `" "` rather than left stranded. This is a small divergence from upstream 4.26 — see [Known Non-Parity](UPSTREAM_SYNC.md#known-non-parity-with-typescript-sdk).
