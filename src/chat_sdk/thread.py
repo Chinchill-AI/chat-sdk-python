@@ -674,6 +674,18 @@ class ThreadImpl:
                 msg.id,
                 PostableMarkdown(markdown=final_content),
             )
+        elif placeholder_text is not None and not final_content.strip() and last_edit_content == placeholder_text:
+            # Divergence from upstream 4.26: upstream leaves the placeholder
+            # visible when the stream produces only whitespace, which strands
+            # "..." on the message forever. We replace it with " " so the
+            # placeholder is cleared consistently with the no-placeholder branch
+            # (which also posts " " in this case). See docs/UPSTREAM_SYNC.md.
+            await self.adapter.edit_message(
+                thread_id_for_edits,
+                msg.id,
+                PostableMarkdown(markdown=" "),
+            )
+            last_edit_content = " "
 
         sent = self._create_sent_message(
             msg.id,

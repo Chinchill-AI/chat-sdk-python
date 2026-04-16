@@ -367,8 +367,11 @@ class TestStreaming:
 
         # Should post initial placeholder
         assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
-        # Should not edit with empty content
-        assert len(adapter._edit_calls) == 0
+        # Python divergence: clear the placeholder with " " on empty streams so
+        # users don't see a stuck "..." forever. (Upstream leaves it visible;
+        # documented in docs/UPSTREAM_SYNC.md.)
+        assert len(adapter._edit_calls) == 1
+        assert adapter._edit_calls[0][2] == PostableMarkdown(markdown=" ")
 
     # it("should support disabling the placeholder for fallback streaming")
     @pytest.mark.asyncio
@@ -389,6 +392,25 @@ class TestStreaming:
         last_post = adapter._post_calls[-1]
         assert isinstance(last_post[1], PostableMarkdown)
         assert last_post[1].markdown == "Hi"
+
+    # Python-specific regression: ensure whitespace-only streams don't leave
+    # the placeholder stuck on the message. This is a deliberate divergence
+    # from upstream 4.26, which keeps the placeholder visible.
+    @pytest.mark.asyncio
+    async def test_should_clear_placeholder_when_stream_is_whitespace_only(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["   ", "\n", "  \n"])
+        await thread.post(text_stream)
+
+        # Placeholder was posted
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        # And cleared via edit to " "
+        final_edit = adapter._edit_calls[-1]
+        assert isinstance(final_edit[2], PostableMarkdown)
+        assert final_edit[2].markdown == " "
 
     # it("should handle empty stream with disabled placeholder")
     @pytest.mark.asyncio
