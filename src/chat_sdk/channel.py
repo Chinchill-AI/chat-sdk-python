@@ -397,7 +397,7 @@ class ChannelImpl:
     @classmethod
     def from_json(
         cls,
-        data: dict[str, Any],
+        data: dict[str, Any] | ChannelImpl,
         adapter: Adapter | None = None,
         chat: _ChatSingleton | None = None,
     ) -> ChannelImpl:
@@ -411,7 +411,13 @@ class ChannelImpl:
             Explicit adapter. Skips singleton lookup.
         chat:
             Explicit Chat instance for adapter/state resolution.
+
+        Idempotent: if ``data`` is already a :class:`ChannelImpl`, it is
+        returned unchanged. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)``.
         """
+        if isinstance(data, ChannelImpl):
+            return data
         channel = cls(
             _ChannelImplConfigLazy(
                 id=data["id"],

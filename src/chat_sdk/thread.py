@@ -739,7 +739,7 @@ class ThreadImpl:
     @classmethod
     def from_json(
         cls,
-        data: dict[str, Any],
+        data: dict[str, Any] | ThreadImpl,
         adapter: Adapter | None = None,
         chat: _ChatSingleton | None = None,
     ) -> ThreadImpl:
@@ -755,11 +755,17 @@ class ThreadImpl:
             Explicit Chat instance. If provided, adapter and state are resolved
             from this instance instead of the singleton. Useful in multi-chat
             or test scenarios.
+
+        Idempotent: if ``data`` is already a :class:`ThreadImpl`, it is
+        returned unchanged. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)``.
         """
+        if isinstance(data, ThreadImpl):
+            return data
         current_msg_raw = data.get("currentMessage") or data.get("current_message")
-        current_msg = None
-        if current_msg_raw:
-            current_msg = Message.from_json(current_msg_raw)
+        # ``object_hook`` revives nested dicts first, so ``currentMessage`` may
+        # already be a Message instance by the time this runs.
+        current_msg = Message.from_json(current_msg_raw) if current_msg_raw else None
 
         thread = cls(
             _ThreadImplConfig(

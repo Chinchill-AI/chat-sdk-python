@@ -436,14 +436,22 @@ class Message:
         return result
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> Message:
+    def from_json(cls, data: dict[str, Any] | Message) -> Message:
         """Reconstruct a Message from serialized JSON data.
 
         Converts ISO date strings back to ``datetime`` objects.
         Accepts both camelCase (canonical output of ``to_json()``) and
         snake_case keys for backward compatibility.  For explicit
         dual-format handling see :meth:`from_json_compat`.
+
+        Idempotent: if ``data`` is already a :class:`Message`, it is
+        returned unchanged. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)``, where nested values are
+        revived bottom-up and the outer dict may already contain a revived
+        instance.
         """
+        if isinstance(data, Message):
+            return data
         meta = data.get("metadata", {})
 
         date_sent_raw = meta.get("dateSent") or meta.get("date_sent")
