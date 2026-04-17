@@ -14,7 +14,7 @@ import os
 import re
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
@@ -30,6 +30,7 @@ from chat_sdk.adapters.discord.types import (
     DiscordGatewayMessageData,
     DiscordGatewayReactionData,
     DiscordInteraction,
+    DiscordInteractionData,
     DiscordInteractionResponse,
     DiscordRequestContext,
     DiscordSlashCommandContext,
@@ -52,6 +53,7 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -160,7 +162,7 @@ class DiscordAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -379,7 +381,7 @@ class DiscordAdapter:
             self._logger.warn("Chat instance not initialized, ignoring interaction")
             return
 
-        data = interaction.get("data", {})
+        data: DiscordInteractionData = interaction.get("data", cast(DiscordInteractionData, {}))
         command_name = data.get("name")
         if not command_name:
             self._logger.warn("No command name in application command interaction")
@@ -447,7 +449,7 @@ class DiscordAdapter:
                 is_me=user.get("id") == self._application_id,
             ),
             adapter=self,
-            channel=None,
+            channel=cast(Any, None),  # chat.py's _handle_slash_command_event creates the ChannelImpl
             raw=interaction,
         )
         event.channel_id = channel_id  # type: ignore[attr-defined]
@@ -609,7 +611,7 @@ class DiscordAdapter:
         )
 
         try:
-            await self._chat.handle_incoming_message(self, thread_id, chat_message)
+            await cast(Any, self._chat).handle_incoming_message(self, thread_id, chat_message)
         except Exception as error:
             self._logger.error(
                 "Error handling forwarded message",
@@ -704,7 +706,7 @@ class DiscordAdapter:
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=cast(Any, None),
                 thread_id=thread_id,
                 message_id=data.get("message_id", ""),
                 emoji=normalized,
@@ -953,7 +955,7 @@ class DiscordAdapter:
             "DELETE",
         )
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:  # noqa: ARG002
         """Start typing indicator in a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = decoded.thread_id or decoded.channel_id
@@ -1159,7 +1161,7 @@ class DiscordAdapter:
 
             accumulated += text
 
-            postable: AdapterPostableMessage = {"raw": accumulated}
+            postable = cast(AdapterPostableMessage, {"raw": accumulated})
 
             if message_id:
                 await self.edit_message(thread_id, message_id, postable)
@@ -1256,7 +1258,7 @@ class DiscordAdapter:
             ],
         )
 
-    def _get_attachment_type(self, mime_type: str | None) -> str:
+    def _get_attachment_type(self, mime_type: str | None) -> Literal["image", "file", "video", "audio"]:
         """Determine attachment type from MIME type."""
         if not mime_type:
             return "file"
@@ -1407,9 +1409,10 @@ class DiscordAdapter:
                 return raw.decode("utf-8") if isinstance(raw, bytes) else raw
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
         if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
+            text_attr = request.text
+            if callable(text_attr):
+                return await cast(Any, text_attr)()
+            return text_attr
         if hasattr(request, "data"):
             data = request.data
             return data.decode("utf-8") if isinstance(data, bytes) else str(data)

@@ -16,7 +16,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
 from chat_sdk.adapters.linear.format_converter import LinearFormatConverter
@@ -47,6 +47,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -169,7 +170,7 @@ class LinearAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -302,9 +303,9 @@ class LinearAdapter:
         payload_type = payload.get("type")
         if payload_type == "Comment":
             if payload.get("action") == "create":
-                self._handle_comment_created(payload, options)
+                self._handle_comment_created(cast(CommentWebhookPayload, payload), options)
         elif payload_type == "Reaction":
-            self._handle_reaction(payload)
+            self._handle_reaction(cast(ReactionWebhookPayload, payload))
 
         return self._make_response("ok", 200)
 
@@ -337,18 +338,19 @@ class LinearAdapter:
             self._logger.warn("Chat instance not initialized, ignoring comment")
             return
 
-        data = payload.get("data", {})
-        actor = payload.get("actor", {})
+        data: LinearCommentData = payload.get("data", cast(LinearCommentData, {}))
+        actor: LinearWebhookActor = payload.get("actor", cast(LinearWebhookActor, {}))
 
         # Skip non-issue comments
-        issue_id = data.get("issueId") or data.get("issue_id")
+        data_any = cast(dict[str, Any], data)
+        issue_id = cast(str | None, data_any.get("issueId") or data_any.get("issue_id"))
         if not issue_id:
             self._logger.debug("Ignoring non-issue comment", {"commentId": data.get("id")})
             return
 
         # Determine thread
-        parent_id = data.get("parentId") or data.get("parent_id")
-        root_comment_id = parent_id or data.get("id")
+        parent_id = cast(str | None, data_any.get("parentId") or data_any.get("parent_id"))
+        root_comment_id = cast(str | None, parent_id or data.get("id"))
         thread_id = self.encode_thread_id(
             LinearThreadId(
                 issue_id=issue_id,
@@ -359,7 +361,7 @@ class LinearAdapter:
         message = self._build_message(data, actor, thread_id)
 
         # Skip bot's own messages
-        user_id = data.get("userId") or data.get("user_id")
+        user_id = data_any.get("userId") or data_any.get("user_id")
         if user_id == self._bot_user_id:
             self._logger.debug("Ignoring message from self", {"messageId": data.get("id")})
             return
@@ -392,8 +394,9 @@ class LinearAdapter:
         thread_id: str,
     ) -> Message:
         """Build a Message from a Linear comment and actor."""
+        comment_any = cast(dict[str, Any], comment)
         text = comment.get("body", "")
-        user_id = comment.get("userId") or comment.get("user_id", "")
+        user_id = cast(str, comment_any.get("userId") or comment_any.get("user_id", ""))
 
         author = Author(
             user_id=user_id,
@@ -405,8 +408,8 @@ class LinearAdapter:
 
         formatted = self._format_converter.to_ast(text)
 
-        created_at = comment.get("createdAt") or comment.get("created_at", "")
-        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
+        created_at = cast(str, comment_any.get("createdAt") or comment_any.get("created_at", ""))
+        updated_at = cast(str, comment_any.get("updatedAt") or comment_any.get("updated_at", ""))
 
         return Message(
             id=comment.get("id", ""),
@@ -537,7 +540,7 @@ class LinearAdapter:
             ),
         )
 
-    async def delete_message(self, _thread_id: str, message_id: str) -> None:
+    async def delete_message(self, thread_id: str, message_id: str) -> None:  # noqa: ARG002
         """Delete a message (delete a comment)."""
         await self._ensure_valid_token()
 
@@ -554,7 +557,7 @@ class LinearAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
+        thread_id: str,  # noqa: ARG002
         message_id: str,
         emoji: EmojiValue | str,
     ) -> None:
@@ -575,14 +578,14 @@ class LinearAdapter:
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,  # noqa: ARG002
+        message_id: str,  # noqa: ARG002
+        emoji: EmojiValue | str,  # noqa: ARG002
     ) -> None:
         """Remove a reaction from a comment (limited support)."""
         self._logger.warn("removeReaction is not fully supported on Linear - reaction ID lookup would be required")
 
-    async def start_typing(self, _thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:  # noqa: ARG002
         """Start typing indicator. Not supported by Linear."""
         pass
 
@@ -739,7 +742,7 @@ class LinearAdapter:
                     "userId": user_id,
                     "createdAt": node.get("createdAt", ""),
                     "updatedAt": node.get("updatedAt", ""),
-                    "url": node.get("url"),
+                    "url": node.get("url", ""),
                 },
             ),
             author=Author(
@@ -834,11 +837,12 @@ class LinearAdapter:
     def parse_message(self, raw: LinearRawMessage) -> Message:
         """Parse platform message format to normalized format."""
         comment = raw.get("comment", {})
+        comment_any = cast(dict[str, Any], comment)
         text = comment.get("body", "")
-        user_id = comment.get("userId") or comment.get("user_id", "")
+        user_id = cast(str, comment_any.get("userId") or comment_any.get("user_id", ""))
 
-        created_at = comment.get("createdAt") or comment.get("created_at", "")
-        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
+        created_at = cast(str, comment_any.get("createdAt") or comment_any.get("created_at", ""))
+        updated_at = cast(str, comment_any.get("updatedAt") or comment_any.get("updated_at", ""))
 
         return Message(
             id=comment.get("id", ""),
@@ -891,7 +895,7 @@ class LinearAdapter:
 
         # Post the accumulated text as a single comment
         if accumulated:
-            postable: AdapterPostableMessage = {"raw": accumulated}
+            postable = cast(AdapterPostableMessage, {"raw": accumulated})
             result = await self.post_message(thread_id, postable)
             message_id = result.id
 
@@ -969,9 +973,10 @@ class LinearAdapter:
                 return raw.decode("utf-8") if isinstance(raw, bytes) else raw
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
         if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
+            text_attr = request.text
+            if callable(text_attr):
+                return await cast(Any, text_attr)()
+            return text_attr
         if hasattr(request, "data"):
             data = request.data
             return data.decode("utf-8") if isinstance(data, bytes) else str(data)

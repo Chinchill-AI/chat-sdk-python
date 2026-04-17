@@ -7,7 +7,7 @@ See: https://discord.com/developers/docs/interactions/message-components
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.discord.types import DiscordActionRow, DiscordButton
 from chat_sdk.cards import (
@@ -113,12 +113,12 @@ def _process_child(
     elif child_type == "fields":
         _convert_fields_element(child, fields)  # type: ignore[arg-type]
     elif child_type == "link":
-        label = child.get("label", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        label = cast(str, child.get("label", ""))  # type: ignore[union-attr]
+        url = cast(str, child.get("url", ""))  # type: ignore[union-attr]
         text_parts.append(f"[{_convert_emoji(label)}]({url})")
     elif child_type == "table":
-        headers = child.get("headers", [])  # type: ignore[union-attr]
-        rows = child.get("rows", [])  # type: ignore[union-attr]
+        headers = cast(list[str], child.get("headers", []))  # type: ignore[union-attr]
+        rows = cast(list[list[str]], child.get("rows", []))  # type: ignore[union-attr]
         text_parts.append("\n".join(render_gfm_table(headers, rows)))
     else:
         text = card_child_to_fallback_text(child)
@@ -270,8 +270,8 @@ def _child_to_fallback_text(child: CardChild) -> str | None:
             if (t := _child_to_fallback_text(c))
         )
     if child_type == "table":
-        headers = child.get("headers", [])  # type: ignore[union-attr]
-        rows = child.get("rows", [])  # type: ignore[union-attr]
+        headers = cast(list[str], child.get("headers", []))  # type: ignore[union-attr]
+        rows = cast(list[list[str]], child.get("rows", []))  # type: ignore[union-attr]
         return f"```\n{table_element_to_ascii(headers, rows)}\n```"
     if child_type == "divider":
         return "---"
