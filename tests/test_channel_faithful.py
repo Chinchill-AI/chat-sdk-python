@@ -651,6 +651,24 @@ class TestSerialization:
         assert channel.is_dm is False
         assert channel.adapter is adapter
 
+    def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self):
+        """from_json(data, adapter=X) must update _adapter_name to X.name so
+        to_json() doesn't serialize a stale name. Regression for a P2 raised
+        in review."""
+        from chat_sdk.testing import create_mock_adapter as _create
+
+        renamed_adapter = _create("teams")
+        json_data = {
+            "_type": "chat:Channel",
+            "id": "C123",
+            "adapter_name": "slack",  # different from the bound adapter
+            "is_dm": False,
+        }
+        channel = ChannelImpl.from_json(json_data, renamed_adapter)
+
+        assert channel.adapter.name == "teams"
+        assert channel.to_json()["adapterName"] == "teams"
+
 
 # ===========================================================================
 # deriveChannelId (tested in channel.test.ts alongside ChannelImpl)
