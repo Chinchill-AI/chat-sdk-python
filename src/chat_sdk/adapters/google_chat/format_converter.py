@@ -115,6 +115,13 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             url = node.get("url", "")
             if link_text == url:
                 return url
+            # Labels containing the `|` or `>` delimiters, or a newline, can't
+            # be emitted safely in <url|text> form — Google Chat (and our own
+            # round-trip regex) stops at the first `>` / `|`. Fall back to
+            # plain `text (url)` so the label text is preserved and Google
+            # Chat's auto-link detection still makes the URL clickable.
+            if "|" in link_text or ">" in link_text or "\n" in link_text:
+                return f"{link_text} ({url})"
             return f"<{url}|{link_text}>"
 
         if node_type == "heading":

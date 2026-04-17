@@ -167,6 +167,19 @@ class TestFromAst:
         result = converter.from_markdown("[Click here](https://example.com)")
         assert result == "<https://example.com|Click here>"
 
+    def test_falls_back_to_parenthesized_form_when_label_contains_reserved_chars(self):
+        """Labels containing `>` / `|` / newline would produce malformed
+        `<url|text>` output (Google Chat + our own regex stop at the first
+        `>` or `|`), so fall back to plain `text (url)` so the label is
+        preserved intact and the URL is still auto-detected as a link."""
+        converter = _converter()
+        for label in ["a > b", "a | b", "a\nb"]:
+            result = converter.from_markdown(f"[{label}](https://example.com)")
+            assert result == f"{label} (https://example.com)"
+            # Sanity: the safe-labels path still uses <url|text>.
+        safe = converter.from_markdown("[ok](https://example.com)")
+        assert safe == "<https://example.com|ok>"
+
     def test_blockquote(self):
         converter = _converter()
         ast = converter.to_ast("> quoted text")
