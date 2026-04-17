@@ -44,8 +44,9 @@ class GoogleChatFormatConverter(BaseFormatConverter):
 
         # Google Chat custom link syntax <url|text> -> [text](url). Must run
         # before bold/strikethrough so the `|` inside a link label isn't
-        # matched by those patterns.
-        markdown = re.sub(r"<(https?://[^|\s>]+)\|([^>]+)>", r"[\2](\1)", markdown)
+        # matched by those patterns. Accepts any RFC 3986 scheme, not just
+        # http(s), so mailto:/tel:/etc. round-trip cleanly.
+        markdown = re.sub(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+)\|([^>]+)>", r"[\2](\1)", markdown)
 
         # Bold: *text* -> **text**
         markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
@@ -65,8 +66,8 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         result = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).strip("`").strip(), text)
         # Inline code
         result = re.sub(r"`([^`]+)`", r"\1", result)
-        # Google Chat custom link syntax: <url|text> -> text
-        result = re.sub(r"<https?://[^|\s>]+\|([^>]+)>", r"\1", result)
+        # Google Chat custom link syntax: <url|text> -> text (any RFC 3986 scheme)
+        result = re.sub(r"<[a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+\|([^>]+)>", r"\1", result)
         # Bold markers (*text*)
         result = re.sub(r"\*([^*]+)\*", r"\1", result)
         # Italic markers (_text_)

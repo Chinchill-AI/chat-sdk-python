@@ -79,6 +79,34 @@ class TestToAst:
         _walk(ast)
         assert found, "Expected a link node with url='https://example.com' and text='Example'"
 
+    def test_gchat_custom_link_parses_non_http_schemes(self):
+        """mailto:/tel:/etc. emit <url|text> in from_ast; to_ast must accept
+        any RFC 3986 scheme, not just http(s)."""
+        converter = _converter()
+        for url, label in [
+            ("mailto:test@example.com", "Email"),
+            ("tel:+15551234", "Call"),
+            ("ftp:files.example.com", "Files"),
+        ]:
+            ast = converter.to_ast(f"Contact <{url}|{label}> for details")
+            found = False
+
+            def _walk(node: object, _url: str = url, _label: str = label) -> None:
+                nonlocal found
+                if isinstance(node, dict):
+                    if node.get("type") == "link" and node.get("url") == _url:
+                        children = node.get("children", [])
+                        text = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                        if text == _label:
+                            found = True
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+            _walk(ast)
+            assert found, f"Expected a link node for url={url!r} label={label!r}"
+            # And extract_plain_text should reduce to just the label
+            assert converter.extract_plain_text(f"<{url}|{label}>") == label
+
 
 # ---------------------------------------------------------------------------
 # from_ast: AST -> Google Chat format
