@@ -47,6 +47,11 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         # before bold/strikethrough so the `|` inside a link label isn't
         # matched by those patterns. Accepts any RFC 3986 scheme, not just
         # http(s), so mailto:/tel:/etc. round-trip cleanly.
+        #
+        # Known limitation: URLs containing unescaped `)` are truncated at
+        # the first `)` because our Markdown parser doesn't implement
+        # CommonMark's balanced-parens rule. Upstream has no round-trip
+        # at all, so this is still strictly better for the common case.
         markdown = re.sub(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+)\|([^>]+)>", r"[\2](\1)", markdown)
 
         # Bold: *text* -> **text**

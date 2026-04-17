@@ -389,7 +389,10 @@ class ChannelImpl:
         return {
             "_type": "chat:Channel",
             "id": self._id,
-            "adapterName": self._adapter_name if self._adapter_name else self.adapter.name,
+            # Explicit `is not None` matches upstream's `??` behavior (preserve
+            # "" if that's what was stored) and avoids triggering lazy adapter
+            # resolution when `_adapter_name` was set but no `_adapter` is bound.
+            "adapterName": self._adapter_name if self._adapter_name is not None else self.adapter.name,
             "channelVisibility": self._channel_visibility,
             "isDM": self._is_dm,
         }
