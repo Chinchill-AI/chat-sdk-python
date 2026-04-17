@@ -1,6 +1,6 @@
 [project]
 name = "chat-sdk"
-version = "0.4.26"
+version = "0.4.26.1"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
 readme = "README.md"
 license = {text = "MIT"}
@@ -80,9 +80,10 @@ dev = [
 # ---------------------------------------------------------------------------
 # Pyrefly type checker configuration
 # ---------------------------------------------------------------------------
-# Baseline workflow:
-#   Check against baseline: uv run pyrefly check --baseline=.pyrefly-baseline.json
-#   Refresh baseline:       uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline
+# Enforced strictly in CI — src/ must report 0 errors. If pyrefly flags a
+# legitimate gap that can't be fixed cleanly, prefer a narrow
+# `# pyrefly: ignore[<code>]` with a comment over adding to a baseline
+# file — keeps the scope of suppressions visible and reviewable.
 # ---------------------------------------------------------------------------
 
 [tool.pyrefly]
@@ -115,5 +116,4 @@ replace-imports-with-any = [
 ]
 
 [tool.pyrefly.errors]
-# Default severity. Known issues tracked in .pyrefly-baseline.json —
-# new errors fail CI, existing ones are allowed.
+# Default severity for all error categories. Strict: 0 errors expected.

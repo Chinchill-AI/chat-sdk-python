@@ -275,7 +275,10 @@ class DiscordAdapter:
             return False
 
         try:
-            import nacl.signing  # lazy import
+            # pyrefly: ignore[missing-import]
+            # pynacl is an optional extra; replace-imports-with-any covers
+            # the top-level `nacl` module but not its submodules.
+            import nacl.signing
 
             verify_key = nacl.signing.VerifyKey(bytes.fromhex(self._public_key))
             message = timestamp.encode("utf-8") + body_bytes

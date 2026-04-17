@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.26.1 (2026-04-17)
+
+Python-only patch on top of 4.26.0. Strict type checking with pyrefly.
+
+### Type cleanup
+- **Zero pyrefly errors across `src/`** (was 213 when pyrefly was first wired up). Fixes are surgical: parameter-name overrides aligned with base protocols, `lock_scope` narrowed to `LockScope | None`, `cast()` around `TypedDict` union access in card builders and webhook dispatch, `NoReturn` on raise-only helpers, `isinstance` / `TypeGuard` narrowing in place of `hasattr`, and a handful of narrow `# pyrefly: ignore[missing-import]` markers for optional-dep submodules (`nacl.signing`, `redis.asyncio`, `slack_sdk.web.async_client`, `google.auth`).
+- **`_ChatSingleton` is now `@runtime_checkable Protocol`**, so `Chat` is structurally recognized as a valid resolver without runtime changes.
+- **WhatsApp `WhatsAppInboundMessage` TypedDict** uses the functional syntax so the JSON key `"from"` is type-checkable instead of the `"from_"` workaround.
+- **Sync-or-async handler dispatch** in `chat.py` uses `inspect.isawaitable` so callers returning either a coroutine or a plain value both work (previously implicit).
+- **`.pyrefly-baseline.json` removed**: the baseline was only there to bootstrap adoption. Strict 0-error enforcement is now the CI contract.
+
+### CI
+- `Lint & Type Check` workflow is now a hard gate on type errors (no `--baseline` fallback).
+
 ## 0.4.26 (2026-04-16)
 
 Synced to [Vercel Chat 4.26.0](https://github.com/vercel/chat).
