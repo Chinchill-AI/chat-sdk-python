@@ -23,6 +23,52 @@ from chat_sdk.shared.base_format_converter import (
     table_to_ascii,
 )
 
+_GCHAT_LINK_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+)\|([^>]+)>")
+# Private-use code point chosen as a placeholder token. PUA characters are
+# guaranteed never to appear in user-authored text, so the round-trip
+# substitution (emit placeholder → parse Markdown → inject link nodes) can
+# use them as unique markers without collision risk.
+_GCHAT_LINK_PLACEHOLDER = "\ue000LINK{idx}\ue000"
+_GCHAT_LINK_PLACEHOLDER_RE = re.compile(r"\ue000LINK(\d+)\ue000")
+
+
+def _inject_link_placeholders(node: dict, links: list[tuple[str, str]]) -> None:
+    """Walk the AST in place and expand ``\\ue000LINK{idx}\\ue000`` placeholders
+    in text nodes into real link nodes. Used by ``to_ast`` to bypass the
+    Markdown parser for custom ``<url|text>`` tokens whose URLs may contain
+    characters the parser can't round-trip (e.g. unescaped ``)``).
+    """
+    children = node.get("children")
+    if not isinstance(children, list):
+        return
+    new_children: list = []
+    for child in children:
+        if isinstance(child, dict) and child.get("type") == "text":
+            value = child.get("value", "")
+            if "\ue000" not in value:
+                new_children.append(child)
+                continue
+            parts = _GCHAT_LINK_PLACEHOLDER_RE.split(value)
+            # parts alternates plain-text / placeholder-index / plain-text / ...
+            for i, part in enumerate(parts):
+                if i % 2 == 0:
+                    if part:
+                        new_children.append({"type": "text", "value": part})
+                else:
+                    url, text = links[int(part)]
+                    new_children.append(
+                        {
+                            "type": "link",
+                            "url": url,
+                            "children": [{"type": "text", "value": text}],
+                        }
+                    )
+        else:
+            if isinstance(child, dict):
+                _inject_link_placeholders(child, links)
+            new_children.append(child)
+    node["children"] = new_children
+
 
 class GoogleChatFormatConverter(BaseFormatConverter):
     """Format converter between standard markdown AST and Google Chat format.
@@ -43,16 +89,22 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         markdown = platform_text
 
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
-        # Google Chat custom link syntax <url|text> -> [text](url). Must run
-        # before bold/strikethrough so the `|` inside a link label isn't
-        # matched by those patterns. Accepts any RFC 3986 scheme, not just
-        # http(s), so mailto:/tel:/etc. round-trip cleanly.
-        #
-        # Known limitation: URLs containing unescaped `)` are truncated at
-        # the first `)` because our Markdown parser doesn't implement
-        # CommonMark's balanced-parens rule. Upstream has no round-trip
-        # at all, so this is still strictly better for the common case.
-        markdown = re.sub(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+)\|([^>]+)>", r"[\2](\1)", markdown)
+        # Google Chat custom link syntax `<url|text>` has to survive our
+        # Markdown parser, which doesn't implement CommonMark's balanced-
+        # parens rule for link destinations. A naive regex substitution to
+        # `[text](url)` would corrupt URLs containing `)` (e.g. Wikipedia-
+        # style `https://en.wikipedia.org/wiki/Foo_(bar)`). Instead we
+        # extract each match to a PUA placeholder, parse the rest as
+        # Markdown, and inject real link nodes where the placeholders
+        # land. Accepts any RFC 3986 scheme.
+        links: list[tuple[str, str]] = []
+
+        def _capture(match: re.Match[str]) -> str:
+            idx = len(links)
+            links.append((match.group(1), match.group(2)))
+            return _GCHAT_LINK_PLACEHOLDER.format(idx=idx)
+
+        markdown = _GCHAT_LINK_RE.sub(_capture, markdown)
 
         # Bold: *text* -> **text**
         markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
@@ -61,7 +113,10 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         markdown = re.sub(r"(?<!~)~([^~\n]+)~(?!~)", r"~~\1~~", markdown)
 
         # Italic and code are the same format as markdown
-        return parse_markdown(markdown)
+        ast = parse_markdown(markdown)
+        if links:
+            _inject_link_placeholders(ast, links)
+        return ast
 
     def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Google Chat formatted text.

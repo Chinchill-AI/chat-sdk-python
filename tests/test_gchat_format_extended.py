@@ -79,6 +79,27 @@ class TestToAst:
         _walk(ast)
         assert found, "Expected a link node with url='https://example.com' and text='Example'"
 
+    def test_gchat_custom_link_parses_url_with_balanced_parens(self):
+        """URLs containing `(...)` (e.g. Wikipedia-style) must round-trip
+        intact. The Markdown parser doesn't implement CommonMark's balanced-
+        parens rule for link destinations, so a naive regex rewrite
+        `<url|text>` → `[text](url)` would truncate the URL at the first `)`.
+        The AST placeholder substitution path in `to_ast` bypasses the parser
+        for these tokens and injects a link node with the full URL intact."""
+        converter = _converter()
+        ast = converter.to_ast("See <https://example.com/a_(b)|Wiki> for info")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert link_urls == ["https://example.com/a_(b)"], f"expected intact URL, got {link_urls!r}"
+
     def test_gchat_custom_link_parses_non_http_schemes(self):
         """mailto:/tel:/etc. emit <url|text> in from_ast; to_ast must accept
         any RFC 3986 scheme, not just http(s)."""
