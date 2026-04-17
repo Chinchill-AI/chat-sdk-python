@@ -449,9 +449,18 @@ class TestStreaming:
         adapter = create_mock_adapter()
         state = create_mock_state()
 
-        thread = _make_thread(adapter, state)
-        text_stream = _create_text_stream(["Hello world"])
-        await thread.post(text_stream)
+        # Simulate the warm-up path: a whitespace-only chunk arrives before the
+        # real content, and the background edit loop fires fast enough to see
+        # it. Without the warm-up chunk the test never exercises the empty-edit
+        # guard — it'd just post "Hello world" immediately.
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10)
+
+        async def _stream() -> AsyncIterator[str]:
+            yield " "
+            await asyncio.sleep(0.05)
+            yield "Hello world\n"
+
+        await thread.post(_stream())
 
         markdown_edits = [content for _, _, content in adapter._edit_calls if isinstance(content, PostableMarkdown)]
         assert markdown_edits, "expected at least one PostableMarkdown edit"

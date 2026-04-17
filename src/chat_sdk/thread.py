@@ -744,7 +744,10 @@ class ThreadImpl:
             "channelVisibility": self._channel_visibility,
             "currentMessage": self._current_message.to_json() if self._current_message else None,
             "isDM": self._is_dm,
-            "adapterName": self._adapter_name if self._adapter_name else self.adapter.name,
+            # Explicit `is not None` matches upstream's `??` behavior (preserve
+            # "" if that's what was stored) and avoids triggering lazy adapter
+            # resolution when `_adapter_name` was set but no `_adapter` is bound.
+            "adapterName": self._adapter_name if self._adapter_name is not None else self.adapter.name,
         }
 
     @classmethod
