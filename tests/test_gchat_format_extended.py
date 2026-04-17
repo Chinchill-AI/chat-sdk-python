@@ -79,6 +79,54 @@ class TestToAst:
         _walk(ast)
         assert found, "Expected a link node with url='https://example.com' and text='Example'"
 
+    def test_gchat_custom_link_syntax_inside_code_span_stays_literal(self):
+        """`<url|text>` inside inline or fenced code is user content, not a
+        link. The AST-placeholder substitution must restore the original
+        syntax in code nodes rather than embedding the `\\ue000LINK...`
+        sentinel."""
+        converter = _converter()
+
+        def _values_of_type(ast: object, target: str) -> list[str]:
+            out: list[str] = []
+
+            def _walk(node: object) -> None:
+                if isinstance(node, dict):
+                    if node.get("type") == target:
+                        out.append(node.get("value", ""))
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+            _walk(ast)
+            return out
+
+        ast_inline = converter.to_ast("Use `<https://example.com|Example>` in code")
+        assert _values_of_type(ast_inline, "inlineCode") == ["<https://example.com|Example>"]
+
+        ast_fenced = converter.to_ast("```\ncurl <https://api.com|example>\n```")
+        fenced_values = _values_of_type(ast_fenced, "code")
+        assert any("<https://api.com|example>" in v for v in fenced_values), fenced_values
+
+    def test_gchat_custom_link_tolerates_out_of_range_placeholder(self):
+        """If user input happens to include the PUA placeholder pattern with
+        an index that isn't in our `links` list, `to_ast` must not raise. The
+        unknown placeholder is preserved as literal text and any real
+        `<url|text>` alongside it still parses correctly."""
+        converter = _converter()
+        # Index 999 is deliberately out of range; there's only one real
+        # <url|text> token so `links` will have length 1.
+        ast = converter.to_ast("\ue000LINK999\ue000 and <https://example.com|Real>")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert link_urls == ["https://example.com"]
+
     def test_gchat_custom_link_parses_url_with_balanced_parens(self):
         """URLs containing `(...)` (e.g. Wikipedia-style) must round-trip
         intact. The Markdown parser doesn't implement CommonMark's balanced-

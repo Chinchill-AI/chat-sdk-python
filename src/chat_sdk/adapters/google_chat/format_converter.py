@@ -37,13 +37,35 @@ def _inject_link_placeholders(node: dict, links: list[tuple[str, str]]) -> None:
     in text nodes into real link nodes. Used by ``to_ast`` to bypass the
     Markdown parser for custom ``<url|text>`` tokens whose URLs may contain
     characters the parser can't round-trip (e.g. unescaped ``)``).
+
+    Code spans (``inlineCode`` / ``code``) are handled specially: their content
+    is literal, so placeholders in them are rewritten back to the original
+    ``<url|text>`` syntax rather than being turned into link nodes. Out-of-
+    range placeholder indices (which can appear if crafted/accidental user
+    input happens to match the placeholder pattern) are left as literal text
+    rather than raising ``IndexError``.
     """
+
+    def _placeholder_to_literal(value: str) -> str:
+        def _sub(match: re.Match[str]) -> str:
+            i = int(match.group(1))
+            if 0 <= i < len(links):
+                url, text = links[i]
+                return f"<{url}|{text}>"
+            return match.group(0)
+
+        return _GCHAT_LINK_PLACEHOLDER_RE.sub(_sub, value)
+
     children = node.get("children")
     if not isinstance(children, list):
         return
     new_children: list = []
     for child in children:
-        if isinstance(child, dict) and child.get("type") == "text":
+        if not isinstance(child, dict):
+            new_children.append(child)
+            continue
+        ctype = child.get("type")
+        if ctype == "text":
             value = child.get("value", "")
             if "\ue000" not in value:
                 new_children.append(child)
@@ -55,17 +77,29 @@ def _inject_link_placeholders(node: dict, links: list[tuple[str, str]]) -> None:
                     if part:
                         new_children.append({"type": "text", "value": part})
                 else:
-                    url, text = links[int(part)]
-                    new_children.append(
-                        {
-                            "type": "link",
-                            "url": url,
-                            "children": [{"type": "text", "value": text}],
-                        }
-                    )
+                    idx = int(part)
+                    if 0 <= idx < len(links):
+                        url, text = links[idx]
+                        new_children.append(
+                            {
+                                "type": "link",
+                                "url": url,
+                                "children": [{"type": "text", "value": text}],
+                            }
+                        )
+                    else:
+                        # Unknown placeholder (malformed / crafted input).
+                        # Preserve as literal text rather than raising.
+                        new_children.append({"type": "text", "value": f"\ue000LINK{idx}\ue000"})
+        elif ctype in ("inlineCode", "code") and isinstance(child.get("value"), str):
+            # Code spans are literal — a `<url|text>` inside them is user
+            # content, not a link. Restore the original syntax rather than
+            # leaving the placeholder embedded in the code value.
+            if "\ue000" in child["value"]:
+                child["value"] = _placeholder_to_literal(child["value"])
+            new_children.append(child)
         else:
-            if isinstance(child, dict):
-                _inject_link_placeholders(child, links)
+            _inject_link_placeholders(child, links)
             new_children.append(child)
     node["children"] = new_children
 
