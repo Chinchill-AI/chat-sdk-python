@@ -16,10 +16,15 @@ import os
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
-from chat_sdk.adapters.whatsapp.cards import card_to_whatsapp, decode_whatsapp_callback_data
+from chat_sdk.adapters.whatsapp.cards import (
+    WhatsAppCardResultInteractive,
+    WhatsAppCardResultText,
+    card_to_whatsapp,
+    decode_whatsapp_callback_data,
+)
 from chat_sdk.adapters.whatsapp.format_converter import WhatsAppFormatConverter
 from chat_sdk.adapters.whatsapp.types import (
     WhatsAppAdapterConfig,
@@ -44,6 +49,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -102,7 +108,7 @@ class WhatsAppAdapter:
 
     def __init__(self, config: WhatsAppAdapterConfig) -> None:
         self._name = "whatsapp"
-        self._lock_scope = "channel"
+        self._lock_scope: LockScope = "channel"
         self._persist_message_history = True
         self._user_name = config.user_name
         self._access_token = config.access_token
@@ -124,7 +130,7 @@ class WhatsAppAdapter:
         return self._name
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope | None:
         return self._lock_scope
 
     @property
@@ -207,7 +213,7 @@ class WhatsAppAdapter:
                     for message in value["messages"]:
                         try:
                             self._handle_inbound_message(
-                                message,
+                                cast(WhatsAppInboundMessage, message),
                                 (value.get("contacts") or [None])[0],
                                 value.get("metadata", {}).get("phone_number_id", ""),
                                 options,
@@ -348,7 +354,8 @@ class WhatsAppAdapter:
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
-                thread=None,
+                # Thread is resolved later by chat.process_reaction; None is runtime-valid.
+                thread=None,  # pyrefly: ignore[bad-argument-type]
                 thread_id=thread_id,
                 message_id=inbound["reaction"]["message_id"],
                 user=user,
@@ -392,7 +399,8 @@ class WhatsAppAdapter:
             return
 
         decoded = decode_whatsapp_callback_data(raw_id)
-        action_id = decoded["action_id"]
+        # decode_whatsapp_callback_data always populates "action_id"; coerce to str for typing.
+        action_id = decoded["action_id"] or raw_id
         value = decoded.get("value") if decoded.get("value") is not None else fallback_value
 
         contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
@@ -709,13 +717,17 @@ class WhatsAppAdapter:
         card = extract_card(message)
         if card:
             result = card_to_whatsapp(card)
-            if result.get("type") == "interactive":
-                interactive = json.loads(convert_emoji_placeholders(json.dumps(result["interactive"]), "whatsapp"))
+            if result["type"] == "interactive":
+                interactive_result = cast(WhatsAppCardResultInteractive, result)
+                interactive = json.loads(
+                    convert_emoji_placeholders(json.dumps(interactive_result["interactive"]), "whatsapp")
+                )
                 return await self._send_interactive_message(thread_id, user_wa_id, interactive)
+            text_result = cast(WhatsAppCardResultText, result)
             return await self._send_text_message(
                 thread_id,
                 user_wa_id,
-                convert_emoji_placeholders(result["text"], "whatsapp"),
+                convert_emoji_placeholders(text_result["text"], "whatsapp"),
             )
 
         # Regular text message
@@ -840,7 +852,8 @@ class WhatsAppAdapter:
                 accumulated += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
-        return await self.post_message(thread_id, {"markdown": accumulated})
+        # The test suite asserts this dict-shape is preserved; cast for typing.
+        return await self.post_message(thread_id, cast(AdapterPostableMessage, {"markdown": accumulated}))
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message. Not supported by WhatsApp Cloud API."""
@@ -1041,7 +1054,8 @@ class WhatsAppAdapter:
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a request object."""
         if hasattr(request, "text") and callable(request.text):
-            return await request.text()
+            text_fn: Any = request.text
+            return await text_fn()
         if hasattr(request, "body"):
             body = request.body
             if isinstance(body, bytes):

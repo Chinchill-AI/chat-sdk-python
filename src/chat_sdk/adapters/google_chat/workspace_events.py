@@ -343,7 +343,8 @@ async def _get_access_token(
         # Custom auth - assume it provides a token directly
         custom_auth = auth["auth"]
         if callable(custom_auth):
-            return await custom_auth()
+            auth_fn: Any = custom_auth
+            return await auth_fn()
         return str(custom_auth)
     else:
         raise ValueError("Unsupported auth type for workspace events")
@@ -403,8 +404,9 @@ async def _get_adc_token(scopes: list[str], http_session: Any | None = None) -> 
     to metadata server for GCE/Cloud Run environments.
     """
     try:
-        import google.auth
-        import google.auth.transport.requests
+        # google-auth is an optional dependency; pyrefly cannot see it.
+        import google.auth  # pyrefly: ignore[missing-import]
+        import google.auth.transport.requests  # pyrefly: ignore[missing-import]
 
         creds, _ = google.auth.default(scopes=scopes)
         request = google.auth.transport.requests.Request()

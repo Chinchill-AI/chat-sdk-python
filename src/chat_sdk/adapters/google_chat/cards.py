@@ -8,7 +8,7 @@ Python port of cards.ts.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.cards import (
     CardChild,
@@ -124,8 +124,9 @@ def _convert_child_to_widgets(
     elif child_type == "fields":
         return _convert_fields_to_widgets(child)
     elif child_type == "link":
-        label = child.get("label", "")
-        url = child.get("url", "")
+        # child is a CardChild union; the "link" branch is specifically a LinkElement.
+        label = str(cast(dict[str, Any], child).get("label", ""))
+        url = str(cast(dict[str, Any], child).get("url", ""))
         return [
             {
                 "textParagraph": {
@@ -152,7 +153,7 @@ def _markdown_to_gchat(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
 
 
-def _convert_text_to_widget(element: dict[str, Any]) -> dict[str, Any]:
+def _convert_text_to_widget(element: Any) -> dict[str, Any]:
     """Convert a text element to a widget."""
     text = _markdown_to_gchat(convert_emoji(element.get("content", "")))
 
@@ -166,7 +167,7 @@ def _convert_text_to_widget(element: dict[str, Any]) -> dict[str, Any]:
     return {"textParagraph": {"text": text}}
 
 
-def _convert_image_to_widget(element: dict[str, Any]) -> dict[str, Any]:
+def _convert_image_to_widget(element: Any) -> dict[str, Any]:
     """Convert an image element to a widget."""
     return {
         "image": {
@@ -182,7 +183,7 @@ def _convert_divider_to_widget() -> dict[str, Any]:
 
 
 def _convert_actions_to_widget(
-    element: dict[str, Any],
+    element: Any,
     endpoint_url: str | None = None,
 ) -> dict[str, Any]:
     """Convert an actions element to a widget."""
@@ -264,7 +265,7 @@ def _convert_link_button_to_google_button(
 
 
 def _convert_section_to_widgets(
-    element: dict[str, Any],
+    element: Any,
     endpoint_url: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a section element to widgets."""
@@ -274,7 +275,7 @@ def _convert_section_to_widgets(
     return widgets
 
 
-def _convert_table_to_widget(element: dict[str, Any]) -> dict[str, Any]:
+def _convert_table_to_widget(element: Any) -> dict[str, Any]:
     """Convert a table element to a widget.
 
     Renders as monospace text (ASCII table) in a TextParagraph widget.
@@ -290,7 +291,7 @@ def _convert_table_to_widget(element: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_fields_to_widgets(
-    element: dict[str, Any],
+    element: Any,
 ) -> list[dict[str, Any]]:
     """Convert fields element to decorated text widgets."""
     return [

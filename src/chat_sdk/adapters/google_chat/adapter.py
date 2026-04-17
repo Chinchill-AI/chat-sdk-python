@@ -17,7 +17,7 @@ import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn, cast
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
 from chat_sdk.adapters.google_chat.format_converter import GoogleChatFormatConverter
@@ -69,6 +69,7 @@ from chat_sdk.types import (
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     Message,
     RawMessage,
     ReactionEvent,
@@ -130,7 +131,7 @@ class GoogleChatAdapter:
             config = GoogleChatAdapterConfig()
 
         self._name = "gchat"
-        self._lock_scope: str | None = None
+        self._lock_scope: LockScope | None = None
         self._persist_message_history: bool | None = None
         self._logger: Logger = config.logger or ConsoleLogger("info").child("gchat")
         self._user_name = config.user_name or "bot"
@@ -211,7 +212,7 @@ class GoogleChatAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return self._lock_scope
 
     @property
@@ -323,8 +324,9 @@ class GoogleChatAdapter:
     async def _get_adc_token(self, scopes: list[str]) -> str:
         """Get an access token using Application Default Credentials."""
         try:
-            import google.auth
-            import google.auth.transport.requests
+            # google-auth is an optional dependency; pyrefly cannot see it.
+            import google.auth  # pyrefly: ignore[missing-import]
+            import google.auth.transport.requests  # pyrefly: ignore[missing-import]
 
             creds, _ = google.auth.default(scopes=scopes)
             request = google.auth.transport.requests.Request()
@@ -761,7 +763,8 @@ class GoogleChatAdapter:
         # Parse request body
         body: str
         if hasattr(request, "text") and callable(request.text):
-            body = await request.text()
+            text_fn: Any = request.text
+            body = await text_fn()
         elif hasattr(request, "body"):
             raw_body = request.body
             body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
@@ -1022,7 +1025,8 @@ class GoogleChatAdapter:
             reaction_user = reaction.get("user") or {}
             return ReactionEvent(
                 adapter=self,
-                thread=None,
+                # Thread is resolved later by chat.process_reaction; None is runtime-valid.
+                thread=None,  # pyrefly: ignore[bad-argument-type]
                 thread_id=thread_id,
                 message_id=message_name,
                 user=Author(
@@ -1594,7 +1598,8 @@ class GoogleChatAdapter:
                 accumulated += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
-        return await self.post_message(thread_id, {"markdown": accumulated})
+        # The test suite asserts this dict-shape is preserved; cast for typing.
+        return await self.post_message(thread_id, cast(AdapterPostableMessage, {"markdown": accumulated}))
 
     # =========================================================================
     # Reactions
@@ -2644,11 +2649,10 @@ class GoogleChatAdapter:
     # Error handling
     # =========================================================================
 
-    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> Any:
+    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> NoReturn:
         """Handle Google Chat API errors with proper error classification.
 
-        Always re-raises. Returns Never (but typed as Any so callers satisfy
-        return type without explicit annotation).
+        Always re-raises.
         """
         error_code = getattr(error, "code", None)
         error_message = getattr(error, "message", str(error))

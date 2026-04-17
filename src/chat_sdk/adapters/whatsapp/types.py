@@ -132,44 +132,35 @@ class WhatsAppWebhookPayload(TypedDict):
 # =============================================================================
 
 
-class WhatsAppInboundMessage(TypedDict, total=False):
-    """Inbound message from a user.
+# Using functional TypedDict syntax because "from" is a reserved Python keyword.
+# See: https://peps.python.org/pep-0589/#alternative-syntax
+WhatsAppInboundMessage = TypedDict(
+    "WhatsAppInboundMessage",
+    {
+        "audio": dict[str, Any],
+        "button": dict[str, str],
+        "context": dict[str, str],
+        "document": dict[str, Any],
+        # Sender's WhatsApp ID (JSON key "from")
+        "from": str,
+        "id": str,
+        "image": dict[str, Any],
+        "interactive": dict[str, Any],
+        "location": dict[str, Any],
+        "reaction": dict[str, str],
+        "sticker": dict[str, Any],
+        "text": dict[str, str],
+        "timestamp": str,
+        "type": str,
+        "video": dict[str, Any],
+        "voice": dict[str, Any],
+    },
+    total=False,
+)
+"""Inbound message from a user.
 
-    See: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
-    """
-
-    # Audio message content
-    audio: dict[str, Any]
-    # Legacy button response (from template quick replies)
-    button: dict[str, str]
-    # Context for quoted replies
-    context: dict[str, str]
-    # Document message content
-    document: dict[str, Any]
-    # Sender's WhatsApp ID
-    from_: str  # mapped from "from" in JSON
-    # Unique message ID
-    id: str
-    # Image message content
-    image: dict[str, Any]
-    # Interactive message reply
-    interactive: dict[str, Any]
-    # Location message content
-    location: dict[str, Any]
-    # Reaction to a message
-    reaction: dict[str, str]
-    # Sticker message content
-    sticker: dict[str, Any]
-    # Text message content
-    text: dict[str, str]
-    # Unix timestamp string
-    timestamp: str
-    # Message type
-    type: str
-    # Video message content
-    video: dict[str, Any]
-    # Voice message content
-    voice: dict[str, Any]
+See: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
+"""
 
 
 # =============================================================================
@@ -254,7 +245,7 @@ class WhatsAppRawMessage(TypedDict, total=False):
     """
 
     # The raw inbound message data
-    message: dict[str, Any]
+    message: WhatsAppInboundMessage
     # Phone number ID that received the message
     phone_number_id: str
     # Contact info from the webhook

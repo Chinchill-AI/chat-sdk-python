@@ -224,8 +224,8 @@ def _render_child(child: CardChild) -> list[str]:
         return result
 
     if child_type == "image":
-        alt = child.get("alt", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        alt = str(child.get("alt", ""))  # type: ignore[union-attr]
+        url = str(child.get("url", ""))  # type: ignore[union-attr]
         if alt:
             return [f"{alt}: {url}"]
         return [url]
