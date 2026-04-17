@@ -428,6 +428,9 @@ class ChannelImpl:
         )
         if adapter is not None:
             channel._adapter = adapter
+            # Keep _adapter_name in sync with the explicit adapter so
+            # to_json() doesn't serialize a stale name.
+            channel._adapter_name = adapter.name
         elif chat is not None:
             if channel._adapter_name:
                 resolved = chat.get_adapter(channel._adapter_name)

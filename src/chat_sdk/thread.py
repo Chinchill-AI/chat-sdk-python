@@ -779,6 +779,9 @@ class ThreadImpl:
         )
         if adapter is not None:
             thread._adapter = adapter
+            # Keep _adapter_name in sync with the explicit adapter so
+            # to_json() doesn't serialize a stale name after rebind.
+            thread._adapter_name = adapter.name
         elif chat is not None:
             if thread._adapter_name:
                 resolved = chat.get_adapter(thread._adapter_name)

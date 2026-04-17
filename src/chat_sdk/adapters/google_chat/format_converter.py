@@ -42,6 +42,11 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         """
         markdown = gchat_text
 
+        # Google Chat custom link syntax <url|text> -> [text](url). Must run
+        # before bold/strikethrough so the `|` inside a link label isn't
+        # matched by those patterns.
+        markdown = re.sub(r"<(https?://[^|\s>]+)\|([^>]+)>", r"[\2](\1)", markdown)
+
         # Bold: *text* -> **text**
         markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
 
@@ -58,13 +63,15 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         """
         # Remove code blocks
         result = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).strip("`").strip(), text)
-        # Remove inline code
+        # Inline code
         result = re.sub(r"`([^`]+)`", r"\1", result)
-        # Remove bold markers (*text*)
+        # Google Chat custom link syntax: <url|text> -> text
+        result = re.sub(r"<https?://[^|\s>]+\|([^>]+)>", r"\1", result)
+        # Bold markers (*text*)
         result = re.sub(r"\*([^*]+)\*", r"\1", result)
-        # Remove italic markers (_text_)
+        # Italic markers (_text_)
         result = re.sub(r"_([^_]+)_", r"\1", result)
-        # Remove strikethrough markers (~text~)
+        # Strikethrough markers (~text~)
         result = re.sub(r"~([^~]+)~", r"\1", result)
         return result.strip()
 

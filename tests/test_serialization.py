@@ -579,6 +579,28 @@ class TestThreadFromJsonFaithful:
         assert thread.is_dm is False
         assert thread.adapter.name == "slack"
 
+    def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self, mock_state):
+        """from_json(data, adapter=X) must update _adapter_name to X.name so
+        to_json() doesn't serialize a stale name that refers to a different
+        adapter than what's actually bound. Regression for a P2 raised in
+        review."""
+        from chat_sdk.testing import create_mock_adapter
+
+        renamed_adapter = create_mock_adapter("teams")
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channel_id": "C123",
+            "is_dm": False,
+            "adapter_name": "slack",  # different from the bound adapter
+        }
+        thread = ThreadImpl.from_json(data, adapter=renamed_adapter)
+
+        # Runtime uses the bound adapter...
+        assert thread.adapter.name == "teams"
+        # ...and re-serialization reflects that, not the stale "slack" name.
+        assert thread.to_json()["adapterName"] == "teams"
+
     def test_should_reconstruct_dm_thread(self, mock_adapter, mock_state):
         data = {
             "_type": "chat:Thread",

@@ -55,6 +55,30 @@ class TestToAst:
         ast = converter.to_ast("Use `const x = 1`")
         assert ast["type"] == "root"
 
+    def test_gchat_custom_link_parses_back_to_link_node(self):
+        """Round-trip guard: `<url|text>` emitted by from_ast must parse back
+        to a link node so downstream handlers see structured links, not raw
+        angle-bracket text. Regression test for a P1 raised in review."""
+        converter = _converter()
+        ast = converter.to_ast("See <https://example.com|Example> for more")
+
+        # Walk the AST looking for a link node with the expected URL and label.
+        found = False
+
+        def _walk(node: object) -> None:
+            nonlocal found
+            if isinstance(node, dict):
+                if node.get("type") == "link" and node.get("url") == "https://example.com":
+                    children = node.get("children", [])
+                    text = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                    if text == "Example":
+                        found = True
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert found, "Expected a link node with url='https://example.com' and text='Example'"
+
 
 # ---------------------------------------------------------------------------
 # from_ast: AST -> Google Chat format
@@ -246,6 +270,14 @@ class TestExtractPlainText:
         converter = _converter()
         result = converter.extract_plain_text("```\nsome code\n```")
         assert "some code" in result
+
+    def test_strips_gchat_custom_link_to_label(self):
+        """<url|text> should reduce to just the label text."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("See <https://example.com|Example Site> for details")
+            == "See Example Site for details"
+        )
 
 
 # ---------------------------------------------------------------------------
