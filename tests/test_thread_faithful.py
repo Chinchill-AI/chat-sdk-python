@@ -388,10 +388,14 @@ class TestStreaming:
         assert len(placeholder_calls) == 0
         # Final content is delivered through post since no mid-stream commit
         # fired (no newline in the chunks) and the empty-content guard
-        # prevents an intermediate empty post.
-        last_post = adapter._post_calls[-1]
-        assert isinstance(last_post[1], PostableMarkdown)
-        assert last_post[1].markdown == "Hi"
+        # prevents an intermediate empty post. The whole exchange is
+        # exactly one post_message("Hi") and zero edits — any regression
+        # that splits it into an early post + late edit would fail here.
+        assert len(adapter._post_calls) == 1
+        assert len(adapter._edit_calls) == 0
+        only_post = adapter._post_calls[0]
+        assert isinstance(only_post[1], PostableMarkdown)
+        assert only_post[1].markdown == "Hi"
 
     # Python-specific regression: ensure whitespace-only streams don't leave
     # the placeholder stuck on the message. This is a deliberate divergence

@@ -1109,7 +1109,11 @@ class TestStandaloneReviver:
             "isDM": False,
             "adapterName": "slack",
         }
-        channel = ChannelImpl.from_json(data)
+        # Route through the public `chat_sdk.reviver` entry point rather than
+        # `ChannelImpl.from_json` directly so a regression in the reviver's
+        # "chat:Channel" dispatch would fail here too.
+        channel = json.loads(json.dumps(data), object_hook=reviver)
+        assert isinstance(channel, ChannelImpl)
         reserialized = channel.to_json()
         assert reserialized["_type"] == "chat:Channel"
         assert reserialized["adapterName"] == "slack"
