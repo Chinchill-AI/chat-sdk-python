@@ -439,9 +439,9 @@ class TestStreaming:
         text_stream = _create_text_stream(["| A | B |\n", "|---|---|\n", "| 1 | 2 |\n"])
         await thread.post(text_stream)
 
-        for _, content in adapter._post_calls:
-            if isinstance(content, PostableMarkdown):
-                assert len(content.markdown.strip()) > 0
+        markdown_posts = [content for _, content in adapter._post_calls if isinstance(content, PostableMarkdown)]
+        assert markdown_posts, "expected at least one PostableMarkdown post"
+        assert all(p.markdown.strip() for p in markdown_posts)
 
     # it("should not edit placeholder to empty during LLM warm-up")
     @pytest.mark.asyncio
@@ -453,9 +453,9 @@ class TestStreaming:
         text_stream = _create_text_stream(["Hello world"])
         await thread.post(text_stream)
 
-        for _, _, content in adapter._edit_calls:
-            if isinstance(content, PostableMarkdown):
-                assert len(content.markdown.strip()) > 0
+        markdown_edits = [content for _, _, content in adapter._edit_calls if isinstance(content, PostableMarkdown)]
+        assert markdown_edits, "expected at least one PostableMarkdown edit"
+        assert all(e.markdown.strip() for e in markdown_edits)
 
     # it("should not post empty content during streaming with whitespace chunks")
     @pytest.mark.asyncio
@@ -467,9 +467,9 @@ class TestStreaming:
         text_stream = _create_text_stream(["  ", "\n", "  \n"])
         await thread.post(text_stream)
 
-        for _, content in adapter._post_calls:
-            if isinstance(content, PostableMarkdown):
-                assert len(content.markdown) > 0
+        markdown_posts = [content for _, content in adapter._post_calls if isinstance(content, PostableMarkdown)]
+        assert markdown_posts, "expected at least one PostableMarkdown post"
+        assert all(len(p.markdown) > 0 for p in markdown_posts)
 
     # it("should preserve newlines in streamed text (native path)")
     @pytest.mark.asyncio

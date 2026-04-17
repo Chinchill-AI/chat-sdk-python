@@ -348,8 +348,10 @@ class TestFallbackStreamingPlaceholder:
         # guard defers the first commit until stream end, so the final content
         # arrives via post rather than an intermediate edit.
         assert len(adapter._post_calls) >= 1
-        last_post = adapter._post_calls[-1]
-        assert last_post[0] == "slack:C123:1234.5678"
+        last_thread_id, last_content = adapter._post_calls[-1]
+        assert last_thread_id == "slack:C123:1234.5678"
+        last_markdown = last_content.markdown if hasattr(last_content, "markdown") else last_content
+        assert last_markdown == "Hi"
 
 
 # ============================================================================

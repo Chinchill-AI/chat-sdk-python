@@ -680,12 +680,23 @@ class ThreadImpl:
             # "..." on the message forever. We replace it with " " so the
             # placeholder is cleared consistently with the no-placeholder branch
             # (which also posts " " in this case). See docs/UPSTREAM_SYNC.md.
-            await self.adapter.edit_message(
-                thread_id_for_edits,
-                msg.id,
-                PostableMarkdown(markdown=" "),
-            )
-            last_edit_content = " "
+            #
+            # Some adapters (e.g. Telegram) reject whitespace-only content with
+            # a ValidationError. If the edit fails, we log and fall back to
+            # upstream's "leave placeholder visible" behavior for that adapter.
+            try:
+                await self.adapter.edit_message(
+                    thread_id_for_edits,
+                    msg.id,
+                    PostableMarkdown(markdown=" "),
+                )
+                last_edit_content = " "
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn(
+                        "fallbackStream placeholder-clear edit failed; placeholder will remain visible",
+                        exc,
+                    )
 
         sent = self._create_sent_message(
             msg.id,
@@ -733,7 +744,7 @@ class ThreadImpl:
             "channelVisibility": self._channel_visibility,
             "currentMessage": self._current_message.to_json() if self._current_message else None,
             "isDM": self._is_dm,
-            "adapterName": self._adapter_name or self.adapter.name,
+            "adapterName": self._adapter_name if self._adapter_name else self.adapter.name,
         }
 
     @classmethod
@@ -762,17 +773,26 @@ class ThreadImpl:
         """
         if isinstance(data, ThreadImpl):
             return data
-        current_msg_raw = data.get("currentMessage") or data.get("current_message")
+        # Explicit None-checks (not `or`) to avoid the truthiness trap:
+        # `""` is a valid-but-falsy value that shouldn't silently fall
+        # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+        raw_current = data["currentMessage"] if "currentMessage" in data else data.get("current_message")
         # ``object_hook`` revives nested dicts first, so ``currentMessage`` may
         # already be a Message instance by the time this runs.
-        current_msg = Message.from_json(current_msg_raw) if current_msg_raw else None
+        current_msg = Message.from_json(raw_current) if raw_current is not None else None
+
+        raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+        raw_channel_id = data["channelId"] if "channelId" in data else data.get("channel_id")
+        raw_channel_visibility = (
+            data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
+        )
 
         thread = cls(
             _ThreadImplConfig(
                 id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
-                channel_id=data.get("channelId") or data.get("channel_id", ""),
-                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
+                adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                channel_id=raw_channel_id if raw_channel_id is not None else "",
+                channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
                 current_message=current_msg,
                 is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
             )

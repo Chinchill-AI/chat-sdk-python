@@ -389,7 +389,7 @@ class ChannelImpl:
         return {
             "_type": "chat:Channel",
             "id": self._id,
-            "adapterName": self._adapter_name or self.adapter.name,
+            "adapterName": self._adapter_name if self._adapter_name else self.adapter.name,
             "channelVisibility": self._channel_visibility,
             "isDM": self._is_dm,
         }
@@ -418,11 +418,18 @@ class ChannelImpl:
         """
         if isinstance(data, ChannelImpl):
             return data
+        # Explicit None-checks (not `or`) to avoid the truthiness trap:
+        # `""` is a valid-but-falsy value that shouldn't silently fall
+        # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+        raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+        raw_channel_visibility = (
+            data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
+        )
         channel = cls(
             _ChannelImplConfigLazy(
                 id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
-                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
+                adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
                 is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
             )
         )

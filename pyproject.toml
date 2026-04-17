@@ -93,7 +93,7 @@ project-excludes = ["**/__pycache__", "**/.pytest_cache"]
 disable-project-excludes-heuristics = true
 use-ignore-files = false
 
-python-version = "3.11"
+python-version = "3.10"
 python-platform = "linux"
 
 # Optional adapter deps that aren't in the default install. Treating them as
