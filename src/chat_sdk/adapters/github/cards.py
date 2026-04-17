@@ -6,7 +6,7 @@ as formatted markdown with bold text, dividers, and links.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.cards import (
     CardChild,
@@ -93,41 +93,42 @@ def card_to_github_markdown(card: CardElement) -> str:
 
 def _render_child(child: CardChild) -> list[str]:
     """Render a card child element to markdown lines."""
-    child_type = child.get("type", "")
+    child_dict = cast(dict[str, Any], child)
+    child_type = child_dict.get("type", "")
 
     if child_type == "text":
-        return _render_text(child)
+        return _render_text(child_dict)
 
     if child_type == "fields":
-        return _render_fields(child)
+        return _render_fields(child_dict)
 
     if child_type == "actions":
-        return _render_actions(child)
+        return _render_actions(child_dict)
 
     if child_type == "section":
         # Flatten section children
         result: list[str] = []
-        for section_child in child.get("children", []):
+        for section_child in child_dict.get("children", []):
             result.extend(_render_child(section_child))
         return result
 
     if child_type == "image":
-        alt = child.get("alt", "")
-        url = child.get("url", "")
+        alt = str(child_dict.get("alt", ""))
+        url = str(child_dict.get("url", ""))
         if alt:
             return [f"![{_escape_markdown(alt)}]({url})"]
         return [f"![]({url})"]
 
     if child_type == "link":
-        label = child.get("label", "")
-        url = child.get("url", "")
+        label = str(child_dict.get("label", ""))
+        url = str(child_dict.get("url", ""))
         return [f"[{_escape_markdown(label)}]({url})"]
 
     if child_type == "divider":
         return ["---"]
 
     if child_type == "table":
-        return _render_table(child)
+        return _render_table(child_dict)
 
     # Fallback
     text = card_child_to_fallback_text(child)
@@ -233,7 +234,7 @@ def _child_to_plain_text(child: CardChild) -> str | None:
         return None
 
     if child_type == "table":
-        return "\n".join(_render_table(child))
+        return "\n".join(_render_table(cast(dict[str, Any], child)))
 
     if child_type == "section":
         return "\n".join(

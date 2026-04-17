@@ -21,8 +21,11 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from urllib.parse import parse_qs
+
+if TYPE_CHECKING:
+    from chat_sdk.modals import ModalElement
 
 from chat_sdk.adapters.slack.cards import (
     card_to_block_kit,
@@ -203,7 +206,7 @@ class SlackAdapter:
         self._bot_id: str | None = None  # Bot app ID (B_xxx)
         self._chat: ChatInstance | None = None
         self._format_converter = SlackFormatConverter()
-        self._lock_scope = "thread"
+        self._lock_scope: Literal["channel", "thread"] = "thread"
         self._persist_message_history = False
 
         # Channel external/shared cache
@@ -245,7 +248,7 @@ class SlackAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> Literal["channel", "thread"] | None:
         return self._lock_scope
 
     @property
@@ -287,7 +290,9 @@ class SlackAdapter:
             self._client_cache.move_to_end(resolved_token)
             return self._client_cache[resolved_token]
 
-        from slack_sdk.web.async_client import AsyncWebClient
+        # slack_sdk is an optional runtime dep, installed only when the Slack
+        # adapter is actually used.
+        from slack_sdk.web.async_client import AsyncWebClient  # pyrefly: ignore[missing-import]
 
         client = AsyncWebClient(token=resolved_token)
         self._client_cache[resolved_token] = client
@@ -396,11 +401,12 @@ class SlackAdapter:
         bot_user_id = (stored.get("botUserId") or stored.get("bot_user_id") or "") if isinstance(stored, dict) else ""
         team_name = (stored.get("teamName") or stored.get("team_name") or "") if isinstance(stored, dict) else ""
         if self._encryption_key and is_encrypted_token_data(bot_token_raw):
+            encrypted_data = cast(dict[str, Any], bot_token_raw)
             decrypted = decrypt_token(
                 EncryptedTokenData(
-                    iv=bot_token_raw["iv"],
-                    data=bot_token_raw["data"],
-                    tag=bot_token_raw["tag"],
+                    iv=encrypted_data["iv"],
+                    data=encrypted_data["data"],
+                    tag=encrypted_data["tag"],
                 ),
                 self._encryption_key,
             )
@@ -643,7 +649,12 @@ class SlackAdapter:
         """
         # Read the raw body
         if hasattr(request, "text") and callable(request.text):
-            body: str = await request.text()
+            text_result: Any = request.text()
+            # aiohttp returns a coroutine; starlette/flask return str
+            if hasattr(text_result, "__await__"):
+                body: str = await text_result
+            else:
+                body = str(text_result)
         elif hasattr(request, "body"):
             raw = request.body
             if asyncio.iscoroutine(raw) or asyncio.isfuture(raw):
@@ -663,7 +674,7 @@ class SlackAdapter:
             return {"body": "Invalid signature", "status": 401}
 
         # Form-urlencoded payloads (interactive + slash commands)
-        content_type = headers.get("content-type", headers.get("Content-Type", ""))
+        content_type = headers.get("content-type", headers.get("Content-Type", "")) or ""
         if "application/x-www-form-urlencoded" in content_type:
             params = parse_qs(body, keep_blank_values=True)
 
@@ -863,7 +874,7 @@ class SlackAdapter:
                 is_me=False,
             ),
             adapter=self,
-            channel=None,  # chat.py's _handle_slash_command_event creates the ChannelImpl
+            channel=cast(Any, None),  # chat.py's _handle_slash_command_event creates the ChannelImpl
             raw={k: v[0] for k, v in params.items()} if params else {},
             trigger_id=trigger_id,
         )
@@ -1033,7 +1044,7 @@ class SlackAdapter:
                         private_metadata=modal.get("private_metadata"),
                     )
                 )
-                view = modal_to_slack_view(modal, metadata)
+                view = modal_to_slack_view(cast("ModalElement", modal), metadata)
                 return {"response_action": response.action, "view": view}
         return {}
 
@@ -1141,7 +1152,7 @@ class SlackAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=cast(Any, None),
                 raw=event,
                 adapter=self,
             )
@@ -2292,7 +2303,7 @@ class SlackAdapter:
                 private_metadata=modal.get("private_metadata"),
             )
         )
-        view = modal_to_slack_view(modal, metadata)
+        view = modal_to_slack_view(cast("ModalElement", modal), metadata)
 
         self._logger.debug(
             "Slack API: views.open",
@@ -2309,7 +2320,7 @@ class SlackAdapter:
 
     async def update_modal(self, view_id: str, modal: dict[str, Any]) -> dict[str, str]:
         """Update an existing modal using views.update."""
-        view = modal_to_slack_view(modal)
+        view = modal_to_slack_view(cast("ModalElement", modal))
 
         try:
             client = self._get_client()
@@ -2714,7 +2725,7 @@ class SlackAdapter:
     # Error handling
     # ==================================================================
 
-    def _handle_slack_error(self, error: Any) -> None:
+    def _handle_slack_error(self, error: Any) -> NoReturn:
         """Re-raise Slack errors with appropriate SDK error types.
 
         Never returns (always raises).

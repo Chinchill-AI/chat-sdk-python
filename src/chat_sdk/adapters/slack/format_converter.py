@@ -37,12 +37,13 @@ class SlackFormatConverter(BaseFormatConverter):
         """Render an AST to Slack mrkdwn format."""
         return self._from_ast_with_node_converter(ast, self._node_to_mrkdwn)
 
-    def to_ast(self, mrkdwn: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse Slack mrkdwn into an AST.
 
         Converts Slack-specific syntax to standard markdown, then parses
         with the shared parser.
         """
+        mrkdwn = platform_text
         markdown = mrkdwn
 
         # User mentions: <@U123|name> -> @name or <@U123> -> @U123
@@ -94,8 +95,9 @@ class SlackFormatConverter(BaseFormatConverter):
             return self.from_ast(message.ast)
         return ""
 
-    def extract_plain_text(self, mrkdwn: str) -> str:
+    def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Slack mrkdwn by stripping formatting."""
+        mrkdwn = platform_text
         text = mrkdwn
 
         # Remove user mentions formatting: <@U123|name> -> @name, <@U123> -> @U123

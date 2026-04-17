@@ -17,7 +17,7 @@ import re
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
 from chat_sdk.adapters.github.format_converter import GitHubFormatConverter
@@ -49,6 +49,7 @@ from chat_sdk.types import (
     ListThreadsResult,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     StreamChunk,
     StreamOptions,
@@ -115,21 +116,29 @@ class GitHubAdapter:
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
 
-        has_explicit_auth = bool(config.get("token") or config.get("app_id") or config.get("private_key"))
+        # Use cast to a permissive dict for variant-specific keys; pyrefly can't
+        # narrow the union of TypedDicts through .get() calls used as discriminators.
+        config_any = cast(dict[str, Any], config)
+        token_val = config_any.get("token")
+        app_id_val = config_any.get("app_id")
+        private_key_val = config_any.get("private_key")
+        installation_id_val = config_any.get("installation_id")
 
-        if config.get("token"):
-            self._auth_token = config["token"]
-        elif config.get("app_id") and config.get("private_key"):
-            if config.get("installation_id"):
+        has_explicit_auth = bool(token_val or app_id_val or private_key_val)
+
+        if token_val:
+            self._auth_token = token_val
+        elif app_id_val and private_key_val:
+            if installation_id_val:
                 self._app_credentials = {
-                    "app_id": config["app_id"],
-                    "private_key": config["private_key"],
+                    "app_id": app_id_val,
+                    "private_key": private_key_val,
                 }
-                self._installation_id = config["installation_id"]
+                self._installation_id = installation_id_val
             else:
                 self._app_credentials = {
-                    "app_id": config["app_id"],
-                    "private_key": config["private_key"],
+                    "app_id": app_id_val,
+                    "private_key": private_key_val,
                 }
                 self._logger.info(
                     "GitHub adapter initialized in multi-tenant mode (installation ID will be extracted from webhooks)"
@@ -177,7 +186,7 @@ class GitHubAdapter:
         return str(self._bot_user_id) if self._bot_user_id else None
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> Literal["channel", "thread"] | None:
         return None
 
     @property
@@ -314,7 +323,9 @@ class GitHubAdapter:
             )
         )
 
-        message = self._parse_issue_comment(comment, repository, issue["number"], thread_id, thread_type)
+        message = self._parse_issue_comment(
+            comment, cast(dict[str, Any], repository), issue["number"], thread_id, thread_type
+        )
 
         if sender.get("id") == self._bot_user_id:
             self._logger.debug("Ignoring message from self", {"messageId": comment["id"]})
@@ -349,7 +360,9 @@ class GitHubAdapter:
             )
         )
 
-        message = self._parse_review_comment(comment, repository, pull_request["number"], thread_id)
+        message = self._parse_review_comment(
+            comment, cast(dict[str, Any], repository), pull_request["number"], thread_id
+        )
 
         if sender.get("id") == self._bot_user_id:
             self._logger.debug("Ignoring message from self", {"messageId": comment["id"]})
@@ -523,7 +536,7 @@ class GitHubAdapter:
                 text += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 text += chunk.text
-        return await self.post_message(thread_id, {"markdown": text})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=text))
 
     @staticmethod
     def _build_raw_message(decoded: Any, comment: dict[str, Any]) -> dict[str, Any]:
@@ -884,30 +897,41 @@ class GitHubAdapter:
 
     def parse_message(self, raw: GitHubRawMessage) -> Message:
         """Parse a raw message into normalized format."""
-        if raw.get("type") == "issue_comment":
-            thread_type = raw.get("thread_type", "pr") or "pr"
+        raw_any = cast(dict[str, Any], raw)
+        if raw_any.get("type") == "issue_comment":
+            thread_type_raw = raw_any.get("thread_type", "pr") or "pr"
+            thread_type: Literal["pr", "issue"] = "issue" if thread_type_raw == "issue" else "pr"
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
-                    owner=raw["repository"]["owner"]["login"],
-                    repo=raw["repository"]["name"],
-                    pr_number=raw["pr_number"],
+                    owner=raw_any["repository"]["owner"]["login"],
+                    repo=raw_any["repository"]["name"],
+                    pr_number=raw_any["pr_number"],
                     type=thread_type,
                 )
             )
             return self._parse_issue_comment(
-                raw["comment"], raw["repository"], raw["pr_number"], thread_id, thread_type
+                raw_any["comment"],
+                cast(dict[str, Any], raw_any["repository"]),
+                raw_any["pr_number"],
+                thread_id,
+                thread_type,
             )
         else:
-            root_comment_id = raw["comment"].get("in_reply_to_id") or raw["comment"]["id"]
+            root_comment_id = int(raw_any["comment"].get("in_reply_to_id") or raw_any["comment"]["id"])
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
-                    owner=raw["repository"]["owner"]["login"],
-                    repo=raw["repository"]["name"],
-                    pr_number=raw["pr_number"],
+                    owner=raw_any["repository"]["owner"]["login"],
+                    repo=raw_any["repository"]["name"],
+                    pr_number=raw_any["pr_number"],
                     review_comment_id=root_comment_id,
                 )
             )
-            return self._parse_review_comment(raw["comment"], raw["repository"], raw["pr_number"], thread_id)
+            return self._parse_review_comment(
+                raw_any["comment"],
+                cast(dict[str, Any], raw_any["repository"]),
+                raw_any["pr_number"],
+                thread_id,
+            )
 
     def render_formatted(self, content: FormattedContent) -> str:
         """Render formatted content to GitHub markdown."""
@@ -1065,7 +1089,12 @@ class GitHubAdapter:
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a request object."""
         if hasattr(request, "text") and callable(request.text):
-            return await request.text()
+            result: Any = request.text()
+            # aiohttp returns a coroutine; starlette/flask return str
+            if hasattr(result, "__await__"):
+                awaited: Any = await result
+                return str(awaited)
+            return str(result)
         if hasattr(request, "body"):
             body = request.body
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
