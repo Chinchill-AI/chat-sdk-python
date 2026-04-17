@@ -42,6 +42,7 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         """
         markdown = gchat_text
 
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         # Google Chat custom link syntax <url|text> -> [text](url). Must run
         # before bold/strikethrough so the `|` inside a link label isn't
         # matched by those patterns. Accepts any RFC 3986 scheme, not just
@@ -66,6 +67,7 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         result = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).strip("`").strip(), text)
         # Inline code
         result = re.sub(r"`([^`]+)`", r"\1", result)
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         # Google Chat custom link syntax: <url|text> -> text (any RFC 3986 scheme)
         result = re.sub(r"<[a-zA-Z][a-zA-Z0-9+.\-]*:[^|\s>]+\|([^>]+)>", r"\1", result)
         # Bold markers (*text*)
@@ -115,6 +117,7 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             url = node.get("url", "")
             if link_text == url:
                 return url
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Labels containing the `|` or `>` delimiters, or a newline, can't
             # be emitted safely in <url|text> form — Google Chat (and our own
             # round-trip regex) stops at the first `>` / `|`. Fall back to

@@ -779,6 +779,7 @@ class ThreadImpl:
         )
         if adapter is not None:
             thread._adapter = adapter
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Keep _adapter_name in sync with the explicit adapter so
             # to_json() doesn't serialize a stale name after rebind.
             thread._adapter_name = adapter.name

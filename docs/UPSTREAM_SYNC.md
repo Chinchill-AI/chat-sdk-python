@@ -72,6 +72,55 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 - **Preserve parity** and document the inconsistency in the non-parity section below
 - **Intentionally diverge** and document the divergence in the non-parity section
 
+## Divergence Policy
+
+Every divergence from upstream has a cost: merge conflicts on future syncs,
+cross-SDK state drift, and a gradual slide from "port" toward "fork". Follow
+the rules below before adding one.
+
+### When to diverge
+
+1. **Default: preserve parity.** Matching upstream behavior — even buggy —
+   reduces merge conflicts and keeps cross-SDK state predictable. If the
+   behavior is cosmetic or stylistic, preserve parity and move on.
+2. **Diverge only when upstream** causes one of:
+   - **Data loss or corruption** (e.g. dropping fields on round-trip).
+   - **Malformed wire output** the platform itself mis-renders.
+   - **Hard UX failure with no workaround** (e.g. stuck loading state
+     that users can't clear).
+3. **Before diverging**, open an issue upstream
+   ([vercel/chat](https://github.com/vercel/chat/issues)) linking the bug.
+   If upstream accepts and fixes it, delete the divergence on the next sync.
+4. **Budget**: a sync PR that accumulates **more than 2 divergences** is a
+   signal — escalate to a design discussion ("is this still a port?")
+   before landing quietly.
+
+### How to land a divergence
+
+1. **Commit prefix**: use `diverge(scope): ...`, not `fix:` — `fix:` implies
+   parity with upstream's intent.
+2. **Add a row to the [Known Non-Parity](#known-non-parity-with-typescript-sdk)
+   table** with: Python behavior, TS behavior, rationale, and upstream
+   issue link (if filed).
+3. **Drop a one-line breadcrumb at the divergence site**:
+   ```python
+   # Divergence from upstream — see docs/UPSTREAM_SYNC.md
+   ```
+   So a future porter doesn't delete the code thinking it's drift.
+4. **Add a regression test** that fails if someone "fixes" the divergence
+   back to upstream's behavior. The test's docstring should cite the reason.
+5. **CHANGELOG entry** under a "Python-specific (divergence from upstream)"
+   subsection.
+
+### Review signal
+
+- **Sync PR titles**: `sync: upstream v<ver>` (not a branch name). Reviewers
+  scanning the PR list need to see "this is a sync" at a glance.
+- **Divergence commits are separate** from the sync commit. Don't bundle a
+  divergence into `sync: upstream v...`; split it into its own
+  `diverge(scope): ...` commit with the non-parity table update in the same
+  commit.
+
 ## How to Diff Upstream Changes
 
 ```bash

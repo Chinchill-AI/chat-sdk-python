@@ -428,6 +428,7 @@ class ChannelImpl:
         )
         if adapter is not None:
             channel._adapter = adapter
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Keep _adapter_name in sync with the explicit adapter so
             # to_json() doesn't serialize a stale name.
             channel._adapter_name = adapter.name
