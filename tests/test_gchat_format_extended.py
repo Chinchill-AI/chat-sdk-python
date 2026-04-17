@@ -168,17 +168,53 @@ class TestFromAst:
         assert result == "<https://example.com|Click here>"
 
     def test_falls_back_to_parenthesized_form_when_label_contains_reserved_chars(self):
-        """Labels containing `>` / `|` / newline would produce malformed
-        `<url|text>` output (Google Chat + our own regex stop at the first
-        `>` or `|`), so fall back to plain `text (url)` so the label is
-        preserved intact and the URL is still auto-detected as a link."""
+        """Labels containing `>` / `|` / `]` / newline would produce malformed
+        `<url|text>` output: Google Chat and our own regex stop at the first
+        `>` or `|`, and `]` prematurely closes the Markdown link when to_ast()
+        converts the `<url|text>` form back to `[text](url)`. Fall back to
+        plain `text (url)` so the label is preserved intact and the URL is
+        still auto-detected as a link.
+
+        Note: `from_markdown` can't construct these labels because the Markdown
+        parser itself splits on `]`/newline. We exercise the `from_ast` emit
+        path directly with a hand-built AST instead.
+        """
         converter = _converter()
-        for label in ["a > b", "a | b", "a\nb"]:
-            result = converter.from_markdown(f"[{label}](https://example.com)")
-            assert result == f"{label} (https://example.com)"
-            # Sanity: the safe-labels path still uses <url|text>.
-        safe = converter.from_markdown("[ok](https://example.com)")
-        assert safe == "<https://example.com|ok>"
+        for label in ["a > b", "a | b", "a ] b", "a\nb"]:
+            ast = {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [
+                            {
+                                "type": "link",
+                                "url": "https://example.com",
+                                "children": [{"type": "text", "value": label}],
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = converter.from_ast(ast)
+            assert result == f"{label} (https://example.com)", f"label={label!r}"
+        # Sanity: labels without reserved chars still use the <url|text> form.
+        ok_ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "children": [{"type": "text", "value": "ok"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        assert converter.from_ast(ok_ast) == "<https://example.com|ok>"
 
     def test_blockquote(self):
         converter = _converter()

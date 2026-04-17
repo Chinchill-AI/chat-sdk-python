@@ -771,35 +771,38 @@ class ThreadImpl:
             or test scenarios.
 
         Idempotent: if ``data`` is already a :class:`ThreadImpl`, it is
-        returned unchanged. This makes it safe to call via
-        ``json.loads(..., object_hook=reviver)``.
+        reused (not reconstructed) but any ``adapter``/``chat`` arguments
+        are still applied. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)`` while still respecting
+        explicit rebinding.
         """
         if isinstance(data, ThreadImpl):
-            return data
-        # Explicit None-checks (not `or`) to avoid the truthiness trap:
-        # `""` is a valid-but-falsy value that shouldn't silently fall
-        # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
-        raw_current = data["currentMessage"] if "currentMessage" in data else data.get("current_message")
-        # ``object_hook`` revives nested dicts first, so ``currentMessage`` may
-        # already be a Message instance by the time this runs.
-        current_msg = Message.from_json(raw_current) if raw_current is not None else None
+            thread = data
+        else:
+            # Explicit None-checks (not `or`) to avoid the truthiness trap:
+            # `""` is a valid-but-falsy value that shouldn't silently fall
+            # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+            raw_current = data["currentMessage"] if "currentMessage" in data else data.get("current_message")
+            # ``object_hook`` revives nested dicts first, so ``currentMessage``
+            # may already be a Message instance by the time this runs.
+            current_msg = Message.from_json(raw_current) if raw_current is not None else None
 
-        raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
-        raw_channel_id = data["channelId"] if "channelId" in data else data.get("channel_id")
-        raw_channel_visibility = (
-            data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
-        )
-
-        thread = cls(
-            _ThreadImplConfig(
-                id=data["id"],
-                adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
-                channel_id=raw_channel_id if raw_channel_id is not None else "",
-                channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
-                current_message=current_msg,
-                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+            raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+            raw_channel_id = data["channelId"] if "channelId" in data else data.get("channel_id")
+            raw_channel_visibility = (
+                data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
             )
-        )
+
+            thread = cls(
+                _ThreadImplConfig(
+                    id=data["id"],
+                    adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                    channel_id=raw_channel_id if raw_channel_id is not None else "",
+                    channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
+                    current_message=current_msg,
+                    is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                )
+            )
         if adapter is not None:
             thread._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.

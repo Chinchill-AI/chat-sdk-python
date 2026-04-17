@@ -413,26 +413,29 @@ class ChannelImpl:
             Explicit Chat instance for adapter/state resolution.
 
         Idempotent: if ``data`` is already a :class:`ChannelImpl`, it is
-        returned unchanged. This makes it safe to call via
-        ``json.loads(..., object_hook=reviver)``.
+        reused (not reconstructed) but any ``adapter``/``chat`` arguments
+        are still applied. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)`` while still respecting
+        explicit rebinding.
         """
         if isinstance(data, ChannelImpl):
-            return data
-        # Explicit None-checks (not `or`) to avoid the truthiness trap:
-        # `""` is a valid-but-falsy value that shouldn't silently fall
-        # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
-        raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
-        raw_channel_visibility = (
-            data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
-        )
-        channel = cls(
-            _ChannelImplConfigLazy(
-                id=data["id"],
-                adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
-                channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
-                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+            channel = data
+        else:
+            # Explicit None-checks (not `or`) to avoid the truthiness trap:
+            # `""` is a valid-but-falsy value that shouldn't silently fall
+            # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+            raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+            raw_channel_visibility = (
+                data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
             )
-        )
+            channel = cls(
+                _ChannelImplConfigLazy(
+                    id=data["id"],
+                    adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                    channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
+                    is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                )
+            )
         if adapter is not None:
             channel._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.

@@ -476,9 +476,13 @@ class TestStreaming:
         text_stream = _create_text_stream(["  ", "\n", "  \n"])
         await thread.post(text_stream)
 
+        # Whitespace-only stream with placeholder disabled: the SDK normalizes
+        # to a single `" "` in the final post_message call, not the original
+        # whitespace buffer. Asserting the exact value catches regressions that
+        # would silently emit "   \n" or similar.
         markdown_posts = [content for _, content in adapter._post_calls if isinstance(content, PostableMarkdown)]
-        assert markdown_posts, "expected at least one PostableMarkdown post"
-        assert all(len(p.markdown) > 0 for p in markdown_posts)
+        assert len(markdown_posts) == 1
+        assert markdown_posts[0].markdown == " "
 
     # it("should preserve newlines in streamed text (native path)")
     @pytest.mark.asyncio

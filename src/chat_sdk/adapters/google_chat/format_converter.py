@@ -118,12 +118,14 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             if link_text == url:
                 return url
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
-            # Labels containing the `|` or `>` delimiters, or a newline, can't
-            # be emitted safely in <url|text> form — Google Chat (and our own
-            # round-trip regex) stops at the first `>` / `|`. Fall back to
-            # plain `text (url)` so the label text is preserved and Google
-            # Chat's auto-link detection still makes the URL clickable.
-            if "|" in link_text or ">" in link_text or "\n" in link_text:
+            # Labels containing `|`, `>`, `]`, or a newline can't be emitted
+            # safely in <url|text> form: Google Chat (and our own round-trip
+            # regex) stops at the first `>` / `|`, and `]` prematurely closes
+            # the label when to_ast() converts `<url|text>` to Markdown
+            # `[text](url)` form. Fall back to plain `text (url)` so the label
+            # text is preserved and Google Chat's auto-link detection still
+            # makes the URL clickable.
+            if any(c in link_text for c in ("|", ">", "]", "\n")):
                 return f"{link_text} ({url})"
             return f"<{url}|{link_text}>"
 

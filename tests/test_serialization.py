@@ -579,6 +579,31 @@ class TestThreadFromJsonFaithful:
         assert thread.is_dm is False
         assert thread.adapter.name == "slack"
 
+    def test_should_rebind_adapter_when_data_is_already_a_threadimpl(self, mock_state):
+        """Idempotent path: when ``data`` is already a ThreadImpl (e.g. revived
+        via ``object_hook``), passing an explicit ``adapter=`` must still rebind
+        it — an early-return shortcut would leave ``_adapter`` stale. Regression
+        for a CodeRabbit finding on commit 8dd34d1."""
+        from chat_sdk.testing import create_mock_adapter
+
+        first = create_mock_adapter("slack")
+        second = create_mock_adapter("teams")
+        original = ThreadImpl.from_json(
+            {
+                "_type": "chat:Thread",
+                "id": "slack:C123:1234.5678",
+                "channel_id": "C123",
+                "is_dm": False,
+                "adapter_name": "slack",
+            },
+            adapter=first,
+        )
+        rebound = ThreadImpl.from_json(original, adapter=second)
+
+        # Rebind applied even though data was already a ThreadImpl:
+        assert rebound.adapter.name == "teams"
+        assert rebound.to_json()["adapterName"] == "teams"
+
     def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self, mock_state):
         """from_json(data, adapter=X) must update _adapter_name to X.name so
         to_json() doesn't serialize a stale name that refers to a different
