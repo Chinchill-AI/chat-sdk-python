@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, TypeGuard
 
 # Button style options
 ButtonStyle = Literal["primary", "danger", "default"]
@@ -146,7 +146,7 @@ class CardElement(TypedDict, total=False):
     children: list[CardChild]
 
 
-def is_card_element(value: Any) -> bool:
+def is_card_element(value: Any) -> TypeGuard[CardElement]:
     """Check if a value is a CardElement."""
     return isinstance(value, dict) and value.get("type") == "card"
 

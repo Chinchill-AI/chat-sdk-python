@@ -190,7 +190,7 @@ class MockAdapter:
         )
 
     async def post_channel_message(self, channel_id: str, message: AdapterPostableMessage) -> RawMessage:
-        return RawMessage(id="msg-1", thread_id=None, raw={})
+        return RawMessage(id="msg-1", thread_id="", raw={})
 
 
 # ---------------------------------------------------------------------------

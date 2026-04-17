@@ -105,8 +105,11 @@ class RedisStateAdapter:
             self._client = client
             self._owns_client = False
         else:
-            # Lazy import: redis.asyncio is only required when actually used
-            import redis.asyncio as aioredis
+            # Lazy import: redis.asyncio is only required when actually used.
+            # pyrefly can't see the submodule even though `redis` is in
+            # replace-imports-with-any; the submodule needs to be looked up
+            # at runtime only.
+            import redis.asyncio as aioredis  # pyrefly: ignore[missing-import]
 
             resolved_url = url or os.environ.get("REDIS_URL")
             if not resolved_url:

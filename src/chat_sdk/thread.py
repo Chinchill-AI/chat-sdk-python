@@ -12,7 +12,7 @@ import contextvars
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
@@ -29,6 +29,7 @@ from chat_sdk.types import (
     EphemeralMessage,
     FetchOptions,
     FormattedContent,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
     PostableCard,
@@ -56,7 +57,8 @@ _default_chat: _ChatSingleton | None = None
 _active_chat: contextvars.ContextVar[_ChatSingleton | None] = contextvars.ContextVar("_active_chat", default=None)
 
 
-class _ChatSingleton:
+@runtime_checkable
+class _ChatSingleton(Protocol):
     """Minimal interface for the Chat singleton to avoid circular imports."""
 
     def get_adapter(self, name: str) -> Adapter | None: ...
@@ -314,7 +316,7 @@ class ThreadImpl:
 
     async def set_state(
         self,
-        new_state: dict[str, Any],
+        state: dict[str, Any],
         *,
         replace: bool = False,
     ) -> None:
@@ -324,10 +326,10 @@ class ThreadImpl:
         """
         key = f"{THREAD_STATE_KEY_PREFIX}{self._id}"
         if replace:
-            await self._state_adapter.set(key, new_state, THREAD_STATE_TTL_MS)
+            await self._state_adapter.set(key, state, THREAD_STATE_TTL_MS)
         else:
             existing = await self._state_adapter.get(key)
-            merged = {**(existing or {}), **new_state}
+            merged = {**(existing or {}), **state}
             await self._state_adapter.set(key, merged, THREAD_STATE_TTL_MS)
 
     # -- Channel -------------------------------------------------------------
@@ -546,14 +548,14 @@ class ThreadImpl:
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
-            async def _wrapped_stream() -> AsyncIterator[str | StreamChunk]:
+            async def _wrapped_stream() -> AsyncIterator[str | StreamChunk | dict[str, Any]]:
                 nonlocal accumulated
                 async for chunk in text_stream:
                     if isinstance(chunk, str):
                         accumulated += chunk
                     elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                         accumulated += chunk.get("text", "")
-                    elif hasattr(chunk, "type") and chunk.type == "markdown_text":
+                    elif isinstance(chunk, MarkdownTextChunk):
                         accumulated += chunk.text
                     yield chunk
 
@@ -574,7 +576,7 @@ class ThreadImpl:
                     yield chunk
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     yield chunk.get("text", "")
-                elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
+                elif isinstance(chunk, MarkdownTextChunk):
                     yield chunk.text
                 # Skip non-text chunks in fallback mode
 
@@ -927,7 +929,7 @@ def _to_message(sent: SentMessage) -> Message:
 # ---------------------------------------------------------------------------
 
 
-async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]:
+async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk | dict[str, Any]]:
     """Normalise a raw async iterable into str or StreamChunk items.
 
     Handles plain strings, AI SDK fullStream events, and StreamChunk objects.

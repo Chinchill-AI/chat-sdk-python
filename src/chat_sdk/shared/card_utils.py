@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, cast
 
-from chat_sdk.cards import CardChild, CardElement, card_child_to_fallback_text, table_element_to_ascii
+from chat_sdk.cards import (
+    CardChild,
+    CardElement,
+    FieldElement,
+    FieldsElement,
+    LinkElement,
+    SectionElement,
+    TableElement,
+    TextElement,
+    card_child_to_fallback_text,
+    table_element_to_ascii,
+)
 from chat_sdk.emoji import convert_emoji_placeholders
 
 PlatformName = Literal["slack", "gchat", "teams", "discord"]
@@ -65,17 +76,24 @@ def _child_to_fallback_text(child: CardChild, convert_text: Callable[[str], str]
     """Convert a card child element to fallback text."""
     child_type = child.get("type", "")
     if child_type == "text":
-        return convert_text(child.get("content", ""))
+        text_child = cast(TextElement, child)
+        return convert_text(text_child.get("content", ""))
     if child_type == "link":
-        return f"{convert_text(child.get('label', ''))} ({child.get('url', '')})"
+        link_child = cast(LinkElement, child)
+        return f"{convert_text(link_child.get('label', ''))} ({link_child.get('url', '')})"
     if child_type == "fields":
-        return "\n".join(f"{convert_text(f['label'])}: {convert_text(f['value'])}" for f in child.get("children", []))
+        fields_child = cast(FieldsElement, child)
+        fields: list[FieldElement] = fields_child.get("children", [])
+        return "\n".join(f"{convert_text(f['label'])}: {convert_text(f['value'])}" for f in fields)
     if child_type == "actions":
         return None
     if child_type == "section":
-        return "\n".join(filter(None, (_child_to_fallback_text(c, convert_text) for c in child.get("children", []))))
+        section_child = cast(SectionElement, child)
+        section_children: list[CardChild] = section_child.get("children", [])
+        return "\n".join(filter(None, (_child_to_fallback_text(c, convert_text) for c in section_children)))
     if child_type == "table":
-        return table_element_to_ascii(child.get("headers", []), child.get("rows", []))
+        table_child = cast(TableElement, child)
+        return table_element_to_ascii(table_child.get("headers", []), table_child.get("rows", []))
     if child_type == "divider":
         return "---"
     return card_child_to_fallback_text(child)
