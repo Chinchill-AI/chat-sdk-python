@@ -34,13 +34,13 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         """Render an AST to Google Chat format."""
         return self._from_ast_with_node_converter(ast, self._node_to_gchat)
 
-    def to_ast(self, gchat_text: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse Google Chat message into an AST.
 
         Converts Google Chat format to standard markdown, then parses
         with the shared parser.
         """
-        markdown = gchat_text
+        markdown = platform_text
 
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         # Google Chat custom link syntax <url|text> -> [text](url). Must run
@@ -58,13 +58,13 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         # Italic and code are the same format as markdown
         return parse_markdown(markdown)
 
-    def extract_plain_text(self, text: str) -> str:
+    def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Google Chat formatted text.
 
         Strips formatting markers while preserving the text content.
         """
         # Remove code blocks
-        result = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).strip("`").strip(), text)
+        result = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).strip("`").strip(), platform_text)
         # Inline code
         result = re.sub(r"`([^`]+)`", r"\1", result)
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.

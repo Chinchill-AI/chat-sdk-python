@@ -79,13 +79,13 @@ class WhatsAppFormatConverter(BaseFormatConverter):
 
         return self._to_whatsapp_format(markdown)
 
-    def to_ast(self, markdown: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse WhatsApp markdown into an AST.
 
         Transforms WhatsApp-specific formatting to standard markdown first,
         then parses with the shared parser.
         """
-        standard_markdown = self._from_whatsapp_format(markdown)
+        standard_markdown = self._from_whatsapp_format(platform_text)
         return parse_markdown(standard_markdown)
 
     def _to_whatsapp_format(self, text: str) -> str:

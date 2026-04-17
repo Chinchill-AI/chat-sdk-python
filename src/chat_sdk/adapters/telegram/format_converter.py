@@ -50,6 +50,6 @@ class TelegramFormatConverter(BaseFormatConverter):
         transformed = walk_ast(copy.deepcopy(ast), visitor)
         return stringify_markdown(transformed).strip()
 
-    def to_ast(self, text: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse plain text / markdown into an AST using the shared parser."""
-        return parse_markdown(text)
+        return parse_markdown(platform_text)
