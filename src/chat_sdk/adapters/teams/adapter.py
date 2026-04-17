@@ -14,7 +14,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn, cast
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -45,11 +45,13 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
     ReactionEvent,
     StreamOptions,
+    Thread,
     ThreadInfo,
     WebhookOptions,
     _parse_iso,
@@ -195,7 +197,7 @@ class TeamsAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -503,7 +505,9 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    # Chat fills in the thread before dispatching to handlers;
+                    # see ReactionEvent docs. cast sidesteps the non-Optional field type.
+                    thread=cast(Thread, None),
                     adapter=self,
                     raw=activity,
                 ),
@@ -520,7 +524,9 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    # Chat fills in the thread before dispatching to handlers;
+                    # see ReactionEvent docs. cast sidesteps the non-Optional field type.
+                    thread=cast(Thread, None),
                     adapter=self,
                     raw=activity,
                 ),
@@ -570,7 +576,7 @@ class TeamsAdapter:
     def _create_attachment(self, att: dict[str, Any]) -> Attachment:
         """Create an Attachment from a Teams attachment dict."""
         content_type = att.get("contentType", "")
-        att_type: str = "file"
+        att_type: Literal["audio", "file", "image", "video"] = "file"
         if content_type.startswith("image/"):
             att_type = "image"
         elif content_type.startswith("video/"):
@@ -767,24 +773,27 @@ class TeamsAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Add a reaction (not supported by Teams Bot Framework API)."""
+        del thread_id, message_id, emoji
         self._logger.warn("addReaction is not supported by the Teams Bot Framework API")
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction (not supported by Teams Bot Framework API)."""
+        del thread_id, message_id, emoji
         self._logger.warn("removeReaction is not supported by the Teams Bot Framework API")
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Send typing indicator to a Teams conversation."""
+        del status
         decoded = self.decode_thread_id(thread_id)
 
         self._logger.debug(
@@ -1777,9 +1786,10 @@ class TeamsAdapter:
                 return raw.decode("utf-8") if isinstance(raw, bytes) else raw
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
         if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
+            text_attr: Any = request.text
+            if callable(text_attr):
+                return await cast(Any, text_attr())
+            return text_attr
         if hasattr(request, "data"):
             data = request.data
             return data.decode("utf-8") if isinstance(data, bytes) else str(data)

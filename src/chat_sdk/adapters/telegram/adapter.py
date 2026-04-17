@@ -18,7 +18,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.telegram.cards import (
     card_to_telegram_inline_keyboard,
@@ -68,10 +68,12 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
     ReactionEvent,
+    Thread,
     ThreadInfo,
     WebhookOptions,
 )
@@ -257,7 +259,7 @@ class TelegramAdapter:
             )
 
         self._name: str = "telegram"
-        self._lock_scope: str = "channel"
+        self._lock_scope: LockScope = "channel"
         self._persist_message_history: bool = True
 
         self._bot_token: str = bot_token
@@ -300,7 +302,7 @@ class TelegramAdapter:
         return self._name
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property
@@ -696,13 +698,13 @@ class TelegramAdapter:
         )
 
         decoded = decode_telegram_callback_data(callback_query.get("data"))
-        action_id = decoded["action_id"]
+        action_id = decoded["action_id"] if decoded["action_id"] is not None else ""
         value = decoded["value"]
 
         # The TS source uses callback_query.from – in our types this is from_user
         from_user = callback_query.get("from_user") or callback_query.get("from")  # type: ignore[call-overload]
         user = (
-            self.to_author(from_user)
+            self.to_author(cast(TelegramUser, from_user))
             if from_user
             else Author(
                 full_name="unknown",
@@ -781,7 +783,9 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        # Chat fills in the thread before dispatching to handlers;
+                        # see ReactionEvent docs. cast sidesteps the non-Optional field type.
+                        thread=cast(Thread, None),
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -799,7 +803,9 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        # Chat fills in the thread before dispatching to handlers;
+                        # see ReactionEvent docs. cast sidesteps the non-Optional field type.
+                        thread=cast(Thread, None),
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -1018,9 +1024,10 @@ class TelegramAdapter:
         self,
         thread_id: str,
         message_id: str,
-        _emoji: EmojiValue | str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a Telegram message."""
+        del emoji
         parsed_thread = self._resolve_thread_id(thread_id)
         decoded = self.decode_composite_message_id(message_id, parsed_thread.chat_id)
 
@@ -1236,7 +1243,7 @@ class TelegramAdapter:
         sender_chat = raw.get("sender_chat")
 
         if from_user:
-            author = self.to_author(from_user)
+            author = self.to_author(cast(TelegramUser, from_user))
         elif sender_chat:
             author = self.to_reaction_actor_author(sender_chat)
         else:
@@ -1725,14 +1732,18 @@ class TelegramAdapter:
     def reaction_key(self, reaction: TelegramReactionType) -> str:
         """Compute a unique key for a Telegram reaction."""
         if reaction.get("type") == "emoji":
-            return reaction.get("emoji", "")
-        return f"custom:{reaction.get('custom_emoji_id', '')}"
+            emoji_value = reaction.get("emoji", "")
+            return emoji_value if isinstance(emoji_value, str) else ""
+        custom_id = reaction.get("custom_emoji_id", "")
+        return f"custom:{custom_id if isinstance(custom_id, str) else ''}"
 
     def reaction_to_emoji_value(self, reaction: TelegramReactionType) -> EmojiValue:
         """Convert a Telegram reaction to an :class:`EmojiValue`."""
         if reaction.get("type") == "emoji":
-            return get_emoji(reaction.get("emoji", ""))
-        return get_emoji(f"custom:{reaction.get('custom_emoji_id', '')}")
+            emoji_value = reaction.get("emoji", "")
+            return get_emoji(emoji_value if isinstance(emoji_value, str) else "")
+        custom_id = reaction.get("custom_emoji_id", "")
+        return get_emoji(f"custom:{custom_id if isinstance(custom_id, str) else ''}")
 
     # -- Telegram API --------------------------------------------------------
 
@@ -1909,12 +1920,15 @@ class TelegramAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a framework-agnostic request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
+        text_attr: Any = getattr(request, "text", None)
+        if callable(text_attr):
+            result = cast(Any, text_attr())
+            return await result
+        body_attr: Any = getattr(request, "body", None)
+        if body_attr is not None:
+            body: Any = body_attr
             if callable(body):
-                body = await body()
+                body = await cast(Any, body())
             if isinstance(body, bytes):
                 return body.decode("utf-8")
             return str(body)

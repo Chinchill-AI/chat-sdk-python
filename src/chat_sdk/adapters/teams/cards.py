@@ -129,8 +129,10 @@ def _convert_child_to_adaptive(child: CardChild) -> dict[str, Any]:
     if child_type == "fields":
         return {"elements": [_convert_fields_to_element(child)], "actions": []}  # type: ignore[arg-type]
     if child_type == "link":
-        label = child.get("label", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        label_raw = child.get("label", "")  # type: ignore[union-attr]
+        url_raw = child.get("url", "")  # type: ignore[union-attr]
+        label = label_raw if isinstance(label_raw, str) else ""
+        url = url_raw if isinstance(url_raw, str) else ""
         return {
             "elements": [
                 {
