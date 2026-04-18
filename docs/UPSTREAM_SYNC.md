@@ -72,6 +72,59 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 - **Preserve parity** and document the inconsistency in the non-parity section below
 - **Intentionally diverge** and document the divergence in the non-parity section
 
+## Divergence Policy
+
+Every divergence from upstream has a cost: merge conflicts on future syncs,
+cross-SDK state drift, and a gradual slide from "port" toward "fork". Follow
+the rules below before adding one.
+
+### When to diverge
+
+1. **Default: preserve parity.** Matching upstream behavior — even buggy —
+   reduces merge conflicts and keeps cross-SDK state predictable. If the
+   behavior is cosmetic or stylistic, preserve parity and move on.
+2. **Diverge only when upstream** causes one of:
+   - **Data loss or corruption** (e.g. dropping fields on round-trip).
+   - **Malformed wire output** the platform itself mis-renders.
+   - **Hard UX failure with no workaround** (e.g. stuck loading state
+     that users can't clear).
+3. **Before diverging**, open an issue upstream
+   ([vercel/chat](https://github.com/vercel/chat/issues)) linking the bug.
+   If upstream accepts and fixes it, delete the divergence on the next sync.
+4. **Budget**: a sync PR that accumulates **more than 2 divergences** is a
+   signal — escalate to a design discussion ("is this still a port?")
+   before landing quietly.
+
+### How to land a divergence
+
+1. **Commit prefix**: use `diverge(scope): ...`, not `fix:` — `fix:` implies
+   parity with upstream's intent.
+2. **Add a row to the [Known Non-Parity](#known-non-parity-with-typescript-sdk)
+   table** with: Python behavior, TS behavior, rationale, and upstream
+   issue link (if filed).
+3. **Drop a one-line breadcrumb at the divergence site**:
+   ```python
+   # Divergence from upstream — see docs/UPSTREAM_SYNC.md
+   ```
+   So a future porter doesn't delete the code thinking it's drift.
+4. **Add a regression test** that fails if someone "fixes" the divergence
+   back to upstream's behavior. The test's docstring should cite the reason.
+5. **CHANGELOG entry** under a "Python-specific (divergence from upstream)"
+   subsection.
+6. **Run the self-review adversarial checks** from
+   [docs/SELF_REVIEW.md](SELF_REVIEW.md). Divergence code is exactly the
+   kind of novel, Python-specific logic that bot reviewers consistently
+   find bugs in — catch them yourself first.
+
+### Review signal
+
+- **Sync PR titles**: `sync: upstream v<ver>` (not a branch name). Reviewers
+  scanning the PR list need to see "this is a sync" at a glance.
+- **Divergence commits are separate** from the sync commit. Don't bundle a
+  divergence into `sync: upstream v...`; split it into its own
+  `diverge(scope): ...` commit with the non-parity table update in the same
+  commit.
+
 ## How to Diff Upstream Changes
 
 ```bash
@@ -394,6 +447,14 @@ stay explicit instead of being rediscovered in code review.
 | Chat resolver | 3-level: explicit → ContextVar → global | Process-global singleton | See [DECISIONS.md](DECISIONS.md#why-3-level-chat-resolver) |
 | PostableObject history | Cached in message history with real message ID | Not cached (skips history) | Upstream gap — posted messages should appear in thread/channel history |
 | Teams `msteams` transport key | Stripped from action values | Not stripped | Upstream gap — SDK-injected metadata should not leak to handlers |
+| Fallback streaming with whitespace-only streams | Placeholder cleared to `" "` on final edit | Placeholder left visible (`"..."` stuck) | Upstream 4.26 guards against empty edits but leaves the placeholder stranded on the message. We issue one final `edit_message(" ")` so the placeholder disappears when no real content was produced. |
+| Google Chat `<url\|text>` round-trip | `to_ast()` / `extract_plain_text()` parse the custom-label syntax back to a link node / bare label | `toAst()` / `extractPlainText()` leave `<url\|text>` as raw text (or parse the whole string as an autolink with a malformed URL) | Upstream 4.26 emits `<url\|text>` in `from_ast` but never taught the reverse direction to parse it. A message posted with `[label](url)` then read back through `fetch_messages` comes back as unstructured text (or worse, a link node with the full `url\|text` as its URL) in upstream. We close the round-trip via an AST placeholder substitution: each `<url\|text>` is extracted to a private-use sentinel, Markdown is parsed on the rest, and link nodes are injected where the sentinels landed. This avoids the Markdown parser's incomplete handling of balanced-parens link destinations, so URLs like `https://en.wikipedia.org/wiki/Foo_(bar)` round-trip intact. |
+| `from_json(data, adapter=X)` → `_adapter_name` | Updated to `X.name` so `to_json()` reflects the bound adapter | Kept at `json.adapterName`, so re-serialization can emit a name that no longer matches the actual adapter | Upstream TS has the same gap but only exposes it via the `fromJSON(json, adapter?)` overload. In Python we lean on this API more (explicit `chat=` / explicit `adapter=` is preferred over the singleton). We sync the name on rebind so runtime and serialize agree. |
+| Google Chat link labels with `\|` / `>` / `]` / newline, empty labels, URLs without a scheme, or URLs containing `\|` / `>` | Fall back to `text (url)` (or bare URL for empty labels) when the `<url\|text>` form can't round-trip safely | Always `<url\|text>`, producing malformed or un-parseable output | Google Chat's `<url\|text>` has no escape for `\|` or `>`; `]` breaks our own `to_ast()` regex (which converts `<url\|text>` to Markdown `[text](url)`, and Markdown closes the label at the first `]`); newline breaks the single-line form; schemeless URLs and URLs containing `\|`/`>` don't match our reverse parser. Upstream emits the malformed form regardless; we fall back to the pre-4.26 `text (url)` form (or the bare URL for empty labels) so the label/URL stays intact and Google Chat's auto-link detection still fires for http(s). |
+| Google Chat heading rendering | `#`-headings emit as `*text*` (bold) so they're visually distinct | Falls through to default node-to-text (plain concatenation) | Google Chat has no heading syntax; emitting plain text loses the visual hierarchy. Bold is the closest approximation the platform supports. |
+| Google Chat image rendering | Images emit as `{alt} ({url})` or bare `url` | No image branch — falls through to default which concatenates children only, dropping the URL | Upstream silently drops image URLs when rendering to Google Chat text. We preserve the URL so the message content isn't lost. |
+| Fallback streaming stream-exception capture | `_fallback_stream` captures exceptions from the stream iterator, flushes whatever content was already rendered, awaits `pending_edit`, and re-raises after cleanup | `try/finally` only — exception propagates immediately, `pendingEdit` is un-awaited, and the placeholder is stranded as `"..."` | Upstream leaves a hard UX failure when streams crash mid-flight (common: LLM connection drops): placeholder visible forever, orphan background task. We flush + clean up before re-raising so the caller still sees the original error and users see the partial content instead of a spinner. |
+| Fallback streaming final SentMessage content | SentMessage + final edit carry `final_content` (remend'd — inline markers auto-closed) | SentMessage + final edit carry raw `accumulated` | Narrow UX refinement. If a stream ends with an unclosed `*`/`~~`/etc., upstream ships the unclosed marker; we run `_remend` so the user sees a clean final message. Not observable in the common case where streams close their own markers. |
 
 ### Platform-specific gaps
 

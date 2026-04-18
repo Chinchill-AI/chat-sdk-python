@@ -216,6 +216,33 @@ class TestToBlocksWithTable:
         assert blocks[1]["type"] == "section"
         assert "```" in blocks[1]["text"]["text"]
 
+    def test_should_replace_empty_table_cells_with_a_space_to_satisfy_slack_api(self):
+        ast = self.converter.to_ast("| Kind | Label |\n|------|-------|\n| FORM | Form Submission |\n| and more... | |")
+        blocks = self.converter.to_blocks_with_table(ast)
+        assert blocks is not None
+        table_block = blocks[0]
+        assert table_block["type"] == "table"
+        for row in table_block["rows"]:
+            for cell in row:
+                assert len(cell["text"]) > 0
+        assert table_block["rows"][2][1]["text"] == " "
+
+    def test_should_handle_empty_header_cells_with_parse_markdown_production_path(self):
+        from chat_sdk.shared.markdown_parser import parse_markdown
+
+        markdown = "Here is a table:\n\n|  | Header2 |\n|---------|----------|\n| Data1 | Data2 |"
+        ast = parse_markdown(markdown)
+        blocks = self.converter.to_blocks_with_table(ast)
+        assert blocks is not None
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "section"
+        assert blocks[1]["type"] == "table"
+        table_block = blocks[1]
+        assert table_block["rows"][0][0]["text"] == " "
+        for row in table_block["rows"]:
+            for cell in row:
+                assert len(cell["text"]) > 0
+
 
 # ---------------------------------------------------------------------------
 # Nested lists

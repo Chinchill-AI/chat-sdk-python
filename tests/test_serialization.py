@@ -11,11 +11,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from chat_sdk import reviver
+from chat_sdk.channel import ChannelImpl
+from chat_sdk.chat import Chat
 from chat_sdk.testing import (
     create_mock_adapter,
     create_test_message,
 )
-from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
+from chat_sdk.thread import ThreadImpl, _ThreadImplConfig, clear_chat_singleton
 from chat_sdk.types import (
     Attachment,
     Author,
@@ -576,6 +579,268 @@ class TestThreadFromJsonFaithful:
         assert thread.is_dm is False
         assert thread.adapter.name == "slack"
 
+    def test_should_rebind_adapter_when_data_is_already_a_threadimpl(self, mock_state):
+        """Idempotent path: when ``data`` is already a ThreadImpl (e.g. revived
+        via ``object_hook``), passing an explicit ``adapter=`` must still rebind
+        it — an early-return shortcut would leave ``_adapter`` stale. Regression
+        for a CodeRabbit finding on commit 8dd34d1."""
+        from chat_sdk.testing import create_mock_adapter
+
+        first = create_mock_adapter("slack")
+        second = create_mock_adapter("teams")
+        original = ThreadImpl.from_json(
+            {
+                "_type": "chat:Thread",
+                "id": "slack:C123:1234.5678",
+                "channel_id": "C123",
+                "is_dm": False,
+                "adapter_name": "slack",
+            },
+            adapter=first,
+        )
+        rebound = ThreadImpl.from_json(original, adapter=second)
+
+        # Rebind applied even though data was already a ThreadImpl:
+        assert rebound.adapter.name == "teams"
+        assert rebound.to_json()["adapterName"] == "teams"
+
+    def test_should_invalidate_state_and_channel_caches_on_idempotent_rebind(self, mock_state):
+        """When `from_json(existing_instance, adapter=X)` rebinds an already-
+        revived ThreadImpl, caches derived from the previous binding must be
+        invalidated — otherwise `_state_adapter_instance` would continue
+        routing to the OLD chat's state backend and `_channel_cache` would
+        still reference the OLD adapter. Regression for a Codex P1."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        # Prime the thread with the first adapter + state, and force both
+        # caches (state and channel) to populate.
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+            )
+        )
+        _ = original.channel  # populate _channel_cache
+        assert original._channel_cache is not None
+        assert original._state_adapter_instance is first_state
+
+        # Rebind to a different adapter. Both caches must drop so the next
+        # access resolves against the new binding.
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._channel_cache is None
+        assert rebound._state_adapter_instance is None
+        # And the adapter is actually rebound.
+        assert rebound.adapter.name == "teams"
+
+    def test_should_reset_is_subscribed_context_on_rebind(self, mock_state):
+        """A thread constructed inside a subscribed-context handler carries
+        `_is_subscribed_context=True`. If that thread is rebound to a new
+        adapter/chat, the new context has no active subscription — the flag
+        should clear so `is_subscribed()` doesn't short-circuit to True
+        against the new state backend. Regression for a self-review-
+        subagent finding."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+                is_subscribed_context=True,
+            )
+        )
+        assert original._is_subscribed_context is True
+
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._is_subscribed_context is False
+
+    def test_should_leave_thread_unchanged_when_chat_rebind_lookup_fails(self, mock_state):
+        """Transactional rebind: `from_json(existing_thread, chat=Y)` must
+        either fully apply the rebind or leave the thread untouched. If
+        `chat.get_adapter(name)` returns None, the RuntimeError must fire
+        BEFORE any cache invalidation — callers that catch the exception
+        should be able to keep using the thread with its original
+        bindings intact. Regression for a Codex P2."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state, create_test_message
+
+        slack_a = create_mock_adapter("slack")
+        state_a = create_mock_state()
+        # Chat B has a different adapter name, so looking up "slack" will fail.
+        chat_b = Chat(
+            ChatConfig(
+                user_name="bot-b",
+                adapters={"teams": create_mock_adapter("teams")},
+                state=create_mock_state(),
+            )
+        )
+
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=slack_a,
+                state_adapter=state_a,
+                channel_id="C123",
+                initial_message=create_test_message("m1", "hello"),
+                is_subscribed_context=True,
+            )
+        )
+        # Capture every state-bearing attribute before the rebind.
+        snapshot = {
+            "_adapter": original._adapter,
+            "_adapter_name": original._adapter_name,
+            "_state_adapter_instance": original._state_adapter_instance,
+            "_channel_cache": original._channel_cache,
+            "_message_history": original._message_history,
+            "_recent_messages": list(original._recent_messages),
+            "_is_subscribed_context": original._is_subscribed_context,
+        }
+
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            ThreadImpl.from_json(original, chat=chat_b)
+
+        # Every cached attribute must be exactly as it was before. A
+        # non-transactional implementation would have nulled some of these
+        # before the raise, making recovery unsafe.
+        for attr, before in snapshot.items():
+            after = getattr(original, attr)
+            assert after == before, f"{attr}: expected {before!r}, got {after!r}"
+        # Extra identity check for objects where equality might be loose.
+        assert original._adapter is snapshot["_adapter"]
+        assert original._state_adapter_instance is snapshot["_state_adapter_instance"]
+
+    def test_should_invalidate_recent_messages_and_message_history_on_rebind(self, mock_state):
+        """Two additional caches that carry previous-binding references must
+        also drop on idempotent rebind: `_recent_messages` (populated from
+        adapter fetches) and `_message_history` (tied to chat's cache).
+        Regression for a self-review-subagent finding."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state, create_test_message
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        # Prime caches: initial_message populates _recent_messages, and
+        # message_history is a sentinel cache object.
+        sentinel_history = object()
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+                initial_message=create_test_message("m1", "hello"),
+                message_history=sentinel_history,
+            )
+        )
+        assert len(original._recent_messages) == 1
+        assert original._message_history is sentinel_history
+
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._recent_messages == [], "recent_messages should drop on rebind"
+        assert rebound._message_history is None, "message_history should drop on rebind"
+
+    def test_should_set_state_from_chat_when_both_adapter_and_chat_passed(self, mock_state):
+        """adapter= and chat= are orthogonal. Passing both must apply both:
+        the explicit adapter is bound AND state comes from the explicit
+        chat. The previous `elif chat` branch silently ignored chat when
+        adapter was also passed, leading to split routing. Regression for
+        a self-review-subagent finding."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        teams_adapter = create_mock_adapter("teams")
+        chat_state = create_mock_state()
+        chat_instance = Chat(
+            ChatConfig(
+                user_name="bot",
+                adapters={"slack": create_mock_adapter("slack")},
+                state=chat_state,
+            )
+        )
+
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channel_id": "C123",
+            "is_dm": False,
+            "adapter_name": "slack",
+        }
+        thread = ThreadImpl.from_json(data, adapter=teams_adapter, chat=chat_instance)
+
+        # Explicit adapter wins for adapter binding.
+        assert thread.adapter is teams_adapter
+        # Explicit chat's state is applied (previously the elif branch
+        # skipped this, leaving state as None and silently routing to the
+        # singleton on next access).
+        assert thread._state_adapter_instance is chat_state
+
+    def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_thread(self, mock_state):
+        """When `from_json(existing_instance, chat=Y)` rebinds a thread that
+        was originally constructed directly by a Chat (so `_adapter_name`
+        is None), the new chat's matching adapter must replace the old one.
+        Otherwise state calls go to chat Y while `post`/`edit` still use
+        chat X's adapter — split-routing. Regression for a Codex P1."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        slack_a = create_mock_adapter("slack")
+        slack_b = create_mock_adapter("slack")
+        state_a = create_mock_state()
+        state_b = create_mock_state()
+        chat_b = Chat(ChatConfig(user_name="bot-b", adapters={"slack": slack_b}, state=state_b))
+
+        # Thread constructed via chat_a's path: _adapter is slack_a,
+        # _adapter_name is None (not set by direct construction).
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=slack_a,
+                state_adapter=state_a,
+                channel_id="C123",
+            )
+        )
+        assert original._adapter is slack_a
+        assert original._adapter_name is None
+
+        # Rebind to chat_b. Both adapter and state must switch to chat_b's.
+        rebound = ThreadImpl.from_json(original, chat=chat_b)
+        assert rebound.adapter is slack_b, "adapter not rebound to the new chat"
+        assert rebound._state_adapter_instance is state_b, "state not rebound to the new chat"
+
+    def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self, mock_state):
+        """from_json(data, adapter=X) must update _adapter_name to X.name so
+        to_json() doesn't serialize a stale name that refers to a different
+        adapter than what's actually bound. Regression for a P2 raised in
+        review."""
+        from chat_sdk.testing import create_mock_adapter
+
+        renamed_adapter = create_mock_adapter("teams")
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channel_id": "C123",
+            "is_dm": False,
+            "adapter_name": "slack",  # different from the bound adapter
+        }
+        thread = ThreadImpl.from_json(data, adapter=renamed_adapter)
+
+        # Runtime uses the bound adapter...
+        assert thread.adapter.name == "teams"
+        # ...and re-serialization reflects that, not the stale "slack" name.
+        assert thread.to_json()["adapterName"] == "teams"
+
     def test_should_reconstruct_dm_thread(self, mock_adapter, mock_state):
         data = {
             "_type": "chat:Thread",
@@ -858,6 +1123,263 @@ class TestChatReviver:
             }
             result = reviver("message", message_data)
             assert isinstance(result.metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+
+# ============================================================================
+# Standalone reviver (no Chat instance required at import time)
+# ============================================================================
+
+
+class TestStandaloneReviver:
+    """Tests for the module-level :func:`chat_sdk.reviver` function.
+
+    Mirrors the TS ``standalone reviver()`` describe block. Python's
+    ``json.loads`` uses ``object_hook`` rather than a key/value reviver, so
+    usage differs slightly: the function is passed as ``object_hook`` and
+    receives each decoded dict.
+    """
+
+    def test_should_revive_chatthread_objects(self, mock_adapter, mock_state):
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "thread": {
+                        "_type": "chat:Thread",
+                        "id": "slack:C123:1234.5678",
+                        "channelId": "C123",
+                        "isDM": False,
+                        "adapterName": "slack",
+                    }
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert isinstance(parsed["thread"], ThreadImpl)
+            assert parsed["thread"].id == "slack:C123:1234.5678"
+        finally:
+            clear_chat_singleton()
+
+    def test_should_revive_chatmessage_objects(self, mock_adapter, mock_state):
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "message": {
+                        "_type": "chat:Message",
+                        "id": "msg-1",
+                        "threadId": "slack:C123:1234.5678",
+                        "text": "Hello",
+                        "formatted": {"type": "root", "children": []},
+                        "raw": {},
+                        "author": {
+                            "userId": "U123",
+                            "userName": "testuser",
+                            "fullName": "Test User",
+                            "isBot": False,
+                            "isMe": False,
+                        },
+                        "metadata": {
+                            "dateSent": "2024-01-15T10:30:00.000Z",
+                            "edited": False,
+                        },
+                        "attachments": [],
+                    }
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert parsed["message"].id == "msg-1"
+            assert isinstance(parsed["message"].metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_revive_both_thread_and_message_in_same_payload(self, mock_adapter, mock_state):
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "thread": {
+                        "_type": "chat:Thread",
+                        "id": "slack:C123:1234.5678",
+                        "channelId": "C123",
+                        "isDM": False,
+                        "adapterName": "slack",
+                    },
+                    "message": {
+                        "_type": "chat:Message",
+                        "id": "msg-1",
+                        "threadId": "slack:C123:1234.5678",
+                        "text": "Hello",
+                        "formatted": {"type": "root", "children": []},
+                        "raw": {},
+                        "author": {
+                            "userId": "U123",
+                            "userName": "testuser",
+                            "fullName": "Test User",
+                            "isBot": False,
+                            "isMe": False,
+                        },
+                        "metadata": {
+                            "dateSent": "2024-01-15T10:30:00.000Z",
+                            "edited": False,
+                        },
+                        "attachments": [],
+                    },
+                }
+            )
+            parsed = json.loads(payload, object_hook=reviver)
+            assert isinstance(parsed["thread"], ThreadImpl)
+            assert isinstance(parsed["message"].metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_leave_nonchat_objects_unchanged(self, mock_adapter, mock_state):
+        payload = json.dumps(
+            {
+                "name": "test",
+                "count": 42,
+                "nested": {"_type": "other:Type", "value": "unchanged"},
+            }
+        )
+        parsed = json.loads(payload, object_hook=reviver)
+        assert parsed["name"] == "test"
+        assert parsed["count"] == 42
+        assert parsed["nested"]["_type"] == "other:Type"
+
+    def test_should_be_usable_directly_as_json_parse_second_argument(self, mock_adapter, mock_state):
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            message_json = {
+                "_type": "chat:Message",
+                "id": "msg-direct",
+                "threadId": "slack:C123:1234.5678",
+                "text": "Direct usage",
+                "formatted": {"type": "root", "children": []},
+                "raw": {},
+                "author": {
+                    "userId": "U123",
+                    "userName": "testuser",
+                    "fullName": "Test User",
+                    "isBot": False,
+                    "isMe": False,
+                },
+                "metadata": {
+                    "dateSent": "2024-01-15T10:30:00.000Z",
+                    "edited": False,
+                },
+                "attachments": [],
+            }
+            parsed = json.loads(json.dumps(message_json), object_hook=reviver)
+            assert parsed.id == "msg-direct"
+            assert parsed.text == "Direct usage"
+            assert isinstance(parsed.metadata.date_sent, datetime)
+        finally:
+            clear_chat_singleton()
+
+    def test_should_allow_reserialization_of_a_revived_thread_without_singleton(self):
+        clear_chat_singleton()
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channelId": "C123",
+            "isDM": False,
+            "adapterName": "slack",
+        }
+        thread = ThreadImpl.from_json(data)
+        reserialized = thread.to_json()
+        assert reserialized["_type"] == "chat:Thread"
+        assert reserialized["adapterName"] == "slack"
+        assert reserialized["id"] == "slack:C123:1234.5678"
+
+    def test_should_allow_reserialization_of_a_revived_channel_without_singleton(self):
+        clear_chat_singleton()
+        data = {
+            "_type": "chat:Channel",
+            "id": "C123",
+            "isDM": False,
+            "adapterName": "slack",
+        }
+        # Route through the public `chat_sdk.reviver` entry point rather than
+        # `ChannelImpl.from_json` directly so a regression in the reviver's
+        # "chat:Channel" dispatch would fail here too.
+        channel = json.loads(json.dumps(data), object_hook=reviver)
+        assert isinstance(channel, ChannelImpl)
+        reserialized = channel.to_json()
+        assert reserialized["_type"] == "chat:Channel"
+        assert reserialized["adapterName"] == "slack"
+        assert reserialized["id"] == "C123"
+
+    def test_should_revive_thread_with_nested_current_message_via_object_hook(self, mock_adapter, mock_state):
+        """``object_hook`` revives children first, so ``currentMessage`` reaches
+        ``ThreadImpl.from_json`` as a :class:`Message` instance, not a dict.
+        ``from_json`` must accept that without raising ``AttributeError``."""
+        chat = Chat(
+            user_name="test-bot",
+            adapters={"slack": mock_adapter},
+            state=mock_state,
+            logger="silent",
+        )
+        chat.register_singleton()
+        try:
+            payload = json.dumps(
+                {
+                    "_type": "chat:Thread",
+                    "id": "slack:C123:1234.5678",
+                    "channelId": "C123",
+                    "isDM": False,
+                    "adapterName": "slack",
+                    "currentMessage": {
+                        "_type": "chat:Message",
+                        "id": "msg-current",
+                        "threadId": "slack:C123:1234.5678",
+                        "text": "hi",
+                        "formatted": {"type": "root", "children": []},
+                        "raw": {},
+                        "author": {
+                            "userId": "U123",
+                            "userName": "testuser",
+                            "fullName": "Test User",
+                            "isBot": False,
+                            "isMe": False,
+                        },
+                        "metadata": {
+                            "dateSent": "2024-01-15T10:30:00.000Z",
+                            "edited": False,
+                        },
+                        "attachments": [],
+                    },
+                }
+            )
+            thread = json.loads(payload, object_hook=reviver)
+            assert isinstance(thread, ThreadImpl)
+            assert thread._current_message is not None
+            assert isinstance(thread._current_message, Message)
+            assert thread._current_message.id == "msg-current"
         finally:
             clear_chat_singleton()
 

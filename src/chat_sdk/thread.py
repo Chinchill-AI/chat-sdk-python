@@ -621,8 +621,15 @@ class ThreadImpl:
                     pass  # interval elapsed, do the edit
                 if stop_event.is_set() or msg is None:
                     break
-                content = renderer.get_committable_text()
-                if content != last_edit_content:
+                # Use `render()` (not `get_committable_text`) for fallback
+                # streaming: the fallback path uses full-message replacement
+                # edits, so we want the current rendered state (including
+                # `_remend` inline-marker repair). `get_committable_text` is
+                # for append-only native-streaming surfaces and holds back
+                # content that may still change — wrong method for this
+                # code path. Matches upstream packages/chat/src/thread.ts.
+                content = renderer.render()
+                if content.strip() and content != last_edit_content:
                     try:
                         await self.adapter.edit_message(
                             thread_id_for_edits,
@@ -637,47 +644,140 @@ class ThreadImpl:
         if msg is not None:
             pending_edit = asyncio.create_task(_edit_loop())
 
+        stream_error: Exception | None = None
         try:
             async for chunk in text_stream:
                 renderer.push(chunk)
                 if msg is None:
-                    content = renderer.get_committable_text()
-                    msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
-                    thread_id_for_edits = msg.thread_id or self._id
-                    last_edit_content = content
-                    pending_edit = asyncio.create_task(_edit_loop())
+                    # `render()` for the first-post content too — same
+                    # reasoning as the edit loop above.
+                    content = renderer.render()
+                    if content.strip():
+                        msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
+                        thread_id_for_edits = msg.thread_id or self._id
+                        last_edit_content = content
+                        pending_edit = asyncio.create_task(_edit_loop())
+        except Exception as exc:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+            # Capture so we can run the cleanup + flush below even when the
+            # stream raises mid-iteration (e.g. LLM connection drops). The
+            # alternative — letting the exception propagate immediately —
+            # would leak pending_edit as an orphan task AND strand the
+            # placeholder as a forever-"..." message, which is exactly the
+            # pathology the placeholder-clear divergence was added to fix.
+            #
+            # Control-flow exceptions (CancelledError, KeyboardInterrupt,
+            # SystemExit, GeneratorExit) are intentionally NOT caught —
+            # those signal shutdown and must propagate immediately.
+            # `finally: stop_event.set()` still fires on every exit path,
+            # so the background _edit_loop exits cleanly on cancellation
+            # too.
+            stream_error = exc
         finally:
             stop_event.set()
 
         if pending_edit is not None:
-            await pending_edit
+            try:
+                await pending_edit
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn("fallbackStream edit-loop task raised", exc)
+
+        # If the stream raised before we ever posted anything, there's no
+        # SentMessage to return and no placeholder to clean up — propagate
+        # the original error so the caller sees it.
+        if stream_error is not None and msg is None:
+            raise stream_error
 
         accumulated = renderer.get_text()
         final_content = renderer.finish()
 
         # Final message
         if msg is None:
-            msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=accumulated))
+            # Stream contract requires a SentMessage, so post at least a space
+            # if the stream produced only whitespace.
+            markdown = accumulated if accumulated.strip() else " "
+            msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=markdown))
             thread_id_for_edits = msg.thread_id or self._id
-            last_edit_content = accumulated
+            # Track what was actually posted to the platform — not `accumulated`,
+            # which may differ (e.g. `" "` substituted for whitespace-only).
+            last_edit_content = markdown
 
         # Always ensure the final content is sent, regardless of what _edit_loop did.
         # Re-check last_edit_content after awaiting pending_edit since _edit_loop
         # may have updated it concurrently.
-        if final_content != last_edit_content:
-            await self.adapter.edit_message(
-                thread_id_for_edits,
-                msg.id,
-                PostableMarkdown(markdown=final_content),
-            )
+        #
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+        # Upstream ships `accumulated` (raw) for the final edit and the
+        # SentMessage; we ship `final_content` (remend'd, inline markers
+        # auto-closed). Narrow UX refinement — unobservable when streams
+        # close their own markers.
+        if final_content.strip() and final_content != last_edit_content:
+            # Symmetric with the placeholder-clear branch below: if the
+            # adapter rejects the final edit (rate-limit, transient 5xx,
+            # content-policy violation), log and leave the message as
+            # whatever was last successfully edited. The caller still
+            # receives a SentMessage that matches `last_edit_content`
+            # and can call `.edit()`/`.delete()` on it — without this
+            # try/except, propagating the exception orphans the posted
+            # placeholder message on the platform.
+            try:
+                await self.adapter.edit_message(
+                    thread_id_for_edits,
+                    msg.id,
+                    PostableMarkdown(markdown=final_content),
+                )
+                last_edit_content = final_content
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn(
+                        "fallbackStream final edit failed; message reflects previous content",
+                        exc,
+                    )
+        elif placeholder_text is not None and not final_content.strip() and last_edit_content == placeholder_text:
+            # Divergence from upstream 4.26: upstream leaves the placeholder
+            # visible when the stream produces only whitespace, which strands
+            # "..." on the message forever. We replace it with " " so the
+            # placeholder is cleared consistently with the no-placeholder branch
+            # (which also posts " " in this case). See docs/UPSTREAM_SYNC.md.
+            #
+            # Some adapters (e.g. Telegram) reject whitespace-only content with
+            # a ValidationError. If the edit fails, we log and fall back to
+            # upstream's "leave placeholder visible" behavior for that adapter.
+            try:
+                await self.adapter.edit_message(
+                    thread_id_for_edits,
+                    msg.id,
+                    PostableMarkdown(markdown=" "),
+                )
+                last_edit_content = " "
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn(
+                        "fallbackStream placeholder-clear edit failed; placeholder will remain visible",
+                        exc,
+                    )
 
+        # SentMessage reflects what's actually on the platform, not the
+        # renderer's last snapshot: in the placeholder-clear branch we
+        # edited to " " (or left "..." on a strict adapter); in the
+        # whitespace-only + no-placeholder branch we posted " " rather
+        # than the raw empty accumulated. Using `last_edit_content`
+        # ensures `sent.text` matches what a user would see.
         sent = self._create_sent_message(
             msg.id,
-            PostableMarkdown(markdown=final_content),
+            PostableMarkdown(markdown=last_edit_content),
             thread_id_for_edits,
         )
         if self._message_history is not None:
             await self._message_history.append(self._id, _to_message(sent))
+
+        # If the stream raised mid-way, we've now flushed whatever partial
+        # content was rendered (so the user sees real content instead of a
+        # stranded "..."). Re-raise the original error so the caller still
+        # learns the stream failed.
+        if stream_error is not None:
+            raise stream_error
 
         return sent
 
@@ -717,13 +817,16 @@ class ThreadImpl:
             "channelVisibility": self._channel_visibility,
             "currentMessage": self._current_message.to_json() if self._current_message else None,
             "isDM": self._is_dm,
-            "adapterName": self.adapter.name,
+            # Explicit `is not None` matches upstream's `??` behavior (preserve
+            # "" if that's what was stored) and avoids triggering lazy adapter
+            # resolution when `_adapter_name` was set but no `_adapter` is bound.
+            "adapterName": self._adapter_name if self._adapter_name is not None else self.adapter.name,
         }
 
     @classmethod
     def from_json(
         cls,
-        data: dict[str, Any],
+        data: dict[str, Any] | ThreadImpl,
         adapter: Adapter | None = None,
         chat: _ChatSingleton | None = None,
     ) -> ThreadImpl:
@@ -739,34 +842,107 @@ class ThreadImpl:
             Explicit Chat instance. If provided, adapter and state are resolved
             from this instance instead of the singleton. Useful in multi-chat
             or test scenarios.
-        """
-        current_msg_raw = data.get("currentMessage") or data.get("current_message")
-        current_msg = None
-        if current_msg_raw:
-            current_msg = Message.from_json(current_msg_raw)
 
-        thread = cls(
-            _ThreadImplConfig(
-                id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
-                channel_id=data.get("channelId") or data.get("channel_id", ""),
-                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
-                current_message=current_msg,
-                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+        Idempotent: if ``data`` is already a :class:`ThreadImpl`, it is
+        reused (not reconstructed) but any ``adapter``/``chat`` arguments
+        are still applied. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)`` while still respecting
+        explicit rebinding.
+        """
+        if isinstance(data, ThreadImpl):
+            thread = data
+            # Invalidate caches derived from the previous binding so the
+            # rebind block below resolves them fresh against the new
+            # adapter/chat. Without this, attributes copied from the old
+            # binding would continue to route state/channel/message
+            # operations to the previous context — the classic split-
+            # routing bug.
+            #
+            # Transactional rebind: if the caller passes only `chat=`, we
+            # need to resolve the adapter from the new chat by name. If that
+            # lookup fails, we must raise BEFORE mutating any cache, so a
+            # caller that catches the RuntimeError is left with an
+            # unchanged thread. Pre-flight the lookup here; the binding
+            # block below repeats it (cheap dict access) when it actually
+            # applies the result.
+            if chat is not None and adapter is None:
+                _lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
+                if _lookup_name and chat.get_adapter(_lookup_name) is None:
+                    raise RuntimeError(f'Adapter "{_lookup_name}" not found in the provided Chat instance')
+
+            # Validation passed — safe to invalidate caches.
+            #
+            # Every attribute that embeds a reference to the old context
+            # gets cleared here: `_state_adapter_instance` (old chat's
+            # state backend), `_channel_cache` (old adapter's channel),
+            # `_message_history` (old chat's history cache),
+            # `_recent_messages` (old adapter's fetched content), and
+            # `_is_subscribed_context` (handler-context flag from the
+            # old chat — a thread rebound to a new context shouldn't
+            # claim it's still inside a subscribed handler). The rebind
+            # block re-resolves each as needed.
+            if adapter is not None or chat is not None:
+                thread._state_adapter_instance = None
+                thread._channel_cache = None
+                thread._message_history = None
+                thread._recent_messages = []
+                thread._is_subscribed_context = False
+        else:
+            # Explicit None-checks (not `or`) to avoid the truthiness trap:
+            # `""` is a valid-but-falsy value that shouldn't silently fall
+            # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+            raw_current = data["currentMessage"] if "currentMessage" in data else data.get("current_message")
+            # ``object_hook`` revives nested dicts first, so ``currentMessage``
+            # may already be a Message instance by the time this runs.
+            current_msg = Message.from_json(raw_current) if raw_current is not None else None
+
+            raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+            raw_channel_id = data["channelId"] if "channelId" in data else data.get("channel_id")
+            raw_channel_visibility = (
+                data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
             )
-        )
+
+            thread = cls(
+                _ThreadImplConfig(
+                    id=data["id"],
+                    adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                    channel_id=raw_channel_id if raw_channel_id is not None else "",
+                    channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
+                    current_message=current_msg,
+                    is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                )
+            )
+        # `adapter` and `chat` are orthogonal: if both are passed we apply
+        # both (explicit adapter + chat's state). If only one is passed,
+        # the other's effects are left lazy. An earlier `elif chat` branch
+        # silently dropped chat's state when adapter was also passed,
+        # creating a split-routing bug.
         if adapter is not None:
             thread._adapter = adapter
-        elif chat is not None:
-            if thread._adapter_name:
-                resolved = chat.get_adapter(thread._adapter_name)
-                if resolved is None:
-                    raise RuntimeError(f'Adapter "{thread._adapter_name}" not found in the provided Chat instance')
-                thread._adapter = resolved
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+            # Keep _adapter_name in sync with the explicit adapter so
+            # to_json() doesn't serialize a stale name after rebind.
+            thread._adapter_name = adapter.name
+        if chat is not None:
+            # If the caller didn't also pass an explicit adapter, resolve
+            # one from chat using the current name. Falls back to
+            # `_adapter.name` for direct-constructed threads where
+            # `_adapter_name` was never stored.
+            if adapter is None:
+                lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
+                if lookup_name:
+                    resolved = chat.get_adapter(lookup_name)
+                    if resolved is None:
+                        raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
+                    thread._adapter = resolved
+                    thread._adapter_name = lookup_name
+            # State always comes from chat when chat is explicitly passed.
             thread._state_adapter_instance = chat.get_state()
-        elif has_chat_singleton() and thread._adapter_name:
-            # Eagerly bind from the active/global chat so the thread doesn't
-            # lazily re-resolve later (which could hit a different chat).
+        elif adapter is None and has_chat_singleton() and thread._adapter_name:
+            # Singleton fallback only fires when neither adapter nor chat
+            # were explicitly passed. Eagerly bind from the active/global
+            # chat so the thread doesn't lazily re-resolve later (which
+            # could hit a different chat).
             active = get_chat_singleton()
             resolved = active.get_adapter(thread._adapter_name)
             if resolved is not None:

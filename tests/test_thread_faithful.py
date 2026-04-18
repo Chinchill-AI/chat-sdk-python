@@ -367,12 +367,11 @@ class TestStreaming:
 
         # Should post initial placeholder
         assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
-        # Should edit with empty string wrapped as markdown (final content)
-        last_edit = adapter._edit_calls[-1]
-        assert last_edit[0] == "slack:C123:1234.5678"
-        assert last_edit[1] == "msg-1"
-        assert isinstance(last_edit[2], PostableMarkdown)
-        assert last_edit[2].markdown == ""
+        # Python divergence: clear the placeholder with " " on empty streams so
+        # users don't see a stuck "..." forever. (Upstream leaves it visible;
+        # documented in docs/UPSTREAM_SYNC.md.)
+        assert len(adapter._edit_calls) == 1
+        assert adapter._edit_calls[0][2] == PostableMarkdown(markdown=" ")
 
     # it("should support disabling the placeholder for fallback streaming")
     @pytest.mark.asyncio
@@ -387,10 +386,207 @@ class TestStreaming:
         # Should NOT have posted "..."
         placeholder_calls = [c for c in adapter._post_calls if c[1] == "..."]
         assert len(placeholder_calls) == 0
-        # Should have final edit with "Hi"
+        # With the placeholder disabled, the first chunk triggers the
+        # initial post; subsequent chunks accumulate and the edit loop
+        # flushes them via edit_message. Matches upstream TS behavior.
+        assert len(adapter._post_calls) == 1
+        first_post = adapter._post_calls[0]
+        assert isinstance(first_post[1], PostableMarkdown)
+        assert first_post[1].markdown == "H"
         last_edit = adapter._edit_calls[-1]
         assert isinstance(last_edit[2], PostableMarkdown)
         assert last_edit[2].markdown == "Hi"
+
+    # Python-specific regression: ensure whitespace-only streams don't leave
+    # the placeholder stuck on the message. This is a deliberate divergence
+    # from upstream 4.26, which keeps the placeholder visible.
+    @pytest.mark.asyncio
+    async def test_should_clear_placeholder_when_stream_is_whitespace_only(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["   ", "\n", "  \n"])
+        await thread.post(text_stream)
+
+        # Placeholder was posted
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        # And cleared via edit to " "
+        final_edit = adapter._edit_calls[-1]
+        assert isinstance(final_edit[2], PostableMarkdown)
+        assert final_edit[2].markdown == " "
+
+    # Symmetric with the placeholder-clear defensive try/except: if the
+    # final-content edit fails (rate-limit, 5xx, content-policy reject),
+    # `_fallback_stream` must still return a SentMessage for the posted
+    # placeholder so the caller has a handle to edit/delete it. Without
+    # this, the exception propagates and the placeholder message on the
+    # platform is orphaned — the caller catching the error has no way to
+    # reach it.
+    @pytest.mark.asyncio
+    async def test_should_swallow_final_edit_error_and_return_sent_message(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        # Reject every edit_message call with real content — simulating
+        # e.g. a permanent 5xx on the final flush.
+        edit_error = RuntimeError("adapter rejected final edit")
+        original_edit = adapter.edit_message
+        rejected: list[PostableMarkdown] = []
+
+        async def always_fail_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            if isinstance(message, PostableMarkdown) and message.markdown.strip():
+                rejected.append(message)
+                raise edit_error
+            return await original_edit(thread_id, message_id, message)
+
+        adapter.edit_message = always_fail_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
+
+        async def stream() -> AsyncIterator[str]:
+            yield "Hello\n"
+            await asyncio.sleep(0.05)
+            yield "world\n"
+
+        # Must not raise — the caller gets a SentMessage back even though
+        # the final edit was rejected.
+        sent = await thread.post(stream())
+
+        # Placeholder was posted; at least one edit was attempted and
+        # rejected; the failure was logged.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        assert len(rejected) >= 1
+        assert any(
+            call[0] == "fallbackStream final edit failed; message reflects previous content"
+            for call in logger.warn.calls
+        ), [c[0] for c in logger.warn.calls]
+
+        # SentMessage is valid and reflects the placeholder (what's actually
+        # on the platform, since every edit was rejected).
+        assert sent is not None
+        assert sent.id == "msg-1"
+        assert sent.text == "..."
+
+    # Codex P2 regression: the returned `SentMessage` must reflect what's
+    # actually visible on the platform, not the renderer's final_content.
+    # When the placeholder-clear edit fails (strict adapter rejects `" "`),
+    # the platform still shows "..." — `sent.text` must match that, not
+    # the empty `final_content` that `renderer.finish()` returned for a
+    # whitespace-only stream. Previously `_create_sent_message` used
+    # `final_content` unconditionally, so downstream consumers relying on
+    # `sent.text` saw "" while users on the platform saw "...".
+    @pytest.mark.asyncio
+    async def test_sent_message_reflects_stranded_placeholder_on_strict_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        async def strict_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            # Mirror Telegram: reject whitespace-only edits.
+            if isinstance(message, PostableMarkdown) and not message.markdown.strip():
+                raise ValueError("Message text cannot be empty")
+            # Non-whitespace edits don't happen in this test; defensive no-op.
+            return await MockAdapter.edit_message(adapter, thread_id, message_id, message)  # type: ignore[arg-type]
+
+        adapter.edit_message = strict_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, logger=MockLogger())  # default placeholder "..."
+        text_stream = _create_text_stream(["   ", "\n"])
+        sent = await thread.post(text_stream)
+
+        # Placeholder posted; the platform still shows "..." because the
+        # clear-to-" " edit was rejected.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+
+        # The SentMessage must reflect that stranded "...", not "".
+        assert sent.text == "...", f"expected sent.text == '...', got {sent.text!r}"
+
+    # Python-specific regression: when a streaming source raises mid-stream
+    # (e.g. LLM connection drops), `_fallback_stream` must still flush the
+    # accumulated partial content + clean up the background edit task
+    # before re-raising. Without this, the placeholder stays stranded as
+    # "..." even though partial content was rendered, and pending_edit
+    # becomes an orphan task. This is the exact pathology the placeholder-
+    # clear divergence was designed to fix — but previously only ran on
+    # the happy path.
+    @pytest.mark.asyncio
+    async def test_should_flush_and_cleanup_when_stream_raises_midway(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
+
+        stream_error = RuntimeError("LLM connection dropped")
+
+        async def failing_stream() -> AsyncIterator[str]:
+            yield "Partial content\n"
+            await asyncio.sleep(0.05)  # Let the edit loop commit the partial.
+            raise stream_error
+
+        # Caller must still see the original exception — the flush is best-
+        # effort, not a swallow.
+        with pytest.raises(RuntimeError, match="LLM connection dropped"):
+            await thread.post(failing_stream())
+
+        # Placeholder was posted and the partial content was flushed via an
+        # edit. A regression that skipped cleanup would leave `_post_calls`
+        # with just "..." and no edits.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        markdown_edits = [c for _, _, c in adapter._edit_calls if isinstance(c, PostableMarkdown)]
+        assert markdown_edits, "expected the edit loop to have flushed partial content before re-raise"
+        # The latest edit must contain the partial content the stream produced.
+        assert "Partial content" in markdown_edits[-1].markdown
+
+    # Python-specific regression: when the placeholder-clear edit_message(" ")
+    # raises (e.g. Telegram rejects whitespace-only content with a
+    # ValidationError), `_fallback_stream` must log + swallow the error so
+    # `thread.post()` still returns a SentMessage. The previous test pinned
+    # the happy path; this one pins the defensive try/except added in
+    # commit 8dd34d1 specifically for adapters that reject blank text.
+    @pytest.mark.asyncio
+    async def test_should_swallow_placeholder_clear_error_on_strict_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        # Telegram's adapter raises ValidationError when text.strip() is empty.
+        # Simulate by intercepting edit_message and raising on the " " payload.
+        clear_attempts: list[PostableMarkdown] = []
+        original_edit = adapter.edit_message
+
+        async def strict_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            if isinstance(message, PostableMarkdown) and not message.markdown.strip():
+                clear_attempts.append(message)
+                raise ValueError("Message text cannot be empty")
+            return await original_edit(thread_id, message_id, message)
+
+        adapter.edit_message = strict_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, logger=logger)
+        # Whitespace-only stream triggers the placeholder-clear branch.
+        text_stream = _create_text_stream(["   ", "\n", "  \n"])
+
+        # Must not raise — the SDK should log and fall through to the
+        # upstream "leave placeholder visible" behavior on rejection.
+        sent = await thread.post(text_stream)
+
+        # Placeholder was posted, then exactly one clear edit was attempted
+        # (and rejected). No retry, no infinite loop.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        assert len(clear_attempts) == 1
+        assert clear_attempts[0].markdown == " "
+        # The warn log fired with the expected message (asserting the exact
+        # string so a refactor that changes the log can't silently break the
+        # observability contract).
+        assert any(
+            call[0] == "fallbackStream placeholder-clear edit failed; placeholder will remain visible"
+            for call in logger.warn.calls
+        ), [c[0] for c in logger.warn.calls]
+        # Stream contract still holds — we got a SentMessage back.
+        assert sent is not None
+        assert sent.id == "msg-1"
 
     # it("should handle empty stream with disabled placeholder")
     @pytest.mark.asyncio
@@ -402,13 +598,67 @@ class TestStreaming:
         text_stream = _create_text_stream([])
         await thread.post(text_stream)
 
-        # Should still post a message (empty), wrapped as markdown
+        # Should post a non-empty fallback since stream must return a SentMessage
         assert len(adapter._post_calls) == 1
         posted = adapter._post_calls[0][1]
         assert isinstance(posted, PostableMarkdown)
-        assert posted.markdown == ""
-        # No edit needed since post content matches accumulated
+        assert posted.markdown == " "
         assert len(adapter._edit_calls) == 0
+
+    # it("should not post empty content when table is buffered with null placeholder")
+    @pytest.mark.asyncio
+    async def test_should_not_post_empty_content_when_table_is_buffered_with_null_placeholder(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state, fallback_streaming_placeholder_text=None)
+        text_stream = _create_text_stream(["| A | B |\n", "|---|---|\n", "| 1 | 2 |\n"])
+        await thread.post(text_stream)
+
+        markdown_posts = [content for _, content in adapter._post_calls if isinstance(content, PostableMarkdown)]
+        assert markdown_posts, "expected at least one PostableMarkdown post"
+        assert all(p.markdown.strip() for p in markdown_posts)
+
+    # it("should not edit placeholder to empty during LLM warm-up")
+    @pytest.mark.asyncio
+    async def test_should_not_edit_placeholder_to_empty_during_llm_warmup(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        # Simulate the warm-up path: a whitespace-only chunk arrives before the
+        # real content, and the background edit loop fires fast enough to see
+        # it. Without the warm-up chunk the test never exercises the empty-edit
+        # guard — it'd just post "Hello world" immediately.
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10)
+
+        async def _stream() -> AsyncIterator[str]:
+            yield " "
+            await asyncio.sleep(0.05)
+            yield "Hello world\n"
+
+        await thread.post(_stream())
+
+        markdown_edits = [content for _, _, content in adapter._edit_calls if isinstance(content, PostableMarkdown)]
+        assert markdown_edits, "expected at least one PostableMarkdown edit"
+        assert all(e.markdown.strip() for e in markdown_edits)
+
+    # it("should not post empty content during streaming with whitespace chunks")
+    @pytest.mark.asyncio
+    async def test_should_not_post_empty_content_during_streaming_with_whitespace_chunks(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        thread = _make_thread(adapter, state, fallback_streaming_placeholder_text=None)
+        text_stream = _create_text_stream(["  ", "\n", "  \n"])
+        await thread.post(text_stream)
+
+        # Whitespace-only stream with placeholder disabled: the SDK normalizes
+        # to a single `" "` in the final post_message call, not the original
+        # whitespace buffer. Asserting the exact value catches regressions that
+        # would silently emit "   \n" or similar.
+        markdown_posts = [content for _, content in adapter._post_calls if isinstance(content, PostableMarkdown)]
+        assert len(markdown_posts) == 1
+        assert markdown_posts[0].markdown == " "
 
     # it("should preserve newlines in streamed text (native path)")
     @pytest.mark.asyncio
@@ -608,9 +858,12 @@ class TestFallbackStreamingErrorLogging:
         thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
 
         async def slow_stream() -> AsyncIterator[str]:
-            yield "Hel"
+            # Newlines are required so the streaming renderer commits content
+            # mid-stream; without them the post-4.26 empty-content guard
+            # skips intermediate edits entirely.
+            yield "Hel\n"
             await asyncio.sleep(0.05)
-            yield "lo"
+            yield "lo\n"
 
         await thread.post(slow_stream())
 

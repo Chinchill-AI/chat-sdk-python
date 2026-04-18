@@ -34,9 +34,9 @@ class GitHubFormatConverter(BaseFormatConverter):
             return ""
         return stringify_markdown(ast).strip()
 
-    def to_ast(self, markdown: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse GitHub markdown into an AST.
 
         GitHub uses standard GFM, so we use the shared parser directly.
         """
-        return parse_markdown(markdown)
+        return parse_markdown(platform_text)

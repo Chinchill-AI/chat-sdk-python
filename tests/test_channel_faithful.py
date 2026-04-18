@@ -651,6 +651,149 @@ class TestSerialization:
         assert channel.is_dm is False
         assert channel.adapter is adapter
 
+    def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self):
+        """from_json(data, adapter=X) must update _adapter_name to X.name so
+        to_json() doesn't serialize a stale name. Regression for a P2 raised
+        in review."""
+        from chat_sdk.testing import create_mock_adapter as _create
+
+        renamed_adapter = _create("teams")
+        json_data = {
+            "_type": "chat:Channel",
+            "id": "C123",
+            "adapter_name": "slack",  # different from the bound adapter
+            "is_dm": False,
+        }
+        channel = ChannelImpl.from_json(json_data, renamed_adapter)
+
+        assert channel.adapter.name == "teams"
+        assert channel.to_json()["adapterName"] == "teams"
+
+    def test_should_rebind_adapter_when_data_is_already_a_channelimpl(self):
+        """Idempotent path: when ``data`` is already a ChannelImpl (e.g. revived
+        via ``object_hook``), passing an explicit ``adapter=`` must still rebind
+        it — an early-return shortcut would leave ``_adapter`` stale. Symmetric
+        with the ThreadImpl regression in test_serialization.py."""
+        from chat_sdk.testing import create_mock_adapter as _create
+
+        first = _create("slack")
+        second = _create("teams")
+        original = ChannelImpl.from_json(
+            {
+                "_type": "chat:Channel",
+                "id": "C123",
+                "adapter_name": "slack",
+                "is_dm": False,
+            },
+            first,
+        )
+        rebound = ChannelImpl.from_json(original, second)
+
+        # Rebind applied even though data was already a ChannelImpl:
+        assert rebound.adapter.name == "teams"
+        assert rebound.to_json()["adapterName"] == "teams"
+
+    def test_should_invalidate_state_cache_on_idempotent_rebind(self):
+        """When `from_json(existing_instance, adapter=X)` rebinds an already-
+        revived ChannelImpl, `_state_adapter_instance` must be invalidated
+        so subsequent `get_state`/`set_state` calls route through the new
+        binding, not the previous one. Regression for a Codex P1."""
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        first_adapter = _create("slack")
+        second_adapter = _create("teams")
+        first_state = _create_state()
+
+        # Construct a channel with the first adapter + state explicitly
+        # (so the state cache is populated).
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=first_adapter,
+                state_adapter=first_state,
+            )
+        )
+        assert original._state_adapter_instance is first_state
+
+        # Rebind via the idempotent path. State cache must drop so the
+        # next access resolves against the new binding.
+        rebound = ChannelImpl.from_json(original, second_adapter)
+        assert rebound._state_adapter_instance is None
+        assert rebound.adapter.name == "teams"
+
+    def test_should_leave_channel_unchanged_when_chat_rebind_lookup_fails(self):
+        """Transactional rebind: `from_json(existing_channel, chat=Y)` must
+        raise BEFORE mutating any cache when the adapter lookup against
+        the new chat fails. Callers catching the exception get their
+        original channel back unchanged. Regression for a Codex P2."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        slack_a = _create("slack")
+        state_a = _create_state()
+        chat_b = Chat(
+            ChatConfig(
+                user_name="bot-b",
+                adapters={"teams": _create("teams")},  # no 'slack'
+                state=_create_state(),
+            )
+        )
+
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=slack_a,
+                state_adapter=state_a,
+            )
+        )
+        snapshot = {
+            "_adapter": original._adapter,
+            "_adapter_name": original._adapter_name,
+            "_state_adapter_instance": original._state_adapter_instance,
+            "_message_history": original._message_history,
+        }
+
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            ChannelImpl.from_json(original, chat=chat_b)
+
+        for attr, before in snapshot.items():
+            after = getattr(original, attr)
+            assert after == before, f"{attr}: expected {before!r}, got {after!r}"
+        assert original._adapter is snapshot["_adapter"]
+        assert original._state_adapter_instance is snapshot["_state_adapter_instance"]
+
+    def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_channel(self):
+        """When `from_json(existing_channel, chat=Y)` rebinds a channel that
+        was constructed directly (so `_adapter_name` is None), the new
+        chat's matching adapter must replace the old one. Otherwise state
+        calls route to chat Y while message operations still use the
+        previous adapter — split routing. Regression for a Codex P1."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        slack_a = _create("slack")
+        slack_b = _create("slack")
+        state_a = _create_state()
+        state_b = _create_state()
+        chat_b = Chat(ChatConfig(user_name="bot-b", adapters={"slack": slack_b}, state=state_b))
+
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=slack_a,
+                state_adapter=state_a,
+            )
+        )
+        assert original._adapter is slack_a
+        assert original._adapter_name is None
+
+        rebound = ChannelImpl.from_json(original, chat=chat_b)
+        assert rebound.adapter is slack_b, "adapter not rebound to the new chat"
+        assert rebound._state_adapter_instance is state_b, "state not rebound to the new chat"
+
 
 # ===========================================================================
 # deriveChannelId (tested in channel.test.ts alongside ChannelImpl)

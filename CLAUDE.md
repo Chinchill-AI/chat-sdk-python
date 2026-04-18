@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.25.0). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.26.0). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -63,6 +63,16 @@ All thread IDs follow: `{adapter}:{channel}:{thread}`
    truthy objects. Use AsyncMock (not MagicMock) in tests to surface these.
 3. **No two tests should verify the same thing.** Duplicates inflate counts
    without catching more bugs.
+
+## Self-Review Discipline
+
+Before declaring any change ready, run the adversarial checks in
+[docs/SELF_REVIEW.md](docs/SELF_REVIEW.md). In short: input sweeps,
+emit/parse symmetry, pass-interaction, unforgeable sentinels, divergence
+budget, rebind/state coherence, and the pre-ship "what would an
+adversarial reviewer find?" question. Apply these especially to novel
+logic, new regex/substitution passes, and anything that lands as a
+divergence from upstream.
 
 ## Port Rules (TS → Python)
 

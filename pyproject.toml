@@ -1,6 +1,6 @@
 [project]
 name = "chat-sdk"
-version = "0.4.25"
+version = "0.4.26"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
 readme = "README.md"
 license = {text = "MIT"}
@@ -74,4 +74,46 @@ dev = [
     "aiohttp>=3.9",
     "pyjwt[crypto]>=2.8",
     "ruff>=0.4.0",
+    "pyrefly==0.61.1",
 ]
+
+# ---------------------------------------------------------------------------
+# Pyrefly type checker configuration
+# ---------------------------------------------------------------------------
+# Baseline workflow:
+#   Check against baseline: uv run pyrefly check --baseline=.pyrefly-baseline.json
+#   Refresh baseline:       uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline
+# ---------------------------------------------------------------------------
+
+[tool.pyrefly]
+project-includes = ["src"]
+project-excludes = ["**/__pycache__", "**/.pytest_cache"]
+
+# Without disabling heuristics pyrefly skips src/ because of our layout.
+disable-project-excludes-heuristics = true
+use-ignore-files = false
+
+python-version = "3.10"
+python-platform = "linux"
+
+# Optional adapter deps that aren't in the default install. Treating them as
+# Any keeps pyrefly from flagging missing-import every time we lazy-load one.
+replace-imports-with-any = [
+    # Slack
+    "slack_sdk",
+    # Discord
+    "nacl",
+    # Google Chat
+    "google",
+    # State backends
+    "redis",
+    "asyncpg",
+    # HTTP clients used in lazy paths
+    "httpx",
+    # GitHub App auth
+    "jwt",
+]
+
+[tool.pyrefly.errors]
+# Default severity. Known issues tracked in .pyrefly-baseline.json —
+# new errors fail CI, existing ones are allowed.

@@ -389,7 +389,10 @@ class ChannelImpl:
         return {
             "_type": "chat:Channel",
             "id": self._id,
-            "adapterName": self.adapter.name,
+            # Explicit `is not None` matches upstream's `??` behavior (preserve
+            # "" if that's what was stored) and avoids triggering lazy adapter
+            # resolution when `_adapter_name` was set but no `_adapter` is bound.
+            "adapterName": self._adapter_name if self._adapter_name is not None else self.adapter.name,
             "channelVisibility": self._channel_visibility,
             "isDM": self._is_dm,
         }
@@ -397,7 +400,7 @@ class ChannelImpl:
     @classmethod
     def from_json(
         cls,
-        data: dict[str, Any],
+        data: dict[str, Any] | ChannelImpl,
         adapter: Adapter | None = None,
         chat: _ChatSingleton | None = None,
     ) -> ChannelImpl:
@@ -411,25 +414,76 @@ class ChannelImpl:
             Explicit adapter. Skips singleton lookup.
         chat:
             Explicit Chat instance for adapter/state resolution.
+
+        Idempotent: if ``data`` is already a :class:`ChannelImpl`, it is
+        reused (not reconstructed) but any ``adapter``/``chat`` arguments
+        are still applied. This makes it safe to call via
+        ``json.loads(..., object_hook=reviver)`` while still respecting
+        explicit rebinding.
         """
-        channel = cls(
-            _ChannelImplConfigLazy(
-                id=data["id"],
-                adapter_name=data.get("adapterName") or data.get("adapter_name", ""),
-                channel_visibility=data.get("channelVisibility") or data.get("channel_visibility", "unknown"),
-                is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+        if isinstance(data, ChannelImpl):
+            channel = data
+            # Transactional rebind: if chat= is passed without adapter=,
+            # we'll need to resolve the adapter from the new chat by name.
+            # Pre-flight that lookup and raise (leaving the channel
+            # unchanged) BEFORE invalidating caches, so a caller that
+            # catches the RuntimeError isn't left with a partially-reset
+            # instance. The binding block below repeats the lookup when
+            # it actually applies the result (cheap).
+            if chat is not None and adapter is None:
+                _lookup_name = channel._adapter_name or (
+                    channel._adapter.name if channel._adapter is not None else None
+                )
+                if _lookup_name and chat.get_adapter(_lookup_name) is None:
+                    raise RuntimeError(f'Adapter "{_lookup_name}" not found in the provided Chat instance')
+
+            # Validation passed — safe to invalidate.
+            # Both `_state_adapter_instance` (old chat's state backend)
+            # and `_message_history` (old chat's cache) would route to
+            # the previous context otherwise.
+            if adapter is not None or chat is not None:
+                channel._state_adapter_instance = None
+                channel._message_history = None
+        else:
+            # Explicit None-checks (not `or`) to avoid the truthiness trap:
+            # `""` is a valid-but-falsy value that shouldn't silently fall
+            # through to the snake_case alias. See UPSTREAM_SYNC.md hazard #1.
+            raw_adapter_name = data["adapterName"] if "adapterName" in data else data.get("adapter_name")
+            raw_channel_visibility = (
+                data["channelVisibility"] if "channelVisibility" in data else data.get("channel_visibility")
             )
-        )
+            channel = cls(
+                _ChannelImplConfigLazy(
+                    id=data["id"],
+                    adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
+                    channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
+                    is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                )
+            )
+        # `adapter` and `chat` are orthogonal: if both are passed we apply
+        # both (explicit adapter + chat's state). If only one is passed,
+        # the other's effects are left lazy. An earlier `elif chat` branch
+        # silently dropped chat's state when adapter was also passed,
+        # creating a split-routing bug.
         if adapter is not None:
             channel._adapter = adapter
-        elif chat is not None:
-            if channel._adapter_name:
-                resolved = chat.get_adapter(channel._adapter_name)
-                if resolved is None:
-                    raise RuntimeError(f'Adapter "{channel._adapter_name}" not found in the provided Chat instance')
-                channel._adapter = resolved
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+            # Keep _adapter_name in sync with the explicit adapter so
+            # to_json() doesn't serialize a stale name.
+            channel._adapter_name = adapter.name
+        if chat is not None:
+            if adapter is None:
+                # Resolve adapter via chat using `_adapter_name` or the
+                # currently-bound adapter's name as the lookup key.
+                lookup_name = channel._adapter_name or (channel._adapter.name if channel._adapter is not None else None)
+                if lookup_name:
+                    resolved = chat.get_adapter(lookup_name)
+                    if resolved is None:
+                        raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
+                    channel._adapter = resolved
+                    channel._adapter_name = lookup_name
             channel._state_adapter_instance = chat.get_state()
-        elif has_chat_singleton() and channel._adapter_name:
+        elif adapter is None and has_chat_singleton() and channel._adapter_name:
             active = get_chat_singleton()
             resolved = active.get_adapter(channel._adapter_name)
             if resolved is not None:
