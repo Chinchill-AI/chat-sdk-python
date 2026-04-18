@@ -638,6 +638,39 @@ class TestThreadFromJsonFaithful:
         # And the adapter is actually rebound.
         assert rebound.adapter.name == "teams"
 
+    def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_thread(self, mock_state):
+        """When `from_json(existing_instance, chat=Y)` rebinds a thread that
+        was originally constructed directly by a Chat (so `_adapter_name`
+        is None), the new chat's matching adapter must replace the old one.
+        Otherwise state calls go to chat Y while `post`/`edit` still use
+        chat X's adapter — split-routing. Regression for a Codex P1."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        slack_a = create_mock_adapter("slack")
+        slack_b = create_mock_adapter("slack")
+        state_a = create_mock_state()
+        state_b = create_mock_state()
+        chat_b = Chat(ChatConfig(user_name="bot-b", adapters={"slack": slack_b}, state=state_b))
+
+        # Thread constructed via chat_a's path: _adapter is slack_a,
+        # _adapter_name is None (not set by direct construction).
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=slack_a,
+                state_adapter=state_a,
+                channel_id="C123",
+            )
+        )
+        assert original._adapter is slack_a
+        assert original._adapter_name is None
+
+        # Rebind to chat_b. Both adapter and state must switch to chat_b's.
+        rebound = ThreadImpl.from_json(original, chat=chat_b)
+        assert rebound.adapter is slack_b, "adapter not rebound to the new chat"
+        assert rebound._state_adapter_instance is state_b, "state not rebound to the new chat"
+
     def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self, mock_state):
         """from_json(data, adapter=X) must update _adapter_name to X.name so
         to_json() doesn't serialize a stale name that refers to a different

@@ -853,11 +853,21 @@ class ThreadImpl:
             # to_json() doesn't serialize a stale name after rebind.
             thread._adapter_name = adapter.name
         elif chat is not None:
-            if thread._adapter_name:
-                resolved = chat.get_adapter(thread._adapter_name)
+            # Resolve the adapter against the new Chat. `_adapter_name` may
+            # be None for threads constructed directly by a Chat instance
+            # (as opposed to dict-revived ones), so fall back to the
+            # currently-bound adapter's name as the lookup key. Without
+            # this, a chat rebind on a direct-constructed thread would
+            # update state routing but leave `_adapter` pointing at the
+            # OLD chat's adapter — a split-routing bug where `post()` and
+            # `set_state()` target different Chat contexts.
+            lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
+            if lookup_name:
+                resolved = chat.get_adapter(lookup_name)
                 if resolved is None:
-                    raise RuntimeError(f'Adapter "{thread._adapter_name}" not found in the provided Chat instance')
+                    raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
                 thread._adapter = resolved
+                thread._adapter_name = lookup_name
             thread._state_adapter_instance = chat.get_state()
         elif has_chat_singleton() and thread._adapter_name:
             # Eagerly bind from the active/global chat so the thread doesn't

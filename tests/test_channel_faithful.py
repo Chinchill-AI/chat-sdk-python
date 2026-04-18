@@ -722,6 +722,36 @@ class TestSerialization:
         assert rebound._state_adapter_instance is None
         assert rebound.adapter.name == "teams"
 
+    def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_channel(self):
+        """When `from_json(existing_channel, chat=Y)` rebinds a channel that
+        was constructed directly (so `_adapter_name` is None), the new
+        chat's matching adapter must replace the old one. Otherwise state
+        calls route to chat Y while message operations still use the
+        previous adapter — split routing. Regression for a Codex P1."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        slack_a = _create("slack")
+        slack_b = _create("slack")
+        state_a = _create_state()
+        state_b = _create_state()
+        chat_b = Chat(ChatConfig(user_name="bot-b", adapters={"slack": slack_b}, state=state_b))
+
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=slack_a,
+                state_adapter=state_a,
+            )
+        )
+        assert original._adapter is slack_a
+        assert original._adapter_name is None
+
+        rebound = ChannelImpl.from_json(original, chat=chat_b)
+        assert rebound.adapter is slack_b, "adapter not rebound to the new chat"
+        assert rebound._state_adapter_instance is state_b, "state not rebound to the new chat"
+
 
 # ===========================================================================
 # deriveChannelId (tested in channel.test.ts alongside ChannelImpl)

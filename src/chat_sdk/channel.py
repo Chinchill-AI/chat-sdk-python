@@ -453,11 +453,19 @@ class ChannelImpl:
             # to_json() doesn't serialize a stale name.
             channel._adapter_name = adapter.name
         elif chat is not None:
-            if channel._adapter_name:
-                resolved = chat.get_adapter(channel._adapter_name)
+            # Resolve the adapter against the new Chat. `_adapter_name` may
+            # be None for channels constructed directly by a Chat instance,
+            # so fall back to the currently-bound adapter's name as the
+            # lookup key — without this, a chat rebind on a direct-
+            # constructed channel would update state routing but leave
+            # `_adapter` pointing at the OLD adapter (split-routing bug).
+            lookup_name = channel._adapter_name or (channel._adapter.name if channel._adapter is not None else None)
+            if lookup_name:
+                resolved = chat.get_adapter(lookup_name)
                 if resolved is None:
-                    raise RuntimeError(f'Adapter "{channel._adapter_name}" not found in the provided Chat instance')
+                    raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
                 channel._adapter = resolved
+                channel._adapter_name = lookup_name
             channel._state_adapter_instance = chat.get_state()
         elif has_chat_singleton() and channel._adapter_name:
             active = get_chat_singleton()
