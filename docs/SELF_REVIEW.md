@@ -109,6 +109,14 @@ Walk every instance attribute and ask: "does this value come from the
 previous binding, and would it route operations to the wrong context
 after the rebind?"
 
+**Also walk the error paths.** If the rebind can raise partway through
+(e.g. an adapter lookup returns None, a network call fails), order the
+steps so any raise leaves the object in a well-defined state — either
+unchanged (transactional) or fully committed to the new binding.
+Validating inputs before mutating is the simplest way; try/except with
+rollback is the alternative. A half-mutated object that the caller
+catches-and-reuses is the worst outcome.
+
 ### 7. The pre-ship question
 
 Before declaring any change ready, ask yourself:

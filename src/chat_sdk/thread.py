@@ -851,13 +851,9 @@ class ThreadImpl:
             # block below repeats it (cheap dict access) when it actually
             # applies the result.
             if chat is not None and adapter is None:
-                _lookup_name = thread._adapter_name or (
-                    thread._adapter.name if thread._adapter is not None else None
-                )
+                _lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
                 if _lookup_name and chat.get_adapter(_lookup_name) is None:
-                    raise RuntimeError(
-                        f'Adapter "{_lookup_name}" not found in the provided Chat instance'
-                    )
+                    raise RuntimeError(f'Adapter "{_lookup_name}" not found in the provided Chat instance')
 
             # Validation passed — safe to invalidate caches.
             #

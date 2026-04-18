@@ -435,9 +435,7 @@ class ChannelImpl:
                     channel._adapter.name if channel._adapter is not None else None
                 )
                 if _lookup_name and chat.get_adapter(_lookup_name) is None:
-                    raise RuntimeError(
-                        f'Adapter "{_lookup_name}" not found in the provided Chat instance'
-                    )
+                    raise RuntimeError(f'Adapter "{_lookup_name}" not found in the provided Chat instance')
 
             # Validation passed — safe to invalidate.
             # Both `_state_adapter_instance` (old chat's state backend)
