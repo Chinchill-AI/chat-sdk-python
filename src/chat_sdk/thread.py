@@ -637,7 +637,7 @@ class ThreadImpl:
         if msg is not None:
             pending_edit = asyncio.create_task(_edit_loop())
 
-        stream_error: BaseException | None = None
+        stream_error: Exception | None = None
         try:
             async for chunk in text_stream:
                 renderer.push(chunk)
@@ -648,13 +648,20 @@ class ThreadImpl:
                         thread_id_for_edits = msg.thread_id or self._id
                         last_edit_content = content
                         pending_edit = asyncio.create_task(_edit_loop())
-        except BaseException as exc:
+        except Exception as exc:
             # Capture so we can run the cleanup + flush below even when the
             # stream raises mid-iteration (e.g. LLM connection drops). The
             # alternative — letting the exception propagate immediately —
             # would leak pending_edit as an orphan task AND strand the
             # placeholder as a forever-"..." message, which is exactly the
             # pathology the placeholder-clear divergence was added to fix.
+            #
+            # Control-flow exceptions (CancelledError, KeyboardInterrupt,
+            # SystemExit, GeneratorExit) are intentionally NOT caught —
+            # those signal shutdown and must propagate immediately.
+            # `finally: stop_event.set()` still fires on every exit path,
+            # so the background _edit_loop exits cleanly on cancellation
+            # too.
             stream_error = exc
         finally:
             stop_event.set()
