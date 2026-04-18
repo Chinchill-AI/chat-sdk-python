@@ -638,6 +638,72 @@ class TestThreadFromJsonFaithful:
         # And the adapter is actually rebound.
         assert rebound.adapter.name == "teams"
 
+    def test_should_invalidate_recent_messages_and_message_history_on_rebind(self, mock_state):
+        """Two additional caches that carry previous-binding references must
+        also drop on idempotent rebind: `_recent_messages` (populated from
+        adapter fetches) and `_message_history` (tied to chat's cache).
+        Regression for a self-review-subagent finding."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state, create_test_message
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        # Prime caches: initial_message populates _recent_messages, and
+        # message_history is a sentinel cache object.
+        sentinel_history = object()
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+                initial_message=create_test_message("m1", "hello"),
+                message_history=sentinel_history,
+            )
+        )
+        assert len(original._recent_messages) == 1
+        assert original._message_history is sentinel_history
+
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._recent_messages == [], "recent_messages should drop on rebind"
+        assert rebound._message_history is None, "message_history should drop on rebind"
+
+    def test_should_set_state_from_chat_when_both_adapter_and_chat_passed(self, mock_state):
+        """adapter= and chat= are orthogonal. Passing both must apply both:
+        the explicit adapter is bound AND state comes from the explicit
+        chat. The previous `elif chat` branch silently ignored chat when
+        adapter was also passed, leading to split routing. Regression for
+        a self-review-subagent finding."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        teams_adapter = create_mock_adapter("teams")
+        chat_state = create_mock_state()
+        chat_instance = Chat(
+            ChatConfig(
+                user_name="bot",
+                adapters={"slack": create_mock_adapter("slack")},
+                state=chat_state,
+            )
+        )
+
+        data = {
+            "_type": "chat:Thread",
+            "id": "slack:C123:1234.5678",
+            "channel_id": "C123",
+            "is_dm": False,
+            "adapter_name": "slack",
+        }
+        thread = ThreadImpl.from_json(data, adapter=teams_adapter, chat=chat_instance)
+
+        # Explicit adapter wins for adapter binding.
+        assert thread.adapter is teams_adapter
+        # Explicit chat's state is applied (previously the elif branch
+        # skipped this, leaving state as None and silently routing to the
+        # singleton on next access).
+        assert thread._state_adapter_instance is chat_state
+
     def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_thread(self, mock_state):
         """When `from_json(existing_instance, chat=Y)` rebinds a thread that
         was originally constructed directly by a Chat (so `_adapter_name`

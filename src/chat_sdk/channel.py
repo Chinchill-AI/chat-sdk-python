@@ -423,13 +423,14 @@ class ChannelImpl:
         """
         if isinstance(data, ChannelImpl):
             channel = data
-            # Invalidate the state-adapter cache so the rebind block below
-            # resolves it fresh against the new adapter/chat. Without this,
-            # `get_state` / `set_state` calls would continue to route
-            # through the OLD chat's state backend even though the
-            # channel now reports the new adapter name.
+            # Invalidate caches derived from the previous binding so the
+            # rebind block below resolves them fresh against the new
+            # adapter/chat. Both `_state_adapter_instance` (old chat's
+            # state backend) and `_message_history` (old chat's cache)
+            # would route to the previous context otherwise.
             if adapter is not None or chat is not None:
                 channel._state_adapter_instance = None
+                channel._message_history = None
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
@@ -446,28 +447,30 @@ class ChannelImpl:
                     is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
                 )
             )
+        # `adapter` and `chat` are orthogonal: if both are passed we apply
+        # both (explicit adapter + chat's state). If only one is passed,
+        # the other's effects are left lazy. An earlier `elif chat` branch
+        # silently dropped chat's state when adapter was also passed,
+        # creating a split-routing bug.
         if adapter is not None:
             channel._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Keep _adapter_name in sync with the explicit adapter so
             # to_json() doesn't serialize a stale name.
             channel._adapter_name = adapter.name
-        elif chat is not None:
-            # Resolve the adapter against the new Chat. `_adapter_name` may
-            # be None for channels constructed directly by a Chat instance,
-            # so fall back to the currently-bound adapter's name as the
-            # lookup key — without this, a chat rebind on a direct-
-            # constructed channel would update state routing but leave
-            # `_adapter` pointing at the OLD adapter (split-routing bug).
-            lookup_name = channel._adapter_name or (channel._adapter.name if channel._adapter is not None else None)
-            if lookup_name:
-                resolved = chat.get_adapter(lookup_name)
-                if resolved is None:
-                    raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
-                channel._adapter = resolved
-                channel._adapter_name = lookup_name
+        if chat is not None:
+            if adapter is None:
+                # Resolve adapter via chat using `_adapter_name` or the
+                # currently-bound adapter's name as the lookup key.
+                lookup_name = channel._adapter_name or (channel._adapter.name if channel._adapter is not None else None)
+                if lookup_name:
+                    resolved = chat.get_adapter(lookup_name)
+                    if resolved is None:
+                        raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
+                    channel._adapter = resolved
+                    channel._adapter_name = lookup_name
             channel._state_adapter_instance = chat.get_state()
-        elif has_chat_singleton() and channel._adapter_name:
+        elif adapter is None and has_chat_singleton() and channel._adapter_name:
             active = get_chat_singleton()
             resolved = active.get_adapter(channel._adapter_name)
             if resolved is not None:

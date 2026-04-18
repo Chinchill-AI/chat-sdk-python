@@ -310,10 +310,15 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             # can't safely round-trip:
             #   - labels containing `|`, `>`, `]`, or a newline would be
             #     truncated on the platform or by our own parser;
+            #   - URLs containing `|` or `>` would collide with the
+            #     `<url|text>` delimiters, re-parsing to a different URL
+            #     than the one we intended;
             #   - URLs without a scheme (e.g. relative paths like `/docs`)
             #     won't match the reverse parser's scheme-prefixed regex,
             #     so the link node would be lost on the read side.
-            if any(c in link_text for c in ("|", ">", "]", "\n")) or not _HAS_SCHEME_RE.match(url):
+            label_unsafe = any(c in link_text for c in ("|", ">", "]", "\n"))
+            url_unsafe = any(c in url for c in ("|", ">"))
+            if label_unsafe or url_unsafe or not _HAS_SCHEME_RE.match(url):
                 return f"{link_text} ({url})"
             return f"<{url}|{link_text}>"
 

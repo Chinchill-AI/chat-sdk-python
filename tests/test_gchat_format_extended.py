@@ -408,6 +408,31 @@ class TestFromAst:
         # `(https://example.com)` parenthetical either.
         assert converter.from_ast(ast) == "https://example.com"
 
+    def test_falls_back_to_parenthesized_form_for_urls_with_reserved_delimiters(self):
+        """URLs containing `|` or `>` can't be emitted in `<url|text>` form
+        without aliasing with the syntax delimiters. Without the fallback,
+        `foo:bar|baz` → `<foo:bar|baz|Label>` → parses as url=`foo:bar`,
+        label=`baz|Label`. Regression for a Codex P2."""
+        converter = _converter()
+        for url in ["foo:bar|baz", "foo:bar>baz", "scheme:a|b>c"]:
+            ast = {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [
+                            {
+                                "type": "link",
+                                "url": url,
+                                "children": [{"type": "text", "value": "Label"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = converter.from_ast(ast)
+            assert result == f"Label ({url})", f"url={url!r}, got {result!r}"
+
     def test_falls_back_to_parenthesized_form_for_urls_without_a_scheme(self):
         """URLs without an RFC 3986 scheme (relative paths like `/docs`,
         fragment-only anchors like `#section`, protocol-relative like

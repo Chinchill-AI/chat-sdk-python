@@ -813,14 +813,22 @@ class ThreadImpl:
             thread = data
             # Invalidate caches derived from the previous binding so the
             # rebind block below resolves them fresh against the new
-            # adapter/chat. Without this, `_state_adapter_instance` could
-            # continue pointing at the OLD chat's state backend and
-            # `_channel_cache` at the OLD adapter's channel — the thread
-            # would report the new adapter name but route state/channel
-            # operations to the previous context.
+            # adapter/chat. Without this, attributes copied from the old
+            # binding would continue to route state/channel/message
+            # operations to the previous context — the classic split-
+            # routing bug.
+            #
+            # Every attribute that embeds a reference to the old context
+            # gets cleared here: `_state_adapter_instance` (old chat's
+            # state backend), `_channel_cache` (old adapter's channel),
+            # `_message_history` (old chat's history cache), and
+            # `_recent_messages` (old adapter's fetched content). The
+            # rebind block re-resolves each as needed.
             if adapter is not None or chat is not None:
                 thread._state_adapter_instance = None
                 thread._channel_cache = None
+                thread._message_history = None
+                thread._recent_messages = []
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
@@ -846,32 +854,37 @@ class ThreadImpl:
                     is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
                 )
             )
+        # `adapter` and `chat` are orthogonal: if both are passed we apply
+        # both (explicit adapter + chat's state). If only one is passed,
+        # the other's effects are left lazy. An earlier `elif chat` branch
+        # silently dropped chat's state when adapter was also passed,
+        # creating a split-routing bug.
         if adapter is not None:
             thread._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Keep _adapter_name in sync with the explicit adapter so
             # to_json() doesn't serialize a stale name after rebind.
             thread._adapter_name = adapter.name
-        elif chat is not None:
-            # Resolve the adapter against the new Chat. `_adapter_name` may
-            # be None for threads constructed directly by a Chat instance
-            # (as opposed to dict-revived ones), so fall back to the
-            # currently-bound adapter's name as the lookup key. Without
-            # this, a chat rebind on a direct-constructed thread would
-            # update state routing but leave `_adapter` pointing at the
-            # OLD chat's adapter — a split-routing bug where `post()` and
-            # `set_state()` target different Chat contexts.
-            lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
-            if lookup_name:
-                resolved = chat.get_adapter(lookup_name)
-                if resolved is None:
-                    raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
-                thread._adapter = resolved
-                thread._adapter_name = lookup_name
+        if chat is not None:
+            # If the caller didn't also pass an explicit adapter, resolve
+            # one from chat using the current name. Falls back to
+            # `_adapter.name` for direct-constructed threads where
+            # `_adapter_name` was never stored.
+            if adapter is None:
+                lookup_name = thread._adapter_name or (thread._adapter.name if thread._adapter is not None else None)
+                if lookup_name:
+                    resolved = chat.get_adapter(lookup_name)
+                    if resolved is None:
+                        raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
+                    thread._adapter = resolved
+                    thread._adapter_name = lookup_name
+            # State always comes from chat when chat is explicitly passed.
             thread._state_adapter_instance = chat.get_state()
-        elif has_chat_singleton() and thread._adapter_name:
-            # Eagerly bind from the active/global chat so the thread doesn't
-            # lazily re-resolve later (which could hit a different chat).
+        elif adapter is None and has_chat_singleton() and thread._adapter_name:
+            # Singleton fallback only fires when neither adapter nor chat
+            # were explicitly passed. Eagerly bind from the active/global
+            # chat so the thread doesn't lazily re-resolve later (which
+            # could hit a different chat).
             active = get_chat_singleton()
             resolved = active.get_adapter(thread._adapter_name)
             if resolved is not None:
