@@ -621,7 +621,14 @@ class ThreadImpl:
                     pass  # interval elapsed, do the edit
                 if stop_event.is_set() or msg is None:
                     break
-                content = renderer.get_committable_text()
+                # Use `render()` (not `get_committable_text`) for fallback
+                # streaming: the fallback path uses full-message replacement
+                # edits, so we want the current rendered state (including
+                # `_remend` inline-marker repair). `get_committable_text` is
+                # for append-only native-streaming surfaces and holds back
+                # content that may still change — wrong method for this
+                # code path. Matches upstream packages/chat/src/thread.ts.
+                content = renderer.render()
                 if content.strip() and content != last_edit_content:
                     try:
                         await self.adapter.edit_message(
@@ -642,13 +649,16 @@ class ThreadImpl:
             async for chunk in text_stream:
                 renderer.push(chunk)
                 if msg is None:
-                    content = renderer.get_committable_text()
+                    # `render()` for the first-post content too — same
+                    # reasoning as the edit loop above.
+                    content = renderer.render()
                     if content.strip():
                         msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=content))
                         thread_id_for_edits = msg.thread_id or self._id
                         last_edit_content = content
                         pending_edit = asyncio.create_task(_edit_loop())
         except Exception as exc:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Capture so we can run the cleanup + flush below even when the
             # stream raises mid-iteration (e.g. LLM connection drops). The
             # alternative — letting the exception propagate immediately —
@@ -694,6 +704,12 @@ class ThreadImpl:
         # Always ensure the final content is sent, regardless of what _edit_loop did.
         # Re-check last_edit_content after awaiting pending_edit since _edit_loop
         # may have updated it concurrently.
+        #
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+        # Upstream ships `accumulated` (raw) for the final edit and the
+        # SentMessage; we ship `final_content` (remend'd, inline markers
+        # auto-closed). Narrow UX refinement — unobservable when streams
+        # close their own markers.
         if final_content.strip() and final_content != last_edit_content:
             await self.adapter.edit_message(
                 thread_id_for_edits,
@@ -821,14 +837,18 @@ class ThreadImpl:
             # Every attribute that embeds a reference to the old context
             # gets cleared here: `_state_adapter_instance` (old chat's
             # state backend), `_channel_cache` (old adapter's channel),
-            # `_message_history` (old chat's history cache), and
-            # `_recent_messages` (old adapter's fetched content). The
-            # rebind block re-resolves each as needed.
+            # `_message_history` (old chat's history cache),
+            # `_recent_messages` (old adapter's fetched content), and
+            # `_is_subscribed_context` (handler-context flag from the
+            # old chat — a thread rebound to a new context shouldn't
+            # claim it's still inside a subscribed handler). The rebind
+            # block re-resolves each as needed.
             if adapter is not None or chat is not None:
                 thread._state_adapter_instance = None
                 thread._channel_cache = None
                 thread._message_history = None
                 thread._recent_messages = []
+                thread._is_subscribed_context = False
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall

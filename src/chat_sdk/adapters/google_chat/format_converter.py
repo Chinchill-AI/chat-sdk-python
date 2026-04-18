@@ -323,8 +323,10 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             return f"<{url}|{link_text}>"
 
         if node_type == "heading":
-            # Intentional improvement over TS SDK: Google Chat has no heading
-            # syntax, so we wrap headings in bold (*...*) for visual emphasis.
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+            # Google Chat has no heading syntax; upstream falls through to
+            # plain-text concatenation and loses the visual hierarchy. We
+            # wrap headings in bold (*...*) as the closest approximation.
             children = node.get("children", [])
             content = "".join(self._node_to_gchat(child) for child in children)
             return f"*{content}*"
@@ -350,6 +352,10 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             return f"```\n{table_to_ascii(node)}\n```"
 
         if node_type == "image":
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+            # Upstream has no image branch; the default fallback concatenates
+            # children only, dropping the URL. We emit `{alt} ({url})` or the
+            # bare URL so the content survives.
             alt = node.get("alt", "")
             url = node.get("url", "")
             if alt:

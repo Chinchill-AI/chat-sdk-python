@@ -386,16 +386,16 @@ class TestStreaming:
         # Should NOT have posted "..."
         placeholder_calls = [c for c in adapter._post_calls if c[1] == "..."]
         assert len(placeholder_calls) == 0
-        # Final content is delivered through post since no mid-stream commit
-        # fired (no newline in the chunks) and the empty-content guard
-        # prevents an intermediate empty post. The whole exchange is
-        # exactly one post_message("Hi") and zero edits — any regression
-        # that splits it into an early post + late edit would fail here.
+        # With the placeholder disabled, the first chunk triggers the
+        # initial post; subsequent chunks accumulate and the edit loop
+        # flushes them via edit_message. Matches upstream TS behavior.
         assert len(adapter._post_calls) == 1
-        assert len(adapter._edit_calls) == 0
-        only_post = adapter._post_calls[0]
-        assert isinstance(only_post[1], PostableMarkdown)
-        assert only_post[1].markdown == "Hi"
+        first_post = adapter._post_calls[0]
+        assert isinstance(first_post[1], PostableMarkdown)
+        assert first_post[1].markdown == "H"
+        last_edit = adapter._edit_calls[-1]
+        assert isinstance(last_edit[2], PostableMarkdown)
+        assert last_edit[2].markdown == "Hi"
 
     # Python-specific regression: ensure whitespace-only streams don't leave
     # the placeholder stuck on the message. This is a deliberate divergence

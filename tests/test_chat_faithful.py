@@ -344,13 +344,16 @@ class TestFallbackStreamingPlaceholder:
         # No placeholder "..." should have been posted
         for _tid, content in adapter._post_calls:
             assert content != "..."
-        # With placeholder=None and no-newline chunks, the post-4.26 empty-content
-        # guard defers the first commit until stream end, so the final content
-        # arrives via post rather than an intermediate edit.
+        # With placeholder=None the first chunk posts immediately; subsequent
+        # chunks are delivered via edit_message (matches upstream TS's
+        # `render()`-based edit loop).
         assert len(adapter._post_calls) >= 1
-        last_thread_id, last_content = adapter._post_calls[-1]
-        assert last_thread_id == "slack:C123:1234.5678"
-        last_markdown = last_content.markdown if hasattr(last_content, "markdown") else last_content
+        first_thread_id, _first_content = adapter._post_calls[0]
+        assert first_thread_id == "slack:C123:1234.5678"
+        # The final edit carries the full "Hi" payload.
+        assert len(adapter._edit_calls) >= 1
+        last_edit_content = adapter._edit_calls[-1][2]
+        last_markdown = last_edit_content.markdown if hasattr(last_edit_content, "markdown") else last_edit_content
         assert last_markdown == "Hi"
 
 

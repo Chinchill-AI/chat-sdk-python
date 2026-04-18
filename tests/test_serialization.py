@@ -638,6 +638,33 @@ class TestThreadFromJsonFaithful:
         # And the adapter is actually rebound.
         assert rebound.adapter.name == "teams"
 
+    def test_should_reset_is_subscribed_context_on_rebind(self, mock_state):
+        """A thread constructed inside a subscribed-context handler carries
+        `_is_subscribed_context=True`. If that thread is rebound to a new
+        adapter/chat, the new context has no active subscription — the flag
+        should clear so `is_subscribed()` doesn't short-circuit to True
+        against the new state backend. Regression for a self-review-
+        subagent finding."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+                is_subscribed_context=True,
+            )
+        )
+        assert original._is_subscribed_context is True
+
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._is_subscribed_context is False
+
     def test_should_invalidate_recent_messages_and_message_history_on_rebind(self, mock_state):
         """Two additional caches that carry previous-binding references must
         also drop on idempotent rebind: `_recent_messages` (populated from
