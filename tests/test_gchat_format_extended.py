@@ -127,6 +127,45 @@ class TestToAst:
         _walk(ast)
         assert link_urls == ["https://example.com"]
 
+    def test_gchat_multiple_custom_links_in_one_paragraph(self):
+        """A single paragraph with multiple `<url|text>` tokens must produce
+        the right number of link nodes in the right order, with the
+        surrounding text correctly split between them. Catches regressions
+        in the placeholder-substitution split logic (off-by-one, dropped
+        text, wrong link order)."""
+        converter = _converter()
+        ast = converter.to_ast(
+            "Contact <mailto:a@example.com|Alice>, <mailto:b@example.com|Bob>, or <https://example.com|the site>."
+        )
+
+        # Collect (text, link) sequence in document order.
+        flat: list[tuple[str, dict | str]] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                ntype = node.get("type")
+                if ntype == "text":
+                    flat.append(("text", node.get("value", "")))
+                elif ntype == "link":
+                    children = node.get("children", []) or []
+                    label = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                    flat.append(("link", {"url": node.get("url", ""), "text": label}))
+                else:
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+        _walk(ast)
+
+        assert flat == [
+            ("text", "Contact "),
+            ("link", {"url": "mailto:a@example.com", "text": "Alice"}),
+            ("text", ", "),
+            ("link", {"url": "mailto:b@example.com", "text": "Bob"}),
+            ("text", ", or "),
+            ("link", {"url": "https://example.com", "text": "the site"}),
+            ("text", "."),
+        ]
+
     def test_gchat_custom_link_parses_url_with_balanced_parens(self):
         """URLs containing `(...)` (e.g. Wikipedia-style) must round-trip
         intact. The Markdown parser doesn't implement CommonMark's balanced-
@@ -423,6 +462,17 @@ class TestExtractPlainText:
         assert (
             converter.extract_plain_text("See <https://example.com|Example Site> for details")
             == "See Example Site for details"
+        )
+
+    def test_strips_gchat_custom_link_with_balanced_parens_in_url(self):
+        """The plain-text path must also strip cleanly when the URL contains
+        unescaped `)`. Regex stops at `|`/`>`, not `)`, so the label is what
+        survives — but pin it explicitly so a future regex tweak can't
+        regress this without failing the test."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("See <https://en.wikipedia.org/wiki/Foo_(bar)|Wiki> for info")
+            == "See Wiki for info"
         )
 
 

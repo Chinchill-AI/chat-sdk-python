@@ -416,6 +416,55 @@ class TestStreaming:
         assert isinstance(final_edit[2], PostableMarkdown)
         assert final_edit[2].markdown == " "
 
+    # Python-specific regression: when the placeholder-clear edit_message(" ")
+    # raises (e.g. Telegram rejects whitespace-only content with a
+    # ValidationError), `_fallback_stream` must log + swallow the error so
+    # `thread.post()` still returns a SentMessage. The previous test pinned
+    # the happy path; this one pins the defensive try/except added in
+    # commit 8dd34d1 specifically for adapters that reject blank text.
+    @pytest.mark.asyncio
+    async def test_should_swallow_placeholder_clear_error_on_strict_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        # Telegram's adapter raises ValidationError when text.strip() is empty.
+        # Simulate by intercepting edit_message and raising on the " " payload.
+        clear_attempts: list[PostableMarkdown] = []
+        original_edit = adapter.edit_message
+
+        async def strict_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            if isinstance(message, PostableMarkdown) and not message.markdown.strip():
+                clear_attempts.append(message)
+                raise ValueError("Message text cannot be empty")
+            return await original_edit(thread_id, message_id, message)
+
+        adapter.edit_message = strict_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, logger=logger)
+        # Whitespace-only stream triggers the placeholder-clear branch.
+        text_stream = _create_text_stream(["   ", "\n", "  \n"])
+
+        # Must not raise — the SDK should log and fall through to the
+        # upstream "leave placeholder visible" behavior on rejection.
+        sent = await thread.post(text_stream)
+
+        # Placeholder was posted, then exactly one clear edit was attempted
+        # (and rejected). No retry, no infinite loop.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        assert len(clear_attempts) == 1
+        assert clear_attempts[0].markdown == " "
+        # The warn log fired with the expected message (asserting the exact
+        # string so a refactor that changes the log can't silently break the
+        # observability contract).
+        assert any(
+            call[0] == "fallbackStream placeholder-clear edit failed; placeholder will remain visible"
+            for call in logger.warn.calls
+        ), [c[0] for c in logger.warn.calls]
+        # Stream contract still holds — we got a SentMessage back.
+        assert sent is not None
+        assert sent.id == "msg-1"
+
     # it("should handle empty stream with disabled placeholder")
     @pytest.mark.asyncio
     async def test_should_handle_empty_stream(self):

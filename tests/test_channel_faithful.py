@@ -669,6 +669,30 @@ class TestSerialization:
         assert channel.adapter.name == "teams"
         assert channel.to_json()["adapterName"] == "teams"
 
+    def test_should_rebind_adapter_when_data_is_already_a_channelimpl(self):
+        """Idempotent path: when ``data`` is already a ChannelImpl (e.g. revived
+        via ``object_hook``), passing an explicit ``adapter=`` must still rebind
+        it — an early-return shortcut would leave ``_adapter`` stale. Symmetric
+        with the ThreadImpl regression in test_serialization.py."""
+        from chat_sdk.testing import create_mock_adapter as _create
+
+        first = _create("slack")
+        second = _create("teams")
+        original = ChannelImpl.from_json(
+            {
+                "_type": "chat:Channel",
+                "id": "C123",
+                "adapter_name": "slack",
+                "is_dm": False,
+            },
+            first,
+        )
+        rebound = ChannelImpl.from_json(original, second)
+
+        # Rebind applied even though data was already a ChannelImpl:
+        assert rebound.adapter.name == "teams"
+        assert rebound.to_json()["adapterName"] == "teams"
+
 
 # ===========================================================================
 # deriveChannelId (tested in channel.test.ts alongside ChannelImpl)
