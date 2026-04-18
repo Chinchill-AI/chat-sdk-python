@@ -693,6 +693,35 @@ class TestSerialization:
         assert rebound.adapter.name == "teams"
         assert rebound.to_json()["adapterName"] == "teams"
 
+    def test_should_invalidate_state_cache_on_idempotent_rebind(self):
+        """When `from_json(existing_instance, adapter=X)` rebinds an already-
+        revived ChannelImpl, `_state_adapter_instance` must be invalidated
+        so subsequent `get_state`/`set_state` calls route through the new
+        binding, not the previous one. Regression for a Codex P1."""
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        first_adapter = _create("slack")
+        second_adapter = _create("teams")
+        first_state = _create_state()
+
+        # Construct a channel with the first adapter + state explicitly
+        # (so the state cache is populated).
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=first_adapter,
+                state_adapter=first_state,
+            )
+        )
+        assert original._state_adapter_instance is first_state
+
+        # Rebind via the idempotent path. State cache must drop so the
+        # next access resolves against the new binding.
+        rebound = ChannelImpl.from_json(original, second_adapter)
+        assert rebound._state_adapter_instance is None
+        assert rebound.adapter.name == "teams"
+
 
 # ===========================================================================
 # deriveChannelId (tested in channel.test.ts alongside ChannelImpl)

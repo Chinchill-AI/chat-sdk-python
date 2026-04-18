@@ -423,6 +423,13 @@ class ChannelImpl:
         """
         if isinstance(data, ChannelImpl):
             channel = data
+            # Invalidate the state-adapter cache so the rebind block below
+            # resolves it fresh against the new adapter/chat. Without this,
+            # `get_state` / `set_state` calls would continue to route
+            # through the OLD chat's state backend even though the
+            # channel now reports the new adapter name.
+            if adapter is not None or chat is not None:
+                channel._state_adapter_instance = None
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall

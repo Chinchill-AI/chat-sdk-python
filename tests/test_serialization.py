@@ -604,6 +604,40 @@ class TestThreadFromJsonFaithful:
         assert rebound.adapter.name == "teams"
         assert rebound.to_json()["adapterName"] == "teams"
 
+    def test_should_invalidate_state_and_channel_caches_on_idempotent_rebind(self, mock_state):
+        """When `from_json(existing_instance, adapter=X)` rebinds an already-
+        revived ThreadImpl, caches derived from the previous binding must be
+        invalidated — otherwise `_state_adapter_instance` would continue
+        routing to the OLD chat's state backend and `_channel_cache` would
+        still reference the OLD adapter. Regression for a Codex P1."""
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("teams")
+        first_state = create_mock_state()
+
+        # Prime the thread with the first adapter + state, and force both
+        # caches (state and channel) to populate.
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=first_adapter,
+                state_adapter=first_state,
+                channel_id="C123",
+            )
+        )
+        _ = original.channel  # populate _channel_cache
+        assert original._channel_cache is not None
+        assert original._state_adapter_instance is first_state
+
+        # Rebind to a different adapter. Both caches must drop so the next
+        # access resolves against the new binding.
+        rebound = ThreadImpl.from_json(original, adapter=second_adapter)
+        assert rebound._channel_cache is None
+        assert rebound._state_adapter_instance is None
+        # And the adapter is actually rebound.
+        assert rebound.adapter.name == "teams"
+
     def test_should_sync_adapter_name_when_explicit_adapter_is_bound(self, mock_state):
         """from_json(data, adapter=X) must update _adapter_name to X.name so
         to_json() doesn't serialize a stale name that refers to a different

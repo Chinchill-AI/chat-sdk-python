@@ -811,6 +811,16 @@ class ThreadImpl:
         """
         if isinstance(data, ThreadImpl):
             thread = data
+            # Invalidate caches derived from the previous binding so the
+            # rebind block below resolves them fresh against the new
+            # adapter/chat. Without this, `_state_adapter_instance` could
+            # continue pointing at the OLD chat's state backend and
+            # `_channel_cache` at the OLD adapter's channel — the thread
+            # would report the new adapter name but route state/channel
+            # operations to the previous context.
+            if adapter is not None or chat is not None:
+                thread._state_adapter_instance = None
+                thread._channel_cache = None
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
