@@ -665,6 +665,61 @@ class TestThreadFromJsonFaithful:
         rebound = ThreadImpl.from_json(original, adapter=second_adapter)
         assert rebound._is_subscribed_context is False
 
+    def test_should_leave_thread_unchanged_when_chat_rebind_lookup_fails(self, mock_state):
+        """Transactional rebind: `from_json(existing_thread, chat=Y)` must
+        either fully apply the rebind or leave the thread untouched. If
+        `chat.get_adapter(name)` returns None, the RuntimeError must fire
+        BEFORE any cache invalidation — callers that catch the exception
+        should be able to keep using the thread with its original
+        bindings intact. Regression for a Codex P2."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state, create_test_message
+
+        slack_a = create_mock_adapter("slack")
+        state_a = create_mock_state()
+        # Chat B has a different adapter name, so looking up "slack" will fail.
+        chat_b = Chat(
+            ChatConfig(
+                user_name="bot-b",
+                adapters={"teams": create_mock_adapter("teams")},
+                state=create_mock_state(),
+            )
+        )
+
+        original = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=slack_a,
+                state_adapter=state_a,
+                channel_id="C123",
+                initial_message=create_test_message("m1", "hello"),
+                is_subscribed_context=True,
+            )
+        )
+        # Capture every state-bearing attribute before the rebind.
+        snapshot = {
+            "_adapter": original._adapter,
+            "_adapter_name": original._adapter_name,
+            "_state_adapter_instance": original._state_adapter_instance,
+            "_channel_cache": original._channel_cache,
+            "_message_history": original._message_history,
+            "_recent_messages": list(original._recent_messages),
+            "_is_subscribed_context": original._is_subscribed_context,
+        }
+
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            ThreadImpl.from_json(original, chat=chat_b)
+
+        # Every cached attribute must be exactly as it was before. A
+        # non-transactional implementation would have nulled some of these
+        # before the raise, making recovery unsafe.
+        for attr, before in snapshot.items():
+            after = getattr(original, attr)
+            assert after == before, f"{attr}: expected {before!r}, got {after!r}"
+        # Extra identity check for objects where equality might be loose.
+        assert original._adapter is snapshot["_adapter"]
+        assert original._state_adapter_instance is snapshot["_state_adapter_instance"]
+
     def test_should_invalidate_recent_messages_and_message_history_on_rebind(self, mock_state):
         """Two additional caches that carry previous-binding references must
         also drop on idempotent rebind: `_recent_messages` (populated from

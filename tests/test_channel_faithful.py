@@ -722,6 +722,48 @@ class TestSerialization:
         assert rebound._state_adapter_instance is None
         assert rebound.adapter.name == "teams"
 
+    def test_should_leave_channel_unchanged_when_chat_rebind_lookup_fails(self):
+        """Transactional rebind: `from_json(existing_channel, chat=Y)` must
+        raise BEFORE mutating any cache when the adapter lookup against
+        the new chat fails. Callers catching the exception get their
+        original channel back unchanged. Regression for a Codex P2."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter as _create
+        from chat_sdk.testing import create_mock_state as _create_state
+
+        slack_a = _create("slack")
+        state_a = _create_state()
+        chat_b = Chat(
+            ChatConfig(
+                user_name="bot-b",
+                adapters={"teams": _create("teams")},  # no 'slack'
+                state=_create_state(),
+            )
+        )
+
+        original = ChannelImpl(
+            _ChannelImplConfigWithAdapter(
+                id="C123",
+                adapter=slack_a,
+                state_adapter=state_a,
+            )
+        )
+        snapshot = {
+            "_adapter": original._adapter,
+            "_adapter_name": original._adapter_name,
+            "_state_adapter_instance": original._state_adapter_instance,
+            "_message_history": original._message_history,
+        }
+
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            ChannelImpl.from_json(original, chat=chat_b)
+
+        for attr, before in snapshot.items():
+            after = getattr(original, attr)
+            assert after == before, f"{attr}: expected {before!r}, got {after!r}"
+        assert original._adapter is snapshot["_adapter"]
+        assert original._state_adapter_instance is snapshot["_state_adapter_instance"]
+
     def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_channel(self):
         """When `from_json(existing_channel, chat=Y)` rebinds a channel that
         was constructed directly (so `_adapter_name` is None), the new

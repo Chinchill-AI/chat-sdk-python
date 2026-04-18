@@ -423,11 +423,26 @@ class ChannelImpl:
         """
         if isinstance(data, ChannelImpl):
             channel = data
-            # Invalidate caches derived from the previous binding so the
-            # rebind block below resolves them fresh against the new
-            # adapter/chat. Both `_state_adapter_instance` (old chat's
-            # state backend) and `_message_history` (old chat's cache)
-            # would route to the previous context otherwise.
+            # Transactional rebind: if chat= is passed without adapter=,
+            # we'll need to resolve the adapter from the new chat by name.
+            # Pre-flight that lookup and raise (leaving the channel
+            # unchanged) BEFORE invalidating caches, so a caller that
+            # catches the RuntimeError isn't left with a partially-reset
+            # instance. The binding block below repeats the lookup when
+            # it actually applies the result (cheap).
+            if chat is not None and adapter is None:
+                _lookup_name = channel._adapter_name or (
+                    channel._adapter.name if channel._adapter is not None else None
+                )
+                if _lookup_name and chat.get_adapter(_lookup_name) is None:
+                    raise RuntimeError(
+                        f'Adapter "{_lookup_name}" not found in the provided Chat instance'
+                    )
+
+            # Validation passed — safe to invalidate.
+            # Both `_state_adapter_instance` (old chat's state backend)
+            # and `_message_history` (old chat's cache) would route to
+            # the previous context otherwise.
             if adapter is not None or chat is not None:
                 channel._state_adapter_instance = None
                 channel._message_history = None
