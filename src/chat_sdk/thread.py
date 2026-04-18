@@ -637,6 +637,7 @@ class ThreadImpl:
         if msg is not None:
             pending_edit = asyncio.create_task(_edit_loop())
 
+        stream_error: BaseException | None = None
         try:
             async for chunk in text_stream:
                 renderer.push(chunk)
@@ -647,11 +648,29 @@ class ThreadImpl:
                         thread_id_for_edits = msg.thread_id or self._id
                         last_edit_content = content
                         pending_edit = asyncio.create_task(_edit_loop())
+        except BaseException as exc:
+            # Capture so we can run the cleanup + flush below even when the
+            # stream raises mid-iteration (e.g. LLM connection drops). The
+            # alternative — letting the exception propagate immediately —
+            # would leak pending_edit as an orphan task AND strand the
+            # placeholder as a forever-"..." message, which is exactly the
+            # pathology the placeholder-clear divergence was added to fix.
+            stream_error = exc
         finally:
             stop_event.set()
 
         if pending_edit is not None:
-            await pending_edit
+            try:
+                await pending_edit
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn("fallbackStream edit-loop task raised", exc)
+
+        # If the stream raised before we ever posted anything, there's no
+        # SentMessage to return and no placeholder to clean up — propagate
+        # the original error so the caller sees it.
+        if stream_error is not None and msg is None:
+            raise stream_error
 
         accumulated = renderer.get_text()
         final_content = renderer.finish()
@@ -705,6 +724,13 @@ class ThreadImpl:
         )
         if self._message_history is not None:
             await self._message_history.append(self._id, _to_message(sent))
+
+        # If the stream raised mid-way, we've now flushed whatever partial
+        # content was rendered (so the user sees real content instead of a
+        # stranded "..."). Re-raise the original error so the caller still
+        # learns the stream failed.
+        if stream_error is not None:
+            raise stream_error
 
         return sent
 

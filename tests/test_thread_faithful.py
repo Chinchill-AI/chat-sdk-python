@@ -416,6 +416,43 @@ class TestStreaming:
         assert isinstance(final_edit[2], PostableMarkdown)
         assert final_edit[2].markdown == " "
 
+    # Python-specific regression: when a streaming source raises mid-stream
+    # (e.g. LLM connection drops), `_fallback_stream` must still flush the
+    # accumulated partial content + clean up the background edit task
+    # before re-raising. Without this, the placeholder stays stranded as
+    # "..." even though partial content was rendered, and pending_edit
+    # becomes an orphan task. This is the exact pathology the placeholder-
+    # clear divergence was designed to fix — but previously only ran on
+    # the happy path.
+    @pytest.mark.asyncio
+    async def test_should_flush_and_cleanup_when_stream_raises_midway(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
+
+        stream_error = RuntimeError("LLM connection dropped")
+
+        async def failing_stream() -> AsyncIterator[str]:
+            yield "Partial content\n"
+            await asyncio.sleep(0.05)  # Let the edit loop commit the partial.
+            raise stream_error
+
+        # Caller must still see the original exception — the flush is best-
+        # effort, not a swallow.
+        with pytest.raises(RuntimeError, match="LLM connection dropped"):
+            await thread.post(failing_stream())
+
+        # Placeholder was posted and the partial content was flushed via an
+        # edit. A regression that skipped cleanup would leave `_post_calls`
+        # with just "..." and no edits.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        markdown_edits = [c for _, _, c in adapter._edit_calls if isinstance(c, PostableMarkdown)]
+        assert markdown_edits, "expected the edit loop to have flushed partial content before re-raise"
+        # The latest edit must contain the partial content the stream produced.
+        assert "Partial content" in markdown_edits[-1].markdown
+
     # Python-specific regression: when the placeholder-clear edit_message(" ")
     # raises (e.g. Telegram rejects whitespace-only content with a
     # ValidationError), `_fallback_stream` must log + swallow the error so

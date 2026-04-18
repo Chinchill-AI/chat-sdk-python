@@ -79,6 +79,41 @@ class TestToAst:
         _walk(ast)
         assert found, "Expected a link node with url='https://example.com' and text='Example'"
 
+    def test_to_ast_preserves_bold_and_strike_markers_inside_code_spans(self):
+        """Bold / strikethrough pre-parse passes must not rewrite marker
+        characters inside code spans. Without the code-stash pass that
+        protects them, `` `*foo*` `` would come back as inlineCode with
+        value `**foo**` (doubled asterisks) and `` `~bar~` `` as
+        `~~bar~~`. Same class of pass-interaction bug as the Codex
+        finding on `extract_plain_text`, caught by a subagent self-review."""
+        converter = _converter()
+
+        # Inline code with bold-ish markers
+        ast1 = converter.to_ast("Use `*foo*` here")
+        inline_values: list[str] = []
+
+        def _walk(node: object, target: str, out: list[str]) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == target:
+                    out.append(node.get("value", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child, target, out)
+
+        _walk(ast1, "inlineCode", inline_values)
+        assert inline_values == ["*foo*"], inline_values
+
+        # Inline code with strike-ish markers
+        ast2 = converter.to_ast("Use `~bar~` here")
+        inline_values2: list[str] = []
+        _walk(ast2, "inlineCode", inline_values2)
+        assert inline_values2 == ["~bar~"], inline_values2
+
+        # Fenced code with a mix of markers
+        ast3 = converter.to_ast("```\n*bold* and ~strike~\n```")
+        fenced_values: list[str] = []
+        _walk(ast3, "code", fenced_values)
+        assert any("*bold* and ~strike~" in v for v in fenced_values), fenced_values
+
     def test_gchat_custom_link_syntax_inside_code_span_stays_literal(self):
         """`<url|text>` inside inline or fenced code is user content, not a
         link. The AST-placeholder substitution must restore the original
@@ -346,6 +381,32 @@ class TestFromAst:
             ],
         }
         assert converter.from_ast(ok_ast) == "<https://example.com|ok>"
+
+    def test_emits_bare_url_when_link_label_is_empty(self):
+        """A link node with empty children can't round-trip through
+        `<url|text>` (parse regex requires ≥1 char in the label) or
+        `text (url)` (reads as a parenthetical). Emit just the URL so
+        Google Chat auto-links it — the empty label carried no
+        information anyway."""
+        converter = _converter()
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        # No `<url|>` (would be visible as literal angle brackets) and no
+        # `(https://example.com)` parenthetical either.
+        assert converter.from_ast(ast) == "https://example.com"
 
     def test_falls_back_to_parenthesized_form_for_urls_without_a_scheme(self):
         """URLs without an RFC 3986 scheme (relative paths like `/docs`,

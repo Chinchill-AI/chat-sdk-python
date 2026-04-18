@@ -47,21 +47,26 @@ def _inject_link_placeholders(
     node: dict,
     links: list[tuple[str, str]],
     placeholder_re: re.Pattern[str],
+    code_contents: list[str] | None = None,
+    code_placeholder_re: re.Pattern[str] | None = None,
 ) -> None:
-    """Walk the AST in place and expand placeholder tokens in text nodes into
-    real link nodes. Used by ``to_ast`` to bypass the Markdown parser for
-    custom ``<url|text>`` tokens whose URLs may contain characters the parser
-    can't round-trip (e.g. unescaped ``)``).
+    """Walk the AST in place and expand placeholder tokens.
 
-    Code spans (``inlineCode`` / ``code``) are handled specially: their
-    content is literal, so placeholders in them are rewritten back to the
-    original ``<url|text>`` syntax rather than being turned into link nodes.
-    Out-of-range placeholder indices (which can happen with crafted input
-    that guessed the nonce) are left as literal text rather than raising
-    ``IndexError``.
+    Text-node placeholders for ``<url|text>`` are expanded into real link
+    nodes. ``inlineCode`` / ``code`` nodes are handled specially:
+
+    - Any ``\\ue002CODE{idx}-{nonce}\\ue002`` placeholder in the node value
+      is restored to the original code content (which was stashed before
+      the bold / strikethrough pre-passes so those passes can't rewrite
+      marker characters inside code spans).
+    - Any stray link placeholder in the value is rewritten back to the
+      original ``<url|text>`` literal, since code-span content is literal.
+
+    Out-of-range indices (which can happen with crafted input that guessed
+    a nonce) are left as literal text rather than raising ``IndexError``.
     """
 
-    def _placeholder_to_literal(value: str) -> str:
+    def _link_placeholder_to_literal(value: str) -> str:
         def _sub(match: re.Match[str]) -> str:
             i = int(match.group(1))
             if 0 <= i < len(links):
@@ -70,6 +75,18 @@ def _inject_link_placeholders(
             return match.group(0)
 
         return placeholder_re.sub(_sub, value)
+
+    def _restore_code(value: str) -> str:
+        if code_contents is None or code_placeholder_re is None:
+            return value
+
+        def _sub(match: re.Match[str]) -> str:
+            i = int(match.group(1))
+            if 0 <= i < len(code_contents):
+                return code_contents[i]
+            return match.group(0)
+
+        return code_placeholder_re.sub(_sub, value)
 
     children = node.get("children")
     if not isinstance(children, list):
@@ -107,14 +124,18 @@ def _inject_link_placeholders(
                         # Preserve as literal text rather than raising.
                         new_children.append({"type": "text", "value": f"\ue000LINK{idx}\ue000"})
         elif ctype in ("inlineCode", "code") and isinstance(child.get("value"), str):
-            # Code spans are literal — a `<url|text>` inside them is user
-            # content, not a link. Restore the original syntax rather than
-            # leaving the placeholder embedded in the code value.
-            if "\ue000" in child["value"]:
-                child["value"] = _placeholder_to_literal(child["value"])
+            # Restore stashed code content (raw user bytes including any
+            # `*`/`~`/`<url|text>` that the pre-parse passes would have
+            # otherwise mangled).
+            value = _restore_code(child["value"])
+            # Also restore any stray link placeholder — code-span content
+            # is literal, so `<url|text>` should stay as-is.
+            if "\ue000" in value:
+                value = _link_placeholder_to_literal(value)
+            child["value"] = value
             new_children.append(child)
         else:
-            _inject_link_placeholders(child, links, placeholder_re)
+            _inject_link_placeholders(child, links, placeholder_re, code_contents, code_placeholder_re)
             new_children.append(child)
     node["children"] = new_children
 
@@ -135,7 +156,32 @@ class GoogleChatFormatConverter(BaseFormatConverter):
         Converts Google Chat format to standard markdown, then parses
         with the shared parser.
         """
-        markdown = platform_text
+        # Stash code-span *contents* (keeping the surrounding backticks)
+        # behind nonce'd placeholders BEFORE running the bold/strike
+        # substitutions. Without this, input like `` `*foo*` `` would have
+        # the `*foo*` inside the code span rewritten to `**foo**` by the
+        # bold pass, and the user would see doubled asterisks in the
+        # resulting `inlineCode` node. The backticks stay, so the
+        # Markdown parser still produces proper `inlineCode` / `code`
+        # nodes; the walker restores the original content at the end.
+        code_nonce = secrets.token_hex(4)
+        code_contents: list[str] = []
+        code_placeholder_re = re.compile(rf"\ue002CODE(\d+)-{code_nonce}\ue002")
+
+        def _stash_code(match: re.Match[str]) -> str:
+            code_contents.append(match.group(2))
+            return f"{match.group(1)}\ue002CODE{len(code_contents) - 1}-{code_nonce}\ue002{match.group(3)}"
+
+        # Fenced first (``` ... ```), then inline (` ... `). Order matters:
+        # fenced-first avoids ``` being read as three adjacent inline spans.
+        # The fenced pattern requires a newline after the opening fence
+        # because our Markdown parser treats `` ``` TEXT ``` `` as a lang
+        # tag rather than a code block — preserving that newline keeps the
+        # placeholder'd form parseable the same way the original was.
+        # The inline pattern uses negative look-around to avoid matching
+        # backticks that are part of a (now placeholder'd) fence.
+        markdown = re.sub(r"(```[ \t]*\n)([\s\S]*?)(\n```)", _stash_code, platform_text)
+        markdown = re.sub(r"(?<!`)(`)([^`\n]+)(`)(?!`)", _stash_code, markdown)
 
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         # Google Chat custom link syntax `<url|text>` has to survive our
@@ -168,8 +214,8 @@ class GoogleChatFormatConverter(BaseFormatConverter):
 
         # Italic and code are the same format as markdown
         ast = parse_markdown(markdown)
-        if links:
-            _inject_link_placeholders(ast, links, placeholder_re)
+        if links or code_contents:
+            _inject_link_placeholders(ast, links, placeholder_re, code_contents, code_placeholder_re)
         return ast
 
     def extract_plain_text(self, platform_text: str) -> str:
@@ -251,6 +297,13 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             link_text = "".join(self._node_to_gchat(child) for child in children)
             url = node.get("url", "")
             if link_text == url:
+                return url
+            # An empty label can't round-trip in either `<url|text>` or
+            # `text (url)` form (the parser regex requires ≥1 char in the
+            # label, and "(url)" alone reads as a parenthetical). Emit the
+            # bare URL — Google Chat auto-detects it as a link and no
+            # structure is lost beyond the empty label itself.
+            if not link_text:
                 return url
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
             # Fall back to plain `text (url)` when the `<url|text>` form
