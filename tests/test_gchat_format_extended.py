@@ -106,6 +106,29 @@ class TestToAst:
         fenced_values = _values_of_type(ast_fenced, "code")
         assert any("<https://api.com|example>" in v for v in fenced_values), fenced_values
 
+    def test_gchat_custom_link_tolerates_in_range_forged_placeholder(self):
+        """User text containing the literal PUA placeholder pattern with an
+        in-range index could previously be rewritten as a duplicate link
+        node (content corruption). The per-call nonce added to the
+        placeholder makes it unforgeable, so the literal stays literal and
+        only the real `<url|text>` produces a link."""
+        converter = _converter()
+        # Old format was `\ue000LINK0\ue000`. Feeding that exact string
+        # alongside a real link used to resolve to links[0] twice.
+        ast = converter.to_ast("\ue000LINK0\ue000 and <https://example.com|Real>")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        # Exactly one link — the real <url|text>, not the forged placeholder.
+        assert link_urls == ["https://example.com"]
+
     def test_gchat_custom_link_tolerates_out_of_range_placeholder(self):
         """If user input happens to include the PUA placeholder pattern with
         an index that isn't in our `links` list, `to_ast` must not raise. The
@@ -324,6 +347,21 @@ class TestFromAst:
         }
         assert converter.from_ast(ok_ast) == "<https://example.com|ok>"
 
+    def test_falls_back_to_parenthesized_form_for_urls_without_a_scheme(self):
+        """URLs without an RFC 3986 scheme (relative paths like `/docs`,
+        fragment-only anchors like `#section`, protocol-relative like
+        `//example.com/x`) can't round-trip through `<url|text>` because
+        the reverse parsers only recognize scheme-prefixed URLs. Fall back
+        to the plain `text (url)` form so the link survives as readable
+        text and Google Chat's auto-link detection still fires where it
+        can. Regression for a Codex P2."""
+        converter = _converter()
+        for url in ["/docs", "#section", "../relative", "//example.com/x"]:
+            result = converter.from_markdown(f"[doc]({url})")
+            assert result == f"doc ({url})", f"url={url!r}"
+        # Sanity: absolute URLs still use the <url|text> form.
+        assert converter.from_markdown("[doc](https://example.com)") == "<https://example.com|doc>"
+
     def test_blockquote(self):
         converter = _converter()
         ast = converter.to_ast("> quoted text")
@@ -474,6 +512,30 @@ class TestExtractPlainText:
             converter.extract_plain_text("See <https://en.wikipedia.org/wiki/Foo_(bar)|Wiki> for info")
             == "See Wiki for info"
         )
+
+    def test_preserves_gchat_custom_link_literal_inside_inline_code(self):
+        """Code spans are literal — a `<url|text>` inside backticks is user
+        content, not a link. The link-strip regex runs on the surrounding
+        text only; code contents are preserved verbatim (just without the
+        backticks). Regression test for a P2 Codex finding: before the fix,
+        the strip-inline-code pass ran first and exposed the link syntax to
+        the link-strip pass, which collapsed it to just the label."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("Use `<https://example.com|Example>` here")
+            == "Use <https://example.com|Example> here"
+        )
+
+    def test_preserves_gchat_custom_link_literal_inside_fenced_code(self):
+        """Same as inline code, but for fenced ``` blocks. Content between
+        the fences must be preserved verbatim."""
+        converter = _converter()
+        result = converter.extract_plain_text("Here is the code:\n```\ncurl <https://api.com|example>\n```\nDone.")
+        assert "<https://api.com|example>" in result
+        # And the label-only form should NOT appear (would indicate the strip
+        # pass leaked into code content).
+        assert ">example<" not in result
+        assert " example " not in result
 
 
 # ---------------------------------------------------------------------------
