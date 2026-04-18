@@ -416,6 +416,59 @@ class TestStreaming:
         assert isinstance(final_edit[2], PostableMarkdown)
         assert final_edit[2].markdown == " "
 
+    # Symmetric with the placeholder-clear defensive try/except: if the
+    # final-content edit fails (rate-limit, 5xx, content-policy reject),
+    # `_fallback_stream` must still return a SentMessage for the posted
+    # placeholder so the caller has a handle to edit/delete it. Without
+    # this, the exception propagates and the placeholder message on the
+    # platform is orphaned — the caller catching the error has no way to
+    # reach it.
+    @pytest.mark.asyncio
+    async def test_should_swallow_final_edit_error_and_return_sent_message(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        logger = MockLogger()
+
+        # Reject every edit_message call with real content — simulating
+        # e.g. a permanent 5xx on the final flush.
+        edit_error = RuntimeError("adapter rejected final edit")
+        original_edit = adapter.edit_message
+        rejected: list[PostableMarkdown] = []
+
+        async def always_fail_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            if isinstance(message, PostableMarkdown) and message.markdown.strip():
+                rejected.append(message)
+                raise edit_error
+            return await original_edit(thread_id, message_id, message)
+
+        adapter.edit_message = always_fail_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, streaming_update_interval_ms=10, logger=logger)
+
+        async def stream() -> AsyncIterator[str]:
+            yield "Hello\n"
+            await asyncio.sleep(0.05)
+            yield "world\n"
+
+        # Must not raise — the caller gets a SentMessage back even though
+        # the final edit was rejected.
+        sent = await thread.post(stream())
+
+        # Placeholder was posted; at least one edit was attempted and
+        # rejected; the failure was logged.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        assert len(rejected) >= 1
+        assert any(
+            call[0] == "fallbackStream final edit failed; message reflects previous content"
+            for call in logger.warn.calls
+        ), [c[0] for c in logger.warn.calls]
+
+        # SentMessage is valid and reflects the placeholder (what's actually
+        # on the platform, since every edit was rejected).
+        assert sent is not None
+        assert sent.id == "msg-1"
+        assert sent.text == "..."
+
     # Codex P2 regression: the returned `SentMessage` must reflect what's
     # actually visible on the platform, not the renderer's final_content.
     # When the placeholder-clear edit fails (strict adapter rejects `" "`),

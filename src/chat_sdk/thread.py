@@ -713,12 +713,27 @@ class ThreadImpl:
         # auto-closed). Narrow UX refinement — unobservable when streams
         # close their own markers.
         if final_content.strip() and final_content != last_edit_content:
-            await self.adapter.edit_message(
-                thread_id_for_edits,
-                msg.id,
-                PostableMarkdown(markdown=final_content),
-            )
-            last_edit_content = final_content
+            # Symmetric with the placeholder-clear branch below: if the
+            # adapter rejects the final edit (rate-limit, transient 5xx,
+            # content-policy violation), log and leave the message as
+            # whatever was last successfully edited. The caller still
+            # receives a SentMessage that matches `last_edit_content`
+            # and can call `.edit()`/`.delete()` on it — without this
+            # try/except, propagating the exception orphans the posted
+            # placeholder message on the platform.
+            try:
+                await self.adapter.edit_message(
+                    thread_id_for_edits,
+                    msg.id,
+                    PostableMarkdown(markdown=final_content),
+                )
+                last_edit_content = final_content
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warn(
+                        "fallbackStream final edit failed; message reflects previous content",
+                        exc,
+                    )
         elif placeholder_text is not None and not final_content.strip() and last_edit_content == placeholder_text:
             # Divergence from upstream 4.26: upstream leaves the placeholder
             # visible when the stream produces only whitespace, which strands
