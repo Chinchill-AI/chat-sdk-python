@@ -416,6 +416,39 @@ class TestStreaming:
         assert isinstance(final_edit[2], PostableMarkdown)
         assert final_edit[2].markdown == " "
 
+    # Codex P2 regression: the returned `SentMessage` must reflect what's
+    # actually visible on the platform, not the renderer's final_content.
+    # When the placeholder-clear edit fails (strict adapter rejects `" "`),
+    # the platform still shows "..." — `sent.text` must match that, not
+    # the empty `final_content` that `renderer.finish()` returned for a
+    # whitespace-only stream. Previously `_create_sent_message` used
+    # `final_content` unconditionally, so downstream consumers relying on
+    # `sent.text` saw "" while users on the platform saw "...".
+    @pytest.mark.asyncio
+    async def test_sent_message_reflects_stranded_placeholder_on_strict_adapter(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        async def strict_edit(thread_id: str, message_id: str, message: Any) -> RawMessage:
+            # Mirror Telegram: reject whitespace-only edits.
+            if isinstance(message, PostableMarkdown) and not message.markdown.strip():
+                raise ValueError("Message text cannot be empty")
+            # Non-whitespace edits don't happen in this test; defensive no-op.
+            return await MockAdapter.edit_message(adapter, thread_id, message_id, message)  # type: ignore[arg-type]
+
+        adapter.edit_message = strict_edit  # type: ignore[assignment]
+
+        thread = _make_thread(adapter, state, logger=MockLogger())  # default placeholder "..."
+        text_stream = _create_text_stream(["   ", "\n"])
+        sent = await thread.post(text_stream)
+
+        # Placeholder posted; the platform still shows "..." because the
+        # clear-to-" " edit was rejected.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+
+        # The SentMessage must reflect that stranded "...", not "".
+        assert sent.text == "...", f"expected sent.text == '...', got {sent.text!r}"
+
     # Python-specific regression: when a streaming source raises mid-stream
     # (e.g. LLM connection drops), `_fallback_stream` must still flush the
     # accumulated partial content + clean up the background edit task

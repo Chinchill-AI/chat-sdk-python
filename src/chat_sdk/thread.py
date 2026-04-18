@@ -699,7 +699,9 @@ class ThreadImpl:
             markdown = accumulated if accumulated.strip() else " "
             msg = await self.adapter.post_message(self._id, PostableMarkdown(markdown=markdown))
             thread_id_for_edits = msg.thread_id or self._id
-            last_edit_content = accumulated
+            # Track what was actually posted to the platform — not `accumulated`,
+            # which may differ (e.g. `" "` substituted for whitespace-only).
+            last_edit_content = markdown
 
         # Always ensure the final content is sent, regardless of what _edit_loop did.
         # Re-check last_edit_content after awaiting pending_edit since _edit_loop
@@ -716,6 +718,7 @@ class ThreadImpl:
                 msg.id,
                 PostableMarkdown(markdown=final_content),
             )
+            last_edit_content = final_content
         elif placeholder_text is not None and not final_content.strip() and last_edit_content == placeholder_text:
             # Divergence from upstream 4.26: upstream leaves the placeholder
             # visible when the stream produces only whitespace, which strands
@@ -740,9 +743,15 @@ class ThreadImpl:
                         exc,
                     )
 
+        # SentMessage reflects what's actually on the platform, not the
+        # renderer's last snapshot: in the placeholder-clear branch we
+        # edited to " " (or left "..." on a strict adapter); in the
+        # whitespace-only + no-placeholder branch we posted " " rather
+        # than the raw empty accumulated. Using `last_edit_content`
+        # ensures `sent.text` matches what a user would see.
         sent = self._create_sent_message(
             msg.id,
-            PostableMarkdown(markdown=final_content),
+            PostableMarkdown(markdown=last_edit_content),
             thread_id_for_edits,
         )
         if self._message_history is not None:
