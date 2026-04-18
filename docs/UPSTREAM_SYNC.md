@@ -112,9 +112,9 @@ the rules below before adding one.
 5. **CHANGELOG entry** under a "Python-specific (divergence from upstream)"
    subsection.
 6. **Run the self-review adversarial checks** from
-   [CLAUDE.md § Self-Review Discipline](../CLAUDE.md#self-review-discipline).
-   Divergence code is exactly the kind of novel, Python-specific logic that
-   bot reviewers consistently find bugs in — catch them yourself first.
+   [docs/SELF_REVIEW.md](SELF_REVIEW.md). Divergence code is exactly the
+   kind of novel, Python-specific logic that bot reviewers consistently
+   find bugs in — catch them yourself first.
 
 ### Review signal
 

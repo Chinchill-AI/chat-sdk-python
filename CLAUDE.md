@@ -66,47 +66,12 @@ All thread IDs follow: `{adapter}:{channel}:{thread}`
 
 ## Self-Review Discipline
 
-Review bots (Codex, CoderRabbit) outperformed agent self-review ~3× on recent
-PRs — not because they're magic, but because they run adversarial checks
-consistently. Run these yourself *before* declaring code ready. They target
-the specific blindspots that have cost us silent bugs.
-
-1. **Adversarial input sweep.** For every regex, substitution, or tokenization
-   pass you add, enumerate ~5 inputs that could break it:
-   - empty input, single-char input
-   - input containing the marker/sentinel your code produces (forgery)
-   - input containing each delimiter your pattern uses
-   - the pattern appearing in unintended contexts (code spans, quoted strings)
-   - very long input, odd unicode, PUA code points
-
-2. **Emit/parse symmetry.** If you add `X → Y` (emit), verify your `Y → X`
-   (parse) accepts every `X` the emit might produce. Every URL scheme, every
-   label shape, every edge case (empty / relative / None). Asymmetry between
-   emit and parse is a common source of silent data loss.
-
-3. **Pass-interaction check.** When inserting a new transformation pass into
-   a pipeline (markdown parsing, stripping, rendering), walk through every
-   existing pass: does yours break any? do any break yours? does ORDER
-   matter? Example: a link-strip inserted after code-stripping corrupts code
-   content containing link syntax.
-
-4. **Unforgeable sentinels.** Any placeholder token that later code maps
-   back to structured data must carry a per-call nonce
-   (`secrets.token_hex(n)`). Fixed tokens like `\ue000LINK0\ue000` can be
-   forged by user input. Also tolerate out-of-range / unrecognized
-   sentinels without raising — fall back to literal text.
-
-5. **Divergence budget.** `docs/UPSTREAM_SYNC.md` sets a max of **2
-   divergences per sync**. Enforce this against yourself. A 3rd divergence
-   = stop and ask whether this is still a sync or becoming a fork. Document
-   every divergence in the non-parity table, add a breadcrumb at the code
-   site, write a regression test that would fail if someone "fixes" the
-   divergence back to upstream.
-
-6. **The Codex pre-ship question.** Before declaring ready, ask yourself:
-   "What would Codex find in this code right now?" Be adversarial. If the
-   honest answer is "probably X," test X first. Don't wait for a bot to
-   file it.
+Before declaring any change ready, run the adversarial checks in
+[docs/SELF_REVIEW.md](docs/SELF_REVIEW.md). In short: input sweeps,
+emit/parse symmetry, pass-interaction, unforgeable sentinels, divergence
+budget, and the pre-ship "what would an adversarial reviewer find?"
+question. Apply these especially to novel logic, new regex/substitution
+passes, and anything that lands as a divergence from upstream.
 
 ## Port Rules (TS → Python)
 
