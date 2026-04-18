@@ -111,6 +111,10 @@ the rules below before adding one.
    back to upstream's behavior. The test's docstring should cite the reason.
 5. **CHANGELOG entry** under a "Python-specific (divergence from upstream)"
    subsection.
+6. **Run the self-review adversarial checks** from
+   [CLAUDE.md § Self-Review Discipline](../CLAUDE.md#self-review-discipline).
+   Divergence code is exactly the kind of novel, Python-specific logic that
+   bot reviewers consistently find bugs in — catch them yourself first.
 
 ### Review signal
 
