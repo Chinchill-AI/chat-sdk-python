@@ -90,7 +90,26 @@ Every divergence must have:
   back to upstream's behavior
 - A CHANGELOG entry under "Python-specific (divergence from upstream)"
 
-### 6. The pre-ship question
+### 6. Rebind / idempotent-path state coherence
+
+When a constructor or factory accepts an already-constructed instance
+and then "rebinds" or "updates" it (common in `from_json`-style
+idempotent APIs, dependency-injection helpers, or adapter-swapping code),
+every cached or derived piece of state must be re-resolved against the
+new binding. Common leak paths:
+
+- Cached downstream instances (a `_channel_cache` on a thread, a state
+  adapter pointer, a resolved HTTP client).
+- Cached lookup keys (a name copied from the old binding and not
+  re-synced to the new one).
+- Lazy-resolution placeholders that were already resolved under the
+  old binding and now hold stale references.
+
+Walk every instance attribute and ask: "does this value come from the
+previous binding, and would it route operations to the wrong context
+after the rebind?"
+
+### 7. The pre-ship question
 
 Before declaring any change ready, ask yourself:
 

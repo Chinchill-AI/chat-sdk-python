@@ -69,9 +69,10 @@ All thread IDs follow: `{adapter}:{channel}:{thread}`
 Before declaring any change ready, run the adversarial checks in
 [docs/SELF_REVIEW.md](docs/SELF_REVIEW.md). In short: input sweeps,
 emit/parse symmetry, pass-interaction, unforgeable sentinels, divergence
-budget, and the pre-ship "what would an adversarial reviewer find?"
-question. Apply these especially to novel logic, new regex/substitution
-passes, and anything that lands as a divergence from upstream.
+budget, rebind/state coherence, and the pre-ship "what would an
+adversarial reviewer find?" question. Apply these especially to novel
+logic, new regex/substitution passes, and anything that lands as a
+divergence from upstream.
 
 ## Port Rules (TS → Python)
 
