@@ -124,36 +124,26 @@ class _BytearrayBodyRequest:
 def _adapters() -> list[tuple[str, Any]]:
     """Return (name, extractor) pairs for each adapter's body extraction.
 
-    Lazy imports because some adapters require platform deps (cryptography,
-    pynacl). If a dep isn't installed, that adapter is skipped.
+    Imported directly: every adapter lazy-imports its platform deps inside
+    methods, so module-level import works in any environment the test runs
+    in. A broken adapter module fails the suite — matching the repo rule
+    "every test must fail when the code is wrong."
     """
-    result: list[tuple[str, Any]] = []
+    from chat_sdk.adapters.discord.adapter import DiscordAdapter
+    from chat_sdk.adapters.github.adapter import GitHubAdapter
+    from chat_sdk.adapters.linear.adapter import LinearAdapter
+    from chat_sdk.adapters.teams.adapter import TeamsAdapter
+    from chat_sdk.adapters.telegram.adapter import TelegramAdapter
+    from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
 
-    # GitHub (static method)
-    try:
-        from chat_sdk.adapters.github.adapter import GitHubAdapter
-
-        result.append(("github", GitHubAdapter._get_request_body))
-    except ImportError:
-        pass  # Optional platform dep missing — skip this adapter's cases.
-
-    # Telegram (static method)
-    try:
-        from chat_sdk.adapters.telegram.adapter import TelegramAdapter
-
-        result.append(("telegram", TelegramAdapter._get_request_body))
-    except ImportError:
-        pass  # Optional platform dep missing — skip this adapter's cases.
-
-    # WhatsApp (static method)
-    try:
-        from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
-
-        result.append(("whatsapp", WhatsAppAdapter._get_request_body))
-    except ImportError:
-        pass  # Optional platform dep missing — skip this adapter's cases.
-
-    return result
+    return [
+        ("github", GitHubAdapter._get_request_body),
+        ("telegram", TelegramAdapter._get_request_body),
+        ("whatsapp", WhatsAppAdapter._get_request_body),
+        ("discord", DiscordAdapter._get_request_body),
+        ("linear", LinearAdapter._get_request_body),
+        ("teams", TeamsAdapter._get_request_body),
+    ]
 
 
 @pytest.mark.parametrize("name,extractor", _adapters())
@@ -205,6 +195,17 @@ async def test_handles_async_callable_body(name: str, extractor: Any) -> None:
     """
     result = await extractor(_AsyncCallableBodyRequest(b'{"ok": true}'))
     assert result == '{"ok": true}', f"{name} failed async body()"
+
+
+@pytest.mark.parametrize("name,extractor", _adapters())
+async def test_handles_sync_callable_body(name: str, extractor: Any) -> None:
+    """Sync `def body(self)` returning bytes is consumed directly —
+    covers the callable-but-non-awaitable body branch. Without this,
+    a regression that always awaits `body()` would only show up in
+    async-framework use and silently pass the suite.
+    """
+    result = await extractor(_SyncCallableBodyRequest(b'{"ok": true}'))
+    assert result == '{"ok": true}', f"{name} failed sync body()"
 
 
 @pytest.mark.parametrize("name,extractor", _adapters())

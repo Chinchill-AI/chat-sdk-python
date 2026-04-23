@@ -1403,11 +1403,19 @@ class DiscordAdapter:
     # Request/Response helpers (framework-agnostic)
     # =========================================================================
 
-    async def _get_request_body(self, request: Any) -> str:
+    @staticmethod
+    async def _get_request_body(request: Any) -> str:
         """Extract the request body as a string."""
-        # `hasattr` narrows `Any` to `object` and kills downstream type info,
-        # so we use `getattr(..., default)` which preserves `Any`. The
-        # `await` below is safe because `inspect.isawaitable` guards it.
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        # Handle both callable and non-callable `request.text`. Gating
+        # entry on callability would drop populated string attributes.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         body = getattr(request, "body", None)
         if body is not None:
             if callable(body):
@@ -1417,19 +1425,13 @@ class DiscordAdapter:
             if inspect.isawaitable(body):
                 body = await body
             if hasattr(body, "read"):
-                raw_read = body.read
-                raw = await raw_read() if inspect.iscoroutinefunction(raw_read) else raw_read()
-                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+                raw_result = body.read()
+                raw = await raw_result if inspect.isawaitable(raw_result) else raw_result
+                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
             return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
-        text_attr = getattr(request, "text", None)
-        if text_attr is not None:
-            if callable(text_attr):
-                result = text_attr()
-                return str(await result if inspect.isawaitable(result) else result)
-            return text_attr
         data = getattr(request, "data", None)
         if data is not None:
-            return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+            return data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
         return ""
 
     def _get_header(self, request: Any, name: str) -> str | None:
