@@ -1106,7 +1106,7 @@ class GitHubAdapter:
                 body = body()
             if inspect.isawaitable(body):
                 body = await body
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
         return ""
 
     @staticmethod

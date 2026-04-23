@@ -212,3 +212,13 @@ async def test_handles_bytes_body_attribute(name: str, extractor: Any) -> None:
     """`request.body` as a bytes property is decoded as UTF-8."""
     result = await extractor(_PropertyBodyRequest(b'{"ok": true}'))
     assert result == '{"ok": true}', f"{name} failed bytes body attr"
+
+
+@pytest.mark.parametrize("name,extractor", _adapters())
+async def test_handles_bytearray_body_attribute(name: str, extractor: Any) -> None:
+    """`request.body` as bytearray — bytes/bytearray symmetry on the body
+    path, catching the asymmetry where we fixed text-path for bytearray
+    but left body-path checking only `isinstance(body, bytes)`.
+    """
+    result = await extractor(_BytearrayBodyRequest(bytearray(b'{"ok": true}')))
+    assert result == '{"ok": true}', f"{name} failed bytearray body attr"

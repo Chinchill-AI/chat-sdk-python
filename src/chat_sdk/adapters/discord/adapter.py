@@ -1419,8 +1419,8 @@ class DiscordAdapter:
             if hasattr(body, "read"):
                 raw_read = body.read
                 raw = await raw_read() if inspect.iscoroutinefunction(raw_read) else raw_read()
-                return raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
+                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
         text_attr = getattr(request, "text", None)
         if text_attr is not None:
             if callable(text_attr):

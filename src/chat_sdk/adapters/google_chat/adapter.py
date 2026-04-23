@@ -785,7 +785,7 @@ class GoogleChatAdapter:
                     raw_body = raw_body()
                 if inspect.isawaitable(raw_body):
                     raw_body = await raw_body
-                body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
+                body = raw_body.decode("utf-8") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)
             elif isinstance(request, dict):
                 body = json.dumps(request)
             else:

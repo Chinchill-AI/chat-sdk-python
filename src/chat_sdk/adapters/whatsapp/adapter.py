@@ -1073,7 +1073,7 @@ class WhatsAppAdapter:
                 body = body()
             if inspect.isawaitable(body):
                 body = await body
-            if isinstance(body, bytes):
+            if isinstance(body, (bytes, bytearray)):
                 return body.decode("utf-8")
             return str(body)
         return ""
