@@ -102,7 +102,7 @@ Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mappin
    gh release create v0.4.26 --target main --title "v0.4.26 — Synced to Vercel Chat 4.26.0"
    ```
    - Tag format: `v{version}` (e.g., `v0.4.26`)
-   - Pre-release flag for alpha versions (`v0.4.26a1` → `--prerelease`)
+   - Use the pre-release flag for alpha versions (`v0.4.26a1` → `--prerelease`)
    - This triggers the `publish.yml` workflow → PyPI
 
 6. **Verify on PyPI**: `pip install chat-sdk=={version}`
