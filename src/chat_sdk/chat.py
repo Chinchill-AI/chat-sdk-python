@@ -300,13 +300,21 @@ class Chat:
         # -- Concurrent-strategy semaphore ------------------------------------
         # `max_concurrent` bounds in-flight handler dispatches when using the
         # `"concurrent"` strategy. `None` means unbounded (matches the upstream
-        # TS default of `Infinity`). A non-None value caps parallel handler
-        # runs at that number — useful for rate-limit hygiene and bounded
-        # resource use. Divergence from upstream: upstream accepts the config
-        # field but doesn't enforce it; we do.
+        # TS default of `Infinity`). A positive integer caps parallel handler
+        # runs. Divergence from upstream: upstream accepts the config field
+        # but doesn't enforce it; we do.
+        #
+        # Reject `<= 0` explicitly rather than silently ignoring — a user
+        # passing `max_concurrent=0` likely means "pause all processing"
+        # (not supported) or has a typo. Either way, silently falling back
+        # to unbounded concurrency would surprise them.
+        if self._concurrency_max_concurrent is not None and self._concurrency_max_concurrent <= 0:
+            raise ValueError(
+                f"ConcurrencyConfig.max_concurrent must be > 0 or None, got {self._concurrency_max_concurrent}"
+            )
         self._concurrent_semaphore: asyncio.Semaphore | None = (
             asyncio.Semaphore(self._concurrency_max_concurrent)
-            if self._concurrency_max_concurrent is not None and self._concurrency_max_concurrent > 0
+            if self._concurrency_max_concurrent is not None
             else None
         )
 

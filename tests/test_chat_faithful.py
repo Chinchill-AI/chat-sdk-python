@@ -2267,8 +2267,6 @@ class TestConcurrencyConcurrent:
     # it. We do. Bound should cap in-flight handlers at N; the (N+1)th
     # message has to wait until one of the first N releases.
     async def test_max_concurrent_bounds_in_flight_handlers(self):
-        import asyncio
-
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
@@ -2305,25 +2303,43 @@ class TestConcurrencyConcurrent:
             for i in range(5)
         ]
 
-        # Let the first two handlers enter and block on the gate.
+        # Let the first two handlers enter and block on the gate. Others
+        # must be blocked on the semaphore, so `in_flight` is capped at 2
+        # and the observed peak is <= 2 (not `== 2` — we'd narrow to 2
+        # only after the final drain below, when the peak is meaningful).
         for _ in range(20):
             await asyncio.sleep(0)
         assert in_flight == 2
-        assert max_observed == 2
+        assert max_observed <= 2
 
         # Release the gate; all 5 should drain.
         gate.set()
         await asyncio.gather(*tasks)
 
         assert finished == 5
-        # The bound was never exceeded.
+        # The bound was never exceeded; peak reached exactly 2.
         assert max_observed == 2
+
+    # Python-specific: reject invalid `max_concurrent` values at construction
+    # time rather than silently falling back to unbounded (which would
+    # surprise users who set `max_concurrent=0` expecting strict throttling).
+    async def test_max_concurrent_zero_or_negative_raises(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_value in (0, -1, -100):
+            import pytest
+
+            with pytest.raises(ValueError, match="max_concurrent must be > 0 or None"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),
+                )
 
     # Python-specific: None / missing max_concurrent must keep the
     # unbounded behavior (matches upstream TS default of Infinity).
     async def test_max_concurrent_none_allows_unbounded(self):
-        import asyncio
-
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
