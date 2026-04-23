@@ -55,6 +55,23 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/chat_sdk"]
 
+# Explicit sdist allowlist — hatch's default pulls in every tracked and
+# untracked file in the repo, which has leaked `.coverage` (with local
+# absolute paths), agent scratchpads, CI config, and dev scripts to PyPI.
+# Everything here is what a source-install consumer needs; anything else
+# (CI, dev scripts, local notes) stays out.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/pyproject.toml",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
