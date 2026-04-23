@@ -365,7 +365,7 @@ class DiscordAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=interaction,
             ),
@@ -454,7 +454,7 @@ class DiscordAdapter:
                 is_me=user.get("id") == self._application_id,
             ),
             adapter=self,
-            channel=None,
+            channel=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             raw=interaction,
         )
         event.channel_id = channel_id  # type: ignore[attr-defined]
@@ -711,7 +711,7 @@ class DiscordAdapter:
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=data.get("message_id", ""),
                 emoji=normalized,

@@ -15,7 +15,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -415,7 +415,7 @@ class TeamsAdapter:
                 ),
                 message_id=activity.get("replyToId") or activity.get("id", ""),
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=activity,
             ),
@@ -458,7 +458,7 @@ class TeamsAdapter:
                 ),
                 message_id=activity.get("replyToId") or activity.get("id", ""),
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=activity,
             ),
@@ -505,7 +505,7 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                     adapter=self,
                     raw=activity,
                 ),
@@ -522,7 +522,7 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                     adapter=self,
                     raw=activity,
                 ),
@@ -572,7 +572,7 @@ class TeamsAdapter:
     def _create_attachment(self, att: dict[str, Any]) -> Attachment:
         """Create an Attachment from a Teams attachment dict."""
         content_type = att.get("contentType", "")
-        att_type: str = "file"
+        att_type: Literal["audio", "file", "image", "video"] = "file"
         if content_type.startswith("image/"):
             att_type = "image"
         elif content_type.startswith("video/"):

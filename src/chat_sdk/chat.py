@@ -36,6 +36,7 @@ from chat_sdk.types import (
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
     Author,
+    Channel,
     ChannelVisibility,
     ChatConfig,
     ConcurrencyStrategy,
@@ -1096,7 +1097,7 @@ class Chat:
         context_id: str,
         thread: ThreadImpl | None = None,
         message: Message | None = None,
-        channel: ChannelImpl | None = None,
+        channel: Channel | None = None,
     ) -> None:
         key = f"modal-context:{adapter_name}:{context_id}"
         context = {

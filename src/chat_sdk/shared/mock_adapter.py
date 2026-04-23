@@ -190,7 +190,10 @@ class MockAdapter:
         )
 
     async def post_channel_message(self, channel_id: str, message: AdapterPostableMessage) -> RawMessage:
-        return RawMessage(id="msg-1", thread_id=None, raw={})
+        # Channel-scoped posts don't have a thread — use the channel id as
+        # the identifier so downstream code that expects a non-null
+        # `thread_id` can still route by string key.
+        return RawMessage(id="msg-1", thread_id=channel_id, raw={})
 
 
 # ---------------------------------------------------------------------------

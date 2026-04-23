@@ -946,14 +946,16 @@ class PostEphemeralOptions:
 class ReactionEvent:
     """Reaction event data.
 
-    `thread` is optional because some platforms deliver reactions without a
-    usable thread context (e.g. Slack reactions on a top-level channel
-    message; Teams reactions where the message lookup failed). Consumers
-    should `if event.thread is None: return` before using it.
+    Matches upstream TS `ReactionEvent` shape: `thread` is required here
+    because handlers receive the fully-populated event after `Chat`
+    re-wraps any partial event from an adapter. Adapters dispatch via
+    `chat.process_reaction(...)` with a partial event (`thread=None` at
+    construction); `Chat` resolves the real thread before invoking
+    handlers, so this field is never `None` at handler time.
     """
 
     adapter: Adapter
-    thread: Thread | None
+    thread: Thread
     thread_id: str
     message_id: str
     user: Author
@@ -1029,14 +1031,15 @@ class ModalResponse:
 class SlashCommandEvent:
     """Slash command event data.
 
-    `channel` is optional because some platforms (notably Discord) fire
-    slash commands without a channel context (DM slash commands), and
-    because adapters may not always resolve the channel before dispatch.
-    Consumers should `if event.channel is None: return` before using it.
+    Matches upstream TS `SlashCommandEvent`: `channel` is required here
+    because handlers receive the fully-populated event after `Chat`
+    re-wraps the partial event from an adapter. Adapters pass
+    `channel=None` at construction; `Chat` constructs a real `Channel`
+    before invoking handlers, so this is never `None` at handler time.
     """
 
     adapter: Adapter
-    channel: Channel | None
+    channel: Channel
     user: Author
     command: str
     text: str
@@ -1416,11 +1419,15 @@ class Postable(Protocol):
 
     async def set_state(
         self,
-        state: dict[str, Any],
+        new_state: dict[str, Any],
         *,
         replace: bool = False,
     ) -> None:
-        """Set the state. Merges with existing state by default."""
+        """Set the state. Merges with existing state by default.
+
+        Parameter is named `new_state` to match upstream TS
+        `setState(newState)` and preserve call-site kwarg compatibility.
+        """
         ...
 
     async def start_typing(self, status: str | None = None) -> None:

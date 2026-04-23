@@ -20,7 +20,12 @@ from datetime import datetime, timezone
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
-from chat_sdk.adapters.whatsapp.cards import card_to_whatsapp, decode_whatsapp_callback_data
+from chat_sdk.adapters.whatsapp.cards import (
+    WhatsAppCardResultInteractive,
+    WhatsAppCardResultText,
+    card_to_whatsapp,
+    decode_whatsapp_callback_data,
+)
 from chat_sdk.adapters.whatsapp.format_converter import WhatsAppFormatConverter
 from chat_sdk.adapters.whatsapp.types import (
     WhatsAppAdapterConfig,
@@ -353,7 +358,7 @@ class WhatsAppAdapter:
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["reaction"]["message_id"],
                 user=user,
@@ -404,7 +409,7 @@ class WhatsAppAdapter:
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["id"],
                 user=Author(
@@ -443,7 +448,7 @@ class WhatsAppAdapter:
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["id"],
                 user=Author(
@@ -713,14 +718,19 @@ class WhatsAppAdapter:
         # Check if this is a card with interactive buttons
         card = extract_card(message)
         if card:
+            # `card_to_whatsapp` returns a `WhatsAppCardResultInteractive`
+            # or `WhatsAppCardResultText` union; the `type` check narrows
+            # at runtime but pyrefly doesn't propagate TypedDict `type`-tag
+            # discrimination, so cast the field access on each branch.
             result = card_to_whatsapp(card)
             if result.get("type") == "interactive":
-                interactive = json.loads(convert_emoji_placeholders(json.dumps(result["interactive"]), "whatsapp"))
+                interactive_raw = cast("WhatsAppCardResultInteractive", result)["interactive"]
+                interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
                 return await self._send_interactive_message(thread_id, user_wa_id, interactive)
             return await self._send_text_message(
                 thread_id,
                 user_wa_id,
-                convert_emoji_placeholders(result["text"], "whatsapp"),
+                convert_emoji_placeholders(cast("WhatsAppCardResultText", result)["text"], "whatsapp"),
             )
 
         # Regular text message

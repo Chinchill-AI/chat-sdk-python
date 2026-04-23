@@ -183,12 +183,11 @@ class ChannelImpl:
 
     async def set_state(
         self,
-        state: dict[str, Any],
+        new_state: dict[str, Any],
         *,
         replace: bool = False,
     ) -> None:
         """Set channel state. Merges with existing by default."""
-        new_state = state
         key = f"{CHANNEL_STATE_KEY_PREFIX}{self._id}"
         if replace:
             await self._state_adapter.set(key, new_state, THREAD_STATE_TTL_MS)

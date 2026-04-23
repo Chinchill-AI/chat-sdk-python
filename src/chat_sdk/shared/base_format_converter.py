@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.shared.markdown_parser import (
     Content,
@@ -186,12 +186,14 @@ class BaseFormatConverter(ABC):
 
                 return card_to_fallback_text(message["card"])
             if message.get("type") == "card":
-                from chat_sdk.cards import is_card_element
+                from chat_sdk.cards import CardElement, is_card_element
 
                 if is_card_element(message):
                     from chat_sdk.cards import card_to_fallback_text
 
-                    return card_to_fallback_text(message)
+                    # `is_card_element` isn't a TypeGuard, so pyrefly still
+                    # sees `dict[Any, Any]`. Cast to match the signature.
+                    return card_to_fallback_text(cast("CardElement", message))
                 return ""
             return str(message)
 

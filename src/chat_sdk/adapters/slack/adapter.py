@@ -913,7 +913,7 @@ class SlackAdapter:
                 is_me=False,
             ),
             adapter=self,
-            channel=None,  # chat.py's _handle_slash_command_event creates the ChannelImpl
+            channel=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             raw={k: v[0] for k, v in params.items()} if params else {},
             trigger_id=trigger_id,
         )
@@ -972,7 +972,7 @@ class SlackAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=payload,
                 trigger_id=payload.get("trigger_id"),
@@ -1191,7 +1191,7 @@ class SlackAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 raw=event,
                 adapter=self,
             )

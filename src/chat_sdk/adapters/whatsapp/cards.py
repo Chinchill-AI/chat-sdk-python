@@ -12,7 +12,7 @@ See: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactiv
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 from chat_sdk.adapters.whatsapp.types import WhatsAppInteractiveMessage
 from chat_sdk.cards import (
@@ -224,8 +224,8 @@ def _render_child(child: CardChild) -> list[str]:
         return result
 
     if child_type == "image":
-        alt = child.get("alt", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        alt = cast("str", child.get("alt", ""))
+        url = cast("str", child.get("url", ""))
         if alt:
             return [f"{alt}: {url}"]
         return [url]

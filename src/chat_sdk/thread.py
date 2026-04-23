@@ -12,7 +12,7 @@ import contextvars
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
@@ -30,8 +30,10 @@ from chat_sdk.types import (
     EphemeralMessage,
     FetchOptions,
     FormattedContent,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
+    PlanUpdateChunk,
     PostableCard,
     PostableMarkdown,
     PostableMessage,
@@ -43,6 +45,7 @@ from chat_sdk.types import (
     StateAdapter,
     StreamChunk,
     StreamOptions,
+    TaskUpdateChunk,
 )
 
 if TYPE_CHECKING:
@@ -322,7 +325,7 @@ class ThreadImpl:
 
     async def set_state(
         self,
-        state: dict[str, Any],
+        new_state: dict[str, Any],
         *,
         replace: bool = False,
     ) -> None:
@@ -330,7 +333,6 @@ class ThreadImpl:
 
         State is persisted for 30 days.
         """
-        new_state = state
         key = f"{THREAD_STATE_KEY_PREFIX}{self._id}"
         if replace:
             await self._state_adapter.set(key, new_state, THREAD_STATE_TTL_MS)
@@ -590,7 +592,10 @@ class ThreadImpl:
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     yield chunk.get("text", "")
                 elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
-                    yield chunk.text
+                    # Runtime-narrowed to a MarkdownTextChunk via the `type`
+                    # tag; only that variant has `.text`. Pyrefly doesn't do
+                    # tag-based union narrowing, so read via `getattr`.
+                    yield getattr(chunk, "text", "")
                 # Skip non-text chunks in fallback mode
 
         return await self._fallback_stream(_text_only_stream(), options)
@@ -1139,9 +1144,12 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
         elif isinstance(item, dict):
             t = item.get("type")
 
-            # Pass through known StreamChunk dict types
+            # Pass through known StreamChunk dict types. The `t` check
+            # narrows at runtime to one of the three StreamChunk TypedDicts,
+            # but pyrefly doesn't narrow through tag-string comparisons, so
+            # cast to the declared yield union.
             if t in ("markdown_text", "task_update", "plan_update"):
-                yield item
+                yield cast("MarkdownTextChunk | PlanUpdateChunk | TaskUpdateChunk", item)
                 continue
 
             if t == "text-delta":

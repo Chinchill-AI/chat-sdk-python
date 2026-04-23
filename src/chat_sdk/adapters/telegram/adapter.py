@@ -19,7 +19,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.telegram.cards import (
     card_to_telegram_inline_keyboard,
@@ -698,11 +698,14 @@ class TelegramAdapter:
         )
 
         decoded = decode_telegram_callback_data(callback_query.get("data"))
-        action_id = decoded["action_id"]
+        action_id = decoded["action_id"] or ""
         value = decoded["value"]
 
         # The TS source uses callback_query.from – in our types this is from_user
-        from_user = callback_query.get("from_user") or callback_query.get("from")  # type: ignore[call-overload]
+        from_user = cast(
+            "TelegramUser | None",
+            callback_query.get("from_user") or callback_query.get("from"),  # type: ignore[call-overload]
+        )
         user = (
             self.to_author(from_user)
             if from_user
@@ -718,7 +721,7 @@ class TelegramAdapter:
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=message_id,
                 user=user,
@@ -783,7 +786,7 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -801,7 +804,7 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -1234,7 +1237,10 @@ class TelegramAdapter:
         text = apply_telegram_entities(plain_text, entities)
 
         # Determine author -- Telegram uses 'from' key which is a reserved word
-        from_user = raw.get("from_user") or raw.get("from")  # type: ignore[call-overload]
+        from_user = cast(
+            "TelegramUser | None",
+            raw.get("from_user") or raw.get("from"),  # type: ignore[call-overload]
+        )
         sender_chat = raw.get("sender_chat")
 
         if from_user:
@@ -1726,15 +1732,17 @@ class TelegramAdapter:
 
     def reaction_key(self, reaction: TelegramReactionType) -> str:
         """Compute a unique key for a Telegram reaction."""
+        # `TelegramReactionType` is a TypedDict union; `.get()` returns the
+        # union of all value-types, so narrow the strings we know are strings.
         if reaction.get("type") == "emoji":
-            return reaction.get("emoji", "")
-        return f"custom:{reaction.get('custom_emoji_id', '')}"
+            return cast("str", reaction.get("emoji", ""))
+        return f"custom:{cast('str', reaction.get('custom_emoji_id', ''))}"
 
     def reaction_to_emoji_value(self, reaction: TelegramReactionType) -> EmojiValue:
         """Convert a Telegram reaction to an :class:`EmojiValue`."""
         if reaction.get("type") == "emoji":
-            return get_emoji(reaction.get("emoji", ""))
-        return get_emoji(f"custom:{reaction.get('custom_emoji_id', '')}")
+            return get_emoji(cast("str", reaction.get("emoji", "")))
+        return get_emoji(f"custom:{cast('str', reaction.get('custom_emoji_id', ''))}")
 
     # -- Telegram API --------------------------------------------------------
 

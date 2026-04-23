@@ -80,9 +80,8 @@ dev = [
 # ---------------------------------------------------------------------------
 # Pyrefly type checker configuration
 # ---------------------------------------------------------------------------
-# Baseline workflow:
-#   Check against baseline: uv run pyrefly check --baseline=.pyrefly-baseline.json
-#   Refresh baseline:       uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline
+# Target: zero errors. Run:
+#   uv run pyrefly check
 # ---------------------------------------------------------------------------
 
 [tool.pyrefly]

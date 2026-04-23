@@ -1030,7 +1030,7 @@ class GoogleChatAdapter:
             reaction_user = reaction.get("user") or {}
             return ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=message_name,
                 user=Author(
@@ -1198,7 +1198,7 @@ class GoogleChatAdapter:
 
         action_event = ActionEvent(
             adapter=self,
-            thread=None,
+            thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             thread_id=thread_id,
             message_id=(message or {}).get("name", ""),
             user=Author(
