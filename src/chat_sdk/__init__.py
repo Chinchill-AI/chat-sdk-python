@@ -101,6 +101,7 @@ from chat_sdk.plan import (
     is_postable_object,
     post_postable_object,
 )
+from chat_sdk.reviver import reviver
 from chat_sdk.shared.base_format_converter import BaseFormatConverter
 from chat_sdk.shared.errors import (
     AdapterError,
@@ -181,7 +182,7 @@ from chat_sdk.types import (
 )
 
 # The upstream Vercel Chat version this release is synced to.
-UPSTREAM_PARITY = "4.25.0"
+UPSTREAM_PARITY = "4.26.0"
 
 __all__ = [
     "UPSTREAM_PARITY",
@@ -205,6 +206,8 @@ __all__ = [
     "post_postable_object",
     # AI
     "to_ai_messages",
+    # Standalone reviver for workflow-safe deserialization
+    "reviver",
     # Card builders (PascalCase primary — matches source TS SDK)
     "Actions",
     "Button",

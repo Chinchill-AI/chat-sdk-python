@@ -55,6 +55,224 @@ class TestToAst:
         ast = converter.to_ast("Use `const x = 1`")
         assert ast["type"] == "root"
 
+    def test_gchat_custom_link_parses_back_to_link_node(self):
+        """Round-trip guard: `<url|text>` emitted by from_ast must parse back
+        to a link node so downstream handlers see structured links, not raw
+        angle-bracket text. Regression test for a P1 raised in review."""
+        converter = _converter()
+        ast = converter.to_ast("See <https://example.com|Example> for more")
+
+        # Walk the AST looking for a link node with the expected URL and label.
+        found = False
+
+        def _walk(node: object) -> None:
+            nonlocal found
+            if isinstance(node, dict):
+                if node.get("type") == "link" and node.get("url") == "https://example.com":
+                    children = node.get("children", [])
+                    text = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                    if text == "Example":
+                        found = True
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert found, "Expected a link node with url='https://example.com' and text='Example'"
+
+    def test_to_ast_preserves_bold_and_strike_markers_inside_code_spans(self):
+        """Bold / strikethrough pre-parse passes must not rewrite marker
+        characters inside code spans. Without the code-stash pass that
+        protects them, `` `*foo*` `` would come back as inlineCode with
+        value `**foo**` (doubled asterisks) and `` `~bar~` `` as
+        `~~bar~~`. Same class of pass-interaction bug as the Codex
+        finding on `extract_plain_text`, caught by a subagent self-review."""
+        converter = _converter()
+
+        # Inline code with bold-ish markers
+        ast1 = converter.to_ast("Use `*foo*` here")
+        inline_values: list[str] = []
+
+        def _walk(node: object, target: str, out: list[str]) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == target:
+                    out.append(node.get("value", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child, target, out)
+
+        _walk(ast1, "inlineCode", inline_values)
+        assert inline_values == ["*foo*"], inline_values
+
+        # Inline code with strike-ish markers
+        ast2 = converter.to_ast("Use `~bar~` here")
+        inline_values2: list[str] = []
+        _walk(ast2, "inlineCode", inline_values2)
+        assert inline_values2 == ["~bar~"], inline_values2
+
+        # Fenced code with a mix of markers
+        ast3 = converter.to_ast("```\n*bold* and ~strike~\n```")
+        fenced_values: list[str] = []
+        _walk(ast3, "code", fenced_values)
+        assert any("*bold* and ~strike~" in v for v in fenced_values), fenced_values
+
+    def test_gchat_custom_link_syntax_inside_code_span_stays_literal(self):
+        """`<url|text>` inside inline or fenced code is user content, not a
+        link. The AST-placeholder substitution must restore the original
+        syntax in code nodes rather than embedding the `\\ue000LINK...`
+        sentinel."""
+        converter = _converter()
+
+        def _values_of_type(ast: object, target: str) -> list[str]:
+            out: list[str] = []
+
+            def _walk(node: object) -> None:
+                if isinstance(node, dict):
+                    if node.get("type") == target:
+                        out.append(node.get("value", ""))
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+            _walk(ast)
+            return out
+
+        ast_inline = converter.to_ast("Use `<https://example.com|Example>` in code")
+        assert _values_of_type(ast_inline, "inlineCode") == ["<https://example.com|Example>"]
+
+        ast_fenced = converter.to_ast("```\ncurl <https://api.com|example>\n```")
+        fenced_values = _values_of_type(ast_fenced, "code")
+        assert any("<https://api.com|example>" in v for v in fenced_values), fenced_values
+
+    def test_gchat_custom_link_tolerates_in_range_forged_placeholder(self):
+        """User text containing the literal PUA placeholder pattern with an
+        in-range index could previously be rewritten as a duplicate link
+        node (content corruption). The per-call nonce added to the
+        placeholder makes it unforgeable, so the literal stays literal and
+        only the real `<url|text>` produces a link."""
+        converter = _converter()
+        # Old format was `\ue000LINK0\ue000`. Feeding that exact string
+        # alongside a real link used to resolve to links[0] twice.
+        ast = converter.to_ast("\ue000LINK0\ue000 and <https://example.com|Real>")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        # Exactly one link — the real <url|text>, not the forged placeholder.
+        assert link_urls == ["https://example.com"]
+
+    def test_gchat_custom_link_tolerates_out_of_range_placeholder(self):
+        """If user input happens to include the PUA placeholder pattern with
+        an index that isn't in our `links` list, `to_ast` must not raise. The
+        unknown placeholder is preserved as literal text and any real
+        `<url|text>` alongside it still parses correctly."""
+        converter = _converter()
+        # Index 999 is deliberately out of range; there's only one real
+        # <url|text> token so `links` will have length 1.
+        ast = converter.to_ast("\ue000LINK999\ue000 and <https://example.com|Real>")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert link_urls == ["https://example.com"]
+
+    def test_gchat_multiple_custom_links_in_one_paragraph(self):
+        """A single paragraph with multiple `<url|text>` tokens must produce
+        the right number of link nodes in the right order, with the
+        surrounding text correctly split between them. Catches regressions
+        in the placeholder-substitution split logic (off-by-one, dropped
+        text, wrong link order)."""
+        converter = _converter()
+        ast = converter.to_ast(
+            "Contact <mailto:a@example.com|Alice>, <mailto:b@example.com|Bob>, or <https://example.com|the site>."
+        )
+
+        # Collect (text, link) sequence in document order.
+        flat: list[tuple[str, dict | str]] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                ntype = node.get("type")
+                if ntype == "text":
+                    flat.append(("text", node.get("value", "")))
+                elif ntype == "link":
+                    children = node.get("children", []) or []
+                    label = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                    flat.append(("link", {"url": node.get("url", ""), "text": label}))
+                else:
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+        _walk(ast)
+
+        assert flat == [
+            ("text", "Contact "),
+            ("link", {"url": "mailto:a@example.com", "text": "Alice"}),
+            ("text", ", "),
+            ("link", {"url": "mailto:b@example.com", "text": "Bob"}),
+            ("text", ", or "),
+            ("link", {"url": "https://example.com", "text": "the site"}),
+            ("text", "."),
+        ]
+
+    def test_gchat_custom_link_parses_url_with_balanced_parens(self):
+        """URLs containing `(...)` (e.g. Wikipedia-style) must round-trip
+        intact. The Markdown parser doesn't implement CommonMark's balanced-
+        parens rule for link destinations, so a naive regex rewrite
+        `<url|text>` → `[text](url)` would truncate the URL at the first `)`.
+        The AST placeholder substitution path in `to_ast` bypasses the parser
+        for these tokens and injects a link node with the full URL intact."""
+        converter = _converter()
+        ast = converter.to_ast("See <https://example.com/a_(b)|Wiki> for info")
+        link_urls: list[str] = []
+
+        def _walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "link":
+                    link_urls.append(node.get("url", ""))
+                for child in node.get("children", []) or []:
+                    _walk(child)
+
+        _walk(ast)
+        assert link_urls == ["https://example.com/a_(b)"], f"expected intact URL, got {link_urls!r}"
+
+    def test_gchat_custom_link_parses_non_http_schemes(self):
+        """mailto:/tel:/etc. emit <url|text> in from_ast; to_ast must accept
+        any RFC 3986 scheme, not just http(s)."""
+        converter = _converter()
+        for url, label in [
+            ("mailto:test@example.com", "Email"),
+            ("tel:+15551234", "Call"),
+            ("ftp:files.example.com", "Files"),
+        ]:
+            ast = converter.to_ast(f"Contact <{url}|{label}> for details")
+            found = False
+
+            def _walk(node: object, _url: str = url, _label: str = label) -> None:
+                nonlocal found
+                if isinstance(node, dict):
+                    if node.get("type") == "link" and node.get("url") == _url:
+                        children = node.get("children", [])
+                        text = "".join(c.get("value", "") for c in children if isinstance(c, dict))
+                        if text == _label:
+                            found = True
+                    for child in node.get("children", []) or []:
+                        _walk(child)
+
+            _walk(ast)
+            assert found, f"Expected a link node for url={url!r} label={label!r}"
+            # And extract_plain_text should reduce to just the label
+            assert converter.extract_plain_text(f"<{url}|{label}>") == label
+
 
 # ---------------------------------------------------------------------------
 # from_ast: AST -> Google Chat format
@@ -105,7 +323,130 @@ class TestFromAst:
         converter = _converter()
         ast = converter.to_ast("[click here](https://example.com)")
         result = converter.from_ast(ast)
-        assert "click here (https://example.com)" in result
+        assert "<https://example.com|click here>" in result
+
+    def test_should_preserve_custom_link_labels_in_posted_messages(self):
+        # Matches the integration-tests parity case: a posted markdown link
+        # with a custom label must render as Google Chat's <url|text> syntax
+        # rather than being flattened to "text (url)".
+        converter = _converter()
+        result = converter.from_markdown("[Click here](https://example.com)")
+        assert result == "<https://example.com|Click here>"
+
+    def test_falls_back_to_parenthesized_form_when_label_contains_reserved_chars(self):
+        """Labels containing `>` / `|` / `]` / newline would produce malformed
+        `<url|text>` output: Google Chat and our own regex stop at the first
+        `>` or `|`, and `]` prematurely closes the Markdown link when to_ast()
+        converts the `<url|text>` form back to `[text](url)`. Fall back to
+        plain `text (url)` so the label is preserved intact and the URL is
+        still auto-detected as a link.
+
+        Note: `from_markdown` can't construct these labels because the Markdown
+        parser itself splits on `]`/newline. We exercise the `from_ast` emit
+        path directly with a hand-built AST instead.
+        """
+        converter = _converter()
+        for label in ["a > b", "a | b", "a ] b", "a\nb"]:
+            ast = {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [
+                            {
+                                "type": "link",
+                                "url": "https://example.com",
+                                "children": [{"type": "text", "value": label}],
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = converter.from_ast(ast)
+            assert result == f"{label} (https://example.com)", f"label={label!r}"
+        # Sanity: labels without reserved chars still use the <url|text> form.
+        ok_ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "children": [{"type": "text", "value": "ok"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        assert converter.from_ast(ok_ast) == "<https://example.com|ok>"
+
+    def test_emits_bare_url_when_link_label_is_empty(self):
+        """A link node with empty children can't round-trip through
+        `<url|text>` (parse regex requires ≥1 char in the label) or
+        `text (url)` (reads as a parenthetical). Emit just the URL so
+        Google Chat auto-links it — the empty label carried no
+        information anyway."""
+        converter = _converter()
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        # No `<url|>` (would be visible as literal angle brackets) and no
+        # `(https://example.com)` parenthetical either.
+        assert converter.from_ast(ast) == "https://example.com"
+
+    def test_falls_back_to_parenthesized_form_for_urls_with_reserved_delimiters(self):
+        """URLs containing `|` or `>` can't be emitted in `<url|text>` form
+        without aliasing with the syntax delimiters. Without the fallback,
+        `foo:bar|baz` → `<foo:bar|baz|Label>` → parses as url=`foo:bar`,
+        label=`baz|Label`. Regression for a Codex P2."""
+        converter = _converter()
+        for url in ["foo:bar|baz", "foo:bar>baz", "scheme:a|b>c"]:
+            ast = {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [
+                            {
+                                "type": "link",
+                                "url": url,
+                                "children": [{"type": "text", "value": "Label"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = converter.from_ast(ast)
+            assert result == f"Label ({url})", f"url={url!r}, got {result!r}"
+
+    def test_falls_back_to_parenthesized_form_for_urls_without_a_scheme(self):
+        """URLs without an RFC 3986 scheme (relative paths like `/docs`,
+        fragment-only anchors like `#section`, protocol-relative like
+        `//example.com/x`) can't round-trip through `<url|text>` because
+        the reverse parsers only recognize scheme-prefixed URLs. Fall back
+        to the plain `text (url)` form so the link survives as readable
+        text and Google Chat's auto-link detection still fires where it
+        can. Regression for a Codex P2."""
+        converter = _converter()
+        for url in ["/docs", "#section", "../relative", "//example.com/x"]:
+            result = converter.from_markdown(f"[doc]({url})")
+            assert result == f"doc ({url})", f"url={url!r}"
+        # Sanity: absolute URLs still use the <url|text> form.
+        assert converter.from_markdown("[doc](https://example.com)") == "<https://example.com|doc>"
 
     def test_blockquote(self):
         converter = _converter()
@@ -238,6 +579,49 @@ class TestExtractPlainText:
         converter = _converter()
         result = converter.extract_plain_text("```\nsome code\n```")
         assert "some code" in result
+
+    def test_strips_gchat_custom_link_to_label(self):
+        """<url|text> should reduce to just the label text."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("See <https://example.com|Example Site> for details")
+            == "See Example Site for details"
+        )
+
+    def test_strips_gchat_custom_link_with_balanced_parens_in_url(self):
+        """The plain-text path must also strip cleanly when the URL contains
+        unescaped `)`. Regex stops at `|`/`>`, not `)`, so the label is what
+        survives — but pin it explicitly so a future regex tweak can't
+        regress this without failing the test."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("See <https://en.wikipedia.org/wiki/Foo_(bar)|Wiki> for info")
+            == "See Wiki for info"
+        )
+
+    def test_preserves_gchat_custom_link_literal_inside_inline_code(self):
+        """Code spans are literal — a `<url|text>` inside backticks is user
+        content, not a link. The link-strip regex runs on the surrounding
+        text only; code contents are preserved verbatim (just without the
+        backticks). Regression test for a P2 Codex finding: before the fix,
+        the strip-inline-code pass ran first and exposed the link syntax to
+        the link-strip pass, which collapsed it to just the label."""
+        converter = _converter()
+        assert (
+            converter.extract_plain_text("Use `<https://example.com|Example>` here")
+            == "Use <https://example.com|Example> here"
+        )
+
+    def test_preserves_gchat_custom_link_literal_inside_fenced_code(self):
+        """Same as inline code, but for fenced ``` blocks. Content between
+        the fences must be preserved verbatim."""
+        converter = _converter()
+        result = converter.extract_plain_text("Here is the code:\n```\ncurl <https://api.com|example>\n```\nDone.")
+        assert "<https://api.com|example>" in result
+        # And the label-only form should NOT appear (would indicate the strip
+        # pass leaked into code content).
+        assert ">example<" not in result
+        assert " example " not in result
 
 
 # ---------------------------------------------------------------------------

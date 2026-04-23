@@ -344,11 +344,17 @@ class TestFallbackStreamingPlaceholder:
         # No placeholder "..." should have been posted
         for _tid, content in adapter._post_calls:
             assert content != "..."
-        # The last edit should contain "Hi"
-        assert len(adapter._edit_calls) > 0
-        last_edit = adapter._edit_calls[-1]
-        # last_edit is (thread_id, message_id, content)
-        assert last_edit[0] == "slack:C123:1234.5678"
+        # With placeholder=None the first chunk posts immediately; subsequent
+        # chunks are delivered via edit_message (matches upstream TS's
+        # `render()`-based edit loop).
+        assert len(adapter._post_calls) >= 1
+        first_thread_id, _first_content = adapter._post_calls[0]
+        assert first_thread_id == "slack:C123:1234.5678"
+        # The final edit carries the full "Hi" payload.
+        assert len(adapter._edit_calls) >= 1
+        last_edit_content = adapter._edit_calls[-1][2]
+        last_markdown = last_edit_content.markdown if hasattr(last_edit_content, "markdown") else last_edit_content
+        assert last_markdown == "Hi"
 
 
 # ============================================================================

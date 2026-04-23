@@ -37,13 +37,13 @@ class SlackFormatConverter(BaseFormatConverter):
         """Render an AST to Slack mrkdwn format."""
         return self._from_ast_with_node_converter(ast, self._node_to_mrkdwn)
 
-    def to_ast(self, mrkdwn: str) -> Root:
+    def to_ast(self, platform_text: str) -> Root:
         """Parse Slack mrkdwn into an AST.
 
         Converts Slack-specific syntax to standard markdown, then parses
         with the shared parser.
         """
-        markdown = mrkdwn
+        markdown = platform_text
 
         # User mentions: <@U123|name> -> @name or <@U123> -> @U123
         markdown = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", markdown)
@@ -94,9 +94,9 @@ class SlackFormatConverter(BaseFormatConverter):
             return self.from_ast(message.ast)
         return ""
 
-    def extract_plain_text(self, mrkdwn: str) -> str:
+    def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Slack mrkdwn by stripping formatting."""
-        text = mrkdwn
+        text = platform_text
 
         # Remove user mentions formatting: <@U123|name> -> @name, <@U123> -> @U123
         text = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", text)
@@ -280,13 +280,15 @@ class SlackFormatConverter(BaseFormatConverter):
         rows_data: list[list[dict[str, str]]] = []
 
         for row in node.get("children", []):
-            cells = [
-                {
-                    "type": "raw_text",
-                    "text": "".join(self._node_to_mrkdwn(c) for c in cell.get("children", [])) or " ",
-                }
-                for cell in row.get("children", [])
-            ]
+            cells = []
+            for cell in row.get("children", []):
+                # Convert cell children to text, defaulting to a space if empty.
+                # Slack API requires table cell text to be at least 1 character.
+                # Use an explicit length check rather than a truthiness check to
+                # avoid substituting valid strings like "0".
+                raw_text = "".join(self._node_to_mrkdwn(c) for c in cell.get("children", []))
+                text = raw_text if len(raw_text) > 0 else " "
+                cells.append({"type": "raw_text", "text": text})
             rows_data.append(cells)
 
         block: SlackBlock = {"type": "table", "rows": rows_data}

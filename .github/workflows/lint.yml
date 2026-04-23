@@ -1,0 +1,104 @@
+name: Lint & Type Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+      - '.pyrefly-baseline.json'
+      - '.github/workflows/lint.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+      - '.pyrefly-baseline.json'
+      - '.github/workflows/lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    if: "!github.event.pull_request.draft"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f  # v4
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Ruff check
+        id: ruff_check
+        continue-on-error: true
+        run: uv run ruff check src/ tests/ scripts/
+
+      - name: Ruff format check
+        id: ruff_format
+        continue-on-error: true
+        run: uv run ruff format --check src/ tests/ scripts/
+
+      - name: Test quality audit
+        id: audit
+        continue-on-error: true
+        run: uv run python scripts/audit_test_quality.py
+
+      - name: Pyrefly type check (against baseline)
+        id: pyrefly
+        continue-on-error: true
+        run: uv run pyrefly check --baseline=.pyrefly-baseline.json
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Report results
+        if: always()
+        run: |
+          echo "## Lint & Type Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Outcome |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruff check | ${{ steps.ruff_check.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruff format | ${{ steps.ruff_format.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test audit | ${{ steps.audit.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pyrefly | ${{ steps.pyrefly.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.pyrefly.outcome }}" = "success" ]; then
+            echo "No new type issues above the baseline." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "New type issues above the baseline. Either fix them or refresh the baseline with \`uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline\` if intentional." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail if any step failed
+        if: always()
+        env:
+          RUFF_CHECK: ${{ steps.ruff_check.outcome }}
+          RUFF_FORMAT: ${{ steps.ruff_format.outcome }}
+          AUDIT: ${{ steps.audit.outcome }}
+          PYREFLY: ${{ steps.pyrefly.outcome }}
+        run: |
+          failures=0
+          for var in RUFF_CHECK RUFF_FORMAT AUDIT PYREFLY; do
+            outcome="${!var}"
+            if [ "$outcome" != "success" ]; then
+              echo "$var failed (outcome: $outcome)"
+              failures=1
+            fi
+          done
+          [ "$failures" -eq 0 ] || exit 1
