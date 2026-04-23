@@ -73,6 +73,7 @@ from chat_sdk.types import (
     LinkPreview,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     MemberJoinedChannelEvent,
     Message,
     MessageMetadata,
@@ -203,7 +204,7 @@ class SlackAdapter:
         self._bot_id: str | None = None  # Bot app ID (B_xxx)
         self._chat: ChatInstance | None = None
         self._format_converter = SlackFormatConverter()
-        self._lock_scope = "thread"
+        self._lock_scope: LockScope = "thread"
         self._persist_message_history = False
 
         # Channel external/shared cache
@@ -245,7 +246,7 @@ class SlackAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property

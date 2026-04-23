@@ -132,44 +132,49 @@ class WhatsAppWebhookPayload(TypedDict):
 # =============================================================================
 
 
-class WhatsAppInboundMessage(TypedDict, total=False):
-    """Inbound message from a user.
-
-    See: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
-    """
-
-    # Audio message content
-    audio: dict[str, Any]
-    # Legacy button response (from template quick replies)
-    button: dict[str, str]
-    # Context for quoted replies
-    context: dict[str, str]
-    # Document message content
-    document: dict[str, Any]
-    # Sender's WhatsApp ID
-    from_: str  # mapped from "from" in JSON
-    # Unique message ID
-    id: str
-    # Image message content
-    image: dict[str, Any]
-    # Interactive message reply
-    interactive: dict[str, Any]
-    # Location message content
-    location: dict[str, Any]
-    # Reaction to a message
-    reaction: dict[str, str]
-    # Sticker message content
-    sticker: dict[str, Any]
-    # Text message content
-    text: dict[str, str]
-    # Unix timestamp string
-    timestamp: str
-    # Message type
-    type: str
-    # Video message content
-    video: dict[str, Any]
-    # Voice message content
-    voice: dict[str, Any]
+# Inbound message from a user. The `"from"` field name matches the raw JSON
+# key (a Python keyword at class-body level, so we use the functional
+# TypedDict form to preserve it verbatim).
+#
+# See: https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
+WhatsAppInboundMessage = TypedDict(
+    "WhatsAppInboundMessage",
+    {
+        # Audio message content
+        "audio": dict[str, Any],
+        # Legacy button response (from template quick replies)
+        "button": dict[str, str],
+        # Context for quoted replies
+        "context": dict[str, str],
+        # Document message content
+        "document": dict[str, Any],
+        # Sender's WhatsApp ID
+        "from": str,
+        # Unique message ID
+        "id": str,
+        # Image message content
+        "image": dict[str, Any],
+        # Interactive message reply
+        "interactive": dict[str, Any],
+        # Location message content
+        "location": dict[str, Any],
+        # Reaction to a message
+        "reaction": dict[str, str],
+        # Sticker message content
+        "sticker": dict[str, Any],
+        # Text message content
+        "text": dict[str, str],
+        # Unix timestamp string
+        "timestamp": str,
+        # Message type
+        "type": str,
+        # Video message content
+        "video": dict[str, Any],
+        # Voice message content
+        "voice": dict[str, Any],
+    },
+    total=False,
+)
 
 
 # =============================================================================

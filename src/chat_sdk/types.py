@@ -944,10 +944,16 @@ class PostEphemeralOptions:
 
 @dataclass
 class ReactionEvent:
-    """Reaction event data."""
+    """Reaction event data.
+
+    `thread` is optional because some platforms deliver reactions without a
+    usable thread context (e.g. Slack reactions on a top-level channel
+    message; Teams reactions where the message lookup failed). Consumers
+    should `if event.thread is None: return` before using it.
+    """
 
     adapter: Adapter
-    thread: Thread
+    thread: Thread | None
     thread_id: str
     message_id: str
     user: Author
@@ -1021,10 +1027,16 @@ class ModalResponse:
 
 @dataclass
 class SlashCommandEvent:
-    """Slash command event data."""
+    """Slash command event data.
+
+    `channel` is optional because some platforms (notably Discord) fire
+    slash commands without a channel context (DM slash commands), and
+    because adapters may not always resolve the channel before dispatch.
+    Consumers should `if event.channel is None: return` before using it.
+    """
 
     adapter: Adapter
-    channel: Channel
+    channel: Channel | None
     user: Author
     command: str
     text: str

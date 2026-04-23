@@ -47,6 +47,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -169,7 +170,7 @@ class LinearAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -537,7 +538,7 @@ class LinearAdapter:
             ),
         )
 
-    async def delete_message(self, _thread_id: str, message_id: str) -> None:
+    async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message (delete a comment)."""
         await self._ensure_valid_token()
 
@@ -554,7 +555,7 @@ class LinearAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
+        thread_id: str,
         message_id: str,
         emoji: EmojiValue | str,
     ) -> None:
@@ -575,14 +576,14 @@ class LinearAdapter:
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a comment (limited support)."""
         self._logger.warn("removeReaction is not fully supported on Linear - reaction ID lookup would be required")
 
-    async def start_typing(self, _thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Start typing indicator. Not supported by Linear."""
         pass
 

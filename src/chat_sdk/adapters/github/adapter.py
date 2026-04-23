@@ -17,7 +17,7 @@ import re
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
 from chat_sdk.adapters.github.format_converter import GitHubFormatConverter
@@ -31,6 +31,7 @@ from chat_sdk.adapters.github.types import (
     GitHubUser,
     IssueCommentWebhookPayload,
     PullRequestReviewCommentWebhookPayload,
+    _GitHubAdapterConfigInternal,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -47,6 +48,7 @@ from chat_sdk.types import (
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -89,7 +91,10 @@ class GitHubAdapter:
     """
 
     def __init__(self, config: GitHubAdapterConfig | None = None) -> None:
-        config = config or {}
+        # The public API surface is the auth-mode-specific TypedDict union
+        # above; internally we duck-type with `.get()` so narrow to the
+        # superset TypedDict that admits every possible key.
+        config = cast(_GitHubAdapterConfigInternal, config or {})
         self._name = "github"
 
         webhook_secret = config.get("webhook_secret") or os.environ.get("GITHUB_WEBHOOK_SECRET")
@@ -177,7 +182,7 @@ class GitHubAdapter:
         return str(self._bot_user_id) if self._bot_user_id else None
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property

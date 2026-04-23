@@ -45,6 +45,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -195,7 +196,7 @@ class TeamsAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -767,23 +768,23 @@ class TeamsAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Add a reaction (not supported by Teams Bot Framework API)."""
         self._logger.warn("addReaction is not supported by the Teams Bot Framework API")
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction (not supported by Teams Bot Framework API)."""
         self._logger.warn("removeReaction is not supported by the Teams Bot Framework API")
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Send typing indicator to a Teams conversation."""
         decoded = self.decode_thread_id(thread_id)
 

@@ -44,6 +44,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -102,7 +103,7 @@ class WhatsAppAdapter:
 
     def __init__(self, config: WhatsAppAdapterConfig) -> None:
         self._name = "whatsapp"
-        self._lock_scope = "channel"
+        self._lock_scope: LockScope = "channel"
         self._persist_message_history = True
         self._user_name = config.user_name
         self._access_token = config.access_token
@@ -124,7 +125,7 @@ class WhatsAppAdapter:
         return self._name
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property

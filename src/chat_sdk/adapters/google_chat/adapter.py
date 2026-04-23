@@ -69,6 +69,7 @@ from chat_sdk.types import (
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     Message,
     RawMessage,
     ReactionEvent,
@@ -130,7 +131,7 @@ class GoogleChatAdapter:
             config = GoogleChatAdapterConfig()
 
         self._name = "gchat"
-        self._lock_scope: str | None = None
+        self._lock_scope: LockScope | None = None
         self._persist_message_history: bool | None = None
         self._logger: Logger = config.logger or ConsoleLogger("info").child("gchat")
         self._user_name = config.user_name or "bot"
@@ -211,7 +212,7 @@ class GoogleChatAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return self._lock_scope
 
     @property

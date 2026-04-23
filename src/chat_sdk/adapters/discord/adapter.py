@@ -52,6 +52,7 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -160,7 +161,7 @@ class DiscordAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -953,7 +954,7 @@ class DiscordAdapter:
             "DELETE",
         )
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Start typing indicator in a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = decoded.thread_id or decoded.channel_id

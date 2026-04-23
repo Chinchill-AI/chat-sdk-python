@@ -68,6 +68,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -257,7 +258,7 @@ class TelegramAdapter:
             )
 
         self._name: str = "telegram"
-        self._lock_scope: str = "channel"
+        self._lock_scope: LockScope = "channel"
         self._persist_message_history: bool = True
 
         self._bot_token: str = bot_token
@@ -300,7 +301,7 @@ class TelegramAdapter:
         return self._name
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property
@@ -1018,7 +1019,7 @@ class TelegramAdapter:
         self,
         thread_id: str,
         message_id: str,
-        _emoji: EmojiValue | str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a Telegram message."""
         parsed_thread = self._resolve_thread_id(thread_id)
