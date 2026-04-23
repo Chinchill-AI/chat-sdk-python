@@ -16,3 +16,7 @@ build/
 .mypy_cache/
 uv.lock
 .claude/
+.coverage
+coverage.xml
+htmlcov/
+AGENTS.md
