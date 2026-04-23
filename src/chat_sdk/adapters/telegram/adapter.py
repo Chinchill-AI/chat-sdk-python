@@ -1928,7 +1928,7 @@ class TelegramAdapter:
             if callable(text_attr):
                 result = text_attr()
                 text_attr = await result if inspect.isawaitable(result) else result
-            return text_attr.decode("utf-8") if isinstance(text_attr, bytes) else str(text_attr)
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         body = getattr(request, "body", None)
         if body is not None:
             if callable(body):

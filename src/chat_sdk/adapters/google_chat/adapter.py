@@ -775,7 +775,7 @@ class GoogleChatAdapter:
             if callable(text_attr):
                 result = text_attr()
                 text_attr = await result if inspect.isawaitable(result) else result
-            body = text_attr.decode("utf-8") if isinstance(text_attr, bytes) else str(text_attr)
+            body = text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         else:
             raw_body = getattr(request, "body", None)
             if raw_body is not None:
