@@ -1921,10 +1921,14 @@ class TelegramAdapter:
         """Extract body text from a framework-agnostic request object."""
         # `hasattr` narrows `Any` → `object` (not awaitable); `getattr(..., None)`
         # preserves `Any` for the duck-typed framework paths.
+        # Handle both callable and non-callable `request.text` forms.
+        # Gating entry on callability would drop populated string attrs.
         text_attr = getattr(request, "text", None)
-        if text_attr is not None and callable(text_attr):
-            result = text_attr()
-            return str(await result if inspect.isawaitable(result) else result)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, bytes) else str(text_attr)
         body = getattr(request, "body", None)
         if body is not None:
             if callable(body):

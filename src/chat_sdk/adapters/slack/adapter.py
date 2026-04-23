@@ -688,11 +688,16 @@ class SlackAdapter:
         # Read the raw body. `hasattr` narrows `Any` → `object` (not
         # awaitable), so we use `getattr(..., None)` to preserve the
         # `Any` type across the duck-typed framework branches.
+        # Handle both callable (`async def text(self)`) and non-callable
+        # (`text: str` attribute) forms of `request.text`. Gating entry
+        # on callability would drop populated string attributes.
         text_attr = getattr(request, "text", None)
         body: str
-        if text_attr is not None and callable(text_attr):
-            result = text_attr()
-            body = str(await result if inspect.isawaitable(result) else result)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            body = text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         else:
             raw = getattr(request, "body", None)
             if raw is not None:

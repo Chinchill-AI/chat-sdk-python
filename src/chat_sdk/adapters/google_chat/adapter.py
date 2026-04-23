@@ -764,11 +764,18 @@ class GoogleChatAdapter:
         # Parse request body. `hasattr` narrows `Any` → `object` (not
         # awaitable); `getattr(..., None)` preserves `Any` for the
         # framework duck-typed path.
+        # `request.text` may be either an async method (aiohttp, FastAPI)
+        # or a populated string/bytes attribute (Django raw HttpRequest,
+        # some mock objects). Handle both — testing callability inside
+        # the non-None branch, not gating entry on it, so non-callable
+        # text attributes aren't silently dropped to the body branch.
         body: str
         text_attr = getattr(request, "text", None)
-        if text_attr is not None and callable(text_attr):
-            result = text_attr()
-            body = str(await result if inspect.isawaitable(result) else result)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            body = text_attr.decode("utf-8") if isinstance(text_attr, bytes) else str(text_attr)
         else:
             raw_body = getattr(request, "body", None)
             if raw_body is not None:
