@@ -1019,9 +1019,6 @@ class TestPublicContextAccessors:
     async def test_current_token_honors_per_request_context(self):
         adapter, _, _ = await _init_adapter()
 
-        async def within_ctx() -> str:
-            return adapter.current_token
-
         from chat_sdk.adapters.slack.types import RequestContext
 
         token = adapter._request_context.set(RequestContext(token="xoxb-per-request", bot_user_id="U_PER"))

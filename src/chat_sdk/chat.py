@@ -1404,12 +1404,26 @@ class Chat:
 
         Mirrors ``chat.thread(threadId)`` from the upstream TS SDK.
         """
-        adapter_name = thread_id.split(":")[0] if ":" in thread_id else ""
-        if not adapter_name:
+        # Validate thread ID shape: must be `{adapter}:{remainder}` with a
+        # non-empty adapter prefix AND non-empty remainder. Without the
+        # remainder check, `"slack:"` or `"slack::"` would construct a
+        # ThreadImpl with an empty channel ID that blows up on the first
+        # adapter call — surface the error here instead.
+        adapter_name, sep, remainder = thread_id.partition(":")
+        if not sep or not adapter_name or not remainder:
             raise ChatError(f"Invalid thread ID: {thread_id}")
         adapter = self._adapters.get(adapter_name)
         if adapter is None:
             raise ChatError(f'Adapter "{adapter_name}" not found for thread ID "{thread_id}"')
+
+        # Defer to the adapter to derive channel_id — it knows the
+        # platform-specific encoding. Empty channel_id also means malformed.
+        try:
+            derived_channel_id = adapter.channel_id_from_thread_id(thread_id)
+        except Exception as exc:
+            raise ChatError(f"Invalid thread ID: {thread_id}") from exc
+        if not derived_channel_id or derived_channel_id == f"{adapter_name}:":
+            raise ChatError(f"Invalid thread ID: {thread_id}")
 
         stub_message = (
             current_message
@@ -1421,7 +1435,9 @@ class Chat:
                 formatted={"type": "root", "children": []},
                 raw=None,
                 author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                # Deterministic timestamp for the stub message — `datetime.now()`
+                # makes this method non-deterministic and harder to test.
+                metadata=MessageMetadata(date_sent=datetime.fromtimestamp(0, tz=timezone.utc), edited=False),
             )
         )
         return self._create_thread(adapter, thread_id, stub_message, False)

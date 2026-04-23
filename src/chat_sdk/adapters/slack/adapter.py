@@ -21,7 +21,10 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from slack_sdk.web.async_client import AsyncWebClient
 from urllib.parse import parse_qs
 
 from chat_sdk.adapters.slack.cards import (
@@ -275,7 +278,7 @@ class SlackAdapter:
         return self._get_token()
 
     @property
-    def current_client(self) -> Any:
+    def current_client(self) -> AsyncWebClient:
         """Return an ``AsyncWebClient`` preconfigured with :attr:`current_token`.
 
         The returned client is LRU-cached by token. Raises
