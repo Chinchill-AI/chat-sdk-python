@@ -504,14 +504,18 @@ class TestChatThreadFactory:
         assert thread._message_history is chat._message_history
 
     def test_omits_history_when_adapter_does_not_persist(self):
-        """Adapters with `persist_message_history=False`/None opt out of
-        the shared history cache. `Chat.thread()` respects that: the
-        Thread gets `None` for history rather than a shared cache the
-        adapter won't populate.
+        """Adapters with `persist_message_history` falsy opt out of the
+        shared history cache. `Chat.thread()` respects that: the Thread
+        gets `None` for history rather than a shared cache the adapter
+        won't populate.
+
+        Explicitly set `persist_message_history = None` rather than
+        relying on the mock's default — prevents silent test regression
+        if the mock default ever changes.
         """
         chat = _make_chat("slack")
         adapter = chat._adapters["slack"]
-        assert not adapter.persist_message_history  # default on mock is None
+        adapter.persist_message_history = None
 
         thread = chat.thread("slack:C123:1234567890.123456")
         assert thread._state_adapter is chat._state_adapter
@@ -525,17 +529,20 @@ class TestChatThreadFactory:
             chat.thread("no-colon-here")
 
     def test_empty_remainder_raises(self):
-        """`slack:` or `slack::` would create a thread with empty channel
-        ID that blows up on the first adapter call — surface the error
-        at construction time instead.
+        """`slack:` or `slack::`, or any string where every segment after
+        the adapter prefix is empty, would create a thread with no real
+        content. Surface the error at construction time instead of
+        relying on adapter-specific `channel_id_from_thread_id` to
+        catch it (adapters differ in what they return for malformed
+        input — some return the input, some return a partial prefix —
+        so we validate structurally before dispatching to the adapter).
         """
         from chat_sdk.errors import ChatError
 
         chat = _make_chat("slack")
-        with pytest.raises(ChatError, match="Invalid thread ID"):
-            chat.thread("slack:")
-        with pytest.raises(ChatError, match="Invalid thread ID"):
-            chat.thread("slack::")
+        for bad in ("slack:", "slack::", "slack:::", "slack::::"):
+            with pytest.raises(ChatError, match="Invalid thread ID"):
+                chat.thread(bad)
 
     def test_unregistered_adapter_raises(self):
         from chat_sdk.errors import ChatError

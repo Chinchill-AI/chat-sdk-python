@@ -1404,25 +1404,34 @@ class Chat:
 
         Mirrors ``chat.thread(threadId)`` from the upstream TS SDK.
         """
-        # Validate thread ID shape: must be `{adapter}:{remainder}` with a
-        # non-empty adapter prefix AND non-empty remainder. Without the
-        # remainder check, `"slack:"` or `"slack::"` would construct a
-        # ThreadImpl with an empty channel ID that blows up on the first
-        # adapter call — surface the error here instead.
+        # Validate thread ID shape structurally, before calling the adapter.
+        # A valid ID is `{adapter}:{segment}[:{segment}...]` with:
+        #   - non-empty adapter prefix
+        #   - at least one non-empty segment after the prefix
+        # Rejects `"slack:"`, `"slack::"`, `"slack::::"` etc. at the SDK
+        # boundary so we don't rely on each adapter's
+        # `channel_id_from_thread_id` doing its own defense. (Different
+        # adapters return different things for malformed input; we need
+        # a single source of truth.)
         adapter_name, sep, remainder = thread_id.partition(":")
-        if not sep or not adapter_name or not remainder:
+        if not sep or not adapter_name:
             raise ChatError(f"Invalid thread ID: {thread_id}")
+        # Remainder is empty or only colons → no actual content.
+        if not remainder or not any(seg for seg in remainder.split(":")):
+            raise ChatError(f"Invalid thread ID: {thread_id}")
+
         adapter = self._adapters.get(adapter_name)
         if adapter is None:
             raise ChatError(f'Adapter "{adapter_name}" not found for thread ID "{thread_id}"')
 
-        # Defer to the adapter to derive channel_id — it knows the
-        # platform-specific encoding. Empty channel_id also means malformed.
+        # Defer to the adapter to derive channel_id as a secondary sanity
+        # check — some platform-specific patterns can pass the structural
+        # check but still be malformed (e.g. wrong number of segments).
         try:
             derived_channel_id = adapter.channel_id_from_thread_id(thread_id)
         except Exception as exc:
             raise ChatError(f"Invalid thread ID: {thread_id}") from exc
-        if not derived_channel_id or derived_channel_id == f"{adapter_name}:":
+        if not derived_channel_id:
             raise ChatError(f"Invalid thread ID: {thread_id}")
 
         stub_message = (
