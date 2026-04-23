@@ -1,14 +1,75 @@
 # Changelog
 
-## Unreleased
+## 0.4.26.1 (2026-04-23)
+
+Python-only follow-up on `0.4.26`. Still alpha — APIs may change.
 
 ### Fixes
-- **Slack native streaming no longer crashes on first chunk** (issue #44): `SlackAdapter.stream()` now awaits `AsyncWebClient.chat_stream(...)`; the previous code called `.append()` on an unawaited coroutine, raising `AttributeError` and forcing callers onto the post+edit fallback. Existing tests were updated to use `AsyncMock` for `chat_stream` so they mirror the real client.
-- **Teams divider now renders a visible separator line** (issue #45): `card_to_adaptive_card` previously emitted an empty `Container` with `separator: True`, which Microsoft Teams renders at zero height. The new behavior hoists `separator: True` onto the following sibling (or emits a minimal non-empty Container for a trailing divider). Upstream TS ships the same bug; documented as a divergence in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md).
 
-### Python-only additions
-- **`SlackAdapter.current_token` / `current_client`** (issue #47): public `@property` accessors that return the request-context-bound bot token and a preconfigured `AsyncWebClient`. Replaces reaching into `_get_token()` / `_get_client()` from consumer code that needs to call the Slack Web API directly from inside a handler (email resolution, user profile fetches, etc.). TS keeps `getToken()` private; documented as a Python-only extension in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md).
-- **`Chat.thread(thread_id, *, current_message=None)`** (issue #46): public worker-reconstruction factory mirroring TS `chat.thread(threadId)`. Adapter is inferred from the thread ID prefix; state and message history come from the Chat instance. Pass `current_message` when the worker needs Slack native streaming (it populates `recipient_user_id` / `recipient_team_id`).
+- **Slack native streaming**: `SlackAdapter.stream()` no longer calls
+  `AsyncWebClient.chat_stream(...)` without `await`. The unawaited coroutine
+  returned a truthy object, and the first `streamer.append(...)` raised
+  `AttributeError`, breaking native Slack streaming for any consumer using
+  the default adapter. Issue #44.
+- **Teams divider renders at non-zero height**: empty `Container` with
+  `separator: True` rendered as zero-height in the Teams UI. Dividers
+  between siblings now hoist `separator: True` onto the following element;
+  a trailing divider emits a minimal non-empty Container. Issue #45.
+- **`ConcurrencyConfig.max_concurrent` is now enforced**: consumers setting
+  `concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=N)`
+  now actually get an `asyncio.Semaphore(N)` cap on in-flight handlers.
+  Previously the field was accepted and ignored (upstream TS has the same
+  gap). `None` / unset keeps the unbounded default. Issue #51.
+
+### Python-specific (divergence from upstream 4.26)
+
+- **Fallback streaming runtime robustness** (cluster of fixes): framework-
+  agnostic `request.text()` handling now tolerates sync Flask-style
+  requests (was raising `TypeError: object is not awaitable`). Handlers
+  typed `Callable[..., Awaitable[None] | None]` may return sync (`None`) —
+  the dispatcher now `await`s only when `inspect.isawaitable()` confirms,
+  preventing runtime crashes on sync handlers.
+- **`max_concurrent` enforcement** (see above) — upstream accepts the
+  config field but never enforces it; we do.
+
+### New public APIs
+
+- **`Chat.thread(thread_id, *, current_message=None)`**: new worker-
+  reconstruction factory mirroring TS `chat.thread(threadId)`. Adapter is
+  inferred from the thread-ID prefix; state and message history come from
+  the Chat instance. `current_message` is preserved so Slack native
+  streaming still works post-reconstruction. Issue #46.
+- **`SlackAdapter.current_token` / `current_client`**: public `@property`
+  accessors for the request-context-bound bot token and a preconfigured
+  `AsyncWebClient`. Replaces underscore access from consumer code making
+  direct Slack Web API calls inside a handler (email resolution, user
+  profile fetches, etc.). Issue #47.
+
+### Internals
+
+- **Pyrefly: 213 → 0 type errors**; baseline file removed. CI now enforces
+  zero errors. Root causes fixed: 8-adapter `lock_scope: LockScope | None`
+  protocol conformance; `_ChatSingleton` as `Protocol`; submodule-aware
+  `replace-imports-with-any`; `NoReturn` on error re-raisers;
+  `inspect.isawaitable` guards for duck-typed request handling and
+  sync-or-async handler dispatch. No `Any` widening, no new `# type:
+  ignore` lines beyond 10 at adapter event-construction sites where
+  `thread=None`/`channel=None` get re-wrapped by `Chat` before handler
+  dispatch (matches upstream TS's `Omit<>` partial-event pattern).
+- Test count: **3545 passed**, 2 skipped.
+
+### Known gaps (not fixed in this release)
+
+- `onOptionsLoad` handler for dynamic select dropdowns — issue #50
+- `Thread.getParticipants()` method — issue #54
+- `rehydrate_attachment` adapter hook for queue/debounce + attachments —
+  issue #52
+- 40 upstream tests without Python equivalents (Options Load, Plan variants,
+  StreamingPlan options, getParticipants) — issue #53
+- Discord native Gateway WebSocket (HTTP-only today) — issue #57
+- Teams certificate-based mTLS auth — issue #58
+- Google Chat file uploads (TODO upstream too) — issue #59
+- Global handler-dispatch bound across reactions/actions/slash/modals — issue #61
 
 ## 0.4.26 (2026-04-16)
 

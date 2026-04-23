@@ -39,6 +39,7 @@ from chat_sdk.types import (
     Channel,
     ChannelVisibility,
     ChatConfig,
+    ConcurrencyConfig,
     ConcurrencyStrategy,
     EmojiValue,
     Lock,
@@ -296,6 +297,48 @@ class Chat:
             self._concurrency_max_queue_size = concurrency.max_queue_size
             self._concurrency_on_queue_full = concurrency.on_queue_full
             self._concurrency_queue_entry_ttl_ms = concurrency.queue_entry_ttl_ms
+
+        # -- Concurrent-strategy semaphore ------------------------------------
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+        # `max_concurrent` bounds in-flight handler dispatches when using the
+        # `"concurrent"` strategy. `None` means unbounded (matches the upstream
+        # TS default of `Infinity`). A positive integer caps parallel handler
+        # runs. Upstream accepts the config field but never enforces it
+        # (3 writes, 0 reads); we enforce it via `asyncio.Semaphore`.
+        #
+        # Only construct the semaphore when the strategy actually uses it —
+        # if a user sets `max_concurrent=5` with `strategy="queue"`, they
+        # have a misconfiguration that we surface as a `ValueError` rather
+        # than silently allocating an unused primitive.
+        #
+        # Reject `<= 0` explicitly rather than silently ignoring — a user
+        # passing `max_concurrent=0` likely means "pause all processing"
+        # (not supported) or has a typo. Either way, silently falling back
+        # to unbounded concurrency would surprise them.
+        raw_max = concurrency.max_concurrent if isinstance(concurrency, ConcurrencyConfig) else None
+        if raw_max is not None and (
+            # Reject non-int (including bool, which is an int subclass but
+            # semantically meaningless here) before any arithmetic —
+            # `asyncio.Semaphore(1.5)` silently goes negative, `Semaphore(True)`
+            # allocates a 1-way bound from a boolean, and `Semaphore("2")`
+            # raises `TypeError` instead of our ValueError.
+            isinstance(raw_max, bool) or not isinstance(raw_max, int) or raw_max <= 0
+        ):
+            raise ValueError(
+                f"ConcurrencyConfig.max_concurrent must be a positive integer or None; "
+                f"got {raw_max!r}. Pass None for unbounded concurrency."
+            )
+        if self._concurrency_max_concurrent is not None and self._concurrency_strategy != "concurrent":
+            raise ValueError(
+                f"ConcurrencyConfig.max_concurrent is only honored when strategy='concurrent'; "
+                f"got strategy={self._concurrency_strategy!r}. Either switch to strategy='concurrent' "
+                "or drop max_concurrent."
+            )
+        self._concurrent_semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self._concurrency_max_concurrent)
+            if self._concurrency_max_concurrent is not None
+            else None
+        )
 
         # -- Message history (placeholder -- real impl would use MessageHistoryCache)
         self._message_history = _MessageHistoryCache(self._state_adapter, config.message_history)
@@ -1840,7 +1883,15 @@ class Chat:
         thread_id: str,
         message: Message,
     ) -> None:
-        await self._dispatch_to_handlers(adapter, thread_id, message)
+        # Enforce `max_concurrent` bound when configured. Upstream TS
+        # accepts the config field but never enforces it; we do, so that
+        # consumers setting `ConcurrencyConfig(strategy="concurrent",
+        # max_concurrent=N)` actually get a bound of N in-flight handlers.
+        if self._concurrent_semaphore is None:
+            await self._dispatch_to_handlers(adapter, thread_id, message)
+            return
+        async with self._concurrent_semaphore:
+            await self._dispatch_to_handlers(adapter, thread_id, message)
 
     # ========================================================================
     # Dispatch to handlers

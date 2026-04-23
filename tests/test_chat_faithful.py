@@ -2263,6 +2263,178 @@ class TestConcurrencyConcurrent:
         assert len(calls) == 1
         assert calls[0] == "Hey @slack-bot concurrent"
 
+    # Python-specific: upstream accepts max_concurrent but doesn't enforce
+    # it. We do. Bound should cap in-flight handlers at N; the (N+1)th
+    # message has to wait until one of the first N releases.
+    async def test_max_concurrent_bounds_in_flight_handlers(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=2),
+        )
+
+        in_flight = 0
+        max_observed = 0
+        gate = asyncio.Event()
+        finished = 0
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal in_flight, max_observed, finished
+            in_flight += 1
+            max_observed = max(max_observed, in_flight)
+            await gate.wait()
+            in_flight -= 1
+            finished += 1
+
+        # Dispatch 5 messages concurrently — at most 2 should be in flight
+        # at any time while the gate is closed.
+        tasks = [
+            asyncio.create_task(
+                chat.handle_incoming_message(
+                    adapter,
+                    f"slack:C123:{i}",
+                    create_test_message(f"msg-{i}", "Hey @slack-bot"),
+                )
+            )
+            for i in range(5)
+        ]
+
+        # Wait until the first 2 handlers reach the gate. asyncio uses a
+        # single-threaded cooperative scheduler, so between `_reach_cap`
+        # returning and the next assertion, no other task can interleave
+        # — tasks 3-5 are parked on `semaphore.acquire()`. The
+        # `in_flight == 2` check IS stable here.
+        async def _reach_cap() -> None:
+            while in_flight < 2:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(_reach_cap(), timeout=1.0)
+        # Snapshot while the gate is still closed: exactly the bound
+        # should be in flight, and no more.
+        assert in_flight == 2
+
+        # Release the gate; all 5 should drain. If the semaphore leaked,
+        # `max_observed` inside the handlers captured the peak before
+        # any could unblock, so the final assertion below would fail.
+        gate.set()
+        await asyncio.gather(*tasks)
+
+        assert finished == 5
+        # The critical assertion: peak in-flight never exceeded 2.
+        assert max_observed == 2
+
+    # Python-specific: reject invalid `max_concurrent` values at construction
+    # time rather than silently falling back to unbounded (which would
+    # surprise users who set `max_concurrent=0` expecting strict throttling).
+    async def test_max_concurrent_zero_or_negative_raises(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_value in (0, -1, -100):
+            import pytest
+
+            with pytest.raises(ValueError, match="max_concurrent must be a positive integer or None"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),
+                )
+
+    # Python-specific: reject non-integer `max_concurrent` at construction
+    # instead of letting `asyncio.Semaphore` misbehave (`1.5` silently drives
+    # the counter negative, `True` allocates a 1-way bound from a bool,
+    # `"2"` raises `TypeError` from inside the primitive instead of our
+    # `ValueError`).
+    async def test_max_concurrent_non_integer_raises(self):
+        import pytest
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_value in (1.5, True, False, "2", 0.0, [1]):
+            with pytest.raises(ValueError, match="max_concurrent must be a positive integer or None"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),  # type: ignore[arg-type]
+                )
+
+    # Python-specific: setting `max_concurrent` with a non-concurrent strategy
+    # is a misconfiguration — the field is only honored under `"concurrent"`.
+    # Fail loudly instead of silently allocating an unused semaphore.
+    async def test_max_concurrent_with_non_concurrent_strategy_raises(self):
+        import pytest
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_strategy in ("queue", "debounce", "drop"):
+            with pytest.raises(ValueError, match="only honored when strategy='concurrent'"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy=bad_strategy, max_concurrent=5),
+                )
+
+    # Python-specific: None / missing max_concurrent must keep the
+    # unbounded behavior (matches upstream TS default of Infinity).
+    # Parameterized to cover both the string form (max_concurrent implicit)
+    # and the explicit ConcurrencyConfig(max_concurrent=None) form — the
+    # two take separate code paths in Chat.__init__ (string → defaults,
+    # ConcurrencyConfig → field read), so both must be verified.
+    @pytest.mark.parametrize(
+        "concurrency_value",
+        [
+            "concurrent",
+            ConcurrencyConfig(strategy="concurrent", max_concurrent=None),
+        ],
+        ids=["string", "config_none"],
+    )
+    async def test_max_concurrent_none_allows_unbounded(self, concurrency_value):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency=concurrency_value)
+
+        in_flight = 0
+        max_observed = 0
+        gate = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal in_flight, max_observed
+            in_flight += 1
+            max_observed = max(max_observed, in_flight)
+            await gate.wait()
+            in_flight -= 1
+
+        tasks = [
+            asyncio.create_task(
+                chat.handle_incoming_message(
+                    adapter,
+                    f"slack:C123:{i}",
+                    create_test_message(f"msg-{i}", "Hey @slack-bot"),
+                )
+            )
+            for i in range(5)
+        ]
+
+        # Poll until all 5 are in flight; with no semaphore they should
+        # all reach the gate.
+        async def _reach_five() -> None:
+            while in_flight < 5:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(_reach_five(), timeout=1.0)
+        assert in_flight == 5
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert max_observed == 5
+
 
 # ============================================================================
 # 22. lockScope (tests 87-91)

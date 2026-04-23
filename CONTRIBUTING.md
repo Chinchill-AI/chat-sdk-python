@@ -58,13 +58,20 @@ All PRs must pass `ruff check` with zero errors.
 Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mapping).
 
 - `0.4.25` = synced to upstream `4.25.0`
-- `0.4.25.1` = Python-only fix on top of `4.25.0`
+- `0.4.25.1` = Python-only changes (fixes, and additive features during
+  alpha) between upstream sync points
 - `0.4.26a1` = alpha while porting upstream `4.26.0`
 
+> **Additive changes in `.patch` bumps are OK during alpha**. The package
+> is marked `Development Status :: 3 - Alpha` and the `0.x.y` prefix signals
+> pre-1.0 per semver convention, so new public APIs can land in `.patch`
+> bumps without a version-scheme violation. Once we hit `1.0`, `.patch`
+> should be fixes-only.
+>
 > **Upstream patch releases**: Vercel Chat has historically gone straight to
 > minor bumps, but if upstream ships a patch (e.g. `4.25.1`) we sync it by
 > bumping to the next minor (`0.4.26`). We don't reuse the `.patch` slot for
-> upstream patches — it's reserved for Python-only fixes so the two can't
+> upstream patches — it's reserved for Python-only changes so the two can't
 > collide.
 
 ### Steps
