@@ -2361,11 +2361,22 @@ class TestConcurrencyConcurrent:
 
     # Python-specific: None / missing max_concurrent must keep the
     # unbounded behavior (matches upstream TS default of Infinity).
-    async def test_max_concurrent_none_allows_unbounded(self):
+    # Parameterized to cover both the string form (max_concurrent implicit)
+    # and the explicit ConcurrencyConfig(max_concurrent=None) form — the
+    # two take separate code paths in Chat.__init__ (string → defaults,
+    # ConcurrencyConfig → field read), so both must be verified.
+    @pytest.mark.parametrize(
+        "concurrency_value",
+        [
+            "concurrent",
+            ConcurrencyConfig(strategy="concurrent", max_concurrent=None),
+        ],
+    )
+    async def test_max_concurrent_none_allows_unbounded(self, concurrency_value):
         state = create_mock_state()
         adapter = create_mock_adapter("slack")
 
-        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="concurrent")
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency=concurrency_value)
 
         in_flight = 0
         max_observed = 0
