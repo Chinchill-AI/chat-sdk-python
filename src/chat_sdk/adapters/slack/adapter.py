@@ -21,10 +21,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from slack_sdk.web.async_client import AsyncWebClient
+from typing import Any
 from urllib.parse import parse_qs
 
 from chat_sdk.adapters.slack.cards import (
@@ -278,8 +275,14 @@ class SlackAdapter:
         return self._get_token()
 
     @property
-    def current_client(self) -> AsyncWebClient:
+    def current_client(self) -> Any:
         """Return an ``AsyncWebClient`` preconfigured with :attr:`current_token`.
+
+        Return type is ``Any`` (rather than the concrete
+        ``AsyncWebClient``) because ``slack_sdk`` is an optional
+        dependency — consumers who install the SDK without the `slack`
+        extra shouldn't pay a type-check-time import cost. Docstring
+        captures the actual runtime type for tooling that reads it.
 
         The returned client is LRU-cached by token. Raises
         :class:`AuthenticationError` when no token is available.
