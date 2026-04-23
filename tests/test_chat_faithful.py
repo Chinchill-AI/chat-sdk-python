@@ -2263,6 +2263,102 @@ class TestConcurrencyConcurrent:
         assert len(calls) == 1
         assert calls[0] == "Hey @slack-bot concurrent"
 
+    # Python-specific: upstream accepts max_concurrent but doesn't enforce
+    # it. We do. Bound should cap in-flight handlers at N; the (N+1)th
+    # message has to wait until one of the first N releases.
+    async def test_max_concurrent_bounds_in_flight_handlers(self):
+        import asyncio
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=2),
+        )
+
+        in_flight = 0
+        max_observed = 0
+        gate = asyncio.Event()
+        finished = 0
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal in_flight, max_observed, finished
+            in_flight += 1
+            max_observed = max(max_observed, in_flight)
+            await gate.wait()
+            in_flight -= 1
+            finished += 1
+
+        # Dispatch 5 messages concurrently — at most 2 should be in flight
+        # at any time while the gate is closed.
+        tasks = [
+            asyncio.create_task(
+                chat.handle_incoming_message(
+                    adapter,
+                    f"slack:C123:{i}",
+                    create_test_message(f"msg-{i}", "Hey @slack-bot"),
+                )
+            )
+            for i in range(5)
+        ]
+
+        # Let the first two handlers enter and block on the gate.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert in_flight == 2
+        assert max_observed == 2
+
+        # Release the gate; all 5 should drain.
+        gate.set()
+        await asyncio.gather(*tasks)
+
+        assert finished == 5
+        # The bound was never exceeded.
+        assert max_observed == 2
+
+    # Python-specific: None / missing max_concurrent must keep the
+    # unbounded behavior (matches upstream TS default of Infinity).
+    async def test_max_concurrent_none_allows_unbounded(self):
+        import asyncio
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="concurrent")
+
+        in_flight = 0
+        max_observed = 0
+        gate = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal in_flight, max_observed
+            in_flight += 1
+            max_observed = max(max_observed, in_flight)
+            await gate.wait()
+            in_flight -= 1
+
+        tasks = [
+            asyncio.create_task(
+                chat.handle_incoming_message(
+                    adapter,
+                    f"slack:C123:{i}",
+                    create_test_message(f"msg-{i}", "Hey @slack-bot"),
+                )
+            )
+            for i in range(5)
+        ]
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # All 5 should be in flight simultaneously (no bound).
+        assert in_flight == 5
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert max_observed == 5
+
 
 # ============================================================================
 # 22. lockScope (tests 87-91)

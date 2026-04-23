@@ -297,6 +297,19 @@ class Chat:
             self._concurrency_on_queue_full = concurrency.on_queue_full
             self._concurrency_queue_entry_ttl_ms = concurrency.queue_entry_ttl_ms
 
+        # -- Concurrent-strategy semaphore ------------------------------------
+        # `max_concurrent` bounds in-flight handler dispatches when using the
+        # `"concurrent"` strategy. `None` means unbounded (matches the upstream
+        # TS default of `Infinity`). A non-None value caps parallel handler
+        # runs at that number — useful for rate-limit hygiene and bounded
+        # resource use. Divergence from upstream: upstream accepts the config
+        # field but doesn't enforce it; we do.
+        self._concurrent_semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self._concurrency_max_concurrent)
+            if self._concurrency_max_concurrent is not None and self._concurrency_max_concurrent > 0
+            else None
+        )
+
         # -- Message history (placeholder -- real impl would use MessageHistoryCache)
         self._message_history = _MessageHistoryCache(self._state_adapter, config.message_history)
 
@@ -1840,7 +1853,15 @@ class Chat:
         thread_id: str,
         message: Message,
     ) -> None:
-        await self._dispatch_to_handlers(adapter, thread_id, message)
+        # Enforce `max_concurrent` bound when configured. Upstream TS
+        # accepts the config field but never enforces it; we do, so that
+        # consumers setting `ConcurrencyConfig(strategy="concurrent",
+        # max_concurrent=N)` actually get a bound of N in-flight handlers.
+        if self._concurrent_semaphore is None:
+            await self._dispatch_to_handlers(adapter, thread_id, message)
+            return
+        async with self._concurrent_semaphore:
+            await self._dispatch_to_handlers(adapter, thread_id, message)
 
     # ========================================================================
     # Dispatch to handlers
