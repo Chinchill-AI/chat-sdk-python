@@ -58,8 +58,14 @@ All PRs must pass `ruff check` with zero errors.
 Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mapping).
 
 - `0.4.25` = synced to upstream `4.25.0`
-- `0.4.25.1` = Python-only fix
+- `0.4.25.1` = Python-only fix on top of `4.25.0`
 - `0.4.26a1` = alpha while porting upstream `4.26.0`
+
+> **Upstream patch releases**: Vercel Chat has historically gone straight to
+> minor bumps, but if upstream ships a patch (e.g. `4.25.1`) we sync it by
+> bumping to the next minor (`0.4.26`). We don't reuse the `.patch` slot for
+> upstream patches — it's reserved for Python-only fixes so the two can't
+> collide.
 
 ### Steps
 
@@ -68,6 +74,10 @@ Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mappin
    uv run ruff check src/ tests/ scripts/
    uv run ruff format --check src/ tests/ scripts/
    uv run python scripts/audit_test_quality.py
+   # verify_test_fidelity.py needs the upstream TS repo at $TS_ROOT (default
+   # /tmp/vercel-chat). Without it, the script silently skips checks and exits
+   # 0, so releases can ship unverified. Clone once:
+   #   git clone https://github.com/vercel/chat.git /tmp/vercel-chat
    uv run python scripts/verify_test_fidelity.py
    uv run pytest tests/ --tb=short -q
    ```
@@ -97,13 +107,16 @@ Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mappin
 
 6. **Verify on PyPI**: `pip install chat-sdk=={version}`
 
-7. **Cleanup**: delete any yanked/superseded GitHub releases.
+7. **Cleanup**: mark yanked/superseded GitHub releases as deprecated in their
+   description — don't delete them (deleting removes history and breaks any
+   external links that reference the tag).
 
 ### What NOT to do
 
 - Don't publish without CI green on all 4 Python versions (3.10-3.13)
 - Don't skip the fidelity check for test changes
-- Don't use alpha tags for upstream syncs (only for work-in-progress)
+- Don't use alpha tags for *final* sync releases — alpha tags (`0.4.26a1`) are
+  only for work-in-progress ports while syncing a new upstream version
 - Don't amend published releases — create a patch instead
 
 ## License
