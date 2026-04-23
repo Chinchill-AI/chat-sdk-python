@@ -259,7 +259,7 @@ class WhatsAppRawMessage(TypedDict, total=False):
     """
 
     # The raw inbound message data
-    message: dict[str, Any]
+    message: WhatsAppInboundMessage
     # Phone number ID that received the message
     phone_number_id: str
     # Contact info from the webhook

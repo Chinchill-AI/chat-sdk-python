@@ -429,7 +429,7 @@ class TestLinearStream:
         adapter.post_message.assert_called_once()
         call_args = adapter.post_message.call_args
         assert call_args.args[0] == thread_id
-        assert call_args.args[1]["raw"] == "hello world"
+        assert call_args.args[1].raw == "hello world"
         assert result.id == "comment-1"
 
     @pytest.mark.asyncio
@@ -463,7 +463,7 @@ class TestLinearStream:
         await adapter.stream("linear:issue-2", dict_gen())
 
         adapter.post_message.assert_called_once()
-        assert adapter.post_message.call_args.args[1]["raw"] == "chunk"
+        assert adapter.post_message.call_args.args[1].raw == "chunk"
 
 
 # ===========================================================================

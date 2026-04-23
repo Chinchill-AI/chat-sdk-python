@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import inspect
 import json
 import math
 import os
@@ -1910,12 +1911,17 @@ class TelegramAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a framework-agnostic request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); `getattr(..., None)`
+        # preserves `Any` for the duck-typed framework paths.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None and callable(text_attr):
+            result = text_attr()
+            return str(await result if inspect.isawaitable(result) else result)
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
-                body = await body()
+                result = body()
+                body = await result if inspect.isawaitable(result) else result
             if isinstance(body, bytes):
                 return body.decode("utf-8")
             return str(body)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from chat_sdk.adapters.github.types import (
     GitHubIssueComment,
     GitHubRawMessage,
     GitHubReactionContent,
+    GitHubRepository,
     GitHubReviewComment,
     GitHubThreadId,
     GitHubUser,
@@ -51,6 +53,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     StreamChunk,
     StreamOptions,
@@ -365,7 +368,7 @@ class GitHubAdapter:
     def _parse_issue_comment(
         self,
         comment: GitHubIssueComment,
-        repository: dict[str, Any],
+        repository: GitHubRepository,
         pr_number: int,
         thread_id: str,
         thread_type: Literal["pr", "issue"] = "pr",
@@ -409,7 +412,7 @@ class GitHubAdapter:
     def _parse_review_comment(
         self,
         comment: GitHubReviewComment,
-        repository: dict[str, Any],
+        repository: GitHubRepository,
         pr_number: int,
         thread_id: str,
     ) -> Message:
@@ -528,7 +531,7 @@ class GitHubAdapter:
                 text += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 text += chunk.text
-        return await self.post_message(thread_id, {"markdown": text})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=text))
 
     @staticmethod
     def _build_raw_message(decoded: Any, comment: dict[str, Any]) -> dict[str, Any]:
@@ -889,8 +892,11 @@ class GitHubAdapter:
 
     def parse_message(self, raw: GitHubRawMessage) -> Message:
         """Parse a raw message into normalized format."""
+        # `raw` is a GitHubRawMessage dict with keys of varying value-types
+        # depending on the event variant; `.get()` unions to `object | str`.
+        # Narrow via casts where we've runtime-verified via `raw.get("type")`.
         if raw.get("type") == "issue_comment":
-            thread_type = raw.get("thread_type", "pr") or "pr"
+            thread_type = cast("Literal['issue', 'pr']", raw.get("thread_type", "pr") or "pr")
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
                     owner=raw["repository"]["owner"]["login"],
@@ -900,10 +906,17 @@ class GitHubAdapter:
                 )
             )
             return self._parse_issue_comment(
-                raw["comment"], raw["repository"], raw["pr_number"], thread_id, thread_type
+                cast("GitHubIssueComment", raw["comment"]),
+                raw["repository"],
+                raw["pr_number"],
+                thread_id,
+                thread_type,
             )
         else:
-            root_comment_id = raw["comment"].get("in_reply_to_id") or raw["comment"]["id"]
+            root_comment_id = cast(
+                "int | None",
+                raw["comment"].get("in_reply_to_id") or raw["comment"]["id"],
+            )
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
                     owner=raw["repository"]["owner"]["login"],
@@ -912,7 +925,12 @@ class GitHubAdapter:
                     review_comment_id=root_comment_id,
                 )
             )
-            return self._parse_review_comment(raw["comment"], raw["repository"], raw["pr_number"], thread_id)
+            return self._parse_review_comment(
+                cast("GitHubReviewComment", raw["comment"]),
+                raw["repository"],
+                raw["pr_number"],
+                thread_id,
+            )
 
     def render_formatted(self, content: FormattedContent) -> str:
         """Render formatted content to GitHub markdown."""
@@ -1069,10 +1087,14 @@ class GitHubAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (which is not awaitable), so
+        # `getattr(..., None)` keeps `Any` for the framework duck-type path.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None and callable(text_attr):
+            result = text_attr()
+            return str(await result if inspect.isawaitable(result) else result)
+        body = getattr(request, "body", None)
+        if body is not None:
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
         return ""
 

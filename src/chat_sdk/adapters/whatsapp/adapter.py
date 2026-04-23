@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import math
 import os
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.whatsapp.cards import card_to_whatsapp, decode_whatsapp_callback_data
@@ -47,6 +48,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     StreamChunk,
@@ -203,12 +205,14 @@ class WhatsAppAdapter:
 
                 value = change.get("value", {})
 
-                # Process incoming messages
+                # Process incoming messages. `value["messages"]` is typed as
+                # `list[dict[str, Any]]` on the webhook TypedDict; cast each
+                # entry to the more-specific inbound shape for handler dispatch.
                 if value.get("messages"):
                     for message in value["messages"]:
                         try:
                             self._handle_inbound_message(
-                                message,
+                                cast("WhatsAppInboundMessage", message),
                                 (value.get("contacts") or [None])[0],
                                 value.get("metadata", {}).get("phone_number_id", ""),
                                 options,
@@ -393,7 +397,7 @@ class WhatsAppAdapter:
             return
 
         decoded = decode_whatsapp_callback_data(raw_id)
-        action_id = decoded["action_id"]
+        action_id = decoded["action_id"] or ""
         value = decoded.get("value") if decoded.get("value") is not None else fallback_value
 
         contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
@@ -841,7 +845,7 @@ class WhatsAppAdapter:
                 accumulated += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
-        return await self.post_message(thread_id, {"markdown": accumulated})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message. Not supported by WhatsApp Cloud API."""
@@ -1041,10 +1045,14 @@ class WhatsAppAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None and callable(text_attr):
+            result = text_attr()
+            return str(await result if inspect.isawaitable(result) else result)
+        body = getattr(request, "body", None)
+        if body is not None:
             if isinstance(body, bytes):
                 return body.decode("utf-8")
             return str(body)

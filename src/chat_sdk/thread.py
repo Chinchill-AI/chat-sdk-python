@@ -12,7 +12,7 @@ import contextvars
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
@@ -24,6 +24,7 @@ from chat_sdk.types import (
     AdapterPostableMessage,
     Attachment,
     Author,
+    Channel,
     ChannelVisibility,
     EmojiValue,
     EphemeralMessage,
@@ -56,8 +57,15 @@ _default_chat: _ChatSingleton | None = None
 _active_chat: contextvars.ContextVar[_ChatSingleton | None] = contextvars.ContextVar("_active_chat", default=None)
 
 
-class _ChatSingleton:
-    """Minimal interface for the Chat singleton to avoid circular imports."""
+@runtime_checkable
+class _ChatSingleton(Protocol):
+    """Structural interface for the Chat singleton.
+
+    Declared as a `Protocol` so the concrete `Chat` class structurally
+    satisfies it without an explicit import/inheritance cycle — both
+    `thread.py` and `channel.py` need the type but can't directly depend
+    on `chat.py`.
+    """
 
     def get_adapter(self, name: str) -> Adapter | None: ...
     def get_state(self) -> StateAdapter: ...
@@ -314,7 +322,7 @@ class ThreadImpl:
 
     async def set_state(
         self,
-        new_state: dict[str, Any],
+        state: dict[str, Any],
         *,
         replace: bool = False,
     ) -> None:
@@ -322,6 +330,7 @@ class ThreadImpl:
 
         State is persisted for 30 days.
         """
+        new_state = state
         key = f"{THREAD_STATE_KEY_PREFIX}{self._id}"
         if replace:
             await self._state_adapter.set(key, new_state, THREAD_STATE_TTL_MS)
@@ -333,8 +342,14 @@ class ThreadImpl:
     # -- Channel -------------------------------------------------------------
 
     @property
-    def channel(self) -> ChannelImpl:
-        """Get the Channel containing this thread. Lazy-created and cached."""
+    def channel(self) -> Channel:
+        """Get the Channel containing this thread. Lazy-created and cached.
+
+        Declared as `Channel` (the protocol) rather than `ChannelImpl` so
+        `ThreadImpl` structurally satisfies the `Thread` protocol —
+        property getter return types have to match protocol return types
+        exactly.
+        """
         if self._channel_cache is None:
             from chat_sdk.channel import ChannelImpl, derive_channel_id
 

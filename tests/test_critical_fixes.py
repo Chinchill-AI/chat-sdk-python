@@ -323,7 +323,7 @@ class TestGoogleChatStreamSignature:
         assert result.id == "msg-1"
         assert len(posted) == 1
         assert posted[0][0] == "gchat:spaces/abc"
-        assert posted[0][1] == {"markdown": "Hello world"}
+        assert posted[0][1].markdown == "Hello world"
 
     @pytest.mark.asyncio
     async def test_stream_handles_markdown_text_chunks(self):
@@ -349,7 +349,7 @@ class TestGoogleChatStreamSignature:
 
         await adapter.stream("gchat:spaces/xyz", mixed_stream())
 
-        assert posted[0][1] == {"markdown": "Start middle end"}
+        assert posted[0][1].markdown == "Start middle end"
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +496,7 @@ class TestWhatsAppStream:
 
         assert result.id == "wamid.streamed"
         assert len(posted) == 1
-        assert posted[0][1] == {"markdown": "chunk1 chunk2 chunk3"}
+        assert posted[0][1].markdown == "chunk1 chunk2 chunk3"
 
 
 # ---------------------------------------------------------------------------

@@ -11,14 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
+import inspect
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from chat_sdk.channel import ChannelImpl
+from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
@@ -1046,7 +1046,7 @@ class Chat:
         # Create channel for the command
         channel_id = getattr(event, "channel_id", None) or (event.channel.id if event.channel else "")
         channel = ChannelImpl(
-            _ChannelImplConfigForChat(
+            _ChannelImplConfigWithAdapter(
                 id=channel_id,
                 adapter=event.adapter,
                 state_adapter=self._state_adapter,
@@ -1371,7 +1371,7 @@ class Chat:
         if adapter is None:
             raise ChatError(f'Adapter "{adapter_name}" not found for channel ID "{channel_id}"')
         return ChannelImpl(
-            _ChannelImplConfigForChat(
+            _ChannelImplConfigWithAdapter(
                 id=channel_id,
                 adapter=adapter,
                 state_adapter=self._state_adapter,
@@ -1504,7 +1504,11 @@ class Chat:
                 if hasattr(adapter, "is_dm") and callable(getattr(adapter, "is_dm", None))
                 else False
             )  # type: ignore[union-attr]
-            scope = await self._lock_scope_config(
+            # The public contract lets callers return either `LockScope` (sync)
+            # or `Awaitable[LockScope]`. `inspect.isawaitable` narrows so we
+            # only `await` the coroutine/future branch — doing so
+            # unconditionally would raise `TypeError` on a sync return.
+            result = self._lock_scope_config(
                 LockScopeContext(
                     adapter=adapter,
                     channel_id=channel_id,
@@ -1512,6 +1516,7 @@ class Chat:
                     thread_id=thread_id,
                 )
             )
+            scope = await result if inspect.isawaitable(result) else result
         else:
             scope = self._lock_scope_config or adapter.lock_scope or "thread"  # type: ignore[assignment]
 
@@ -1868,7 +1873,9 @@ class Chat:
             self._logger.debug("Direct message received - calling handlers", {"thread_id": thread_id})
             channel = thread.channel
             for h in self._direct_message_handlers:
-                await h(thread, message, channel, context)
+                result = h(thread, message, channel, context)
+                if inspect.isawaitable(result):
+                    await result
             return
 
         # Backward compat: DMs without handlers treated as mentions
@@ -1893,7 +1900,9 @@ class Chat:
             if pat.pattern.search(message.text):
                 self._logger.debug("Message matched pattern", {"pattern": pat.pattern.pattern})
                 matched = True
-                await pat.handler(thread, message, context)
+                result = pat.handler(thread, message, context)
+                if inspect.isawaitable(result):
+                    await result
 
         if not matched:
             self._logger.debug("No handlers matched message", {"thread_id": thread_id})
@@ -2035,7 +2044,12 @@ class Chat:
         context: MessageContext | None = None,
     ) -> None:
         for h in handlers:
-            await h(thread, message, context)
+            result = h(thread, message, context)
+            # Handlers are typed `Callable[..., Awaitable[None] | None]` —
+            # sync handlers return None and must NOT be awaited, or we
+            # raise TypeError at runtime. Narrow with `isawaitable`.
+            if inspect.isawaitable(result):
+                await result
 
 
 # ---------------------------------------------------------------------------
@@ -2106,21 +2120,3 @@ class _MessageHistoryCache:
         if limit is not None:
             messages = messages[-limit:]
         return messages
-
-
-# ---------------------------------------------------------------------------
-# Config helper used by Chat._create_thread internally
-# (avoids importing channel config types at module level)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _ChannelImplConfigForChat:
-    """Config passed from Chat to ChannelImpl."""
-
-    id: str
-    adapter: Adapter
-    state_adapter: StateAdapter
-    channel_visibility: ChannelVisibility = "unknown"
-    is_dm: bool = False
-    message_history: Any = None

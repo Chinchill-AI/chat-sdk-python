@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
 from chat_sdk.adapters.google_chat.format_converter import GoogleChatFormatConverter
@@ -71,6 +72,7 @@ from chat_sdk.types import (
     ListThreadsResult,
     LockScope,
     Message,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     StateAdapter,
@@ -759,17 +761,22 @@ class GoogleChatAdapter:
             except Exception:
                 pass
 
-        # Parse request body
+        # Parse request body. `hasattr` narrows `Any` → `object` (not
+        # awaitable); `getattr(..., None)` preserves `Any` for the
+        # framework duck-typed path.
         body: str
-        if hasattr(request, "text") and callable(request.text):
-            body = await request.text()
-        elif hasattr(request, "body"):
-            raw_body = request.body
-            body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
-        elif isinstance(request, dict):
-            body = json.dumps(request)
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None and callable(text_attr):
+            result = text_attr()
+            body = str(await result if inspect.isawaitable(result) else result)
         else:
-            body = str(request)
+            raw_body = getattr(request, "body", None)
+            if raw_body is not None:
+                body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
+            elif isinstance(request, dict):
+                body = json.dumps(request)
+            else:
+                body = str(request)
 
         self._logger.debug("GChat webhook raw body", {"body": body})
 
@@ -1595,7 +1602,7 @@ class GoogleChatAdapter:
                 accumulated += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
-        return await self.post_message(thread_id, {"markdown": accumulated})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
     # =========================================================================
     # Reactions
@@ -2645,11 +2652,12 @@ class GoogleChatAdapter:
     # Error handling
     # =========================================================================
 
-    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> Any:
+    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> NoReturn:
         """Handle Google Chat API errors with proper error classification.
 
-        Always re-raises. Returns Never (but typed as Any so callers satisfy
-        return type without explicit annotation).
+        Always re-raises — the `NoReturn` annotation lets type checkers skip
+        the "missing return" warning for callers that rely on this to
+        propagate out of a `try/except` block.
         """
         error_code = getattr(error, "code", None)
         error_message = getattr(error, "message", str(error))

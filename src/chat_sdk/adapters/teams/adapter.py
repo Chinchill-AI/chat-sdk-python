@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -1769,20 +1770,25 @@ class TeamsAdapter:
 
     async def _get_request_body(self, request: Any) -> str:
         """Extract the request body as a string."""
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
                 body = body()
             if hasattr(body, "read"):
-                raw = await body.read() if hasattr(body.read, "__await__") else body.read()
+                raw_read = body.read
+                raw = await raw_read() if inspect.iscoroutinefunction(raw_read) else raw_read()
                 return raw.decode("utf-8") if isinstance(raw, bytes) else raw
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
-        if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
-        if hasattr(request, "data"):
-            data = request.data
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                return str(await result if inspect.isawaitable(result) else result)
+            return text_attr
+        data = getattr(request, "data", None)
+        if data is not None:
             return data.decode("utf-8") if isinstance(data, bytes) else str(data)
         return ""
 

@@ -9,12 +9,13 @@ Python port of packages/adapter-discord/src/index.ts.
 from __future__ import annotations
 
 import hmac
+import inspect
 import json
 import os
 import re
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
@@ -55,6 +56,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableRaw,
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
@@ -380,7 +382,11 @@ class DiscordAdapter:
             self._logger.warn("Chat instance not initialized, ignoring interaction")
             return
 
-        data = interaction.get("data", {})
+        # `interaction["data"]` is a union of several TypedDicts (one per
+        # interaction type). Cast to a plain dict so we can access shared
+        # fields like `name` and `options` without pyrefly rejecting keys
+        # that only appear on one variant.
+        data = cast("dict[str, Any]", interaction.get("data", {}))
         command_name = data.get("name")
         if not command_name:
             self._logger.warn("No command name in application command interaction")
@@ -1160,7 +1166,7 @@ class DiscordAdapter:
 
             accumulated += text
 
-            postable: AdapterPostableMessage = {"raw": accumulated}
+            postable: AdapterPostableMessage = PostableRaw(raw=accumulated)
 
             if message_id:
                 await self.edit_message(thread_id, message_id, postable)
@@ -1257,7 +1263,7 @@ class DiscordAdapter:
             ],
         )
 
-    def _get_attachment_type(self, mime_type: str | None) -> str:
+    def _get_attachment_type(self, mime_type: str | None) -> Literal["audio", "file", "image", "video"]:
         """Determine attachment type from MIME type."""
         if not mime_type:
             return "file"
@@ -1399,20 +1405,26 @@ class DiscordAdapter:
 
     async def _get_request_body(self, request: Any) -> str:
         """Extract the request body as a string."""
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` to `object` and kills downstream type info,
+        # so we use `getattr(..., default)` which preserves `Any`. The
+        # `await` below is safe because `inspect.isawaitable` guards it.
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
                 body = body()
             if hasattr(body, "read"):
-                raw = await body.read() if hasattr(body.read, "__await__") else body.read()
+                raw_read = body.read
+                raw = await raw_read() if inspect.iscoroutinefunction(raw_read) else raw_read()
                 return raw.decode("utf-8") if isinstance(raw, bytes) else raw
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
-        if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
-        if hasattr(request, "data"):
-            data = request.data
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                return str(await result if inspect.isawaitable(result) else result)
+            return text_attr
+        data = getattr(request, "data", None)
+        if data is not None:
             return data.decode("utf-8") if isinstance(data, bytes) else str(data)
         return ""
 

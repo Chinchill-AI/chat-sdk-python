@@ -6,7 +6,7 @@ as formatted markdown with bold text, dividers, and links.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.cards import (
     CardChild,
@@ -92,42 +92,50 @@ def card_to_github_markdown(card: CardElement) -> str:
 
 
 def _render_child(child: CardChild) -> list[str]:
-    """Render a card child element to markdown lines."""
+    """Render a card child element to markdown lines.
+
+    The per-type helpers below accept `dict[str, Any]` because they access
+    dynamic keys (`content`, `label`, etc.) that are specific to one
+    variant of the `CardChild` union. The narrowing happens via the
+    `child_type` check, so casting to `dict[str, Any]` at the call sites
+    is safe and keeps the helpers simple.
+    """
     child_type = child.get("type", "")
 
     if child_type == "text":
-        return _render_text(child)
+        return _render_text(cast("dict[str, Any]", child))
 
     if child_type == "fields":
-        return _render_fields(child)
+        return _render_fields(cast("dict[str, Any]", child))
 
     if child_type == "actions":
-        return _render_actions(child)
+        return _render_actions(cast("dict[str, Any]", child))
 
     if child_type == "section":
         # Flatten section children
         result: list[str] = []
-        for section_child in child.get("children", []):
+        section_children = cast("list[CardChild]", child.get("children", []))
+        for section_child in section_children:
             result.extend(_render_child(section_child))
         return result
 
     if child_type == "image":
-        alt = child.get("alt", "")
-        url = child.get("url", "")
+        alt = cast("str", child.get("alt", ""))
+        url = cast("str", child.get("url", ""))
         if alt:
             return [f"![{_escape_markdown(alt)}]({url})"]
         return [f"![]({url})"]
 
     if child_type == "link":
-        label = child.get("label", "")
-        url = child.get("url", "")
+        label = cast("str", child.get("label", ""))
+        url = cast("str", child.get("url", ""))
         return [f"[{_escape_markdown(label)}]({url})"]
 
     if child_type == "divider":
         return ["---"]
 
     if child_type == "table":
-        return _render_table(child)
+        return _render_table(cast("dict[str, Any]", child))
 
     # Fallback
     text = card_child_to_fallback_text(child)
@@ -233,7 +241,7 @@ def _child_to_plain_text(child: CardChild) -> str | None:
         return None
 
     if child_type == "table":
-        return "\n".join(_render_table(child))
+        return "\n".join(_render_table(cast("dict[str, Any]", child)))
 
     if child_type == "section":
         return "\n".join(
