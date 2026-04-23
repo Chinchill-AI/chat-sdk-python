@@ -8,7 +8,7 @@ Python port of cards.ts.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.cards import (
     CardChild,
@@ -73,7 +73,7 @@ def card_to_google_card(
                 sections.append({"widgets": current_widgets})
                 current_widgets = []
             # Convert section as its own section
-            section_widgets = _convert_section_to_widgets(child, opts.get("endpoint_url"))
+            section_widgets = _convert_section_to_widgets(cast("dict[str, Any]", child), opts.get("endpoint_url"))
             sections.append({"widgets": section_widgets})
         else:
             # Add to current widgets
@@ -108,24 +108,30 @@ def _convert_child_to_widgets(
     child: CardChild,
     endpoint_url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Convert a card child element to Google Chat widgets."""
+    """Convert a card child element to Google Chat widgets.
+
+    The per-type helpers below accept `dict[str, Any]` because they reach
+    for variant-specific keys (`content`, `label`, `url`, etc.). The
+    `child_type` check narrows the union, so the `cast` is safe and lets
+    the helpers stay simple.
+    """
     child_type = child.get("type")
 
     if child_type == "text":
-        return [_convert_text_to_widget(child)]
+        return [_convert_text_to_widget(cast("dict[str, Any]", child))]
     elif child_type == "image":
-        return [_convert_image_to_widget(child)]
+        return [_convert_image_to_widget(cast("dict[str, Any]", child))]
     elif child_type == "divider":
         return [_convert_divider_to_widget()]
     elif child_type == "actions":
-        return [_convert_actions_to_widget(child, endpoint_url)]
+        return [_convert_actions_to_widget(cast("dict[str, Any]", child), endpoint_url)]
     elif child_type == "section":
-        return _convert_section_to_widgets(child, endpoint_url)
+        return _convert_section_to_widgets(cast("dict[str, Any]", child), endpoint_url)
     elif child_type == "fields":
-        return _convert_fields_to_widgets(child)
+        return _convert_fields_to_widgets(cast("dict[str, Any]", child))
     elif child_type == "link":
-        label = child.get("label", "")
-        url = child.get("url", "")
+        label = cast("str", child.get("label", ""))
+        url = cast("str", child.get("url", ""))
         return [
             {
                 "textParagraph": {
@@ -134,7 +140,7 @@ def _convert_child_to_widgets(
             },
         ]
     elif child_type == "table":
-        return [_convert_table_to_widget(child)]
+        return [_convert_table_to_widget(cast("dict[str, Any]", child))]
     else:
         text = card_child_to_fallback_text(child)
         if text:

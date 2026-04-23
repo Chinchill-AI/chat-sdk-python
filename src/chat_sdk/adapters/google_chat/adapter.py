@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import re
 import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
 from chat_sdk.adapters.google_chat.format_converter import GoogleChatFormatConverter
@@ -69,7 +70,9 @@ from chat_sdk.types import (
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     Message,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     StateAdapter,
@@ -130,7 +133,7 @@ class GoogleChatAdapter:
             config = GoogleChatAdapterConfig()
 
         self._name = "gchat"
-        self._lock_scope: str | None = None
+        self._lock_scope: LockScope | None = None
         self._persist_message_history: bool | None = None
         self._logger: Logger = config.logger or ConsoleLogger("info").child("gchat")
         self._user_name = config.user_name or "bot"
@@ -211,7 +214,7 @@ class GoogleChatAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return self._lock_scope
 
     @property
@@ -758,17 +761,35 @@ class GoogleChatAdapter:
             except Exception:
                 pass
 
-        # Parse request body
+        # Parse request body. `hasattr` narrows `Any` → `object` (not
+        # awaitable); `getattr(..., None)` preserves `Any` for the
+        # framework duck-typed path.
+        # `request.text` may be either an async method (aiohttp, FastAPI)
+        # or a populated string/bytes attribute (Django raw HttpRequest,
+        # some mock objects). Handle both — testing callability inside
+        # the non-None branch, not gating entry on it, so non-callable
+        # text attributes aren't silently dropped to the body branch.
         body: str
-        if hasattr(request, "text") and callable(request.text):
-            body = await request.text()
-        elif hasattr(request, "body"):
-            raw_body = request.body
-            body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
-        elif isinstance(request, dict):
-            body = json.dumps(request)
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            body = text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         else:
-            body = str(request)
+            raw_body = getattr(request, "body", None)
+            if raw_body is not None:
+                # Some frameworks expose `body` as an async method; call and
+                # await if needed before treating as bytes/str.
+                if callable(raw_body):
+                    raw_body = raw_body()
+                if inspect.isawaitable(raw_body):
+                    raw_body = await raw_body
+                body = raw_body.decode("utf-8") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)
+            elif isinstance(request, dict):
+                body = json.dumps(request)
+            else:
+                body = str(request)
 
         self._logger.debug("GChat webhook raw body", {"body": body})
 
@@ -1022,7 +1043,7 @@ class GoogleChatAdapter:
             reaction_user = reaction.get("user") or {}
             return ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=message_name,
                 user=Author(
@@ -1190,7 +1211,7 @@ class GoogleChatAdapter:
 
         action_event = ActionEvent(
             adapter=self,
-            thread=None,
+            thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             thread_id=thread_id,
             message_id=(message or {}).get("name", ""),
             user=Author(
@@ -1594,7 +1615,7 @@ class GoogleChatAdapter:
                 accumulated += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
-        return await self.post_message(thread_id, {"markdown": accumulated})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
     # =========================================================================
     # Reactions
@@ -2644,11 +2665,12 @@ class GoogleChatAdapter:
     # Error handling
     # =========================================================================
 
-    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> Any:
+    def _handle_google_chat_error(self, error: Any, context: str | None = None) -> NoReturn:
         """Handle Google Chat API errors with proper error classification.
 
-        Always re-raises. Returns Never (but typed as Any so callers satisfy
-        return type without explicit annotation).
+        Always re-raises — the `NoReturn` annotation lets type checkers skip
+        the "missing return" warning for callers that rely on this to
+        propagate out of a `try/except` block.
         """
         error_code = getattr(error, "code", None)
         error_message = getattr(error, "message", str(error))

@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -45,6 +46,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -195,7 +197,7 @@ class TeamsAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -413,7 +415,7 @@ class TeamsAdapter:
                 ),
                 message_id=activity.get("replyToId") or activity.get("id", ""),
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=activity,
             ),
@@ -456,7 +458,7 @@ class TeamsAdapter:
                 ),
                 message_id=activity.get("replyToId") or activity.get("id", ""),
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=activity,
             ),
@@ -503,7 +505,7 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                     adapter=self,
                     raw=activity,
                 ),
@@ -520,7 +522,7 @@ class TeamsAdapter:
                     user=user,
                     message_id=message_id,
                     thread_id=thread_id,
-                    thread=None,
+                    thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                     adapter=self,
                     raw=activity,
                 ),
@@ -570,7 +572,7 @@ class TeamsAdapter:
     def _create_attachment(self, att: dict[str, Any]) -> Attachment:
         """Create an Attachment from a Teams attachment dict."""
         content_type = att.get("contentType", "")
-        att_type: str = "file"
+        att_type: Literal["audio", "file", "image", "video"] = "file"
         if content_type.startswith("image/"):
             att_type = "image"
         elif content_type.startswith("video/"):
@@ -767,23 +769,23 @@ class TeamsAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Add a reaction (not supported by Teams Bot Framework API)."""
         self._logger.warn("addReaction is not supported by the Teams Bot Framework API")
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction (not supported by Teams Bot Framework API)."""
         self._logger.warn("removeReaction is not supported by the Teams Bot Framework API")
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Send typing indicator to a Teams conversation."""
         decoded = self.decode_thread_id(thread_id)
 
@@ -1766,23 +1768,35 @@ class TeamsAdapter:
     # Request/Response helpers (framework-agnostic)
     # =========================================================================
 
-    async def _get_request_body(self, request: Any) -> str:
+    @staticmethod
+    async def _get_request_body(request: Any) -> str:
         """Extract the request body as a string."""
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        # Handle both callable and non-callable `request.text`. Gating
+        # entry on callability would drop populated string attributes.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
                 body = body()
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if inspect.isawaitable(body):
+                body = await body
             if hasattr(body, "read"):
-                raw = await body.read() if hasattr(body.read, "__await__") else body.read()
-                return raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
-        if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
-        if hasattr(request, "data"):
-            data = request.data
-            return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                raw_result = body.read()
+                raw = await raw_result if inspect.isawaitable(raw_result) else raw_result
+                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+        data = getattr(request, "data", None)
+        if data is not None:
+            return data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
         return ""
 
     def _get_header(self, request: Any, name: str) -> str | None:

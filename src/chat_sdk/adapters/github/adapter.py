@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from chat_sdk.adapters.github.cards import card_to_github_markdown
 from chat_sdk.adapters.github.format_converter import GitHubFormatConverter
@@ -26,11 +27,13 @@ from chat_sdk.adapters.github.types import (
     GitHubIssueComment,
     GitHubRawMessage,
     GitHubReactionContent,
+    GitHubRepository,
     GitHubReviewComment,
     GitHubThreadId,
     GitHubUser,
     IssueCommentWebhookPayload,
     PullRequestReviewCommentWebhookPayload,
+    _GitHubAdapterConfigInternal,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -47,8 +50,10 @@ from chat_sdk.types import (
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     StreamChunk,
     StreamOptions,
@@ -89,7 +94,10 @@ class GitHubAdapter:
     """
 
     def __init__(self, config: GitHubAdapterConfig | None = None) -> None:
-        config = config or {}
+        # The public API surface is the auth-mode-specific TypedDict union
+        # above; internally we duck-type with `.get()` so narrow to the
+        # superset TypedDict that admits every possible key.
+        config = cast(_GitHubAdapterConfigInternal, config or {})
         self._name = "github"
 
         webhook_secret = config.get("webhook_secret") or os.environ.get("GITHUB_WEBHOOK_SECRET")
@@ -177,7 +185,7 @@ class GitHubAdapter:
         return str(self._bot_user_id) if self._bot_user_id else None
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -360,7 +368,7 @@ class GitHubAdapter:
     def _parse_issue_comment(
         self,
         comment: GitHubIssueComment,
-        repository: dict[str, Any],
+        repository: GitHubRepository,
         pr_number: int,
         thread_id: str,
         thread_type: Literal["pr", "issue"] = "pr",
@@ -404,7 +412,7 @@ class GitHubAdapter:
     def _parse_review_comment(
         self,
         comment: GitHubReviewComment,
-        repository: dict[str, Any],
+        repository: GitHubRepository,
         pr_number: int,
         thread_id: str,
     ) -> Message:
@@ -523,7 +531,7 @@ class GitHubAdapter:
                 text += chunk
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 text += chunk.text
-        return await self.post_message(thread_id, {"markdown": text})
+        return await self.post_message(thread_id, PostableMarkdown(markdown=text))
 
     @staticmethod
     def _build_raw_message(decoded: Any, comment: dict[str, Any]) -> dict[str, Any]:
@@ -884,8 +892,11 @@ class GitHubAdapter:
 
     def parse_message(self, raw: GitHubRawMessage) -> Message:
         """Parse a raw message into normalized format."""
+        # `raw` is a GitHubRawMessage dict with keys of varying value-types
+        # depending on the event variant; `.get()` unions to `object | str`.
+        # Narrow via casts where we've runtime-verified via `raw.get("type")`.
         if raw.get("type") == "issue_comment":
-            thread_type = raw.get("thread_type", "pr") or "pr"
+            thread_type = cast("Literal['issue', 'pr']", raw.get("thread_type", "pr") or "pr")
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
                     owner=raw["repository"]["owner"]["login"],
@@ -895,10 +906,17 @@ class GitHubAdapter:
                 )
             )
             return self._parse_issue_comment(
-                raw["comment"], raw["repository"], raw["pr_number"], thread_id, thread_type
+                cast("GitHubIssueComment", raw["comment"]),
+                raw["repository"],
+                raw["pr_number"],
+                thread_id,
+                thread_type,
             )
         else:
-            root_comment_id = raw["comment"].get("in_reply_to_id") or raw["comment"]["id"]
+            root_comment_id = cast(
+                "int | None",
+                raw["comment"].get("in_reply_to_id") or raw["comment"]["id"],
+            )
             thread_id = self.encode_thread_id(
                 GitHubThreadId(
                     owner=raw["repository"]["owner"]["login"],
@@ -907,7 +925,12 @@ class GitHubAdapter:
                     review_comment_id=root_comment_id,
                 )
             )
-            return self._parse_review_comment(raw["comment"], raw["repository"], raw["pr_number"], thread_id)
+            return self._parse_review_comment(
+                cast("GitHubReviewComment", raw["comment"]),
+                raw["repository"],
+                raw["pr_number"],
+                thread_id,
+            )
 
     def render_formatted(self, content: FormattedContent) -> str:
         """Render formatted content to GitHub markdown."""
@@ -1064,11 +1087,26 @@ class GitHubAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
+        # `hasattr` narrows `Any` → `object` (which is not awaitable), so
+        # `getattr(..., None)` keeps `Any` for the framework duck-type path.
+        # Handle both callable (`async def text(self)`) and non-callable
+        # (`text: str` property) cases — gating entry on callability
+        # would silently drop valid string attributes.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+        body = getattr(request, "body", None)
+        if body is not None:
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if callable(body):
+                body = body()
+            if inspect.isawaitable(body):
+                body = await body
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
         return ""
 
     @staticmethod

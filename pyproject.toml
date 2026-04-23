@@ -80,9 +80,8 @@ dev = [
 # ---------------------------------------------------------------------------
 # Pyrefly type checker configuration
 # ---------------------------------------------------------------------------
-# Baseline workflow:
-#   Check against baseline: uv run pyrefly check --baseline=.pyrefly-baseline.json
-#   Refresh baseline:       uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline
+# Target: zero errors. Run:
+#   uv run pyrefly check
 # ---------------------------------------------------------------------------
 
 [tool.pyrefly]
@@ -99,21 +98,27 @@ python-platform = "linux"
 # Optional adapter deps that aren't in the default install. Treating them as
 # Any keeps pyrefly from flagging missing-import every time we lazy-load one.
 replace-imports-with-any = [
-    # Slack
+    # Slack — covers top-level + submodule imports like slack_sdk.web.async_client
     "slack_sdk",
-    # Discord
+    "slack_sdk.*",
+    # Discord — signed-request verification uses pynacl's nacl.signing
     "nacl",
-    # Google Chat
+    "nacl.*",
+    # Google Chat — auth uses google.auth.* subpackages
     "google",
+    "google.*",
     # State backends
     "redis",
+    "redis.*",
     "asyncpg",
+    "asyncpg.*",
     # HTTP clients used in lazy paths
     "httpx",
+    "httpx.*",
     # GitHub App auth
     "jwt",
+    "jwt.*",
 ]
 
 [tool.pyrefly.errors]
-# Default severity. Known issues tracked in .pyrefly-baseline.json —
-# new errors fail CI, existing ones are allowed.
+# CI policy: zero pyrefly errors.

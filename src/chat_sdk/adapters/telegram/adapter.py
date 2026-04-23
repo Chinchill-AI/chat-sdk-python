@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import inspect
 import json
 import math
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.telegram.cards import (
     card_to_telegram_inline_keyboard,
@@ -68,6 +69,7 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
     RawMessage,
@@ -257,7 +259,7 @@ class TelegramAdapter:
             )
 
         self._name: str = "telegram"
-        self._lock_scope: str = "channel"
+        self._lock_scope: LockScope = "channel"
         self._persist_message_history: bool = True
 
         self._bot_token: str = bot_token
@@ -300,7 +302,7 @@ class TelegramAdapter:
         return self._name
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property
@@ -696,11 +698,14 @@ class TelegramAdapter:
         )
 
         decoded = decode_telegram_callback_data(callback_query.get("data"))
-        action_id = decoded["action_id"]
+        action_id = decoded["action_id"] or ""
         value = decoded["value"]
 
         # The TS source uses callback_query.from – in our types this is from_user
-        from_user = callback_query.get("from_user") or callback_query.get("from")  # type: ignore[call-overload]
+        from_user = cast(
+            "TelegramUser | None",
+            callback_query.get("from_user") or callback_query.get("from"),  # type: ignore[call-overload]
+        )
         user = (
             self.to_author(from_user)
             if from_user
@@ -716,7 +721,7 @@ class TelegramAdapter:
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=message_id,
                 user=user,
@@ -781,7 +786,7 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -799,7 +804,7 @@ class TelegramAdapter:
                 self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
-                        thread=None,
+                        thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                         thread_id=thread_id,
                         message_id=message_id,
                         user=actor,
@@ -1018,7 +1023,7 @@ class TelegramAdapter:
         self,
         thread_id: str,
         message_id: str,
-        _emoji: EmojiValue | str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a Telegram message."""
         parsed_thread = self._resolve_thread_id(thread_id)
@@ -1232,7 +1237,10 @@ class TelegramAdapter:
         text = apply_telegram_entities(plain_text, entities)
 
         # Determine author -- Telegram uses 'from' key which is a reserved word
-        from_user = raw.get("from_user") or raw.get("from")  # type: ignore[call-overload]
+        from_user = cast(
+            "TelegramUser | None",
+            raw.get("from_user") or raw.get("from"),  # type: ignore[call-overload]
+        )
         sender_chat = raw.get("sender_chat")
 
         if from_user:
@@ -1724,15 +1732,17 @@ class TelegramAdapter:
 
     def reaction_key(self, reaction: TelegramReactionType) -> str:
         """Compute a unique key for a Telegram reaction."""
+        # `TelegramReactionType` is a TypedDict union; `.get()` returns the
+        # union of all value-types, so narrow the strings we know are strings.
         if reaction.get("type") == "emoji":
-            return reaction.get("emoji", "")
-        return f"custom:{reaction.get('custom_emoji_id', '')}"
+            return cast("str", reaction.get("emoji", ""))
+        return f"custom:{cast('str', reaction.get('custom_emoji_id', ''))}"
 
     def reaction_to_emoji_value(self, reaction: TelegramReactionType) -> EmojiValue:
         """Convert a Telegram reaction to an :class:`EmojiValue`."""
         if reaction.get("type") == "emoji":
-            return get_emoji(reaction.get("emoji", ""))
-        return get_emoji(f"custom:{reaction.get('custom_emoji_id', '')}")
+            return get_emoji(cast("str", reaction.get("emoji", "")))
+        return get_emoji(f"custom:{cast('str', reaction.get('custom_emoji_id', ''))}")
 
     # -- Telegram API --------------------------------------------------------
 
@@ -1909,13 +1919,22 @@ class TelegramAdapter:
     @staticmethod
     async def _get_request_body(request: Any) -> str:
         """Extract body text from a framework-agnostic request object."""
-        if hasattr(request, "text") and callable(request.text):
-            return await request.text()
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); `getattr(..., None)`
+        # preserves `Any` for the duck-typed framework paths.
+        # Handle both callable and non-callable `request.text` forms.
+        # Gating entry on callability would drop populated string attrs.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
-                body = await body()
-            if isinstance(body, bytes):
+                result = body()
+                body = await result if inspect.isawaitable(result) else result
+            if isinstance(body, (bytes, bytearray)):
                 return body.decode("utf-8")
             return str(body)
         return ""

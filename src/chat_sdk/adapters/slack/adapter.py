@@ -13,6 +13,7 @@ import base64
 import contextvars
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -21,7 +22,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn, cast
 from urllib.parse import parse_qs
 
 from chat_sdk.adapters.slack.cards import (
@@ -51,6 +52,7 @@ from chat_sdk.adapters.slack.types import (
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
+from chat_sdk.modals import ModalElement
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.types import (
@@ -73,6 +75,7 @@ from chat_sdk.types import (
     LinkPreview,
     ListThreadsOptions,
     ListThreadsResult,
+    LockScope,
     MemberJoinedChannelEvent,
     Message,
     MessageMetadata,
@@ -203,7 +206,7 @@ class SlackAdapter:
         self._bot_id: str | None = None  # Bot app ID (B_xxx)
         self._chat: ChatInstance | None = None
         self._format_converter = SlackFormatConverter()
-        self._lock_scope = "thread"
+        self._lock_scope: LockScope = "thread"
         self._persist_message_history = False
 
         # Channel external/shared cache
@@ -245,7 +248,7 @@ class SlackAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str:
+    def lock_scope(self) -> LockScope:
         return self._lock_scope
 
     @property
@@ -433,6 +436,10 @@ class SlackAdapter:
         bot_user_id = (stored.get("botUserId") or stored.get("bot_user_id") or "") if isinstance(stored, dict) else ""
         team_name = (stored.get("teamName") or stored.get("team_name") or "") if isinstance(stored, dict) else ""
         if self._encryption_key and is_encrypted_token_data(bot_token_raw):
+            # `is_encrypted_token_data` is a runtime type guard but doesn't
+            # carry TypeGuard narrowing, so pyrefly still sees `None`. Assert
+            # to collapse the Optional for the field access below.
+            assert bot_token_raw is not None
             decrypted = decrypt_token(
                 EncryptedTokenData(
                     iv=bot_token_raw["iv"],
@@ -678,16 +685,33 @@ class SlackAdapter:
 
         Returns a dict with ``body`` and ``status`` keys.
         """
-        # Read the raw body
-        if hasattr(request, "text") and callable(request.text):
-            body: str = await request.text()
-        elif hasattr(request, "body"):
-            raw = request.body
-            if asyncio.iscoroutine(raw) or asyncio.isfuture(raw):
-                raw = await raw
-            body = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        # Read the raw body. `hasattr` narrows `Any` → `object` (not
+        # awaitable), so we use `getattr(..., None)` to preserve the
+        # `Any` type across the duck-typed framework branches.
+        # Handle both callable (`async def text(self)`) and non-callable
+        # (`text: str` attribute) forms of `request.text`. Gating entry
+        # on callability would drop populated string attributes.
+        text_attr = getattr(request, "text", None)
+        body: str
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            body = text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
         else:
-            body = str(request)
+            raw = getattr(request, "body", None)
+            if raw is not None:
+                # Some frameworks expose `body` as an async method (e.g.
+                # `async def body(self)`) — call it, then await if the
+                # result is awaitable. Previously we only handled the
+                # coroutine-as-attribute case, not the async-method case.
+                if callable(raw):
+                    raw = raw()
+                if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) or inspect.isawaitable(raw):
+                    raw = await raw
+                body = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            else:
+                body = str(request)
 
         self._logger.debug("Slack webhook raw body", {"body": body[:500]})
 
@@ -700,7 +724,7 @@ class SlackAdapter:
             return {"body": "Invalid signature", "status": 401}
 
         # Form-urlencoded payloads (interactive + slash commands)
-        content_type = headers.get("content-type", headers.get("Content-Type", ""))
+        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
         if "application/x-www-form-urlencoded" in content_type:
             params = parse_qs(body, keep_blank_values=True)
 
@@ -900,7 +924,7 @@ class SlackAdapter:
                 is_me=False,
             ),
             adapter=self,
-            channel=None,  # chat.py's _handle_slash_command_event creates the ChannelImpl
+            channel=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             raw={k: v[0] for k, v in params.items()} if params else {},
             trigger_id=trigger_id,
         )
@@ -959,7 +983,7 @@ class SlackAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=payload,
                 trigger_id=payload.get("trigger_id"),
@@ -1070,7 +1094,7 @@ class SlackAdapter:
                         private_metadata=modal.get("private_metadata"),
                     )
                 )
-                view = modal_to_slack_view(modal, metadata)
+                view = modal_to_slack_view(cast(ModalElement, modal), metadata)
                 return {"response_action": response.action, "view": view}
         return {}
 
@@ -1178,7 +1202,7 @@ class SlackAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 raw=event,
                 adapter=self,
             )
@@ -2329,7 +2353,7 @@ class SlackAdapter:
                 private_metadata=modal.get("private_metadata"),
             )
         )
-        view = modal_to_slack_view(modal, metadata)
+        view = modal_to_slack_view(cast(ModalElement, modal), metadata)
 
         self._logger.debug(
             "Slack API: views.open",
@@ -2346,7 +2370,7 @@ class SlackAdapter:
 
     async def update_modal(self, view_id: str, modal: dict[str, Any]) -> dict[str, str]:
         """Update an existing modal using views.update."""
-        view = modal_to_slack_view(modal)
+        view = modal_to_slack_view(cast(ModalElement, modal))
 
         try:
             client = self._get_client()
@@ -2751,10 +2775,12 @@ class SlackAdapter:
     # Error handling
     # ==================================================================
 
-    def _handle_slack_error(self, error: Any) -> None:
+    def _handle_slack_error(self, error: Any) -> NoReturn:
         """Re-raise Slack errors with appropriate SDK error types.
 
-        Never returns (always raises).
+        Always raises — the `NoReturn` annotation lets type checkers skip
+        the "missing return" warning for callers that rely on this to
+        propagate out of a `try/except` block.
         """
         # slack_sdk's SlackApiError has a .response attribute (SlackResponse)
         # SlackResponse has a .data dict and an .get() method

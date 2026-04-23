@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -340,10 +341,12 @@ async def _get_access_token(
     elif isinstance(auth, WorkspaceEventsAuthADC):
         return await _get_adc_token(scopes, http_session)
     elif isinstance(auth, dict) and "auth" in auth:
-        # Custom auth - assume it provides a token directly
+        # Custom auth — `auth["auth"]` can be sync or async. `isawaitable`
+        # narrows the result so sync callables work without a TypeError.
         custom_auth = auth["auth"]
         if callable(custom_auth):
-            return await custom_auth()
+            result = custom_auth()
+            return str(await result if inspect.isawaitable(result) else result)
         return str(custom_auth)
     else:
         raise ValueError("Unsupported auth type for workspace events")

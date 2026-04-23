@@ -11,12 +11,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
 from chat_sdk.adapters.linear.format_converter import LinearFormatConverter
@@ -47,8 +48,10 @@ from chat_sdk.types import (
     FetchOptions,
     FetchResult,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
+    PostableRaw,
     RawMessage,
     StreamOptions,
     ThreadInfo,
@@ -169,7 +172,7 @@ class LinearAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -298,13 +301,15 @@ class LinearAdapter:
                 )
                 return self._make_response("Webhook expired", 401)
 
-        # Handle events based on type
+        # Handle events based on type. The payload shape is determined by
+        # `type` at runtime — cast to the matching TypedDict so each handler
+        # sees the right variant.
         payload_type = payload.get("type")
         if payload_type == "Comment":
             if payload.get("action") == "create":
-                self._handle_comment_created(payload, options)
+                self._handle_comment_created(cast("CommentWebhookPayload", payload), options)
         elif payload_type == "Reaction":
-            self._handle_reaction(payload)
+            self._handle_reaction(cast("ReactionWebhookPayload", payload))
 
         return self._make_response("ok", 200)
 
@@ -337,18 +342,23 @@ class LinearAdapter:
             self._logger.warn("Chat instance not initialized, ignoring comment")
             return
 
-        data = payload.get("data", {})
-        actor = payload.get("actor", {})
+        # TypedDict `.get()` unions every field-type from the union of shapes
+        # (comment-created payloads vs older camel/snake fallbacks), producing
+        # `object | str`. Cast to `str` where we've runtime-narrowed via the
+        # truthy check — the dispatch block already filtered to `Comment`
+        # events, so these keys are known to be strings.
+        data = cast("LinearCommentData", payload.get("data", {}))
+        actor = cast("LinearWebhookActor", payload.get("actor", {}))
 
         # Skip non-issue comments
-        issue_id = data.get("issueId") or data.get("issue_id")
+        issue_id = cast("str | None", data.get("issueId") or data.get("issue_id"))
         if not issue_id:
             self._logger.debug("Ignoring non-issue comment", {"commentId": data.get("id")})
             return
 
         # Determine thread
         parent_id = data.get("parentId") or data.get("parent_id")
-        root_comment_id = parent_id or data.get("id")
+        root_comment_id = cast("str | None", parent_id or data.get("id"))
         thread_id = self.encode_thread_id(
             LinearThreadId(
                 issue_id=issue_id,
@@ -392,8 +402,12 @@ class LinearAdapter:
         thread_id: str,
     ) -> Message:
         """Build a Message from a Linear comment and actor."""
-        text = comment.get("body", "")
-        user_id = comment.get("userId") or comment.get("user_id", "")
+        # `comment.get("body")` unions every value type across the TypedDict
+        # variants, giving `object | str`. Cast to `str` where the runtime
+        # shape guarantees a string (Linear webhook `Comment` payloads
+        # always have `body`, `userId`, `createdAt`, `updatedAt` as strings).
+        text = cast("str", comment.get("body", ""))
+        user_id = cast("str", comment.get("userId") or comment.get("user_id", ""))
 
         author = Author(
             user_id=user_id,
@@ -405,8 +419,8 @@ class LinearAdapter:
 
         formatted = self._format_converter.to_ast(text)
 
-        created_at = comment.get("createdAt") or comment.get("created_at", "")
-        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
+        created_at = cast("str", comment.get("createdAt") or comment.get("created_at", ""))
+        updated_at = cast("str", comment.get("updatedAt") or comment.get("updated_at", ""))
 
         return Message(
             id=comment.get("id", ""),
@@ -537,7 +551,7 @@ class LinearAdapter:
             ),
         )
 
-    async def delete_message(self, _thread_id: str, message_id: str) -> None:
+    async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message (delete a comment)."""
         await self._ensure_valid_token()
 
@@ -554,7 +568,7 @@ class LinearAdapter:
 
     async def add_reaction(
         self,
-        _thread_id: str,
+        thread_id: str,
         message_id: str,
         emoji: EmojiValue | str,
     ) -> None:
@@ -575,14 +589,14 @@ class LinearAdapter:
 
     async def remove_reaction(
         self,
-        _thread_id: str,
-        _message_id: str,
-        _emoji: EmojiValue | str,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a comment (limited support)."""
         self._logger.warn("removeReaction is not fully supported on Linear - reaction ID lookup would be required")
 
-    async def start_typing(self, _thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Start typing indicator. Not supported by Linear."""
         pass
 
@@ -739,7 +753,7 @@ class LinearAdapter:
                     "userId": user_id,
                     "createdAt": node.get("createdAt", ""),
                     "updatedAt": node.get("updatedAt", ""),
-                    "url": node.get("url"),
+                    "url": node.get("url", ""),
                 },
             ),
             author=Author(
@@ -832,13 +846,19 @@ class LinearAdapter:
         return f"linear:{decoded.issue_id}"
 
     def parse_message(self, raw: LinearRawMessage) -> Message:
-        """Parse platform message format to normalized format."""
-        comment = raw.get("comment", {})
-        text = comment.get("body", "")
-        user_id = comment.get("userId") or comment.get("user_id", "")
+        """Parse platform message format to normalized format.
 
-        created_at = comment.get("createdAt") or comment.get("created_at", "")
-        updated_at = comment.get("updatedAt") or comment.get("updated_at", "")
+        TypedDict `.get()` unions every value-type across camel/snake-case
+        aliases, producing `object | str`. Cast the string fields we know
+        are strings at runtime so downstream constructors (`Author`,
+        `_parse_iso`) receive `str` instead of `object`.
+        """
+        comment = raw.get("comment", {})
+        text = cast("str", comment.get("body", ""))
+        user_id = cast("str", comment.get("userId") or comment.get("user_id", ""))
+
+        created_at = cast("str", comment.get("createdAt") or comment.get("created_at", ""))
+        updated_at = cast("str", comment.get("updatedAt") or comment.get("updated_at", ""))
 
         return Message(
             id=comment.get("id", ""),
@@ -891,7 +911,7 @@ class LinearAdapter:
 
         # Post the accumulated text as a single comment
         if accumulated:
-            postable: AdapterPostableMessage = {"raw": accumulated}
+            postable: AdapterPostableMessage = PostableRaw(raw=accumulated)
             result = await self.post_message(thread_id, postable)
             message_id = result.id
 
@@ -958,23 +978,35 @@ class LinearAdapter:
     # Request/Response helpers (framework-agnostic)
     # =========================================================================
 
-    async def _get_request_body(self, request: Any) -> str:
+    @staticmethod
+    async def _get_request_body(request: Any) -> str:
         """Extract the request body as a string."""
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        # Handle both callable and non-callable `request.text`. Gating
+        # entry on callability would drop populated string attributes.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
                 body = body()
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if inspect.isawaitable(body):
+                body = await body
             if hasattr(body, "read"):
-                raw = await body.read() if hasattr(body.read, "__await__") else body.read()
-                return raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
-        if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
-        if hasattr(request, "data"):
-            data = request.data
-            return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                raw_result = body.read()
+                raw = await raw_result if inspect.isawaitable(raw_result) else raw_result
+                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+        data = getattr(request, "data", None)
+        if data is not None:
+            return data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
         return ""
 
     def _get_header(self, request: Any, name: str) -> str | None:

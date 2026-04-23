@@ -12,7 +12,7 @@ import contextvars
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
@@ -24,13 +24,16 @@ from chat_sdk.types import (
     AdapterPostableMessage,
     Attachment,
     Author,
+    Channel,
     ChannelVisibility,
     EmojiValue,
     EphemeralMessage,
     FetchOptions,
     FormattedContent,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
+    PlanUpdateChunk,
     PostableCard,
     PostableMarkdown,
     PostableMessage,
@@ -42,6 +45,7 @@ from chat_sdk.types import (
     StateAdapter,
     StreamChunk,
     StreamOptions,
+    TaskUpdateChunk,
 )
 
 if TYPE_CHECKING:
@@ -56,8 +60,15 @@ _default_chat: _ChatSingleton | None = None
 _active_chat: contextvars.ContextVar[_ChatSingleton | None] = contextvars.ContextVar("_active_chat", default=None)
 
 
-class _ChatSingleton:
-    """Minimal interface for the Chat singleton to avoid circular imports."""
+@runtime_checkable
+class _ChatSingleton(Protocol):
+    """Structural interface for the Chat singleton.
+
+    Declared as a `Protocol` so the concrete `Chat` class structurally
+    satisfies it without an explicit import/inheritance cycle — both
+    `thread.py` and `channel.py` need the type but can't directly depend
+    on `chat.py`.
+    """
 
     def get_adapter(self, name: str) -> Adapter | None: ...
     def get_state(self) -> StateAdapter: ...
@@ -333,8 +344,14 @@ class ThreadImpl:
     # -- Channel -------------------------------------------------------------
 
     @property
-    def channel(self) -> ChannelImpl:
-        """Get the Channel containing this thread. Lazy-created and cached."""
+    def channel(self) -> Channel:
+        """Get the Channel containing this thread. Lazy-created and cached.
+
+        Declared as `Channel` (the protocol) rather than `ChannelImpl` so
+        `ThreadImpl` structurally satisfies the `Thread` protocol —
+        property getter return types have to match protocol return types
+        exactly.
+        """
         if self._channel_cache is None:
             from chat_sdk.channel import ChannelImpl, derive_channel_id
 
@@ -575,7 +592,10 @@ class ThreadImpl:
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     yield chunk.get("text", "")
                 elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
-                    yield chunk.text
+                    # Runtime-narrowed to a MarkdownTextChunk via the `type`
+                    # tag; only that variant has `.text`. Pyrefly doesn't do
+                    # tag-based union narrowing, so read via `getattr`.
+                    yield getattr(chunk, "text", "")
                 # Skip non-text chunks in fallback mode
 
         return await self._fallback_stream(_text_only_stream(), options)
@@ -1124,9 +1144,12 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
         elif isinstance(item, dict):
             t = item.get("type")
 
-            # Pass through known StreamChunk dict types
+            # Pass through known StreamChunk dict types. The `t` check
+            # narrows at runtime to one of the three StreamChunk TypedDicts,
+            # but pyrefly doesn't narrow through tag-string comparisons, so
+            # cast to the declared yield union.
             if t in ("markdown_text", "task_update", "plan_update"):
-                yield item
+                yield cast("MarkdownTextChunk | PlanUpdateChunk | TaskUpdateChunk", item)
                 continue
 
             if t == "text-delta":

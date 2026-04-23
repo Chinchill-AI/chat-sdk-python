@@ -9,6 +9,8 @@ See: https://linear.app/docs/comment-on-issues
 
 from __future__ import annotations
 
+from typing import cast
+
 from chat_sdk.cards import (
     ActionsElement,
     CardChild,
@@ -88,14 +90,14 @@ def _render_child(child: CardChild) -> list[str]:
             result.extend(_render_child(c))
         return result
     if child_type == "image":
-        alt = child.get("alt", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        alt = cast("str", child.get("alt", ""))
+        url = cast("str", child.get("url", ""))
         if alt:
             return [f"![{_escape_markdown(alt)}]({url})"]
         return [f"![]({url})"]
     if child_type == "link":
-        label = child.get("label", "")  # type: ignore[union-attr]
-        url = child.get("url", "")  # type: ignore[union-attr]
+        label = cast("str", child.get("label", ""))
+        url = cast("str", child.get("url", ""))
         return [f"[{_escape_markdown(label)}]({url})"]
     if child_type == "divider":
         return ["---"]
@@ -185,8 +187,8 @@ def _child_to_plain_text(child: CardChild) -> str | None:
         # Actions are interactive-only -- exclude from fallback text.
         return None
     if child_type == "table":
-        headers = child.get("headers", [])  # type: ignore[union-attr]
-        rows = child.get("rows", [])  # type: ignore[union-attr]
+        headers = cast("list[str]", child.get("headers", []))
+        rows = cast("list[list[str]]", child.get("rows", []))
         return "\n".join(render_gfm_table(headers, rows))
     if child_type == "section":
         parts = [

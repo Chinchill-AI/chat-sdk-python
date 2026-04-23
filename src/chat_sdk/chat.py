@@ -11,14 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
+import inspect
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from chat_sdk.channel import ChannelImpl
+from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
@@ -36,6 +36,7 @@ from chat_sdk.types import (
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
     Author,
+    Channel,
     ChannelVisibility,
     ChatConfig,
     ConcurrencyStrategy,
@@ -873,7 +874,7 @@ class Chat:
         for pat in self._modal_submit_handlers:
             if not pat.callback_ids or event.callback_id in pat.callback_ids:
                 try:
-                    response = await pat.handler(full_event)
+                    response = await self._invoke_handler(pat.handler, full_event)
                     if response is not None:
                         return response
                 except Exception as exc:
@@ -908,7 +909,7 @@ class Chat:
 
             for pat in self._modal_close_handlers:
                 if not pat.callback_ids or event.callback_id in pat.callback_ids:
-                    await pat.handler(full_event)
+                    await self._invoke_handler(pat.handler, full_event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -947,7 +948,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._assistant_thread_started_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -968,7 +969,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._assistant_context_changed_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -989,7 +990,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._app_home_opened_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1010,7 +1011,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._member_joined_channel_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1046,7 +1047,7 @@ class Chat:
         # Create channel for the command
         channel_id = getattr(event, "channel_id", None) or (event.channel.id if event.channel else "")
         channel = ChannelImpl(
-            _ChannelImplConfigForChat(
+            _ChannelImplConfigWithAdapter(
                 id=channel_id,
                 adapter=event.adapter,
                 state_adapter=self._state_adapter,
@@ -1080,11 +1081,11 @@ class Chat:
         for pat in self._slash_command_handlers:
             if not pat.commands:
                 self._logger.debug("Running catch-all slash command handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
             if event.command in pat.commands:
                 self._logger.debug("Running matched slash command handler", {"command": event.command})
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # Modal context persistence
@@ -1096,7 +1097,7 @@ class Chat:
         context_id: str,
         thread: ThreadImpl | None = None,
         message: Message | None = None,
-        channel: ChannelImpl | None = None,
+        channel: Channel | None = None,
     ) -> None:
         key = f"modal-context:{adapter_name}:{context_id}"
         context = {
@@ -1255,11 +1256,11 @@ class Chat:
         for pat in self._action_handlers:
             if not pat.action_ids:
                 self._logger.debug("Running catch-all action handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
             if event.action_id in pat.action_ids:
                 self._logger.debug("Running matched action handler", {"action_id": event.action_id})
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # Reaction handling
@@ -1317,7 +1318,7 @@ class Chat:
         for pat in self._reaction_handlers:
             if not pat.emoji:
                 self._logger.debug("Running catch-all reaction handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
 
             matches = any(
@@ -1333,7 +1334,7 @@ class Chat:
             )
             if matches:
                 self._logger.debug("Running matched reaction handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # openDM / channel
@@ -1371,7 +1372,7 @@ class Chat:
         if adapter is None:
             raise ChatError(f'Adapter "{adapter_name}" not found for channel ID "{channel_id}"')
         return ChannelImpl(
-            _ChannelImplConfigForChat(
+            _ChannelImplConfigWithAdapter(
                 id=channel_id,
                 adapter=adapter,
                 state_adapter=self._state_adapter,
@@ -1504,7 +1505,11 @@ class Chat:
                 if hasattr(adapter, "is_dm") and callable(getattr(adapter, "is_dm", None))
                 else False
             )  # type: ignore[union-attr]
-            scope = await self._lock_scope_config(
+            # The public contract lets callers return either `LockScope` (sync)
+            # or `Awaitable[LockScope]`. `inspect.isawaitable` narrows so we
+            # only `await` the coroutine/future branch — doing so
+            # unconditionally would raise `TypeError` on a sync return.
+            result = self._lock_scope_config(
                 LockScopeContext(
                     adapter=adapter,
                     channel_id=channel_id,
@@ -1512,6 +1517,7 @@ class Chat:
                     thread_id=thread_id,
                 )
             )
+            scope = await result if inspect.isawaitable(result) else result
         else:
             scope = self._lock_scope_config or adapter.lock_scope or "thread"  # type: ignore[assignment]
 
@@ -1868,7 +1874,9 @@ class Chat:
             self._logger.debug("Direct message received - calling handlers", {"thread_id": thread_id})
             channel = thread.channel
             for h in self._direct_message_handlers:
-                await h(thread, message, channel, context)
+                result = h(thread, message, channel, context)
+                if inspect.isawaitable(result):
+                    await result
             return
 
         # Backward compat: DMs without handlers treated as mentions
@@ -1893,7 +1901,9 @@ class Chat:
             if pat.pattern.search(message.text):
                 self._logger.debug("Message matched pattern", {"pattern": pat.pattern.pattern})
                 matched = True
-                await pat.handler(thread, message, context)
+                result = pat.handler(thread, message, context)
+                if inspect.isawaitable(result):
+                    await result
 
         if not matched:
             self._logger.debug("No handlers matched message", {"thread_id": thread_id})
@@ -2035,7 +2045,28 @@ class Chat:
         context: MessageContext | None = None,
     ) -> None:
         for h in handlers:
-            await h(thread, message, context)
+            await self._invoke_handler(h, thread, message, context)
+
+    @staticmethod
+    async def _invoke_handler(handler: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Invoke a handler and await the result only if awaitable.
+
+        All Chat handler types (message, reaction, action, slash, modal,
+        options-load, assistant, home, member-joined) are declared as
+        `Callable[..., Awaitable[T] | T]` — i.e. users may register either
+        a sync or an async callable. Awaiting the return value
+        unconditionally raises `TypeError: object NoneType can't be used
+        in 'await' expression` for sync handlers, so this helper narrows
+        with `inspect.isawaitable`.
+
+        Returns whatever the handler returned (post-await for async) so
+        callers that need the value (modal submit → `ModalResponse`) can
+        still capture it.
+        """
+        result = handler(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -2106,21 +2137,3 @@ class _MessageHistoryCache:
         if limit is not None:
             messages = messages[-limit:]
         return messages
-
-
-# ---------------------------------------------------------------------------
-# Config helper used by Chat._create_thread internally
-# (avoids importing channel config types at module level)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _ChannelImplConfigForChat:
-    """Config passed from Chat to ChannelImpl."""
-
-    id: str
-    adapter: Adapter
-    state_adapter: StateAdapter
-    channel_visibility: ChannelVisibility = "unknown"
-    is_dm: bool = False
-    message_history: Any = None

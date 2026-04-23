@@ -8,7 +8,6 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'
-      - '.pyrefly-baseline.json'
       - '.github/workflows/lint.yml'
   pull_request:
     branches: [main]
@@ -18,7 +17,6 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'
-      - '.pyrefly-baseline.json'
       - '.github/workflows/lint.yml'
   workflow_dispatch:
 
@@ -59,10 +57,10 @@ jobs:
         continue-on-error: true
         run: uv run python scripts/audit_test_quality.py
 
-      - name: Pyrefly type check (against baseline)
+      - name: Pyrefly type check
         id: pyrefly
         continue-on-error: true
-        run: uv run pyrefly check --baseline=.pyrefly-baseline.json
+        run: uv run pyrefly check
 
       - name: Minimize uv cache
         run: uv cache prune --ci
@@ -80,9 +78,9 @@ jobs:
           echo "| Pyrefly | ${{ steps.pyrefly.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.pyrefly.outcome }}" = "success" ]; then
-            echo "No new type issues above the baseline." >> $GITHUB_STEP_SUMMARY
+            echo "Zero type errors." >> $GITHUB_STEP_SUMMARY
           else
-            echo "New type issues above the baseline. Either fix them or refresh the baseline with \`uv run pyrefly check --baseline=.pyrefly-baseline.json --update-baseline\` if intentional." >> $GITHUB_STEP_SUMMARY
+            echo "Type errors detected — see run output." >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Fail if any step failed

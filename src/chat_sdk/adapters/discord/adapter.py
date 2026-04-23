@@ -9,12 +9,13 @@ Python port of packages/adapter-discord/src/index.ts.
 from __future__ import annotations
 
 import hmac
+import inspect
 import json
 import os
 import re
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
@@ -52,8 +53,10 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    LockScope,
     Message,
     MessageMetadata,
+    PostableRaw,
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
@@ -160,7 +163,7 @@ class DiscordAdapter:
         return self._bot_user_id
 
     @property
-    def lock_scope(self) -> str | None:
+    def lock_scope(self) -> LockScope | None:
         return None
 
     @property
@@ -362,7 +365,7 @@ class DiscordAdapter:
                 ),
                 message_id=message_id,
                 thread_id=thread_id,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 adapter=self,
                 raw=interaction,
             ),
@@ -379,7 +382,11 @@ class DiscordAdapter:
             self._logger.warn("Chat instance not initialized, ignoring interaction")
             return
 
-        data = interaction.get("data", {})
+        # `interaction["data"]` is a union of several TypedDicts (one per
+        # interaction type). Cast to a plain dict so we can access shared
+        # fields like `name` and `options` without pyrefly rejecting keys
+        # that only appear on one variant.
+        data = cast("dict[str, Any]", interaction.get("data", {}))
         command_name = data.get("name")
         if not command_name:
             self._logger.warn("No command name in application command interaction")
@@ -447,7 +454,7 @@ class DiscordAdapter:
                 is_me=user.get("id") == self._application_id,
             ),
             adapter=self,
-            channel=None,
+            channel=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
             raw=interaction,
         )
         event.channel_id = channel_id  # type: ignore[attr-defined]
@@ -704,7 +711,7 @@ class DiscordAdapter:
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
-                thread=None,
+                thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=data.get("message_id", ""),
                 emoji=normalized,
@@ -953,7 +960,7 @@ class DiscordAdapter:
             "DELETE",
         )
 
-    async def start_typing(self, thread_id: str, _status: str | None = None) -> None:
+    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Start typing indicator in a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = decoded.thread_id or decoded.channel_id
@@ -1159,7 +1166,7 @@ class DiscordAdapter:
 
             accumulated += text
 
-            postable: AdapterPostableMessage = {"raw": accumulated}
+            postable: AdapterPostableMessage = PostableRaw(raw=accumulated)
 
             if message_id:
                 await self.edit_message(thread_id, message_id, postable)
@@ -1256,7 +1263,7 @@ class DiscordAdapter:
             ],
         )
 
-    def _get_attachment_type(self, mime_type: str | None) -> str:
+    def _get_attachment_type(self, mime_type: str | None) -> Literal["audio", "file", "image", "video"]:
         """Determine attachment type from MIME type."""
         if not mime_type:
             return "file"
@@ -1396,23 +1403,35 @@ class DiscordAdapter:
     # Request/Response helpers (framework-agnostic)
     # =========================================================================
 
-    async def _get_request_body(self, request: Any) -> str:
+    @staticmethod
+    async def _get_request_body(request: Any) -> str:
         """Extract the request body as a string."""
-        if hasattr(request, "body"):
-            body = request.body
+        # `hasattr` narrows `Any` → `object` (not awaitable); using
+        # `getattr(..., None)` preserves `Any` for framework duck-typing.
+        # Handle both callable and non-callable `request.text`. Gating
+        # entry on callability would drop populated string attributes.
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+        body = getattr(request, "body", None)
+        if body is not None:
             if callable(body):
                 body = body()
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if inspect.isawaitable(body):
+                body = await body
             if hasattr(body, "read"):
-                raw = await body.read() if hasattr(body.read, "__await__") else body.read()
-                return raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            return body.decode("utf-8") if isinstance(body, bytes) else str(body)
-        if hasattr(request, "text"):
-            if callable(request.text):
-                return await request.text()
-            return request.text
-        if hasattr(request, "data"):
-            data = request.data
-            return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                raw_result = body.read()
+                raw = await raw_result if inspect.isawaitable(raw_result) else raw_result
+                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+        data = getattr(request, "data", None)
+        if data is not None:
+            return data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
         return ""
 
     def _get_header(self, request: Any, name: str) -> str | None:

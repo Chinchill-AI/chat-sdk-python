@@ -80,7 +80,23 @@ class GitHubAdapterAutoConfig(GitHubAdapterBaseConfig, total=False):
     """Configuration with no auth fields - will auto-detect from env vars."""
 
 
-# Union of all configuration types
+class _GitHubAdapterConfigInternal(GitHubAdapterBaseConfig, total=False):
+    """Internal superset used for duck-typed `config.get(...)` auth detection.
+
+    The public API surface is the auth-mode-specific TypedDicts above — they
+    document which fields are valid for each auth mode. Inside `__init__` we
+    do mode detection via `.get("token")`, `.get("app_id")`, etc., which
+    requires a type that admits every possible key. This type is never
+    exposed to consumers.
+    """
+
+    token: str
+    app_id: str
+    installation_id: int
+    private_key: str
+
+
+# Union of all public configuration types
 GitHubAdapterConfig = (
     GitHubAdapterPATConfig | GitHubAdapterAppConfig | GitHubAdapterMultiTenantAppConfig | GitHubAdapterAutoConfig
 )

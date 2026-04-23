@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, cast
 
 from chat_sdk.cards import CardChild, CardElement, card_child_to_fallback_text, table_element_to_ascii
 from chat_sdk.emoji import convert_emoji_placeholders
@@ -62,20 +62,30 @@ def card_to_fallback_text(
 
 
 def _child_to_fallback_text(child: CardChild, convert_text: Callable[[str], str]) -> str | None:
-    """Convert a card child element to fallback text."""
+    """Convert a card child element to fallback text.
+
+    `child` is a `CardChild` union of TypedDicts; the `child_type` check
+    narrows at runtime but pyrefly returns `object | str` from `.get()`
+    on the union, so we `cast` on each branch to the specific value type.
+    """
     child_type = child.get("type", "")
     if child_type == "text":
-        return convert_text(child.get("content", ""))
+        return convert_text(cast("str", child.get("content", "")))
     if child_type == "link":
-        return f"{convert_text(child.get('label', ''))} ({child.get('url', '')})"
+        return f"{convert_text(cast('str', child.get('label', '')))} ({cast('str', child.get('url', ''))})"
     if child_type == "fields":
-        return "\n".join(f"{convert_text(f['label'])}: {convert_text(f['value'])}" for f in child.get("children", []))
+        children = cast("list[dict[str, str]]", child.get("children", []))
+        return "\n".join(f"{convert_text(f['label'])}: {convert_text(f['value'])}" for f in children)
     if child_type == "actions":
         return None
     if child_type == "section":
-        return "\n".join(filter(None, (_child_to_fallback_text(c, convert_text) for c in child.get("children", []))))
+        section_children = cast("list[CardChild]", child.get("children", []))
+        return "\n".join(filter(None, (_child_to_fallback_text(c, convert_text) for c in section_children)))
     if child_type == "table":
-        return table_element_to_ascii(child.get("headers", []), child.get("rows", []))
+        return table_element_to_ascii(
+            cast("list[str]", child.get("headers", [])),
+            cast("list[list[str]]", child.get("rows", [])),
+        )
     if child_type == "divider":
         return "---"
     return card_child_to_fallback_text(child)
