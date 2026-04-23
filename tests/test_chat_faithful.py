@@ -2303,11 +2303,19 @@ class TestConcurrencyConcurrent:
             for i in range(5)
         ]
 
-        # Let the first two handlers enter and block on the gate. Others
-        # must be blocked on the semaphore, so `in_flight` is capped at 2
-        # and the observed peak is <= 2 (not `== 2` — we'd narrow to 2
-        # only after the final drain below, when the peak is meaningful).
-        for _ in range(20):
+        # Poll until the first 2 handlers have reached the gate. Fixed
+        # yield counts can be flaky on slow CI — a handler that needs to
+        # traverse a few internal `await`s before reaching `gate.wait()`
+        # may not show up in N cycles. Poll with a short timeout instead.
+        async def _reach_cap() -> None:
+            while in_flight < 2:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(_reach_cap(), timeout=1.0)
+
+        # Let any would-be extra tasks finish racing to the gate; if the
+        # bound leaks, in_flight would climb above 2 here.
+        for _ in range(10):
             await asyncio.sleep(0)
         assert in_flight == 2
         assert max_observed <= 2
@@ -2330,11 +2338,28 @@ class TestConcurrencyConcurrent:
         for bad_value in (0, -1, -100):
             import pytest
 
-            with pytest.raises(ValueError, match="max_concurrent must be > 0 or None"):
+            with pytest.raises(ValueError, match="max_concurrent must be a positive integer or None"):
                 await _init_chat(
                     adapter=adapter,
                     state=state,
                     concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),
+                )
+
+    # Python-specific: setting `max_concurrent` with a non-concurrent strategy
+    # is a misconfiguration — the field is only honored under `"concurrent"`.
+    # Fail loudly instead of silently allocating an unused semaphore.
+    async def test_max_concurrent_with_non_concurrent_strategy_raises(self):
+        import pytest
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_strategy in ("queue", "debounce", "drop"):
+            with pytest.raises(ValueError, match="only honored when strategy='concurrent'"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy=bad_strategy, max_concurrent=5),
                 )
 
     # Python-specific: None / missing max_concurrent must keep the
@@ -2367,9 +2392,14 @@ class TestConcurrencyConcurrent:
             )
             for i in range(5)
         ]
-        for _ in range(20):
-            await asyncio.sleep(0)
-        # All 5 should be in flight simultaneously (no bound).
+
+        # Poll until all 5 are in flight; with no semaphore they should
+        # all reach the gate.
+        async def _reach_five() -> None:
+            while in_flight < 5:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(_reach_five(), timeout=1.0)
         assert in_flight == 5
         gate.set()
         await asyncio.gather(*tasks)

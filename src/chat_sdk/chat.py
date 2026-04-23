@@ -39,6 +39,7 @@ from chat_sdk.types import (
     Channel,
     ChannelVisibility,
     ChatConfig,
+    ConcurrencyConfig,
     ConcurrencyStrategy,
     EmojiValue,
     Lock,
@@ -298,19 +299,33 @@ class Chat:
             self._concurrency_queue_entry_ttl_ms = concurrency.queue_entry_ttl_ms
 
         # -- Concurrent-strategy semaphore ------------------------------------
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         # `max_concurrent` bounds in-flight handler dispatches when using the
         # `"concurrent"` strategy. `None` means unbounded (matches the upstream
         # TS default of `Infinity`). A positive integer caps parallel handler
-        # runs. Divergence from upstream: upstream accepts the config field
-        # but doesn't enforce it; we do.
+        # runs. Upstream accepts the config field but never enforces it
+        # (3 writes, 0 reads); we enforce it via `asyncio.Semaphore`.
+        #
+        # Only construct the semaphore when the strategy actually uses it —
+        # if a user sets `max_concurrent=5` with `strategy="queue"`, they
+        # have a misconfiguration that we surface as a `ValueError` rather
+        # than silently allocating an unused primitive.
         #
         # Reject `<= 0` explicitly rather than silently ignoring — a user
         # passing `max_concurrent=0` likely means "pause all processing"
         # (not supported) or has a typo. Either way, silently falling back
         # to unbounded concurrency would surprise them.
+        raw_max = concurrency.max_concurrent if isinstance(concurrency, ConcurrencyConfig) else None
         if self._concurrency_max_concurrent is not None and self._concurrency_max_concurrent <= 0:
             raise ValueError(
-                f"ConcurrencyConfig.max_concurrent must be > 0 or None, got {self._concurrency_max_concurrent}"
+                f"ConcurrencyConfig.max_concurrent must be a positive integer or None; "
+                f"got {raw_max!r}. Pass None for unbounded concurrency."
+            )
+        if self._concurrency_max_concurrent is not None and self._concurrency_strategy != "concurrent":
+            raise ValueError(
+                f"ConcurrencyConfig.max_concurrent is only honored when strategy='concurrent'; "
+                f"got strategy={self._concurrency_strategy!r}. Either switch to strategy='concurrent' "
+                "or drop max_concurrent."
             )
         self._concurrent_semaphore: asyncio.Semaphore | None = (
             asyncio.Semaphore(self._concurrency_max_concurrent)
