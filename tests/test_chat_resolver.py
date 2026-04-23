@@ -529,18 +529,30 @@ class TestChatThreadFactory:
             chat.thread("no-colon-here")
 
     def test_empty_remainder_raises(self):
-        """`slack:` or `slack::`, or any string where every segment after
-        the adapter prefix is empty, would create a thread with no real
-        content. Surface the error at construction time instead of
-        relying on adapter-specific `channel_id_from_thread_id` to
-        catch it (adapters differ in what they return for malformed
-        input — some return the input, some return a partial prefix —
-        so we validate structurally before dispatching to the adapter).
+        """IDs where the channel segment is empty — even when later
+        segments are populated — would create a thread with no channel
+        context. Surface the error at construction time rather than
+        relying on adapter-specific `channel_id_from_thread_id` (which
+        may legitimately return empty, raise, or pass through the
+        original input depending on adapter).
+
+        Crucial cases: `slack::thread` and `slack::foo:bar` have an
+        empty channel segment but non-empty later segments. An "any
+        segment non-empty" check would accept these; the structural
+        validation checks the channel segment specifically.
         """
         from chat_sdk.errors import ChatError
 
         chat = _make_chat("slack")
-        for bad in ("slack:", "slack::", "slack:::", "slack::::"):
+        bad_ids = (
+            "slack:",
+            "slack::",
+            "slack:::",
+            "slack::::",
+            "slack::thread",  # empty channel, non-empty thread
+            "slack::foo:bar",  # empty channel, multi-segment rest
+        )
+        for bad in bad_ids:
             with pytest.raises(ChatError, match="Invalid thread ID"):
                 chat.thread(bad)
 

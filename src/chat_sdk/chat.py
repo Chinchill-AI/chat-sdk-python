@@ -1405,19 +1405,24 @@ class Chat:
         Mirrors ``chat.thread(threadId)`` from the upstream TS SDK.
         """
         # Validate thread ID shape structurally, before calling the adapter.
-        # A valid ID is `{adapter}:{segment}[:{segment}...]` with:
+        # A valid ID is `{adapter}:{channel}[:{rest}...]` with:
         #   - non-empty adapter prefix
-        #   - at least one non-empty segment after the prefix
-        # Rejects `"slack:"`, `"slack::"`, `"slack::::"` etc. at the SDK
-        # boundary so we don't rely on each adapter's
+        #   - non-empty **channel** segment (the part between the first
+        #     and second colon, if there's a second colon; or the whole
+        #     remainder if not)
+        # Rejects `"slack:"`, `"slack::"`, `"slack::thread"`, etc. at
+        # the SDK boundary so we don't rely on each adapter's
         # `channel_id_from_thread_id` doing its own defense. (Different
         # adapters return different things for malformed input; we need
         # a single source of truth.)
+        #
+        # Checking just "any segment is non-empty" would wrongly accept
+        # `"slack::thread"` (empty channel, non-empty thread).
         adapter_name, sep, remainder = thread_id.partition(":")
-        if not sep or not adapter_name:
+        if not sep or not adapter_name or not remainder:
             raise ChatError(f"Invalid thread ID: {thread_id}")
-        # Remainder is empty or only colons → no actual content.
-        if not remainder or not any(seg for seg in remainder.split(":")):
+        channel_segment, _, _ = remainder.partition(":")
+        if not channel_segment:
             raise ChatError(f"Invalid thread ID: {thread_id}")
 
         adapter = self._adapters.get(adapter_name)
