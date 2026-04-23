@@ -897,7 +897,7 @@ class TestStream:
         mock_streamer = MagicMock()
         mock_streamer.append = AsyncMock()
         mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "999.999"}})
-        client.chat_stream = MagicMock(return_value=mock_streamer)
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
 
         from chat_sdk.types import MarkdownTextChunk
 
@@ -922,7 +922,7 @@ class TestStream:
         mock_streamer = MagicMock()
         mock_streamer.append = AsyncMock()
         mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "888.888"}})
-        client.chat_stream = MagicMock(return_value=mock_streamer)
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
 
         from chat_sdk.types import TaskUpdateChunk
 
@@ -947,7 +947,7 @@ class TestStream:
         mock_streamer = MagicMock()
         mock_streamer.append = AsyncMock()
         mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "777.777"}})
-        client.chat_stream = MagicMock(return_value=mock_streamer)
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
 
         from chat_sdk.types import PlanUpdateChunk
 
@@ -963,6 +963,79 @@ class TestStream:
         )
 
         assert result.id == "777.777"
+
+    @pytest.mark.asyncio
+    async def test_stream_awaits_chat_stream_coroutine(self):
+        """Regression test for issue #44: ``AsyncWebClient.chat_stream`` is a
+        coroutine function. Without ``await``, ``streamer`` is a coroutine
+        and calling ``.append`` raises ``AttributeError``. This test uses
+        an ``AsyncMock`` (mirroring the real client) so the fix is required
+        to pass.
+        """
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "444.444"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "hello"
+
+        result = await adapter.stream(
+            "slack:C123:1234567890.000000",
+            text_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert result.id == "444.444"
+        client.chat_stream.assert_awaited_once()
+        assert mock_streamer.append.await_count >= 1
+
+
+# =============================================================================
+# Public request-context accessors (issue #47)
+# =============================================================================
+
+
+class TestPublicContextAccessors:
+    """``current_token`` / ``current_client`` expose the same values as the
+    underscore-prefixed helpers without forcing callers into private API.
+    """
+
+    @pytest.mark.asyncio
+    async def test_current_token_returns_default_bot_token_in_single_workspace(self):
+        adapter, _, _ = await _init_adapter()
+        assert adapter.current_token == "xoxb-test-token"
+
+    @pytest.mark.asyncio
+    async def test_current_client_returns_preconfigured_client(self):
+        adapter, mock_client, _ = await _init_adapter()
+        # ``_patch_client`` redirects ``_get_client`` to the MockSlackClient,
+        # so the public accessor must route through the same path.
+        assert adapter.current_client is mock_client
+
+    @pytest.mark.asyncio
+    async def test_current_token_honors_per_request_context(self):
+        adapter, _, _ = await _init_adapter()
+
+        async def within_ctx() -> str:
+            return adapter.current_token
+
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        token = adapter._request_context.set(RequestContext(token="xoxb-per-request", bot_user_id="U_PER"))
+        try:
+            assert adapter.current_token == "xoxb-per-request"
+        finally:
+            adapter._request_context.reset(token)
+
+    def test_current_token_raises_without_any_token(self):
+        from chat_sdk.shared.errors import AuthenticationError
+
+        adapter = _make_adapter(bot_token=None)
+        with pytest.raises(AuthenticationError):
+            _ = adapter.current_token
 
 
 # =============================================================================

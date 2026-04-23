@@ -1378,6 +1378,54 @@ class Chat:
             )
         )
 
+    def thread(
+        self,
+        thread_id: str,
+        *,
+        current_message: Message | None = None,
+    ) -> ThreadImpl:
+        """Get a Thread by its thread ID (e.g. 'slack:C123ABC:1234567890.123456').
+
+        The adapter is resolved from the thread ID prefix; state and message
+        history come from this Chat instance. This is the public
+        construction path for worker processes — use it instead of
+        reaching into ``ThreadImpl`` / ``_ThreadImplConfig`` directly.
+
+        Parameters
+        ----------
+        thread_id:
+            Fully-qualified thread ID. Must start with a registered
+            adapter name followed by ``:``.
+        current_message:
+            Optional reference to the message the worker is responding to.
+            Required for Slack native streaming, which populates
+            ``recipient_user_id`` / ``recipient_team_id`` from the author
+            of this message. Omit for post-only worker flows.
+
+        Mirrors ``chat.thread(threadId)`` from the upstream TS SDK.
+        """
+        adapter_name = thread_id.split(":")[0] if ":" in thread_id else ""
+        if not adapter_name:
+            raise ChatError(f"Invalid thread ID: {thread_id}")
+        adapter = self._adapters.get(adapter_name)
+        if adapter is None:
+            raise ChatError(f'Adapter "{adapter_name}" not found for thread ID "{thread_id}"')
+
+        stub_message = (
+            current_message
+            if current_message is not None
+            else Message(
+                id="",
+                thread_id=thread_id,
+                text="",
+                formatted={"type": "root", "children": []},
+                raw=None,
+                author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+            )
+        )
+        return self._create_thread(adapter, thread_id, stub_message, False)
+
     # ========================================================================
     # Adapter inference
     # ========================================================================
