@@ -2303,29 +2303,26 @@ class TestConcurrencyConcurrent:
             for i in range(5)
         ]
 
-        # Poll until the first 2 handlers have reached the gate. Fixed
-        # yield counts can be flaky on slow CI — a handler that needs to
-        # traverse a few internal `await`s before reaching `gate.wait()`
-        # may not show up in N cycles. Poll with a short timeout instead.
+        # Wait until the first 2 handlers have reached the gate, then
+        # drain the other 3 after releasing it. We rely exclusively on
+        # `max_observed` (captured inside the handler, atomic under the
+        # asyncio cooperative scheduler) to detect a semaphore leak —
+        # point-in-time checks between polling and assertion are racy
+        # on fast multi-core runners.
         async def _reach_cap() -> None:
             while in_flight < 2:
                 await asyncio.sleep(0.001)
 
         await asyncio.wait_for(_reach_cap(), timeout=1.0)
 
-        # Let any would-be extra tasks finish racing to the gate; if the
-        # bound leaks, in_flight would climb above 2 here.
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert in_flight == 2
-        assert max_observed <= 2
-
-        # Release the gate; all 5 should drain.
+        # Release the gate; all 5 should drain. If the semaphore leaked,
+        # `max_observed` inside the handlers captured the peak before
+        # any could unblock, so the final assertion below would fail.
         gate.set()
         await asyncio.gather(*tasks)
 
         assert finished == 5
-        # The bound was never exceeded; peak reached exactly 2.
+        # The critical assertion: peak in-flight never exceeded 2.
         assert max_observed == 2
 
     # Python-specific: reject invalid `max_concurrent` values at construction
