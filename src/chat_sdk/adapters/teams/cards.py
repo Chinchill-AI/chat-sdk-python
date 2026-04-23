@@ -31,6 +31,10 @@ ADAPTIVE_CARD_VERSION = "1.4"
 # Used when a card has select/radio_select inputs but no submit button.
 AUTO_SUBMIT_ACTION_ID = "__auto_submit"
 
+# Internal marker key for divider placeholders. Stripped by
+# ``_hoist_dividers`` before the card is serialized — never reaches Teams.
+_DIVIDER_MARKER = "__chatSdkDivider"
+
 
 def _convert_emoji(text: str) -> str:
     """Convert emoji placeholders to Teams format."""
@@ -96,6 +100,8 @@ def card_to_adaptive_card(card: CardElement) -> dict[str, Any]:
         body.extend(result["elements"])
         actions.extend(result["actions"])
 
+    body = _hoist_dividers(body)
+
     adaptive_card: dict[str, Any] = {
         "type": "AdaptiveCard",
         "$schema": ADAPTIVE_CARD_SCHEMA,
@@ -121,7 +127,14 @@ def _convert_child_to_adaptive(child: CardChild) -> dict[str, Any]:
     if child_type == "image":
         return {"elements": [_convert_image_to_element(child)], "actions": []}  # type: ignore[arg-type]
     if child_type == "divider":
-        return {"elements": [{"type": "Container", "separator": True, "items": []}], "actions": []}
+        # Emit an internal marker instead of the final Container. The
+        # post-processing pass (_hoist_dividers) either moves ``separator``
+        # onto the next sibling (preferred — renders as a full-width line)
+        # or, for a trailing divider with no next sibling, replaces it with
+        # a minimal non-empty Container so the separator is visible. An
+        # empty ``Container`` with ``separator: True`` renders at zero
+        # height in Microsoft Teams.
+        return {"elements": [{_DIVIDER_MARKER: True}], "actions": []}
     if child_type == "actions":
         return _convert_actions_to_elements(child)  # type: ignore[arg-type]
     if child_type == "section":
@@ -148,6 +161,37 @@ def _convert_child_to_adaptive(child: CardChild) -> dict[str, Any]:
     if text:
         return {"elements": [{"type": "TextBlock", "text": text, "wrap": True}], "actions": []}
     return {"elements": [], "actions": []}
+
+
+def _hoist_dividers(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace internal divider markers with ``separator: True`` on the next sibling.
+
+    An Adaptive Card ``Container`` with ``separator: True`` and no ``items``
+    renders at zero height in Microsoft Teams — the separator line is
+    effectively invisible. Instead, hoist the separator onto the following
+    sibling so it renders as a full-width line above that element. For a
+    trailing divider with no next sibling, emit a non-empty Container so
+    the separator is still visible.
+    """
+    result: list[dict[str, Any]] = []
+    pending = False
+    for el in elements:
+        if el.get(_DIVIDER_MARKER):
+            pending = True
+            continue
+        if pending:
+            el = {**el, "separator": True}
+            pending = False
+        result.append(el)
+    if pending:
+        result.append(
+            {
+                "type": "Container",
+                "separator": True,
+                "items": [{"type": "TextBlock", "text": " ", "wrap": False}],
+            }
+        )
+    return result
 
 
 def _convert_text_to_element(element: TextElement) -> dict[str, Any]:
@@ -319,6 +363,7 @@ def _convert_section_to_elements(element: SectionElement) -> dict[str, Any]:
         container_items.extend(result["elements"])
         actions.extend(result["actions"])
 
+    container_items = _hoist_dividers(container_items)
     if container_items:
         elements.append({"type": "Container", "items": container_items})
 

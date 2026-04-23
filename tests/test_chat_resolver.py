@@ -426,3 +426,139 @@ class TestChannelImplResolver:
         await asyncio.gather(task(chat_a, "ca"), task(chat_b, "cb"))
         assert results["ca"] == "ca"
         assert results["cb"] == "cb"
+
+
+class TestChatThreadFactory:
+    """``Chat.thread(thread_id)`` — public worker-reconstruction path (issue #46).
+
+    Mirrors ``chat.thread(threadId)`` from the upstream TS SDK. Lets worker
+    processes rebuild a Thread bound to this Chat's state and the adapter
+    inferred from the thread ID prefix — no need to reach into
+    ``ThreadImpl`` / ``_ThreadImplConfig`` directly.
+    """
+
+    def setup_method(self):
+        clear_chat_singleton()
+
+    def teardown_method(self):
+        clear_chat_singleton()
+
+    def test_infers_adapter_from_thread_id_prefix(self):
+        chat = _make_chat("slack")
+        thread = chat.thread("slack:C123:1234567890.123456")
+        assert thread.adapter.name == "slack"
+        assert thread.id == "slack:C123:1234567890.123456"
+
+    def test_propagates_explicit_current_message(self):
+        """Slack native streaming reads ``current_message`` to populate
+        recipient IDs; the public factory must let workers supply it.
+        """
+        from datetime import datetime, timezone
+
+        from chat_sdk import Author, Message, MessageMetadata
+
+        chat = _make_chat("slack")
+        thread_id = "slack:C123:1234567890.123456"
+        msg = Message(
+            id="M1",
+            thread_id=thread_id,
+            text="hi",
+            formatted={"type": "root", "children": []},
+            raw=None,
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+            # Fixed timestamp — `datetime.now()` makes tests non-deterministic.
+            metadata=MessageMetadata(date_sent=datetime(2024, 1, 1, tzinfo=timezone.utc), edited=False),
+        )
+        thread = chat.thread(thread_id, current_message=msg)
+        assert thread._current_message is msg
+
+    def test_omitting_current_message_stubs_a_placeholder(self):
+        """Workers that only post (no streaming) can omit ``current_message``."""
+        chat = _make_chat("slack")
+        thread = chat.thread("slack:C123:1234567890.123456")
+        assert thread._current_message is not None
+        assert thread._current_message.id == ""
+
+    def test_reuses_parent_chat_state_and_history(self):
+        """The factory must bind the new Thread to the parent Chat's state
+        adapter and message history. This is the core contract of
+        `chat.thread()` — worker processes reconstruct a Thread that
+        shares state with the original Chat instance, not a fresh
+        detached thread. Without this, state writes/reads from the worker
+        wouldn't be visible to the Chat in-process.
+
+        For adapters that don't persist message history (persist_message_history
+        falsy), `_create_thread` intentionally skips the history bind —
+        there's no cache to share. This test uses a persisting adapter to
+        exercise the positive case.
+        """
+        chat = _make_chat("slack")
+        # Opt the mock adapter into message history so the factory binds it
+        adapter = chat._adapters["slack"]
+        adapter.persist_message_history = True
+
+        thread = chat.thread("slack:C123:1234567890.123456")
+        # State adapter must be the exact same instance, not a copy
+        assert thread._state_adapter is chat._state_adapter
+        # Message history must be the exact same instance too
+        assert thread._message_history is chat._message_history
+
+    def test_omits_history_when_adapter_does_not_persist(self):
+        """Adapters with `persist_message_history` falsy opt out of the
+        shared history cache. `Chat.thread()` respects that: the Thread
+        gets `None` for history rather than a shared cache the adapter
+        won't populate.
+
+        Explicitly set `persist_message_history = None` rather than
+        relying on the mock's default — prevents silent test regression
+        if the mock default ever changes.
+        """
+        chat = _make_chat("slack")
+        adapter = chat._adapters["slack"]
+        adapter.persist_message_history = None
+
+        thread = chat.thread("slack:C123:1234567890.123456")
+        assert thread._state_adapter is chat._state_adapter
+        assert thread._message_history is None
+
+    def test_invalid_thread_id_raises(self):
+        from chat_sdk.errors import ChatError
+
+        chat = _make_chat("slack")
+        with pytest.raises(ChatError, match="Invalid thread ID"):
+            chat.thread("no-colon-here")
+
+    def test_empty_remainder_raises(self):
+        """IDs where the channel segment is empty — even when later
+        segments are populated — would create a thread with no channel
+        context. Surface the error at construction time rather than
+        relying on adapter-specific `channel_id_from_thread_id` (which
+        may legitimately return empty, raise, or pass through the
+        original input depending on adapter).
+
+        Crucial cases: `slack::thread` and `slack::foo:bar` have an
+        empty channel segment but non-empty later segments. An "any
+        segment non-empty" check would accept these; the structural
+        validation checks the channel segment specifically.
+        """
+        from chat_sdk.errors import ChatError
+
+        chat = _make_chat("slack")
+        bad_ids = (
+            "slack:",
+            "slack::",
+            "slack:::",
+            "slack::::",
+            "slack::thread",  # empty channel, non-empty thread
+            "slack::foo:bar",  # empty channel, multi-segment rest
+        )
+        for bad in bad_ids:
+            with pytest.raises(ChatError, match="Invalid thread ID"):
+                chat.thread(bad)
+
+    def test_unregistered_adapter_raises(self):
+        from chat_sdk.errors import ChatError
+
+        chat = _make_chat("slack")
+        with pytest.raises(ChatError, match='Adapter "teams" not found'):
+            chat.thread("teams:foo:bar")

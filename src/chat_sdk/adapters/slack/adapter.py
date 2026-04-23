@@ -253,6 +253,43 @@ class SlackAdapter:
         return self._persist_message_history
 
     # ------------------------------------------------------------------
+    # Public request-context accessors
+    #
+    # These are Python-only extensions to the Adapter surface. They let
+    # code running inside a handler call the Slack Web API directly —
+    # e.g. ``users.info`` for caller-email resolution — without
+    # reaching into the underscore-prefixed ``_get_token`` /
+    # ``_get_client`` helpers. See docs/UPSTREAM_SYNC.md.
+    # ------------------------------------------------------------------
+
+    @property
+    def current_token(self) -> str:
+        """Return the bot token bound to the current request context.
+
+        In multi-workspace mode this is the token resolved by the
+        ``InstallationStore`` for the current request; in single-workspace
+        mode it is the default bot token. Raises
+        :class:`AuthenticationError` when called outside a request context
+        with no default token configured.
+        """
+        return self._get_token()
+
+    @property
+    def current_client(self) -> Any:
+        """Return an ``AsyncWebClient`` preconfigured with :attr:`current_token`.
+
+        Return type is ``Any`` (rather than the concrete
+        ``AsyncWebClient``) because ``slack_sdk`` is an optional
+        dependency — consumers who install the SDK without the `slack`
+        extra shouldn't pay a type-check-time import cost. Docstring
+        captures the actual runtime type for tooling that reads it.
+
+        The returned client is LRU-cached by token. Raises
+        :class:`AuthenticationError` when no token is available.
+        """
+        return self._get_client()
+
+    # ------------------------------------------------------------------
     # Token management
     # ------------------------------------------------------------------
 
@@ -2030,7 +2067,7 @@ class SlackAdapter:
         if options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
 
-        streamer = client.chat_stream(**stream_kwargs)
+        streamer = await client.chat_stream(**stream_kwargs)
 
         first = True
         last_appended = ""

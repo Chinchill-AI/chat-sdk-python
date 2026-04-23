@@ -93,11 +93,78 @@ class TestCardToAdaptiveCard:
             "size": "auto",
         }
 
-    def test_divider_elements(self):
-        card = Card(children=[Divider()])
+    def test_divider_hoists_separator_onto_next_sibling(self):
+        """Regression test for issue #45: a divider between siblings should set
+        ``separator: True`` on the following element rather than emitting an
+        empty Container (which Teams renders at zero height).
+        """
+        card = Card(
+            children=[
+                CardText("above"),
+                Divider(),
+                CardText("below"),
+            ]
+        )
+        adaptive = card_to_adaptive_card(card)
+        assert len(adaptive["body"]) == 2
+        assert adaptive["body"][0] == {"type": "TextBlock", "text": "above", "wrap": True}
+        assert adaptive["body"][1] == {
+            "type": "TextBlock",
+            "text": "below",
+            "wrap": True,
+            "separator": True,
+        }
+
+    def test_divider_leading_hoists_onto_first_sibling(self):
+        card = Card(children=[Divider(), CardText("only")])
         adaptive = card_to_adaptive_card(card)
         assert len(adaptive["body"]) == 1
-        assert adaptive["body"][0] == {"type": "Container", "separator": True, "items": []}
+        assert adaptive["body"][0] == {
+            "type": "TextBlock",
+            "text": "only",
+            "wrap": True,
+            "separator": True,
+        }
+
+    def test_divider_trailing_falls_back_to_non_empty_container(self):
+        """A divider with no following sibling must still be visible — an
+        empty Container with ``separator: True`` renders at zero height, so
+        emit a minimal non-empty Container instead.
+        """
+        card = Card(children=[CardText("above"), Divider()])
+        adaptive = card_to_adaptive_card(card)
+        assert len(adaptive["body"]) == 2
+        assert adaptive["body"][0] == {"type": "TextBlock", "text": "above", "wrap": True}
+        trailing = adaptive["body"][1]
+        assert trailing["type"] == "Container"
+        assert trailing["separator"] is True
+        assert trailing["items"], "trailing-divider Container must not be empty"
+
+    def test_divider_never_leaks_internal_marker_key(self):
+        """The internal marker key used during conversion must never appear
+        in the final Adaptive Card payload sent to Teams.
+        """
+        card = Card(
+            children=[
+                CardText("a"),
+                Divider(),
+                Divider(),
+                CardText("b"),
+                Divider(),
+            ]
+        )
+        adaptive = card_to_adaptive_card(card)
+
+        def _walk(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    assert not key.startswith("__chatSdk"), f"leaked marker key: {key}"
+                    _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(adaptive)
 
     def test_actions_with_buttons(self):
         card = Card(

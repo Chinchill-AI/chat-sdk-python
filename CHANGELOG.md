@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- **Slack native streaming no longer crashes on first chunk** (issue #44): `SlackAdapter.stream()` now awaits `AsyncWebClient.chat_stream(...)`; the previous code called `.append()` on an unawaited coroutine, raising `AttributeError` and forcing callers onto the post+edit fallback. Existing tests were updated to use `AsyncMock` for `chat_stream` so they mirror the real client.
+- **Teams divider now renders a visible separator line** (issue #45): `card_to_adaptive_card` previously emitted an empty `Container` with `separator: True`, which Microsoft Teams renders at zero height. The new behavior hoists `separator: True` onto the following sibling (or emits a minimal non-empty Container for a trailing divider). Upstream TS ships the same bug; documented as a divergence in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md).
+
+### Python-only additions
+- **`SlackAdapter.current_token` / `current_client`** (issue #47): public `@property` accessors that return the request-context-bound bot token and a preconfigured `AsyncWebClient`. Replaces reaching into `_get_token()` / `_get_client()` from consumer code that needs to call the Slack Web API directly from inside a handler (email resolution, user profile fetches, etc.). TS keeps `getToken()` private; documented as a Python-only extension in [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md).
+- **`Chat.thread(thread_id, *, current_message=None)`** (issue #46): public worker-reconstruction factory mirroring TS `chat.thread(threadId)`. Adapter is inferred from the thread ID prefix; state and message history come from the Chat instance. Pass `current_message` when the worker needs Slack native streaming (it populates `recipient_user_id` / `recipient_team_id`).
+
 ## 0.4.26 (2026-04-16)
 
 Synced to [Vercel Chat 4.26.0](https://github.com/vercel/chat).
