@@ -56,7 +56,7 @@ Python-only follow-up on `0.4.26`. Still alpha — APIs may change.
   ignore` lines beyond 10 at adapter event-construction sites where
   `thread=None`/`channel=None` get re-wrapped by `Chat` before handler
   dispatch (matches upstream TS's `Omit<>` partial-event pattern).
-- Test count: **3471 passed**, 2 skipped.
+- Test count: **3544 passed**, 2 skipped.
 
 ### Known gaps (not fixed in this release)
 

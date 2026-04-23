@@ -2303,17 +2303,19 @@ class TestConcurrencyConcurrent:
             for i in range(5)
         ]
 
-        # Wait until the first 2 handlers have reached the gate, then
-        # drain the other 3 after releasing it. We rely exclusively on
-        # `max_observed` (captured inside the handler, atomic under the
-        # asyncio cooperative scheduler) to detect a semaphore leak —
-        # point-in-time checks between polling and assertion are racy
-        # on fast multi-core runners.
+        # Wait until the first 2 handlers reach the gate. asyncio uses a
+        # single-threaded cooperative scheduler, so between `_reach_cap`
+        # returning and the next assertion, no other task can interleave
+        # — tasks 3-5 are parked on `semaphore.acquire()`. The
+        # `in_flight == 2` check IS stable here.
         async def _reach_cap() -> None:
             while in_flight < 2:
                 await asyncio.sleep(0.001)
 
         await asyncio.wait_for(_reach_cap(), timeout=1.0)
+        # Snapshot while the gate is still closed: exactly the bound
+        # should be in flight, and no more.
+        assert in_flight == 2
 
         # Release the gate; all 5 should drain. If the semaphore leaked,
         # `max_observed` inside the handlers captured the peak before
@@ -2371,6 +2373,7 @@ class TestConcurrencyConcurrent:
             "concurrent",
             ConcurrencyConfig(strategy="concurrent", max_concurrent=None),
         ],
+        ids=["string", "config_none"],
     )
     async def test_max_concurrent_none_allows_unbounded(self, concurrency_value):
         state = create_mock_state()
