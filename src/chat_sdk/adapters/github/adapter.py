@@ -1095,6 +1095,12 @@ class GitHubAdapter:
             return str(await result if inspect.isawaitable(result) else result)
         body = getattr(request, "body", None)
         if body is not None:
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if callable(body):
+                body = body()
+            if inspect.isawaitable(body):
+                body = await body
             return body.decode("utf-8") if isinstance(body, bytes) else str(body)
         return ""
 

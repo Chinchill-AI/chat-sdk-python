@@ -724,13 +724,13 @@ class WhatsAppAdapter:
             # discrimination, so cast the field access on each branch.
             result = card_to_whatsapp(card)
             if result.get("type") == "interactive":
-                interactive_raw = cast("WhatsAppCardResultInteractive", result)["interactive"]
+                interactive_raw = cast(WhatsAppCardResultInteractive, result)["interactive"]
                 interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
                 return await self._send_interactive_message(thread_id, user_wa_id, interactive)
             return await self._send_text_message(
                 thread_id,
                 user_wa_id,
-                convert_emoji_placeholders(cast("WhatsAppCardResultText", result)["text"], "whatsapp"),
+                convert_emoji_placeholders(cast(WhatsAppCardResultText, result)["text"], "whatsapp"),
             )
 
         # Regular text message
@@ -1063,6 +1063,12 @@ class WhatsAppAdapter:
             return str(await result if inspect.isawaitable(result) else result)
         body = getattr(request, "body", None)
         if body is not None:
+            # Some frameworks expose `body` as an async method; call and
+            # await if needed before treating as bytes/str.
+            if callable(body):
+                body = body()
+            if inspect.isawaitable(body):
+                body = await body
             if isinstance(body, bytes):
                 return body.decode("utf-8")
             return str(body)

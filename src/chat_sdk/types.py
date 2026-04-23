@@ -1346,9 +1346,6 @@ class ChatInstance(Protocol):
         adapter: Adapter,
         thread_id: str,
         message: Message,
-        options: WebhookOptions | None = None,
-        *,
-        is_subscribed: bool = False,
     ) -> None: ...
     def process_action(self, event: Any, options: WebhookOptions | None = None) -> None: ...
     def process_reaction(self, event: Any, options: WebhookOptions | None = None) -> None: ...

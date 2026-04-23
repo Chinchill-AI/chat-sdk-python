@@ -874,7 +874,7 @@ class Chat:
         for pat in self._modal_submit_handlers:
             if not pat.callback_ids or event.callback_id in pat.callback_ids:
                 try:
-                    response = await pat.handler(full_event)
+                    response = await self._invoke_handler(pat.handler, full_event)
                     if response is not None:
                         return response
                 except Exception as exc:
@@ -909,7 +909,7 @@ class Chat:
 
             for pat in self._modal_close_handlers:
                 if not pat.callback_ids or event.callback_id in pat.callback_ids:
-                    await pat.handler(full_event)
+                    await self._invoke_handler(pat.handler, full_event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -948,7 +948,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._assistant_thread_started_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -969,7 +969,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._assistant_context_changed_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -990,7 +990,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._app_home_opened_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1011,7 +1011,7 @@ class Chat:
     ) -> None:
         async def _task() -> None:
             for h in self._member_joined_channel_handlers:
-                await h(event)
+                await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1081,11 +1081,11 @@ class Chat:
         for pat in self._slash_command_handlers:
             if not pat.commands:
                 self._logger.debug("Running catch-all slash command handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
             if event.command in pat.commands:
                 self._logger.debug("Running matched slash command handler", {"command": event.command})
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # Modal context persistence
@@ -1256,11 +1256,11 @@ class Chat:
         for pat in self._action_handlers:
             if not pat.action_ids:
                 self._logger.debug("Running catch-all action handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
             if event.action_id in pat.action_ids:
                 self._logger.debug("Running matched action handler", {"action_id": event.action_id})
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # Reaction handling
@@ -1318,7 +1318,7 @@ class Chat:
         for pat in self._reaction_handlers:
             if not pat.emoji:
                 self._logger.debug("Running catch-all reaction handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
                 continue
 
             matches = any(
@@ -1334,7 +1334,7 @@ class Chat:
             )
             if matches:
                 self._logger.debug("Running matched reaction handler")
-                await pat.handler(full_event)
+                await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # openDM / channel
@@ -2045,12 +2045,28 @@ class Chat:
         context: MessageContext | None = None,
     ) -> None:
         for h in handlers:
-            result = h(thread, message, context)
-            # Handlers are typed `Callable[..., Awaitable[None] | None]` —
-            # sync handlers return None and must NOT be awaited, or we
-            # raise TypeError at runtime. Narrow with `isawaitable`.
-            if inspect.isawaitable(result):
-                await result
+            await self._invoke_handler(h, thread, message, context)
+
+    @staticmethod
+    async def _invoke_handler(handler: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Invoke a handler and await the result only if awaitable.
+
+        All Chat handler types (message, reaction, action, slash, modal,
+        options-load, assistant, home, member-joined) are declared as
+        `Callable[..., Awaitable[T] | T]` — i.e. users may register either
+        a sync or an async callable. Awaiting the return value
+        unconditionally raises `TypeError: object NoneType can't be used
+        in 'await' expression` for sync handlers, so this helper narrows
+        with `inspect.isawaitable`.
+
+        Returns whatever the handler returned (post-await for async) so
+        callers that need the value (modal submit → `ModalResponse`) can
+        still capture it.
+        """
+        result = handler(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 # ---------------------------------------------------------------------------

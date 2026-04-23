@@ -696,7 +696,13 @@ class SlackAdapter:
         else:
             raw = getattr(request, "body", None)
             if raw is not None:
-                if asyncio.iscoroutine(raw) or asyncio.isfuture(raw):
+                # Some frameworks expose `body` as an async method (e.g.
+                # `async def body(self)`) — call it, then await if the
+                # result is awaitable. Previously we only handled the
+                # coroutine-as-attribute case, not the async-method case.
+                if callable(raw):
+                    raw = raw()
+                if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) or inspect.isawaitable(raw):
                     raw = await raw
                 body = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
             else:
@@ -1083,7 +1089,7 @@ class SlackAdapter:
                         private_metadata=modal.get("private_metadata"),
                     )
                 )
-                view = modal_to_slack_view(cast("ModalElement", modal), metadata)
+                view = modal_to_slack_view(cast(ModalElement, modal), metadata)
                 return {"response_action": response.action, "view": view}
         return {}
 
@@ -2342,7 +2348,7 @@ class SlackAdapter:
                 private_metadata=modal.get("private_metadata"),
             )
         )
-        view = modal_to_slack_view(cast("ModalElement", modal), metadata)
+        view = modal_to_slack_view(cast(ModalElement, modal), metadata)
 
         self._logger.debug(
             "Slack API: views.open",
@@ -2359,7 +2365,7 @@ class SlackAdapter:
 
     async def update_modal(self, view_id: str, modal: dict[str, Any]) -> dict[str, str]:
         """Update an existing modal using views.update."""
-        view = modal_to_slack_view(cast("ModalElement", modal))
+        view = modal_to_slack_view(cast(ModalElement, modal))
 
         try:
             client = self._get_client()

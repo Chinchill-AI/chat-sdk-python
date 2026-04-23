@@ -772,6 +772,12 @@ class GoogleChatAdapter:
         else:
             raw_body = getattr(request, "body", None)
             if raw_body is not None:
+                # Some frameworks expose `body` as an async method; call and
+                # await if needed before treating as bytes/str.
+                if callable(raw_body):
+                    raw_body = raw_body()
+                if inspect.isawaitable(raw_body):
+                    raw_body = await raw_body
                 body = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
             elif isinstance(request, dict):
                 body = json.dumps(request)

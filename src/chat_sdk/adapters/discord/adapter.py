@@ -1412,6 +1412,10 @@ class DiscordAdapter:
         if body is not None:
             if callable(body):
                 body = body()
+            # Some frameworks expose `body` as an async method; if calling it
+            # produced a coroutine, await it before treating as bytes/str.
+            if inspect.isawaitable(body):
+                body = await body
             if hasattr(body, "read"):
                 raw_read = body.read
                 raw = await raw_read() if inspect.iscoroutinefunction(raw_read) else raw_read()
