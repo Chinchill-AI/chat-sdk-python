@@ -2344,6 +2344,25 @@ class TestConcurrencyConcurrent:
                     concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),
                 )
 
+    # Python-specific: reject non-integer `max_concurrent` at construction
+    # instead of letting `asyncio.Semaphore` misbehave (`1.5` silently drives
+    # the counter negative, `True` allocates a 1-way bound from a bool,
+    # `"2"` raises `TypeError` from inside the primitive instead of our
+    # `ValueError`).
+    async def test_max_concurrent_non_integer_raises(self):
+        import pytest
+
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        for bad_value in (1.5, True, False, "2", 0.0, [1]):
+            with pytest.raises(ValueError, match="max_concurrent must be a positive integer or None"):
+                await _init_chat(
+                    adapter=adapter,
+                    state=state,
+                    concurrency=ConcurrencyConfig(strategy="concurrent", max_concurrent=bad_value),  # type: ignore[arg-type]
+                )
+
     # Python-specific: setting `max_concurrent` with a non-concurrent strategy
     # is a misconfiguration — the field is only honored under `"concurrent"`.
     # Fail loudly instead of silently allocating an unused semaphore.

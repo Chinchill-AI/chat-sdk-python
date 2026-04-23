@@ -316,7 +316,14 @@ class Chat:
         # (not supported) or has a typo. Either way, silently falling back
         # to unbounded concurrency would surprise them.
         raw_max = concurrency.max_concurrent if isinstance(concurrency, ConcurrencyConfig) else None
-        if self._concurrency_max_concurrent is not None and self._concurrency_max_concurrent <= 0:
+        if raw_max is not None and (
+            # Reject non-int (including bool, which is an int subclass but
+            # semantically meaningless here) before any arithmetic —
+            # `asyncio.Semaphore(1.5)` silently goes negative, `Semaphore(True)`
+            # allocates a 1-way bound from a boolean, and `Semaphore("2")`
+            # raises `TypeError` instead of our ValueError.
+            isinstance(raw_max, bool) or not isinstance(raw_max, int) or raw_max <= 0
+        ):
             raise ValueError(
                 f"ConcurrencyConfig.max_concurrent must be a positive integer or None; "
                 f"got {raw_max!r}. Pass None for unbounded concurrency."
