@@ -5,7 +5,7 @@ Thanks for your interest in contributing! This guide covers the essentials.
 ## Dev Environment Setup
 
 ```bash
-# Clone and install (requires Python 3.11+ and uv)
+# Clone and install (requires Python 3.10+ and uv)
 git clone https://github.com/Chinchill-AI/chat-sdk-python.git
 cd chat-sdk-python
 uv sync --group dev
@@ -49,6 +49,75 @@ All PRs must pass `ruff check` with zero errors.
 - Check existing issues before opening a new one.
 - Reference the issue number in your PR description (e.g., `Fixes #42`).
 - For large changes, open an issue first to discuss the approach.
+
+## Release Procedure
+
+### Version scheme
+
+`0.{upstream_major}.{upstream_minor}[.patch]` — our version embeds the upstream
+Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mapping).
+
+- `0.4.25` = synced to upstream `4.25.0`
+- `0.4.25.1` = Python-only fix on top of `4.25.0`
+- `0.4.26a1` = alpha while porting upstream `4.26.0`
+
+> **Upstream patch releases**: Vercel Chat has historically gone straight to
+> minor bumps, but if upstream ships a patch (e.g. `4.25.1`) we sync it by
+> bumping to the next minor (`0.4.26`). We don't reuse the `.patch` slot for
+> upstream patches — it's reserved for Python-only fixes so the two can't
+> collide.
+
+### Steps
+
+1. **Full validation** (must all pass):
+   ```bash
+   uv run ruff check src/ tests/ scripts/
+   uv run ruff format --check src/ tests/ scripts/
+   uv run python scripts/audit_test_quality.py
+   # verify_test_fidelity.py needs the upstream TS repo at $TS_ROOT (default
+   # /tmp/vercel-chat). Without it, the script silently skips checks and exits
+   # 0, so releases can ship unverified. Clone once:
+   #   git clone https://github.com/vercel/chat.git /tmp/vercel-chat
+   uv run python scripts/verify_test_fidelity.py
+   uv run pytest tests/ --tb=short -q
+   ```
+
+2. **Update version** in all locations:
+   - `pyproject.toml` → `version = "0.4.26"`
+   - `README.md` → status line
+   - `CLAUDE.md` → version reference
+   - `src/chat_sdk/__init__.py` → `UPSTREAM_PARITY = "4.26.0"` (for upstream syncs)
+   - `CHANGELOG.md` → new entry with public-facing release notes
+
+3. **Changelog guidelines**:
+   - Lead with what users need to do (upgrading section, breaking changes)
+   - Group by impact (new features, bug fixes, internals)
+   - Don't list internal engineering details (phantom absorber counts, etc.)
+   - Link to upstream release for sync releases
+
+4. **Create PR**, get CI green, merge.
+
+5. **Create GitHub release**:
+   ```bash
+   gh release create v0.4.26 --target main --title "v0.4.26 — Synced to Vercel Chat 4.26.0"
+   ```
+   - Tag format: `v{version}` (e.g., `v0.4.26`)
+   - Use the pre-release flag for alpha versions (`v0.4.26a1` → `--prerelease`)
+   - This triggers the `publish.yml` workflow → PyPI
+
+6. **Verify on PyPI**: `pip install chat-sdk=={version}`
+
+7. **Cleanup**: mark yanked/superseded GitHub releases as deprecated in their
+   description — don't delete them (deleting removes history and breaks any
+   external links that reference the tag).
+
+### What NOT to do
+
+- Don't publish without CI green on all 4 Python versions (3.10-3.13)
+- Don't skip the fidelity check for test changes
+- Don't use alpha tags for *final* sync releases — alpha tags (`0.4.26a1`) are
+  only for work-in-progress ports while syncing a new upstream version
+- Don't amend published releases — create a patch instead
 
 ## License
 
