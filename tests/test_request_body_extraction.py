@@ -135,7 +135,7 @@ def _adapters() -> list[tuple[str, Any]]:
 
         result.append(("github", GitHubAdapter._get_request_body))
     except ImportError:
-        pass
+        pass  # Optional platform dep missing — skip this adapter's cases.
 
     # Telegram (static method)
     try:
@@ -143,7 +143,7 @@ def _adapters() -> list[tuple[str, Any]]:
 
         result.append(("telegram", TelegramAdapter._get_request_body))
     except ImportError:
-        pass
+        pass  # Optional platform dep missing — skip this adapter's cases.
 
     # WhatsApp (static method)
     try:
@@ -151,7 +151,7 @@ def _adapters() -> list[tuple[str, Any]]:
 
         result.append(("whatsapp", WhatsAppAdapter._get_request_body))
     except ImportError:
-        pass
+        pass  # Optional platform dep missing — skip this adapter's cases.
 
     return result
 
