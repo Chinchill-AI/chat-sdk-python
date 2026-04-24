@@ -2,6 +2,20 @@
 name = "chat-sdk"
 version = "0.4.26.2"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
+keywords = [
+    "chat",
+    "chatbot",
+    "chatops",
+    "slack-bot",
+    "discord-bot",
+    "telegram-bot",
+    "teams-bot",
+    "whatsapp-bot",
+    "bot-framework",
+    "async",
+    "asyncio",
+    "vercel",
+]
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -16,7 +30,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
     "Topic :: Communications :: Chat",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
 
