@@ -8,6 +8,7 @@ which in-memory operation to perform.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import re
 import time
@@ -542,7 +543,7 @@ class TestPostgresStateTTL:
     @pytest.mark.asyncio
     async def test_set_with_ttl_expires(self, pg_state: PostgresStateAdapter):
         await pg_state.set("key", "value", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await pg_state.get("key") is None
 
     @pytest.mark.asyncio
@@ -553,14 +554,14 @@ class TestPostgresStateTTL:
     @pytest.mark.asyncio
     async def test_set_without_ttl_never_expires(self, pg_state: PostgresStateAdapter):
         await pg_state.set("key", "value")
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await pg_state.get("key") == "value"
 
     @pytest.mark.asyncio
     async def test_expired_key_cleaned_on_get(self, pg_state: PostgresStateAdapter, mock_pool: MockAsyncpgPool):
         """When get() returns None for an expired key, the adapter runs an opportunistic DELETE."""
         await pg_state.set("key", "value", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         await pg_state.get("key")
 
         # After the get, the expired row should have been cleaned up
@@ -598,7 +599,7 @@ class TestPostgresStateSetIfNotExists:
     @pytest.mark.asyncio
     async def test_succeeds_after_expired_key(self, pg_state: PostgresStateAdapter):
         await pg_state.set("key", "old", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         # The key is expired; set_if_not_exists should succeed
         result = await pg_state.set_if_not_exists("key", "new")
         assert result is True
@@ -632,7 +633,7 @@ class TestPostgresStateLocks:
     async def test_acquire_lock_succeeds_when_expired(self, pg_state: PostgresStateAdapter):
         lock1 = await pg_state.acquire_lock("thread-1", 1)
         assert lock1 is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         lock2 = await pg_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
         assert lock2.thread_id == "thread-1"
@@ -670,7 +671,7 @@ class TestPostgresStateLocks:
         assert result is True
 
         # Lock should still be held after original TTL
-        time.sleep(0.15)
+        await asyncio.sleep(0.15)
         lock2 = await pg_state.acquire_lock("thread-1", 30_000)
         assert lock2 is None
 
@@ -687,7 +688,7 @@ class TestPostgresStateLocks:
     async def test_extend_lock_after_expiry_fails(self, pg_state: PostgresStateAdapter):
         lock = await pg_state.acquire_lock("thread-1", 1)
         assert lock is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
 
         result = await pg_state.extend_lock(lock, 60_000)
         assert result is False
@@ -752,7 +753,6 @@ class TestPostgresStateLocks:
 
         # Third acquire after expiry: should succeed in single query
         mock_pool.executed_queries.clear()
-        time.sleep(0.005)
         # Force-expire the lock for testing
         lock_key = ("test", "race-thread")
         mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
@@ -801,7 +801,7 @@ class TestPostgresStateLists:
     @pytest.mark.asyncio
     async def test_list_with_ttl_expires(self, pg_state: PostgresStateAdapter):
         await pg_state.append_to_list("key", "a", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         result = await pg_state.get_list("key")
         assert result == []
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Test hygiene
+
+- Sweep remaining `time.sleep` → `await asyncio.sleep` in async tests
+  (`test_memory_state.py`, `test_state_postgres.py`). Closes the same
+  flaky-test hazard fixed for the Redis backend in PR #73.
+
 ## 0.4.26.1 (2026-04-23)
 
 Python-only follow-up on `0.4.26`. Still alpha — APIs may change.

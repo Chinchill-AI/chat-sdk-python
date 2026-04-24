@@ -5,6 +5,7 @@ Tests the real in-memory state adapter (not the mock).
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -139,7 +140,7 @@ class TestMemoryStateTTL:
         # Set with a very short TTL
         await memory_state.set("key", "value", ttl_ms=1)
         # Wait for expiry
-        time.sleep(0.005)  # 5ms -- well past 1ms TTL
+        await asyncio.sleep(0.005)  # 5ms -- well past 1ms TTL
         assert await memory_state.get("key") is None
 
     @pytest.mark.asyncio
@@ -151,13 +152,13 @@ class TestMemoryStateTTL:
     async def test_set_without_ttl_never_expires(self, memory_state: MemoryStateAdapter):
         await memory_state.set("key", "value")
         # Even after a brief wait
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await memory_state.get("key") == "value"
 
     @pytest.mark.asyncio
     async def test_set_if_not_exists_respects_expired_key(self, memory_state: MemoryStateAdapter):
         await memory_state.set("key", "old", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         result = await memory_state.set_if_not_exists("key", "new")
         assert result is True
         assert await memory_state.get("key") == "new"
@@ -191,7 +192,7 @@ class TestMemoryStateLocks:
     async def test_acquire_lock_succeeds_after_expiry(self, memory_state: MemoryStateAdapter):
         lock1 = await memory_state.acquire_lock("thread-1", 1)  # 1ms TTL
         assert lock1 is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
 
         lock2 = await memory_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
@@ -234,7 +235,7 @@ class TestMemoryStateLocks:
         assert result is True
 
         # Lock should still be held after original TTL would have expired
-        time.sleep(0.15)
+        await asyncio.sleep(0.15)
         lock2 = await memory_state.acquire_lock("thread-1", 30_000)
         assert lock2 is None  # Still held due to extension
 
@@ -251,7 +252,7 @@ class TestMemoryStateLocks:
     async def test_extend_lock_fails_after_expiry(self, memory_state: MemoryStateAdapter):
         lock = await memory_state.acquire_lock("thread-1", 1)
         assert lock is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
 
         result = await memory_state.extend_lock(lock, 60_000)
         assert result is False
@@ -317,7 +318,7 @@ class TestMemoryStateLists:
     @pytest.mark.asyncio
     async def test_list_with_ttl_expires(self, memory_state: MemoryStateAdapter):
         await memory_state.append_to_list("key", "a", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         result = await memory_state.get_list("key")
         assert result == []
 
