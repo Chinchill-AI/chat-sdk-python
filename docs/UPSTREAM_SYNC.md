@@ -72,6 +72,38 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 - **Preserve parity** and document the inconsistency in the non-parity section below
 - **Intentionally diverge** and document the divergence in the non-parity section
 
+### Test fidelity (strict mode)
+
+`scripts/verify_test_fidelity.py` runs in CI (`.github/workflows/lint.yml`) pinned
+to `vercel/chat@4.26.0` (matches the `UPSTREAM_PARITY` constant in
+`src/chat_sdk/__init__.py`). **CI runs `--strict`** — the repo ships at 0
+missing *for mapped core files* as of `0.4.26.2` and the baseline
+(`scripts/fidelity_baseline.json`) is empty. Scope is defined by the
+`MAPPING` dict in the script: 8 of 17 `packages/chat/src/*.test.ts` files
+today (extending to the remaining 9 is tracked as a follow-up). Unmapped
+files are not checked — tightening scope requires editing `MAPPING` and
+re-running `--strict`.
+
+Infra guardrails:
+
+- The workflow's `Clone upstream vercel/chat at pinned parity tag` step does
+  **not** use `continue-on-error` — a failed clone aborts the job loudly.
+- The script itself fails with exit 1 if any mapped TS file is missing under
+  `TS_ROOT` (defense in depth against silent skips).
+
+Workflows:
+
+| Goal | Command |
+|------|---------|
+| Port a missing test | Write the Python test and land it; CI rejects anything that re-introduces a gap |
+| Add a Python-only divergence (intentional skip) | Document in [Known Non-Parity](#known-non-parity-with-typescript-sdk), then `--update-baseline` and switch the workflow back to non-strict default for that file if truly unavoidable |
+| Upstream sync | After pulling new upstream, run `--strict` — newly-added TS tests appear as missing and CI fails until ported |
+| Final parity check | Same as CI: `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict` |
+
+Baseline mode (the default without `--strict`) is retained for local
+development where a few ports land in flight. Regenerate the baseline via
+`--update-baseline` rather than hand-editing.
+
 ## Divergence Policy
 
 Every divergence from upstream has a cost: merge conflicts on future syncs,

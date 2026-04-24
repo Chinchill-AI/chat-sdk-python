@@ -105,5 +105,22 @@ async mock bugs, and cross-file duplicates. PRs that introduce hard failures
 will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
-`it("...")` has a matching Python `def test_*()`. Must show 0 missing before
-committing test changes.
+`it("...")` in the mapped core files has a matching Python `def test_*()`,
+pinned to `chat@4.26.0`. The `MAPPING` dict in that script is the
+authoritative scope list — it currently covers 8 of 17
+`packages/chat/src/*.test.ts` files (extending it is tracked as a
+follow-up). **CI runs `--strict`** (see `.github/workflows/lint.yml`):
+any missing translation in a mapped file fails the build, and a missing
+upstream checkout also fails (the script exits non-zero when any mapped
+TS file isn't found). Baseline mode (the default without `--strict`) is
+retained for local workflows where a few ports land in flight —
+regenerate via `--update-baseline` after documenting intentional
+divergence in `docs/UPSTREAM_SYNC.md`.
+
+Before the fidelity check can run locally, clone the pinned upstream
+checkout (same command CI uses in `lint.yml`):
+```bash
+git clone --depth 1 --branch chat@4.26.0 \
+  https://github.com/vercel/chat.git /tmp/vercel-chat
+```
+Then `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict`.

@@ -8,6 +8,7 @@ from chat_sdk.cards import (
     is_card_element,
     table_element_to_ascii,
 )
+from chat_sdk.shared.card_utils import escape_table_cell, render_gfm_table
 
 
 class TestIsCardElement:
@@ -159,3 +160,51 @@ class TestCardChildToFallbackText:
     def test_button_element_returns_none(self):
         child = {"type": "button", "label": "Click me"}
         assert card_child_to_fallback_text(child) is None
+
+
+class TestEscapeTableCell:
+    """Tests for shared.card_utils.escape_table_cell."""
+
+    def test_plain_text_passthrough(self):
+        assert escape_table_cell("hello world") == "hello world"
+
+    def test_pipe_escaped(self):
+        assert escape_table_cell("a|b") == r"a\|b"
+
+    def test_backslash_doubled_before_pipe_escape(self):
+        # Backslash must be doubled FIRST so that a literal `\|` in input
+        # doesn't collide with the subsequent pipe-escape.
+        assert escape_table_cell(r"a\b") == r"a\\b"
+        assert escape_table_cell(r"a\|b") == r"a\\\|b"
+
+    def test_newline_collapsed_to_space(self):
+        assert escape_table_cell("line1\nline2") == "line1 line2"
+
+    def test_multiple_substitutions(self):
+        assert escape_table_cell("a|b\nc\\d") == r"a\|b c\\d"
+
+    def test_empty_string(self):
+        assert escape_table_cell("") == ""
+
+
+class TestRenderGfmTable:
+    """Tests for shared.card_utils.render_gfm_table."""
+
+    def test_basic_table(self):
+        lines = render_gfm_table(["h1", "h2"], [["a", "b"], ["c", "d"]])
+        assert lines == [
+            "| h1 | h2 |",
+            "| --- | --- |",
+            "| a | b |",
+            "| c | d |",
+        ]
+
+    def test_cells_are_escaped(self):
+        lines = render_gfm_table(["col"], [["pipe|inside"], ["has\nnewline"]])
+        assert r"pipe\|inside" in lines[2]
+        assert "has newline" in lines[3]
+
+    def test_empty_rows(self):
+        # No data rows — only header + separator.
+        lines = render_gfm_table(["only"], [])
+        assert lines == ["| only |", "| --- |"]
