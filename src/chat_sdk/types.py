@@ -1519,6 +1519,10 @@ class Thread(Postable, Protocol):
         """Refresh ``recent_messages`` from the API."""
         ...
 
+    async def get_participants(self) -> list[Author]:
+        """Return unique non-bot, non-self authors who've posted in the thread."""
+        ...
+
     def create_sent_message_from_message(self, message: Message) -> SentMessage:
         """Wrap a Message as a SentMessage with edit/delete capabilities."""
         ...
