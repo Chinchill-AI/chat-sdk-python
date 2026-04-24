@@ -360,12 +360,21 @@ class IoRedisStateAdapter(RedisStateAdapter):
     """:class:`RedisStateAdapter` variant that emits ``ioredis_``-prefixed lock tokens.
 
     Use this when sharing a Redis with a TypeScript Vercel Chat deployment whose
-    ``ioredis``-backed state adapter writes tokens of the form
-    ``ioredis_{ms}_{hex16}``. Behavior is otherwise identical to
-    :class:`RedisStateAdapter` — same Lua scripts, same key layout, same
-    ``SET NX PX`` acquisition, same ``PEXPIRE`` extend. Tokens compare by full
-    string equality, so the prefix is an observability and migration aid for
-    cross-runtime Redis sharing, not a security boundary.
+    ``ioredis``-backed state adapter writes ``ioredis_``-prefixed lock tokens.
+    Behavior is otherwise identical to :class:`RedisStateAdapter` — same Lua
+    scripts, same key layout, same ``SET NX PX`` acquisition, same ``PEXPIRE``
+    extend. Tokens compare by full string equality, so the prefix is an
+    observability and migration aid for cross-runtime Redis sharing, not a
+    security boundary.
+
+    Note: the token suffix shape diverges intentionally. Python emits
+    ``ioredis_{ms}_{secrets.token_hex(16)}`` (32 hex chars, CSPRNG), whereas
+    upstream emits ``ioredis_${Date.now()}_${Math.random().toString(36).substring(2, 15)}``
+    (base36, ≤13 chars, **not** CSPRNG). Interop for lock-release is
+    unaffected — each runtime issues and releases its own tokens and the
+    comparison is by full string equality — but the bytes in Redis and in
+    log lines differ. We do not regress to ``Math.random()`` for cosmetic
+    byte-for-byte parity; see ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
 
     Enables migrations like "drain TS, then flip Python on" with tokens
     identifiable by runtime-of-origin at a glance — e.g. reading a lock's

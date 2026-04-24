@@ -612,19 +612,34 @@ class TestRedisStateTokenPrefix:
             await adapter.disconnect()
 
     @pytest.mark.asyncio
-    async def test_ioredis_token_shape(self, mock_redis: MockRedis):
-        """ioredis_ token shape matches TS: 'ioredis_{ms}_{hex16}' (32 hex chars)."""
+    async def test_ioredis_token_shape_python_diverges_from_upstream(self, mock_redis: MockRedis):
+        """ioredis_ token shape is an intentional Python-first divergence.
+
+        Upstream (`state-ioredis`/`state-redis`) emits
+        ``ioredis_${Date.now()}_${Math.random().toString(36).substring(2, 15)}``
+        -- base36, variable length (up to 13 chars, fewer if Math.random()'s
+        decimal has trailing zeros), and **not** from a CSPRNG.
+
+        We intentionally diverge to ``ioredis_{ms}_{secrets.token_hex(16)}``
+        -- always 32 hex characters, CSPRNG-sourced. Lock-release still works
+        cross-runtime because each runtime issues its own token on acquire
+        and release/extend compare the token by full string equality; the
+        divergence is cosmetic (log-line shape + bytes observed in Redis).
+
+        Do not regress this to ``Math.random()`` for byte-for-byte parity --
+        CSPRNG quality is not worth trading for cosmetic compatibility.
+        """
         adapter = IoRedisStateAdapter(client=mock_redis, key_prefix="test")
         await adapter.connect()
         try:
             lock = await adapter.acquire_lock("thread-1", 30_000)
             assert lock is not None
             parts = lock.token.split("_")
-            # ["ioredis", "<ms>", "<hex16>"]
+            # ["ioredis", "<ms>", "<hex32>"] -- Python shape, NOT upstream's base36.
             assert len(parts) == 3
             assert parts[0] == "ioredis"
             assert parts[1].isdigit()
-            # secrets.token_hex(16) -> 32 hex characters
+            # secrets.token_hex(16) -> 32 hex characters (upstream emits <=13 base36 chars).
             assert len(parts[2]) == 32
             int(parts[2], 16)  # raises if not hex
         finally:
