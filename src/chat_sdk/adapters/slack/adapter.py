@@ -1030,8 +1030,11 @@ class SlackAdapter:
         user_id = user_ref.get("id", "")
         username = user_ref.get("username")
         name = user_ref.get("name")
-        user_name = username if username is not None else (name if name is not None else user_id)
-        full_name = name if name is not None else (username if username is not None else user_id)
+        # Upstream uses `||` truthy-fallthrough intentionally: an empty-string
+        # username falls through to name, then user_id. See upstream
+        # packages/adapter-slack/src/index.ts lines ~1258-1260.
+        user_name = username or name or user_id
+        full_name = name or username or user_id
 
         action_id = payload.get("action_id", "")
         val = payload.get("value")
