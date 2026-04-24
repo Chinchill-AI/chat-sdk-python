@@ -510,6 +510,100 @@ class TestParseMessage:
         assert adapter.parse_message(make_event("audio/mpeg")).attachments[0].type == "audio"
         assert adapter.parse_message(make_event("application/pdf")).attachments[0].type == "file"
 
+    def test_attachment_captures_team_id_in_fetch_metadata(self):
+        """The team_id from the event is stored on fetch_metadata for later rehydration."""
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "user": "U123",
+            "channel": "C456",
+            "text": "",
+            "ts": "1234567890.123456",
+            "team": "T_TEAM_42",
+            "files": [
+                {
+                    "id": "F123",
+                    "mimetype": "image/png",
+                    "url_private": "https://files.slack.com/img.png",
+                }
+            ],
+        }
+        msg = adapter.parse_message(event)
+        assert msg.attachments[0].fetch_metadata == {
+            "url": "https://files.slack.com/img.png",
+            "teamId": "T_TEAM_42",
+        }
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment (port of TS describe("rehydrateAttachment"))
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    """Port of TS ``describe("rehydrateAttachment")`` in adapter-slack/src/index.test.ts."""
+
+    # TS: "should resolve token from installation when teamId is present"
+    @pytest.mark.asyncio
+    async def test_should_resolve_token_from_installation_when_teamid_is_present(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(
+            signing_secret="test-secret",
+            bot_token=None,
+            client_id="client-id",
+            client_secret="client-secret",
+        )
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        await adapter.set_installation(
+            "T_MULTI_1",
+            SlackInstallation(
+                bot_token="xoxb-multi-workspace-token",
+                bot_user_id="U_BOT_MULTI",
+            ),
+        )
+
+        rehydrated = adapter.rehydrate_attachment(
+            Attachment(
+                type="image",
+                url="https://files.slack.com/img.png",
+                fetch_metadata={
+                    "url": "https://files.slack.com/img.png",
+                    "teamId": "T_MULTI_1",
+                },
+            )
+        )
+
+        assert rehydrated.fetch_data is not None
+
+    # TS: "should fall back to getToken when no teamId in fetchMetadata"
+    def test_should_fall_back_to_gettoken_when_no_teamid_in_fetchmetadata(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(bot_token="xoxb-single")
+        rehydrated = adapter.rehydrate_attachment(
+            Attachment(
+                type="image",
+                url="https://files.slack.com/img.png",
+                fetch_metadata={"url": "https://files.slack.com/img.png"},
+            )
+        )
+        assert rehydrated.fetch_data is not None
+
+    # TS: "should return attachment unchanged when no url"
+    def test_should_return_attachment_unchanged_when_no_url(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(bot_token="xoxb-test")
+        attachment = Attachment(type="file", name="test.bin")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+
+        assert rehydrated.fetch_data is None
+        # Upstream asserts `toBe(attachment)` — identical object.
+        assert rehydrated is attachment
+
 
 # ---------------------------------------------------------------------------
 # Edge cases

@@ -327,6 +327,62 @@ class TestParseMessage:
         assert msg.metadata.edited is False
         assert msg.metadata.date_sent == datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
+    def test_attachment_stores_url_in_fetch_metadata(self):
+        """Teams fetch_metadata captures the URL so rehydrate_attachment can rebuild fetch_data."""
+        adapter = _make_adapter(app_id="test-app")
+        activity = {
+            "type": "message",
+            "id": "msg-108",
+            "text": "test",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "attachments": [
+                {"contentType": "image/jpeg", "contentUrl": "https://x.com/photo.jpg", "name": "photo.jpg"},
+            ],
+        }
+        msg = adapter.parse_message(activity)
+        assert msg.attachments[0].fetch_metadata == {"url": "https://x.com/photo.jpg"}
+        assert msg.attachments[0].fetch_data is not None
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    def test_rehydrates_fetch_data_from_fetch_metadata_url(self):
+        """After JSON roundtrip (fetch_data stripped), the URL in fetch_metadata restores the closure."""
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(app_id="test-app")
+        attachment = Attachment(
+            type="image",
+            url="https://x.com/photo.jpg",
+            fetch_metadata={"url": "https://x.com/photo.jpg"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+
+    def test_rehydrate_falls_back_to_attachment_url_when_fetch_metadata_missing(self):
+        """When fetch_metadata is absent, rehydrate falls back to the attachment's top-level url."""
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(app_id="test-app")
+        attachment = Attachment(type="file", url="https://x.com/doc.pdf")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+
+    def test_rehydrate_returns_unchanged_when_no_url(self):
+        """Without any URL, rehydrate returns the attachment unchanged."""
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(app_id="test-app")
+        attachment = Attachment(type="file", name="local.bin")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated is attachment
+
 
 # ---------------------------------------------------------------------------
 # normalizeMentions (via parseMessage)

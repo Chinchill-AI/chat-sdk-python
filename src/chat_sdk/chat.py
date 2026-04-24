@@ -36,6 +36,7 @@ from chat_sdk.types import (
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
+    Attachment,
     Author,
     Channel,
     ChannelVisibility,
@@ -1890,7 +1891,7 @@ class Chat:
             if entry is None:
                 break
 
-            msg = self._rehydrate_message(entry.message)
+            msg = self._rehydrate_message(entry.message, adapter)
             now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
             if now > entry.expires_at:
                 self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
@@ -1920,7 +1921,7 @@ class Chat:
                 entry = await self._state_adapter.dequeue(lock_key)
                 if entry is None:
                     break
-                msg = self._rehydrate_message(entry.message)
+                msg = self._rehydrate_message(entry.message, adapter)
                 now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
                 if now <= entry.expires_at:
                     pending.append((msg, entry.expires_at))
@@ -2124,52 +2125,75 @@ class Chat:
     # Message rehydration
     # ========================================================================
 
-    def _rehydrate_message(self, raw: Any) -> Message:
-        """Reconstruct a proper Message from a dequeued entry (may be plain dict)."""
+    def _rehydrate_message(self, raw: Any, adapter: Adapter | None = None) -> Message:
+        """Reconstruct a proper Message from a dequeued entry (may be plain dict).
+
+        After a JSON roundtrip through the state adapter (queue/debounce
+        strategies), the message is a plain dict and any ``fetch_data``
+        callables on attachments have been stripped.  If ``adapter``
+        exposes a ``rehydrate_attachment`` hook we call it on every
+        attachment that lost its ``fetch_data`` closure so downstream
+        handlers can still download bytes.
+        """
+        # Matches upstream: if the entry is already a Message instance, its
+        # fetch_data closures never went through a JSON roundtrip, so we
+        # return it untouched — no rehydrate pass.
         if isinstance(raw, Message):
             return raw
 
         if isinstance(raw, dict):
             if raw.get("_type") == "chat:Message":
-                return _message_from_json(raw)
-            # Fallback: plain dict
-            metadata_raw = raw.get("metadata", {})
-            date_sent = metadata_raw.get("date_sent")
-            if isinstance(date_sent, str):
-                date_sent = _parse_iso(date_sent)
-            elif not isinstance(date_sent, datetime):
-                date_sent = datetime.now(tz=timezone.utc)
+                msg = _message_from_json(raw)
+            else:
+                # Fallback: plain dict
+                metadata_raw = raw.get("metadata", {})
+                date_sent = metadata_raw.get("date_sent")
+                if isinstance(date_sent, str):
+                    date_sent = _parse_iso(date_sent)
+                elif not isinstance(date_sent, datetime):
+                    date_sent = datetime.now(tz=timezone.utc)
 
-            edited_at = metadata_raw.get("edited_at")
-            if isinstance(edited_at, str):
-                edited_at = _parse_iso(edited_at)
+                edited_at = metadata_raw.get("edited_at")
+                if isinstance(edited_at, str):
+                    edited_at = _parse_iso(edited_at)
 
-            author_raw = raw.get("author", {})
-            return Message(
-                id=raw.get("id", ""),
-                thread_id=raw.get("thread_id", ""),
-                text=raw.get("text", ""),
-                formatted=raw.get("formatted", {"type": "root", "children": []}),
-                raw=raw.get("raw"),
-                author=Author(
-                    user_id=author_raw.get("user_id", ""),
-                    user_name=author_raw.get("user_name", ""),
-                    full_name=author_raw.get("full_name", ""),
-                    is_bot=author_raw.get("is_bot", False),
-                    is_me=author_raw.get("is_me", False),
-                ),
-                metadata=MessageMetadata(
-                    date_sent=date_sent,
-                    edited=metadata_raw.get("edited", False),
-                    edited_at=edited_at,
-                ),
-                attachments=raw.get("attachments", []),
-                is_mention=raw.get("is_mention"),
-                links=raw.get("links", []),
-            )
+                author_raw = raw.get("author", {})
+                msg = Message(
+                    id=raw.get("id", ""),
+                    thread_id=raw.get("thread_id", ""),
+                    text=raw.get("text", ""),
+                    formatted=raw.get("formatted", {"type": "root", "children": []}),
+                    raw=raw.get("raw"),
+                    author=Author(
+                        user_id=author_raw.get("user_id", ""),
+                        user_name=author_raw.get("user_name", ""),
+                        full_name=author_raw.get("full_name", ""),
+                        is_bot=author_raw.get("is_bot", False),
+                        is_me=author_raw.get("is_me", False),
+                    ),
+                    metadata=MessageMetadata(
+                        date_sent=date_sent,
+                        edited=metadata_raw.get("edited", False),
+                        edited_at=edited_at,
+                    ),
+                    attachments=_coerce_attachments(raw.get("attachments", [])),
+                    is_mention=raw.get("is_mention"),
+                    links=raw.get("links", []),
+                )
+        else:
+            # Last resort: assume it's already a Message-like object
+            return raw  # type: ignore[return-value]
 
-        # Last resort: assume it's already a Message-like object
-        return raw  # type: ignore[return-value]
+        # Apply the adapter's rehydrate_attachment hook (if provided) to any
+        # attachment that lost its fetch_data closure during serialization.
+        # Matches TS: `adapter?.rehydrateAttachment?.(att)` — duck-typed so
+        # adapters that do not declare the hook (e.g. bare MockAdapter) are
+        # treated as no-ops and the attachment is left untouched.
+        rehydrate = getattr(adapter, "rehydrate_attachment", None) if adapter else None
+        if callable(rehydrate) and msg.attachments:
+            msg.attachments = [att if att.fetch_data is not None else rehydrate(att) for att in msg.attachments]
+
+        return msg
 
     # ========================================================================
     # Handler execution
@@ -2212,6 +2236,36 @@ class Chat:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_attachments(raw: Any) -> list[Attachment]:
+    """Convert a list of attachment dicts (post JSON roundtrip) to ``Attachment`` instances.
+
+    ``Message.from_json()`` already handles this when the outer dict uses the
+    ``_type: "chat:Message"`` envelope, but the plain-dict fallback in
+    ``_rehydrate_message`` may receive raw dicts (e.g. in-memory state that
+    bypassed ``to_json``).  Idempotent: ``Attachment`` instances pass through.
+    """
+    if not raw:
+        return []
+    out: list[Attachment] = []
+    for att in raw:
+        if isinstance(att, Attachment):
+            out.append(att)
+        elif isinstance(att, dict):
+            out.append(
+                Attachment(
+                    type=att.get("type", "file"),
+                    url=att.get("url"),
+                    name=att.get("name"),
+                    mime_type=att.get("mimeType") or att.get("mime_type"),
+                    size=att.get("size"),
+                    width=att.get("width"),
+                    height=att.get("height"),
+                    fetch_metadata=att.get("fetchMetadata") or att.get("fetch_metadata"),
+                )
+            )
+    return out
+
+
 def _message_from_json(data: dict[str, Any]) -> Message:
     author_raw = data.get("author", {})
     metadata_raw = data.get("metadata", {})
@@ -2244,7 +2298,7 @@ def _message_from_json(data: dict[str, Any]) -> Message:
             edited=metadata_raw.get("edited", False),
             edited_at=edited_at,
         ),
-        attachments=data.get("attachments", []),
+        attachments=_coerce_attachments(data.get("attachments", [])),
         is_mention=data.get("isMention") if "isMention" in data else data.get("is_mention"),
         links=data.get("links", []),
     )

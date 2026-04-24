@@ -687,3 +687,32 @@ class TestUnsupportedMethods:
         adapter = _make_adapter()
         with pytest.raises(Exception, match="(?i)not support"):
             await adapter.delete_message("whatsapp:123456789:15551234567", "wamid.xxx")
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    """Cover ``WhatsAppAdapter.rehydrate_attachment``."""
+
+    def test_rehydrates_fetch_data_from_media_id(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(
+            type="image",
+            fetch_metadata={"mediaId": "media-42"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        assert rehydrated.fetch_metadata == {"mediaId": "media-42"}
+
+    def test_returns_unchanged_when_no_media_id(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(type="file", name="local.bin")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated is attachment

@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn
 
@@ -582,11 +583,52 @@ class TeamsAdapter:
         elif content_type.startswith("audio/"):
             att_type = "audio"
 
+        url = att.get("contentUrl")
         return Attachment(
             type=att_type,
-            url=att.get("contentUrl"),
+            url=url,
             name=att.get("name"),
             mime_type=content_type or None,
+            fetch_metadata={"url": url} if url else None,
+            fetch_data=self._build_teams_fetch_data(url) if url else None,
+        )
+
+    def _build_teams_fetch_data(self, url: str) -> Callable[[], Awaitable[bytes]]:
+        """Build a lazy ``fetch_data`` closure for a Teams file URL."""
+
+        async def fetch_data() -> bytes:
+            import httpx
+
+            async with httpx.AsyncClient() as http:
+                resp = await http.get(url)
+                resp.raise_for_status()
+                return resp.content
+
+        return fetch_data
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized Teams attachment.
+
+        Teams uses public file URLs (signed by the Graph API), so all we
+        need to rebuild the download closure is the URL — either from
+        ``fetch_metadata["url"]`` or the attachment's top-level ``url``.
+        Returns the attachment unchanged when no URL is available.
+        """
+        meta = attachment.fetch_metadata or {}
+        url = meta.get("url") or attachment.url
+        if not url:
+            return attachment
+        return Attachment(
+            type=attachment.type,
+            url=attachment.url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=self._build_teams_fetch_data(url),
+            fetch_metadata=attachment.fetch_metadata,
         )
 
     def _is_message_from_self(self, activity: dict[str, Any]) -> bool:

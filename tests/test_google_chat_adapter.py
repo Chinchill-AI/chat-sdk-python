@@ -202,3 +202,46 @@ class TestCreateGoogleChatAdapter:
     def test_custom_user_name(self):
         adapter = _make_adapter(user_name="mybot")
         assert adapter.user_name == "mybot"
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    """Cover ``GoogleChatAdapter.rehydrate_attachment``."""
+
+    def test_rehydrates_from_resource_name(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(
+            type="image",
+            fetch_metadata={"resourceName": "spaces/ABC/messages/X/attachments/Y"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        assert rehydrated.fetch_metadata == {
+            "resourceName": "spaces/ABC/messages/X/attachments/Y",
+        }
+
+    def test_rehydrates_from_url_when_no_resource_name(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(
+            type="file",
+            url="https://chat.googleapis.com/v1/media/X?alt=media",
+            fetch_metadata={"url": "https://chat.googleapis.com/v1/media/X?alt=media"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+
+    def test_returns_unchanged_when_no_metadata(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(type="file", name="local.bin")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated is attachment
