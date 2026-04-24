@@ -144,15 +144,19 @@ class TestSlackBlockSuggestion:
     # TS: "returns empty options when block_suggestion handler exceeds 2.5s budget"
     @pytest.mark.asyncio
     async def test_returns_empty_options_when_block_suggestion_handler_exceeds_budget(self):
+        from chat_sdk.types import WebhookOptions
+
         chat = _make_mock_chat()
 
         slow_done = asyncio.Event()
 
         async def _slow_handler(event: Any, options: Any = None):
-            # Handler that runs well past the 2.5s budget. The adapter
-            # should time out and return [] before this completes.
+            # Handler that runs past the (patched 50ms) budget. The
+            # adapter should time out and return [] before this completes.
+            # Sleep is kept short so the orphaned task can be awaited in
+            # the finally block without lingering and flaking other tests.
             try:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(0.5)
                 return [{"label": "Too late", "value": "late"}]
             finally:
                 slow_done.set()
@@ -161,6 +165,16 @@ class TestSlackBlockSuggestion:
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
         await adapter.initialize(chat)
+
+        # Capture the shielded handler task via wait_until so we can
+        # clean it up in finally. Same pattern as
+        # test_timed_out_task_is_registered_with_wait_until.
+        registered: list[Any] = []
+
+        def _wait_until(awaitable: Any) -> None:
+            registered.append(awaitable)
+
+        options = WebhookOptions(wait_until=_wait_until)
 
         # Patch the module-level timeout so the test runs quickly (real
         # 2.5s budget is exercised in fidelity-level production code).
@@ -179,7 +193,7 @@ class TestSlackBlockSuggestion:
             }
             req = _make_interactive_request(payload)
 
-            response = await adapter.handle_webhook(req)
+            response = await adapter.handle_webhook(req, options)
 
             assert response["status"] == 200
             parsed = json.loads(response["body"])
@@ -190,6 +204,10 @@ class TestSlackBlockSuggestion:
             assert not slow_done.is_set()
         finally:
             slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = original_timeout
+            # Await the still-running slow task so it doesn't linger
+            # past this test and flake adjacent async tests.
+            if registered:
+                await asyncio.gather(*registered, return_exceptions=True)
 
     # On timeout, the orphaned handler task must be registered with
     # WebhookOptions.wait_until so serverless runtimes (e.g. Vercel) keep
