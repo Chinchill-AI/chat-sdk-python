@@ -1074,6 +1074,12 @@ class SlackAdapter:
 
             load_task.add_done_callback(_late_error)
             _pin_task(load_task)
+            # Register with wait_until so serverless/webhook runtimes
+            # (e.g. Vercel) keep the task alive past the HTTP response;
+            # otherwise the late-error logging path above can be killed
+            # before it runs.
+            if options and options.wait_until:
+                options.wait_until(load_task)
             return self._options_load_response([])
 
         return self._options_load_response(result if result is not None else [])

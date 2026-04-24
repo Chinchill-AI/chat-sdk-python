@@ -190,3 +190,60 @@ class TestSlackBlockSuggestion:
             assert not slow_done.is_set()
         finally:
             slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = original_timeout
+
+    # On timeout, the orphaned handler task must be registered with
+    # WebhookOptions.wait_until so serverless runtimes (e.g. Vercel) keep
+    # it alive until the late-error logging callback fires.
+    @pytest.mark.asyncio
+    async def test_timed_out_task_is_registered_with_wait_until(self):
+        from chat_sdk.types import WebhookOptions
+
+        chat = _make_mock_chat()
+
+        async def _slow_handler(event: Any, options: Any = None):
+            await asyncio.sleep(5.0)
+            return []
+
+        chat.process_options_load = AsyncMock(side_effect=_slow_handler)
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        registered: list[Any] = []
+
+        def _wait_until(awaitable: Any) -> None:
+            registered.append(awaitable)
+
+        options = WebhookOptions(wait_until=_wait_until)
+
+        import chat_sdk.adapters.slack.adapter as slack_adapter_mod
+
+        original_timeout = slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS
+        slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = 50
+        try:
+            payload = {
+                "type": "block_suggestion",
+                "team": {"id": "T123"},
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "action_id": "person_select",
+                "block_id": "person_block",
+                "value": "mar",
+            }
+            req = _make_interactive_request(payload)
+
+            response = await adapter.handle_webhook(req, options)
+
+            assert response["status"] == 200
+            parsed = json.loads(response["body"])
+            assert parsed == {"options": []}
+
+            # The timed-out handler task must be handed off to wait_until
+            # so serverless runtimes don't kill it prematurely.
+            assert len(registered) == 1
+            assert isinstance(registered[0], asyncio.Task)
+            assert not registered[0].done()
+        finally:
+            slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = original_timeout
+            # Cancel the still-running slow task so it doesn't leak.
+            if registered and not registered[0].done():
+                registered[0].cancel()
