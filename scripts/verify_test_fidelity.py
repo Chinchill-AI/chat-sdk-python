@@ -266,6 +266,7 @@ def main() -> int:
     all_missing: dict[str, list] = {}
     new_misses: dict[str, list[tuple[str, str]]] = {}
     fixed: dict[str, list[tuple[str, str]]] = {}
+    missing_ts_files: list[str] = []
 
     print("=" * 70)
     print("TEST FIDELITY REPORT")
@@ -280,7 +281,8 @@ def main() -> int:
     for ts_rel, py_rel in MAPPING.items():
         ts_path = os.path.join(TS_ROOT, ts_rel)
         if not os.path.exists(ts_path):
-            print(f"\n{ts_rel} — SKIPPED (file not found)")
+            print(f"\n{ts_rel} — MISSING (upstream TS file not found at {ts_path})")
+            missing_ts_files.append(ts_path)
             continue
 
         ts_tests = extract_ts_tests(ts_path)
@@ -343,6 +345,24 @@ def main() -> int:
         print(f"  Real tests: {real_total} | Absorbers: {total_absorbers}")
     else:
         print(f"TOTAL: {total_matched}/{total_ts} matched ({pct}%), {total_missing} missing")
+
+    # Infra guard: if any mapped TS file is missing, we cannot verify fidelity.
+    # Do NOT treat this as success — a failed upstream clone would otherwise
+    # silently pass CI. Fail loudly before any downstream success branches.
+    if missing_ts_files:
+        print(
+            f"\nupstream checkout missing — cannot verify fidelity. "
+            f"{len(missing_ts_files)} mapped TS file(s) not found under TS_ROOT={TS_ROOT!r}:"
+        )
+        for path in missing_ts_files:
+            print(f"  - {path}")
+        print(
+            "\nClone the upstream repo at the pinned parity tag, e.g.:\n"
+            "  git clone --depth 1 --branch chat@4.26.0 "
+            "https://github.com/vercel/chat.git /tmp/vercel-chat\n"
+            "then re-run with TS_ROOT=/tmp/vercel-chat."
+        )
+        return 1
 
     if update_baseline:
         write_baseline(BASELINE_PATH, all_missing, total_ts)
