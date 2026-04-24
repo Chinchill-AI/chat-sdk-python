@@ -56,6 +56,13 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
 - Ported the 4 `[getParticipants]` tests from `thread.test.ts` and the 4
   `[thread]` factory tests from `chat.test.ts` (existing-behavior coverage
   for `Chat.thread(id)`). Closes 8 fidelity gaps.
+- Ported 19 `[post with Plan]` tests from `thread.test.ts` — closes #55.
+
+### Fixes (parity with upstream Plan semantics)
+
+- **`Plan.update_task(input)` / `StreamingPlan.update_task(input)` now honor `input.id`** — previously only worked on the last in-progress task; with `id` set, targets that specific task and returns `None` for unknown IDs. Matches upstream `UpdateTaskInput` semantics.
+- **`Plan.add_task()` / `update_task()` now propagate `adapter.edit_object` errors** — previously swallowed and logged; upstream returns the chained promise so callers see failures.
+- **Plan edit queue is now actually sequential under concurrency** — previously racy under `asyncio.gather`; rewrote `_enqueue_edit` to build the chain synchronously before awaiting, matching upstream TS's `.then`-based chain. Fixes out-of-order edits when multiple `add_task`/`update_task` calls interleave.
 
 ### Test hygiene
 
