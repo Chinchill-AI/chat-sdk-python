@@ -956,8 +956,12 @@ class Chat:
         """Process an options-load event (external-select suggestion lookup).
 
         Runs specific-action-ID handlers before catch-all handlers and returns
-        the first non-empty result. Errors are logged and skipped so later
-        handlers still get a chance. Mirrors upstream ``processOptionsLoad``.
+        the first handler result that isn't ``None`` — including an explicit
+        ``[]``, which short-circuits subsequent handlers (handler says "I
+        handled this action, show no options"). Errors are logged and skipped
+        so later handlers still get a chance. Mirrors upstream
+        ``processOptionsLoad`` (TS ``if (options) { return options; }``, where
+        ``[]`` is truthy and therefore short-circuits).
         """
         matching_handlers = [
             pat for pat in self._options_load_handlers if pat.action_ids and event.action_id in pat.action_ids
