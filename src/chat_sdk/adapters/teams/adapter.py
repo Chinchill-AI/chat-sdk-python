@@ -162,11 +162,13 @@ class TeamsAdapter:
         self._app_password = config.app_password or os.environ.get("TEAMS_APP_PASSWORD", "")
         self._app_tenant_id = config.app_tenant_id or os.environ.get("TEAMS_APP_TENANT_ID", "")
 
-        if config.certificate:
+        if config.certificate is not None:
+            # Exact parity with upstream adapter-teams/src/config.ts:13-18.
+            # ``appPassword`` is referenced in camelCase to match upstream text.
             raise ValidationError(
                 "teams",
-                "Certificate-based authentication is not yet supported. "
-                "Use app_password (client secret) or federated (workload identity) authentication instead.",
+                "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
+                "Use appPassword (client secret) or federated (workload identity) authentication instead.",
             )
 
         if not self._app_id:

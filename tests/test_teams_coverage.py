@@ -27,7 +27,11 @@ from chat_sdk.adapters.teams.adapter import (
     TeamsAdapter,
     _validate_service_url,
 )
-from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
+from chat_sdk.adapters.teams.types import (
+    TeamsAdapterConfig,
+    TeamsAuthCertificate,
+    TeamsThreadId,
+)
 from chat_sdk.shared.errors import (
     AuthenticationError,
     NetworkError,
@@ -1490,7 +1494,10 @@ class TestCertificateConfig:
                 TeamsAdapterConfig(
                     app_id="test",
                     app_password="test",
-                    certificate={"thumbprint": "abc", "private_key": "key"},
+                    certificate=TeamsAuthCertificate(
+                        certificate_private_key="key",
+                        certificate_thumbprint="abc",
+                    ),
                 )
             )
 

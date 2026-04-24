@@ -20,6 +20,20 @@
   (default `"redis"`). Parameterizes the lock-token prefix for observability
   and interop.
 
+### Upstream parity
+
+- **Teams: `TeamsAuthCertificate` config shape** (Issue #58). Ports the
+  upstream `TeamsAuthCertificate` interface (`adapter-teams/src/types.ts:3-10`)
+  as a Python dataclass with `certificate_private_key`, `certificate_thumbprint`,
+  and `x5c` fields. `TeamsAdapterConfig(certificate=...)` is accepted and
+  re-exported from `chat_sdk.adapters.teams` so consumers can code against the
+  shape ahead of MS Teams SDK support. Passing a non-`None` value still throws
+  at adapter startup — the error message is now verbatim with
+  `adapter-teams/src/config.ts:13-18` (`"Certificate-based authentication is
+  not yet supported by the Teams SDK adapter. Use appPassword (client secret)
+  or federated (workload identity) authentication instead."`). Not a functional
+  implementation; upstream does not implement cert auth either.
+
 ### Test hygiene
 
 - Sweep remaining `time.sleep` → `await asyncio.sleep` in async tests
