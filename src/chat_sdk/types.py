@@ -249,7 +249,15 @@ class MessageMetadata:
 
 @dataclass
 class Attachment:
-    """File attachment."""
+    """File attachment.
+
+    ``fetch_metadata`` is a serializable dict of adapter-specific identifiers
+    (e.g. Slack URL + team ID, Telegram file_id, WhatsApp media_id) that
+    survives JSON roundtrips and lets
+    :meth:`Adapter.rehydrate_attachment` rebuild the ``fetch_data`` download
+    closure after the queue/debounce path drops callables during
+    serialization.
+    """
 
     type: Literal["image", "file", "video", "audio"]
     url: str | None = None
@@ -260,6 +268,7 @@ class Attachment:
     height: int | None = None
     data: bytes | None = None
     fetch_data: Callable[[], Awaitable[bytes]] | None = None
+    fetch_metadata: dict[str, str] | None = None
 
 
 @dataclass
@@ -302,7 +311,12 @@ class SerializedMessageMetadata(TypedDict, total=False):
 
 
 class SerializedAttachment(TypedDict, total=False):
-    """Serialized attachment (non-serializable fields omitted)."""
+    """Serialized attachment (non-serializable fields omitted).
+
+    ``fetch_metadata`` is preserved so ``Adapter.rehydrate_attachment`` can
+    reconstruct the download closure after a JSON roundtrip through the
+    state adapter (e.g. queue/debounce concurrency).
+    """
 
     type: Literal["image", "file", "video", "audio"]
     url: str
@@ -311,6 +325,7 @@ class SerializedAttachment(TypedDict, total=False):
     size: int
     width: int
     height: int
+    fetch_metadata: dict[str, str]
 
 
 class SerializedLinkPreview(TypedDict, total=False):
@@ -414,6 +429,11 @@ class Message:
                         "size": att.size,
                         "width": att.width,
                         "height": att.height,
+                        # ``fetchMetadata`` carries adapter-specific identifiers
+                        # (URL, team id, file id, etc.) used by
+                        # ``Adapter.rehydrate_attachment`` to rebuild the
+                        # download closure after a JSON roundtrip.
+                        "fetchMetadata": att.fetch_metadata,
                     }
                 )
                 for att in self.attachments
@@ -495,10 +515,19 @@ class Message:
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mimeType") or att.get("mime_type"),
+                    mime_type=(att.get("mimeType") if att.get("mimeType") is not None else att.get("mime_type")),
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
+                    # ``data`` is not part of the ``SerializedAttachment`` wire
+                    # shape (``to_json`` drops bytes — JSON can't carry them).
+                    # We still accept it here so callers handing a raw dict
+                    # that happens to carry pre-fetched bytes (e.g. in-memory
+                    # state backends) don't silently lose the payload.
+                    data=att.get("data"),
+                    fetch_metadata=(
+                        att.get("fetchMetadata") if att.get("fetchMetadata") is not None else att.get("fetch_metadata")
+                    ),
                 )
                 for att in attachments_data
             ],
@@ -566,10 +595,18 @@ class Message:
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mime_type") or att.get("mimeType"),
+                    mime_type=(att.get("mime_type") if att.get("mime_type") is not None else att.get("mimeType")),
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
+                    # ``data`` is not part of the ``SerializedAttachment`` wire
+                    # shape (bytes aren't JSON-safe), but accepting it here
+                    # keeps in-memory callers that pass raw dicts with
+                    # pre-fetched bytes from silently losing the payload.
+                    data=att.get("data"),
+                    fetch_metadata=(
+                        att.get("fetch_metadata") if att.get("fetch_metadata") is not None else att.get("fetchMetadata")
+                    ),
                 )
                 for att in attachments_data
             ],
@@ -1305,6 +1342,26 @@ class BaseAdapter:
     async def disconnect(self) -> None:
         """Cleanup hook called when the Chat instance is shut down."""
         raise ChatNotImplementedError(self.name, "disconnect")
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on an attachment after deserialization.
+
+        Called by :class:`~chat_sdk.chat.Chat` during message rehydration in
+        the queue/debounce concurrency paths.  The default implementation is a
+        no-op (returns the attachment unchanged) — adapters that support file
+        downloads should override it to rebuild the platform-specific
+        download closure from ``attachment.fetch_metadata``.
+
+        .. important::
+           This hook must be **synchronous**.  Async rehydration is not
+           supported — the call site assigns the return value directly into
+           ``Message.attachments``, so returning a coroutine would land a
+           coroutine in the list and downstream ``att.fetch_data`` access
+           would raise.  If platform-specific rehydration needs I/O, push
+           the async work into the returned ``fetch_data`` closure (which
+           *is* awaited when consumers call it) instead of doing it here.
+        """
+        return attachment
 
 
 # =============================================================================

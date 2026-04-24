@@ -23,7 +23,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, NoReturn, cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.slack.cards import (
     card_to_block_kit,
@@ -1791,7 +1791,10 @@ class SlackAdapter:
                 edited=bool(event.get("edited")),
                 edited_at=edited_at,
             ),
-            attachments=[self._create_attachment(f) for f in event.get("files", [])],
+            attachments=[
+                self._create_attachment(f, team_id=event.get("team") or event.get("team_id"))
+                for f in event.get("files", [])
+            ],
             links=self._extract_links(event),
         )
 
@@ -1833,12 +1836,21 @@ class SlackAdapter:
                 edited=bool(event.get("edited")),
                 edited_at=edited_at,
             ),
-            attachments=[self._create_attachment(f) for f in event.get("files", [])],
+            attachments=[
+                self._create_attachment(f, team_id=event.get("team") or event.get("team_id"))
+                for f in event.get("files", [])
+            ],
             links=self._extract_links(event),
         )
 
-    def _create_attachment(self, file: dict[str, Any]) -> Attachment:
-        """Create an Attachment from a Slack file object."""
+    def _create_attachment(self, file: dict[str, Any], team_id: str | None = None) -> Attachment:
+        """Create an Attachment from a Slack file object.
+
+        ``team_id`` identifies the workspace the file belongs to and is
+        stored in ``fetch_metadata`` so :meth:`rehydrate_attachment` can
+        rebuild the download closure (with workspace-specific token) after
+        the queue/debounce path JSON-serializes the message.
+        """
         url = file.get("url_private")
         # Capture token at creation time (during webhook processing)
         bot_token = self._get_token()
@@ -1853,18 +1865,13 @@ class SlackAdapter:
             att_type = "audio"
 
         async def fetch_data() -> bytes:
-            import httpx
+            return await self._fetch_slack_file(url, bot_token)  # type: ignore[arg-type]
 
-            async with httpx.AsyncClient() as http:
-                resp = await http.get(url, headers={"Authorization": f"Bearer {bot_token}"})  # type: ignore[arg-type]
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                if "text/html" in content_type:
-                    raise RuntimeError(
-                        "Failed to download file from Slack: received HTML login page. "
-                        'Ensure your Slack app has the "files:read" OAuth scope.'
-                    )
-                return resp.content
+        fetch_meta: dict[str, str] = {}
+        if url:
+            fetch_meta["url"] = url
+        if team_id:
+            fetch_meta["teamId"] = team_id
 
         return Attachment(
             type=att_type,  # type: ignore[arg-type]
@@ -1875,6 +1882,110 @@ class SlackAdapter:
             width=file.get("original_w"),
             height=file.get("original_h"),
             fetch_data=fetch_data if url else None,
+            fetch_metadata=fetch_meta or None,
+        )
+
+    @staticmethod
+    def _is_trusted_slack_download_url(url: str) -> bool:
+        """Gate Slack file downloads to known Slack-owned hosts.
+
+        We refuse to forward ``Authorization: Bearer {token}`` to an
+        arbitrary URL.  After ``rehydrate_attachment`` reconstructs the
+        fetch closure from serialized ``fetch_metadata``, that URL may
+        have been tampered with in the state store — a crafted value
+        could exfiltrate the workspace bot token.
+
+        This is a Python-first divergence: upstream Slack adapter does not
+        validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
+        """
+        try:
+            parsed = urlparse(url)
+        except (ValueError, TypeError):
+            return False
+        if parsed.scheme != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        # Exact-match hosts
+        if host in {"files.slack.com", "slack.com"}:
+            return True
+        # Suffix match for Slack-owned subdomains
+        return host.endswith(".slack.com") or host.endswith(".slack-edge.com")
+
+    async def _fetch_slack_file(self, url: str, token: str) -> bytes:
+        """Download a file from a Slack ``url_private`` endpoint.
+
+        Shared by :meth:`_create_attachment` (direct fetch closure) and
+        :meth:`rehydrate_attachment` (reconstructed closure after JSON
+        roundtrip).  Validates the host against the Slack allowlist
+        before forwarding the bot token (SSRF guard).
+        """
+        if not self._is_trusted_slack_download_url(url):
+            raise ValidationError(
+                "slack",
+                f"Refusing to fetch Slack file from untrusted URL: {url}",
+            )
+
+        import httpx
+
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "text/html" in content_type:
+                raise RuntimeError(
+                    "Failed to download file from Slack: received HTML login page. "
+                    'Ensure your Slack app has the "files:read" OAuth scope.'
+                )
+            return resp.content
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized Slack attachment.
+
+        Matches the upstream TS implementation: looks up the download URL
+        (and optional ``teamId`` for multi-workspace installations) from
+        ``attachment.fetch_metadata``, and rebuilds a ``fetch_data`` closure
+        that resolves the workspace-specific bot token at call time.
+
+        Returns the attachment unchanged when no URL is available.  The
+        URL is re-validated inside the closure (by ``_fetch_slack_file``)
+        rather than here so that a trusted-at-serialize-time URL still
+        fails closed if the allowlist tightens later.
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        meta_url = meta.get("url")
+        url = meta_url if meta_url is not None else attachment.url
+        team_id = meta.get("teamId")
+        if not url:
+            return attachment
+
+        adapter = self
+
+        async def fetch_data() -> bytes:
+            if team_id:
+                installation = await adapter.get_installation(team_id)
+                if installation is None:
+                    raise AuthenticationError(
+                        "slack",
+                        f"Installation not found for team {team_id}",
+                    )
+                token = installation.bot_token
+            else:
+                token = adapter._get_token()
+            return await adapter._fetch_slack_file(url, token)
+
+        return Attachment(
+            type=attachment.type,
+            url=attachment.url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=fetch_data,
+            fetch_metadata=attachment.fetch_metadata,
         )
 
     def _is_message_from_self(self, event: dict[str, Any]) -> bool:

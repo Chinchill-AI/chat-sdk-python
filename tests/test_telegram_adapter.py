@@ -368,3 +368,48 @@ class TestCreateTelegramAdapter:
         assert adapter.bot_user_id is None  # not yet initialized
         assert adapter.is_polling is False
         assert adapter.runtime_mode == "webhook"
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    """Port of the Telegram adapter's ``rehydrateAttachment`` behavior."""
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_attachment_uses_file_id_from_fetch_metadata(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        adapter.download_file = AsyncMock(return_value=b"ok")
+        attachment = Attachment(
+            type="image",
+            fetch_metadata={"fileId": "AgACAgIAAxkB"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        # Execute the rehydrated closure to verify it wires file_id correctly.
+        data = await rehydrated.fetch_data()
+        assert data == b"ok"
+        adapter.download_file.assert_awaited_once_with("AgACAgIAAxkB")
+        # fetch_metadata is preserved so the attachment stays serializable/rehydratable again.
+        assert rehydrated.fetch_metadata == {"fileId": "AgACAgIAAxkB"}
+
+    def test_rehydrate_returns_unchanged_when_no_file_id(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        attachment = Attachment(type="file", name="noop.bin")
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated is attachment
+
+    def test_create_attachment_stores_file_id_in_fetch_metadata(self):
+        """Fresh attachments always carry a fileId so they survive JSON roundtrip."""
+        adapter = _make_adapter()
+        att = adapter.create_attachment(type_="image", file_id="F_TEST_42", name="img.jpg")
+        assert att.fetch_metadata == {"fileId": "F_TEST_42"}
+        assert att.fetch_data is not None

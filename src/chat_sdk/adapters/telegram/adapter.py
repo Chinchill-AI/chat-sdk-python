@@ -1365,6 +1365,32 @@ class TelegramAdapter:
             name=name,
             mime_type=mime_type,
             fetch_data=lambda _fid=file_id: self.download_file(_fid),
+            fetch_metadata={"fileId": file_id},
+        )
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized Telegram attachment.
+
+        Pulls ``fileId`` from ``fetch_metadata`` and rebuilds the lazy
+        ``download_file`` closure.  Returns the attachment unchanged when
+        no file ID is present (e.g. a pre-serialized attachment that did
+        not originate from this adapter).
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        file_id = meta.get("fileId")
+        if not file_id:
+            return attachment
+        return Attachment(
+            type=attachment.type,
+            url=attachment.url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=lambda _fid=file_id: self.download_file(_fid),
+            fetch_metadata=attachment.fetch_metadata,
         )
 
     async def download_file(self, file_id: str) -> bytes:

@@ -147,6 +147,135 @@ class TestAttachment:
         assert att.data is None
         assert att.fetch_data is None
 
+    def test_data_bytes_preserved_through_coerce_attachments(self):
+        """``_coerce_attachments`` must not drop ``data: bytes`` from raw dicts.
+
+        In-memory state adapters can hand us attachment dicts that still
+        carry pre-fetched bytes (bypassing ``to_json`` — bytes aren't
+        JSON-safe, so the serialization path explicitly omits them).
+        Round-trip the dict through ``_coerce_attachments`` and assert the
+        bytes survive; regression guard for the silent-data-loss bug on
+        the queue/debounce rehydrate paths.
+        """
+        from chat_sdk.chat import _coerce_attachments
+
+        raw = [
+            {
+                "type": "file",
+                "url": "https://example.com/f.pdf",
+                "name": "f.pdf",
+                "mimeType": "application/pdf",
+                "data": b"PDF-bytes",
+                "fetchMetadata": {"url": "https://example.com/f.pdf"},
+            }
+        ]
+        out = _coerce_attachments(raw)
+        assert len(out) == 1
+        assert isinstance(out[0], Attachment)
+        assert out[0].data == b"PDF-bytes"
+        assert out[0].mime_type == "application/pdf"
+        assert out[0].fetch_metadata == {"url": "https://example.com/f.pdf"}
+
+    def test_data_bytes_preserved_through_from_json(self):
+        """``Message.from_json`` must preserve raw ``data`` bytes when present.
+
+        ``to_json`` drops ``data`` (JSON can't carry bytes), so it will
+        not appear on the wire — but callers that hand us a raw dict with
+        both the envelope and a ``data`` field should not silently lose
+        it.  Exercises the camelCase-first (``from_json``) path.
+        """
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+        raw = {
+            "_type": "chat:Message",
+            "id": "m1",
+            "threadId": "t1",
+            "text": "hi",
+            "formatted": {"type": "root", "children": []},
+            "author": {
+                "userId": "U1",
+                "userName": "a",
+                "fullName": "A",
+                "isBot": False,
+                "isMe": False,
+            },
+            "metadata": {"dateSent": dt.isoformat(), "edited": False},
+            "attachments": [
+                {
+                    "type": "file",
+                    "url": "https://example.com/f.pdf",
+                    "mimeType": "application/pdf",
+                    "data": b"PDF-bytes",
+                }
+            ],
+        }
+        msg = Message.from_json(raw)
+        assert len(msg.attachments) == 1
+        assert msg.attachments[0].data == b"PDF-bytes"
+        assert msg.attachments[0].mime_type == "application/pdf"
+
+    def test_data_bytes_preserved_through_from_json_compat(self):
+        """``Message.from_json_compat`` (snake_case-first) must preserve ``data``."""
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+        raw = {
+            "id": "m1",
+            "thread_id": "t1",
+            "text": "hi",
+            "formatted": {"type": "root", "children": []},
+            "author": {
+                "user_id": "U1",
+                "user_name": "a",
+                "full_name": "A",
+                "is_bot": False,
+                "is_me": False,
+            },
+            "metadata": {"date_sent": dt.isoformat(), "edited": False},
+            "attachments": [
+                {
+                    "type": "file",
+                    "url": "https://example.com/f.pdf",
+                    "mime_type": "application/pdf",
+                    "data": b"PDF-bytes",
+                }
+            ],
+        }
+        msg = Message.from_json_compat(raw)
+        assert len(msg.attachments) == 1
+        assert msg.attachments[0].data == b"PDF-bytes"
+        assert msg.attachments[0].mime_type == "application/pdf"
+
+    def test_to_json_still_drops_bytes(self):
+        """``to_json`` must not emit ``data`` (bytes aren't JSON-safe).
+
+        Regression guard: propagating ``data`` through the in-memory
+        rehydrate paths must not accidentally start serializing bytes
+        onto the wire.
+        """
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+        msg = Message(
+            id="m1",
+            thread_id="t1",
+            text="hi",
+            formatted={"type": "root", "children": []},
+            author=Author(
+                user_id="U1",
+                user_name="a",
+                full_name="A",
+                is_bot=False,
+                is_me=False,
+            ),
+            metadata=MessageMetadata(date_sent=dt),
+            attachments=[
+                Attachment(
+                    type="file",
+                    url="https://example.com/f.pdf",
+                    mime_type="application/pdf",
+                    data=b"PDF-bytes",
+                )
+            ],
+        )
+        serialized = msg.to_json()
+        assert "data" not in serialized["attachments"][0]
+
 
 class TestMessage:
     """Tests for Message dataclass."""

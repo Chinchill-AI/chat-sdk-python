@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+<<<<<<< HEAD
 Parity catch-up with upstream `4.26.0`. No upstream version change.
 
 ### New public APIs
@@ -40,6 +41,17 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   `PostableObject` wrapping an async iterable with platform-specific
   streaming options (`group_tasks`, `end_with`, `update_interval_ms`).
   Mirrors upstream `streaming-plan.ts`. Issue #56.
+- **`Adapter.rehydrate_attachment` hook + `Attachment.fetch_metadata`**:
+  port of upstream's `rehydrateAttachment` hook. `Chat._rehydrate_message`
+  invokes the hook on every attachment that lost its `fetch_data` closure
+  during a JSON roundtrip (queue / debounce / persistent state). The new
+  serializable `fetch_metadata: dict[str, str] | None` field persists
+  adapter-specific identifiers (Slack `url` + `teamId`, Teams `url`,
+  Google Chat `resourceName` + `url`, Telegram `fileId`, WhatsApp
+  `mediaId`). Implementations land on Slack, Teams, Google Chat, Telegram,
+  and WhatsApp. Each rehydrate closure validates the target URL against a
+  per-adapter allowlist before forwarding the auth token (SSRF defense).
+  Closes #52.
 
 ### Upstream parity
 

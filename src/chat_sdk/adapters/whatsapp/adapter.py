@@ -633,6 +633,31 @@ class WhatsAppAdapter:
             mime_type=mime_type,
             name=name,
             fetch_data=lambda mid=media_id: self.download_media(mid),
+            fetch_metadata={"mediaId": media_id},
+        )
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized WhatsApp attachment.
+
+        Pulls ``mediaId`` from ``fetch_metadata`` and rebuilds the lazy
+        ``download_media`` closure.  Returns the attachment unchanged when
+        no media ID is present.
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        media_id = meta.get("mediaId")
+        if not media_id:
+            return attachment
+        return Attachment(
+            type=attachment.type,
+            url=attachment.url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=lambda mid=media_id: self.download_media(mid),
+            fetch_metadata=attachment.fetch_metadata,
         )
 
     async def download_media(self, media_id: str) -> bytes:

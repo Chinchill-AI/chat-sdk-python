@@ -19,6 +19,7 @@ import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, NoReturn
+from urllib.parse import urlparse
 
 from chat_sdk.adapters.google_chat.cards import card_to_google_card
 from chat_sdk.adapters.google_chat.format_converter import GoogleChatFormatConverter
@@ -2612,46 +2613,15 @@ class GoogleChatAdapter:
         elif content_type.startswith("audio/"):
             att_type = "audio"
 
-        # Build fetchData closure
+        fetch_meta: dict[str, str] = {}
+        if resource_name:
+            fetch_meta["resourceName"] = resource_name
+        if url:
+            fetch_meta["url"] = url
+
         fetch_data: Callable[[], Awaitable[bytes]] | None = None
         if resource_name or url:
-            adapter = self
-
-            async def _fetch_data() -> bytes:
-                # Prefer media.download API
-                if resource_name:
-                    token = await adapter._get_access_token()
-                    download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
-                    session = await adapter._get_http_session()
-                    async with session.get(
-                        download_url,
-                        headers={"Authorization": f"Bearer {token}"},
-                    ) as response:
-                        if response.status >= 400:
-                            raise NetworkError(
-                                "gchat",
-                                f"Failed to download media: {response.status}",
-                            )
-                        return await response.read()
-
-                # Fallback to direct URL fetch (downloadUri)
-                if url:
-                    token = await adapter._get_access_token()
-                    session = await adapter._get_http_session()
-                    async with session.get(
-                        url,
-                        headers={"Authorization": f"Bearer {token}"},
-                    ) as response:
-                        if response.status >= 400:
-                            raise NetworkError(
-                                "gchat",
-                                f"Failed to fetch file: {response.status}",
-                            )
-                        return await response.read()
-
-                raise AuthenticationError("gchat", "Cannot fetch file: no URL or resource name")
-
-            fetch_data = _fetch_data
+            fetch_data = self._build_gchat_fetch_data(resource_name, url)
 
         return Attachment(
             type=att_type,  # type: ignore[arg-type]
@@ -2659,6 +2629,115 @@ class GoogleChatAdapter:
             name=att.get("contentName"),
             mime_type=att.get("contentType"),
             fetch_data=fetch_data,
+            fetch_metadata=fetch_meta or None,
+        )
+
+    @staticmethod
+    def _is_trusted_gchat_download_url(url: str) -> bool:
+        """Gate Google Chat attachment downloads to Google-owned hosts.
+
+        After ``rehydrate_attachment`` reconstructs the fetch closure
+        from serialized ``fetch_metadata``, the URL may have been
+        tampered with in the state store.  We refuse to forward the
+        OAuth access token unless the host is a known Google-owned host.
+
+        This is a Python-first divergence: upstream Google Chat adapter
+        does not validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known
+        Non-Parity.
+        """
+        try:
+            parsed = urlparse(url)
+        except (ValueError, TypeError):
+            return False
+        if parsed.scheme != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        allowed_suffixes = (
+            ".googleapis.com",
+            ".googleusercontent.com",
+            ".google.com",
+        )
+        if host.endswith(allowed_suffixes):
+            return True
+        return host in {"chat.googleapis.com", "googleapis.com"}
+
+    def _build_gchat_fetch_data(
+        self,
+        resource_name: str | None,
+        url: str | None,
+    ) -> Callable[[], Awaitable[bytes]]:
+        """Build a lazy ``fetch_data`` closure for a Google Chat attachment."""
+        adapter = self
+
+        async def _fetch_data() -> bytes:
+            # Prefer media.download API
+            if resource_name:
+                token = await adapter._get_access_token()
+                download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
+                session = await adapter._get_http_session()
+                async with session.get(
+                    download_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    if response.status >= 400:
+                        raise NetworkError(
+                            "gchat",
+                            f"Failed to download media: {response.status}",
+                        )
+                    return await response.read()
+
+            # Fallback to direct URL fetch (downloadUri).  Validate the
+            # host before forwarding the OAuth token — the URL may have
+            # been rebuilt from serialized metadata and tampered with.
+            if url:
+                if not adapter._is_trusted_gchat_download_url(url):
+                    raise ValidationError(
+                        "gchat",
+                        f"Refusing to fetch Google Chat file from untrusted URL: {url}",
+                    )
+                token = await adapter._get_access_token()
+                session = await adapter._get_http_session()
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    if response.status >= 400:
+                        raise NetworkError(
+                            "gchat",
+                            f"Failed to fetch file: {response.status}",
+                        )
+                    return await response.read()
+
+            raise AuthenticationError("gchat", "Cannot fetch file: no URL or resource name")
+
+        return _fetch_data
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized Google Chat attachment.
+
+        Pulls ``resourceName`` (preferred, used with media.download API) and
+        ``url`` (fallback) from ``fetch_metadata``.  Returns the attachment
+        unchanged when neither identifier is present.
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        resource_name = meta.get("resourceName")
+        meta_url = meta.get("url")
+        url = meta_url if meta_url is not None else attachment.url
+        if resource_name is None and url is None:
+            return attachment
+        return Attachment(
+            type=attachment.type,
+            url=url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=self._build_gchat_fetch_data(resource_name, url),
+            fetch_metadata=attachment.fetch_metadata,
         )
 
     # =========================================================================
