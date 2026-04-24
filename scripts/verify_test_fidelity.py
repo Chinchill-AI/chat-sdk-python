@@ -270,14 +270,19 @@ def load_baseline(path: Path) -> dict[str, set[tuple[str, str]]]:
 
 
 _DEFAULT_BASELINE_COMMENT = (
-    "Ratchet-down baseline for scripts/verify_test_fidelity.py. "
-    "Each entry is a [describe_block, ts_it_name] pair that is known "
-    "to be missing a Python translation. CI runs --strict (see "
-    ".github/workflows/lint.yml) and ignores this file; baseline "
-    "mode is a local-dev opt-in that accepts any subset of this "
-    "list as missing and fails on new misses outside it. To remove "
-    "entries: port the TS test to its Python counterpart, then "
-    "regenerate this file with --update-baseline."
+    "Ratchet-down baseline for scripts/verify_test_fidelity.py. This "
+    "repo ships at strict fidelity for mapped core files (0 missing) "
+    "against the current UPSTREAM_PARITY tag, so the baseline is "
+    "normally empty. Scope: the MAPPING dict in "
+    "scripts/verify_test_fidelity.py is the authoritative list of TS "
+    "files checked; it currently covers 8 of the 17 "
+    "packages/chat/src/*.test.ts files. Default CI mode runs --strict "
+    "via .github/workflows/lint.yml; this file is retained for local "
+    "workflows that want to opt back into baseline mode (e.g. during "
+    "an upstream sync where several ports land in flight). To "
+    "baseline genuinely-divergent tests, run "
+    "scripts/verify_test_fidelity.py --update-baseline after "
+    "documenting the divergence in docs/UPSTREAM_SYNC.md."
 )
 
 
@@ -299,9 +304,14 @@ def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> N
         except (OSError, json.JSONDecodeError):
             existing_comment = None
 
+    # Derive ts_parity from UPSTREAM_PARITY so a fresh regen after an
+    # upstream version bump doesn't self-trap on a stale literal. Fall
+    # back to the last-known literal only if UPSTREAM_PARITY can't be
+    # read (e.g. __init__.py missing during an in-flight refactor).
+    current_parity = _current_parity_tag()
     payload = {
         "_comment": existing_comment if existing_comment is not None else _DEFAULT_BASELINE_COMMENT,
-        "ts_parity": "chat@4.26.0",
+        "ts_parity": current_parity if current_parity is not None else "chat@4.26.0",
         "total_ts_tests": total_ts,
         "total_missing": sum(len(v) for v in all_missing.values()),
         "missing": {
