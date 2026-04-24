@@ -28,7 +28,11 @@ from chat_sdk.adapters.teams.adapter import (
     TeamsAdapter,
     _handle_teams_error,
 )
-from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
+from chat_sdk.adapters.teams.types import (
+    TeamsAdapterConfig,
+    TeamsAuthCertificate,
+    TeamsThreadId,
+)
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
     AdapterRateLimitError,
@@ -542,9 +546,44 @@ class TestCertificateAuth:
                 TeamsAdapterConfig(
                     app_id="app",
                     app_password="pass",
-                    certificate={"certificate_private_key": "key", "certificate_thumbprint": "thumb"},
+                    certificate=TeamsAuthCertificate(
+                        certificate_private_key="key",
+                        certificate_thumbprint="thumb",
+                    ),
                 )
             )
+
+    def test_raises_with_exact_upstream_message(self):
+        """Startup throw message matches upstream adapter-teams/src/config.ts:13-18 verbatim.
+
+        Upstream references ``appPassword`` (camelCase TS field name); we preserve
+        that in the error text so consumers tailing upstream logs see identical
+        output. Protects against well-meaning rewording to ``app_password``.
+        """
+        expected = (
+            "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
+            "Use appPassword (client secret) or federated (workload identity) authentication instead."
+        )
+        with pytest.raises(ValidationError) as exc_info:
+            TeamsAdapter(
+                TeamsAdapterConfig(
+                    certificate=TeamsAuthCertificate(certificate_private_key="key"),
+                )
+            )
+        assert expected in str(exc_info.value)
+
+    def test_minimal_certificate_only_requires_private_key(self):
+        """``certificate_thumbprint`` and ``x5c`` are optional per upstream types.ts:7-9.
+
+        A ``TeamsAuthCertificate`` constructed with only ``certificate_private_key``
+        must still trigger the startup throw (i.e. the adapter checks presence, not
+        shape).
+        """
+        cert = TeamsAuthCertificate(certificate_private_key="pem-key")
+        assert cert.certificate_thumbprint is None
+        assert cert.x5c is None
+        with pytest.raises(ValidationError, match="Certificate-based"):
+            TeamsAdapter(TeamsAdapterConfig(certificate=cert))
 
 
 # ---------------------------------------------------------------------------

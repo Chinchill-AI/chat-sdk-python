@@ -16,15 +16,24 @@ from chat_sdk.logger import Logger
 # =============================================================================
 
 
-class TeamsAuthCertificate(TypedDict, total=False):
-    """Certificate-based authentication config (not yet supported)."""
+@dataclass
+class TeamsAuthCertificate:
+    """Certificate-based authentication config.
+
+    .. deprecated::
+        Certificate auth is not yet supported by the Teams SDK. Setting
+        ``certificate`` on :class:`TeamsAdapterConfig` raises at adapter
+        startup. Ported for shape parity with upstream
+        ``adapter-teams/src/types.ts`` so consumers can code against the
+        config shape ahead of MS Teams SDK support.
+    """
 
     # PEM-encoded certificate private key
     certificate_private_key: str
     # Hex-encoded certificate thumbprint (optional when x5c is provided)
-    certificate_thumbprint: str
+    certificate_thumbprint: str | None = None
     # Public certificate for subject-name validation (optional)
-    x5c: str
+    x5c: str | None = None
 
 
 class TeamsAuthFederated(TypedDict, total=False):
@@ -53,7 +62,9 @@ class TeamsAdapterConfig:
     app_tenant_id: str | None = None
     # Microsoft App Type.
     app_type: str | None = None  # "MultiTenant" | "SingleTenant"
-    # Certificate auth (not yet supported by the Teams SDK).
+    # Deprecated: certificate auth is not yet supported by the Teams SDK.
+    # Passing a non-None value raises at adapter startup — kept for shape
+    # parity with upstream adapter-teams/src/types.ts.
     certificate: TeamsAuthCertificate | None = None
     # Federated (workload identity) authentication.
     federated: TeamsAuthFederated | None = None
