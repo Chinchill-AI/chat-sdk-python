@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### New public APIs
+
+- **`IoRedisStateAdapter`**: `RedisStateAdapter` subclass defaulting to the
+  `ioredis_` lock-token prefix used by upstream Vercel Chat's `ioredis`-backed
+  state. Enables cross-runtime Redis sharing between TS and Python chat-sdk
+  deployments during migrations. Closes #71.
+- **`RedisStateAdapter(token_prefix=...)`**: new `token_prefix` kwarg
+  (default `"redis"`). Parameterizes the lock-token prefix for observability
+  and interop.
+
 ### Test hygiene
 
 - Sweep remaining `time.sleep` → `await asyncio.sleep` in async tests

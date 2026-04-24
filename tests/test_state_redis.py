@@ -13,7 +13,7 @@ import time
 import pytest
 
 from chat_sdk.errors import StateNotConnectedError
-from chat_sdk.state.redis import RedisStateAdapter
+from chat_sdk.state.redis import IoRedisStateAdapter, RedisStateAdapter
 from chat_sdk.types import Lock, QueueEntry
 
 # ============================================================================
@@ -540,6 +540,154 @@ class TestRedisStateLocks:
         assert lock1 is not None
         assert lock2 is not None
         assert lock1.token != lock2.token
+
+
+# ============================================================================
+# Lock token prefix: parameterization + IoRedisStateAdapter interop
+# ============================================================================
+
+
+class TestRedisStateTokenPrefix:
+    """Lock token prefix parameterization for TS/Python Redis interop (#71)."""
+
+    @pytest.mark.asyncio
+    async def test_default_prefix_is_redis(self, mock_redis: MockRedis):
+        """Default RedisStateAdapter keeps the historical 'redis_' prefix (back-compat)."""
+        adapter = RedisStateAdapter(client=mock_redis, key_prefix="test")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("redis_")
+            assert not lock.token.startswith("ioredis_")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_custom_prefix_applied(self, mock_redis: MockRedis):
+        """token_prefix='custom' emits tokens with exactly that prefix + underscore."""
+        adapter = RedisStateAdapter(client=mock_redis, key_prefix="test", token_prefix="custom")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("custom_")
+            # And it must not accidentally match the default.
+            assert not lock.token.startswith("redis_")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_ioredis_subclass_default_prefix(self, mock_redis: MockRedis):
+        """IoRedisStateAdapter() defaults to the 'ioredis_' prefix for TS interop."""
+        adapter = IoRedisStateAdapter(client=mock_redis, key_prefix="test")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("ioredis_")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_ioredis_subclass_is_redis_adapter(self, mock_redis: MockRedis):
+        """IoRedisStateAdapter is a RedisStateAdapter so `isinstance` checks pass."""
+        adapter = IoRedisStateAdapter(client=mock_redis, key_prefix="test")
+        assert isinstance(adapter, RedisStateAdapter)
+
+    @pytest.mark.asyncio
+    async def test_ioredis_subclass_prefix_override(self, mock_redis: MockRedis):
+        """Explicit token_prefix on IoRedisStateAdapter wins over the 'ioredis' default."""
+        adapter = IoRedisStateAdapter(client=mock_redis, key_prefix="test", token_prefix="override")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("override_")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_ioredis_token_shape(self, mock_redis: MockRedis):
+        """ioredis_ token shape matches TS: 'ioredis_{ms}_{hex16}' (32 hex chars)."""
+        adapter = IoRedisStateAdapter(client=mock_redis, key_prefix="test")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            parts = lock.token.split("_")
+            # ["ioredis", "<ms>", "<hex16>"]
+            assert len(parts) == 3
+            assert parts[0] == "ioredis"
+            assert parts[1].isdigit()
+            # secrets.token_hex(16) -> 32 hex characters
+            assert len(parts[2]) == 32
+            int(parts[2], 16)  # raises if not hex
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_release_lock_works_with_custom_prefix(self, mock_redis: MockRedis):
+        """Release lock compares full string — custom prefix must still release."""
+        adapter = RedisStateAdapter(client=mock_redis, key_prefix="test", token_prefix="ioredis")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("ioredis_")
+
+            # Release with the correct (ioredis-prefixed) token succeeds.
+            await adapter.release_lock(lock)
+
+            # Proof the key was actually deleted — reacquire succeeds.
+            lock2 = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock2 is not None
+            assert lock2.token.startswith("ioredis_")
+            assert lock2.token != lock.token
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_release_lock_wrong_prefix_is_noop(self, mock_redis: MockRedis):
+        """A token with a wrong prefix but otherwise-similar shape must not release."""
+        adapter = RedisStateAdapter(client=mock_redis, key_prefix="test", token_prefix="ioredis")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+
+            # Fabricate a "redis_"-prefixed token with same suffix.
+            suffix = lock.token[len("ioredis_") :]
+            forged = Lock(
+                thread_id="thread-1",
+                token=f"redis_{suffix}",
+                expires_at=lock.expires_at,
+            )
+            await adapter.release_lock(forged)
+
+            # Original lock still held.
+            collide = await adapter.acquire_lock("thread-1", 30_000)
+            assert collide is None
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_extend_lock_works_with_custom_prefix(self, mock_redis: MockRedis):
+        """Extend lock must succeed when the token matches by full string (custom prefix)."""
+        adapter = RedisStateAdapter(client=mock_redis, key_prefix="test", token_prefix="ioredis")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 100)
+            assert lock is not None
+            ok = await adapter.extend_lock(lock, 60_000)
+            assert ok is True
+
+            # Wait past the original 100ms TTL; extend bumped it to 60s.
+            time.sleep(0.15)
+            contender = await adapter.acquire_lock("thread-1", 30_000)
+            assert contender is None
+        finally:
+            await adapter.disconnect()
 
 
 # ============================================================================

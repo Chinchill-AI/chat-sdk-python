@@ -26,8 +26,8 @@ _logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _generate_token() -> str:
-    return f"redis_{int(time.time() * 1000)}_{secrets.token_hex(16)}"
+def _generate_token(prefix: str = "redis") -> str:
+    return f"{prefix}_{int(time.time() * 1000)}_{secrets.token_hex(16)}"
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +88,14 @@ class RedisStateAdapter:
     across multiple server instances.
 
     Implements the full :class:`~chat_sdk.types.StateAdapter` protocol.
+
+    Lock tokens are generated with the shape ``{token_prefix}_{ms}_{hex16}``.
+    The prefix defaults to ``"redis"``, matching this port's historical
+    behavior. Set ``token_prefix="ioredis"`` (or use :class:`IoRedisStateAdapter`)
+    when sharing a Redis with a TypeScript Vercel Chat deployment whose
+    ``ioredis``-backed state emits ``ioredis_`` tokens. Release and extend
+    semantics compare the full token string, so the prefix is an observability
+    and migration aid, not a security boundary.
     """
 
     def __init__(
@@ -96,8 +104,10 @@ class RedisStateAdapter:
         url: str | None = None,
         client: Any | None = None,
         key_prefix: str = "chat-sdk",
+        token_prefix: str = "redis",
     ) -> None:
         self._key_prefix = key_prefix
+        self._token_prefix = token_prefix
         self._connected = False
         self._connect_lock = asyncio.Lock()
 
@@ -162,7 +172,7 @@ class RedisStateAdapter:
     async def acquire_lock(self, thread_id: str, ttl_ms: int) -> Lock | None:
         self._ensure_connected()
 
-        token = _generate_token()
+        token = _generate_token(self._token_prefix)
         lock_key = self._key("lock", thread_id)
 
         # SET NX PX for atomic lock acquisition
@@ -339,6 +349,31 @@ class RedisStateAdapter:
     def _ensure_connected(self) -> None:
         if not self._connected:
             raise StateNotConnectedError("RedisStateAdapter")
+
+
+# ---------------------------------------------------------------------------
+# ioredis-compatible subclass
+# ---------------------------------------------------------------------------
+
+
+class IoRedisStateAdapter(RedisStateAdapter):
+    """:class:`RedisStateAdapter` variant that emits ``ioredis_``-prefixed lock tokens.
+
+    Use this when sharing a Redis with a TypeScript Vercel Chat deployment whose
+    ``ioredis``-backed state adapter writes tokens of the form
+    ``ioredis_{ms}_{hex16}``. Behavior is otherwise identical to
+    :class:`RedisStateAdapter` — same Lua scripts, same key layout, same
+    ``SET NX PX`` acquisition, same ``PEXPIRE`` extend. Tokens compare by full
+    string equality, so the prefix is an observability and migration aid for
+    cross-runtime Redis sharing, not a security boundary.
+
+    Enables migrations like "drain TS, then flip Python on" with tokens
+    identifiable by runtime-of-origin at a glance when inspecting
+    ``KEYS chat:lock:*`` in Redis.
+    """
+
+    def __init__(self, *, token_prefix: str = "ioredis", **kwargs: Any) -> None:
+        super().__init__(token_prefix=token_prefix, **kwargs)
 
 
 # ---------------------------------------------------------------------------
