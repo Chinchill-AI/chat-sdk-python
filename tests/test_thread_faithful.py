@@ -997,6 +997,67 @@ class TestStreaming:
         assert options.stop_blocks == [{"type": "actions"}]
         assert options.update_interval_ms == 2000
 
+    # Python-only regression lock: the truthiness fix in thread.py (post
+    # dispatcher + `_fallback_stream` interval guard) replaced `if x:` with
+    # `if x is not None:`. The propagation test above uses truthy values
+    # (`end_with=[{...}]`, `update_interval_ms=2000`), which would pass even
+    # under the old truthy check. Pin the specifically falsy-but-explicit
+    # values that motivated the fix so a regression to `if x:` resets them
+    # to `StreamOptions` defaults (None) and fails loudly here.
+    @pytest.mark.asyncio
+    async def test_streamingplan_falsy_options_still_propagate_to_fallback(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        # Ensure no native stream — forces the fallback path.
+        assert not hasattr(adapter, "stream") or getattr(adapter, "stream", None) is None
+
+        thread = _make_thread(adapter, state)
+
+        captured_options: list[Any] = []
+        original_fallback = thread._fallback_stream
+
+        async def _spy_fallback(text_stream: Any, options: Any = None) -> Any:
+            captured_options.append(options)
+            return await original_fallback(text_stream, options)
+
+        thread._fallback_stream = _spy_fallback  # type: ignore[method-assign]
+
+        text_stream = _create_text_stream(["Hello", " ", "World"])
+        await thread.post(
+            StreamingPlan(
+                text_stream,
+                StreamingPlanOptions(
+                    # Falsy-but-explicit: edit on every chunk. Under a truthy
+                    # check (`if update_interval_ms:`), 0 is dropped and the
+                    # default (500) wins — silently changing streaming
+                    # cadence. `is not None` preserves the caller's choice.
+                    update_interval_ms=0,
+                    # Falsy-but-explicit: caller opts in to "no stop blocks".
+                    # Under `if end_with:`, [] would be dropped and
+                    # `StreamOptions.stop_blocks` would stay None, which is
+                    # indistinguishable from the default. Lock in that the
+                    # explicit empty list makes it through to StreamOptions.
+                    end_with=[],
+                    group_tasks="plan",
+                ),
+            )
+        )
+
+        assert len(captured_options) == 1
+        options = captured_options[0]
+        assert options is not None
+        # Falsy values explicitly set by the caller must survive the mapping.
+        assert options.update_interval_ms == 0, (
+            "update_interval_ms=0 was dropped — likely a regression to "
+            "truthiness-based option mapping in thread.py post dispatcher."
+        )
+        assert options.stop_blocks == [], (
+            "end_with=[] was dropped — likely a regression to truthiness-"
+            "based option mapping in thread.py post dispatcher."
+        )
+        # Sanity: truthy option still propagates alongside the falsy ones.
+        assert options.task_display_mode == "plan"
+
     # it("should still work without options (backward compat)")
     @pytest.mark.asyncio
     async def test_should_still_work_without_options_backward_compat(self):
