@@ -21,6 +21,7 @@ from typing import Any
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
+from chat_sdk.modals import SelectOptionElement
 from chat_sdk.thread import (
     ThreadImpl,
     _active_chat,
@@ -53,6 +54,7 @@ from chat_sdk.types import (
     ModalResponse,
     ModalSubmitEvent,
     OnLockConflict,
+    OptionsLoadEvent,
     QueueEntry,
     ReactionEvent,
     SlashCommandEvent,
@@ -82,6 +84,7 @@ MessageHandler = Callable[[Any, Message, Any], Awaitable[None] | None]
 SubscribedMessageHandler = Callable[[Any, Message, Any], Awaitable[None] | None]
 ReactionHandler = Callable[[ReactionEvent], Any]
 ActionHandler = Callable[[ActionEvent], Any]
+OptionsLoadHandler = Callable[[OptionsLoadEvent], Any]
 ModalSubmitHandler = Callable[[ModalSubmitEvent], Any]
 ModalCloseHandler = Callable[[ModalCloseEvent], Any]
 SlashCommandHandler = Callable[[SlashCommandEvent], Any]
@@ -117,6 +120,14 @@ class _ActionPattern:
     __slots__ = ("action_ids", "handler")
 
     def __init__(self, action_ids: list[str], handler: ActionHandler) -> None:
+        self.action_ids = action_ids
+        self.handler = handler
+
+
+class _OptionsLoadPattern:
+    __slots__ = ("action_ids", "handler")
+
+    def __init__(self, action_ids: list[str], handler: OptionsLoadHandler) -> None:
         self.action_ids = action_ids
         self.handler = handler
 
@@ -358,6 +369,7 @@ class Chat:
         self._subscribed_message_handlers: list[SubscribedMessageHandler] = []
         self._reaction_handlers: list[_ReactionPattern] = []
         self._action_handlers: list[_ActionPattern] = []
+        self._options_load_handlers: list[_OptionsLoadPattern] = []
         self._modal_submit_handlers: list[_ModalSubmitPattern] = []
         self._modal_close_handlers: list[_ModalClosePattern] = []
         self._slash_command_handlers: list[_SlashCommandPattern] = []
@@ -654,6 +666,47 @@ class Chat:
 
         return decorator
 
+    # -- Options load ---
+
+    def on_options_load(
+        self,
+        action_ids_or_handler: str | list[str] | OptionsLoadHandler | None = None,
+        handler: OptionsLoadHandler | None = None,
+    ) -> OptionsLoadHandler | Callable[[OptionsLoadHandler], OptionsLoadHandler]:
+        """Register a handler for loading dynamic options for external selects.
+
+        Specific action IDs run before catch-all handlers.
+
+        Overloaded:
+        - ``chat.on_options_load(handler)`` -- all selects
+        - ``chat.on_options_load("id", handler)``
+        - ``chat.on_options_load(["id1", "id2"], handler)``
+        - Decorator: ``@chat.on_options_load("id")``
+        """
+        if callable(action_ids_or_handler) and handler is None:
+            self._options_load_handlers.append(_OptionsLoadPattern([], action_ids_or_handler))
+            self._logger.debug("Registered options load handler for all action IDs")
+            return action_ids_or_handler
+
+        if isinstance(action_ids_or_handler, (str, list)) and handler is not None:
+            ids = [action_ids_or_handler] if isinstance(action_ids_or_handler, str) else action_ids_or_handler
+            self._options_load_handlers.append(_OptionsLoadPattern(ids, handler))
+            self._logger.debug("Registered options load handler", {"action_ids": ids})
+            return handler
+
+        # Decorator form
+        ids = (
+            [action_ids_or_handler]
+            if isinstance(action_ids_or_handler, str)
+            else (action_ids_or_handler if isinstance(action_ids_or_handler, list) else [])
+        )
+
+        def decorator(h: OptionsLoadHandler) -> OptionsLoadHandler:
+            self._options_load_handlers.append(_OptionsLoadPattern(ids, h))
+            return h
+
+        return decorator
+
     # -- Modal submit ---
 
     def on_modal_submit(
@@ -891,6 +944,33 @@ class Chat:
             )
             if options and options.wait_until:
                 options.wait_until(task)
+
+    async def process_options_load(
+        self,
+        event: OptionsLoadEvent,
+        options: WebhookOptions | None = None,  # noqa: ARG002 (match upstream signature)
+    ) -> list[SelectOptionElement] | None:
+        """Process an options-load event (external-select suggestion lookup).
+
+        Runs specific-action-ID handlers before catch-all handlers and returns
+        the first non-empty result. Errors are logged and skipped so later
+        handlers still get a chance. Mirrors upstream ``processOptionsLoad``.
+        """
+        matching_handlers = [
+            pat for pat in self._options_load_handlers if pat.action_ids and event.action_id in pat.action_ids
+        ] + [pat for pat in self._options_load_handlers if not pat.action_ids]
+
+        for pat in matching_handlers:
+            try:
+                result = await self._invoke_handler(pat.handler, event)
+                if result:
+                    return result
+            except Exception as exc:
+                self._logger.error(
+                    "Options load handler error",
+                    {"action_id": event.action_id, "error": str(exc)},
+                )
+        return None
 
     async def process_modal_submit(
         self,

@@ -52,7 +52,7 @@ from chat_sdk.adapters.slack.types import (
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.modals import ModalElement
+from chat_sdk.modals import ModalElement, SelectOptionElement
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.types import (
@@ -82,6 +82,7 @@ from chat_sdk.types import (
     ModalCloseEvent,
     ModalResponse,
     ModalSubmitEvent,
+    OptionsLoadEvent,
     RawMessage,
     ReactionEvent,
     ScheduledMessage,
@@ -92,6 +93,10 @@ from chat_sdk.types import (
     ThreadSummary,
     WebhookOptions,
 )
+
+# Slack expects block_suggestion responses within 3s. Leave headroom for
+# network latency so the HTTP response lands before Slack gives up.
+OPTIONS_LOAD_TIMEOUT_MS = 2500
 
 # Strong-reference set for fire-and-forget tasks to prevent GC collection.
 _background_tasks: set[asyncio.Task[Any]] = set()
@@ -881,6 +886,8 @@ class SlackAdapter:
         if payload_type == "block_actions":
             self._handle_block_actions(payload, options)
             return {"body": "", "status": 200}
+        elif payload_type == "block_suggestion":
+            return await self._handle_block_suggestion(payload, options)
         elif payload_type == "view_submission":
             return await self._handle_view_submission(payload, options)
         elif payload_type == "view_closed":
@@ -1000,6 +1007,91 @@ class SlackAdapter:
                 },
             )
             self._chat.process_action(action_event, options)
+
+    # ==================================================================
+    # Block suggestion (external-select options load)
+    # ==================================================================
+
+    async def _handle_block_suggestion(
+        self, payload: dict[str, Any], options: WebhookOptions | None = None
+    ) -> dict[str, Any]:
+        """Handle a Slack block_suggestion interactive payload.
+
+        Slack requires a response within 3s for block_suggestion and does not
+        support an async ack pattern — options must be in the response body.
+        Race the handler against a 2.5s budget and fall back to an empty 200
+        so the menu shows "No results" instead of hanging for the user.
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring block suggestion")
+            return self._options_load_response([])
+
+        user_ref = payload.get("user") or {}
+        user_id = user_ref.get("id", "")
+        user_name = user_ref.get("username") or user_ref.get("name") or user_id
+        full_name = user_ref.get("name") or user_ref.get("username") or user_id
+
+        action_id = payload.get("action_id", "")
+        event = OptionsLoadEvent(
+            action_id=action_id,
+            query=payload.get("value") or "",
+            user=Author(
+                user_id=user_id,
+                user_name=user_name,
+                full_name=full_name,
+                is_bot=False,
+                is_me=False,
+            ),
+            adapter=self,
+            raw=payload,
+        )
+
+        # Use asyncio.shield so the orphaned task still runs (and logs errors)
+        # if we time out. `wait_for` cancels the awaitable on timeout; shielding
+        # prevents that cancellation from propagating into the handler task.
+        load_task = asyncio.ensure_future(self._chat.process_options_load(event, options))
+
+        try:
+            result = await asyncio.wait_for(asyncio.shield(load_task), timeout=OPTIONS_LOAD_TIMEOUT_MS / 1000.0)
+        except asyncio.TimeoutError:
+            self._logger.warn(
+                "Options load handler timed out",
+                {"action_id": action_id, "timeout_ms": OPTIONS_LOAD_TIMEOUT_MS},
+            )
+
+            def _late_error(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self._logger.error(
+                        "Options load handler error after timeout",
+                        {"action_id": action_id, "error": str(exc)},
+                    )
+
+            load_task.add_done_callback(_late_error)
+            _pin_task(load_task)
+            return self._options_load_response([])
+
+        return self._options_load_response(result or [])
+
+    def _options_load_response(self, options_list: list[SelectOptionElement]) -> dict[str, Any]:
+        """Serialize ``SelectOptionElement`` entries to a Slack JSON response."""
+        slack_options: list[dict[str, Any]] = []
+        for opt in options_list[:100]:
+            entry: dict[str, Any] = {
+                "text": {"type": "plain_text", "text": opt.get("label", "")},
+                "value": opt.get("value", ""),
+            }
+            desc = opt.get("description")
+            if desc:
+                entry["description"] = {"type": "plain_text", "text": desc}
+            slack_options.append(entry)
+        return {
+            "body": json.dumps({"options": slack_options}),
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+        }
 
     # ==================================================================
     # View submission / close
