@@ -472,7 +472,7 @@ class Plan:
                 # so in practice ``await prev`` only raises if someone
                 # swapped the chain out with a rejecting future — the
                 # suppression keeps the parity guarantee defensive.)
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(Exception):
                     await prev
             await _do_edit()
 
