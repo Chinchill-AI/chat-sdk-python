@@ -178,6 +178,20 @@ async def post_postable_object(
         Optional logger for error reporting.
     """
 
+    # StreamingPlan (kind == "stream") is a nominal PostableObject that only
+    # Thread.post() knows how to consume (via its native-or-fallback streaming
+    # path). Reject it here so callers get a clear error instead of blank
+    # posts or a wrong-shape adapter.post_object("stream", ...) call. Diverges
+    # from upstream postable-object.ts, which posts ``getFallbackText() == ""``
+    # as an empty message.
+    if getattr(obj, "kind", None) == "stream":
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via post_postable_object / "
+            "Channel.post -- its stream is consumed only by Thread.post(), "
+            "which special-cases kind=='stream' for native or fallback "
+            "streaming. Use thread.post(streaming_plan) instead."
+        )
+
     def _make_context(raw: Any) -> PostableObjectContext:
         return PostableObjectContext(
             adapter=adapter,
@@ -583,20 +597,52 @@ class StreamingPlan:
         return self._options
 
     # -- PostableObject protocol ------------------------------------------------
+    #
+    # StreamingPlan is a "nominal" PostableObject: it satisfies the duck-typing
+    # protocol (so ``is_postable_object()`` detects it and ``Thread.post``'s
+    # ``kind == "stream"`` branch fires), but it cannot actually round-trip
+    # through the generic ``post_postable_object`` helper -- there is no static
+    # fallback text to post and no meaningful ``adapter.post_object("stream",
+    # ...)`` shape.
+    #
+    # Upstream TS has the same latent gap: ``ChannelImpl.post`` routes any
+    # PostableObject through ``postPostableObject``, which would post an empty
+    # string for StreamingPlan. We diverge by failing loudly rather than
+    # silently posting blanks, per CLAUDE.md adversarial-review discipline.
 
     def get_fallback_text(self) -> str:
-        """StreamingPlan has no static fallback text -- streaming is handled
-        by Thread.post() directly via the native-or-fallback streaming path."""
-        return ""
+        """StreamingPlan has no static fallback text.
+
+        Raises ``RuntimeError`` to fail loudly if a generic posting path
+        (e.g. ``Channel.post`` or ``post_postable_object``) tries to
+        consume a StreamingPlan as a normal PostableObject. StreamingPlan
+        must be posted via :meth:`Thread.post`, which special-cases
+        ``kind == "stream"`` and consumes the wrapped async iterable.
+        """
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via the generic PostableObject "
+            "path (no static fallback text). Post it with Thread.post(), "
+            "which routes kind=='stream' to native or fallback streaming."
+        )
 
     def get_post_data(self) -> _StreamingPlanData:
         """Return the underlying stream + options for Thread.post to route."""
         return _StreamingPlanData(stream=self._stream, options=self._options)
 
     def is_supported(self, _adapter: Adapter) -> bool:
-        """StreamingPlan is always supported -- fallback path handles adapters
-        without native streaming."""
-        return True
+        """StreamingPlan is not generically postable -- see
+        :meth:`get_fallback_text`.
+
+        Raises ``RuntimeError`` so misroutes through
+        ``post_postable_object`` fail loudly rather than silently trying
+        ``adapter.post_object("stream", ...)`` on adapters that don't
+        understand the shape.
+        """
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via the generic PostableObject "
+            "path. Post it with Thread.post(), which routes kind=='stream' "
+            "to native or fallback streaming."
+        )
 
     def on_posted(self, _context: PostableObjectContext) -> None:
         """Streams are one-shot, no lifecycle binding needed."""

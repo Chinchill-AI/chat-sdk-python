@@ -496,11 +496,16 @@ class ThreadImpl:
                     group_tasks = getattr(plan_options, "group_tasks", None)
                     end_with = getattr(plan_options, "end_with", None)
                     update_interval_ms = getattr(plan_options, "update_interval_ms", None)
-                    if group_tasks:
+                    # Port Rule #1: use `is not None` so explicit falsy values
+                    # (``end_with=[]``, ``update_interval_ms=0``) still
+                    # propagate to the adapter/fallback instead of being
+                    # silently dropped by a truthiness check. Diverges from
+                    # upstream thread.ts, which has the same latent bug.
+                    if group_tasks is not None:
                         extra.task_display_mode = group_tasks
-                    if end_with:
+                    if end_with is not None:
                         extra.stop_blocks = end_with
-                    if update_interval_ms:
+                    if update_interval_ms is not None:
                         extra.update_interval_ms = update_interval_ms
                 await self._handle_stream(stream_iter, extra_options=extra)
                 return message
@@ -674,8 +679,13 @@ class ThreadImpl:
         Posts an initial placeholder, then edits the message at intervals as
         new text arrives from the stream.
         """
+        # ``is not None`` so explicit ``update_interval_ms=0`` (edit-on-every-
+        # chunk) from ``StreamingPlan`` is honored rather than silently reset
+        # to the thread default by a truthiness check.
         interval_ms = (
-            options.update_interval_ms if options and options.update_interval_ms else self._streaming_update_interval_ms
+            options.update_interval_ms
+            if options is not None and options.update_interval_ms is not None
+            else self._streaming_update_interval_ms
         )
         interval_s = interval_ms / 1000.0
         placeholder_text = self._fallback_streaming_placeholder_text

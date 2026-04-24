@@ -949,6 +949,20 @@ class TestStreaming:
         assert not hasattr(adapter, "stream") or getattr(adapter, "stream", None) is None
 
         thread = _make_thread(adapter, state)
+
+        # Capture StreamOptions at the fallback entry point so we can prove
+        # that StreamingPlanOptions actually reach the fallback path -- this
+        # guards issue #56 against silent truthiness drops that would leave
+        # observable streaming behavior unchanged.
+        captured_options: list[Any] = []
+        original_fallback = thread._fallback_stream
+
+        async def _spy_fallback(text_stream: Any, options: Any = None) -> Any:
+            captured_options.append(options)
+            return await original_fallback(text_stream, options)
+
+        thread._fallback_stream = _spy_fallback  # type: ignore[method-assign]
+
         text_stream = _create_text_stream(["Hello", " ", "World"])
         await thread.post(
             StreamingPlan(
@@ -970,6 +984,18 @@ class TestStreaming:
         assert last_edit[1] == "msg-1"
         assert isinstance(last_edit[2], PostableMarkdown)
         assert last_edit[2].markdown == "Hello World"
+
+        # All three StreamingPlanOptions fields must reach the fallback path.
+        # Before the truthiness->`is not None` fix, end_with=[] and
+        # update_interval_ms=0 would be dropped; asserting full propagation
+        # here catches both the mapping bug and any future regression that
+        # forgets to thread options through to _fallback_stream.
+        assert len(captured_options) == 1
+        options = captured_options[0]
+        assert options is not None
+        assert options.task_display_mode == "plan"
+        assert options.stop_blocks == [{"type": "actions"}]
+        assert options.update_interval_ms == 2000
 
     # it("should still work without options (backward compat)")
     @pytest.mark.asyncio
