@@ -22,11 +22,7 @@ from chat_sdk.shared.base_format_converter import (
     get_node_value,
     parse_markdown,
 )
-
-
-def _escape_table_cell(value: str) -> str:
-    """Escape pipe characters in table cells for GFM rendering."""
-    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+from chat_sdk.shared.card_utils import escape_table_cell
 
 
 class TeamsFormatConverter(BaseFormatConverter):
@@ -194,11 +190,11 @@ class TeamsFormatConverter(BaseFormatConverter):
 
         lines: list[str] = []
         # Header row
-        lines.append(f"| {' | '.join(_escape_table_cell(c) for c in rows[0])} |")
+        lines.append(f"| {' | '.join(escape_table_cell(c) for c in rows[0])} |")
         # Separator
         separators = ["---"] * len(rows[0])
         lines.append(f"| {' | '.join(separators)} |")
         # Data rows
         for row in rows[1:]:
-            lines.append(f"| {' | '.join(_escape_table_cell(c) for c in row)} |")
+            lines.append(f"| {' | '.join(escape_table_cell(c) for c in row)} |")
         return "\n".join(lines)
