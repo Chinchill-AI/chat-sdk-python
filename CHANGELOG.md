@@ -105,7 +105,7 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   (all previously-missing tests ported in this release) — strict fidelity
   for *mapped core files* (8 of 17 `packages/chat/src/*.test.ts` files;
   see the `MAPPING` dict in `scripts/verify_test_fidelity.py` for the
-  authoritative scope list). Closes #53, #72.
+  authoritative scope list). Closes #53.
 
 ## 0.4.26.1 (2026-04-23)
 

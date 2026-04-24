@@ -13,8 +13,11 @@ Usage:
 
 ``--strict`` is the current CI contract (see ``.github/workflows/lint.yml``):
 the baseline is ignored and any missing translation — or a missing upstream
-checkout — fails the build. This repo ships at zero missing against
-``chat@4.26.0``.
+checkout — fails the build. This repo ships at strict fidelity for mapped
+core files (0 missing) against ``chat@4.26.0``. The ``MAPPING`` dict below
+is the authoritative scope list; it currently covers 8 of the 17
+``packages/chat/src/*.test.ts`` files (extending it is tracked as a
+follow-up).
 
 Baseline mode (the default without ``--strict``) is retained for local
 workflows where a few ports land in flight: it succeeds iff the set of

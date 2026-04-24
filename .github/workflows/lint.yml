@@ -63,7 +63,7 @@ jobs:
           git clone --depth 1 --branch chat@4.26.0 \
             https://github.com/vercel/chat.git /tmp/vercel-chat
 
-      - name: Test fidelity check (strict — zero missing)
+      - name: Test fidelity check (strict — zero missing in mapped core files)
         id: fidelity
         continue-on-error: true
         env:
