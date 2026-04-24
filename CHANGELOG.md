@@ -56,6 +56,7 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
 - Ported the 4 `[getParticipants]` tests from `thread.test.ts` and the 4
   `[thread]` factory tests from `chat.test.ts` (existing-behavior coverage
   for `Chat.thread(id)`). Closes 8 fidelity gaps.
+- Ported 19 `[post with Plan]` tests from `thread.test.ts` — closes #55.
 
 ### Test hygiene
 
