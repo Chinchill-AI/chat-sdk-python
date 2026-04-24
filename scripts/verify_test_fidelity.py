@@ -6,17 +6,22 @@ snake_case, and checks that a corresponding def test_...() exists in the
 Python translation.
 
 Usage:
-    python scripts/verify_test_fidelity.py             # baseline mode (default)
-    python scripts/verify_test_fidelity.py --strict    # fail on any missing
+    python scripts/verify_test_fidelity.py --strict    # CI path: fail on any missing
+    python scripts/verify_test_fidelity.py             # baseline mode (local opt-in)
     python scripts/verify_test_fidelity.py --fix       # append stubs for missing
     python scripts/verify_test_fidelity.py --update-baseline  # rewrite baseline
 
-Default (baseline) mode: succeeds iff the set of missing tests is a subset of
-``scripts/fidelity_baseline.json``. Tests that are in the baseline but now pass
-are reported as fixed. New misses outside the baseline fail CI.
+``--strict`` is the current CI contract (see ``.github/workflows/lint.yml``):
+the baseline is ignored and any missing translation — or a missing upstream
+checkout — fails the build. This repo ships at zero missing against
+``chat@4.26.0``.
 
-``--strict`` ignores the baseline and fails on any missing. This is the
-eventual target once the baseline count ratchets to zero.
+Baseline mode (the default without ``--strict``) is retained for local
+workflows where a few ports land in flight: it succeeds iff the set of
+missing tests is a subset of ``scripts/fidelity_baseline.json``. Tests that
+are in the baseline but now pass are reported as fixed; new misses outside
+the baseline fail. Regenerate via ``--update-baseline`` after documenting
+intentional divergence in ``docs/UPSTREAM_SYNC.md``.
 """
 
 import json
@@ -215,12 +220,46 @@ def count_absorbers(py_path: str) -> int:
     return count
 
 
+def _current_parity_tag() -> str | None:
+    """Return the baseline-format parity tag (``chat@X.Y.Z``) for the current repo.
+
+    Reads ``UPSTREAM_PARITY`` from ``src/chat_sdk/__init__.py`` without
+    importing the package (avoids pulling optional runtime deps during a
+    script run). Returns None if the constant can't be located.
+    """
+    init_path = Path(__file__).parent.parent / "src" / "chat_sdk" / "__init__.py"
+    if not init_path.exists():
+        return None
+    with open(init_path) as f:
+        content = f.read()
+    m = re.search(r'^UPSTREAM_PARITY\s*=\s*"([^"]+)"', content, re.MULTILINE)
+    if not m:
+        return None
+    return f"chat@{m.group(1)}"
+
+
 def load_baseline(path: Path) -> dict[str, set[tuple[str, str]]]:
-    """Load fidelity baseline. Missing file returns empty baseline."""
+    """Load fidelity baseline. Missing file returns empty baseline.
+
+    Exits with code 1 when the baseline's ``ts_parity`` disagrees with the
+    current ``UPSTREAM_PARITY`` constant — a stale baseline could otherwise
+    silently mask upstream drift after a version bump.
+    """
     if not path.exists():
         return {}
     with open(path) as f:
         data = json.load(f)
+    baseline_parity = data.get("ts_parity")
+    current_parity = _current_parity_tag()
+    if baseline_parity and current_parity and baseline_parity != current_parity:
+        print(
+            f"\nbaseline parity mismatch: {path.name} was generated for "
+            f"upstream {baseline_parity}, but current parity is "
+            f"{current_parity} — re-run with `--update-baseline` after "
+            f"confirming the diff.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     out: dict[str, set[tuple[str, str]]] = {}
     for ts_rel, entries in data.get("missing", {}).items():
         out[ts_rel] = {(e[0], e[1]) for e in entries}
@@ -233,10 +272,12 @@ def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> N
         "_comment": (
             "Ratchet-down baseline for scripts/verify_test_fidelity.py. "
             "Each entry is a [describe_block, ts_it_name] pair that is known "
-            "to be missing a Python translation. Default CI mode accepts any "
-            "subset of this list as missing and fails on new misses outside "
-            "it. To remove entries: port the TS test to its Python counterpart, "
-            "then regenerate this file with --update-baseline."
+            "to be missing a Python translation. CI runs --strict (see "
+            ".github/workflows/lint.yml) and ignores this file; baseline "
+            "mode is a local-dev opt-in that accepts any subset of this "
+            "list as missing and fails on new misses outside it. To remove "
+            "entries: port the TS test to its Python counterpart, then "
+            "regenerate this file with --update-baseline."
         ),
         "ts_parity": "chat@4.26.0",
         "total_ts_tests": total_ts,
@@ -256,6 +297,15 @@ def main() -> int:
     fix_mode = "--fix" in sys.argv
     strict_mode = "--strict" in sys.argv
     update_baseline = "--update-baseline" in sys.argv
+
+    if strict_mode and update_baseline:
+        print(
+            "error: --strict and --update-baseline are mutually exclusive.\n"
+            "  --strict says 'no missing allowed'; --update-baseline says "
+            "'snapshot whatever is missing into the allowlist'. Pick one.",
+            file=sys.stderr,
+        )
+        return 2
 
     baseline = {} if (strict_mode or update_baseline) else load_baseline(BASELINE_PATH)
 

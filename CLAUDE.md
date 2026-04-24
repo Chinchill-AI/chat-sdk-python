@@ -112,3 +112,11 @@ translation fails the build, and a missing upstream checkout also fails
 mode (the default without `--strict`) is retained for local workflows
 where a few ports land in flight — regenerate via `--update-baseline`
 after documenting intentional divergence in `docs/UPSTREAM_SYNC.md`.
+
+Before the fidelity check can run locally, clone the pinned upstream
+checkout (same command CI uses in `lint.yml`):
+```bash
+git clone --depth 1 --branch chat@4.26.0 \
+  https://github.com/vercel/chat.git /tmp/vercel-chat
+```
+Then `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict`.
