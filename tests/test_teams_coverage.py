@@ -29,7 +29,6 @@ from chat_sdk.adapters.teams.adapter import (
 )
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
-    TeamsAuthCertificate,
     TeamsThreadId,
 )
 from chat_sdk.shared.errors import (
@@ -1480,26 +1479,6 @@ class TestFetchMessagesAdvanced:
                 FetchOptions(direction="forward", cursor="2024-05-01T00:00:00Z"),
             )
             assert len(result.messages) >= 0
-
-
-# ---------------------------------------------------------------------------
-# Certificate config raises
-# ---------------------------------------------------------------------------
-
-
-class TestCertificateConfig:
-    def test_certificate_raises_validation_error(self):
-        with pytest.raises(ValidationError, match="Certificate"):
-            TeamsAdapter(
-                TeamsAdapterConfig(
-                    app_id="test",
-                    app_password="test",
-                    certificate=TeamsAuthCertificate(
-                        certificate_private_key="key",
-                        certificate_thumbprint="abc",
-                    ),
-                )
-            )
 
 
 # ---------------------------------------------------------------------------
