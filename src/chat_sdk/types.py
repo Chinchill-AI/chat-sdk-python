@@ -1366,7 +1366,7 @@ class ChatInstance(Protocol):
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> Awaitable[ModalResponse | None]: ...
     def process_options_load(
-        self, event: Any, options: WebhookOptions | None = None
+        self, event: OptionsLoadEvent, options: WebhookOptions | None = None
     ) -> Awaitable[list[SelectOptionElement] | None]: ...
     def process_modal_close(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None

@@ -84,7 +84,10 @@ MessageHandler = Callable[[Any, Message, Any], Awaitable[None] | None]
 SubscribedMessageHandler = Callable[[Any, Message, Any], Awaitable[None] | None]
 ReactionHandler = Callable[[ReactionEvent], Any]
 ActionHandler = Callable[[ActionEvent], Any]
-OptionsLoadHandler = Callable[[OptionsLoadEvent], Any]
+OptionsLoadHandler = Callable[
+    [OptionsLoadEvent],
+    Awaitable[list[SelectOptionElement] | None] | list[SelectOptionElement] | None,
+]
 ModalSubmitHandler = Callable[[ModalSubmitEvent], Any]
 ModalCloseHandler = Callable[[ModalCloseEvent], Any]
 SlashCommandHandler = Callable[[SlashCommandEvent], Any]
@@ -963,7 +966,7 @@ class Chat:
         for pat in matching_handlers:
             try:
                 result = await self._invoke_handler(pat.handler, event)
-                if result:
+                if result is not None:
                     return result
             except Exception as exc:
                 self._logger.error(

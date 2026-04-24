@@ -1028,13 +1028,16 @@ class SlackAdapter:
 
         user_ref = payload.get("user") or {}
         user_id = user_ref.get("id", "")
-        user_name = user_ref.get("username") or user_ref.get("name") or user_id
-        full_name = user_ref.get("name") or user_ref.get("username") or user_id
+        username = user_ref.get("username")
+        name = user_ref.get("name")
+        user_name = username if username is not None else (name if name is not None else user_id)
+        full_name = name if name is not None else (username if username is not None else user_id)
 
         action_id = payload.get("action_id", "")
+        val = payload.get("value")
         event = OptionsLoadEvent(
             action_id=action_id,
-            query=payload.get("value") or "",
+            query=val if val is not None else "",
             user=Author(
                 user_id=user_id,
                 user_name=user_name,
@@ -1073,7 +1076,7 @@ class SlackAdapter:
             _pin_task(load_task)
             return self._options_load_response([])
 
-        return self._options_load_response(result or [])
+        return self._options_load_response(result if result is not None else [])
 
     def _options_load_response(self, options_list: list[SelectOptionElement]) -> dict[str, Any]:
         """Serialize ``SelectOptionElement`` entries to a Slack JSON response."""

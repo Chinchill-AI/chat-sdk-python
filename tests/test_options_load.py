@@ -15,6 +15,7 @@ import json
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -84,7 +85,7 @@ def _make_mock_chat() -> MagicMock:
 
 
 def _make_interactive_request(payload: dict[str, Any]) -> _FakeRequest:
-    body = f"payload={json.dumps(payload)}"
+    body = f"payload={quote_plus(json.dumps(payload))}"
     return _make_signed_request(body)
 
 
