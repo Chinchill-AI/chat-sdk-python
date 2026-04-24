@@ -13,7 +13,11 @@ import time
 import pytest
 
 from chat_sdk.errors import StateNotConnectedError
-from chat_sdk.state.redis import IoRedisStateAdapter, RedisStateAdapter
+from chat_sdk.state.redis import (
+    IoRedisStateAdapter,
+    RedisStateAdapter,
+    create_redis_state,
+)
 from chat_sdk.types import Lock, QueueEntry
 
 # ============================================================================
@@ -686,6 +690,31 @@ class TestRedisStateTokenPrefix:
             time.sleep(0.15)
             contender = await adapter.acquire_lock("thread-1", 30_000)
             assert contender is None
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_create_redis_state_default_token_prefix(self, mock_redis: MockRedis):
+        """create_redis_state() defaults to 'redis' token prefix (back-compat)."""
+        adapter = create_redis_state(client=mock_redis, key_prefix="test")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("redis_")
+            assert not lock.token.startswith("ioredis_")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_create_redis_state_forwards_token_prefix(self, mock_redis: MockRedis):
+        """create_redis_state(token_prefix=...) forwards through to the adapter."""
+        adapter = create_redis_state(client=mock_redis, key_prefix="test", token_prefix="ioredis")
+        await adapter.connect()
+        try:
+            lock = await adapter.acquire_lock("thread-1", 30_000)
+            assert lock is not None
+            assert lock.token.startswith("ioredis_")
         finally:
             await adapter.disconnect()
 

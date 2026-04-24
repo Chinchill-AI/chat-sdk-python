@@ -368,8 +368,9 @@ class IoRedisStateAdapter(RedisStateAdapter):
     cross-runtime Redis sharing, not a security boundary.
 
     Enables migrations like "drain TS, then flip Python on" with tokens
-    identifiable by runtime-of-origin at a glance when inspecting
-    ``KEYS chat:lock:*`` in Redis.
+    identifiable by runtime-of-origin at a glance — e.g. reading a lock's
+    value via ``GET chat-sdk:lock:<thread_id>``, or in any logs/trace IDs
+    where the token is surfaced on release/extend failures.
     """
 
     def __init__(self, *, token_prefix: str = "ioredis", **kwargs: Any) -> None:
@@ -386,10 +387,20 @@ def create_redis_state(
     url: str | None = None,
     client: Any | None = None,
     key_prefix: str = "chat-sdk",
+    token_prefix: str = "redis",
 ) -> RedisStateAdapter:
     """Create a new Redis state adapter.
 
     Either provide a ``url`` or an existing ``client``.  If neither is given,
     the ``REDIS_URL`` environment variable is used.
+
+    ``token_prefix`` defaults to ``"redis"`` to match
+    :class:`RedisStateAdapter`'s default; pass ``"ioredis"`` (or instantiate
+    :class:`IoRedisStateAdapter`) for TS interop.
     """
-    return RedisStateAdapter(url=url, client=client, key_prefix=key_prefix)
+    return RedisStateAdapter(
+        url=url,
+        client=client,
+        key_prefix=key_prefix,
+        token_prefix=token_prefix,
+    )
