@@ -543,9 +543,13 @@ class _SpyLogger:
 
 class TestEditErrorPath:
     @pytest.mark.asyncio
-    async def test_edit_failure_is_logged_and_plan_continues(self) -> None:
-        """When adapter.edit_message raises, the error is logged and
-        the next mutation still fires successfully."""
+    async def test_edit_failure_propagates_and_plan_continues(self) -> None:
+        """When ``adapter.edit_message`` raises, the caller sees the
+        exception (mirroring upstream TS ``enqueueEdit``), the failure
+        is logged by the internal chain tail, and the next mutation
+        still fires successfully without the previous rejection
+        poisoning the queue.
+        """
         adapter = _FailingEditAdapter()
         logger = _SpyLogger()
         thread = _make_thread(adapter=adapter)
@@ -556,20 +560,19 @@ class TestEditErrorPath:
         assert plan._bound is not None
         plan._bound.logger = logger
 
-        # First mutation: edit will fail
+        # First mutation: edit will fail — caller observes the error.
         adapter.fail_edit = True
-        await plan.add_task(AddTaskOptions(title="Step 2"))
+        with pytest.raises(RuntimeError, match="simulated edit failure"):
+            await plan.add_task(AddTaskOptions(title="Step 2"))
 
-        # The error should have been logged
+        # The internal chain absorbs the error and logs it so the queue
+        # is not poisoned for the next edit.
         assert any("Failed to edit plan" in w[0] for w in logger.warnings)
 
-        # Second mutation: edit succeeds -- plan is still usable
+        # Second mutation: edit succeeds -- plan is still usable.
         adapter.fail_edit = False
         logger.warnings.clear()
         task = await plan.add_task(AddTaskOptions(title="Step 3"))
         assert task is not None
         assert task.title == "Step 3"
         assert len(plan.tasks) == 3
-
-        # The previous-chain failure should also be logged
-        assert any("Previous plan edit failed" in w[0] for w in logger.warnings)

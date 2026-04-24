@@ -1651,16 +1651,64 @@ class TestPostWithPlan:
     # it("should update a specific task by ID")
     @pytest.mark.asyncio
     async def test_should_update_a_specific_task_by_id(self):
-        # GAP: Python ``UpdateTaskInput`` has no ``id`` field; the TS
-        # variant accepts ``{ id, output?, status? }`` to target a specific
-        # task. Skipping until ``plan.py`` grows id-based lookup.
-        pytest.skip("Python UpdateTaskInput has no 'id' field (gap vs TS); track via follow-up to #55")
+        from chat_sdk.plan import (
+            AddTaskOptions,
+            Plan,
+            StartPlanOptions,
+            UpdateTaskInput,
+        )
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+        edit_object = AsyncMock(return_value=None)
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+        task1 = await plan.add_task(AddTaskOptions(title="Step 1"))
+        task2 = await plan.add_task(AddTaskOptions(title="Step 2"))
+
+        assert task1 is not None
+        assert task2 is not None
+
+        updated = await plan.update_task(UpdateTaskInput(id=task1.id, output="Step 1 result", status="complete"))
+
+        assert updated is not None
+        assert updated.id == task1.id
+        assert updated.status == "complete"
+
+        step2 = next((t for t in plan.tasks if t.id == task2.id), None)
+        assert step2 is not None
+        assert step2.status == "in_progress"
 
     # it("should return null when updating by non-existent ID")
     @pytest.mark.asyncio
     async def test_should_return_null_when_updating_by_nonexistent_id(self):
-        # GAP: Same as above — no id-based lookup path in Python update_task.
-        pytest.skip("Python UpdateTaskInput has no 'id' field (gap vs TS); track via follow-up to #55")
+        from chat_sdk.plan import (
+            AddTaskOptions,
+            Plan,
+            StartPlanOptions,
+            UpdateTaskInput,
+        )
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+        edit_object = AsyncMock(return_value=None)
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+        await plan.add_task(AddTaskOptions(title="Step 1"))
+
+        updated = await plan.update_task(UpdateTaskInput(id="non-existent-id", output="nope"))
+
+        assert updated is None
 
     # it("should still update last in_progress task when no ID provided")
     @pytest.mark.asyncio
@@ -1770,13 +1818,43 @@ class TestPostWithPlan:
     # it("should ensure sequential edits via queue")
     @pytest.mark.asyncio
     async def test_should_ensure_sequential_edits_via_queue(self):
-        # GAP: Python ``_enqueue_edit`` awaits then re-binds ``update_chain``
-        # so concurrent mutations can race and edits may arrive out of order
-        # (TS builds the chain synchronously with ``.then``). Skipping until
-        # the Python queue preserves strict ordering under ``asyncio.gather``.
-        pytest.skip(
-            "Python edit queue does not preserve strict ordering under gather (gap vs TS); track via follow-up to #55"
+        import asyncio
+        import random
+
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+
+        edit_order: list[int] = []
+        edit_count = 0
+
+        async def edit_object(thread_id: str, message_id: str, kind: str, data: Any) -> None:
+            nonlocal edit_count
+            edit_count += 1
+            my_order = edit_count
+            # Simulate varying async delays so naive implementations
+            # (await-then-rebind chains) reorder under concurrency.
+            await asyncio.sleep(random.random() * 0.01)
+            edit_order.append(my_order)
+
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+
+        # Fire off multiple updates concurrently — each schedules an
+        # edit through the internal queue; FIFO ordering must hold.
+        await asyncio.gather(
+            plan.add_task(AddTaskOptions(title="Task 1")),
+            plan.update_task("Output 1"),
+            plan.add_task(AddTaskOptions(title="Task 2")),
         )
+
+        assert edit_order == [1, 2, 3]
 
     # it("should return null when calling addTask before post")
     @pytest.mark.asyncio
@@ -1810,20 +1888,58 @@ class TestPostWithPlan:
     # it("should propagate editObject errors from addTask")
     @pytest.mark.asyncio
     async def test_should_propagate_editobject_errors_from_addtask(self):
-        # GAP: Python ``_enqueue_edit`` swallows exceptions (logs warn) so
-        # ``add_task`` does not reject when ``edit_object`` raises. Upstream
-        # returns the chained promise which rejects to the caller. Skipping
-        # until Python propagates the error.
-        pytest.skip("Python _enqueue_edit swallows edit_object errors (gap vs TS); track via follow-up to #55")
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+        edit_object = AsyncMock(side_effect=RuntimeError("rate limited"))
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+
+        with pytest.raises(RuntimeError, match="rate limited"):
+            await plan.add_task(AddTaskOptions(title="Task 1"))
+
+        # Model mutation still happened (upstream asserts tasks.length === 2)
+        assert len(plan.tasks) == 2
 
     # it("should continue accepting edits after a failed edit")
     @pytest.mark.asyncio
     async def test_should_continue_accepting_edits_after_a_failed_edit(self):
-        # GAP: Depends on the error-propagation fix above; after a rejected
-        # edit the queue must still accept new edits without the previous
-        # rejection poisoning the chain. Skipping until error propagation
-        # lands.
-        pytest.skip("Python _enqueue_edit swallows edit_object errors (gap vs TS); track via follow-up to #55")
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+
+        call_count = 0
+
+        async def edit_object(thread_id: str, message_id: str, kind: str, data: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("rate limited")
+            return None
+
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+
+        with pytest.raises(RuntimeError):
+            await plan.add_task(AddTaskOptions(title="Task 1"))
+
+        # A second add_task after a rejected edit must succeed — the
+        # queue's internal chain absorbs prior failures.
+        await plan.add_task(AddTaskOptions(title="Task 2"))
+        assert len(plan.tasks) == 3
+        assert call_count == 2
 
     # it("should set error status via updateTask")
     @pytest.mark.asyncio

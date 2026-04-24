@@ -9,6 +9,7 @@ any PostableObject.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -72,8 +73,17 @@ class AddTaskOptions:
 
 @dataclass
 class UpdateTaskInput:
-    """Structured update input with optional output and status override."""
+    """Structured update input targeting a task by ``id`` (or the last
+    in-progress task when ``id`` is omitted) with optional output and
+    status override.
 
+    Mirrors upstream ``UpdateTaskInput`` shape (`plan.ts`):
+    ``{ id?: string; output?: PlanContent; status?: PlanTaskStatus }``.
+    When ``id`` is set but no matching task exists, ``update_task``
+    returns ``None`` (matching upstream).
+    """
+
+    id: str | None = None
     output: PlanContent | None = None
     status: PlanTaskStatus | None = None
 
@@ -194,7 +204,10 @@ class _BoundState:
     message_id: str
     thread_id: str
     logger: Logger | None = None
-    update_chain: asyncio.Future[None] | None = None
+    # Tail of the synchronously-built edit chain. Each ``_enqueue_edit``
+    # reads this, chains a new task after it, and assigns the new tail
+    # — all before yielding — so concurrent callers see FIFO ordering.
+    update_chain: asyncio.Task[None] | None = None
 
 
 # =============================================================================
@@ -329,24 +342,38 @@ class Plan:
         return PlanTask(id=next_task.id, title=next_task.title, status=next_task.status)
 
     async def update_task(self, update: PlanContent | UpdateTaskInput | None = None) -> PlanTask | None:
-        """Update the current in-progress task.
+        """Update a task on this plan.
 
         ``update`` can be:
-        - ``PlanContent`` (str, list, dict) -- sets the task output
-        - ``UpdateTaskInput`` -- sets output and/or status
-        - ``None`` -- just triggers a re-render
+        - ``PlanContent`` (str, list, dict) -- sets the output on the last
+          in-progress task (falling back to the last task).
+        - ``UpdateTaskInput`` -- sets output and/or status. When
+          ``update.id`` is set, targets that specific task and returns
+          ``None`` if no task matches. When ``id`` is omitted, behaves
+          like the PlanContent path (last in-progress task).
+        - ``None`` -- just triggers a re-render of the current state.
         """
         if not self._can_mutate():
             return None
         current: PlanModelTask | None = None
-        for t in reversed(self._model.tasks):
-            if t.status == "in_progress":
-                current = t
-                break
-        if current is None and self._model.tasks:
-            current = self._model.tasks[-1]
-        if current is None:
-            return None
+        if isinstance(update, UpdateTaskInput) and update.id is not None:
+            for t in self._model.tasks:
+                if t.id == update.id:
+                    current = t
+                    break
+            # Upstream returns null for a non-existent id rather than
+            # silently falling back to "last in-progress".
+            if current is None:
+                return None
+        else:
+            for t in reversed(self._model.tasks):
+                if t.status == "in_progress":
+                    current = t
+                    break
+            if current is None and self._model.tasks:
+                current = self._model.tasks[-1]
+            if current is None:
+                return None
 
         if update is not None:
             if isinstance(update, UpdateTaskInput):
@@ -396,12 +423,27 @@ class Plan:
     async def _enqueue_edit(self) -> None:
         """Edit the posted message with the current plan state.
 
-        Chains edits sequentially to avoid race conditions.
+        Chains edits sequentially to avoid race conditions. Mirrors the
+        upstream TS pattern (`plan.ts`):
+
+        ```ts
+        const chained = bound.updateChain.then(doEdit, doEdit);
+        bound.updateChain = chained.then(() => undefined, (err) => log);
+        return chained;
+        ```
+
+        Crucially, the new chain tail (``update_chain``) is registered
+        **synchronously** — before any ``await`` — so that concurrent
+        callers racing through ``asyncio.gather`` observe a strict FIFO
+        ordering. Errors from the adapter edit propagate to the caller
+        via the returned awaitable (``chained``); the internal chain
+        absorbs them so the next enqueued edit still runs.
         """
         if self._bound is None:
             return
 
         bound = self._bound
+        prev = bound.update_chain  # synchronous read — must not await first
 
         async def _do_edit() -> None:
             if bound.fallback:
@@ -421,17 +463,35 @@ class Plan:
                     self._model,
                 )
 
-        # Chain edits: wait for previous edit to finish before starting new one
-        if bound.update_chain is not None:
-            try:
-                await bound.update_chain
-            except Exception as prev_exc:
-                if bound.logger:
-                    bound.logger.warn("Previous plan edit failed", prev_exc)
+        async def _run_after_prev() -> None:
+            if prev is not None:
+                # Upstream ``.then(doEdit, doEdit)`` runs doEdit whether
+                # the previous edit resolved or rejected; mirror that by
+                # absorbing any exception from the previous step here.
+                # (Note: the internal chain tail absorbs errors anyway,
+                # so in practice ``await prev`` only raises if someone
+                # swapped the chain out with a rejecting future — the
+                # suppression keeps the parity guarantee defensive.)
+                with contextlib.suppress(BaseException):
+                    await prev
+            await _do_edit()
 
-        try:
-            bound.update_chain = asyncio.get_running_loop().create_task(_do_edit())
-            await bound.update_chain
-        except Exception as exc:
-            if bound.logger:
-                bound.logger.warn("Failed to edit plan", exc)
+        loop = asyncio.get_running_loop()
+        chained = loop.create_task(_run_after_prev())
+
+        async def _absorb_for_chain() -> None:
+            # The internal chain tail must not propagate errors — otherwise
+            # the next enqueued edit would await a rejected future and be
+            # treated as a previous-failure chain that still runs doEdit,
+            # but we'd also lose the ability to recover cleanly. Upstream
+            # uses ``chained.then(() => undefined, (err) => logger.warn)``.
+            try:
+                await chained
+            except BaseException as exc:  # noqa: BLE001 — log and swallow for queue
+                if bound.logger is not None:
+                    bound.logger.warn("Failed to edit plan", exc)
+
+        bound.update_chain = loop.create_task(_absorb_for_chain())
+        # ``chained`` preserves upstream semantics: exceptions from the
+        # adapter edit propagate to the caller.
+        await chained
