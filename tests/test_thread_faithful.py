@@ -2540,6 +2540,151 @@ class TestDeriveChannelId:
         assert channel_id == "gchat:spaces/ABC123"
 
 
+# ===========================================================================
+# getParticipants
+# ===========================================================================
+
+
+class TestGetParticipants:
+    """describe("getParticipants")"""
+
+    # it("should return unique non-bot authors from messages")
+    @pytest.mark.asyncio
+    async def test_should_return_unique_nonbot_authors_from_messages(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        msg1 = create_test_message(
+            "1",
+            "Hello",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+        msg2 = create_test_message(
+            "2",
+            "Hi",
+            author=Author(user_id="U2", user_name="bob", full_name="Bob", is_bot=False, is_me=False),
+        )
+        msg3 = create_test_message(
+            "3",
+            "Hello again",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[msg1, msg2, msg3], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state)
+        participants = await thread.get_participants()
+
+        assert len(participants) == 2
+        user_ids = [p.user_id for p in participants]
+        assert "U1" in user_ids
+        assert "U2" in user_ids
+
+    # it("should exclude bot messages")
+    @pytest.mark.asyncio
+    async def test_should_exclude_bot_messages(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        human_msg = create_test_message(
+            "1",
+            "Hello",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+        self_bot_msg = create_test_message(
+            "2",
+            "Hi there!",
+            author=Author(user_id="B1", user_name="bot", full_name="Bot", is_bot=True, is_me=True),
+        )
+        third_party_bot_msg = create_test_message(
+            "3",
+            "Notification",
+            author=Author(user_id="B2", user_name="jira-bot", full_name="Jira Bot", is_bot=True, is_me=False),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[human_msg, self_bot_msg, third_party_bot_msg], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state)
+        participants = await thread.get_participants()
+
+        assert len(participants) == 1
+        assert participants[0].user_id == "U1"
+
+    # Python-only: isolates the is_me=True, is_bot=False exclusion path
+    # (addresses PR #64 bot-review nit — prior test mixes is_bot and is_me).
+    @pytest.mark.asyncio
+    async def test_should_exclude_self_messages_even_when_not_bot(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        self_msg = create_test_message(
+            "1",
+            "my msg",
+            author=Author(user_id="U_SELF", user_name="me", full_name="Me", is_bot=False, is_me=True),
+        )
+        other_msg = create_test_message(
+            "2",
+            "hi",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[self_msg, other_msg], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state)
+        participants = await thread.get_participants()
+
+        assert [p.user_id for p in participants] == ["U1"]
+
+    # it("should return empty array for thread with only bot messages")
+    @pytest.mark.asyncio
+    async def test_should_return_empty_array_for_thread_with_only_bot_messages(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        bot_msg = create_test_message(
+            "1",
+            "Bot message",
+            author=Author(user_id="B1", user_name="bot", full_name="Bot", is_bot=True, is_me=True),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[bot_msg], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state)
+        participants = await thread.get_participants()
+
+        assert len(participants) == 0
+
+    # it("should include currentMessage author")
+    @pytest.mark.asyncio
+    async def test_should_include_currentmessage_author(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        current_msg = create_test_message(
+            "1",
+            "Hey bot",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state, current_message=current_msg)
+        participants = await thread.get_participants()
+
+        assert len(participants) == 1
+        assert participants[0].user_id == "U1"
+
+
 class TestMissingAbsorbers:
     """Fidelity-check absorbers for TS test names that have no Python equivalent."""
 

@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+Parity catch-up with upstream `4.26.0`. No upstream version change.
+
 ### New public APIs
 
+- **`Thread.get_participants()`**: returns unique non-bot, non-self authors
+  who've posted in the thread. Seeds from `current_message.author` (if
+  eligible), then iterates `all_messages()` and dedupes by `user_id`.
+  Mirrors upstream TS `Thread.getParticipants()`. Issue #54.
 - **`IoRedisStateAdapter`**: `RedisStateAdapter` subclass defaulting to the
   `ioredis_` lock-token prefix used by upstream Vercel Chat's `ioredis`-backed
   state. Enables cross-runtime Redis sharing between TS and Python chat-sdk
@@ -33,6 +39,12 @@
   not yet supported by the Teams SDK adapter. Use appPassword (client secret)
   or federated (workload identity) authentication instead."`). Not a functional
   implementation; upstream does not implement cert auth either.
+
+### Test fidelity
+
+- Ported the 4 `[getParticipants]` tests from `thread.test.ts` and the 4
+  `[thread]` factory tests from `chat.test.ts` (existing-behavior coverage
+  for `Chat.thread(id)`). Closes 8 fidelity gaps.
 
 ### Test hygiene
 

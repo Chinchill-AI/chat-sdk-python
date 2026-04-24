@@ -430,6 +430,30 @@ class ThreadImpl:
             for msg in cached:
                 yield msg
 
+    async def get_participants(self) -> list[Author]:
+        """Return unique non-bot, non-self authors who've posted in the thread.
+
+        Mirrors ``getParticipants`` from the upstream TS SDK: seeds the
+        result with ``_current_message.author`` (if present and eligible),
+        then scans ``all_messages()`` oldest-first, skipping ``is_me`` and
+        ``is_bot`` authors and deduping by ``user_id``.
+        """
+        seen: dict[str, Author] = {}
+
+        if (
+            self._current_message is not None
+            and not self._current_message.author.is_me
+            and not self._current_message.author.is_bot
+        ):
+            seen[self._current_message.author.user_id] = self._current_message.author
+
+        async for msg in self.all_messages():
+            if msg.author.is_me or msg.author.is_bot or msg.author.user_id in seen:
+                continue
+            seen[msg.author.user_id] = msg.author
+
+        return list(seen.values())
+
     # -- Subscriptions -------------------------------------------------------
 
     async def is_subscribed(self) -> bool:

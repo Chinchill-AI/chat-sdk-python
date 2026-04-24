@@ -1283,6 +1283,45 @@ class TestOpenDM:
 
 
 # ============================================================================
+# thread() factory
+# ============================================================================
+
+
+class TestThreadFactory:
+    """describe("thread") — chat.thread(id) factory for building a Thread handle."""
+
+    # TS: "should return a Thread handle for a valid thread ID"
+    async def test_should_return_a_thread_handle_for_a_valid_thread_id(self):
+        chat, adapter, state = await _init_chat()
+        thread = chat.thread("slack:C123:1234.5678")
+        assert thread is not None
+        assert thread.id == "slack:C123:1234.5678"
+
+    # TS: "should allow posting to a thread handle"
+    async def test_should_allow_posting_to_a_thread_handle(self):
+        chat, adapter, state = await _init_chat()
+        thread = chat.thread("slack:C123:1234.5678")
+        await thread.post("Hello from outside a webhook!")
+
+        assert any(
+            tid == "slack:C123:1234.5678" and content == "Hello from outside a webhook!"
+            for tid, content in adapter._post_calls
+        )
+
+    # TS: "should throw for an invalid thread ID"
+    async def test_should_throw_for_an_invalid_thread_id(self):
+        chat, adapter, state = await _init_chat()
+        with pytest.raises(ChatError, match="Invalid thread ID"):
+            chat.thread("")
+
+    # TS: "should throw for an unknown adapter prefix"
+    async def test_should_throw_for_an_unknown_adapter_prefix(self):
+        chat, adapter, state = await _init_chat()
+        with pytest.raises(ChatError, match=r'Adapter "unknown" not found'):
+            chat.thread("unknown:C123:1234.5678")
+
+
+# ============================================================================
 # 14. isDM (tests 55-57)
 # ============================================================================
 
