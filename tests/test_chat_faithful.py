@@ -1243,6 +1243,148 @@ class TestActions:
 
 
 # ============================================================================
+# 12b. Options Load (4 tests)
+# ============================================================================
+
+
+class TestOptionsLoad:
+    # TS: "should call onOptionsLoad handler for a matching action ID"
+    async def test_should_call_onoptionsload_handler_for_a_matching_action_id(self):
+        from chat_sdk.types import OptionsLoadEvent
+
+        chat, adapter, state = await _init_chat()
+        captured: list[OptionsLoadEvent] = []
+
+        async def _handler(event: OptionsLoadEvent):
+            captured.append(event)
+            return [{"label": "Maria Garcia", "value": "person_123"}]
+
+        chat.on_options_load("person_select", _handler)
+
+        event = OptionsLoadEvent(
+            action_id="person_select",
+            query="mar",
+            user=_make_author(),
+            adapter=adapter,
+            raw={},
+        )
+        options = await chat.process_options_load(event)
+
+        assert len(captured) == 1
+        assert captured[0].action_id == "person_select"
+        assert captured[0].query == "mar"
+        assert options == [{"label": "Maria Garcia", "value": "person_123"}]
+
+    # TS: "should prefer specific handlers before catch-all handlers"
+    async def test_should_prefer_specific_handlers_before_catchall_handlers(self):
+        from chat_sdk.types import OptionsLoadEvent
+
+        chat, adapter, state = await _init_chat()
+        catchall_calls = 0
+        specific_calls = 0
+
+        async def _catchall(event: OptionsLoadEvent):
+            nonlocal catchall_calls
+            catchall_calls += 1
+            return [{"label": "Fallback", "value": "fallback"}]
+
+        async def _specific(event: OptionsLoadEvent):
+            nonlocal specific_calls
+            specific_calls += 1
+            return [{"label": "Specific", "value": "specific"}]
+
+        chat.on_options_load(_catchall)
+        chat.on_options_load("person_select", _specific)
+
+        event = OptionsLoadEvent(
+            action_id="person_select",
+            query="mar",
+            user=_make_author(),
+            adapter=adapter,
+            raw={},
+        )
+        options = await chat.process_options_load(event)
+
+        assert specific_calls == 1
+        assert catchall_calls == 0
+        assert options == [{"label": "Specific", "value": "specific"}]
+
+    # TS: "should fall back to catch-all handlers when no specific handler matches"
+    async def test_should_fall_back_to_catchall_handlers_when_no_specific_handler_matches(self):
+        from chat_sdk.types import OptionsLoadEvent
+
+        chat, adapter, state = await _init_chat()
+        catchall_calls = 0
+
+        async def _catchall(event: OptionsLoadEvent):
+            nonlocal catchall_calls
+            catchall_calls += 1
+            return [{"label": "Fallback", "value": "fallback"}]
+
+        chat.on_options_load(_catchall)
+
+        event = OptionsLoadEvent(
+            action_id="unknown_select",
+            query="test",
+            user=_make_author(),
+            adapter=adapter,
+            raw={},
+        )
+        options = await chat.process_options_load(event)
+
+        assert catchall_calls == 1
+        assert options == [{"label": "Fallback", "value": "fallback"}]
+
+    # TS: "should continue after handler errors"
+    async def test_should_continue_after_handler_errors(self):
+        from chat_sdk.types import OptionsLoadEvent
+
+        chat, adapter, state = await _init_chat()
+        logger = chat._logger
+        assert isinstance(logger, MockLogger)
+
+        failing_calls = 0
+        fallback_calls = 0
+
+        async def _failing(event: OptionsLoadEvent):
+            nonlocal failing_calls
+            failing_calls += 1
+            raise RuntimeError("boom")
+
+        async def _fallback(event: OptionsLoadEvent):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return [{"label": "Recovered", "value": "recovered"}]
+
+        chat.on_options_load("person_select", _failing)
+        chat.on_options_load(_fallback)
+
+        event = OptionsLoadEvent(
+            action_id="person_select",
+            query="mar",
+            user=_make_author(),
+            adapter=adapter,
+            raw={},
+        )
+        options = await chat.process_options_load(event)
+
+        assert failing_calls == 1
+        assert fallback_calls == 1
+        assert options == [{"label": "Recovered", "value": "recovered"}]
+
+        # Error was logged with the exact upstream string and actionId context.
+        error_calls = logger.error.calls
+        assert any(
+            call
+            and call[0] == "Options load handler error"
+            and len(call) > 1
+            and isinstance(call[1], dict)
+            and call[1].get("action_id") == "person_select"
+            for call in error_calls
+        )
+
+
+# ============================================================================
 # 13. openDM (tests 51-54)
 # ============================================================================
 

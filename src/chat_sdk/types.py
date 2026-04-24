@@ -19,6 +19,7 @@ from typing import (
 from chat_sdk.cards import CardElement
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger, LogLevel
+from chat_sdk.modals import SelectOptionElement
 
 
 def _parse_iso(s: str) -> datetime:
@@ -988,6 +989,22 @@ class ActionEvent:
 
 
 @dataclass
+class OptionsLoadEvent:
+    """Event emitted when an adapter needs dynamic options for an external select.
+
+    Port of upstream TS ``OptionsLoadEvent``. Slack dispatches a
+    ``block_suggestion`` payload to populate an external-select menu; the
+    handler returns the matching options for the current query text.
+    """
+
+    action_id: str
+    adapter: Adapter
+    query: str
+    user: Author
+    raw: Any = None
+
+
+@dataclass
 class ModalSubmitEvent:
     """Modal form submission event."""
 
@@ -1348,6 +1365,9 @@ class ChatInstance(Protocol):
     def process_modal_submit(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> Awaitable[ModalResponse | None]: ...
+    def process_options_load(
+        self, event: OptionsLoadEvent, options: WebhookOptions | None = None
+    ) -> Awaitable[list[SelectOptionElement] | None]: ...
     def process_modal_close(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> None: ...

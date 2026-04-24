@@ -49,7 +49,7 @@ from chat_sdk.cards import (
     text_element,
 )
 from chat_sdk.channel import ChannelImpl
-from chat_sdk.chat import Chat
+from chat_sdk.chat import Chat, OptionsLoadHandler
 from chat_sdk.emoji import (
     EmojiResolver,
     convert_emoji_placeholders,
@@ -155,6 +155,7 @@ from chat_sdk.types import (
     ModalCloseEvent,
     ModalResponse,
     ModalSubmitEvent,
+    OptionsLoadEvent,
     PlanUpdateChunk,
     Postable,
     PostableAst,
@@ -356,6 +357,8 @@ __all__ = [
     "ModalCloseEvent",
     "ModalResponse",
     "ModalSubmitEvent",
+    "OptionsLoadEvent",
+    "OptionsLoadHandler",
     "PlanUpdateChunk",
     "Postable",
     "PostableAst",

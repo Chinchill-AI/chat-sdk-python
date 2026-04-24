@@ -10,6 +10,17 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   who've posted in the thread. Seeds from `current_message.author` (if
   eligible), then iterates `all_messages()` and dedupes by `user_id`.
   Mirrors upstream TS `Thread.getParticipants()`. Issue #54.
+- **`Chat.on_options_load(...)` + `Chat.process_options_load(...)`**: port of
+  upstream `onOptionsLoad` / `processOptionsLoad` for handling
+  external-select option-load events. Specific action IDs run before
+  catch-all handlers; errors are logged and skipped so later handlers still
+  get a chance. New public types: `OptionsLoadEvent`, `OptionsLoadHandler`.
+- **Slack `block_suggestion` dispatch**: the Slack adapter now routes
+  `block_suggestion` interactive payloads through `process_options_load`
+  and serializes the result to a Slack options JSON response. The handler
+  is raced against a 2.5s budget (`OPTIONS_LOAD_TIMEOUT_MS`); on timeout
+  the response is empty options and the orphaned task still logs errors
+  via `asyncio.shield`. Issue #50.
 - **`IoRedisStateAdapter`**: `RedisStateAdapter` subclass defaulting to the
   `ioredis_` lock-token prefix used by upstream Vercel Chat's `ioredis`-backed
   state. Enables cross-runtime Redis sharing between TS and Python chat-sdk
