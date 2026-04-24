@@ -247,3 +247,65 @@ class TestSlackBlockSuggestion:
             # Cancel the still-running slow task so it doesn't leak.
             if registered and not registered[0].done():
                 registered[0].cancel()
+
+    # If the caller-supplied wait_until raises (e.g. an adapter bug or a
+    # serverless runtime that rejects registration), the timeout branch
+    # must still return the empty-options HTTP 200 fallback rather than
+    # surfacing the exception to the webhook.
+    @pytest.mark.asyncio
+    async def test_timeout_falls_back_when_wait_until_raises(self):
+        from chat_sdk.types import WebhookOptions
+
+        chat = _make_mock_chat()
+
+        slow_task_ref: list[Any] = []
+
+        async def _slow_handler(event: Any, options: Any = None):
+            await asyncio.sleep(5.0)
+            return []
+
+        chat.process_options_load = AsyncMock(side_effect=_slow_handler)
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        def _raising_wait_until(awaitable: Any) -> None:
+            slow_task_ref.append(awaitable)
+            raise RuntimeError("runtime refuses to register background task")
+
+        options = WebhookOptions(wait_until=_raising_wait_until)
+
+        import chat_sdk.adapters.slack.adapter as slack_adapter_mod
+
+        original_timeout = slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS
+        slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = 50
+        try:
+            payload = {
+                "type": "block_suggestion",
+                "team": {"id": "T123"},
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "action_id": "person_select",
+                "block_id": "person_block",
+                "value": "mar",
+            }
+            req = _make_interactive_request(payload)
+
+            # Must not raise — the guard should swallow the wait_until error
+            # and still serve the timeout fallback response.
+            response = await adapter.handle_webhook(req, options)
+
+            assert response["status"] == 200
+            headers = response.get("headers") or {}
+            content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+            assert "application/json" in content_type
+            parsed = json.loads(response["body"])
+            assert parsed == {"options": []}
+
+            # Sanity: wait_until was actually invoked (and raised) on the
+            # shielded task — that's what the guard is there to protect.
+            assert len(slow_task_ref) == 1
+            assert isinstance(slow_task_ref[0], asyncio.Task)
+        finally:
+            slack_adapter_mod.OPTIONS_LOAD_TIMEOUT_MS = original_timeout
+            if slow_task_ref and not slow_task_ref[0].done():
+                slow_task_ref[0].cancel()

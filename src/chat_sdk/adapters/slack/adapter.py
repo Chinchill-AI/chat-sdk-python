@@ -1077,9 +1077,17 @@ class SlackAdapter:
             # Register with wait_until so serverless/webhook runtimes
             # (e.g. Vercel) keep the task alive past the HTTP response;
             # otherwise the late-error logging path above can be killed
-            # before it runs.
+            # before it runs. wait_until is user/runtime-provided, so
+            # guard against it raising — we still want to return the
+            # empty-options HTTP 200 fallback.
             if options and options.wait_until:
-                options.wait_until(load_task)
+                try:
+                    options.wait_until(load_task)
+                except Exception as err:
+                    self._logger.warn(
+                        "wait_until raised while registering timed-out options load task",
+                        {"action_id": action_id, "error": str(err)},
+                    )
             return self._options_load_response([])
 
         return self._options_load_response(result if result is not None else [])
