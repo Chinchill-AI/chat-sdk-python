@@ -1747,18 +1747,11 @@ class TestPostWithPlan:
 
     Ported from TS thread.test.ts to close the fidelity gap tracked in #55.
 
-    Note: a few tests in this block expose known behavior gaps between the
-    current Python ``Plan`` implementation and the upstream TS version:
-
-    * ``UpdateTaskInput`` in ``plan.py`` has no ``id`` field, so looking up
-      a task by id via ``update_task({"id": ...})`` is not supported.
-    * ``_enqueue_edit`` swallows adapter errors instead of propagating them
-      to the caller (upstream returns the chained promise, which rejects).
-    * The edit chain is rebuilt post-await rather than synchronously, which
-      does not preserve strict ordering under ``asyncio.gather``.
-
-    Those tests are skipped with a pointer back here so the gaps remain
-    visible for a follow-up fix rather than silently drifting.
+    All 20 tests port their upstream ``thread.test.ts`` counterparts
+    1:1. The three behavior gaps that originally surfaced during the
+    port — ``UpdateTaskInput.id``, ``_enqueue_edit`` error propagation,
+    and synchronous chain registration under ``asyncio.gather`` — have
+    all been fixed in ``plan.py`` as part of this PR (#75).
     """
 
     # it("should post fallback text when adapter does not support plans")
