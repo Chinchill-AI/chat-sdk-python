@@ -1818,7 +1818,6 @@ class TestPostWithPlan:
     # it("should ensure sequential edits via queue")
     @pytest.mark.asyncio
     async def test_should_ensure_sequential_edits_via_queue(self):
-        import asyncio
         import random
 
         from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions

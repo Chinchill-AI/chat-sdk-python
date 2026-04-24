@@ -485,9 +485,14 @@ class Plan:
             # treated as a previous-failure chain that still runs doEdit,
             # but we'd also lose the ability to recover cleanly. Upstream
             # uses ``chained.then(() => undefined, (err) => logger.warn)``.
+            #
+            # Catch ``Exception`` (not ``BaseException``) so that
+            # ``asyncio.CancelledError``, ``KeyboardInterrupt``, and
+            # ``SystemExit`` propagate — only regular failures need to be
+            # absorbed here so the next enqueued edit can still run.
             try:
                 await chained
-            except BaseException as exc:  # noqa: BLE001 — log and swallow for queue
+            except Exception as exc:  # noqa: BLE001 — log and swallow for queue
                 if bound.logger is not None:
                     bound.logger.warn("Failed to edit plan", exc)
 
