@@ -2276,6 +2276,12 @@ def _coerce_attachments(raw: Any) -> list[Attachment]:
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
+                    # ``data`` is not part of ``SerializedAttachment`` (bytes
+                    # aren't JSON-safe, so ``to_json`` drops it).  But
+                    # in-memory state backends can hand us raw dicts that
+                    # still carry the bytes; pass them through so we don't
+                    # silently lose pre-fetched data on rehydrate.
+                    data=att.get("data"),
                     fetch_metadata=fetch_metadata,
                 )
             )

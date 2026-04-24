@@ -515,10 +515,16 @@ class Message:
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mimeType") or att.get("mime_type"),
+                    mime_type=(att.get("mimeType") if att.get("mimeType") is not None else att.get("mime_type")),
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
+                    # ``data`` is not part of the ``SerializedAttachment`` wire
+                    # shape (``to_json`` drops bytes — JSON can't carry them).
+                    # We still accept it here so callers handing a raw dict
+                    # that happens to carry pre-fetched bytes (e.g. in-memory
+                    # state backends) don't silently lose the payload.
+                    data=att.get("data"),
                     fetch_metadata=(
                         att.get("fetchMetadata") if att.get("fetchMetadata") is not None else att.get("fetch_metadata")
                     ),
@@ -589,10 +595,15 @@ class Message:
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mime_type") or att.get("mimeType"),
+                    mime_type=(att.get("mime_type") if att.get("mime_type") is not None else att.get("mimeType")),
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
+                    # ``data`` is not part of the ``SerializedAttachment`` wire
+                    # shape (bytes aren't JSON-safe), but accepting it here
+                    # keeps in-memory callers that pass raw dicts with
+                    # pre-fetched bytes from silently losing the payload.
+                    data=att.get("data"),
                     fetch_metadata=(
                         att.get("fetch_metadata") if att.get("fetch_metadata") is not None else att.get("fetchMetadata")
                     ),
@@ -1340,6 +1351,15 @@ class BaseAdapter:
         no-op (returns the attachment unchanged) — adapters that support file
         downloads should override it to rebuild the platform-specific
         download closure from ``attachment.fetch_metadata``.
+
+        .. important::
+           This hook must be **synchronous**.  Async rehydration is not
+           supported — the call site assigns the return value directly into
+           ``Message.attachments``, so returning a coroutine would land a
+           coroutine in the list and downstream ``att.fetch_data`` access
+           would raise.  If platform-specific rehydration needs I/O, push
+           the async work into the returned ``fetch_data`` closure (which
+           *is* awaited when consumers call it) instead of doing it here.
         """
         return attachment
 

@@ -480,6 +480,7 @@ stay explicit instead of being rediscovered in code review.
 | `from_json()` | Accepts both camelCase and snake_case | camelCase only |
 | Slack installation keys | camelCase (matches TS, with snake_case fallback) | camelCase |
 | Redis/Postgres queue entries | Different wire format (message serialized via `to_json()`) | `JSON.stringify(entry)` directly |
+| `Attachment.data` (bytes) | Not serialized by `to_json()` (bytes aren't JSON-safe). Preserved through in-memory rehydrate paths (`_coerce_attachments`, `Message.from_json{_compat}`) when raw dicts carry the field. A JSON roundtrip through Redis/Postgres state drops `data`; adapters should rely on `fetch_metadata` + `rehydrate_attachment` to reconstruct the download closure instead. | Same — `data` is not part of `SerializedAttachment` |
 
 ### Coverage confidence by module
 
