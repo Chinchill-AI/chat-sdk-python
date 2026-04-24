@@ -1,9 +1,11 @@
 """Plan implementation for chat-sdk.
 
-Python port of Vercel Chat SDK plan.ts and postable-object.ts.
-Provides the Plan class (a PostableObject that manages a task list),
-and the ``post_postable_object`` helper used by Thread/Channel to post
-any PostableObject.
+Python port of Vercel Chat SDK plan.ts, streaming-plan.ts, and
+postable-object.ts. Provides the Plan class (a PostableObject that
+manages a task list), the ``StreamingPlan`` PostableObject that wraps
+an async iterable with platform-specific streaming options, and the
+``post_postable_object`` helper used by Thread/Channel to post any
+PostableObject.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -174,6 +177,20 @@ async def post_postable_object(
     logger:
         Optional logger for error reporting.
     """
+
+    # StreamingPlan (kind == "stream") is a nominal PostableObject that only
+    # Thread.post() knows how to consume (via its native-or-fallback streaming
+    # path). Reject it here so callers get a clear error instead of blank
+    # posts or a wrong-shape adapter.post_object("stream", ...) call. Diverges
+    # from upstream postable-object.ts, which posts ``getFallbackText() == ""``
+    # as an empty message.
+    if getattr(obj, "kind", None) == "stream":
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via post_postable_object / "
+            "Channel.post -- its stream is consumed only by Thread.post(), "
+            "which special-cases kind=='stream' for native or fallback "
+            "streaming. Use thread.post(streaming_plan) instead."
+        )
 
     def _make_context(raw: Any) -> PostableObjectContext:
         return PostableObjectContext(
@@ -500,3 +517,133 @@ class Plan:
         # ``chained`` preserves upstream semantics: exceptions from the
         # adapter edit propagate to the caller.
         await chained
+
+
+# =============================================================================
+# StreamingPlan -- PostableObject that wraps an async iterable with options
+# =============================================================================
+
+
+@dataclass
+class StreamingPlanOptions:
+    """Options for a :class:`StreamingPlan`.
+
+    Mirrors upstream ``StreamingPlanOptions`` (streaming-plan.ts).
+    Python uses snake_case at the public boundary while still accepting
+    ``group_tasks``/``end_with``/``update_interval_ms``.
+
+    Attributes
+    ----------
+    group_tasks:
+        Controls how ``task_update`` chunks are displayed (Slack only).
+        - ``"plan"``  -- all tasks grouped into a single plan block.
+        - ``"timeline"`` -- individual task cards shown inline (default).
+    end_with:
+        Block Kit elements to attach when the stream stops (Slack only).
+        Useful for adding feedback buttons after a streamed response.
+    update_interval_ms:
+        Minimum interval between updates in ms (default: 500).
+        Used for fallback mode (post + edit on adapters without native
+        streaming).
+    """
+
+    group_tasks: Literal["plan", "timeline"] | None = None
+    end_with: list[Any] | None = None
+    update_interval_ms: int | None = None
+
+
+@dataclass
+class _StreamingPlanData:
+    """Internal post-data payload exposed via ``get_post_data``."""
+
+    stream: AsyncIterable[Any]
+    options: StreamingPlanOptions
+
+
+class StreamingPlan:
+    """A ``PostableObject`` wrapping an async iterable with streaming options.
+
+    Use this when you need to pass options like task grouping or stop
+    blocks to the streaming API. For simple streaming without options,
+    pass the async iterable directly to :meth:`Thread.post`.
+
+    Example::
+
+        stream = StreamingPlan(
+            result.full_stream,
+            StreamingPlanOptions(group_tasks="plan", end_with=[feedback_block]),
+        )
+        await thread.post(stream)
+    """
+
+    kind: str = "stream"
+
+    def __init__(
+        self,
+        stream: AsyncIterable[Any],
+        options: StreamingPlanOptions | None = None,
+    ) -> None:
+        self._stream = stream
+        self._options = options if options is not None else StreamingPlanOptions()
+
+    @property
+    def stream(self) -> AsyncIterable[Any]:
+        """The wrapped async iterable of chunks."""
+        return self._stream
+
+    @property
+    def options(self) -> StreamingPlanOptions:
+        """The streaming options supplied at construction time."""
+        return self._options
+
+    # -- PostableObject protocol ------------------------------------------------
+    #
+    # StreamingPlan is a "nominal" PostableObject: it satisfies the duck-typing
+    # protocol (so ``is_postable_object()`` detects it and ``Thread.post``'s
+    # ``kind == "stream"`` branch fires), but it cannot actually round-trip
+    # through the generic ``post_postable_object`` helper -- there is no static
+    # fallback text to post and no meaningful ``adapter.post_object("stream",
+    # ...)`` shape.
+    #
+    # Upstream TS has the same latent gap: ``ChannelImpl.post`` routes any
+    # PostableObject through ``postPostableObject``, which would post an empty
+    # string for StreamingPlan. We diverge by failing loudly rather than
+    # silently posting blanks, per CLAUDE.md adversarial-review discipline.
+
+    def get_fallback_text(self) -> str:
+        """StreamingPlan has no static fallback text.
+
+        Raises ``RuntimeError`` to fail loudly if a generic posting path
+        (e.g. ``Channel.post`` or ``post_postable_object``) tries to
+        consume a StreamingPlan as a normal PostableObject. StreamingPlan
+        must be posted via :meth:`Thread.post`, which special-cases
+        ``kind == "stream"`` and consumes the wrapped async iterable.
+        """
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via the generic PostableObject "
+            "path (no static fallback text). Post it with Thread.post(), "
+            "which routes kind=='stream' to native or fallback streaming."
+        )
+
+    def get_post_data(self) -> _StreamingPlanData:
+        """Return the underlying stream + options for Thread.post to route."""
+        return _StreamingPlanData(stream=self._stream, options=self._options)
+
+    def is_supported(self, _adapter: Adapter) -> bool:
+        """StreamingPlan is not generically postable -- see
+        :meth:`get_fallback_text`.
+
+        Raises ``RuntimeError`` so misroutes through
+        ``post_postable_object`` fail loudly rather than silently trying
+        ``adapter.post_object("stream", ...)`` on adapters that don't
+        understand the shape.
+        """
+        raise RuntimeError(
+            "StreamingPlan cannot be posted via the generic PostableObject "
+            "path. Post it with Thread.post(), which routes kind=='stream' "
+            "to native or fallback streaming."
+        )
+
+    def on_posted(self, _context: PostableObjectContext) -> None:
+        """Streams are one-shot, no lifecycle binding needed."""
+        return None

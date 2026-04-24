@@ -20,6 +20,7 @@ import pytest
 
 from chat_sdk.channel import derive_channel_id
 from chat_sdk.errors import ChatNotImplementedError
+from chat_sdk.plan import StreamingPlan, StreamingPlanOptions
 from chat_sdk.shared.mock_adapter import MockLogger
 from chat_sdk.testing import (
     MockAdapter,
@@ -825,6 +826,263 @@ class TestStreaming:
         options = stream_call_args[0][2]
         assert options.recipient_user_id == "U456"
         assert options.recipient_team_id == "T123"
+
+    # it("should pass StreamingPlan PostableObject options to adapter.stream")
+    @pytest.mark.asyncio
+    async def test_should_pass_streamingplan_postableobject_options_to_adapterstream(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        stream_call_args: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            stream_call_args.append((thread_id, text_stream, options))
+            async for _ in text_stream:
+                pass
+            return RawMessage(id="msg-stream", thread_id="t1", raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello"])
+        stream_msg = StreamingPlan(
+            text_stream,
+            StreamingPlanOptions(
+                group_tasks="plan",
+                end_with=[{"type": "actions"}],
+                update_interval_ms=1000,
+            ),
+        )
+        await thread.post(stream_msg)
+
+        assert len(stream_call_args) == 1
+        thread_id, _iterable, options = stream_call_args[0]
+        assert thread_id == "slack:C123:1234.5678"
+        # Upstream maps groupTasks->taskDisplayMode, endWith->stopBlocks
+        assert options.task_display_mode == "plan"
+        assert options.stop_blocks == [{"type": "actions"}]
+        assert options.update_interval_ms == 1000
+
+    # it("should pass StreamingPlan with only groupTasks")
+    @pytest.mark.asyncio
+    async def test_should_pass_streamingplan_with_only_grouptasks(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        stream_call_args: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            stream_call_args.append((thread_id, text_stream, options))
+            async for _ in text_stream:
+                pass
+            return RawMessage(id="msg-stream", thread_id="t1", raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello"])
+        await thread.post(StreamingPlan(text_stream, StreamingPlanOptions(group_tasks="timeline")))
+
+        assert len(stream_call_args) == 1
+        options = stream_call_args[0][2]
+        assert options.task_display_mode == "timeline"
+        # Omitted options must not be set
+        assert options.stop_blocks is None
+
+    # it("should pass StreamingPlan with only endWith")
+    @pytest.mark.asyncio
+    async def test_should_pass_streamingplan_with_only_endwith(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        stream_call_args: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            stream_call_args.append((thread_id, text_stream, options))
+            async for _ in text_stream:
+                pass
+            return RawMessage(id="msg-stream", thread_id="t1", raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello"])
+        await thread.post(StreamingPlan(text_stream, StreamingPlanOptions(end_with=[{"type": "actions"}])))
+
+        assert len(stream_call_args) == 1
+        options = stream_call_args[0][2]
+        assert options.stop_blocks == [{"type": "actions"}]
+        assert options.task_display_mode is None
+
+    # it("should pass StreamingPlan with only updateIntervalMs")
+    @pytest.mark.asyncio
+    async def test_should_pass_streamingplan_with_only_updateintervalms(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        stream_call_args: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            stream_call_args.append((thread_id, text_stream, options))
+            async for _ in text_stream:
+                pass
+            return RawMessage(id="msg-stream", thread_id="t1", raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello"])
+        await thread.post(StreamingPlan(text_stream, StreamingPlanOptions(update_interval_ms=2000)))
+
+        assert len(stream_call_args) == 1
+        options = stream_call_args[0][2]
+        assert options.update_interval_ms == 2000
+        assert options.task_display_mode is None
+        assert options.stop_blocks is None
+
+    # it("should route StreamingPlan through fallback when adapter has no native streaming")
+    @pytest.mark.asyncio
+    async def test_should_route_streamingplan_through_fallback_when_adapter_has_no_native_streaming(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        # Ensure no stream method
+        assert not hasattr(adapter, "stream") or getattr(adapter, "stream", None) is None
+
+        thread = _make_thread(adapter, state)
+
+        # Capture StreamOptions at the fallback entry point so we can prove
+        # that StreamingPlanOptions actually reach the fallback path -- this
+        # guards issue #56 against silent truthiness drops that would leave
+        # observable streaming behavior unchanged.
+        captured_options: list[Any] = []
+        original_fallback = thread._fallback_stream
+
+        async def _spy_fallback(text_stream: Any, options: Any = None) -> Any:
+            captured_options.append(options)
+            return await original_fallback(text_stream, options)
+
+        thread._fallback_stream = _spy_fallback  # type: ignore[method-assign]
+
+        text_stream = _create_text_stream(["Hello", " ", "World"])
+        await thread.post(
+            StreamingPlan(
+                text_stream,
+                StreamingPlanOptions(
+                    group_tasks="plan",
+                    end_with=[{"type": "actions"}],
+                    update_interval_ms=2000,
+                ),
+            )
+        )
+
+        # Should post initial placeholder and edit with final content
+        assert len(adapter._post_calls) >= 1
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        assert len(adapter._edit_calls) >= 1
+        last_edit = adapter._edit_calls[-1]
+        assert last_edit[0] == "slack:C123:1234.5678"
+        assert last_edit[1] == "msg-1"
+        assert isinstance(last_edit[2], PostableMarkdown)
+        assert last_edit[2].markdown == "Hello World"
+
+        # All three StreamingPlanOptions fields must reach the fallback path.
+        # Before the truthiness->`is not None` fix, end_with=[] and
+        # update_interval_ms=0 would be dropped; asserting full propagation
+        # here catches both the mapping bug and any future regression that
+        # forgets to thread options through to _fallback_stream.
+        assert len(captured_options) == 1
+        options = captured_options[0]
+        assert options is not None
+        assert options.task_display_mode == "plan"
+        assert options.stop_blocks == [{"type": "actions"}]
+        assert options.update_interval_ms == 2000
+
+    # Python-only regression lock: the truthiness fix in thread.py (post
+    # dispatcher + `_fallback_stream` interval guard) replaced `if x:` with
+    # `if x is not None:`. The propagation test above uses truthy values
+    # (`end_with=[{...}]`, `update_interval_ms=2000`), which would pass even
+    # under the old truthy check. Pin the specifically falsy-but-explicit
+    # values that motivated the fix so a regression to `if x:` resets them
+    # to `StreamOptions` defaults (None) and fails loudly here.
+    @pytest.mark.asyncio
+    async def test_streamingplan_falsy_options_still_propagate_to_fallback(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        # Ensure no native stream — forces the fallback path.
+        assert not hasattr(adapter, "stream") or getattr(adapter, "stream", None) is None
+
+        thread = _make_thread(adapter, state)
+
+        captured_options: list[Any] = []
+        original_fallback = thread._fallback_stream
+
+        async def _spy_fallback(text_stream: Any, options: Any = None) -> Any:
+            captured_options.append(options)
+            return await original_fallback(text_stream, options)
+
+        thread._fallback_stream = _spy_fallback  # type: ignore[method-assign]
+
+        text_stream = _create_text_stream(["Hello", " ", "World"])
+        await thread.post(
+            StreamingPlan(
+                text_stream,
+                StreamingPlanOptions(
+                    # Falsy-but-explicit: edit on every chunk. Under a truthy
+                    # check (`if update_interval_ms:`), 0 is dropped and the
+                    # default (500) wins — silently changing streaming
+                    # cadence. `is not None` preserves the caller's choice.
+                    update_interval_ms=0,
+                    # Falsy-but-explicit: caller opts in to "no stop blocks".
+                    # Under `if end_with:`, [] would be dropped and
+                    # `StreamOptions.stop_blocks` would stay None, which is
+                    # indistinguishable from the default. Lock in that the
+                    # explicit empty list makes it through to StreamOptions.
+                    end_with=[],
+                    group_tasks="plan",
+                ),
+            )
+        )
+
+        assert len(captured_options) == 1
+        options = captured_options[0]
+        assert options is not None
+        # Falsy values explicitly set by the caller must survive the mapping.
+        assert options.update_interval_ms == 0, (
+            "update_interval_ms=0 was dropped — likely a regression to "
+            "truthiness-based option mapping in thread.py post dispatcher."
+        )
+        assert options.stop_blocks == [], (
+            "end_with=[] was dropped — likely a regression to truthiness-"
+            "based option mapping in thread.py post dispatcher."
+        )
+        # Sanity: truthy option still propagates alongside the falsy ones.
+        assert options.task_display_mode == "plan"
+
+    # it("should still work without options (backward compat)")
+    @pytest.mark.asyncio
+    async def test_should_still_work_without_options_backward_compat(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        stream_call_args: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            stream_call_args.append((thread_id, text_stream, options))
+            async for _ in text_stream:
+                pass
+            return RawMessage(id="msg-stream", thread_id="t1", raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello"])
+        # Plain async iterable — no StreamingPlan wrapper.
+        await thread.post(text_stream)
+
+        assert len(stream_call_args) == 1
+        options = stream_call_args[0][2]
+        assert options.task_display_mode is None
+        assert options.stop_blocks is None
 
 
 # ===========================================================================
