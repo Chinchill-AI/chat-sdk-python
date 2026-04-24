@@ -1,0 +1,74 @@
+{
+  "_comment": "Ratchet-down baseline for scripts/verify_test_fidelity.py. Each entry is a [describe_block, ts_it_name] pair that is known to be missing a Python translation. Default CI mode accepts any subset of this list as missing and fails on new misses outside it. To remove entries: port the TS test to its Python counterpart, then regenerate this file with --update-baseline.",
+  "ts_parity": "chat@4.26.0",
+  "total_ts_tests": 564,
+  "total_missing": 16,
+  "missing": {
+    "packages/chat/src/thread.test.ts": [
+      [
+        "post with Plan",
+        "should add tasks and call editObject"
+      ],
+      [
+        "post with Plan",
+        "should call adapter postObject when supported"
+      ],
+      [
+        "post with Plan",
+        "should complete plan and mark tasks done"
+      ],
+      [
+        "post with Plan",
+        "should complete plan via editMessage in fallback mode"
+      ],
+      [
+        "post with Plan",
+        "should continue accepting edits after a failed edit"
+      ],
+      [
+        "post with Plan",
+        "should ensure sequential edits via queue"
+      ],
+      [
+        "post with Plan",
+        "should handle various PlanContent formats in initialMessage"
+      ],
+      [
+        "post with Plan",
+        "should post fallback text when adapter does not support plans"
+      ],
+      [
+        "post with Plan",
+        "should propagate editObject errors from addTask"
+      ],
+      [
+        "post with Plan",
+        "should reset plan and start fresh"
+      ],
+      [
+        "post with Plan",
+        "should return null when calling addTask before post"
+      ],
+      [
+        "post with Plan",
+        "should return null when calling complete before post"
+      ],
+      [
+        "post with Plan",
+        "should return null when calling updateTask before post"
+      ],
+      [
+        "post with Plan",
+        "should set error status via updateTask"
+      ],
+      [
+        "post with Plan",
+        "should update current task with output"
+      ],
+      [
+        "post with Plan",
+        "should update via editMessage in fallback mode"
+      ]
+    ]
+  }
+}

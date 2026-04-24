@@ -57,6 +57,20 @@ jobs:
         continue-on-error: true
         run: uv run python scripts/audit_test_quality.py
 
+      - name: Clone upstream vercel/chat at pinned parity tag
+        id: clone_upstream
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --branch chat@4.26.0 \
+            https://github.com/vercel/chat.git /tmp/vercel-chat
+
+      - name: Test fidelity check (baseline-enforced)
+        id: fidelity
+        continue-on-error: true
+        env:
+          TS_ROOT: /tmp/vercel-chat
+        run: uv run python scripts/verify_test_fidelity.py
+
       - name: Pyrefly type check
         id: pyrefly
         continue-on-error: true
@@ -75,6 +89,7 @@ jobs:
           echo "| Ruff check | ${{ steps.ruff_check.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Ruff format | ${{ steps.ruff_format.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test audit | ${{ steps.audit.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test fidelity | ${{ steps.fidelity.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Pyrefly | ${{ steps.pyrefly.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.pyrefly.outcome }}" = "success" ]; then
@@ -89,10 +104,11 @@ jobs:
           RUFF_CHECK: ${{ steps.ruff_check.outcome }}
           RUFF_FORMAT: ${{ steps.ruff_format.outcome }}
           AUDIT: ${{ steps.audit.outcome }}
+          FIDELITY: ${{ steps.fidelity.outcome }}
           PYREFLY: ${{ steps.pyrefly.outcome }}
         run: |
           failures=0
-          for var in RUFF_CHECK RUFF_FORMAT AUDIT PYREFLY; do
+          for var in RUFF_CHECK RUFF_FORMAT AUDIT FIDELITY PYREFLY; do
             outcome="${!var}"
             if [ "$outcome" != "success" ]; then
               echo "$var failed (outcome: $outcome)"

@@ -105,5 +105,8 @@ async mock bugs, and cross-file duplicates. PRs that introduce hard failures
 will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
-`it("...")` has a matching Python `def test_*()`. Must show 0 missing before
-committing test changes.
+`it("...")` has a matching Python `def test_*()`, pinned to `chat@4.26.0`.
+Default mode is baseline-enforced: CI fails on any NEW miss not listed in
+`scripts/fidelity_baseline.json`. Run `--update-baseline` after porting a
+missing test (or documenting an intentional skip in `UPSTREAM_SYNC.md`). Use
+`--strict` to verify the final 0-missing target locally.

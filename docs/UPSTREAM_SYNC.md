@@ -72,6 +72,32 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 - **Preserve parity** and document the inconsistency in the non-parity section below
 - **Intentionally diverge** and document the divergence in the non-parity section
 
+### Test fidelity baseline
+
+`scripts/verify_test_fidelity.py` runs in CI (`.github/workflows/lint.yml`) pinned
+to `vercel/chat@4.26.0` (matches the `UPSTREAM_PARITY` constant in
+`src/chat_sdk/__init__.py`). Default mode is **baseline-enforced**:
+
+- The current set of missing TS-test translations lives in
+  `scripts/fidelity_baseline.json`.
+- CI fails if a TS test is missing that is **not** in the baseline (new drift).
+- CI succeeds if all currently-missing tests are a subset of the baseline — even
+  if nothing has been ported yet.
+- Fixed tests (in baseline but now ported) are reported with a reminder to
+  tighten the baseline.
+
+Workflows:
+
+| Goal | Command |
+|------|---------|
+| Port a missing test | Write the Python test, then `--update-baseline` to remove it from the ratchet |
+| Add a Python-only divergence (intentional skip) | Document in [Known Non-Parity](#known-non-parity-with-typescript-sdk), then `--update-baseline` |
+| Upstream sync | After pulling new upstream, run default mode — any newly-added TS tests appear as NEW misses and CI fails until ported or baselined |
+| Final parity check | `--strict` ignores the baseline and fails on any missing — target once baseline hits zero |
+
+The baseline file is ordered and stable so diffs are easy to review. Regenerate
+it whenever the missing set changes — don't hand-edit.
+
 ## Divergence Policy
 
 Every divergence from upstream has a cost: merge conflicts on future syncs,

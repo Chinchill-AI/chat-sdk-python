@@ -6,11 +6,20 @@ snake_case, and checks that a corresponding def test_...() exists in the
 Python translation.
 
 Usage:
-    python scripts/verify_test_fidelity.py [--fix]
+    python scripts/verify_test_fidelity.py             # baseline mode (default)
+    python scripts/verify_test_fidelity.py --strict    # fail on any missing
+    python scripts/verify_test_fidelity.py --fix       # append stubs for missing
+    python scripts/verify_test_fidelity.py --update-baseline  # rewrite baseline
 
-With --fix: appends stub test functions for any missing translations.
+Default (baseline) mode: succeeds iff the set of missing tests is a subset of
+``scripts/fidelity_baseline.json``. Tests that are in the baseline but now pass
+are reported as fixed. New misses outside the baseline fail CI.
+
+``--strict`` ignores the baseline and fails on any missing. This is the
+eventual target once the baseline count ratchets to zero.
 """
 
+import json
 import os
 import re
 import sys
@@ -18,6 +27,7 @@ from pathlib import Path
 
 TS_ROOT = os.environ.get("TS_ROOT", "/tmp/vercel-chat")
 PY_ROOT = os.environ.get("PY_ROOT", str(Path(__file__).parent.parent))
+BASELINE_PATH = Path(__file__).parent / "fidelity_baseline.json"
 
 # Mapping: TS test file -> Python test file
 MAPPING = {
@@ -205,15 +215,66 @@ def count_absorbers(py_path: str) -> int:
     return count
 
 
+def load_baseline(path: Path) -> dict[str, set[tuple[str, str]]]:
+    """Load fidelity baseline. Missing file returns empty baseline."""
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    out: dict[str, set[tuple[str, str]]] = {}
+    for ts_rel, entries in data.get("missing", {}).items():
+        out[ts_rel] = {(e[0], e[1]) for e in entries}
+    return out
+
+
+def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> None:
+    """Persist the current set of missing tests as the new baseline."""
+    payload = {
+        "_comment": (
+            "Ratchet-down baseline for scripts/verify_test_fidelity.py. "
+            "Each entry is a [describe_block, ts_it_name] pair that is known "
+            "to be missing a Python translation. Default CI mode accepts any "
+            "subset of this list as missing and fails on new misses outside "
+            "it. To remove entries: port the TS test to its Python counterpart, "
+            "then regenerate this file with --update-baseline."
+        ),
+        "ts_parity": "chat@4.26.0",
+        "total_ts_tests": total_ts,
+        "total_missing": sum(len(v) for v in all_missing.values()),
+        "missing": {
+            ts_rel: [[d, t] for d, t, _p in sorted(entries, key=lambda e: (e[0], e[1]))]
+            for ts_rel, entries in sorted(all_missing.items())
+            if entries
+        },
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=False)
+        f.write("\n")
+
+
 def main() -> int:
     fix_mode = "--fix" in sys.argv
+    strict_mode = "--strict" in sys.argv
+    update_baseline = "--update-baseline" in sys.argv
+
+    baseline = {} if (strict_mode or update_baseline) else load_baseline(BASELINE_PATH)
+
     total_missing = 0
     total_matched = 0
     total_ts = 0
     total_absorbers = 0
+    all_missing: dict[str, list] = {}
+    new_misses: dict[str, list[tuple[str, str]]] = {}
+    fixed: dict[str, list[tuple[str, str]]] = {}
 
     print("=" * 70)
     print("TEST FIDELITY REPORT")
+    if strict_mode:
+        print("  mode: --strict (baseline ignored)")
+    elif update_baseline:
+        print("  mode: --update-baseline (rewriting baseline)")
+    else:
+        print(f"  mode: baseline ({BASELINE_PATH.name})")
     print("=" * 70)
 
     for ts_rel, py_rel in MAPPING.items():
@@ -231,6 +292,16 @@ def main() -> int:
         total_matched += matched
         total_missing += len(missing)
         total_absorbers += absorbers
+        all_missing[ts_rel] = missing
+
+        current_missing_keys = {(d, t) for d, t, _p in missing}
+        baseline_keys = baseline.get(ts_rel, set())
+        file_new = sorted(current_missing_keys - baseline_keys)
+        file_fixed = sorted(baseline_keys - current_missing_keys)
+        if file_new:
+            new_misses[ts_rel] = file_new
+        if file_fixed:
+            fixed[ts_rel] = file_fixed
 
         absorber_note = f" ({absorbers} absorbers)" if absorbers else ""
         status = "OK" if not missing else f"GAPS ({len(missing)})"
@@ -243,7 +314,8 @@ def main() -> int:
 
         if missing:
             for describe, ts_name, _py_name in missing[:5]:
-                print(f"    MISSING: [{describe}] {ts_name}")
+                marker = "NEW" if (describe, ts_name) in set(file_new) else "baselined"
+                print(f"    MISSING ({marker}): [{describe}] {ts_name}")
             if len(missing) > 5:
                 print(f"    ... and {len(missing) - 5} more")
 
@@ -272,10 +344,48 @@ def main() -> int:
     else:
         print(f"TOTAL: {total_matched}/{total_ts} matched ({pct}%), {total_missing} missing")
 
-    if total_missing > 0:
-        print("\nRun with --fix to generate stubs for missing tests.")
+    if update_baseline:
+        write_baseline(BASELINE_PATH, all_missing, total_ts)
+        print(f"\nBaseline written to {BASELINE_PATH}")
+        print(f"  {total_missing} missing tests baselined across {sum(1 for v in all_missing.values() if v)} files")
+        return 0
+
+    if total_missing == 0:
+        print("\nAll TS tests have Python equivalents.")
+        if any(baseline.values()):
+            print("Baseline is stale — run with --update-baseline to clear it.")
+        return 0
+
+    if strict_mode:
+        print(f"\n{total_missing} missing (strict mode — baseline ignored).")
+        print("Run with --fix to generate stubs for missing tests.")
         return 1
-    print("\nAll TS tests have Python equivalents.")
+
+    if new_misses:
+        new_count = sum(len(v) for v in new_misses.values())
+        print(f"\n{new_count} NEW miss(es) outside the baseline:")
+        for ts_rel, entries in new_misses.items():
+            for describe, ts_name in entries:
+                print(f"  - {ts_rel} :: [{describe}] {ts_name}")
+        print("\nOptions:")
+        print("  1. Port the missing TS test(s) to the matching Python file")
+        print("  2. If intentional divergence, document in docs/UPSTREAM_SYNC.md")
+        print("     and re-baseline with --update-baseline")
+        print("\nRun with --fix to generate Python stubs for missing tests.")
+        return 1
+
+    if fixed:
+        fixed_count = sum(len(v) for v in fixed.values())
+        print(f"\n✓ {fixed_count} test(s) fixed since baseline (no longer missing):")
+        for _ts_rel, entries in fixed.items():
+            for describe, ts_name in entries[:5]:
+                print(f"    - [{describe}] {ts_name}")
+            if len(entries) > 5:
+                print(f"    ... and {len(entries) - 5} more")
+        print("\nRun with --update-baseline to tighten the baseline.")
+
+    baseline_total = sum(len(v) for v in baseline.values())
+    print(f"\n{total_missing}/{baseline_total} baseline miss(es) still present — no new drift.")
     return 0
 
 
