@@ -59,17 +59,16 @@ jobs:
 
       - name: Clone upstream vercel/chat at pinned parity tag
         id: clone_upstream
-        continue-on-error: true
         run: |
           git clone --depth 1 --branch chat@4.26.0 \
             https://github.com/vercel/chat.git /tmp/vercel-chat
 
-      - name: Test fidelity check (baseline-enforced)
+      - name: Test fidelity check (strict — zero missing)
         id: fidelity
         continue-on-error: true
         env:
           TS_ROOT: /tmp/vercel-chat
-        run: uv run python scripts/verify_test_fidelity.py
+        run: uv run python scripts/verify_test_fidelity.py --strict
 
       - name: Pyrefly type check
         id: pyrefly
