@@ -8,6 +8,7 @@ sismember, rpush, lpush, lrange, ltrim, llen, lpop, ping, aclose.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -378,7 +379,7 @@ class TestRedisStateKV:
     @pytest.mark.asyncio
     async def test_set_with_ttl_expires(self, redis_state: RedisStateAdapter):
         await redis_state.set("key", "value", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await redis_state.get("key") is None
 
     @pytest.mark.asyncio
@@ -389,7 +390,7 @@ class TestRedisStateKV:
     @pytest.mark.asyncio
     async def test_set_without_ttl_never_expires(self, redis_state: RedisStateAdapter):
         await redis_state.set("key", "value")
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await redis_state.get("key") == "value"
 
 
@@ -418,13 +419,13 @@ class TestRedisStateSetIfNotExists:
     async def test_set_if_not_exists_with_ttl(self, redis_state: RedisStateAdapter):
         result = await redis_state.set_if_not_exists("key", "value", ttl_ms=1)
         assert result is True
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         assert await redis_state.get("key") is None
 
     @pytest.mark.asyncio
     async def test_set_if_not_exists_after_expired_key(self, redis_state: RedisStateAdapter):
         await redis_state.set("key", "old", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         result = await redis_state.set_if_not_exists("key", "new")
         assert result is True
         assert await redis_state.get("key") == "new"
@@ -457,7 +458,7 @@ class TestRedisStateLocks:
     async def test_acquire_lock_succeeds_after_expiry(self, redis_state: RedisStateAdapter):
         lock1 = await redis_state.acquire_lock("thread-1", 1)
         assert lock1 is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         lock2 = await redis_state.acquire_lock("thread-1", 30_000)
         assert lock2 is not None
         assert lock2.thread_id == "thread-1"
@@ -494,7 +495,7 @@ class TestRedisStateLocks:
         result = await redis_state.extend_lock(lock, 60_000)
         assert result is True
 
-        time.sleep(0.15)
+        await asyncio.sleep(0.15)
         # Lock still held because we extended
         lock2 = await redis_state.acquire_lock("thread-1", 30_000)
         assert lock2 is None
@@ -512,7 +513,7 @@ class TestRedisStateLocks:
     async def test_extend_lock_after_expiry_fails(self, redis_state: RedisStateAdapter):
         lock = await redis_state.acquire_lock("thread-1", 1)
         assert lock is not None
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
 
         result = await redis_state.extend_lock(lock, 60_000)
         assert result is False
@@ -702,7 +703,7 @@ class TestRedisStateTokenPrefix:
             assert ok is True
 
             # Wait past the original 100ms TTL; extend bumped it to 60s.
-            time.sleep(0.15)
+            await asyncio.sleep(0.15)
             contender = await adapter.acquire_lock("thread-1", 30_000)
             assert contender is None
         finally:
@@ -771,7 +772,7 @@ class TestRedisStateLists:
     @pytest.mark.asyncio
     async def test_list_with_ttl_expires(self, redis_state: RedisStateAdapter):
         await redis_state.append_to_list("key", "a", ttl_ms=1)
-        time.sleep(0.005)
+        await asyncio.sleep(0.005)
         result = await redis_state.get_list("key")
         assert result == []
 
