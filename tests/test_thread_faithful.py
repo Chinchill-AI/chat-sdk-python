@@ -2614,6 +2614,33 @@ class TestGetParticipants:
         assert len(participants) == 1
         assert participants[0].user_id == "U1"
 
+    # Python-only: isolates the is_me=True, is_bot=False exclusion path
+    # (addresses PR #64 bot-review nit — prior test mixes is_bot and is_me).
+    @pytest.mark.asyncio
+    async def test_should_exclude_self_messages_even_when_not_bot(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        self_msg = create_test_message(
+            "1",
+            "my msg",
+            author=Author(user_id="U_SELF", user_name="me", full_name="Me", is_bot=False, is_me=True),
+        )
+        other_msg = create_test_message(
+            "2",
+            "hi",
+            author=Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False),
+        )
+
+        adapter.fetch_messages = AsyncMock(  # type: ignore[assignment]
+            return_value=FetchResult(messages=[self_msg, other_msg], next_cursor=None)
+        )
+
+        thread = _make_thread(adapter, state)
+        participants = await thread.get_participants()
+
+        assert [p.user_id for p in participants] == ["U1"]
+
     # it("should return empty array for thread with only bot messages")
     @pytest.mark.asyncio
     async def test_should_return_empty_array_for_thread_with_only_bot_messages(self):
