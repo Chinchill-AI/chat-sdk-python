@@ -753,7 +753,6 @@ class TestPostgresStateLocks:
 
         # Third acquire after expiry: should succeed in single query
         mock_pool.executed_queries.clear()
-        await asyncio.sleep(0.005)
         # Force-expire the lock for testing
         lock_key = ("test", "race-thread")
         mock_pool.locks[lock_key]["expires_at"] = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
