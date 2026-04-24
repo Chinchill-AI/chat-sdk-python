@@ -17,6 +17,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn
+from urllib.parse import urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -593,16 +594,70 @@ class TeamsAdapter:
             fetch_data=self._build_teams_fetch_data(url) if url else None,
         )
 
+    @staticmethod
+    def _is_trusted_teams_download_url(url: str) -> bool:
+        """Gate Teams file downloads to Microsoft-owned hosts.
+
+        After ``rehydrate_attachment`` reconstructs the fetch closure
+        from serialized ``fetch_metadata``, the URL may have been
+        tampered with.  We refuse to issue a direct GET unless the host
+        is a known Microsoft/Graph download host.
+
+        This is a Python-first divergence: upstream Teams adapter does
+        not validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known
+        Non-Parity.
+        """
+        try:
+            parsed = urlparse(url)
+        except (ValueError, TypeError):
+            return False
+        if parsed.scheme != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        # Microsoft Graph / Bot Framework / SharePoint / Teams file hosts
+        allowed_suffixes = (
+            ".botframework.com",
+            ".graph.microsoft.com",
+            ".sharepoint.com",
+            ".officeapps.live.com",
+            ".office.com",
+            ".office365.com",
+            ".onedrive.com",
+            ".microsoft.com",
+        )
+        if host.endswith(allowed_suffixes):
+            return True
+        # Exact-match traffic-manager / Graph / Teams service hosts
+        return host in {
+            "smba.trafficmanager.net",
+            "graph.microsoft.com",
+            "attachments.office.net",
+        }
+
     def _build_teams_fetch_data(self, url: str) -> Callable[[], Awaitable[bytes]]:
-        """Build a lazy ``fetch_data`` closure for a Teams file URL."""
+        """Build a lazy ``fetch_data`` closure for a Teams file URL.
+
+        Uses the adapter's shared ``aiohttp.ClientSession`` (via
+        :meth:`_get_http_session`) so downloads reuse the connection
+        pool instead of constructing a throwaway client per request.
+        """
 
         async def fetch_data() -> bytes:
-            import httpx
-
-            async with httpx.AsyncClient() as http:
-                resp = await http.get(url)
-                resp.raise_for_status()
-                return resp.content
+            if not self._is_trusted_teams_download_url(url):
+                raise ValidationError(
+                    "teams",
+                    f"Refusing to fetch Teams file from untrusted URL: {url}",
+                )
+            session = await self._get_http_session()
+            async with session.get(url) as resp:
+                if resp.status >= 400:
+                    raise NetworkError(
+                        "teams",
+                        f"Failed to fetch file: {resp.status}",
+                    )
+                return await resp.read()
 
         return fetch_data
 
@@ -613,9 +668,12 @@ class TeamsAdapter:
         need to rebuild the download closure is the URL — either from
         ``fetch_metadata["url"]`` or the attachment's top-level ``url``.
         Returns the attachment unchanged when no URL is available.
+        The URL host is validated inside the closure, so tampered URLs
+        raise at fetch time.
         """
-        meta = attachment.fetch_metadata or {}
-        url = meta.get("url") or attachment.url
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        meta_url = meta.get("url")
+        url = meta_url if meta_url is not None else attachment.url
         if not url:
             return attachment
         return Attachment(

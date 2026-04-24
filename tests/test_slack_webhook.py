@@ -565,6 +565,10 @@ class TestRehydrateAttachment:
             ),
         )
 
+        # Stub the network GET — assert the tenant token is forwarded.
+        fetch_mock = AsyncMock(return_value=b"workspace-bytes")
+        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
                 type="image",
@@ -577,12 +581,22 @@ class TestRehydrateAttachment:
         )
 
         assert rehydrated.fetch_data is not None
+        result = await rehydrated.fetch_data()
+        assert result == b"workspace-bytes"
+        fetch_mock.assert_awaited_once_with(
+            "https://files.slack.com/img.png",
+            "xoxb-multi-workspace-token",
+        )
 
     # TS: "should fall back to getToken when no teamId in fetchMetadata"
-    def test_should_fall_back_to_gettoken_when_no_teamid_in_fetchmetadata(self):
+    @pytest.mark.asyncio
+    async def test_should_fall_back_to_gettoken_when_no_teamid_in_fetchmetadata(self):
         from chat_sdk.types import Attachment
 
         adapter = _make_adapter(bot_token="xoxb-single")
+        fetch_mock = AsyncMock(return_value=b"single-bytes")
+        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
                 type="image",
@@ -591,6 +605,13 @@ class TestRehydrateAttachment:
             )
         )
         assert rehydrated.fetch_data is not None
+        result = await rehydrated.fetch_data()
+        assert result == b"single-bytes"
+        # Bot token (not a workspace-specific install token) is forwarded.
+        fetch_mock.assert_awaited_once_with(
+            "https://files.slack.com/img.png",
+            "xoxb-single",
+        )
 
     # TS: "should return attachment unchanged when no url"
     def test_should_return_attachment_unchanged_when_no_url(self):
@@ -603,6 +624,48 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is None
         # Upstream asserts `toBe(attachment)` — identical object.
         assert rehydrated is attachment
+
+    # Python-first divergence: reject SSRF vectors at fetch time even if the
+    # serialized attachment appeared valid when it was queued.
+    @pytest.mark.asyncio
+    async def test_rehydrated_fetch_data_rejects_untrusted_host(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(bot_token="xoxb-ssrf-token")
+
+        # Sentinel — should NEVER be reached because validation rejects first.
+        evil_fetch = AsyncMock(return_value=b"should-not-run")
+        adapter._fetch_slack_file = evil_fetch  # type: ignore[method-assign]
+        # Restore the real validator + wrap it so we can assert on behavior.
+        real_fetch = SlackAdapter._fetch_slack_file
+
+        async def guarded_fetch(url: str, token: str) -> bytes:
+            return await real_fetch(adapter, url, token)
+
+        adapter._fetch_slack_file = guarded_fetch  # type: ignore[method-assign]
+
+        rehydrated = adapter.rehydrate_attachment(
+            Attachment(
+                type="image",
+                url="https://attacker.example.com/steal",
+                fetch_metadata={"url": "https://attacker.example.com/steal"},
+            )
+        )
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError):
+            await rehydrated.fetch_data()
+
+    def test_is_trusted_slack_download_url_allowlist(self):
+        # Accepts Slack-owned HTTPS hosts
+        assert SlackAdapter._is_trusted_slack_download_url("https://files.slack.com/f.png")
+        assert SlackAdapter._is_trusted_slack_download_url("https://foo.slack-edge.com/x.png")
+        assert SlackAdapter._is_trusted_slack_download_url("https://edge.slack.com/x")
+        # Rejects non-HTTPS even on a trusted host
+        assert not SlackAdapter._is_trusted_slack_download_url("http://files.slack.com/x")
+        # Rejects arbitrary hosts
+        assert not SlackAdapter._is_trusted_slack_download_url("https://attacker.example/x")
+        # Rejects look-alike hosts that merely contain "slack.com"
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack.com.attacker.tld/x")
 
 
 # ---------------------------------------------------------------------------

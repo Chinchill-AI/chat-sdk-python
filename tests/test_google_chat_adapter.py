@@ -245,3 +245,42 @@ class TestRehydrateAttachment:
         attachment = Attachment(type="file", name="local.bin")
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated is attachment
+
+    # Python-first divergence: SSRF guard on the downloadUri fallback path.
+    # The resource_name branch stays trusted (the URL is constructed by
+    # `_build_gchat_fetch_data` from a validated ``spaces/.../messages/...``
+    # identifier, not from an attacker-controllable string).  The `url`
+    # branch is the one that accepts serialized fetch_metadata.
+    @pytest.mark.asyncio
+    async def test_rehydrated_fetch_data_rejects_untrusted_url(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter()
+        # These must never be awaited — validation rejects first.
+        adapter._get_access_token = AsyncMock()  # type: ignore[method-assign]
+        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
+
+        attachment = Attachment(
+            type="image",
+            url="https://attacker.example.com/pwn",
+            fetch_metadata={"url": "https://attacker.example.com/pwn"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError):
+            await rehydrated.fetch_data()
+        adapter._get_access_token.assert_not_awaited()
+        adapter._get_http_session.assert_not_awaited()
+
+    def test_is_trusted_gchat_download_url_allowlist(self):
+        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://chat.googleapis.com/v1/media/X?alt=media")
+        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://lh3.googleusercontent.com/photo.jpg")
+        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://foo.google.com/x")
+        # Rejects non-HTTPS
+        assert not GoogleChatAdapter._is_trusted_gchat_download_url("http://chat.googleapis.com/x")
+        # Rejects arbitrary hosts
+        assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://attacker.example/x")
+        # Rejects look-alikes
+        assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://chat.googleapis.com.attacker.tld/x")

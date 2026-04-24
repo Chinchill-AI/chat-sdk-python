@@ -1376,7 +1376,7 @@ class TelegramAdapter:
         no file ID is present (e.g. a pre-serialized attachment that did
         not originate from this adapter).
         """
-        meta = attachment.fetch_metadata or {}
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
         file_id = meta.get("fileId")
         if not file_id:
             return attachment

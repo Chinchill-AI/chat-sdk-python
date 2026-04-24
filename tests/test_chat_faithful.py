@@ -2380,6 +2380,54 @@ def _install_json_roundtrip_enqueue(state: MockStateAdapter) -> None:
     state.enqueue = enqueue  # type: ignore[method-assign]
 
 
+def _install_message_instance_roundtrip(state: MockStateAdapter) -> None:
+    """Simulate the Python Redis / Postgres ``dequeue`` upgrade path.
+
+    Unlike upstream TS state adapters (which return ``JSON.parse(...)`` raw
+    dicts from ``dequeue``), our ``RedisStateAdapter.dequeue`` and
+    ``PostgresStateAdapter.dequeue`` call ``Message.from_json(...)`` on the
+    dequeued payload and return a proper :class:`Message` instance whose
+    attachments have been JSON-roundtripped (so ``fetch_data`` is stripped).
+
+    This wrapper recreates that behavior on the in-memory state adapter so
+    we can assert that ``Chat._rehydrate_message`` still calls the
+    adapter's ``rehydrate_attachment`` hook on ``Message`` inputs.
+    """
+    import json as _json
+
+    original_enqueue = state.enqueue
+    original_dequeue = state.dequeue
+
+    async def enqueue(thread_id: str, entry: QueueEntry, max_size: int) -> int:
+        serialized_msg = _json.loads(_json.dumps(entry.message.to_json()))
+        serialized_entry = QueueEntry(
+            enqueued_at=entry.enqueued_at,
+            expires_at=entry.expires_at,
+            message=serialized_msg,  # type: ignore[arg-type]
+        )
+        return await original_enqueue(thread_id, serialized_entry, max_size)
+
+    async def dequeue(thread_id: str) -> QueueEntry | None:
+        from chat_sdk.types import Message
+
+        entry = await original_dequeue(thread_id)
+        if entry is None:
+            return None
+        raw_msg = entry.message
+        # Upstream's dequeue leaves this as a raw dict.  Ours rebuilds a
+        # Message instance — mimic that behavior here.
+        if isinstance(raw_msg, dict) and raw_msg.get("_type") == "chat:Message":
+            raw_msg = Message.from_json(raw_msg)
+        return QueueEntry(
+            enqueued_at=entry.enqueued_at,
+            expires_at=entry.expires_at,
+            message=raw_msg,
+        )
+
+    state.enqueue = enqueue  # type: ignore[method-assign]
+    state.dequeue = dequeue  # type: ignore[method-assign]
+
+
 class TestConcurrencyQueueAttachmentRehydration:
     """Faithful port of TS ``describe("concurrency: queue attachment rehydration")``."""
 
@@ -2556,6 +2604,82 @@ class TestConcurrencyQueueAttachmentRehydration:
         assert queued_attachments is not None
         assert queued_attachments[0].fetch_metadata == {"url": "https://example.com/f.pdf"}
         assert queued_attachments[0].fetch_data is None
+
+    # Python-first regression: Redis / Postgres `dequeue` returns a Message
+    # instance (not a raw dict).  Without our divergence from upstream's
+    # `raw instanceof Message -> return untouched` shortcut, rehydration
+    # would be silently skipped for every persistent-backend dequeue.
+    async def test_rehydrates_attachments_when_dequeue_returns_message_instance(self):
+        state = create_mock_state()
+        _install_message_instance_roundtrip(state)
+        adapter = create_mock_adapter("slack")
+
+        rehydrate_calls: list[Attachment] = []
+
+        async def mock_fetch_data() -> bytes:
+            return b"rehydrated-bytes"
+
+        def rehydrate(att: Attachment) -> Attachment:
+            rehydrate_calls.append(att)
+            return Attachment(
+                type=att.type,
+                url=att.url,
+                name=att.name,
+                mime_type=att.mime_type,
+                size=att.size,
+                width=att.width,
+                height=att.height,
+                fetch_metadata=att.fetch_metadata,
+                fetch_data=mock_fetch_data,
+            )
+
+        adapter.rehydrate_attachment = rehydrate  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        received_attachments: list[list[Attachment]] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_attachments.append(message.attachments)
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+
+        async def original_fetch() -> bytes:
+            return b"original"
+
+        msg = create_test_message(
+            "msg-mi-1",
+            "Hey @slack-bot file",
+            attachments=[
+                Attachment(
+                    type="file",
+                    url="https://example.com/f.pdf",
+                    name="f.pdf",
+                    fetch_metadata={"url": "https://example.com/f.pdf"},
+                    fetch_data=original_fetch,
+                ),
+            ],
+        )
+
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        trigger = create_test_message("msg-mi-2", "Hey @slack-bot trigger")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", trigger)
+
+        # The queued attachment went through a JSON roundtrip (fetch_data
+        # stripped) and was upgraded to a Message instance by the wrapper
+        # dequeue — rehydrate_attachment must still fire.
+        assert len(rehydrate_calls) == 1
+        assert rehydrate_calls[0].name == "f.pdf"
+
+        queued_attachments = next(
+            (atts for atts in received_attachments if atts and atts[0].name == "f.pdf"),
+            None,
+        )
+        assert queued_attachments is not None
+        assert queued_attachments[0].fetch_data is mock_fetch_data
 
 
 # ============================================================================

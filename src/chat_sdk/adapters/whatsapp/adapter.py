@@ -643,7 +643,7 @@ class WhatsAppAdapter:
         ``download_media`` closure.  Returns the attachment unchanged when
         no media ID is present.
         """
-        meta = attachment.fetch_metadata or {}
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
         media_id = meta.get("mediaId")
         if not media_id:
             return attachment

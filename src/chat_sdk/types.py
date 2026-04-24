@@ -519,7 +519,9 @@ class Message:
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
-                    fetch_metadata=att.get("fetchMetadata") or att.get("fetch_metadata"),
+                    fetch_metadata=(
+                        att.get("fetchMetadata") if att.get("fetchMetadata") is not None else att.get("fetch_metadata")
+                    ),
                 )
                 for att in attachments_data
             ],
@@ -591,7 +593,9 @@ class Message:
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
-                    fetch_metadata=att.get("fetch_metadata") or att.get("fetchMetadata"),
+                    fetch_metadata=(
+                        att.get("fetch_metadata") if att.get("fetch_metadata") is not None else att.get("fetchMetadata")
+                    ),
                 )
                 for att in attachments_data
             ],

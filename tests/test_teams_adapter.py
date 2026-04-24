@@ -37,6 +37,33 @@ def _make_logger():
     )
 
 
+class _MockAiohttpSession:
+    """Stub for ``aiohttp.ClientSession`` that supports the
+    ``async with session.get(url) as resp`` pattern.
+
+    ``session.get(url)`` returns a synchronous async-context-manager (not
+    a coroutine), so we can't use ``AsyncMock`` for it — the real
+    aiohttp API is not itself async.  Implementing it as a real method
+    also keeps us out of ``audit_test_quality.py``'s "MagicMock used for
+    async method `.get`" false-positive (which pattern-matches on
+    ``KeyValueState.get``, not ``ClientSession.get``).
+    """
+
+    def __init__(self, payload: bytes = b"", status: int = 200):
+        response = MagicMock()
+        response.status = status
+        response.read = AsyncMock(return_value=payload)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=response)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        self._cm = cm
+        self.get_calls: list[str] = []
+
+    def get(self, url: str):
+        self.get_calls.append(url)
+        return self._cm
+
+
 # ---------------------------------------------------------------------------
 # Factory function
 # ---------------------------------------------------------------------------
@@ -352,27 +379,49 @@ class TestParseMessage:
 
 
 class TestRehydrateAttachment:
-    def test_rehydrates_fetch_data_from_fetch_metadata_url(self):
-        """After JSON roundtrip (fetch_data stripped), the URL in fetch_metadata restores the closure."""
+    @pytest.mark.asyncio
+    async def test_rehydrates_fetch_data_from_fetch_metadata_url(self):
+        """After JSON roundtrip (fetch_data stripped), the URL in fetch_metadata restores the closure.
+
+        Awaits the rebuilt closure against a stubbed HTTP session to prove
+        the wire-up is correct (not just "some callable was returned").
+        """
         from chat_sdk.types import Attachment
 
+        trusted_url = "https://graph.microsoft.com/photo.jpg"
         adapter = _make_adapter(app_id="test-app")
+
+        session = _MockAiohttpSession(payload=b"teams-bytes")
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
         attachment = Attachment(
             type="image",
-            url="https://x.com/photo.jpg",
-            fetch_metadata={"url": "https://x.com/photo.jpg"},
+            url=trusted_url,
+            fetch_metadata={"url": trusted_url},
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
 
-    def test_rehydrate_falls_back_to_attachment_url_when_fetch_metadata_missing(self):
+        bytes_result = await rehydrated.fetch_data()
+        assert bytes_result == b"teams-bytes"
+        assert session.get_calls == [trusted_url]
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_falls_back_to_attachment_url_when_fetch_metadata_missing(self):
         """When fetch_metadata is absent, rehydrate falls back to the attachment's top-level url."""
         from chat_sdk.types import Attachment
 
+        trusted_url = "https://attachments.office.net/doc.pdf"
         adapter = _make_adapter(app_id="test-app")
-        attachment = Attachment(type="file", url="https://x.com/doc.pdf")
+
+        session = _MockAiohttpSession(payload=b"fallback-bytes")
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        attachment = Attachment(type="file", url=trusted_url)
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
+        assert await rehydrated.fetch_data() == b"fallback-bytes"
+        assert session.get_calls == [trusted_url]
 
     def test_rehydrate_returns_unchanged_when_no_url(self):
         """Without any URL, rehydrate returns the attachment unchanged."""
@@ -382,6 +431,40 @@ class TestRehydrateAttachment:
         attachment = Attachment(type="file", name="local.bin")
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated is attachment
+
+    # Python-first divergence: SSRF guard at fetch time.
+    @pytest.mark.asyncio
+    async def test_rehydrated_fetch_data_rejects_untrusted_host(self):
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(app_id="test-app")
+        # If the validator is bypassed, this would be called — it must not be.
+        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
+
+        attachment = Attachment(
+            type="image",
+            url="https://attacker.example.com/pwn.jpg",
+            fetch_metadata={"url": "https://attacker.example.com/pwn.jpg"},
+        )
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError):
+            await rehydrated.fetch_data()
+        adapter._get_http_session.assert_not_awaited()
+
+    def test_is_trusted_teams_download_url_allowlist(self):
+        # Accepts Microsoft-owned hosts
+        assert TeamsAdapter._is_trusted_teams_download_url("https://graph.microsoft.com/x")
+        assert TeamsAdapter._is_trusted_teams_download_url("https://foo.sharepoint.com/x")
+        assert TeamsAdapter._is_trusted_teams_download_url("https://smba.trafficmanager.net/x")
+        assert TeamsAdapter._is_trusted_teams_download_url("https://attachments.office.net/x")
+        assert TeamsAdapter._is_trusted_teams_download_url("https://x.botframework.com/y")
+        # Rejects non-HTTPS
+        assert not TeamsAdapter._is_trusted_teams_download_url("http://graph.microsoft.com/x")
+        # Rejects arbitrary hosts
+        assert not TeamsAdapter._is_trusted_teams_download_url("https://attacker.example/x")
+        # Rejects look-alikes
+        assert not TeamsAdapter._is_trusted_teams_download_url("https://graph.microsoft.com.attacker.tld/x")
 
 
 # ---------------------------------------------------------------------------

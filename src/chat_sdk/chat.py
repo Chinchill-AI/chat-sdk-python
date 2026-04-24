@@ -2135,13 +2135,21 @@ class Chat:
         attachment that lost its ``fetch_data`` closure so downstream
         handlers can still download bytes.
         """
-        # Matches upstream: if the entry is already a Message instance, its
-        # fetch_data closures never went through a JSON roundtrip, so we
-        # return it untouched — no rehydrate pass.
+        # Diverges from upstream: upstream TS has
+        # ``if (raw instanceof Message) return raw;`` because its Redis /
+        # Postgres ``dequeue()`` returns the raw ``JSON.parse(value)`` —
+        # never a ``Message`` instance.  Our Python port's Redis +
+        # Postgres ``dequeue()`` already upgrade the raw dict to
+        # ``Message.from_json(...)`` before returning (see
+        # ``state/redis.py`` and ``state/postgres.py``).  An early return
+        # here would therefore skip ``rehydrate_attachment`` for every
+        # dequeued Message in a persistent backend, leaving
+        # ``fetch_data`` stripped.  We fall through and apply the
+        # rehydrate pass; attachments that still have ``fetch_data``
+        # (e.g. in-memory state) are filtered out below.
         if isinstance(raw, Message):
-            return raw
-
-        if isinstance(raw, dict):
+            msg = raw
+        elif isinstance(raw, dict):
             if raw.get("_type") == "chat:Message":
                 msg = _message_from_json(raw)
             else:
