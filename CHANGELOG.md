@@ -1,8 +1,7 @@
 # Changelog
 
-## Unreleased
+## 0.4.26.2 (2026-04-24)
 
-<<<<<<< HEAD
 Parity catch-up with upstream `4.26.0`. No upstream version change.
 
 ### New public APIs
@@ -78,7 +77,7 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
 
 ### Fixes
 
-- **`Plan.update_task(input)` / `StreamingPlan.update_task(input)` now honor `input.id`** — previously only worked on the last in-progress task; with `id` set, targets that specific task and returns `None` for unknown IDs. Matches upstream `UpdateTaskInput` semantics.
+- **`Plan.update_task(input)` now honors `input.id`** — previously only worked on the last in-progress task; with `id` set, targets that specific task and returns `None` for unknown IDs. Matches upstream `UpdateTaskInput` semantics.
 - **`Plan.add_task()` / `update_task()` now propagate `adapter.edit_object` errors** — previously swallowed and logged; upstream returns the chained promise so callers see failures.
 - **Plan edit queue is now actually sequential under concurrency** — previously racy under `asyncio.gather`; rewrote `_enqueue_edit` to build the chain synchronously before awaiting, matching upstream TS's `.then`-based chain. Fixes out-of-order edits when multiple `add_task`/`update_task` calls interleave.
 - **`StreamingPlan` options now wired through `Thread.post()`** — the Python

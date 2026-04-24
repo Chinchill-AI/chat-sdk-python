@@ -1055,6 +1055,9 @@ class SlackAdapter:
         # Use asyncio.shield so the orphaned task still runs (and logs errors)
         # if we time out. `wait_for` cancels the awaitable on timeout; shielding
         # prevents that cancellation from propagating into the handler task.
+        # Use asyncio.ensure_future — process_options_load is typed as returning
+        # Awaitable (matching sibling process_* methods on the ChatInstance
+        # Protocol); create_task() would require narrowing to Coroutine.
         load_task = asyncio.ensure_future(self._chat.process_options_load(event, options))
 
         try:
