@@ -1,5 +1,5 @@
 {
-  "_comment": "Ratchet-down baseline for scripts/verify_test_fidelity.py. This repo ships at strict fidelity (0 missing) against chat@4.26.0, so the baseline is empty. Default CI mode now runs --strict via .github/workflows/lint.yml; this file is retained for local workflows that want to opt back into baseline mode (e.g. during an upstream sync where several ports land in flight). To baseline genuinely-divergent tests, run scripts/verify_test_fidelity.py --update-baseline after documenting the divergence in docs/UPSTREAM_SYNC.md.",
+  "_comment": "Ratchet-down baseline for scripts/verify_test_fidelity.py. This repo ships at strict fidelity for mapped core files (0 missing) against chat@4.26.0, so the baseline is empty. Scope: the MAPPING dict in scripts/verify_test_fidelity.py is the authoritative list of TS files checked; it currently covers 8 of the 17 packages/chat/src/*.test.ts files. Default CI mode runs --strict via .github/workflows/lint.yml; this file is retained for local workflows that want to opt back into baseline mode (e.g. during an upstream sync where several ports land in flight). To baseline genuinely-divergent tests, run scripts/verify_test_fidelity.py --update-baseline after documenting the divergence in docs/UPSTREAM_SYNC.md.",
   "ts_parity": "chat@4.26.0",
   "total_ts_tests": 588,
   "total_missing": 0,

@@ -102,7 +102,10 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   or when any mapped TS file can't be found. Workflow runs `--strict` and
   the clone step no longer carries `continue-on-error: true`, so infra
   failures surface immediately at the job level. Baseline shipped empty
-  (all previously-missing tests ported in this release). Closes #53, #72.
+  (all previously-missing tests ported in this release) — strict fidelity
+  for *mapped core files* (8 of 17 `packages/chat/src/*.test.ts` files;
+  see the `MAPPING` dict in `scripts/verify_test_fidelity.py` for the
+  authoritative scope list). Closes #53, #72.
 
 ## 0.4.26.1 (2026-04-23)
 

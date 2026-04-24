@@ -77,8 +77,12 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 `scripts/verify_test_fidelity.py` runs in CI (`.github/workflows/lint.yml`) pinned
 to `vercel/chat@4.26.0` (matches the `UPSTREAM_PARITY` constant in
 `src/chat_sdk/__init__.py`). **CI runs `--strict`** — the repo ships at 0
-missing as of `0.4.26.2` and the baseline (`scripts/fidelity_baseline.json`)
-is empty.
+missing *for mapped core files* as of `0.4.26.2` and the baseline
+(`scripts/fidelity_baseline.json`) is empty. Scope is defined by the
+`MAPPING` dict in the script: 8 of 17 `packages/chat/src/*.test.ts` files
+today (extending to the remaining 9 is tracked as a follow-up). Unmapped
+files are not checked — tightening scope requires editing `MAPPING` and
+re-running `--strict`.
 
 Infra guardrails:
 

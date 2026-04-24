@@ -266,19 +266,38 @@ def load_baseline(path: Path) -> dict[str, set[tuple[str, str]]]:
     return out
 
 
+_DEFAULT_BASELINE_COMMENT = (
+    "Ratchet-down baseline for scripts/verify_test_fidelity.py. "
+    "Each entry is a [describe_block, ts_it_name] pair that is known "
+    "to be missing a Python translation. CI runs --strict (see "
+    ".github/workflows/lint.yml) and ignores this file; baseline "
+    "mode is a local-dev opt-in that accepts any subset of this "
+    "list as missing and fails on new misses outside it. To remove "
+    "entries: port the TS test to its Python counterpart, then "
+    "regenerate this file with --update-baseline."
+)
+
+
 def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> None:
-    """Persist the current set of missing tests as the new baseline."""
+    """Persist the current set of missing tests as the new baseline.
+
+    If ``path`` already exists and has a ``_comment`` field, that curated
+    comment is preserved so hand-written context (e.g. scope qualifiers,
+    shipping-posture notes) isn't silently overwritten on every
+    ``--update-baseline`` run. Only fresh files get the default boilerplate.
+    """
+    existing_comment: str | None = None
+    if path.exists():
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+            if isinstance(existing.get("_comment"), str):
+                existing_comment = existing["_comment"]
+        except (OSError, json.JSONDecodeError):
+            existing_comment = None
+
     payload = {
-        "_comment": (
-            "Ratchet-down baseline for scripts/verify_test_fidelity.py. "
-            "Each entry is a [describe_block, ts_it_name] pair that is known "
-            "to be missing a Python translation. CI runs --strict (see "
-            ".github/workflows/lint.yml) and ignores this file; baseline "
-            "mode is a local-dev opt-in that accepts any subset of this "
-            "list as missing and fails on new misses outside it. To remove "
-            "entries: port the TS test to its Python counterpart, then "
-            "regenerate this file with --update-baseline."
-        ),
+        "_comment": existing_comment if existing_comment is not None else _DEFAULT_BASELINE_COMMENT,
         "ts_parity": "chat@4.26.0",
         "total_ts_tests": total_ts,
         "total_missing": sum(len(v) for v in all_missing.values()),
