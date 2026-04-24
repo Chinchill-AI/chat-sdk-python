@@ -1786,6 +1786,47 @@ class TestPostWithPlan:
         assert len(plan.tasks) == 1
         assert plan.tasks[0].status == "in_progress"
 
+    # it("should return currentTask correctly")
+    @pytest.mark.asyncio
+    async def test_should_return_currenttask_correctly(self):
+        from chat_sdk.plan import (
+            AddTaskOptions,
+            CompletePlanOptions,
+            Plan,
+            StartPlanOptions,
+        )
+
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_object = AsyncMock(return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={}))
+        edit_object = AsyncMock(return_value=None)
+        adapter.post_object = post_object  # type: ignore[attr-defined]
+        adapter.edit_object = edit_object  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await thread.post(plan)
+
+        # Initially, current task is the first one
+        current = plan.current_task
+        assert current is not None
+        assert current.title == "Start"
+        assert current.status == "in_progress"
+
+        # After adding a new task, current should be the new one
+        await plan.add_task(AddTaskOptions(title="Step 2"))
+        current = plan.current_task
+        assert current is not None
+        assert current.title == "Step 2"
+        assert current.status == "in_progress"
+
+        # After completion, currentTask returns the last task
+        await plan.complete(CompletePlanOptions(complete_message="Done"))
+        current = plan.current_task
+        assert current is not None
+        assert current.title == "Step 2"
+        assert current.status == "complete"
+
     # it("should handle various PlanContent formats in initialMessage")
     @pytest.mark.asyncio
     async def test_should_handle_various_plancontent_formats_in_initialmessage(self):
