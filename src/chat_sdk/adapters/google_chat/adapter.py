@@ -2684,12 +2684,13 @@ class GoogleChatAdapter:
         """
         meta = attachment.fetch_metadata or {}
         resource_name = meta.get("resourceName")
-        url = meta.get("url") or attachment.url
-        if not (resource_name or url):
+        meta_url = meta.get("url")
+        url = meta_url if meta_url is not None else attachment.url
+        if resource_name is None and url is None:
             return attachment
         return Attachment(
             type=attachment.type,
-            url=attachment.url,
+            url=url,
             name=attachment.name,
             mime_type=attachment.mime_type,
             size=attachment.size,

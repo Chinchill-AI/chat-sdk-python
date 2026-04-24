@@ -2189,9 +2189,11 @@ class Chat:
         # Matches TS: `adapter?.rehydrateAttachment?.(att)` — duck-typed so
         # adapters that do not declare the hook (e.g. bare MockAdapter) are
         # treated as no-ops and the attachment is left untouched.
-        rehydrate = getattr(adapter, "rehydrate_attachment", None) if adapter else None
-        if callable(rehydrate) and msg.attachments:
-            msg.attachments = [att if att.fetch_data is not None else rehydrate(att) for att in msg.attachments]
+        rehydrate_fn: Callable[[Attachment], Attachment] | None = (
+            getattr(adapter, "rehydrate_attachment", None) if adapter else None
+        )
+        if rehydrate_fn is not None and msg.attachments:
+            msg.attachments = [att if att.fetch_data is not None else rehydrate_fn(att) for att in msg.attachments]
 
         return msg
 
@@ -2251,16 +2253,22 @@ def _coerce_attachments(raw: Any) -> list[Attachment]:
         if isinstance(att, Attachment):
             out.append(att)
         elif isinstance(att, dict):
+            mime_type = att.get("mimeType")
+            if mime_type is None:
+                mime_type = att.get("mime_type")
+            fetch_metadata = att.get("fetchMetadata")
+            if fetch_metadata is None:
+                fetch_metadata = att.get("fetch_metadata")
             out.append(
                 Attachment(
                     type=att.get("type", "file"),
                     url=att.get("url"),
                     name=att.get("name"),
-                    mime_type=att.get("mimeType") or att.get("mime_type"),
+                    mime_type=mime_type,
                     size=att.get("size"),
                     width=att.get("width"),
                     height=att.get("height"),
-                    fetch_metadata=att.get("fetchMetadata") or att.get("fetch_metadata"),
+                    fetch_metadata=fetch_metadata,
                 )
             )
     return out

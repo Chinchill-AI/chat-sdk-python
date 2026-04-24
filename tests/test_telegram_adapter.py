@@ -378,16 +378,24 @@ class TestCreateTelegramAdapter:
 class TestRehydrateAttachment:
     """Port of the Telegram adapter's ``rehydrateAttachment`` behavior."""
 
-    def test_rehydrate_attachment_uses_file_id_from_fetch_metadata(self):
+    @pytest.mark.asyncio
+    async def test_rehydrate_attachment_uses_file_id_from_fetch_metadata(self):
+        from unittest.mock import AsyncMock
+
         from chat_sdk.types import Attachment
 
         adapter = _make_adapter()
+        adapter.download_file = AsyncMock(return_value=b"ok")
         attachment = Attachment(
             type="image",
             fetch_metadata={"fileId": "AgACAgIAAxkB"},
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
+        # Execute the rehydrated closure to verify it wires file_id correctly.
+        data = await rehydrated.fetch_data()
+        assert data == b"ok"
+        adapter.download_file.assert_awaited_once_with("AgACAgIAAxkB")
         # fetch_metadata is preserved so the attachment stays serializable/rehydratable again.
         assert rehydrated.fetch_metadata == {"fileId": "AgACAgIAAxkB"}
 
