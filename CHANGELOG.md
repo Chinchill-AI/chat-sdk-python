@@ -95,6 +95,15 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   (`test_memory_state.py`, `test_state_postgres.py`). Closes the same
   flaky-test hazard fixed for the Redis backend in PR #73.
 
+### CI / Internals
+
+- `verify_test_fidelity.py` now enforces against upstream on every PR
+  (`.github/workflows/lint.yml`); fails when the upstream clone is missing
+  or when any mapped TS file can't be found. Workflow runs `--strict` and
+  the clone step no longer carries `continue-on-error: true`, so infra
+  failures surface immediately at the job level. Baseline shipped empty
+  (all previously-missing tests ported in this release). Closes #53, #72.
+
 ## 0.4.26.1 (2026-04-23)
 
 Python-only follow-up on `0.4.26`. Still alpha — APIs may change.

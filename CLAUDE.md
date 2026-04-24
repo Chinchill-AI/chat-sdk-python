@@ -106,7 +106,9 @@ will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` has a matching Python `def test_*()`, pinned to `chat@4.26.0`.
-Default mode is baseline-enforced: CI fails on any NEW miss not listed in
-`scripts/fidelity_baseline.json`. Run `--update-baseline` after porting a
-missing test (or documenting an intentional skip in `UPSTREAM_SYNC.md`). Use
-`--strict` to verify the final 0-missing target locally.
+**CI runs `--strict`** (see `.github/workflows/lint.yml`): any missing
+translation fails the build, and a missing upstream checkout also fails
+(the script exits non-zero when any mapped TS file isn't found). Baseline
+mode (the default without `--strict`) is retained for local workflows
+where a few ports land in flight — regenerate via `--update-baseline`
+after documenting intentional divergence in `docs/UPSTREAM_SYNC.md`.
