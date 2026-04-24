@@ -481,8 +481,29 @@ class ThreadImpl:
         or a PostableObject (e.g. Plan). PostableObjects are returned directly
         after posting so the caller can continue to mutate them.
         """
-        # Handle PostableObject (e.g. Plan)
+        # Handle PostableObject (e.g. Plan, StreamingPlan)
         if is_postable_object(message):
+            # StreamingPlan PostableObject -- route through streaming with
+            # options mapped to StreamOptions. Mirrors upstream thread.ts
+            # `if (message.kind === "stream")` branch.
+            if getattr(message, "kind", None) == "stream":
+                postable: Any = message
+                data = postable.get_post_data()
+                stream_iter = getattr(data, "stream", None)
+                plan_options = getattr(data, "options", None)
+                extra = StreamOptions()
+                if plan_options is not None:
+                    group_tasks = getattr(plan_options, "group_tasks", None)
+                    end_with = getattr(plan_options, "end_with", None)
+                    update_interval_ms = getattr(plan_options, "update_interval_ms", None)
+                    if group_tasks:
+                        extra.task_display_mode = group_tasks
+                    if end_with:
+                        extra.stop_blocks = end_with
+                    if update_interval_ms:
+                        extra.update_interval_ms = update_interval_ms
+                await self._handle_stream(stream_iter, extra_options=extra)
+                return message
             raw = await self._handle_postable_object(message)
             # Cache in history with the real message ID (upstream skips this,
             # but that's a gap — posted messages should appear in history).
@@ -567,10 +588,20 @@ class ThreadImpl:
     async def _handle_stream(
         self,
         raw_stream: Any,
+        *,
+        extra_options: StreamOptions | None = None,
     ) -> SentMessage:
         """Handle streaming from an AsyncIterable.
 
         Uses adapter's native streaming if available, otherwise falls back to post+edit.
+
+        ``extra_options`` carries caller-supplied fields (e.g. from a
+        :class:`StreamingPlan`: ``task_display_mode``, ``stop_blocks``,
+        ``update_interval_ms``). They are merged on top of the
+        message-context defaults so the adapter and the fallback path see
+        them. Matches upstream thread.ts where ``StreamingPlan`` options
+        are built into ``StreamOptions`` before both ``adapter.stream`` and
+        ``fallbackStream`` are invoked.
         """
         # Build text-only stream from raw_stream
         text_stream = _from_full_stream(raw_stream)
@@ -582,6 +613,15 @@ class ThreadImpl:
             raw = self._current_message.raw
             if isinstance(raw, dict):
                 options.recipient_team_id = raw.get("team_id") or raw.get("team")
+
+        # Merge caller-supplied StreamingPlan options on top. Explicit fields win.
+        if extra_options is not None:
+            if extra_options.task_display_mode is not None:
+                options.task_display_mode = extra_options.task_display_mode
+            if extra_options.stop_blocks is not None:
+                options.stop_blocks = extra_options.stop_blocks
+            if extra_options.update_interval_ms is not None:
+                options.update_interval_ms = extra_options.update_interval_ms
 
         # Use native streaming if adapter supports it
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]

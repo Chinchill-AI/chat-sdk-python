@@ -36,6 +36,10 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
 - **`RedisStateAdapter(token_prefix=...)`**: new `token_prefix` kwarg
   (default `"redis"`). Parameterizes the lock-token prefix for observability
   and interop.
+- **`StreamingPlan` / `StreamingPlanOptions`** (`chat_sdk.plan`): a
+  `PostableObject` wrapping an async iterable with platform-specific
+  streaming options (`group_tasks`, `end_with`, `update_interval_ms`).
+  Mirrors upstream `streaming-plan.ts`. Issue #56.
 
 ### Upstream parity
 
@@ -57,12 +61,22 @@ Parity catch-up with upstream `4.26.0`. No upstream version change.
   `[thread]` factory tests from `chat.test.ts` (existing-behavior coverage
   for `Chat.thread(id)`). Closes 8 fidelity gaps.
 - Ported 19 `[post with Plan]` tests from `thread.test.ts` — closes #55.
+- Ported 6 `[Streaming]` StreamingPlan option-variant tests from upstream
+  `thread.test.ts` — closes #56.
 
-### Fixes (parity with upstream Plan semantics)
+### Fixes
 
 - **`Plan.update_task(input)` / `StreamingPlan.update_task(input)` now honor `input.id`** — previously only worked on the last in-progress task; with `id` set, targets that specific task and returns `None` for unknown IDs. Matches upstream `UpdateTaskInput` semantics.
 - **`Plan.add_task()` / `update_task()` now propagate `adapter.edit_object` errors** — previously swallowed and logged; upstream returns the chained promise so callers see failures.
 - **Plan edit queue is now actually sequential under concurrency** — previously racy under `asyncio.gather`; rewrote `_enqueue_edit` to build the chain synchronously before awaiting, matching upstream TS's `.then`-based chain. Fixes out-of-order edits when multiple `add_task`/`update_task` calls interleave.
+- **`StreamingPlan` options now wired through `Thread.post()`** — the Python
+  port was missing the `StreamingPlan` class entirely, so `group_tasks` /
+  `end_with` / `update_interval_ms` were silently dropped (a plain async
+  iterable was the only way to stream, and options went nowhere). Upstream
+  already had the `kind === "stream"` branch that maps
+  `groupTasks → taskDisplayMode`, `endWith → stopBlocks`, and
+  `updateIntervalMs → updateIntervalMs` onto `StreamOptions` before invoking
+  `adapter.stream(...)` or the fallback `post+edit` path. Issue #56.
 
 ### Test hygiene
 
