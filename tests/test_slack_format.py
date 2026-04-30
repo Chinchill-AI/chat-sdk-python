@@ -47,6 +47,67 @@ class TestFromMarkdown:
 
 
 # ---------------------------------------------------------------------------
+# renderPostable — PostableMarkdown uses AST path (issue #81)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPostable:
+    """render_postable with PostableMarkdown must use the AST path (from_markdown),
+    not the regex _markdown_to_mrkdwn, to match the TS SDK's fromAst(parseMarkdown())
+    behavior. Regression guard for issue #81.
+    """
+
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_postable_markdown_converts_link(self):
+        """[text](url) -> <url|text> via AST, not regex."""
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="Check [this](https://example.com)"))
+        assert result == "Check <https://example.com|this>"
+
+    def test_dict_markdown_converts_link(self):
+        result = self.converter.render_postable({"markdown": "Check [this](https://example.com)"})
+        assert result == "Check <https://example.com|this>"
+
+    def test_postable_markdown_converts_bold(self):
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="Hello **world**!"))
+        assert result == "Hello *world*!"
+
+    def test_postable_markdown_converts_mixed(self):
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="**Bold** and [link](https://x.com)"))
+        assert "*Bold*" in result
+        assert "<https://x.com|link>" in result
+
+    def test_postable_markdown_link_with_query_string(self):
+        """URL with query params (no parens) converts correctly."""
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(
+            PostableMarkdown(markdown="See [results](https://example.com/search?q=foo&page=2)")
+        )
+        assert "<https://example.com/search?q=foo&page=2|results>" in result
+
+    def test_str_passthrough_only_converts_mentions(self):
+        """str input is treated as already-mrkdwn; only @mentions are wrapped."""
+        result = self.converter.render_postable("Hello *world* and @george")
+        assert "*world*" in result
+        assert "<@george>" in result
+
+    def test_postable_raw_bypasses_conversion(self):
+        """PostableRaw reaches Slack byte-for-byte (only mention wrapping)."""
+        from chat_sdk.types import PostableRaw
+
+        result = self.converter.render_postable(PostableRaw(raw="Already *mrkdwn* text"))
+        assert result == "Already *mrkdwn* text"
+
+
+# ---------------------------------------------------------------------------
 # toMarkdown (mrkdwn -> markdown)
 # ---------------------------------------------------------------------------
 

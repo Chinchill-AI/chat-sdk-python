@@ -84,12 +84,12 @@ class SlackFormatConverter(BaseFormatConverter):
             if "raw" in message:
                 return self._convert_mentions_to_slack(message["raw"])
             if "markdown" in message:
-                return self._markdown_to_mrkdwn(message["markdown"])
+                return self.from_markdown(message["markdown"])
             if "ast" in message:
                 return self.from_ast(message["ast"])
         # Dataclass-style objects
         if hasattr(message, "markdown"):
-            return self._markdown_to_mrkdwn(message.markdown)
+            return self.from_markdown(message.markdown)
         if hasattr(message, "ast"):
             return self.from_ast(message.ast)
         return ""
