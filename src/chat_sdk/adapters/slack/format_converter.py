@@ -202,24 +202,6 @@ class SlackFormatConverter(BaseFormatConverter):
         """Convert @mentions to Slack format: @name -> <@name>."""
         return re.sub(r"(?<!<)@(\w+)", r"<@\1>", text)
 
-    def _markdown_to_mrkdwn(self, text: str) -> str:
-        """Convert standard Markdown to Slack mrkdwn."""
-        result = text
-
-        # Bold: **text** -> *text*
-        result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
-
-        # Strikethrough: ~~text~~ -> ~text~
-        result = re.sub(r"~~(.+?)~~", r"~\1~", result)
-
-        # Links: [text](url) -> <url|text>
-        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", result)
-
-        # Mentions
-        result = self._convert_mentions_to_slack(result)
-
-        return result
-
     def _node_to_mrkdwn(self, node: Content) -> str:
         """Convert a single AST node to Slack mrkdwn."""
         if not isinstance(node, dict):

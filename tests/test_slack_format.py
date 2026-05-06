@@ -106,6 +106,31 @@ class TestRenderPostable:
         result = self.converter.render_postable(PostableRaw(raw="Already *mrkdwn* text"))
         assert result == "Already *mrkdwn* text"
 
+    def test_dict_ast_converts_via_from_ast(self):
+        """{"ast": <root>} is rendered via from_ast."""
+        from chat_sdk.shared.base_format_converter import parse_markdown
+
+        ast = parse_markdown("Hello **world**!")
+        result = self.converter.render_postable({"ast": ast})
+        assert result == "Hello *world*!"
+
+    def test_dict_card_uses_fallback_text(self):
+        """{"card": <payload>} extracts plain text via card_to_fallback_text."""
+        card_payload = {"type": "card", "title": "My Card", "body": [{"type": "text", "text": "Card body"}]}
+        result = self.converter.render_postable({"card": card_payload})
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_object_with_card_attr_uses_fallback_text(self):
+        """Object with .card attribute extracts plain text via card_to_fallback_text."""
+
+        class FakeMessage:
+            card = {"type": "card", "title": "Attr Card", "body": [{"type": "text", "text": "body text"}]}
+
+        result = self.converter.render_postable(FakeMessage())
+        assert isinstance(result, str)
+        assert len(result) > 0
+
 
 # ---------------------------------------------------------------------------
 # toMarkdown (mrkdwn -> markdown)
