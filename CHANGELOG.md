@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.4.27a1 (2026-05-07)
+
+Alpha sync starter for upstream `4.27.0` (`vercel/chat` release commit
+`f55378a`, Apr 30 2026). **No feature ports in this release** — this is a
+parity-bookkeeping bump that establishes the sync branch, sets
+`UPSTREAM_PARITY = "4.27.0"`, and lays out the porting plan below. Each
+substantive commit lands as its own PR (matching the cadence used during
+the `4.26.0` sync: #64, #66, #67, #74, etc.).
+
+### Upstream tagging note
+
+Upstream cut versions for the entire monorepo on Apr 30 2026 (commit
+`f55378a`), bumping `packages/chat/package.json` from `4.26.0` to
+`4.27.0`. As of this writing only `@chat-adapter/shared@4.27.0` got a
+git tag — no `chat@4.27.0` tag was published. The fidelity workflow
+(`scripts/verify_test_fidelity.py`, `.github/workflows/lint.yml`)
+therefore stays pinned to `chat@4.26.0` until either the tag is
+published upstream or the first feature port lands and we move the pin
+to commit `f55378a` directly. Local devs running fidelity in baseline
+mode will see a `chat@4.26.0` vs `chat@4.27.0` mismatch — that's the
+intended in-flight signal.
+
+### Sync scope (22 substantive upstream commits between `chat@4.26.0..f55378a`)
+
+#### Core (`packages/chat/` → `src/chat_sdk/`)
+
+- [ ] **`chat.getUser(adapter, userId)`** for cross-platform user lookups (#391, upstream commit `a520797`). Adapter-side: each adapter exposes `getUser`. Touches `chat.py`, `types.py` (`User` type extension), and every adapter (`slack`, `teams`, `gchat`, `telegram`, `discord`, `whatsapp`, `github`, `linear`).
+- [ ] **`ExternalSelect.initial_option` + `option_groups`** (#410, `70281dc`). Type extension in `types.py`; Slack adapter must serialize `option_groups` to Block Kit.
+- [ ] **`thread.post()` streaming options** (#388, `9093292`). New params plumb through `Thread.post` → `chat.py` orchestrator.
+- [ ] **Slack streaming team ID fix for interactive payloads** (#330, `8a0c7b3`). Bug fix in the Slack streaming path; check `adapters/slack/adapter.py` request-context plumbing.
+- [ ] **Bundled guide markdown + templates manifest** (#423, `b0ab804`). Decision: skip or copy `packages/chat/resources/guides/*.md` and `templates.json` verbatim. Probably skip — these are TS-monorepo authoring resources, not runtime behavior.
+- [x] **`concurrency.maxConcurrent` honored in `concurrent` strategy** (#419, `d630e6c`). Already addressed in the Python port — see the existing `ConcurrencyConfig.max_concurrent` row in `docs/UPSTREAM_SYNC.md` (we enforce via `asyncio.Semaphore` and reject misconfiguration). Upstream has now caught up; on this sync the divergence row downgrades from "silent correctness bug upstream" to "behavior parity restored".
+
+#### Slack (`packages/adapter-slack/` → `src/chat_sdk/adapters/slack/`)
+
+- [ ] **Slack Socket Mode support** (#162, `7e9d0fc`). Big — adds a persistent WebSocket transport alongside HTTP webhooks. Decision: in scope or follow-up? Mirrors the Discord Gateway gap already documented in non-parity ("HTTP interactions only").
+- [ ] **Dynamic `bot_token` resolver + custom `webhookVerifier`** (#421, `2531e9c`). Multi-workspace pattern; touches `SlackAdapter.__init__` and request handling.
+- [ ] **External-select Block Kit support** (#397, `a179b29`). Pairs with the core `option_groups` change above.
+- [ ] **Native `markdown_text` for outgoing messages** (#440, post-release — Apr 17). NOTE: this commit is post-`f55378a` so technically out of `4.27.0` scope, but listed here because the team often picks up post-release fixes.
+- [ ] **Link-preview unfurl metadata enrichment** (#395, `ded6f78`).
+- [ ] **`@mention` regex preserves email addresses** (#394, `c26ee6c`).
+- [ ] **Guard against empty `threadTs` (`invalid_thread_ts` fix)** (#292, `53c6b68`).
+
+#### Teams (`packages/adapter-teams/` → `src/chat_sdk/adapters/teams/`)
+
+- [ ] **Native streaming for DMs via `emit`** (#416, `ed46bae`). Currently the Python port falls back to `_fallback_stream` for Teams; native streaming would lift that.
+- [ ] **DM conversation ID resolution for Graph API** (#403, `4c24c94`). Bug fix.
+- [ ] **Teams SDK 2.0.8 + `User-Agent` header** (#415, `885a471`). TS-side dependency bump; Python equivalent is to verify our `botbuilder` pin and propagate `User-Agent` if not already.
+
+#### Telegram
+
+- [ ] **MarkdownV2 rendering fixes** (#407, `b9a1961`). Pairs with the streaming-chunk safety trim in #446 (post-`f55378a`).
+
+#### Discord
+
+- [ ] **Don't duplicate text when posting card messages** (#256, `7e5b447`). Confirm Python port's `discord/cards.py` doesn't have the same bug.
+
+#### Out of scope for this Python port
+
+- **`@chat-adapter/web`** — new package adding a browser chat UI for chat-sdk bots (#444). No browser runtime in chat-sdk-python.
+- **Documentation site changes** — `apps/docs/`, README/changelog tweaks, dependency bumps.
+
+### Workflow
+
+1. This alpha PR establishes the sync. CI on this draft is intentionally not invoked (lint.yml is gated on `!github.event.pull_request.draft`).
+2. Each item above lands as its own PR, following the same pattern as the `4.26.0` cycle. Each port PR:
+   - Updates the relevant `MAPPING` / fidelity coverage and removes its entries from `scripts/fidelity_baseline.json` if previously baselined.
+   - Bumps lint.yml's pinned upstream ref to commit `f55378a` (or a later SHA if upstream cuts a `chat@4.27.0` tag in the meantime).
+   - Adds an entry under the next `CHANGELOG` heading (`0.4.27a2`, `0.4.27a3`, …).
+3. Once all 22 items are ported (or explicitly documented as divergence in `docs/UPSTREAM_SYNC.md`), the final PR cuts `0.4.27` and switches CI back to strict fidelity at the upstream tag.
+
 ## 0.4.26.3 (2026-05-07)
 
 Python-only fix. No upstream version change.
