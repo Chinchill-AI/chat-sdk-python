@@ -74,7 +74,8 @@ class SlackFormatConverter(BaseFormatConverter):
     def render_postable(self, message: Any) -> str:
         """Render a postable message to Slack mrkdwn string.
 
-        Supports str, ``{"raw": ...}``, ``{"markdown": ...}``, and ``{"ast": ...}``.
+        Supports str, ``{"raw": ...}``, ``{"markdown": ...}``, ``{"ast": ...}``,
+        and card types (``{"card": ...}`` / ``CardElement``).
         """
         if isinstance(message, str):
             return self._convert_mentions_to_slack(message)
@@ -84,15 +85,31 @@ class SlackFormatConverter(BaseFormatConverter):
             if "raw" in message:
                 return self._convert_mentions_to_slack(message["raw"])
             if "markdown" in message:
-                return self._markdown_to_mrkdwn(message["markdown"])
+                return self.from_markdown(message["markdown"])
             if "ast" in message:
                 return self.from_ast(message["ast"])
+            if "card" in message:
+                from chat_sdk.cards import card_to_fallback_text
+
+                return card_to_fallback_text(message["card"])
+            if message.get("type") == "card":
+                from chat_sdk.cards import is_card_element
+
+                if is_card_element(message):
+                    from chat_sdk.cards import card_to_fallback_text
+
+                    return card_to_fallback_text(message)  # type: ignore[arg-type]
+                return str(message)
         # Dataclass-style objects
         if hasattr(message, "markdown"):
-            return self._markdown_to_mrkdwn(message.markdown)
+            return self.from_markdown(message.markdown)
         if hasattr(message, "ast"):
             return self.from_ast(message.ast)
-        return ""
+        if hasattr(message, "card"):
+            from chat_sdk.cards import card_to_fallback_text
+
+            return card_to_fallback_text(message.card)
+        return str(message)
 
     def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Slack mrkdwn by stripping formatting."""
@@ -184,24 +201,6 @@ class SlackFormatConverter(BaseFormatConverter):
     def _convert_mentions_to_slack(self, text: str) -> str:
         """Convert @mentions to Slack format: @name -> <@name>."""
         return re.sub(r"(?<!<)@(\w+)", r"<@\1>", text)
-
-    def _markdown_to_mrkdwn(self, text: str) -> str:
-        """Convert standard Markdown to Slack mrkdwn."""
-        result = text
-
-        # Bold: **text** -> *text*
-        result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
-
-        # Strikethrough: ~~text~~ -> ~text~
-        result = re.sub(r"~~(.+?)~~", r"~\1~", result)
-
-        # Links: [text](url) -> <url|text>
-        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", result)
-
-        # Mentions
-        result = self._convert_mentions_to_slack(result)
-
-        return result
 
     def _node_to_mrkdwn(self, node: Content) -> str:
         """Convert a single AST node to Slack mrkdwn."""

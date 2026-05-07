@@ -47,6 +47,92 @@ class TestFromMarkdown:
 
 
 # ---------------------------------------------------------------------------
+# renderPostable — PostableMarkdown uses AST path (issue #81)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPostable:
+    """render_postable with PostableMarkdown must use the AST path (from_markdown),
+    not the regex _markdown_to_mrkdwn, to match the TS SDK's fromAst(parseMarkdown())
+    behavior. Regression guard for issue #81.
+    """
+
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_postable_markdown_converts_link(self):
+        """[text](url) -> <url|text> via AST, not regex."""
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="Check [this](https://example.com)"))
+        assert result == "Check <https://example.com|this>"
+
+    def test_dict_markdown_converts_link(self):
+        result = self.converter.render_postable({"markdown": "Check [this](https://example.com)"})
+        assert result == "Check <https://example.com|this>"
+
+    def test_postable_markdown_converts_bold(self):
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="Hello **world**!"))
+        assert result == "Hello *world*!"
+
+    def test_postable_markdown_converts_mixed(self):
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(PostableMarkdown(markdown="**Bold** and [link](https://x.com)"))
+        assert "*Bold*" in result
+        assert "<https://x.com|link>" in result
+
+    def test_postable_markdown_link_with_query_string(self):
+        """URL with query params (no parens) converts correctly."""
+        from chat_sdk.types import PostableMarkdown
+
+        result = self.converter.render_postable(
+            PostableMarkdown(markdown="See [results](https://example.com/search?q=foo&page=2)")
+        )
+        assert "<https://example.com/search?q=foo&page=2|results>" in result
+
+    def test_str_passthrough_only_converts_mentions(self):
+        """str input is treated as already-mrkdwn; only @mentions are wrapped."""
+        result = self.converter.render_postable("Hello *world* and @george")
+        assert "*world*" in result
+        assert "<@george>" in result
+
+    def test_postable_raw_bypasses_conversion(self):
+        """PostableRaw reaches Slack byte-for-byte (only mention wrapping)."""
+        from chat_sdk.types import PostableRaw
+
+        result = self.converter.render_postable(PostableRaw(raw="Already *mrkdwn* text"))
+        assert result == "Already *mrkdwn* text"
+
+    def test_dict_ast_converts_via_from_ast(self):
+        """{"ast": <root>} is rendered via from_ast."""
+        from chat_sdk.shared.base_format_converter import parse_markdown
+
+        ast = parse_markdown("Hello **world**!")
+        result = self.converter.render_postable({"ast": ast})
+        assert result == "Hello *world*!"
+
+    def test_dict_card_uses_fallback_text(self):
+        """{"card": <payload>} extracts plain text via card_to_fallback_text."""
+        card_payload = {"type": "card", "title": "My Card", "body": [{"type": "text", "text": "Card body"}]}
+        result = self.converter.render_postable({"card": card_payload})
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_object_with_card_attr_uses_fallback_text(self):
+        """Object with .card attribute extracts plain text via card_to_fallback_text."""
+
+        class FakeMessage:
+            card = {"type": "card", "title": "Attr Card", "body": [{"type": "text", "text": "body text"}]}
+
+        result = self.converter.render_postable(FakeMessage())
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
 # toMarkdown (mrkdwn -> markdown)
 # ---------------------------------------------------------------------------
 
@@ -282,3 +368,143 @@ class TestNestedLists:
         assert "sub a" in result
         assert "sub b" in result
         assert "2. second" in result
+
+
+# ---------------------------------------------------------------------------
+# render_postable — remaining branch coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPostableRemainingBranches:
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_dict_raw_treated_as_mrkdwn_with_mention_wrapping(self):
+        """{"raw": ...} is treated as already-mrkdwn; only @mentions are wrapped."""
+        result = self.converter.render_postable({"raw": "Already *mrkdwn* @george"})
+        assert result == "Already *mrkdwn* <@george>"
+
+    def test_card_element_dict_renders_via_fallback_text(self):
+        """{"type": "card", ...} CardElement dict uses card_to_fallback_text."""
+        from chat_sdk.cards import Card
+
+        card = Card(title="My Card")
+        result = self.converter.render_postable(card)
+        assert "My Card" in result
+
+    def test_object_with_ast_attr_renders_via_from_ast(self):
+        """Object with .ast attribute is rendered via from_ast."""
+        from chat_sdk.shared.base_format_converter import parse_markdown
+
+        class FakeMsg:
+            ast = parse_markdown("Hello **world**!")
+
+        result = self.converter.render_postable(FakeMsg())
+        assert result == "Hello *world*!"
+
+    def test_arbitrary_object_falls_back_to_str(self):
+        """Objects with no recognized attributes fall back to str()."""
+
+        class Opaque:
+            def __str__(self):
+                return "opaque output"
+
+        result = self.converter.render_postable(Opaque())
+        assert result == "opaque output"
+
+    def test_multiple_at_mentions_in_str_all_wrapped(self):
+        """All bare @mentions in a str input are converted, not just the first."""
+        result = self.converter.render_postable("Ping @alice and @bob please")
+        assert "<@alice>" in result
+        assert "<@bob>" in result
+
+
+# ---------------------------------------------------------------------------
+# _node_to_mrkdwn — individual node type rendering
+# ---------------------------------------------------------------------------
+
+
+class TestNodeRendering:
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_heading_renders_as_bold(self):
+        assert self.converter.from_markdown("# My Heading") == "*My Heading*"
+
+    def test_h2_heading_renders_as_bold(self):
+        assert self.converter.from_markdown("## Section Title") == "*Section Title*"
+
+    def test_blockquote_renders_with_gt_prefix(self):
+        result = self.converter.from_markdown("> quoted text")
+        assert result == "> quoted text"
+
+    def test_thematic_break_renders_as_dashes(self):
+        result = self.converter.from_markdown("before\n\n---\n\nafter")
+        assert "---" in result
+        assert "before" in result
+        assert "after" in result
+
+    def test_image_with_alt_renders_alt_and_url(self):
+        result = self.converter.from_markdown("![alt text](https://example.com/img.png)")
+        assert result == "alt text (https://example.com/img.png)"
+
+    def test_image_without_alt_renders_url_only(self):
+        result = self.converter.from_markdown("![](https://example.com/img.png)")
+        assert result == "https://example.com/img.png"
+
+
+# ---------------------------------------------------------------------------
+# extract_plain_text — additional cases
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPlainTextAdditional:
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_removes_strikethrough_markers(self):
+        assert self.converter.extract_plain_text("Hello ~world~!") == "Hello world!"
+
+    def test_extracts_bare_url(self):
+        assert self.converter.extract_plain_text("Visit <https://example.com>") == "Visit https://example.com"
+
+    def test_extracts_channel_mention_with_name(self):
+        assert self.converter.extract_plain_text("Join <#C123|general>") == "Join #general"
+
+    def test_extracts_bare_channel_mention(self):
+        assert self.converter.extract_plain_text("Join <#C123>") == "Join #C123"
+
+    def test_user_mention_with_name_extracted(self):
+        result = self.converter.extract_plain_text("Hey <@U123|john>!")
+        assert result == "Hey @john!"
+
+
+# ---------------------------------------------------------------------------
+# to_blocks_with_table — additional cases
+# ---------------------------------------------------------------------------
+
+
+class TestToBlocksWithTableAdditional:
+    def setup_method(self):
+        self.converter = SlackFormatConverter()
+
+    def test_returns_none_for_non_dict_ast(self):
+        assert self.converter.to_blocks_with_table("not a dict") is None  # type: ignore[arg-type]
+        assert self.converter.to_blocks_with_table(None) is None  # type: ignore[arg-type]
+
+    def test_standalone_table_emits_no_extra_section_blocks(self):
+        """A table with no surrounding text produces exactly one block."""
+        ast = self.converter.to_ast("| A | B |\n|---|---|\n| 1 | 2 |")
+        blocks = self.converter.to_blocks_with_table(ast)
+        assert blocks is not None
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "table"
+
+    def test_table_with_column_alignment_sets_column_settings(self):
+        """Aligned table columns produce column_settings on the table block."""
+        md = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |"
+        ast = self.converter.to_ast(md)
+        blocks = self.converter.to_blocks_with_table(ast)
+        assert blocks is not None
+        settings = blocks[0].get("column_settings")
+        assert settings == [{"align": "left"}, {"align": "center"}, {"align": "right"}]
