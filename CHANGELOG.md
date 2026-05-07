@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.26.3 (2026-05-07)
+
+Python-only fix. No upstream version change.
+
+### Fixes
+
+- **`SlackFormatConverter.render_postable` now uses the AST path for all markdown inputs** (issue #81). Previously, `PostableMarkdown` and `{"markdown": ...}` dict inputs were routed through a private regex helper (`_markdown_to_mrkdwn`) that truncated URLs containing parentheses and diverged silently from the TS SDK's `fromAst(parseMarkdown(text))` behavior. Both branches now call `from_markdown`, which goes through the AST. `str` and `raw` branches are unchanged.
+
+### Structural parity
+
+- **Deleted `_markdown_to_mrkdwn`** — a regex-based private method with no call sites after the fix above. The TS SDK has no equivalent; its presence was an undocumented divergence. Removes a confusing dead-code path and restores structural parity with `adapter-slack/src/markdown.ts`.
+
+### Additions
+
+- **`render_postable` now handles card and object-with-ast inputs** — added `{"card": ...}` dict, `{"type": "card", ...}` `CardElement` dict, `{"ast": ...}` dict, and `.card` / `.ast` attribute branches, plus `str(message)` fallback for unrecognized types. Matches the full union of `AdapterPostableMessage` variants.
+
+### Test quality
+
+- Added 19 tests to `tests/test_slack_format.py` covering all `render_postable` branches, every `_node_to_mrkdwn` node type (heading, blockquote, thematic break, image with/without alt), the remaining `extract_plain_text` paths (strikethrough, bare URL, channel mentions), and `to_blocks_with_table` edge cases (non-dict AST, standalone table, column alignment).
+
 ## 0.4.26.2 (2026-04-24)
 
 Parity catch-up with upstream `4.26.0`. No upstream version change.
