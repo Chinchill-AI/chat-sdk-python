@@ -593,7 +593,12 @@ class TestCertificateAuth:
 
 class TestStream:
     @pytest.mark.asyncio
-    async def test_stream_posts_then_edits(self):
+    async def test_group_chat_stream_accumulates_and_posts_single_message(self):
+        """Group chats / channels accumulate the stream and post one message.
+
+        Mirrors upstream after vercel/chat#416: ``streamViaEmit`` is reserved
+        for DMs; non-DM threads no longer post+edit (which produced flicker).
+        """
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-1"})
         adapter._teams_update = AsyncMock()
@@ -611,12 +616,16 @@ class TestStream:
 
         result = await adapter.stream(tid, text_gen())
         assert result.id == "stream-msg-1"
-        # First chunk creates, second updates
+        # Single send carrying the full accumulated text — no edits.
         assert adapter._teams_send.call_count == 1
-        assert adapter._teams_update.call_count == 1
+        assert adapter._teams_update.call_count == 0
+        sent_payload = adapter._teams_send.await_args.args[1]
+        assert sent_payload["text"] == "Hello world"
+        assert sent_payload["type"] == "message"
 
     @pytest.mark.asyncio
-    async def test_stream_empty_chunks_skipped(self):
+    async def test_group_chat_stream_empty_returns_empty(self):
+        """Empty streams in a group chat skip the post entirely."""
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-2"})
         adapter._teams_update = AsyncMock()
@@ -630,10 +639,11 @@ class TestStream:
 
         async def text_gen():
             yield ""
-            yield "Hello"
             yield ""
 
         result = await adapter.stream(tid, text_gen())
-        assert result.id == "stream-msg-2"
-        assert adapter._teams_send.call_count == 1
+        # No real text → no send, returned RawMessage carries empty content.
+        assert result.id == ""
+        assert result.raw["text"] == ""
+        assert adapter._teams_send.call_count == 0
         assert adapter._teams_update.call_count == 0
