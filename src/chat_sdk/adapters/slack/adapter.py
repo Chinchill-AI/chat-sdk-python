@@ -47,8 +47,11 @@ from chat_sdk.adapters.slack.modals import (
 from chat_sdk.adapters.slack.types import (
     RequestContext,
     SlackAdapterConfig,
+    SlackBotToken,
+    SlackBotTokenResolver,
     SlackInstallation,
     SlackThreadId,
+    SlackWebhookVerifier,
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -164,6 +167,28 @@ def _find_next_mention(text: str) -> int:
     return min(at_idx, hash_idx)
 
 
+def _normalize_bot_token_provider(
+    value: SlackBotToken | None,
+) -> SlackBotTokenResolver | None:
+    """Normalize a ``bot_token`` config value to a zero-arg resolver.
+
+    Mirrors upstream's ``normalizeBotTokenProvider``. A static string becomes
+    a resolver that returns the same string; a callable is returned as-is so
+    rotation or async lookup is preserved. ``None`` -> ``None`` (no token).
+    """
+    if value is None:
+        return None
+    if callable(value):
+        # Already a resolver — keep the user's callable so rotation works.
+        return value
+    static = value
+
+    def _provider() -> str:
+        return static
+
+    return _provider
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -187,24 +212,58 @@ class SlackAdapter:
         self._request_context: ContextVar[RequestContext | None] = ContextVar(
             f"slack_request_context_{id(self)}", default=None
         )
+        # Per-request cache of the resolved default bot token. Populated at the
+        # top of ``handle_webhook`` (after the signature/verifier check) and
+        # read by the sync ``_get_token`` path. Each concurrent request gets
+        # its own contextvar copy so dynamic resolvers returning different
+        # values per call cannot bleed between in-flight requests.
+        self._resolved_default_token: ContextVar[str | None] = ContextVar(
+            f"slack_resolved_default_token_{id(self)}", default=None
+        )
         if config is None:
             config = SlackAdapterConfig()
 
-        signing_secret = config.signing_secret or os.environ.get("SLACK_SIGNING_SECRET")
-        if not signing_secret:
+        # An explicit ``webhook_verifier`` opts out of the SLACK_SIGNING_SECRET
+        # env fallback — otherwise an env-configured deployment would silently
+        # shadow the verifier the caller intended to use.
+        webhook_verifier = config.webhook_verifier
+        signing_secret = config.signing_secret or (
+            None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET")
+        )
+        if not (signing_secret or webhook_verifier):
             raise ValidationError(
                 "slack",
-                "signingSecret is required. Set SLACK_SIGNING_SECRET or provide it in config.",
+                "signingSecret or webhookVerifier is required. Set SLACK_SIGNING_SECRET, "
+                "provide signing_secret in config, or provide a webhook_verifier.",
             )
 
         # Auth fields: botToken presence selects single-workspace mode.
         zero_config = not (config.signing_secret or config.bot_token or config.client_id or config.client_secret)
 
-        bot_token = config.bot_token or (os.environ.get("SLACK_BOT_TOKEN") if zero_config else None)
+        bot_token_config: SlackBotToken | None = config.bot_token
+        if bot_token_config is None and zero_config:
+            env_token = os.environ.get("SLACK_BOT_TOKEN")
+            if env_token:
+                bot_token_config = env_token
+
+        bot_token_provider = _normalize_bot_token_provider(bot_token_config)
 
         self._name = "slack"
-        self._signing_secret = signing_secret
-        self._default_bot_token: str | None = bot_token
+        self._signing_secret: str | None = signing_secret
+        # ``webhook_verifier`` is honored only when ``signing_secret`` is not set —
+        # signing_secret takes precedence when both are provided (matches upstream).
+        self._webhook_verifier: SlackWebhookVerifier | None = None if signing_secret else webhook_verifier
+        # Resolver returning the default (single-workspace) bot token. ``None`` in
+        # multi-workspace mode where the token is resolved per-team from the
+        # InstallationStore. Single-workspace mode with a static string still
+        # uses a resolver under the hood (returns the same string each call).
+        self._default_bot_token_provider: SlackBotTokenResolver | None = bot_token_provider
+        # Last successfully resolved default token, kept for the sync ``current_token``
+        # accessor and for any code path that needs a token outside an awaitable
+        # context. Populated lazily on first await of the resolver and refreshed
+        # on each subsequent webhook entry. Static-string configs prime this at
+        # construction time so sync access works before any webhook fires.
+        self._default_bot_token_cache: str | None = bot_token_config if isinstance(bot_token_config, str) else None
         self._logger: Logger = config.logger or ConsoleLogger("info")
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
@@ -276,11 +335,25 @@ class SlackAdapter:
 
         In multi-workspace mode this is the token resolved by the
         ``InstallationStore`` for the current request; in single-workspace
-        mode it is the default bot token. Raises
-        :class:`AuthenticationError` when called outside a request context
-        with no default token configured.
+        mode it is the default bot token (or the most recently resolved
+        token when a dynamic ``bot_token`` resolver is configured).
+
+        Synchronous: when ``bot_token`` is a resolver and this property is
+        accessed before the resolver has run for the first time, an
+        :class:`AuthenticationError` is raised. Use
+        :meth:`current_token_async` from async contexts to invoke the
+        resolver on demand.
         """
         return self._get_token()
+
+    async def current_token_async(self) -> str:
+        """Async variant of :attr:`current_token` that invokes the resolver.
+
+        Prefer this over :attr:`current_token` in async code paths when a
+        dynamic ``bot_token`` resolver is configured — it ensures the
+        resolver is awaited rather than relying on the cached value.
+        """
+        return await self._resolve_token_async()
 
     @property
     def current_client(self) -> Any:
@@ -302,19 +375,115 @@ class SlackAdapter:
     # ------------------------------------------------------------------
 
     def _get_token(self) -> str:
-        """Return the current bot token for API calls.
+        """Return the current bot token for API calls (sync path).
 
-        Checks request context (multi-workspace) -> default token (single-workspace) -> raises.
+        Checks (in order):
+
+        1. Multi-workspace request context (``_request_context``)
+        2. Per-request resolved default token (``_resolved_default_token``)
+           — primed by ``handle_webhook`` after invoking the resolver
+        3. Static default token cache (set by the constructor for
+           string-typed ``bot_token`` configs)
+        4. Raises :class:`AuthenticationError`
+
+        Synchronous: the token resolver is *not* invoked here. Webhook entry
+        paths call :meth:`_resolve_default_token` first so the per-request
+        cache is primed; static-string ``bot_token`` configs prime the
+        process-wide cache at construction time so this is a no-op for the
+        common case. Use :meth:`_resolve_token_async` from new async call
+        sites that need to invoke a resolver outside webhook flow (e.g.
+        cron jobs).
         """
         ctx = self._request_context.get()
         if ctx and ctx.token:
             return ctx.token
-        if self._default_bot_token:
-            return self._default_bot_token
+        per_request = self._resolved_default_token.get()
+        if per_request is not None:
+            return per_request
+        if self._default_bot_token_cache is not None:
+            return self._default_bot_token_cache
+        if self._default_bot_token_provider is not None:
+            # Resolver-based default token configured but never resolved. This
+            # is a programming error: the async entry path should have awaited
+            # ``_resolve_default_token()`` before reaching here.
+            raise AuthenticationError(
+                "slack",
+                "Bot token resolver has not been invoked yet. Use the async API "
+                "(handle_webhook / current_token_async) so the resolver runs first.",
+            )
         raise AuthenticationError(
             "slack",
             "No bot token available. In multi-workspace mode, ensure the webhook is being processed.",
         )
+
+    async def _resolve_token_async(self) -> str:
+        """Async equivalent of :meth:`_get_token` that invokes the resolver.
+
+        Calls the configured ``bot_token`` resolver (if any), refreshes the
+        per-request cache used by :meth:`_get_token`, and returns the
+        resulting token. Multi-workspace request context still wins.
+        """
+        ctx = self._request_context.get()
+        if ctx and ctx.token:
+            return ctx.token
+        if self._default_bot_token_provider is not None:
+            return await self._resolve_default_token()
+        if self._default_bot_token_cache is not None:
+            return self._default_bot_token_cache
+        raise AuthenticationError(
+            "slack",
+            "No bot token available. In multi-workspace mode, ensure the webhook is being processed.",
+        )
+
+    async def _resolve_default_token(self) -> str:
+        """Invoke the ``bot_token`` resolver and prime the per-request cache.
+
+        Per upstream, the resolver is called *every time a token is needed*
+        (it is the resolver's responsibility to memoize if desired) — this
+        method does not memoize across calls within a process. The result is
+        stashed in the per-request :attr:`_resolved_default_token` ContextVar
+        so the sync ``_get_token`` path inside that request sees the value
+        without re-invoking the resolver, while concurrent requests with
+        their own ContextVar copies are isolated from each other.
+
+        For static-string ``bot_token`` configs the resolver returns the
+        same string each call, but we still update the per-request cache to
+        keep the code path uniform.
+
+        Raises :class:`AuthenticationError` if no resolver is configured.
+        """
+        provider = self._default_bot_token_provider
+        if provider is None:
+            raise AuthenticationError(
+                "slack",
+                "No default bot token resolver configured (multi-workspace mode).",
+            )
+        try:
+            result = provider()
+        except Exception as exc:
+            self._logger.error("Bot token resolver raised", {"error": exc})
+            raise
+        if inspect.isawaitable(result):
+            token = await result
+        else:
+            token = result
+        if not isinstance(token, str) or not token:
+            raise AuthenticationError(
+                "slack",
+                "Bot token resolver returned an empty or non-string value.",
+            )
+        # Per-request cache for downstream sync ``_get_token`` calls.
+        self._resolved_default_token.set(token)
+        return token
+
+    @property
+    def _is_single_workspace(self) -> bool:
+        """``True`` when a default bot token (static or resolver) is configured.
+
+        Multi-workspace mode is the absence of a default token, in which
+        case tokens are resolved per-team via the InstallationStore.
+        """
+        return self._default_bot_token_provider is not None
 
     def _get_client(self, token: str | None = None) -> Any:
         """Return an ``AsyncWebClient`` for the given (or current) token.
@@ -357,10 +526,13 @@ class SlackAdapter:
         """Initialize the adapter and optionally fetch bot identity."""
         self._chat = chat
 
-        # Single-workspace: fetch bot user ID via auth.test
-        if self._default_bot_token and not self._bot_user_id:
+        # Single-workspace: fetch bot user ID via auth.test. We resolve the
+        # bot token via the resolver here so dynamic resolvers work at init
+        # time without forcing the caller to seed a static token first.
+        if self._is_single_workspace and not self._bot_user_id:
             try:
-                client = self._get_client(self._default_bot_token)
+                token = await self._resolve_default_token()
+                client = self._get_client(token)
                 auth_result = await client.auth_test()
                 self._bot_user_id = auth_result.get("user_id")
                 self._bot_id = auth_result.get("bot_id") or None
@@ -374,7 +546,7 @@ class SlackAdapter:
             except Exception as exc:
                 self._logger.warn("Could not fetch bot user ID", {"error": exc})
 
-        if not self._default_bot_token:
+        if not self._is_single_workspace:
             self._logger.info("Slack adapter initialized in multi-workspace mode")
 
     async def disconnect(self) -> None:
@@ -722,11 +894,46 @@ class SlackAdapter:
 
         # Extract headers
         headers = getattr(request, "headers", {})
-        timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
-        signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
 
-        if not self._verify_signature(body, timestamp, signature):
-            return {"body": "Invalid signature", "status": 401}
+        # Verify the request — custom verifier takes priority when configured
+        # without a signing_secret. The verifier may also return a string that
+        # replaces the body for downstream parsing (e.g. canonicalization).
+        if self._webhook_verifier is not None:
+            try:
+                verifier_result = self._webhook_verifier(request, body)
+                if inspect.isawaitable(verifier_result):
+                    verifier_result = await verifier_result
+            except Exception as exc:
+                self._logger.warn("Webhook verifier rejected request", {"error": exc})
+                return {"body": "Invalid signature", "status": 401}
+            if not verifier_result:
+                self._logger.warn("Webhook verifier rejected request")
+                return {"body": "Invalid signature", "status": 401}
+            if isinstance(verifier_result, str):
+                # Substitute the verifier-supplied canonical body before
+                # parsing.  Other truthy returns are pure verification.
+                body = verifier_result
+        else:
+            timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
+            signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
+            if not self._verify_signature(body, timestamp, signature):
+                return {"body": "Invalid signature", "status": 401}
+
+        # Resolve the default bot token via the (possibly async) resolver
+        # before dispatching, so synchronous ``_get_token`` call sites
+        # downstream see a primed cache. For static-string configs this is
+        # already primed at construction, so the resolver is a no-op identity
+        # closure. For dynamic resolvers we re-resolve on every webhook entry
+        # so rotation is observed.
+        if self._is_single_workspace:
+            try:
+                await self._resolve_default_token()
+            except Exception as exc:
+                # Resolver failures here would manifest as auth errors deeper
+                # in dispatch; surface them at the entry point so the caller
+                # gets a clean 500 instead of partial processing. Re-raise.
+                self._logger.error("Bot token resolver failed", {"error": exc})
+                raise
 
         # Form-urlencoded payloads (interactive + slash commands)
         content_type = headers.get("content-type") or headers.get("Content-Type") or ""
@@ -736,7 +943,7 @@ class SlackAdapter:
             # Slash command
             if "command" in params and "payload" not in params:
                 team_id = (params.get("team_id") or [None])[0]
-                if not self._default_bot_token and team_id:
+                if not self._is_single_workspace and team_id:
                     ctx = await self._resolve_token_for_team(team_id)
                     if ctx:
                         tok = self._request_context.set(ctx)
@@ -748,7 +955,7 @@ class SlackAdapter:
                 return await self._handle_slash_command(params, options)
 
             # Interactive payload
-            if not self._default_bot_token:
+            if not self._is_single_workspace:
                 team_id_interactive = self._extract_team_id_from_interactive(body)
                 if team_id_interactive:
                     ctx = await self._resolve_token_for_team(team_id_interactive)
@@ -781,7 +988,7 @@ class SlackAdapter:
         # creates a task via asyncio.create_task).  The copied context is
         # isolated -- the ContextVar change does not leak back to the caller
         # and does not need an explicit reset.
-        if not self._default_bot_token and payload.get("type") == "event_callback":
+        if not self._is_single_workspace and payload.get("type") == "event_callback":
             team_id_event = payload.get("team_id")
             if team_id_event:
                 ctx = await self._resolve_token_for_team(team_id_event)
@@ -802,6 +1009,13 @@ class SlackAdapter:
     # ==================================================================
 
     def _verify_signature(self, body: str, timestamp: str | None, signature: str | None) -> bool:
+        # Defensive: ``_verify_signature`` should never be reached when only a
+        # ``webhook_verifier`` is configured (handle_webhook gates on that),
+        # but if a subclass calls this directly without a signing_secret,
+        # fail closed.
+        if not self._signing_secret:
+            return False
+
         if not (timestamp and signature):
             return False
 
@@ -825,6 +1039,10 @@ class SlackAdapter:
         )
 
         try:
+            # ``hmac.compare_digest`` is the canonical constant-time comparison.
+            # Custom verifiers passed via ``webhook_verifier`` MUST do the
+            # same — a regression to ``==`` would leak signature bytes via
+            # timing.
             return hmac.compare_digest(signature, expected)
         except Exception:
             return False
@@ -1855,8 +2073,13 @@ class SlackAdapter:
         the queue/debounce path JSON-serializes the message.
         """
         url = file.get("url_private")
-        # Capture token at creation time (during webhook processing)
-        bot_token = self._get_token()
+        # Capture per-request token from the active webhook context so
+        # ``fetch_data`` can run later without being inside the ContextVar
+        # frame (e.g. after the message has been queued + rehydrated).
+        # For single-workspace mode the default provider is re-resolved at
+        # fetch time so dynamic ``bot_token`` resolvers honor rotation.
+        ctx = self._request_context.get()
+        ctx_token: str | None = ctx.token if ctx and ctx.token else None
 
         mimetype = file.get("mimetype", "")
         att_type: str = "file"
@@ -1868,7 +2091,8 @@ class SlackAdapter:
             att_type = "audio"
 
         async def fetch_data() -> bytes:
-            return await self._fetch_slack_file(url, bot_token)  # type: ignore[arg-type]
+            token = ctx_token if ctx_token is not None else await self._resolve_token_async()
+            return await self._fetch_slack_file(url, token)  # type: ignore[arg-type]
 
         fetch_meta: dict[str, str] = {}
         if url:
@@ -1975,7 +2199,9 @@ class SlackAdapter:
                     )
                 token = installation.bot_token
             else:
-                token = adapter._get_token()
+                # Use the async resolver so a dynamic ``bot_token`` provider
+                # is invoked at fetch time (rotation-safe).
+                token = await adapter._resolve_token_async()
             return await adapter._fetch_slack_file(url, token)
 
         return Attachment(
@@ -2502,7 +2728,16 @@ class SlackAdapter:
         if files:
             raise ValidationError("slack", "File uploads are not supported in scheduled messages")
 
-        token = self._get_token()
+        # For multi-workspace mode, snapshot the per-team token from the
+        # active request context — ``cancel()`` may run outside the
+        # ContextVar frame. For single-workspace mode, defer resolution to
+        # ``cancel()`` so dynamic resolvers honor token rotation between
+        # ``schedule_message()`` and ``cancel()`` (Slack rotated tokens have
+        # a 12h TTL and scheduled messages can outlive their schedule-time
+        # token).
+        ctx = self._request_context.get()
+        ctx_token: str | None = ctx.token if ctx and ctx.token else None
+        token = ctx_token if ctx_token is not None else await self._resolve_token_async()
 
         try:
             client = self._get_client(token)
@@ -2535,7 +2770,11 @@ class SlackAdapter:
             adapter = self
 
             async def cancel() -> None:
-                c = adapter._get_client(token)
+                # Multi-workspace: use the snapshotted ctx_token (resolver
+                # runs outside the request frame). Single-workspace: re-
+                # resolve so token rotation between schedule + cancel works.
+                cancel_token = ctx_token if ctx_token is not None else await adapter._resolve_token_async()
+                c = adapter._get_client(cancel_token)
                 await c.chat_deleteScheduledMessage(channel=channel, scheduled_message_id=scheduled_message_id)
 
             return ScheduledMessage(
