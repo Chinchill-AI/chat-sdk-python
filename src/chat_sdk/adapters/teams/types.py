@@ -99,11 +99,37 @@ class TeamsThreadId:
 # =============================================================================
 
 
-class TeamsChannelContext(TypedDict):
-    """Teams channel context extracted from activity.channelData."""
+class TeamsChannelContext(TypedDict, total=False):
+    """Teams channel context extracted from activity.channelData.
+
+    The ``type`` discriminator is optional for backwards-compatibility:
+    cached entries written before vercel/chat#403 omit it, and downstream
+    code treats a missing ``type`` as ``"channel"``.
+    """
 
     channel_id: str
     team_id: str
+    type: str  # Literal["channel"] when present
+
+
+class TeamsDmContext(TypedDict):
+    """Teams DM context with the resolved Microsoft Graph chat ID.
+
+    Bot Framework hands out opaque DM conversation IDs (e.g.
+    ``a:1xWhatever``) which are *not* accepted by Graph's
+    ``/chats/{chat-id}/messages`` endpoint. The canonical Graph chat ID
+    for a 1:1 DM is ``19:{userAadId}_{botId}@unq.gbl.spaces`` — derive
+    and cache it from the incoming activity's ``from.aadObjectId``.
+    """
+
+    graph_chat_id: str
+    type: str  # Literal["dm"]
+
+
+# Discriminated union for Microsoft Graph API resolution context.
+# Group chats are not represented — their conversation ID works as-is
+# with Graph's chat endpoints.
+TeamsGraphContext = TeamsChannelContext | TeamsDmContext
 
 
 # =============================================================================
