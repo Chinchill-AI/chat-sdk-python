@@ -19,7 +19,12 @@ from typing import (
 from chat_sdk.cards import CardElement
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger, LogLevel
-from chat_sdk.modals import SelectOptionElement
+from chat_sdk.modals import OptionsLoadGroup, SelectOptionElement
+
+# A handler may return either a flat list of options or a list of labeled
+# groups (Slack's ``option_groups`` shape). Mirrors upstream TS
+# ``OptionsLoadResult = SelectOptionElement[] | OptionsLoadGroup[]``.
+OptionsLoadResult = list[SelectOptionElement] | list[OptionsLoadGroup]
 
 
 def _parse_iso(s: str) -> datetime:
@@ -1424,7 +1429,7 @@ class ChatInstance(Protocol):
     ) -> Awaitable[ModalResponse | None]: ...
     def process_options_load(
         self, event: OptionsLoadEvent, options: WebhookOptions | None = None
-    ) -> Awaitable[list[SelectOptionElement] | None]: ...
+    ) -> Awaitable[OptionsLoadResult | None]: ...
     def process_modal_close(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> None: ...

@@ -52,7 +52,7 @@ from chat_sdk.adapters.slack.types import (
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.modals import ModalElement, SelectOptionElement
+from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.types import (
@@ -1098,23 +1098,69 @@ class SlackAdapter:
 
         return self._options_load_response(result if result is not None else [])
 
-    def _options_load_response(self, options_list: list[SelectOptionElement]) -> dict[str, Any]:
-        """Serialize ``SelectOptionElement`` entries to a Slack JSON response."""
-        slack_options: list[dict[str, Any]] = []
-        for opt in options_list[:100]:
-            entry: dict[str, Any] = {
-                "text": {"type": "plain_text", "text": opt.get("label", "")},
-                "value": opt.get("value", ""),
+    def _options_load_response(
+        self,
+        result: list[SelectOptionElement] | list[OptionsLoadGroup],
+    ) -> dict[str, Any]:
+        """Serialize a flat option list or grouped option list to a Slack JSON response.
+
+        Mirrors upstream ``optionsLoadResponse``: when the first entry has an
+        ``options`` key it is treated as a list of :class:`OptionsLoadGroup`
+        and rendered as ``option_groups``; otherwise it's a flat list of
+        :class:`SelectOptionElement` rendered as ``options``. Slack's spec is
+        explicit that the two are mutually exclusive (only one may appear in
+        the response body).
+        """
+        # Detect grouped form (TS: ``"options" in result[0]``). A grouped
+        # entry is a dict with an ``options`` list inside it; a flat entry is
+        # a dict with ``label``/``value`` keys.
+        is_groups = (
+            len(result) > 0
+            and isinstance(result[0], dict)
+            and "options" in result[0]
+            and isinstance(result[0].get("options"), list)
+        )
+
+        if is_groups:
+            groups_in = cast("list[OptionsLoadGroup]", result)[:100]
+            slack_groups: list[dict[str, Any]] = []
+            for group in groups_in:
+                group_options = group.get("options", [])[:100]
+                slack_groups.append(
+                    {
+                        # Slack spec: group label is plain_text, max 75 chars.
+                        "label": {"type": "plain_text", "text": group.get("label", "")[:75]},
+                        "options": [self._select_option_to_slack(opt) for opt in group_options],
+                    }
+                )
+            return {
+                "body": json.dumps({"option_groups": slack_groups}),
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
             }
-            desc = opt.get("description")
-            if desc:
-                entry["description"] = {"type": "plain_text", "text": desc}
-            slack_options.append(entry)
+
+        flat = cast("list[SelectOptionElement]", result)[:100]
         return {
-            "body": json.dumps({"options": slack_options}),
+            "body": json.dumps({"options": [self._select_option_to_slack(opt) for opt in flat]}),
             "status": 200,
             "headers": {"Content-Type": "application/json"},
         }
+
+    @staticmethod
+    def _select_option_to_slack(opt: SelectOptionElement) -> dict[str, Any]:
+        """Convert a :class:`SelectOptionElement` to Slack's option object shape.
+
+        Mirrors upstream ``selectOptionToSlackOption`` — the ``description``
+        key is omitted (not set to ``null``) when not provided.
+        """
+        entry: dict[str, Any] = {
+            "text": {"type": "plain_text", "text": opt.get("label", "")},
+            "value": opt.get("value", ""),
+        }
+        desc = opt.get("description")
+        if desc:
+            entry["description"] = {"type": "plain_text", "text": desc}
+        return entry
 
     # ==================================================================
     # View submission / close
