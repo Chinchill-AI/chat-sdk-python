@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from chat_sdk.logger import Logger
+
+# Connection mode for the Slack adapter. ``"webhook"`` (default) consumes
+# events via signed HTTP POSTs from Slack. ``"socket"`` opens a long-lived
+# WebSocket via Slack's Socket Mode and ACKs each event over the socket.
+SlackAdapterMode = Literal["webhook", "socket"]
 
 # =============================================================================
 # Configuration
@@ -16,6 +21,8 @@ from chat_sdk.logger import Logger
 class SlackAdapterConfig:
     """Configuration for the Slack adapter."""
 
+    # App-level token (xapp-...). Required when ``mode == "socket"``.
+    app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.
     bot_token: str | None = None
     # Bot user ID (will be fetched if not provided)
@@ -32,8 +39,20 @@ class SlackAdapterConfig:
     installation_key_prefix: str = "slack:installation"
     # Logger instance for error reporting. Defaults to ConsoleLogger.
     logger: Logger | None = None
+    # Connection mode: ``"webhook"`` (default) or ``"socket"``. When set to
+    # ``"socket"`` the adapter opens a Slack Socket Mode WebSocket on
+    # ``initialize()`` and dispatches events over it. ``signing_secret`` is
+    # not required in socket mode (Slack does not sign socket events).
+    mode: SlackAdapterMode = "webhook"
     # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var.
+    # Required in webhook mode; optional in socket mode.
     signing_secret: str | None = None
+    # Shared secret for authenticating events forwarded from a separate
+    # socket-mode listener via HTTP POST. Auto-detected from
+    # SLACK_SOCKET_FORWARDING_SECRET. Falls back to ``app_token`` if not set
+    # (matches upstream behavior; prefer setting this explicitly so the
+    # long-lived xapp- token isn't used as a bearer credential).
+    socket_forwarding_secret: str | None = None
     # Maximum number of cached AsyncWebClient instances (LRU-bounded).
     # Defaults to 100. Increase for large multi-workspace deployments.
     client_cache_max: int | None = None

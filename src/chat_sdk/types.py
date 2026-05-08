@@ -1074,9 +1074,18 @@ class ModalCloseEvent:
 
 @dataclass
 class ModalResponse:
-    """Response to a modal submit event."""
+    """Response to a modal submit event.
 
-    action: Literal["close", "update", "push", "errors"]
+    The ``action`` field selects which Slack ``response_action`` is sent:
+
+    * ``"close"``     — close the current view (no body)
+    * ``"clear"``     — close the entire view stack
+    * ``"update"``    — replace the current view with ``modal``
+    * ``"push"``      — push ``modal`` onto the view stack
+    * ``"errors"``    — show field-level errors (``errors`` dict)
+    """
+
+    action: Literal["close", "clear", "update", "push", "errors"]
     modal: Any = None
     errors: dict[str, str] | None = None
 

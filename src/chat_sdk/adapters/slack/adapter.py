@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -47,6 +48,7 @@ from chat_sdk.adapters.slack.modals import (
 from chat_sdk.adapters.slack.types import (
     RequestContext,
     SlackAdapterConfig,
+    SlackAdapterMode,
     SlackInstallation,
     SlackThreadId,
 )
@@ -190,21 +192,63 @@ class SlackAdapter:
         if config is None:
             config = SlackAdapterConfig()
 
+        mode = config.mode or "webhook"
         signing_secret = config.signing_secret or os.environ.get("SLACK_SIGNING_SECRET")
-        if not signing_secret:
+        if not signing_secret and mode == "webhook":
             raise ValidationError(
                 "slack",
-                "signingSecret is required. Set SLACK_SIGNING_SECRET or provide it in config.",
+                "signingSecret is required for webhook mode. Set SLACK_SIGNING_SECRET or provide it in config.",
             )
 
+        app_token = config.app_token or os.environ.get("SLACK_APP_TOKEN")
+        if mode == "socket":
+            if not app_token:
+                raise ValidationError(
+                    "slack",
+                    "appToken is required for socket mode. Set SLACK_APP_TOKEN or provide it in config.",
+                )
+            # Hazard #12: validate the long-lived secret format on init so a
+            # typo'd bot token (xoxb-) doesn't get silently used as an app
+            # token. Slack app-level tokens always start with ``xapp-``.
+            if not app_token.startswith("xapp-"):
+                raise ValidationError(
+                    "slack",
+                    "appToken must start with 'xapp-' (Slack app-level token). "
+                    "Bot tokens (xoxb-) are not valid for socket mode.",
+                )
+
         # Auth fields: botToken presence selects single-workspace mode.
-        zero_config = not (config.signing_secret or config.bot_token or config.client_id or config.client_secret)
+        zero_config = not (
+            config.signing_secret or config.bot_token or config.client_id or config.client_secret or config.app_token
+        )
 
         bot_token = config.bot_token or (os.environ.get("SLACK_BOT_TOKEN") if zero_config else None)
 
         self._name = "slack"
-        self._signing_secret = signing_secret
+        self._signing_secret: str | None = signing_secret
         self._default_bot_token: str | None = bot_token
+
+        # Socket mode state
+        self._mode: SlackAdapterMode = mode
+        self._app_token: str | None = app_token
+        self._socket_forwarding_secret: str | None = (
+            config.socket_forwarding_secret or os.environ.get("SLACK_SOCKET_FORWARDING_SECRET") or app_token
+        )
+        # The active SocketModeClient instance (when running in socket mode).
+        # Typed as ``Any`` because slack_sdk is an optional dependency.
+        self._socket_client: Any = None
+        # Background task that runs the connect/run/reconnect loop. Tracked so
+        # ``disconnect()`` can cancel it cleanly (hazard #5).
+        self._socket_task: asyncio.Task[None] | None = None
+        # Set when shutdown is requested so the reconnect loop knows to exit
+        # rather than retry on a clean disconnect.
+        self._socket_shutdown = False
+        # Default backoff schedule in seconds. Kept short so tests run fast,
+        # but capped low enough that a flapping Slack connection doesn't busy
+        # loop. Slack's recommended pattern is exponential backoff with jitter;
+        # our minimal schedule mirrors that behavior with explicit caps.
+        self._socket_initial_backoff_s = 1.0
+        self._socket_max_backoff_s = 30.0
         self._logger: Logger = config.logger or ConsoleLogger("info")
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
@@ -259,6 +303,16 @@ class SlackAdapter:
     @property
     def persist_message_history(self) -> bool:
         return self._persist_message_history
+
+    @property
+    def mode(self) -> SlackAdapterMode:
+        """Connection mode (``"webhook"`` or ``"socket"``)."""
+        return self._mode
+
+    @property
+    def is_socket_mode(self) -> bool:
+        """``True`` when the adapter is configured for Socket Mode."""
+        return self._mode == "socket"
 
     # ------------------------------------------------------------------
     # Public request-context accessors
@@ -377,8 +431,18 @@ class SlackAdapter:
         if not self._default_bot_token:
             self._logger.info("Slack adapter initialized in multi-workspace mode")
 
+        if self._mode == "socket":
+            await self.start_socket_mode()
+
     async def disconnect(self) -> None:
-        """No persistent connections to close."""
+        """Close any persistent connections held by the adapter.
+
+        In webhook mode this is a no-op. In socket mode it cancels the
+        background reconnect loop, closes the active ``SocketModeClient``,
+        and waits for the loop to settle. Idempotent — calling it twice or
+        before ``initialize()`` is safe.
+        """
+        await self.stop_socket_mode()
 
     # ==================================================================
     # Multi-workspace installation management
@@ -722,6 +786,31 @@ class SlackAdapter:
 
         # Extract headers
         headers = getattr(request, "headers", {})
+
+        # Forwarded socket-mode events bypass Slack signature verification —
+        # they're authenticated by a shared bearer secret instead. This lets a
+        # separate process run the WebSocket and POST events back to the
+        # webhook endpoint over HTTP. Hazard #12: refuse if no secret is
+        # configured rather than treating an empty header match as success.
+        socket_token = headers.get("x-slack-socket-token") or headers.get("X-Slack-Socket-Token")
+        if socket_token:
+            if not self._socket_forwarding_secret or not hmac.compare_digest(
+                socket_token, self._socket_forwarding_secret
+            ):
+                self._logger.warn("Invalid socket forwarding token")
+                return {"body": "Invalid socket token", "status": 401}
+            try:
+                event = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                return {"body": "Invalid JSON", "status": 400}
+            await self._handle_forwarded_socket_event(event, options)
+            return {"body": "ok", "status": 200}
+
+        # In socket mode, refuse direct webhook POSTs — Slack delivers events
+        # over the WebSocket instead. We still allow forwarded events above.
+        if self._mode == "socket":
+            return {"body": "Webhooks are disabled in socket mode", "status": 405}
+
         timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
         signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
 
@@ -802,7 +891,11 @@ class SlackAdapter:
     # ==================================================================
 
     def _verify_signature(self, body: str, timestamp: str | None, signature: str | None) -> bool:
-        if not (timestamp and signature):
+        # Refuse rather than HMAC against an empty key. This matters in socket
+        # mode where ``signing_secret`` is optional — without this guard a
+        # caller could call ``handle_webhook`` while in socket mode and
+        # silently pass verification with an empty secret.
+        if not (timestamp and signature and self._signing_secret):
             return False
 
         # Check timestamp is recent (within 5 minutes)
@@ -881,6 +974,18 @@ class SlackAdapter:
         except (json.JSONDecodeError, ValueError):
             return {"body": "Invalid payload JSON", "status": 400}
 
+        return await self._dispatch_interactive_payload(payload, options)
+
+    async def _dispatch_interactive_payload(
+        self,
+        payload: dict[str, Any],
+        options: WebhookOptions | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a pre-parsed interactive payload to the right handler.
+
+        Used by both the webhook path (after form-decoding) and the socket
+        mode path (which receives the payload as a JSON object directly).
+        """
         payload_type = payload.get("type")
 
         if payload_type == "block_actions":
@@ -1198,6 +1303,9 @@ class SlackAdapter:
     def _modal_response_to_slack(self, response: ModalResponse, context_id: str | None = None) -> SlackModalResponse:
         if response.action == "close":
             return {}
+        if response.action == "clear":
+            # Close the entire modal view stack (Slack ``response_action: clear``).
+            return {"response_action": "clear"}
         if response.action == "errors":
             return {"response_action": "errors", "errors": response.errors or {}}
         if response.action in ("update", "push"):
@@ -1212,6 +1320,395 @@ class SlackAdapter:
                 view = modal_to_slack_view(cast(ModalElement, modal), metadata)
                 return {"response_action": response.action, "view": view}
         return {}
+
+    # ==================================================================
+    # Socket Mode
+    # ==================================================================
+
+    async def start_socket_mode(self) -> None:
+        """Open a Slack Socket Mode WebSocket and dispatch events.
+
+        Spawns a tracked background task that connects, runs the message
+        loop, and reconnects with exponential backoff on disconnect (per
+        Slack's recommendation). Returns once the initial connection has
+        been established.
+
+        Raises :class:`ValidationError` if the adapter wasn't configured
+        with ``app_token`` (must start with ``xapp-``).
+
+        Idempotent: a second call while connected is a no-op.
+        """
+        if not self._app_token:
+            raise ValidationError(
+                "slack",
+                "appToken is required for socket mode. Set SLACK_APP_TOKEN or provide it in config.",
+            )
+
+        if self._socket_task is not None and not self._socket_task.done():
+            # Already running.
+            return
+
+        # Lazy import (hazard #10) — slack_sdk is an optional dependency.
+        try:
+            from slack_sdk.socket_mode.aiohttp import SocketModeClient  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - import-time failure
+            raise ValidationError(
+                "slack",
+                "slack_sdk is not installed. Install with `pip install chat-sdk[slack]`.",
+            ) from exc
+
+        self._socket_shutdown = False
+        connected = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        # Hazard #5: track the task explicitly so ``stop_socket_mode`` can
+        # cancel it cleanly. Don't use ``asyncio.ensure_future`` without
+        # tracking — a stray reference loss would orphan the WebSocket.
+        self._socket_task = loop.create_task(self._socket_mode_loop(connected))
+
+        # Wait for either the first successful connect or for the loop to
+        # exit (which means the very first connect raised). Re-raise so the
+        # caller learns about a hard config failure (bad app token, network
+        # offline) instead of silently spinning forever.
+        first_done, _ = await asyncio.wait(
+            {asyncio.create_task(connected.wait()), self._socket_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if connected.is_set():
+            return
+        # Socket loop exited before connecting — surface its exception.
+        for done in first_done:
+            if done is self._socket_task:
+                exc = done.exception()
+                if exc is not None:
+                    raise exc
+
+    async def stop_socket_mode(self) -> None:
+        """Close the Socket Mode connection and cancel the reconnect loop.
+
+        Idempotent. Safe to call from any task; it disconnects the active
+        client and waits for the background task to finish.
+        """
+        self._socket_shutdown = True
+
+        client = self._socket_client
+        self._socket_client = None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                self._logger.warn("Error disconnecting Slack socket client", {"error": str(exc)})
+
+        task = self._socket_task
+        self._socket_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            # Cancellation is expected; any other exception was already
+            # logged inside the loop. Don't re-raise on shutdown.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        if task is not None:
+            self._logger.info("Slack socket mode disconnected")
+
+    async def _socket_mode_loop(self, connected: asyncio.Event) -> None:
+        """Connect/run/reconnect loop for Socket Mode.
+
+        Slack's Socket Mode WebSocket is long-lived but can disconnect for
+        many reasons (refresh, network blip, restart). We retry with
+        exponential backoff (with jitter) and reset the backoff once a
+        connection holds for any non-trivial time.
+        """
+        from slack_sdk.socket_mode.aiohttp import SocketModeClient
+
+        backoff = self._socket_initial_backoff_s
+        try:
+            while not self._socket_shutdown:
+                client = SocketModeClient(app_token=cast(str, self._app_token))
+                # Register our request handler. ``socket_mode_request_listeners``
+                # is the documented public extension point on the slack_sdk
+                # client; each listener is ``async (client, request) -> None``.
+                client.socket_mode_request_listeners.append(self._on_socket_request)
+                self._socket_client = client
+                try:
+                    await client.connect()
+                except Exception as exc:
+                    self._logger.error(
+                        "Slack socket mode connect failed",
+                        {"error": str(exc)},
+                    )
+                    self._socket_client = None
+                    if self._socket_shutdown:
+                        return
+                    if not connected.is_set():
+                        # First connect failed and nobody's listening yet —
+                        # surface the error to the caller of start_socket_mode.
+                        raise
+                    await self._socket_sleep_with_backoff(backoff)
+                    backoff = min(backoff * 2, self._socket_max_backoff_s)
+                    continue
+
+                # Connection established (or in progress) — let the caller of
+                # start_socket_mode resume.
+                self._logger.info("Slack socket mode connected")
+                connected.set()
+                backoff = self._socket_initial_backoff_s
+
+                # Wait until the socket disconnects or shutdown is requested.
+                while not self._socket_shutdown:
+                    if not client.is_connected():
+                        break
+                    await asyncio.sleep(1.0)
+
+                # Tear down the current client before reconnecting.
+                self._socket_client = None
+                try:
+                    await client.disconnect()
+                except Exception as exc:  # pragma: no cover - best-effort
+                    self._logger.warn(
+                        "Error disconnecting Slack socket client during reconnect",
+                        {"error": str(exc)},
+                    )
+
+                if self._socket_shutdown:
+                    return
+                self._logger.info("Slack socket mode disconnected, reconnecting")
+                await self._socket_sleep_with_backoff(backoff)
+                backoff = min(backoff * 2, self._socket_max_backoff_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Make sure first-connect failures propagate to the caller of
+            # start_socket_mode, but also log everything else loudly.
+            if not connected.is_set():
+                raise
+            self._logger.error(
+                "Slack socket mode loop crashed",
+                {"error": str(exc)},
+            )
+        finally:
+            client = self._socket_client
+            self._socket_client = None
+            if client is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover - best-effort
+                    await client.disconnect()
+
+    async def _socket_sleep_with_backoff(self, seconds: float) -> None:
+        """Sleep for ``seconds`` but wake immediately on shutdown."""
+        # Poll every 0.25s so a stop_socket_mode call doesn't have to wait
+        # the full backoff window. asyncio.Event would be slightly cleaner
+        # but we don't want to add an Event per loop iteration.
+        deadline = asyncio.get_event_loop().time() + seconds
+        while not self._socket_shutdown:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.25, remaining))
+
+    async def _on_socket_request(self, client: Any, request: Any) -> None:
+        """Listener invoked by ``SocketModeClient`` for each socket message.
+
+        Signature matches slack_sdk's documented hook:
+        ``async (client: SocketModeClient, request: SocketModeRequest) -> None``.
+        """
+        from slack_sdk.socket_mode.response import SocketModeResponse
+
+        envelope_id = getattr(request, "envelope_id", "") or ""
+        event_type = getattr(request, "type", "") or ""
+        payload = getattr(request, "payload", None) or {}
+        retry_attempt = getattr(request, "retry_attempt", 0) or 0
+
+        async def ack(response_payload: dict[str, Any] | None = None) -> None:
+            try:
+                await client.send_socket_mode_response(
+                    SocketModeResponse(envelope_id=envelope_id, payload=response_payload)
+                )
+            except Exception as exc:  # pragma: no cover - best-effort
+                self._logger.warn(
+                    "Failed to send socket mode ack",
+                    {"envelope_id": envelope_id, "error": str(exc)},
+                )
+
+        # Slack re-delivers events that weren't acked in time. Skip retries
+        # so we don't double-process — but still ack so Slack stops resending.
+        if retry_attempt and retry_attempt > 0:
+            await ack()
+            self._logger.debug("Skipping socket mode retry", {"retry_attempt": retry_attempt})
+            return
+
+        await self._route_socket_event(payload, event_type, ack)
+
+    async def _route_socket_event(
+        self,
+        body: dict[str, Any],
+        event_type: str,
+        ack: Callable[..., Awaitable[None]],
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Route a socket-mode event to the same handler the webhook path uses.
+
+        Mirrors upstream's ``routeSocketEvent``. The ``ack`` callback delivers
+        the SocketModeResponse back to Slack — for events_api and
+        slash_commands we ack immediately and let processing run in the
+        background; for interactive payloads we may attach a response body
+        (e.g. modal ``view_submission`` errors) onto the ack.
+        """
+
+        def wrap_async(coro: Awaitable[Any]) -> None:
+            """Run ``coro`` either via ``waitUntil`` or as a tracked task."""
+            if options is not None and options.wait_until is not None:
+                # ``wait_until`` semantics: caller takes ownership.
+                options.wait_until(cast(Any, coro))
+                return
+            task = asyncio.get_event_loop().create_task(cast(Any, coro))
+
+            def _log_exc(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self._logger.error(
+                        "Error in socket mode async handler",
+                        {"error": str(exc)},
+                    )
+
+            task.add_done_callback(_log_exc)
+            _pin_task(task)
+
+        if event_type == "events_api":
+            await ack()
+            event = body.get("event")
+            if not isinstance(event, dict):
+                self._logger.warn(
+                    "Socket mode events_api missing event field",
+                    {"body_type": type(body).__name__},
+                )
+                return
+            payload: dict[str, Any] = {
+                "type": "event_callback",
+                "event": event,
+                "team_id": body.get("team_id"),
+                "event_id": body.get("event_id"),
+                "event_time": body.get("event_time"),
+                "is_ext_shared_channel": body.get("is_ext_shared_channel"),
+            }
+            # Multi-workspace: resolve token before dispatch (mirrors webhook
+            # path). copy_context() keeps the ContextVar set on tasks spawned
+            # by handlers (hazard #6).
+            team_id_event = payload.get("team_id")
+            try:
+                if not self._default_bot_token and team_id_event:
+                    ctx = await self._resolve_token_for_team(team_id_event)
+                    if ctx is None:
+                        self._logger.warn(
+                            "Could not resolve token for team",
+                            {"teamId": team_id_event},
+                        )
+                        return
+                    isolated = contextvars.copy_context()
+                    isolated.run(self._request_context.set, ctx)
+                    isolated.run(self._process_event_payload, payload, options)
+                else:
+                    self._process_event_payload(payload, options)
+            except Exception as exc:
+                self._logger.error(
+                    "Error processing socket mode events_api",
+                    {"error": str(exc)},
+                )
+            return
+
+        if event_type == "slash_commands":
+            await ack()
+            # slash_commands payload is a flat dict mirroring the
+            # form-urlencoded fields; convert to the parse_qs shape that
+            # _handle_slash_command expects (each value wrapped in a list).
+            params: dict[str, list[str]] = {k: [v] for k, v in body.items() if isinstance(v, str)}
+
+            async def run_slash() -> None:
+                team_id_slash = (params.get("team_id") or [None])[0]
+                if not self._default_bot_token and team_id_slash:
+                    ctx = await self._resolve_token_for_team(team_id_slash)
+                    if ctx is None:
+                        self._logger.warn("Could not resolve token for slash command")
+                        return
+                    tok = self._request_context.set(ctx)
+                    try:
+                        await self._handle_slash_command(params, options)
+                    finally:
+                        self._request_context.reset(tok)
+                else:
+                    await self._handle_slash_command(params, options)
+
+            wrap_async(run_slash())
+            return
+
+        if event_type == "interactive":
+            try:
+                # Multi-workspace: scope token resolution to the dispatch.
+                team_ref = body.get("team")
+                team_id_interactive = team_ref.get("id") if isinstance(team_ref, dict) else body.get("team_id")
+                if not self._default_bot_token and team_id_interactive:
+                    ctx = await self._resolve_token_for_team(team_id_interactive)
+                    if ctx is None:
+                        self._logger.warn("Could not resolve token for interactive payload")
+                        await ack()
+                        return
+                    tok = self._request_context.set(ctx)
+                    try:
+                        result = await self._dispatch_interactive_payload(body, options)
+                    finally:
+                        self._request_context.reset(tok)
+                else:
+                    result = await self._dispatch_interactive_payload(body, options)
+            except Exception as exc:
+                self._logger.error(
+                    "Error processing socket mode interactive",
+                    {"error": str(exc)},
+                )
+                await ack()
+                return
+
+            response_body: dict[str, Any] | None = None
+            body_str = result.get("body") if isinstance(result, dict) else None
+            if isinstance(body_str, str) and body_str:
+                content_type = result.get("headers", {}).get("Content-Type", "") if isinstance(result, dict) else ""
+                if "application/json" in content_type:
+                    try:
+                        parsed = json.loads(body_str)
+                        if isinstance(parsed, dict):
+                            response_body = parsed
+                    except (json.JSONDecodeError, ValueError):
+                        response_body = None
+            await ack(response_body)
+            return
+
+        # Unknown event type — still ack so Slack doesn't redeliver.
+        await ack()
+        self._logger.debug("Unhandled socket mode event type", {"type": event_type})
+
+    async def _handle_forwarded_socket_event(
+        self,
+        event: dict[str, Any],
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Process a socket-mode event forwarded over HTTP.
+
+        Companion to :meth:`_route_socket_event` for the serverless pattern
+        where a long-running listener runs in one process and posts events
+        to a webhook handler elsewhere. The ack already happened on the
+        listener side; we just route to the same handler dispatch.
+        """
+
+        async def noop_ack(_response: dict[str, Any] | None = None) -> None:
+            return None
+
+        body = event.get("body")
+        event_type = event.get("eventType") or event.get("event_type") or ""
+        if not isinstance(body, dict) or not isinstance(event_type, str):
+            self._logger.warn(
+                "Forwarded socket event has invalid shape",
+                {"event_type": type(event_type).__name__},
+            )
+            return
+        await self._route_socket_event(body, event_type, noop_ack, options)
 
     # ==================================================================
     # Message events
@@ -3167,5 +3664,16 @@ class SlackAdapter:
 
 
 def create_slack_adapter(config: SlackAdapterConfig | None = None) -> SlackAdapter:
-    """Create a new SlackAdapter instance."""
+    """Create a new SlackAdapter instance.
+
+    For socket mode, the factory rejects multi-workspace setups upfront —
+    Socket Mode is a single-workspace transport (the WebSocket carries one
+    app's events for one workspace) and silently mixing the two would mask
+    a config mistake.
+    """
+    if config is not None and (config.mode or "webhook") == "socket" and (config.client_id or config.client_secret):
+        raise ValidationError(
+            "slack",
+            "Multi-workspace (clientId/clientSecret) is not supported in socket mode.",
+        )
     return SlackAdapter(config)
