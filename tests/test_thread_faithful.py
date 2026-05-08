@@ -855,6 +855,63 @@ class TestStreaming:
             f"team (string) → team.id (object) → user.team_id."
         )
 
+    # it("should forward structured stream chunks to adapter.stream from an action-created thread")
+    # Upstream parity: vercel/chat#330. Verifies that a block_actions
+    # context (where ``raw.team`` is an object) still routes a *structured*
+    # stream (text + ``task_update`` chunks) into ``adapter.stream``, not
+    # the text-only fallback path. Before #330, an undefined
+    # ``recipient_team_id`` would still call ``adapter.stream`` but the
+    # adapter would fail to authenticate; here we assert the chunks land
+    # untouched and ``recipient_team_id`` is set.
+    @pytest.mark.asyncio
+    async def test_should_forward_structured_stream_chunks_to_adapter_stream_from_an_action_created_thread(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        forwarded_chunks: list[Any] = []
+        captured_options: list[Any] = []
+
+        async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+            captured_options.append(options)
+            async for chunk in text_stream:
+                forwarded_chunks.append(chunk)
+            return RawMessage(id="msg-stream", thread_id=thread_id, raw="Hello")
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        action_msg = Message(
+            id="action-msg",
+            thread_id="slack:C123:1234.5678",
+            text="",
+            formatted={"type": "root", "children": []},
+            # block_actions shape with team as an object — the case #330 broke.
+            raw={"team": {"domain": "workspace", "id": "T123"}, "type": "block_actions"},
+            author=Author(
+                user_id="U456",
+                user_name="user",
+                full_name="Test User",
+                is_bot=False,
+                is_me=False,
+            ),
+            metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+            attachments=[],
+        )
+        thread = _make_thread(adapter, state, current_message=action_msg)
+
+        task_chunk = TaskUpdateChunk(id="task-1", status="pending", title="Thinking", type="task_update")
+
+        async def structured_stream() -> AsyncIterator[Any]:
+            yield "Picking option..."
+            yield task_chunk
+
+        await thread.post(structured_stream())
+
+        assert len(captured_options) == 1
+        assert captured_options[0].recipient_team_id == "T123"
+        # Both the text and the task_update chunk reached adapter.stream.
+        assert "Picking option..." in forwarded_chunks
+        assert task_chunk in forwarded_chunks
+
     # vercel/chat#330 regression — concurrent block_actions payloads with
     # different team.id values must not cross-contaminate. Hazard #6
     # (ContextVar boundaries): even though team_id flows through the
