@@ -784,9 +784,32 @@ class TestStreaming:
         open_count = final_md.count("**")
         assert open_count % 2 == 0
 
-    # it("should pass stream options from current message context")
+    # it.each([...])("should pass stream options from Slack current message context via $label")
+    # Upstream parity: vercel/chat#330. Slack carries the workspace ID in
+    # different shapes depending on webhook envelope; the post() dispatcher
+    # must extract it from each.
+    #
+    # What to fix if this fails: see ``_extract_slack_recipient_team_id`` in
+    # ``src/chat_sdk/thread.py``. The interactive payload lookup must follow
+    # the order: top-level ``team_id`` → top-level ``team`` (string) →
+    # nested ``team.id`` (object) → ``user.team_id`` fallback.
+    @pytest.mark.parametrize(
+        ("label", "raw", "expected_team_id"),
+        [
+            ("team_id", {"team_id": "T123", "type": "app_mention"}, "T123"),
+            ("team string", {"team": "T234", "type": "message"}, "T234"),
+            ("team.id object", {"team": {"id": "T345"}, "type": "block_actions"}, "T345"),
+            (
+                "user.team_id fallback",
+                {"type": "block_actions", "user": {"team_id": "T456"}},
+                "T456",
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_should_pass_stream_options_from_current_message_context(self):
+    async def test_should_pass_stream_options_from_current_message_context(
+        self, label: str, raw: dict[str, Any], expected_team_id: str
+    ):
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -806,7 +829,7 @@ class TestStreaming:
             thread_id="slack:C123:1234.5678",
             text="test",
             formatted={"type": "root", "children": []},
-            raw={"team_id": "T123"},
+            raw=raw,
             author=Author(
                 user_id="U456",
                 user_name="user",
@@ -825,7 +848,74 @@ class TestStreaming:
         assert len(stream_call_args) == 1
         options = stream_call_args[0][2]
         assert options.recipient_user_id == "U456"
-        assert options.recipient_team_id == "T123"
+        assert options.recipient_team_id == expected_team_id, (
+            f"label={label!r}: expected {expected_team_id!r} but got "
+            f"{options.recipient_team_id!r}. The interactive-payload "
+            f"team_id extraction (vercel/chat#330) must walk team_id → "
+            f"team (string) → team.id (object) → user.team_id."
+        )
+
+    # vercel/chat#330 regression — concurrent block_actions payloads with
+    # different team.id values must not cross-contaminate. Hazard #6
+    # (ContextVar boundaries): even though team_id flows through the
+    # per-thread ``currentMessage`` (not a ContextVar), running two posts
+    # concurrently still verifies that no module-level cache or shared
+    # adapter state leaks the team between requests.
+    #
+    # What to fix if this fails: a regression in
+    # ``_extract_slack_recipient_team_id`` or in how ThreadImpl reads
+    # ``self._current_message.raw`` is letting one request see another's
+    # team. Check for any ContextVar / module-global the extraction relies
+    # on.
+    @pytest.mark.asyncio
+    async def test_concurrent_block_actions_team_ids_do_not_cross_contaminate(self):
+        captured: list[tuple[str, str | None]] = []
+        captured_lock = asyncio.Lock()
+
+        async def _make_post(team_id: str, user_id: str) -> None:
+            adapter = create_mock_adapter()
+            state = create_mock_state()
+
+            async def mock_stream(thread_id: str, text_stream: Any, options: Any = None) -> RawMessage:
+                # Yield to interleave with the sibling task before recording.
+                await asyncio.sleep(0)
+                async for _ in text_stream:
+                    pass
+                async with captured_lock:
+                    captured.append((user_id, options.recipient_team_id))
+                return RawMessage(id=f"msg-{team_id}", thread_id=thread_id, raw="ok")
+
+            adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+            current_msg = Message(
+                id=f"original-{team_id}",
+                thread_id="slack:C123:1234.5678",
+                text="",
+                formatted={"type": "root", "children": []},
+                # block_actions shape (team is an object).
+                raw={"type": "block_actions", "team": {"id": team_id}},
+                author=Author(
+                    user_id=user_id,
+                    user_name=user_id,
+                    full_name=user_id,
+                    is_bot=False,
+                    is_me=False,
+                ),
+                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                attachments=[],
+            )
+
+            thread = _make_thread(adapter, state, current_message=current_msg)
+            await thread.post(_create_text_stream(["hi"]))
+
+        await asyncio.gather(
+            _make_post("T_AAA", "U_AAA"),
+            _make_post("T_BBB", "U_BBB"),
+        )
+
+        # Each request must see its own team_id, not the other's.
+        captured_map = dict(captured)
+        assert captured_map == {"U_AAA": "T_AAA", "U_BBB": "T_BBB"}
 
     # it("should pass StreamingPlan PostableObject options to adapter.stream")
     @pytest.mark.asyncio
