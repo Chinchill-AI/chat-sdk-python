@@ -91,6 +91,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -597,10 +598,18 @@ class SlackAdapter:
     # User / Channel lookup with caching
     # ==================================================================
 
-    async def _lookup_user(self, user_id: str) -> dict[str, str]:
+    async def _lookup_user(self, user_id: str) -> dict[str, Any]:
         """Look up user info from Slack API with caching.
 
-        Returns ``{"display_name": ..., "real_name": ...}``.
+        Returns a dict with keys ``display_name``, ``real_name``, and
+        (when available from the Slack API or from a cached entry) the
+        optional fields ``email``, ``avatar_url``, ``is_bot``.
+
+        On API failure the returned dict is a fallback shape
+        (``display_name`` / ``real_name`` populated with the user ID) and
+        carries the private ``_lookup_failed: True`` sentinel so callers
+        that need to distinguish "really not found" from "fall back to ID"
+        — like :meth:`get_user` — can return ``None`` instead.
         """
         cache_key = f"slack:user:{user_id}"
 
@@ -610,6 +619,9 @@ class SlackAdapter:
                 return {
                     "display_name": cached.get("display_name", user_id),
                     "real_name": cached.get("real_name", user_id),
+                    "email": cached.get("email"),
+                    "avatar_url": cached.get("avatar_url"),
+                    "is_bot": cached.get("is_bot"),
                 }
 
         try:
@@ -626,11 +638,24 @@ class SlackAdapter:
                 or user_id
             )
             real_name = user.get("real_name") or profile.get("real_name") or display_name
+            email = profile.get("email")
+            # Upstream chose `image_192` (vs the older `image_72`) for
+            # better avatar quality — see vercel/chat#391.
+            avatar_url = profile.get("image_192")
+            is_bot = user.get("is_bot")
+
+            cached_entry: dict[str, Any] = {
+                "display_name": display_name,
+                "real_name": real_name,
+                "email": email,
+                "avatar_url": avatar_url,
+                "is_bot": is_bot,
+            }
 
             if self._chat:
                 await self._chat.get_state().set(
                     cache_key,
-                    {"display_name": display_name, "real_name": real_name},
+                    cached_entry,
                     _USER_CACHE_TTL_MS,
                 )
                 # Reverse index: display name -> user IDs
@@ -649,10 +674,23 @@ class SlackAdapter:
                 "Fetched user info",
                 {"userId": user_id, "displayName": display_name, "realName": real_name},
             )
-            return {"display_name": display_name, "real_name": real_name}
+            return cached_entry
         except Exception as exc:
             self._logger.warn("Could not fetch user info", {"userId": user_id, "error": exc})
-            return {"display_name": user_id, "real_name": user_id}
+            # Keep the fallback dict shape so existing callers (mention
+            # resolution, slash command author binding, message parsing)
+            # don't change behavior on transient lookup failures — they
+            # already used `display_name`/`real_name` and would have
+            # received the user ID either way. The private sentinel lets
+            # `get_user` distinguish "API failed" from "API returned data".
+            return {
+                "display_name": user_id,
+                "real_name": user_id,
+                "email": None,
+                "avatar_url": None,
+                "is_bot": None,
+                "_lookup_failed": True,
+            }
 
     async def _lookup_channel(self, channel_id: str) -> str:
         """Look up channel name from Slack API with caching."""
@@ -677,6 +715,35 @@ class SlackAdapter:
         except Exception as exc:
             self._logger.warn("Could not fetch channel info", {"channelId": channel_id, "error": exc})
             return channel_id
+
+    # ==================================================================
+    # Public user lookup (chat.get_user)
+    # ==================================================================
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up Slack user info via ``users.info``.
+
+        Returns ``None`` when the Slack API call fails (network error,
+        rate limit, missing scopes, unknown user). ``email`` requires the
+        ``users:read.email`` scope; ``avatar_url`` is the high-quality
+        ``image_192`` from the user's Slack profile.
+
+        Mirrors upstream ``SlackAdapter.getUser`` (vercel/chat#391).
+        """
+        try:
+            cached = await self._lookup_user(user_id)
+        except Exception:
+            return None
+        if cached.get("_lookup_failed"):
+            return None
+        return UserInfo(
+            user_id=user_id,
+            user_name=cached.get("display_name") or user_id,
+            full_name=cached.get("real_name") or user_id,
+            is_bot=bool(cached.get("is_bot")) if cached.get("is_bot") is not None else False,
+            email=cached.get("email"),
+            avatar_url=cached.get("avatar_url"),
+        )
 
     # ==================================================================
     # Webhook handling
