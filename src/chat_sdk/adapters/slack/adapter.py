@@ -1775,7 +1775,15 @@ class SlackAdapter:
         previews: list[LinkPreview] = []
         for url in urls:
             preview = self._create_link_preview(url)
-            unfurl = unfurls.get(url) or unfurls.get(_TRAILING_SLASH_PATTERN.sub("", url)) or unfurls.get(f"{url}/")
+            # TS uses ``url.replace(TRAILING_SLASH_PATTERN, "")`` (no ``g``
+            # flag) which strips a single trailing ``/``. Python's
+            # ``re.sub`` defaults to replacing all occurrences, so we
+            # pin ``count=1`` for parity. (Practically the regex anchors
+            # at end-of-string so only one match exists, but locking
+            # this in prevents drift if the pattern ever loosens.)
+            unfurl = (
+                unfurls.get(url) or unfurls.get(_TRAILING_SLASH_PATTERN.sub("", url, count=1)) or unfurls.get(f"{url}/")
+            )
             if unfurl:
                 preview = self._merge_unfurl_into_preview(preview, unfurl)
             previews.append(preview)
@@ -1785,16 +1793,21 @@ class SlackAdapter:
     def _merge_unfurl_into_preview(preview: LinkPreview, unfurl: dict[str, str | None]) -> LinkPreview:
         """Return a new LinkPreview with unfurl metadata merged in.
 
-        Only fills fields that are missing on the preview — user-supplied
-        metadata (e.g. ``title`` from a Slack message URL) wins over the
-        attachment-derived unfurl. ``fetch_message`` is preserved.
+        Mirrors the TS spread ``{ ...preview, ...unfurl }``: the unfurl
+        values OVERRIDE the preview's ``description`` / ``image_url`` /
+        ``site_name`` (the unfurled attachment is the authoritative
+        source). ``title`` is short-circuited by callers (``_enrich_links``
+        skips merging when the preview already has a title), but for the
+        same-event ``_extract_links`` path the unfurl's title also wins
+        when present. ``fetch_message`` is never present on the unfurl
+        and is preserved from the preview.
         """
         return LinkPreview(
             url=preview.url,
-            title=preview.title if preview.title is not None else unfurl.get("title"),
-            description=preview.description if preview.description is not None else unfurl.get("description"),
-            image_url=preview.image_url if preview.image_url is not None else unfurl.get("image_url"),
-            site_name=preview.site_name if preview.site_name is not None else unfurl.get("site_name"),
+            title=unfurl.get("title") if unfurl.get("title") is not None else preview.title,
+            description=unfurl.get("description") if unfurl.get("description") is not None else preview.description,
+            image_url=unfurl.get("image_url") if unfurl.get("image_url") is not None else preview.image_url,
+            site_name=unfurl.get("site_name") if unfurl.get("site_name") is not None else preview.site_name,
             fetch_message=preview.fetch_message,
         )
 
@@ -1906,7 +1919,7 @@ class SlackAdapter:
                 continue
             unfurl = (
                 stored.get(link.url)
-                or stored.get(_TRAILING_SLASH_PATTERN.sub("", link.url))
+                or stored.get(_TRAILING_SLASH_PATTERN.sub("", link.url, count=1))
                 or stored.get(f"{link.url}/")
             )
             if unfurl:
@@ -2019,6 +2032,12 @@ class SlackAdapter:
                 self._create_attachment(f, team_id=event.get("team") or event.get("team_id"))
                 for f in event.get("files", [])
             ],
+            # ``_enrich_links`` polls the unfurl cache for up to
+            # ``_UNFURL_WAIT_MS`` (2000 ms) before giving up, so every
+            # message containing a not-yet-unfurled link adds up to
+            # ~2s of latency to message handling worst-case (it returns
+            # immediately when the cache is already populated or when
+            # there are no links to enrich).
             links=await self._enrich_links(self._extract_links(event), event.get("ts")),
         )
 

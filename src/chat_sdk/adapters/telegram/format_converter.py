@@ -155,6 +155,16 @@ def _render_markdown_v2(node: Content) -> str:
 
     # Fallback for unknown node types: render children if available, else
     # escape any value, else empty.
+    #
+    # Trade-off vs. upstream: TS uses ``node satisfies never`` to make
+    # adding a new mdast node a *compile-time* failure here. In Python
+    # we don't have that guarantee, so an unknown node is silently
+    # converted to its escaped value or empty string rather than
+    # raised. We accept this so that future mdast extensions don't
+    # break message delivery (a stray unknown node should degrade to
+    # plain text, not a crash) — at the cost of losing the upstream
+    # signal that a renderer arm is missing. Test coverage of the
+    # renderer should grow alongside any new node kinds we recognise.
     if children:
         return _render_children(children)
     value = node.get("value")

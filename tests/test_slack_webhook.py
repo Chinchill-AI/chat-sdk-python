@@ -1222,3 +1222,127 @@ class TestUnfurlMetadata:
         original = [_LinkPreview(url="https://example.com")]
         enriched = await adapter._enrich_links(original, "ts1")
         assert enriched is original
+
+    @pytest.mark.asyncio
+    async def test_enrich_links_unfurl_overrides_existing_description(self):
+        """Unfurl description WINS over a pre-existing preview description.
+
+        TS does ``{ ...link, ...unfurl }`` (spread) which overwrites the
+        preview's description. The previous Python implementation
+        preserved the preview's description when non-None — silently
+        diverging from upstream.
+
+        What to fix if this fails: ``_merge_unfurl_into_preview`` in
+        ``src/chat_sdk/adapters/slack/adapter.py`` must let the unfurl
+        values win over the preview's description / image_url /
+        site_name (only ``title`` is short-circuited at the
+        ``_enrich_links`` level).
+        """
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        state._cache["slack:unfurls:t-override"] = {
+            "https://example.com": {
+                "title": None,  # title not present → no short-circuit clobber
+                "description": "new",
+                "image_url": "https://example.com/new.png",
+                "site_name": "Example",
+            }
+        }
+        # Preview already has an "old" description — unfurl must win.
+        original = [
+            _LinkPreview(
+                url="https://example.com",
+                description="old",
+                image_url="https://example.com/old.png",
+                site_name="OldSite",
+            )
+        ]
+        enriched = await adapter._enrich_links(original, "t-override")
+        assert enriched[0].description == "new"
+        assert enriched[0].image_url == "https://example.com/new.png"
+        assert enriched[0].site_name == "Example"
+
+    @pytest.mark.asyncio
+    async def test_message_changed_overwrites_cached_unfurl_not_merge(self):
+        """Two ``message_changed`` events for the same ts overwrite the cache.
+
+        Slack delivers multi-edit unfurls as separate ``message_changed``
+        events. Each event carries the FULL, current attachment list — a
+        merge would keep stale entries from the previous edit. The cache
+        ``set()`` semantics must overwrite, not merge.
+
+        What to fix if this fails: ``_handle_message_changed`` in
+        ``src/chat_sdk/adapters/slack/adapter.py`` must call
+        ``state.set(...)`` (which overwrites) and never read-merge-write.
+        """
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        def _make_changed_body(url: str, title: str) -> str:
+            return json.dumps(
+                {
+                    "type": "event_callback",
+                    "team_id": "T123",
+                    "event": {
+                        "type": "message",
+                        "subtype": "message_changed",
+                        "channel": "C_CHAN",
+                        "ts": "1234567890.222222",
+                        "message": {
+                            "ts": "1234567890.111111",
+                            "attachments": [
+                                {
+                                    "from_url": url,
+                                    "title": title,
+                                    "text": f"body for {title}",
+                                },
+                            ],
+                        },
+                    },
+                }
+            )
+
+        # First edit caches a single unfurl for URL_A.
+        await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://a.example.com", "First")))
+        await asyncio.sleep(0)
+        first = state._cache.get("slack:unfurls:1234567890.111111")
+        assert first is not None
+        assert "https://a.example.com" in first
+
+        # Second edit caches an unfurl for a DIFFERENT URL (URL_B).
+        # If the implementation merged, URL_A would still be in the cache.
+        await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://b.example.com", "Second")))
+        await asyncio.sleep(0)
+        second = state._cache.get("slack:unfurls:1234567890.111111")
+        assert second is not None
+        assert "https://b.example.com" in second
+        assert "https://a.example.com" not in second, "second message_changed must overwrite, not merge"
+        assert second["https://b.example.com"]["title"] == "Second"
+
+    def test_extract_links_url_with_open_paren_survives_parser(self):
+        """A URL containing ``(`` (unbalanced open paren) is preserved.
+
+        Slack delivers URLs in angle brackets — ``<URL>`` — which the
+        adapter parses with ``re.finditer(r"<(https?://[^>]+)>", ...)``.
+        The character class ``[^>]+`` accepts ``(`` so a URL such as
+        ``https://en.wikipedia.org/wiki/Pi_(letter)`` makes it through
+        intact. The other URL extraction path (rich_text blocks) gets
+        the URL as a struct field, so parens are also fine there.
+
+        What to fix if this fails: the URL pattern in ``_extract_links``
+        in ``src/chat_sdk/adapters/slack/adapter.py`` was tightened in a
+        way that drops parentheses.
+        """
+        adapter = _make_adapter()
+        url_with_paren = "https://en.wikipedia.org/wiki/Pi_(letter"  # unbalanced `(` no closing `)`
+        event = {"text": f"see <{url_with_paren}>"}
+        links = adapter._extract_links(event)
+        assert len(links) == 1
+        assert links[0].url == url_with_paren
