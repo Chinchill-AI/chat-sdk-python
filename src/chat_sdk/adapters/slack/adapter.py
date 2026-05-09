@@ -241,8 +241,10 @@ class SlackAdapter:
         # ``disconnect()`` can cancel it cleanly (hazard #5).
         self._socket_task: asyncio.Task[None] | None = None
         # Set when shutdown is requested so the reconnect loop knows to exit
-        # rather than retry on a clean disconnect.
-        self._socket_shutdown = False
+        # rather than retry on a clean disconnect. The Event also wakes up
+        # ``_socket_sleep_with_backoff`` immediately so ``stop_socket_mode``
+        # doesn't have to wait the full backoff window.
+        self._socket_shutdown_event: asyncio.Event = asyncio.Event()
         # Default backoff schedule in seconds. Kept short so tests run fast,
         # but capped low enough that a flapping Slack connection doesn't busy
         # loop. Slack's recommended pattern is exponential backoff with jitter;
@@ -1357,7 +1359,7 @@ class SlackAdapter:
                 "slack_sdk is not installed. Install with `pip install chat-sdk[slack]`.",
             ) from exc
 
-        self._socket_shutdown = False
+        self._socket_shutdown_event.clear()
         connected = asyncio.Event()
         loop = asyncio.get_running_loop()
         # Hazard #5: track the task explicitly so ``stop_socket_mode`` can
@@ -1369,10 +1371,15 @@ class SlackAdapter:
         # exit (which means the very first connect raised). Re-raise so the
         # caller learns about a hard config failure (bad app token, network
         # offline) instead of silently spinning forever.
-        first_done, _ = await asyncio.wait(
-            {asyncio.create_task(connected.wait()), self._socket_task},
+        wait_task = asyncio.create_task(connected.wait())
+        first_done, pending = await asyncio.wait(
+            {wait_task, self._socket_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
+        # Hazard #5: if the loop task finished first, cancel the wait task
+        # explicitly so the orphan ``connected.wait()`` doesn't sit forever.
+        if wait_task in pending:
+            wait_task.cancel()
         if connected.is_set():
             return
         # Socket loop exited before connecting — surface its exception.
@@ -1388,7 +1395,7 @@ class SlackAdapter:
         Idempotent. Safe to call from any task; it disconnects the active
         client and waits for the background task to finish.
         """
-        self._socket_shutdown = True
+        self._socket_shutdown_event.set()
 
         client = self._socket_client
         self._socket_client = None
@@ -1421,7 +1428,7 @@ class SlackAdapter:
 
         backoff = self._socket_initial_backoff_s
         try:
-            while not self._socket_shutdown:
+            while not self._socket_shutdown_event.is_set():
                 client = SocketModeClient(app_token=cast(str, self._app_token))
                 # Register our request handler. ``socket_mode_request_listeners``
                 # is the documented public extension point on the slack_sdk
@@ -1436,7 +1443,7 @@ class SlackAdapter:
                         {"error": str(exc)},
                     )
                     self._socket_client = None
-                    if self._socket_shutdown:
+                    if self._socket_shutdown_event.is_set():
                         return
                     if not connected.is_set():
                         # First connect failed and nobody's listening yet —
@@ -1453,7 +1460,7 @@ class SlackAdapter:
                 backoff = self._socket_initial_backoff_s
 
                 # Wait until the socket disconnects or shutdown is requested.
-                while not self._socket_shutdown:
+                while not self._socket_shutdown_event.is_set():
                     if not client.is_connected():
                         break
                     await asyncio.sleep(1.0)
@@ -1468,7 +1475,7 @@ class SlackAdapter:
                         {"error": str(exc)},
                     )
 
-                if self._socket_shutdown:
+                if self._socket_shutdown_event.is_set():
                     return
                 self._logger.info("Slack socket mode disconnected, reconnecting")
                 await self._socket_sleep_with_backoff(backoff)
@@ -1492,16 +1499,16 @@ class SlackAdapter:
                     await client.disconnect()
 
     async def _socket_sleep_with_backoff(self, seconds: float) -> None:
-        """Sleep for ``seconds`` but wake immediately on shutdown."""
-        # Poll every 0.25s so a stop_socket_mode call doesn't have to wait
-        # the full backoff window. asyncio.Event would be slightly cleaner
-        # but we don't want to add an Event per loop iteration.
-        deadline = asyncio.get_event_loop().time() + seconds
-        while not self._socket_shutdown:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(0.25, remaining))
+        """Sleep for ``seconds`` but wake immediately on shutdown.
+
+        Uses the per-adapter ``_socket_shutdown_event`` so ``stop_socket_mode``
+        can interrupt the backoff window without polling — wakeup latency is
+        bounded by event-loop scheduling, not the previous 0.25s poll.
+        """
+        try:
+            await asyncio.wait_for(self._socket_shutdown_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
 
     async def _on_socket_request(self, client: Any, request: Any) -> None:
         """Listener invoked by ``SocketModeClient`` for each socket message.
