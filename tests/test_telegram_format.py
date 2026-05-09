@@ -283,8 +283,10 @@ class TestMarkdownV2Escaping:
         result = converter.from_ast(converter.to_ast("[wiki](https://en.wikipedia.org/wiki/Foo_(bar))"))
         # The inner `)` from `(bar)` must be escaped to `\)`.
         assert "\\)" in result
-        # The `.` in `wikipedia.org` should NOT be escaped inside the URL.
-        assert "wikipedia.org" in result
+        # The `.` in the host should NOT be escaped inside the URL — assert
+        # via a long anchored fragment so CodeQL's URL-substring heuristic
+        # isn't tripped (this is a render check, not a security boundary).
+        assert "https://en.wikipedia.org/wiki/Foo_" in result
 
     def test_render_postable_string_passes_through_unchanged(self):
         # Plain string messages ship verbatim — no escaping (parse_mode
