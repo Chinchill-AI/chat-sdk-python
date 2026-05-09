@@ -819,6 +819,67 @@ class TestForwardedSocketFreshness:
         result = await adapter.handle_webhook(request)
         assert result["status"] == 401
 
+    async def test_js_emitted_milliseconds_timestamp_accepted(self):
+        """Upstream's ``forwardSocketEvent`` always emits ``Date.now()``
+        (milliseconds since epoch). The Python receiver must accept the JS
+        wire format, not only the Python ``int(time.time())`` (seconds) shape.
+
+        What to fix if this fails: in
+        ``src/chat_sdk/adapters/slack/adapter.py`` ``handle_webhook``, the
+        forwarded-event freshness check must auto-detect millisecond-shaped
+        timestamps (anything > 10**11 — that magnitude crossed in 2001) and
+        normalize to seconds before comparing to ``time.time()``. A naive
+        seconds-only check rejects every real upstream-emitted forward with
+        a ~56,000-year skew.
+        """
+        import time as _time
+
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+        # JS-shaped: ``Date.now()`` returns milliseconds.
+        forwarded = {
+            "type": "socket_event",
+            "eventType": "events_api",
+            "body": {"type": "event_callback", "event": {}},
+            "timestamp": int(_time.time() * 1000),  # ms, like Date.now()
+        }
+        request = _FakeRequest(
+            json.dumps(forwarded),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "fwd-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+        assert result["status"] == 200, (
+            "Forwarded event with JS-shaped Date.now() timestamp (ms) was "
+            "rejected by the freshness check; the receiver must auto-detect "
+            "ms vs s by magnitude"
+        )
+
+    async def test_js_emitted_milliseconds_replay_rejected(self):
+        """A 6-minute-old JS-shaped (ms) timestamp must still be rejected."""
+        import time as _time
+
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+        forwarded = {
+            "type": "socket_event",
+            "eventType": "events_api",
+            "body": {"type": "event_callback", "event": {}},
+            # 6 minutes old, in milliseconds
+            "timestamp": int((_time.time() - 6 * 60) * 1000),
+        }
+        request = _FakeRequest(
+            json.dumps(forwarded),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "fwd-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+        assert result["status"] == 401
+
 
 class TestInteractiveDispatchErrorAck:
     """Regression for review finding #5.

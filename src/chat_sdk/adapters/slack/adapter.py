@@ -814,12 +814,24 @@ class SlackAdapter:
             # without a freshness check, an old captured forwarded event
             # could be replayed indefinitely. Mirror the 5-minute window
             # ``_verify_signature`` enforces on signed webhook traffic.
+            #
+            # Wire format: upstream's ``forwardSocketEvent`` always emits
+            # ``timestamp: Date.now()`` — milliseconds since the Unix epoch
+            # (~1.78e12 today). Python's ``time.time()`` returns seconds.
+            # Auto-detect the unit by magnitude (anything > 10**11 is
+            # certainly milliseconds — that crossed in 2001) so we accept
+            # both the JS-emitted ms shape AND a Python-emitted seconds
+            # shape if a future ``forward_socket_event`` listener lands.
             ts_raw = event.get("timestamp") if isinstance(event, dict) else None
             try:
                 ts_int = int(ts_raw) if ts_raw is not None else None
             except (TypeError, ValueError):
                 ts_int = None
-            if ts_int is None or abs(int(time.time()) - ts_int) > 300:
+            if ts_int is not None and ts_int > 10**11:
+                ts_seconds = ts_int // 1000
+            else:
+                ts_seconds = ts_int
+            if ts_seconds is None or abs(int(time.time()) - ts_seconds) > 300:
                 self._logger.warn(
                     "Forwarded socket event outside freshness window",
                     {"timestamp": ts_raw},
