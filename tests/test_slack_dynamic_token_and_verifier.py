@@ -503,6 +503,15 @@ class TestHandleWebhookCustomVerifier:
 class TestResolverIntegratedWithWebhookFlow:
     @pytest.mark.asyncio
     async def test_handle_webhook_invokes_resolver_before_dispatch(self):
+        """For real event payloads, the resolver is invoked at handle_webhook
+        entry so downstream sync ``_get_token`` callers see the resolved
+        value.
+
+        Note: url_verification is now special-cased and short-circuits
+        BEFORE the resolver runs (see test_url_verification_bypasses_broken_resolver
+        above) — so this test uses a regular ``event_callback`` payload to
+        exercise the resolver-before-dispatch invariant.
+        """
         calls: list[int] = []
 
         def resolver() -> str:
@@ -515,10 +524,17 @@ class TestResolverIntegratedWithWebhookFlow:
                 bot_token=resolver,
             )
         )
-        body = json.dumps({"type": "url_verification", "challenge": "ok"})
+        # Use an event_callback (a real Slack event) — this is the path that
+        # actually needs a token in dispatch. URL verification doesn't.
+        body = json.dumps({
+            "type": "event_callback",
+            "team_id": "T123",
+            "event": {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.0", "text": "hi"},
+        })
         response = await adapter.handle_webhook(_signed_request(body))
+        # event_callback returns 200 even if no handlers fire.
         assert response["status"] == 200
-        assert calls == [1]
+        assert calls == [1], "resolver must be invoked at handle_webhook entry for real events"
 
     @pytest.mark.asyncio
     async def test_resolver_result_visible_to_sync_get_token_during_dispatch(self):
