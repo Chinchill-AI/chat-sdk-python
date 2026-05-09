@@ -1215,7 +1215,10 @@ class TeamsAdapter:
         """
         if session.canceled:
             return
-        if session.stream_id is None or not session._text:  # noqa: SLF001
+        # session.stream_id is only set after a successful chunk send, and
+        # empty chunks are skipped before send — so stream_id-set implies
+        # _text non-empty. Single check is sufficient.
+        if session.stream_id is None:
             return
 
         decoded = self.decode_thread_id(thread_id)
