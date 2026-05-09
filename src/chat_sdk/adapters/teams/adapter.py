@@ -92,6 +92,16 @@ class _TeamsStreamSession:
         """Mark the session canceled. ``stream()`` checks this each chunk."""
         self.canceled = True
 
+    @property
+    def text(self) -> str:
+        """Read-only view of the cumulative streamed text.
+
+        External callers (tests, other adapter helpers) should read this
+        instead of poking at the private ``_text`` attribute. Writes go
+        through ``_stream_via_emit`` which owns the buffer.
+        """
+        return self._text
+
 
 # Bot Framework streaming protocol values for ``channelData.streamType``.
 _STREAM_TYPE_STREAMING = "streaming"
@@ -450,9 +460,15 @@ class TeamsAdapter:
         upstream_wait_until = options.wait_until if options is not None else None
 
         def _chained_wait_until(task: Awaitable[Any]) -> None:
+            # Resolve our own gate FIRST, before invoking the upstream
+            # ``wait_until`` callback. This way, even if the upstream
+            # callback raises, blocks, or never fires, ``processing_done``
+            # is still wired up — making the deadlock-immunity argument
+            # trivially obvious: the await on ``processing_done`` below
+            # cannot starve due to a misbehaving caller-supplied hook.
+            _resolve_processing(task)
             if upstream_wait_until is not None:
                 upstream_wait_until(task)
-            _resolve_processing(task)
 
         chained_options = WebhookOptions(wait_until=_chained_wait_until)
 
@@ -1194,7 +1210,10 @@ class TeamsAdapter:
 
         # Persist accumulated text on the session so close() can emit the
         # final ``message`` activity with the same content the user saw.
-        session._text = accumulated  # noqa: SLF001 — same module
+        # Direct ``_text`` write is the canonical mutator (the public
+        # ``text`` property is read-only by design); both classes live in
+        # the same module so this isn't a cross-module SLF001.
+        session._text = accumulated  # noqa: SLF001
         return RawMessage(
             id=session.first_chunk_id,
             thread_id=thread_id,
@@ -1208,28 +1227,39 @@ class TeamsAdapter:
     ) -> None:
         """Send the final ``message`` activity to close out a stream.
 
-        No-op if the session was canceled or never emitted any chunks (no
-        ``streamId`` was ever assigned). The final activity replaces the
-        running ``typing`` indicator with a real message containing the full
-        accumulated text — Teams clients clear the streaming UI on receipt.
+        No-op if the session was canceled, or if no chunks were ever
+        emitted (empty ``text``). Otherwise we send the final activity —
+        even if the server never returned an ``id`` for the first chunk
+        (i.e. ``stream_id`` is ``None``), in which case we omit
+        ``streamId`` from ``channelData``. Mirrors upstream's looser
+        check: as long as the user saw streamed text, ship the final
+        ``message`` so the Teams streaming UI clears, instead of leaving
+        it spinning until Teams times the session out client-side.
         """
         if session.canceled:
             return
-        # session.stream_id is only set after a successful chunk send, and
-        # empty chunks are skipped before send — so stream_id-set implies
-        # _text non-empty. Single check is sufficient.
-        if session.stream_id is None:
+        # ``text`` is the cumulative buffer; empty means nothing was ever
+        # emitted (empty stream, or stream canceled before first send).
+        if not session.text:
             return
 
         decoded = self.decode_thread_id(thread_id)
+        channel_data: dict[str, Any] = {
+            "streamType": _STREAM_TYPE_FINAL,
+        }
+        # Hazard #7 — only include ``streamId`` when we actually have one.
+        # The Bot Framework REST response can return ``id=""`` even on a
+        # 200, in which case ``stream_id`` stays ``None`` (see emit guard
+        # in ``_stream_via_emit``); ship the final without a ``streamId``
+        # rather than skipping the send.
+        if session.stream_id is not None:
+            channel_data["streamId"] = session.stream_id
+
         final_activity: dict[str, Any] = {
             "type": "message",
-            "text": session._text,  # noqa: SLF001
+            "text": session.text,
             "textFormat": "markdown",
-            "channelData": {
-                "streamType": _STREAM_TYPE_FINAL,
-                "streamId": session.stream_id,
-            },
+            "channelData": channel_data,
             "entities": [
                 {
                     "type": "streaminfo",

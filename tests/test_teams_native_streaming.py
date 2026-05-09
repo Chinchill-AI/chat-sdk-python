@@ -313,6 +313,54 @@ class TestStreamCancellation:
         await adapter._close_stream_session(tid, session)
         adapter._teams_send.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_close_session_sends_final_when_first_chunk_returned_empty_id(
+        self,
+    ):
+        """If Teams accepted chunks but never returned an ``id``, still send the final.
+
+        Regression for the empty-``id`` edge case: the Bot Framework REST
+        response can be 200 with ``{"id": ""}`` even on a successful
+        ``typing`` activity send. ``stream_id`` stays ``None`` (the
+        first-chunk guard skips assignment for the empty string), but
+        ``text`` is non-empty because the user already saw the streamed
+        chunks. Without a final ``message`` activity the Teams streaming
+        UI would spin until Teams times the session out client-side —
+        ship the final ``message`` anyway, omitting ``streamId`` from
+        ``channelData``. Mirrors upstream's looser check.
+        """
+        adapter = _make_adapter()
+        # First call (chunk): returns an empty id. Second call (final):
+        # succeeds.
+        adapter._teams_send = AsyncMock(side_effect=[{"id": ""}, {"id": "final-id"}])
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "hello world"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Sanity: the chunk send went through, but stream_id is unset
+        # because the server didn't hand us one.
+        assert session.stream_id is None
+        assert session.text == "hello world"
+
+        # Now close: the final ``message`` activity must still be sent
+        # (omitting ``streamId``).
+        await adapter._close_stream_session(tid, session)
+
+        assert adapter._teams_send.await_count == 2
+        final_payload = adapter._teams_send.await_args_list[1].args[1]
+        assert final_payload["type"] == "message"
+        assert final_payload["text"] == "hello world"
+        assert final_payload["channelData"]["streamType"] == _STREAM_TYPE_FINAL
+        # Critical: no streamId key when the server never assigned one,
+        # rather than serializing ``"streamId": None``.
+        assert "streamId" not in final_payload["channelData"]
+        assert final_payload["entities"] == [{"type": "streaminfo", "streamType": _STREAM_TYPE_FINAL}]
+
 
 class TestStreamErrors:
     @pytest.mark.asyncio
@@ -603,12 +651,18 @@ class TestHandleMessageActivityLifecycle:
 
 class TestPassInteraction:
     @pytest.mark.asyncio
-    async def test_two_concurrent_dm_streams_have_independent_sessions(self):
-        """Two streams to two different DM threads must not share state.
+    async def test_distinct_dm_threads_each_have_isolated_session_state(self):
+        """Two DM threads streaming in parallel must not share session state.
 
-        Per docs/SELF_REVIEW.md pass-interaction check: two DMs in flight
-        from the same bot to the same user (one per thread) must each
-        carry their own ``streamId`` and ``streamSequence``.
+        This pins the ISOLATION property when sessions are explicitly
+        passed to ``_stream_via_emit`` (the registry is bypassed). Two
+        DMs in flight from the same bot to the same user (one per
+        thread) must each carry their own ``streamId`` and
+        ``streamSequence``.
+
+        Same-thread concurrency (the ``_active_streams`` race) is a
+        DIFFERENT property — see
+        ``test_same_thread_concurrent_handlers_clobber_active_stream``.
         """
         adapter = _make_adapter()
         # Distinct server ids per send so we can verify thread-to-id mapping.
@@ -663,3 +717,95 @@ class TestPassInteraction:
         # and B's to B's.
         for conv_id, payload in send_log:
             assert payload["text"].startswith("A" if "A" in conv_id else "B")
+
+    @pytest.mark.asyncio
+    async def test_same_thread_concurrent_handlers_clobber_active_stream(self):
+        """Two near-simultaneous webhooks for the SAME DM thread.
+
+        Realistic case: a user double-sends, or two webhooks land on the
+        same thread before the first finishes. ``_active_streams`` is a
+        plain ``dict`` keyed by ``thread_id``, so the second registration
+        overwrites the first — pin that behavior here so a future change
+        to add per-thread queueing/locking is a deliberate decision, not
+        an accidental observable change.
+
+        Upstream's ``activeStreams`` is also a plain ``Map`` with the
+        same overwrite semantics; this test mirrors that contract.
+        """
+        adapter = _make_adapter()
+        # Track each session that gets registered, in the order of registration.
+        registered_sessions: list[_TeamsStreamSession] = []
+        # Snapshot the registry contents immediately AFTER each handler's
+        # process_message call so we can pin the clobber.
+        post_registration_snapshots: list[_TeamsStreamSession] = []
+
+        # Block both handlers on a barrier so the second registration races
+        # the first while the first is still "in flight". This pins the
+        # registry behavior under genuine overlap, not just sequential calls.
+        first_registered = asyncio.Event()
+        release_handlers = asyncio.Event()
+
+        adapter._teams_send = AsyncMock(return_value={"id": "send-id"})
+
+        chat = MagicMock()
+        chat.get_state = MagicMock(return_value=None)
+
+        def process_message(adapter_arg, thread_id, message, options):
+            # Snapshot the session that THIS handler call registered.
+            registered_sessions.append(adapter_arg._active_streams[thread_id])
+
+            async def _handler():
+                # Hold both handlers open across the barrier so they truly
+                # overlap. After release, snapshot the registry — by this
+                # point both handlers have registered, and the LATER
+                # registration must have won.
+                if not first_registered.is_set():
+                    first_registered.set()
+                await release_handlers.wait()
+                post_registration_snapshots.append(adapter_arg._active_streams.get(thread_id))
+
+            task = asyncio.get_running_loop().create_task(_handler())
+            options.wait_until(task)
+
+        chat.process_message = process_message
+        adapter._chat = chat
+
+        tid = _dm_thread_id(adapter)
+        activity = {
+            "type": "message",
+            "id": "incoming-same-thread",
+            "text": "user said something",
+            "from": {"id": "user-1", "name": "User One"},
+            "conversation": {"id": "a:1Abc-DM-conversation-id"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+
+        async def _drive_two_handlers():
+            # Start the first; wait until it has registered before launching
+            # the second so the second observes (and clobbers) the first's
+            # registry entry. Then release both.
+            t1 = asyncio.create_task(adapter._handle_message_activity(activity))
+            await first_registered.wait()
+            t2 = asyncio.create_task(adapter._handle_message_activity(activity))
+            # Give the second handler a tick to register.
+            await asyncio.sleep(0)
+            release_handlers.set()
+            await asyncio.gather(t1, t2)
+
+        await _drive_two_handlers()
+
+        # Two distinct sessions were created.
+        assert len(registered_sessions) == 2
+        first_session, second_session = registered_sessions
+        assert first_session is not second_session
+        # Pin upstream's plain-Map clobber semantics: BOTH in-flight
+        # handlers, when they look up the registry post-overlap, see the
+        # SECOND session — the first's entry was overwritten in place.
+        # If a future change adds per-thread queueing/locking it must be
+        # a deliberate decision (i.e. update this test).
+        assert post_registration_snapshots == [second_session, second_session]
+        # After both handlers exit, registry is empty. Handler 2's
+        # finally-block matches ``current is session_2`` and pops; handler
+        # 1's finally-block sees the entry already gone (or not its own)
+        # and skips the pop — either way the dict ends empty.
+        assert tid not in adapter._active_streams
