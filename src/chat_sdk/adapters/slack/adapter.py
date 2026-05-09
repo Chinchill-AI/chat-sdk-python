@@ -22,7 +22,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.slack.cards import (
@@ -122,6 +122,43 @@ SLACK_MESSAGE_URL_PATTERN = re.compile(r"^https?://[^/]+\.slack\.com/archives/([
 _USER_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000  # 8 days
 _CHANNEL_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000
 _REVERSE_INDEX_TTL_MS = 8 * 24 * 60 * 60 * 1000
+
+
+class SlackUserCacheEntry(TypedDict, total=False):
+    """Cached user shape returned by :meth:`SlackAdapter._lookup_user`.
+
+    The first five keys always exist on a successful lookup or
+    cache hit. ``_lookup_failed`` appears only on the failure path
+    (API exception or empty user payload) — callers like
+    :meth:`SlackAdapter.get_user` use it to return ``None`` instead of
+    a fallback ``UserInfo``. ``total=False`` because both the cache hit
+    branch and the failure branch omit ``_lookup_failed``.
+    """
+
+    display_name: str
+    real_name: str
+    email: str | None
+    avatar_url: str | None
+    is_bot: bool | None
+    _lookup_failed: bool
+
+
+def _make_slack_lookup_failed(user_id: str) -> SlackUserCacheEntry:
+    """Build the sentinel cache entry for a failed Slack user lookup.
+
+    Shared between the ``except`` path and the empty-user-payload path
+    so both produce the exact same fallback shape (and neither caches
+    it — see :meth:`SlackAdapter._lookup_user`).
+    """
+    return {
+        "display_name": user_id,
+        "real_name": user_id,
+        "email": None,
+        "avatar_url": None,
+        "is_bot": None,
+        "_lookup_failed": True,
+    }
+
 
 # Ignored message subtypes (system/meta events)
 _IGNORED_SUBTYPES = frozenset(
@@ -598,18 +635,21 @@ class SlackAdapter:
     # User / Channel lookup with caching
     # ==================================================================
 
-    async def _lookup_user(self, user_id: str) -> dict[str, Any]:
+    async def _lookup_user(self, user_id: str) -> SlackUserCacheEntry:
         """Look up user info from Slack API with caching.
 
         Returns a dict with keys ``display_name``, ``real_name``, and
         (when available from the Slack API or from a cached entry) the
         optional fields ``email``, ``avatar_url``, ``is_bot``.
 
-        On API failure the returned dict is a fallback shape
-        (``display_name`` / ``real_name`` populated with the user ID) and
-        carries the private ``_lookup_failed: True`` sentinel so callers
-        that need to distinguish "really not found" from "fall back to ID"
-        — like :meth:`get_user` — can return ``None`` instead.
+        On API failure — or when the API returns success but with an
+        empty/missing ``user`` payload — the returned dict is a fallback
+        shape (``display_name`` / ``real_name`` populated with the user
+        ID) and carries the private ``_lookup_failed: True`` sentinel so
+        callers that need to distinguish "really not found" from "fall
+        back to ID" — like :meth:`get_user` — can return ``None``
+        instead. The fallback entry is **not** cached so a subsequent
+        call retries the lookup.
         """
         cache_key = f"slack:user:{user_id}"
 
@@ -627,7 +667,20 @@ class SlackAdapter:
         try:
             client = self._get_client()
             result = await client.users_info(user=user_id)
-            user = result.get("user", {})
+            user = result.get("user") or {}
+            # Slack can return `{"ok": True, "user": {}}` in some edge cases
+            # (rare, but observed when scopes are partial or the workspace
+            # rejects the lookup post-success). Treat a missing/empty user
+            # payload as a lookup failure so we don't poison the cache
+            # with a `UserInfo("Uxxx", "Uxxx", "Uxxx")` shape that
+            # `get_user` would then convert into a non-null fallback —
+            # diverging from the null-on-failure contract callers expect.
+            if not user:
+                self._logger.warn(
+                    "Slack users.info returned empty user payload",
+                    {"userId": user_id},
+                )
+                return _make_slack_lookup_failed(user_id)
             profile = user.get("profile", {})
 
             display_name = (
@@ -644,7 +697,7 @@ class SlackAdapter:
             avatar_url = profile.get("image_192")
             is_bot = user.get("is_bot")
 
-            cached_entry: dict[str, Any] = {
+            cached_entry: SlackUserCacheEntry = {
                 "display_name": display_name,
                 "real_name": real_name,
                 "email": email,
@@ -683,14 +736,7 @@ class SlackAdapter:
             # already used `display_name`/`real_name` and would have
             # received the user ID either way. The private sentinel lets
             # `get_user` distinguish "API failed" from "API returned data".
-            return {
-                "display_name": user_id,
-                "real_name": user_id,
-                "email": None,
-                "avatar_url": None,
-                "is_bot": None,
-                "_lookup_failed": True,
-            }
+            return _make_slack_lookup_failed(user_id)
 
     async def _lookup_channel(self, channel_id: str) -> str:
         """Look up channel name from Slack API with caching."""

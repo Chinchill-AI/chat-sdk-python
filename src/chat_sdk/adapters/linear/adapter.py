@@ -279,11 +279,15 @@ class LinearAdapter:
         user = (data.get("data") or {}).get("user") if isinstance(data, dict) else None
         if not user or not isinstance(user, dict):
             return None
-        display_name = user.get("displayName") or user.get("name") or user_id
+        # Match upstream literally (vercel/chat#391):
+        #   userName: user.displayName, fullName: user.name
+        # No defensive `or` fallbacks — drift from upstream's exact field
+        # mapping creates cross-SDK inconsistency for callers building on
+        # `user_name` / `full_name` semantics.
         return UserInfo(
             user_id=user.get("id") or user_id,
-            user_name=display_name,
-            full_name=user.get("name") or display_name,
+            user_name=user.get("displayName"),
+            full_name=user.get("name"),
             is_bot=False,
             avatar_url=user.get("avatarUrl"),
             email=user.get("email"),

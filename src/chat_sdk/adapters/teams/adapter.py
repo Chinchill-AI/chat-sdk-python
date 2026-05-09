@@ -17,7 +17,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -242,14 +242,18 @@ class TeamsAdapter:
         # Defense in depth: aadObjectId came from a webhook so it's already
         # platform-trusted, but reject obvious junk before issuing a Graph
         # call (avoids URL injection if the cache is ever populated from
-        # an attacker-controlled path).
+        # an attacker-controlled path). Reject the structural splitters
+        # that change URL semantics outright (`/`, `?`, `#`), then
+        # percent-encode the remainder via `quote(safe="")` (matches
+        # Discord's pattern) so whitespace, `\\`, `;`, etc. cannot escape
+        # the `/users/{id}` path segment.
         aad_str = str(aad_object_id)
         if not aad_str or "/" in aad_str or "?" in aad_str or "#" in aad_str:
             return None
         try:
             token = await self._get_graph_token()
             session = await self._get_http_session()
-            url = f"https://graph.microsoft.com/v1.0/users/{aad_str}"
+            url = f"https://graph.microsoft.com/v1.0/users/{quote(aad_str, safe='')}"
             async with session.get(
                 url,
                 headers={"Authorization": f"Bearer {token}"},

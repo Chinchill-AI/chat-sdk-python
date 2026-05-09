@@ -118,6 +118,44 @@ class TestSlackGetUser:
         assert user is None
 
     @pytest.mark.asyncio
+    async def test_empty_user_payload_is_not_cached(self):
+        """Slack ``users.info`` can return ``{"ok": True, "user": {}}``
+        in edge cases (partial scopes, workspace policy). The lookup
+        must:
+
+        1. Return ``None`` from ``get_user`` (matches upstream
+           null-on-failure contract).
+        2. Skip caching so a subsequent call retries the API instead
+           of serving a poisoned ``UserInfo("Uxxx", "Uxxx", "Uxxx")``
+           shape forever.
+        """
+        from chat_sdk.adapters.slack.adapter import SlackAdapter
+        from chat_sdk.adapters.slack.types import SlackAdapterConfig
+
+        adapter = SlackAdapter(
+            SlackAdapterConfig(signing_secret="s", bot_token="xoxb-test"),
+        )
+        state = _mock_state()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        client = MagicMock()
+        client.users_info = AsyncMock(return_value={"ok": True, "user": {}})
+        adapter._get_client = lambda token=None: client  # type: ignore[assignment]
+
+        # (a) Empty success returns None, not a fallback UserInfo.
+        user = await adapter.get_user("U_EMPTY")
+        assert user is None
+
+        # (b) The cache must NOT contain a poisoned entry. A second call
+        #     should retry the API, not serve cached garbage.
+        assert "slack:user:U_EMPTY" not in state._cache
+        user_again = await adapter.get_user("U_EMPTY")
+        assert user_again is None
+        # users.info called *twice* (no cache short-circuit on attempt 2).
+        assert client.users_info.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_uses_image_192_not_image_72(self):
         """Upstream cite: vercel/chat#391 — switched from image_72 to
         image_192 for better avatar quality. Lock the field choice in.
@@ -611,6 +649,74 @@ class TestTeamsGetUser:
 
         user = await adapter.get_user("29:abc")
         assert user is None
+
+    @pytest.mark.parametrize(
+        "poisoned_aad",
+        [
+            "aad\nLocation: http://evil",  # CRLF / header injection
+            "aad\rLocation: http://evil",  # bare CR
+            "aad\tfoo",  # tab
+            "aad bar",  # whitespace
+            "aad\\..\\leak",  # backslash traversal
+            "aad%2F..%2Fleak",  # already-percent-encoded slash
+            "aad;leak",  # semicolon (path-param splitter on some servers)
+            "..",  # bare traversal
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_aad_object_id_adversarial_inputs_stay_in_users_segment(self, poisoned_aad: str):
+        """Adversarial inputs that slip past the `/`/`?`/`#` reject list
+        must either be rejected outright OR percent-encoded so the
+        resulting Graph URL stays under ``/v1.0/users/`` — they can't
+        pivot the request to a different host, path, or HTTP header.
+        """
+        from urllib.parse import urlparse
+
+        adapter = self._make_adapter()
+        self._seed_chat_state(
+            adapter,
+            {"teams:aadObjectId:29:abc": poisoned_aad},
+        )
+        adapter._get_graph_token = AsyncMock(return_value="graph-token")  # type: ignore[method-assign]
+
+        captured: dict[str, str] = {}
+
+        class _Resp:
+            ok = True
+            status = 200
+
+            async def json(self):
+                return {"displayName": "x", "userPrincipalName": "x@y", "mail": "x@y"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+        def _capture_get(url, *args, **kwargs):
+            captured["url"] = url
+            return _Resp()
+
+        session = MagicMock()
+        session.get = _capture_get
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        # Either get_user returns None (rejected) OR the URL it issued
+        # stays inside the /users/ segment with the input percent-encoded.
+        await adapter.get_user("29:abc")
+        if "url" in captured:
+            url = captured["url"]
+            parsed = urlparse(url)
+            assert parsed.scheme == "https", f"scheme escaped: {url}"
+            assert parsed.netloc == "graph.microsoft.com", f"host escaped: {url}"
+            # Must remain a single segment under /v1.0/users/
+            assert parsed.path.startswith("/v1.0/users/"), f"path escaped: {url}"
+            tail = parsed.path[len("/v1.0/users/") :]
+            assert "/" not in tail, f"path traversal not encoded: {url}"
+            # No raw whitespace / CR / LF / tab survived into the request URL.
+            for ch in ("\n", "\r", "\t", " "):
+                assert ch not in url, f"control character {ch!r} leaked into URL: {url!r}"
 
 
 # =============================================================================
