@@ -1886,7 +1886,11 @@ class SlackAdapter:
         while True:
             try:
                 stored = await state.get(f"slack:unfurls:{message_ts}")
-            except Exception:
+            except Exception as exc:
+                self._logger.warn(
+                    "Failed to read unfurl data from state",
+                    {"error": str(exc), "message_ts": message_ts},
+                )
                 return links
             if stored or time.monotonic() >= deadline:
                 break
