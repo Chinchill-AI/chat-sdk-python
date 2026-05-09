@@ -526,11 +526,13 @@ class TestResolverIntegratedWithWebhookFlow:
         )
         # Use an event_callback (a real Slack event) — this is the path that
         # actually needs a token in dispatch. URL verification doesn't.
-        body = json.dumps({
-            "type": "event_callback",
-            "team_id": "T123",
-            "event": {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.0", "text": "hi"},
-        })
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "team_id": "T123",
+                "event": {"type": "app_mention", "user": "U1", "channel": "C1", "ts": "1.0", "text": "hi"},
+            }
+        )
         response = await adapter.handle_webhook(_signed_request(body))
         # event_callback returns 200 even if no handlers fire.
         assert response["status"] == 200
