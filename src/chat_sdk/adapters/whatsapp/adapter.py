@@ -59,6 +59,7 @@ from chat_sdk.types import (
     StreamChunk,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -153,7 +154,7 @@ class WhatsAppAdapter:
         self._bot_user_id = self._phone_number_id
         self._logger.info("WhatsApp adapter initialized", {"phoneNumberId": self._phone_number_id})
 
-    async def get_user(self, user_id: str) -> None:
+    async def get_user(self, user_id: str) -> UserInfo | None:
         """Not implemented — see docs/UPSTREAM_SYNC.md non-parity table.
 
         WhatsApp Cloud API has no user lookup endpoint; the only stable
