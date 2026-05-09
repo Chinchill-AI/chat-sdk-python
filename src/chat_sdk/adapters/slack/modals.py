@@ -206,7 +206,12 @@ def _external_select_to_block(select: dict[str, Any]) -> SlackBlock:
         element["min_query_length"] = min_query_length
 
     initial_option = select.get("initial_option")
-    if initial_option:
+    if initial_option is not None:
+        # Hazard #1: ``is not None`` (not truthiness) so a hand-constructed
+        # empty dict ``{}`` doesn't silently render as no initial_option,
+        # matching the TS ``if (select.initialOption)`` semantics where
+        # ``{}`` is truthy. Also keeps consistency with the
+        # ``min_query_length is not None`` check above.
         # Unlike static select, ``initial_option`` is the full
         # ``{label, value}`` object — the loader hasn't run yet so a value
         # string would be ambiguous. Mirrors selectOptionToSlackOption.

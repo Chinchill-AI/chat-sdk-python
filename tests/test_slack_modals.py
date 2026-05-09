@@ -573,6 +573,37 @@ class TestModalExternalSelect:
         assert "placeholder" not in el
         assert "min_query_length" not in el
 
+    def test_external_select_initial_option_empty_dict_renders(self):
+        """A hand-built ``initial_option={}`` must round-trip, not silently drop.
+
+        What to fix if this fails: in
+        ``src/chat_sdk/adapters/slack/modals.py``,
+        ``_external_select_to_block`` must guard with ``initial_option is not None``,
+        not the truthiness check ``if initial_option:``. The TS expression
+        ``if (select.initialOption)`` only filters null/undefined; an empty
+        object literal is truthy in JS but ``{}`` is falsy in Python.
+        Without ``is not None``, hand-constructed empty dicts disappear from
+        the rendered Block Kit.
+        """
+        external_select_dict = {
+            "type": "external_select",
+            "id": "person",
+            "label": "Person",
+            "initial_option": {},  # hand-built empty dict
+        }
+        modal = _modal(children=[external_select_dict])
+        view = modal_to_slack_view(modal)
+        el = view["blocks"][0]["element"]
+        assert "initial_option" in el, (
+            "_external_select_to_block dropped initial_option={}; use 'is not None' instead of truthiness in modals.py"
+        )
+        # Renders with empty label/value (since the input is empty), but
+        # the element is present — that's the parity guarantee we want.
+        assert el["initial_option"] == {
+            "text": {"type": "plain_text", "text": ""},
+            "value": "",
+        }
+
     def test_external_select_min_query_length_zero_preserved(self):
         # Hazard #1: a min_query_length of 0 is meaningful (fire on every
         # keystroke). It must not be silently omitted by a truthiness check.
