@@ -209,6 +209,33 @@ class TestBotTokenResolverConstruction:
         with pytest.raises(RuntimeError, match="token fetch failed"):
             await adapter.current_token_async()
 
+    @pytest.mark.asyncio
+    async def test_async_resolver_exception_is_logged_and_propagated(self):
+        """Async resolver exceptions raise during ``await``, not at call time.
+
+        What to fix if this fails: in ``_resolve_default_token``
+        (``adapters/slack/adapter.py``), make sure the ``await result`` is
+        inside the ``try`` block alongside ``provider()`` — otherwise async
+        resolver failures bypass the logger and the rotation-safety
+        invariants documented in the PR.
+        """
+        log_calls: list[tuple[str, dict[str, object]]] = []
+
+        async def resolver() -> str:
+            raise RuntimeError("async fetch failed")
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        adapter._logger.error = lambda msg, ctx=None: log_calls.append((msg, ctx or {}))  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="async fetch failed"):
+            await adapter.current_token_async()
+
+        assert any(msg == "Bot token resolver raised" for msg, _ in log_calls), (
+            "_resolve_default_token must log async resolver failures via "
+            "self._logger.error('Bot token resolver raised'); "
+            "ensure 'await result' is inside the try block"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Constructor: webhook_verifier

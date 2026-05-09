@@ -460,13 +460,13 @@ class SlackAdapter:
             )
         try:
             result = provider()
+            if inspect.isawaitable(result):
+                token = await result
+            else:
+                token = result
         except Exception as exc:
             self._logger.error("Bot token resolver raised", {"error": exc})
             raise
-        if inspect.isawaitable(result):
-            token = await result
-        else:
-            token = result
         if not isinstance(token, str) or not token:
             raise AuthenticationError(
                 "slack",
