@@ -1542,6 +1542,90 @@ class TestEditMessageWithCard:
 
 
 # ============================================================================
+# Card dedup: card messages must not also include the fallback text content
+# (port of vercel/chat#256 / chat@4.27.0)
+# ============================================================================
+
+
+class TestCardContentDedup:
+    """Discord renders both ``content`` and embed cards; sending both
+    produces duplicate text. ``post_message`` must omit ``content`` when a
+    card is present, and ``edit_message`` must explicitly clear it (PATCH
+    keeps omitted fields).
+
+    What to fix if this fails: in ``adapter.py`` ``post_message`` and
+    ``edit_message``, the card branch must NOT call
+    ``card_to_fallback_text``. ``edit_message`` must set
+    ``payload["content"] = ""`` so leftover text from a previous edit
+    doesn't render alongside the new card.
+    """
+
+    @pytest.mark.asyncio
+    async def test_post_message_with_card_omits_content(self):
+        from chat_sdk.cards import Card, CardText
+
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value=_msg_response())
+
+        # Card with title + body — fallback text would be "**Title**\nBody".
+        card_message = {
+            "card": Card(title="Title", children=[CardText("Body")]),
+        }
+
+        await adapter.post_message("discord:guild1:channel456", card_message)
+
+        payload = adapter._discord_fetch.call_args[0][2]
+        # Either 'content' is absent entirely, or it's empty/falsy. Both
+        # are acceptable — Discord won't render duplicate text in either
+        # case. The key invariant is that the card body text doesn't show
+        # up as a separate plain message above the embed.
+        assert not payload.get("content")
+        assert "embeds" in payload and len(payload["embeds"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_edit_message_with_card_clears_content_explicitly(self):
+        from chat_sdk.cards import Card, CardText
+
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value=_msg_response())
+
+        # First post regular text, then edit to a card. The edit must
+        # explicitly send ``content=""`` so the original text disappears.
+        card_message = {
+            "card": Card(title="Updated", children=[CardText("New body")]),
+        }
+        await adapter.edit_message("discord:guild1:channel456", "msg001", card_message)
+
+        payload = adapter._discord_fetch.call_args[0][2]
+        # Contract: the key MUST be present (Discord PATCH preserves
+        # omitted fields, so missing key would leave the old content).
+        assert "content" in payload, "edit_message with card must explicitly set content"
+        assert payload["content"] == "", (
+            "edit_message with card must clear content to empty string, not include card fallback text"
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_message_with_card_no_text_blocks_still_omits_content(self):
+        # Adversarial: card with NO text content at all — nothing to
+        # duplicate, but the omit-content invariant should still hold.
+        from chat_sdk.cards import Actions, Button, Card
+
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value=_msg_response())
+
+        card_message = {
+            "card": Card(
+                title="",
+                children=[Actions([Button(id="ok", label="OK")])],
+            )
+        }
+        await adapter.post_message("discord:guild1:channel456", card_message)
+
+        payload = adapter._discord_fetch.call_args[0][2]
+        assert not payload.get("content")
+
+
+# ============================================================================
 # Forwarded message - bot skips own message
 # ============================================================================
 

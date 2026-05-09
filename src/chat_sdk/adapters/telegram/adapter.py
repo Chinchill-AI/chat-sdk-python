@@ -87,7 +87,7 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"  # pragma: allowlist secret
 MESSAGE_ID_PATTERN = re.compile(r"^([^:]+):(\d+)$")
-TELEGRAM_MARKDOWN_PARSE_MODE = "Markdown"
+TELEGRAM_MARKDOWN_PARSE_MODE = "MarkdownV2"
 MESSAGE_SEQUENCE_PATTERN = re.compile(r":(\d+)$")
 LEADING_AT_PATTERN = re.compile(r"^@+")
 EMOJI_PLACEHOLDER_PATTERN = re.compile(r"^\{\{emoji:([a-z0-9_]+)\}\}$", re.IGNORECASE)
@@ -831,7 +831,12 @@ class TelegramAdapter:
         parse_mode = self.resolve_parse_mode(message, card)
         text = self.truncate_message(
             convert_emoji_placeholders(
-                card_to_fallback_text(card) if card else self._format_converter.render_postable(message),
+                # Route the card's standard-markdown fallback through the
+                # MarkdownV2 renderer so titles render as real bold instead
+                # of literal ``**title**``.
+                self._format_converter.from_markdown(card_to_fallback_text(card))
+                if card
+                else self._format_converter.render_postable(message),
                 "gchat",
             )
         )
@@ -911,7 +916,9 @@ class TelegramAdapter:
         parse_mode = self.resolve_parse_mode(message, card)
         text = self.truncate_message(
             convert_emoji_placeholders(
-                card_to_fallback_text(card) if card else self._format_converter.render_postable(message),
+                self._format_converter.from_markdown(card_to_fallback_text(card))
+                if card
+                else self._format_converter.render_postable(message),
                 "gchat",
             )
         )
@@ -1706,11 +1713,26 @@ class TelegramAdapter:
         message: AdapterPostableMessage,
         card: Any,
     ) -> str | None:
-        """Determine the parse mode to use for a Telegram API call."""
-        has_markdown = (isinstance(message, dict) and "markdown" in message) or (
-            hasattr(message, "markdown") and not isinstance(message, str)
-        )
-        return TELEGRAM_MARKDOWN_PARSE_MODE if (card or has_markdown) else None
+        """Determine the Telegram ``parse_mode`` for an outgoing message.
+
+        Cards and any message routed through the format converter are
+        rendered as MarkdownV2, so Telegram must parse them with
+        ``MarkdownV2``. Plain strings and ``{"raw": ...}`` payloads ship
+        verbatim with no parse mode (Bot API field omitted).
+        """
+        if card:
+            return TELEGRAM_MARKDOWN_PARSE_MODE
+        # Plain strings ship as-is.
+        if isinstance(message, str):
+            return None
+        # ``{"raw": ...}`` and dataclasses with ``.raw`` ship as-is.
+        if isinstance(message, dict) and "raw" in message:
+            return None
+        if hasattr(message, "raw") and not isinstance(message, str):
+            return None
+        # Every other shape ({markdown}, {ast}, JSX, etc.) flows through
+        # format_converter.render_postable, which emits MarkdownV2.
+        return TELEGRAM_MARKDOWN_PARSE_MODE
 
     # -- Truncation ----------------------------------------------------------
 

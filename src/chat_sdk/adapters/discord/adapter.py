@@ -20,7 +20,6 @@ from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
     card_to_discord_payload,
-    card_to_fallback_text,
 )
 from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
 from chat_sdk.adapters.discord.types import (
@@ -747,7 +746,8 @@ class DiscordAdapter:
             card_payload = card_to_discord_payload(card)
             embeds.extend(card_payload["embeds"])
             components.extend(card_payload["components"])
-            payload["content"] = self._truncate_content(card_to_fallback_text(card))
+            # Don't include text — Discord renders both `content` and the card
+            # embed if `content` is set, so cards would post duplicate text.
         else:
             payload["content"] = self._truncate_content(
                 convert_emoji_placeholders(
@@ -848,7 +848,10 @@ class DiscordAdapter:
             card_payload = card_to_discord_payload(card)
             embeds.extend(card_payload["embeds"])
             components.extend(card_payload["components"])
-            payload["content"] = self._truncate_content(card_to_fallback_text(card))
+            # Clear content explicitly so leftover text from a previous edit
+            # doesn't render alongside the card. Discord PATCH preserves
+            # omitted fields, so we must send "" rather than skip the key.
+            payload["content"] = ""
         else:
             payload["content"] = self._truncate_content(
                 convert_emoji_placeholders(

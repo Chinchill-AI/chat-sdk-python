@@ -137,12 +137,13 @@ class TestPostMessageWithCard:
         assert payload.get("reply_markup") is not None
         keyboard = payload["reply_markup"]["inline_keyboard"]
         assert len(keyboard) > 0
-        # With a card, parse_mode should be Markdown
-        assert payload.get("parse_mode") == "Markdown"
+        # With a card, parse_mode should be MarkdownV2 (legacy "Markdown" was
+        # deprecated by Telegram and rejected most LLM-generated text).
+        assert payload.get("parse_mode") == "MarkdownV2"
 
 
 class TestPostMessageParseMode:
-    """post_message with markdown content sends Markdown parse_mode."""
+    """post_message with markdown content sends MarkdownV2 parse_mode."""
 
     @pytest.mark.asyncio
     async def test_post_message_parse_mode_markdown(self):
@@ -153,7 +154,7 @@ class TestPostMessageParseMode:
         await adapter.post_message(THREAD_ID, {"markdown": "**bold**"})
 
         payload = adapter.telegram_fetch.call_args[0][1]
-        assert payload.get("parse_mode") == "Markdown"
+        assert payload.get("parse_mode") == "MarkdownV2"
 
 
 # =============================================================================
@@ -904,17 +905,29 @@ class TestIsBotMentioned:
 
 
 class TestResolveParseMode:
-    def test_card_returns_markdown(self):
+    def test_card_returns_markdown_v2(self):
         adapter = _make_adapter()
-        assert adapter.resolve_parse_mode({}, {"type": "card"}) == "Markdown"
+        assert adapter.resolve_parse_mode({}, {"type": "card"}) == "MarkdownV2"
 
-    def test_markdown_key_returns_markdown(self):
+    def test_markdown_key_returns_markdown_v2(self):
         adapter = _make_adapter()
-        assert adapter.resolve_parse_mode({"markdown": "**bold**"}, None) == "Markdown"
+        assert adapter.resolve_parse_mode({"markdown": "**bold**"}, None) == "MarkdownV2"
 
-    def test_plain_text_returns_none(self):
+    def test_plain_string_returns_none(self):
+        # Plain str messages ship verbatim — no parse mode.
         adapter = _make_adapter()
-        assert adapter.resolve_parse_mode({"text": "hello"}, None) is None
+        assert adapter.resolve_parse_mode("hello", None) is None
+
+    def test_raw_dict_returns_none(self):
+        # `{"raw": ...}` ships verbatim — no parse mode.
+        adapter = _make_adapter()
+        assert adapter.resolve_parse_mode({"raw": "verbatim"}, None) is None
+
+    def test_ast_returns_markdown_v2(self):
+        # `{ast}` shapes go through the format converter (which emits MarkdownV2).
+        adapter = _make_adapter()
+        ast_msg = {"ast": {"type": "root", "children": []}}
+        assert adapter.resolve_parse_mode(ast_msg, None) == "MarkdownV2"
 
 
 # =============================================================================

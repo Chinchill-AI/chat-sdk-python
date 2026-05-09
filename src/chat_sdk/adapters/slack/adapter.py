@@ -122,10 +122,11 @@ _USER_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000  # 8 days
 _CHANNEL_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000
 _REVERSE_INDEX_TTL_MS = 8 * 24 * 60 * 60 * 1000
 
-# Ignored message subtypes (system/meta events)
+# Ignored message subtypes (system/meta events).
+# `message_changed` is NOT in this set — it is routed to
+# `_handle_message_changed` so we can capture link unfurl metadata.
 _IGNORED_SUBTYPES = frozenset(
     {
-        "message_changed",
         "message_deleted",
         "message_replied",
         "channel_join",
@@ -146,6 +147,15 @@ _IGNORED_SUBTYPES = frozenset(
         "tombstone",
     }
 )
+
+# Link-unfurl wait window: Slack delivers unfurled attachments via a
+# separate `message_changed` event ~100-2000ms after the original. We
+# poll briefly so the message handler sees enriched links instead of
+# bare URLs.
+_TRAILING_SLASH_PATTERN = re.compile(r"/$")
+_UNFURL_WAIT_MS = 2000
+_UNFURL_POLL_MS = 150
+_UNFURL_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
 
 
 # ---------------------------------------------------------------------------
@@ -1269,6 +1279,9 @@ class SlackAdapter:
             return
 
         subtype = event.get("subtype")
+        if subtype == "message_changed":
+            self._handle_message_changed(event, options)
+            return
         if subtype and subtype in _IGNORED_SUBTYPES:
             self._logger.debug("Ignoring message subtype", {"subtype": subtype})
             return
@@ -1722,7 +1735,13 @@ class SlackAdapter:
     # ==================================================================
 
     def _extract_links(self, event: dict[str, Any]) -> list[LinkPreview]:
-        """Extract link URLs from a Slack event."""
+        """Extract link URLs from a Slack event.
+
+        Also merges any inline unfurl metadata that Slack already attached to
+        this same event (legacy ``attachments`` array). Cross-event unfurl
+        metadata (delivered later via ``message_changed``) is merged
+        asynchronously via :meth:`_enrich_links`.
+        """
         urls: set[str] = set()
 
         for block in event.get("blocks", []):
@@ -1738,7 +1757,159 @@ class SlackAdapter:
                 pipe_idx = raw.find("|")
                 urls.add(raw[:pipe_idx] if pipe_idx >= 0 else raw)
 
-        return [self._create_link_preview(url) for url in urls]
+        # Build unfurl metadata index from inline (same-event) attachments.
+        unfurls: dict[str, dict[str, str | None]] = {}
+        for att in event.get("attachments") or []:
+            if not isinstance(att, dict):
+                continue
+            att_url = att.get("from_url") or att.get("original_url")
+            if att_url and (att.get("title") or att.get("text")):
+                unfurls[att_url] = {
+                    "title": att.get("title"),
+                    "description": att.get("text"),
+                    "image_url": att.get("image_url") or att.get("thumb_url"),
+                    "site_name": att.get("service_name"),
+                }
+                urls.add(att_url)
+
+        previews: list[LinkPreview] = []
+        for url in urls:
+            preview = self._create_link_preview(url)
+            unfurl = unfurls.get(url) or unfurls.get(_TRAILING_SLASH_PATTERN.sub("", url)) or unfurls.get(f"{url}/")
+            if unfurl:
+                preview = self._merge_unfurl_into_preview(preview, unfurl)
+            previews.append(preview)
+        return previews
+
+    @staticmethod
+    def _merge_unfurl_into_preview(preview: LinkPreview, unfurl: dict[str, str | None]) -> LinkPreview:
+        """Return a new LinkPreview with unfurl metadata merged in.
+
+        Only fills fields that are missing on the preview — user-supplied
+        metadata (e.g. ``title`` from a Slack message URL) wins over the
+        attachment-derived unfurl. ``fetch_message`` is preserved.
+        """
+        return LinkPreview(
+            url=preview.url,
+            title=preview.title if preview.title is not None else unfurl.get("title"),
+            description=preview.description if preview.description is not None else unfurl.get("description"),
+            image_url=preview.image_url if preview.image_url is not None else unfurl.get("image_url"),
+            site_name=preview.site_name if preview.site_name is not None else unfurl.get("site_name"),
+            fetch_message=preview.fetch_message,
+        )
+
+    def _handle_message_changed(self, event: dict[str, Any], _options: WebhookOptions | None = None) -> None:
+        """Cache unfurl metadata from ``message_changed`` events.
+
+        Slack delivers link unfurls asynchronously by editing the original
+        message and dispatching ``message_changed``. We extract any unfurl
+        attachments and store them keyed by the inner message ``ts`` so
+        :meth:`_enrich_links` can pick them up for the original event.
+        """
+        inner = event.get("message")
+        channel = event.get("channel")
+        if not (inner and channel and isinstance(inner, dict)):
+            return
+
+        attachments = inner.get("attachments") or []
+        has_unfurls = any(
+            isinstance(att, dict) and (att.get("from_url") or att.get("original_url")) for att in attachments
+        )
+        if not has_unfurls:
+            self._logger.debug("Ignoring message_changed without unfurl data")
+            return
+
+        ts = inner.get("ts")
+        if not (self._chat and ts):
+            return
+
+        self._logger.debug(
+            "Processing message_changed for link unfurls",
+            {"channel": channel, "ts": ts, "attachmentCount": len(attachments)},
+        )
+
+        unfurls: dict[str, dict[str, str | None]] = {}
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            att_url = att.get("from_url") or att.get("original_url")
+            if att_url and (att.get("title") or att.get("text")):
+                unfurls[att_url] = {
+                    "title": att.get("title"),
+                    "description": att.get("text"),
+                    "image_url": att.get("image_url") or att.get("thumb_url"),
+                    "site_name": att.get("service_name"),
+                }
+
+        if not unfurls:
+            return
+
+        async def _store() -> None:
+            try:
+                await self._chat.get_state().set(  # type: ignore[union-attr]
+                    f"slack:unfurls:{ts}",
+                    unfurls,
+                    _UNFURL_CACHE_TTL_MS,
+                )
+            except Exception as exc:
+                self._logger.error("Failed to cache unfurl metadata", {"error": exc})
+
+        try:
+            task = asyncio.get_running_loop().create_task(_store())
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error("Unfurl cache task failed", {"error": t.exception()}) if t.exception() else None
+                )
+            )
+        except RuntimeError:
+            # No running loop (sync test context) — skip silently.
+            self._logger.debug("No running loop; skipping unfurl cache write")
+
+    async def _enrich_links(self, links: list[LinkPreview], message_ts: str | None) -> list[LinkPreview]:
+        """Enrich ``links`` with unfurl metadata from a ``message_changed`` cache.
+
+        Polls the state cache for up to ``_UNFURL_WAIT_MS`` to give Slack
+        time to deliver the cross-event ``message_changed`` payload.
+        Returns the original list (untouched) when there is nothing to wait
+        for.
+        """
+        if not (self._chat and message_ts) or not links:
+            return links
+
+        all_have_metadata = all((link.title is not None) or (link.fetch_message is not None) for link in links)
+        if all_have_metadata:
+            return links
+
+        deadline = time.monotonic() + (_UNFURL_WAIT_MS / 1000.0)
+        state = self._chat.get_state()
+        stored: dict[str, dict[str, str | None]] | None = None
+        while True:
+            try:
+                stored = await state.get(f"slack:unfurls:{message_ts}")
+            except Exception:
+                return links
+            if stored or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_UNFURL_POLL_MS / 1000.0)
+
+        if not stored:
+            return links
+
+        out: list[LinkPreview] = []
+        for link in links:
+            if link.title is not None:
+                out.append(link)
+                continue
+            unfurl = (
+                stored.get(link.url)
+                or stored.get(_TRAILING_SLASH_PATTERN.sub("", link.url))
+                or stored.get(f"{link.url}/")
+            )
+            if unfurl:
+                out.append(self._merge_unfurl_into_preview(link, unfurl))
+            else:
+                out.append(link)
+        return out
 
     def _create_link_preview(self, url: str) -> LinkPreview:
         """Create a LinkPreview for a URL.
@@ -1844,7 +2015,7 @@ class SlackAdapter:
                 self._create_attachment(f, team_id=event.get("team") or event.get("team_id"))
                 for f in event.get("files", [])
             ],
-            links=self._extract_links(event),
+            links=await self._enrich_links(self._extract_links(event), event.get("ts")),
         )
 
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
@@ -2348,7 +2519,15 @@ class SlackAdapter:
 
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
-        thread_ts = decoded.thread_ts
+        # Normalize empty thread_ts to None to avoid Slack API "invalid_thread_ts" errors.
+        # Stream requires a real thread context — bail out when missing.
+        thread_ts = decoded.thread_ts or None
+        if not thread_ts:
+            self._logger.debug("Slack: stream skipped - no thread context")
+            raise ValidationError(
+                "slack",
+                "Slack streaming requires a valid thread context (non-empty thread_ts)",
+            )
         self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
         token = self._get_token()
