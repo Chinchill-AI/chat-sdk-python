@@ -827,10 +827,7 @@ class SlackAdapter:
                 ts_int = int(ts_raw) if ts_raw is not None else None
             except (TypeError, ValueError):
                 ts_int = None
-            if ts_int is not None and ts_int > 10**11:
-                ts_seconds = ts_int // 1000
-            else:
-                ts_seconds = ts_int
+            ts_seconds = ts_int // 1000 if ts_int is not None and ts_int > 10**11 else ts_int
             if ts_seconds is None or abs(int(time.time()) - ts_seconds) > 300:
                 self._logger.warn(
                     "Forwarded socket event outside freshness window",
