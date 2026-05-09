@@ -164,6 +164,183 @@ def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
     return text[:cut] + ellipsis
 
 
+# ---------------------------------------------------------------------------
+# MarkdownV2-safe truncation
+# ---------------------------------------------------------------------------
+#
+# Port of packages/adapter-telegram/src/markdown.ts (chat@4.27.0).
+#
+# Naive ``slice + "..."`` produces invalid MarkdownV2: ``.`` is a reserved
+# character (must be escaped as ``\.``); a slice can leave an orphan
+# trailing ``\`` that escapes the ellipsis or nothing; and a slice can cut
+# through a paired entity (``*bold*``, `` `code` ``, ``[label](url)``)
+# leaving it unclosed. Telegram rejects all three with
+# ``Bad Request: can't parse entities``.
+#
+# These helpers walk back past unbalanced delimiters and orphan backslashes
+# before appending an escaped ellipsis. They also run on
+# under-the-limit MarkdownV2 inputs (per upstream f46a6fb / chat#446) so
+# streamed chunks that arrive with a transiently unpaired opener are
+# trimmed back to a parseable boundary.
+
+# Entity delimiters whose opener/closer pairing must be preserved when
+# truncating a rendered MarkdownV2 string.
+_MARKDOWN_V2_ENTITY_MARKERS: tuple[str, ...] = ("*", "_", "~", "`")
+
+_MARKDOWN_V2_ELLIPSIS = "\\.\\.\\."
+_PLAIN_ELLIPSIS = "..."
+
+
+def find_unescaped_positions(text: str, marker: str) -> list[int]:
+    """Return indices of every occurrence of *marker* in *text* not preceded
+    by an odd number of backslashes (i.e. not escaped)."""
+    positions: list[int] = []
+    for i, ch in enumerate(text):
+        if ch != marker:
+            continue
+        backslashes = 0
+        j = i - 1
+        while j >= 0 and text[j] == "\\":
+            backslashes += 1
+            j -= 1
+        if backslashes % 2 == 0:
+            positions.append(i)
+    return positions
+
+
+def _find_unescaped_positions_outside_code(text: str, marker: str) -> list[int]:
+    """Like :func:`find_unescaped_positions` but skips occurrences inside
+    fenced code blocks (```````) or inline code spans
+    (`````). Inside those regions Telegram treats ``*``, ``_``, ``~``,
+    ``[``, ``]`` as literal text.
+
+    Port of upstream ``findUnescapedPositionsOutsideCode`` (chat#446).
+    """
+    positions: list[int] = []
+    in_fence = False
+    in_inline = False
+    backslashes = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch == "\\":
+            backslashes += 1
+            i += 1
+            continue
+
+        escaped = backslashes % 2 == 1
+        backslashes = 0
+
+        if ch == "`" and not escaped:
+            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
+            if is_triple and not in_inline:
+                in_fence = not in_fence
+                i += 3
+                continue
+            if not in_fence:
+                in_inline = not in_inline
+            i += 1
+            continue
+
+        if ch == marker and not escaped and not in_fence and not in_inline:
+            positions.append(i)
+        i += 1
+
+    return positions
+
+
+def ends_with_orphan_backslash(text: str) -> bool:
+    """Return True if *text* ends with an odd number of trailing ``\\``."""
+    trailing = 0
+    i = len(text) - 1
+    while i >= 0 and text[i] == "\\":
+        trailing += 1
+        i -= 1
+    return trailing % 2 == 1
+
+
+def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
+    """Drop trailing characters that would produce invalid MarkdownV2.
+
+    Drops:
+      - orphan trailing ``\\`` (would escape the appended ellipsis or nothing)
+      - unclosed entity delimiter (``*``, ``_``, ``~``, `` ` ``) whose closer
+        was cut off
+      - unmatched ``[`` from a link whose closer was cut off
+
+    Best-effort: may drop more than strictly necessary in edge cases, but
+    guarantees the output is parseable MarkdownV2 (when the input was).
+    """
+    current = text
+    max_iterations = len(current) + 1
+
+    for _ in range(max_iterations):
+        if ends_with_orphan_backslash(current):
+            current = current[:-1]
+            continue
+
+        min_unsafe_position = len(current)
+
+        for marker in _MARKDOWN_V2_ENTITY_MARKERS:
+            if marker == "`":
+                positions = find_unescaped_positions(current, marker)
+            else:
+                positions = _find_unescaped_positions_outside_code(current, marker)
+            if len(positions) % 2 == 1:
+                last_unpaired = positions[-1] if positions else len(current)
+                if last_unpaired < min_unsafe_position:
+                    min_unsafe_position = last_unpaired
+
+        open_brackets = _find_unescaped_positions_outside_code(current, "[")
+        close_brackets = _find_unescaped_positions_outside_code(current, "]")
+        if len(open_brackets) > len(close_brackets):
+            last_open = open_brackets[-1] if open_brackets else len(current)
+            if last_open < min_unsafe_position:
+                min_unsafe_position = last_open
+
+        if min_unsafe_position >= len(current):
+            return current
+
+        current = current[:min_unsafe_position]
+
+    return current
+
+
+def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
+    """Truncate *text* to *limit* characters, appending an ellipsis.
+
+    For MarkdownV2 (``parse_mode == "MarkdownV2"``), uses an escaped
+    ellipsis (``\\.\\.\\.``) and trims back past any unbalanced entity
+    delimiter or orphan backslash before appending. Plain text gets a
+    literal ``...``.
+
+    Even when *text* is under the limit, MarkdownV2 inputs go through
+    :func:`_trim_to_markdown_v2_safe_boundary` so that streamed chunks
+    with transiently unpaired entity markers don't trigger Telegram's
+    ``can't parse entities`` 400 (port of chat#446 / upstream f46a6fb).
+
+    Limit is interpreted in Python ``len()`` units (== UTF-16 code units
+    for the BMP, == 1 for astral characters). Telegram's 4096 / 1024
+    caps are documented in UTF-16 code units; for parity with upstream
+    we follow upstream's `string.length` semantics here. Pre-existing
+    UTF-16-aware truncation is reserved for non-MarkdownV2 paths.
+    """
+    is_markdown_v2 = parse_mode == "MarkdownV2"
+
+    if len(text) <= limit:
+        return _trim_to_markdown_v2_safe_boundary(text) if is_markdown_v2 else text
+
+    ellipsis = _MARKDOWN_V2_ELLIPSIS if is_markdown_v2 else _PLAIN_ELLIPSIS
+    sliced = text[: limit - len(ellipsis)]
+
+    if is_markdown_v2:
+        sliced = _trim_to_markdown_v2_safe_boundary(sliced)
+
+    return f"{sliced}{ellipsis}"
+
+
 def _trim_trailing_slashes(url: str) -> str:
     """Remove trailing ``/`` characters from *url*."""
     end = len(url)
@@ -838,7 +1015,8 @@ class TelegramAdapter:
                 if card
                 else self._format_converter.render_postable(message),
                 "gchat",
-            )
+            ),
+            parse_mode,
         )
 
         files = extract_files(message)
@@ -920,7 +1098,8 @@ class TelegramAdapter:
                 if card
                 else self._format_converter.render_postable(message),
                 "gchat",
-            )
+            ),
+            parse_mode,
         )
 
         if not text.strip():
@@ -1453,7 +1632,7 @@ class TelegramAdapter:
             form_data.add_field("message_thread_id", str(thread.message_thread_id))
 
         if text.strip():
-            form_data.add_field("caption", self.truncate_caption(text))
+            form_data.add_field("caption", self.truncate_caption(text, parse_mode))
             if parse_mode:
                 form_data.add_field("parse_mode", parse_mode)
 
@@ -1736,12 +1915,26 @@ class TelegramAdapter:
 
     # -- Truncation ----------------------------------------------------------
 
-    def truncate_message(self, text: str) -> str:
-        """Truncate message text to the Telegram limit (measured in UTF-16 code units)."""
+    def truncate_message(self, text: str, parse_mode: str | None = None) -> str:
+        """Truncate message text to the Telegram message limit.
+
+        For ``parse_mode == "MarkdownV2"`` uses :func:`truncate_for_telegram`,
+        which escapes the ellipsis and walks back past any unbalanced
+        entity delimiter or orphan backslash so the result is parseable.
+        For plain text, falls back to UTF-16 truncation with a literal
+        ``"..."`` ellipsis.
+        """
+        if parse_mode == "MarkdownV2":
+            return truncate_for_telegram(text, TELEGRAM_MESSAGE_LIMIT, parse_mode)
         return _truncate_to_utf16(text, TELEGRAM_MESSAGE_LIMIT)
 
-    def truncate_caption(self, text: str) -> str:
-        """Truncate caption text to the Telegram caption limit (measured in UTF-16 code units)."""
+    def truncate_caption(self, text: str, parse_mode: str | None = None) -> str:
+        """Truncate caption text to the Telegram caption limit.
+
+        See :meth:`truncate_message` for parse-mode handling.
+        """
+        if parse_mode == "MarkdownV2":
+            return truncate_for_telegram(text, TELEGRAM_CAPTION_LIMIT, parse_mode)
         return _truncate_to_utf16(text, TELEGRAM_CAPTION_LIMIT)
 
     # -- Emoji / reactions ---------------------------------------------------

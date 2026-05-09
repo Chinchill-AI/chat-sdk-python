@@ -15,7 +15,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chat_sdk.adapters.telegram.adapter import TelegramAdapter
+from chat_sdk.adapters.telegram.adapter import (
+    TelegramAdapter,
+    ends_with_orphan_backslash,
+    find_unescaped_positions,
+    truncate_for_telegram,
+)
+from chat_sdk.adapters.telegram.format_converter import escape_markdown_v2
 from chat_sdk.adapters.telegram.types import (
     TelegramAdapterConfig,
 )
@@ -951,6 +957,255 @@ class TestTruncation:
         long_text = "x" * 2000
         result = adapter.truncate_caption(long_text)
         assert len(result) <= 1024
+
+
+# =============================================================================
+# Tests -- MarkdownV2-safe truncation (port of chat@4.27.0 b9a1961 + f46a6fb)
+#
+# Background: legacy ``slice + "..."`` truncation produces invalid MarkdownV2
+# because (1) ``.`` is a reserved character that must be escaped as ``\.``,
+# (2) the slice can leave a trailing orphan ``\`` that escapes the
+# appended ellipsis or nothing, (3) the slice can cut through a paired
+# entity (``*bold*``, `` `code` ``, ``[label](url)``) leaving it
+# unclosed. Telegram rejects all three with
+# ``Bad Request: can't parse entities``.
+#
+# These tests pin the exact failure modes that ``truncate_for_telegram``
+# guards against. Each docstring includes "What to fix if this fails:"
+# pointing at the helper that needs to be re-examined.
+# =============================================================================
+
+
+_ESCAPED_ELLIPSIS_PATTERN = "\\.\\.\\."
+
+
+class TestTruncateForTelegram:
+    """Length-limit tests for the MarkdownV2-safe truncator."""
+
+    def test_returns_text_unchanged_when_under_limit(self):
+        """Plain text under the limit is returned verbatim.
+
+        What to fix if this fails: ``truncate_for_telegram`` early-return
+        for non-MarkdownV2 inputs in
+        ``src/chat_sdk/adapters/telegram/adapter.py``.
+        """
+        assert truncate_for_telegram("hello", 100, "plain") == "hello"
+
+    def test_truncates_plain_text_with_literal_ellipsis(self):
+        """Plain text over the limit is sliced and gets ``...``.
+
+        What to fix if this fails: ``truncate_for_telegram`` plain
+        branch should append ``"..."`` (3 chars) and respect the limit.
+        """
+        result = truncate_for_telegram("a" * 200, 100, "plain")
+        assert len(result) == 100
+        assert result.endswith("...")
+
+    def test_truncates_markdown_v2_with_escaped_ellipsis(self):
+        """MarkdownV2 over the limit gets ``\\.\\.\\.`` (escaped).
+
+        What to fix if this fails: the MarkdownV2 ellipsis constant
+        must be ``\\.\\.\\.`` so Telegram doesn't choke on the bare
+        reserved ``.``.
+        """
+        result = truncate_for_telegram("a" * 200, 100, "MarkdownV2")
+        assert len(result) <= 100
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+
+    def test_strips_orphan_backslash_before_ellipsis(self):
+        """A slice ending with a single ``\\`` gets the backslash dropped.
+
+        Without this fix, the orphan ``\\`` would escape the first ``\\``
+        of the ellipsis (``\\\\.\\.``) and Telegram would render a
+        literal backslash and reject the rest.
+
+        What to fix if this fails: ``ends_with_orphan_backslash`` /
+        ``_trim_to_markdown_v2_safe_boundary`` in
+        ``src/chat_sdk/adapters/telegram/adapter.py``.
+        """
+        text = ("a" * 90) + "\\" + ("b" * 50)
+        result = truncate_for_telegram(text, 100, "MarkdownV2")
+        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        assert not ends_with_orphan_backslash(before_ellipsis)
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+
+    def test_strips_unclosed_bold_when_star_crosses_4096(self):
+        """A ``*`` that opens bold but whose closer is past the cut.
+
+        Telegram rejects messages with unbalanced ``*`` markers as
+        ``can't parse entities``. The trim helper must walk back past
+        the unpaired opener.
+
+        What to fix if this fails: the ``*`` arm of
+        ``_MARKDOWN_V2_ENTITY_MARKERS`` in
+        ``_trim_to_markdown_v2_safe_boundary``.
+        """
+        text = ("a" * 80) + "*" + ("b" * 100)
+        result = truncate_for_telegram(text, 100, "MarkdownV2")
+        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        stars = before_ellipsis.count("*")
+        assert stars % 2 == 0
+
+    def test_strips_unclosed_code_when_backtick_crosses_4096(self):
+        """A `` ` `` that opens an inline-code span whose closer is past the cut.
+
+        Same problem as bold but for ``` `code` ```. The backtick-aware
+        scan in ``find_unescaped_positions`` must spot the unpaired
+        opener.
+
+        What to fix if this fails: the `` ` `` entry in
+        ``_MARKDOWN_V2_ENTITY_MARKERS``; note the renderer routes
+        backticks through ``find_unescaped_positions`` (which counts
+        them inside text) rather than the outside-code variant.
+        """
+        text = ("a" * 80) + "`" + ("b" * 100)
+        result = truncate_for_telegram(text, 100, "MarkdownV2")
+        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        backticks = before_ellipsis.count("`")
+        assert backticks % 2 == 0
+
+    def test_handles_input_that_is_all_special_chars(self):
+        """``escape_markdown_v2(".".repeat(200))`` truncates without crashing.
+
+        Each ``.`` becomes ``\\.``; the truncator must not leave a
+        trailing orphan ``\\`` from cutting between ``\\`` and ``.``.
+
+        What to fix if this fails: combination of
+        ``ends_with_orphan_backslash`` plus the safe-boundary loop.
+        """
+        rendered = escape_markdown_v2("." * 200)
+        result = truncate_for_telegram(rendered, 100, "MarkdownV2")
+        assert len(result) <= 100
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+        # And the result must have no orphan trailing backslash.
+        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        assert not ends_with_orphan_backslash(before_ellipsis)
+
+    def test_strips_unmatched_open_bracket_when_link_crosses_4096(self):
+        """An unmatched ``[`` from a link whose ``]`` is past the cut.
+
+        The trim helper walks back past the unpaired ``[`` so the
+        appended ellipsis isn't confused for the link label.
+
+        What to fix if this fails: the bracket-balancing block in
+        ``_trim_to_markdown_v2_safe_boundary``.
+        """
+        text = ("a" * 80) + "[label" + ("b" * 100)
+        result = truncate_for_telegram(text, 100, "MarkdownV2")
+        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        opens = before_ellipsis.count("[")
+        closes = before_ellipsis.count("]")
+        # An unmatched `[` must be trimmed off (count drops to <= closes).
+        assert opens <= closes
+
+
+class TestTruncateForTelegramStreamingChunks:
+    """Port of chat#446 / upstream f46a6fb: under-the-limit MarkdownV2
+    inputs are also passed through the safe-boundary trim because
+    streaming chunks can arrive with a transiently unpaired opener."""
+
+    def test_strips_unpaired_marker_under_limit_streaming_leak(self):
+        """Streaming-chunk leak: ``_italic`` with no closer drops the opener.
+
+        What to fix if this fails: the under-the-limit branch of
+        ``truncate_for_telegram`` must call
+        ``_trim_to_markdown_v2_safe_boundary`` for MarkdownV2.
+        """
+        text = "Hello *world* _italic and bold *bold*"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        underscores = result.count("_")
+        assert underscores % 2 == 0
+
+    def test_does_not_modify_plain_parse_mode_messages(self):
+        """``parse_mode="plain"`` returns the input verbatim.
+
+        What to fix if this fails: the ``is_markdown_v2`` branch in
+        ``truncate_for_telegram`` is leaking into the plain path.
+        """
+        text = "Hello *world* _unclosed"
+        result = truncate_for_telegram(text, 4096, "plain")
+        assert result == text
+
+    def test_preserves_balanced_markdown_v2_under_limit_no_op(self):
+        """Balanced MarkdownV2 under the limit is returned unchanged."""
+        text = "*bold* _italic_ ~strike~ `code`"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+
+class TestFindUnescapedPositions:
+    def test_finds_unescaped_markers(self):
+        assert find_unescaped_positions("*a*", "*") == [0, 2]
+
+    def test_ignores_escaped_markers(self):
+        assert find_unescaped_positions("\\*a*", "*") == [3]
+
+    def test_handles_double_backslash_before_marker(self):
+        # ``\\\\*`` → ``\\`` (escaped backslash) then unescaped ``*``.
+        assert find_unescaped_positions("\\\\*", "*") == [2]
+
+    def test_returns_empty_for_no_markers(self):
+        assert find_unescaped_positions("hello", "*") == []
+
+
+class TestEndsWithOrphanBackslash:
+    def test_returns_true_for_single_trailing_backslash(self):
+        assert ends_with_orphan_backslash("abc\\") is True
+
+    def test_returns_false_for_double_trailing_backslash(self):
+        assert ends_with_orphan_backslash("abc\\\\") is False
+
+    def test_returns_true_for_triple_trailing_backslash(self):
+        assert ends_with_orphan_backslash("abc\\\\\\") is True
+
+    def test_returns_false_for_no_trailing_backslash(self):
+        assert ends_with_orphan_backslash("abc") is False
+
+    def test_returns_false_for_empty_string(self):
+        assert ends_with_orphan_backslash("") is False
+
+
+class TestAdapterTruncateMessageMarkdownV2:
+    """End-to-end tests for ``TelegramAdapter.truncate_message`` /
+    ``truncate_caption`` plumbing parse_mode through to
+    ``truncate_for_telegram``."""
+
+    def test_truncate_message_markdown_v2_uses_safe_truncator(self):
+        """A 5000-char MarkdownV2 message lands under 4096 with the
+        escaped ellipsis (not literal ``...`` which would be a parse
+        error on its own).
+
+        What to fix if this fails: ``TelegramAdapter.truncate_message``
+        in ``src/chat_sdk/adapters/telegram/adapter.py`` must dispatch
+        to ``truncate_for_telegram`` when ``parse_mode == "MarkdownV2"``.
+        """
+        adapter = _make_adapter()
+        text = "a" * 5000
+        result = adapter.truncate_message(text, "MarkdownV2")
+        assert len(result) <= 4096
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+        assert not result.endswith("...")  # not the legacy literal
+
+    def test_truncate_caption_markdown_v2_uses_safe_truncator(self):
+        """Same as above for the 1024-char caption limit.
+
+        What to fix if this fails: ``TelegramAdapter.truncate_caption``
+        in ``src/chat_sdk/adapters/telegram/adapter.py``.
+        """
+        adapter = _make_adapter()
+        text = "a" * 2000
+        result = adapter.truncate_caption(text, "MarkdownV2")
+        assert len(result) <= 1024
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+
+    def test_truncate_message_plain_keeps_legacy_ellipsis(self):
+        """Plain mode still uses literal ``...`` for backward compat."""
+        adapter = _make_adapter()
+        text = "a" * 5000
+        result = adapter.truncate_message(text)
+        assert result.endswith("...")
+        # Length is measured in UTF-16 code units for plain mode (legacy).
+        assert len(result) <= 4096
 
 
 # =============================================================================
