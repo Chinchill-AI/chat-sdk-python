@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -20,7 +20,7 @@ from chat_sdk.logger import Logger
 # Matches the upstream TS contract:
 #   ``type SlackBotToken = string | (() => string | Promise<string>)``
 SlackBotTokenResolver = Callable[[], "str | Awaitable[str]"]
-SlackBotToken = "str | SlackBotTokenResolver"
+SlackBotToken: TypeAlias = str | SlackBotTokenResolver
 
 # Custom webhook verifier. Receives the original request object and the raw
 # body string already consumed by the adapter. Return:
@@ -37,6 +37,11 @@ SlackBotToken = "str | SlackBotTokenResolver"
 #   - constant-time signature comparison (use ``hmac.compare_digest``, never ``==``)
 #   - replay protection (validate ``x-slack-request-timestamp`` freshness)
 #   - any other freshness/origin checks the platform requires
+#   - body-substitution safety: when returning a ``str`` to substitute the body
+#     for downstream parsing, the returned bytes MUST be derived from a
+#     verified payload. Returning attacker-controlled bytes (e.g. echoing the
+#     unverified raw body or splicing in untrusted fields) grants payload
+#     injection — downstream parsing trusts the substituted body unconditionally.
 SlackWebhookVerifier = Callable[[Any, str], "bool | str | None | Awaitable[bool | str | None]"]
 
 # =============================================================================

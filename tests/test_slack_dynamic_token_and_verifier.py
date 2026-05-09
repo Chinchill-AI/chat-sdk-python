@@ -188,13 +188,51 @@ class TestBotTokenResolverConstruction:
             return "xoxb-resolved"
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
-        with pytest.raises(AuthenticationError, match="resolver has not been invoked"):
+        # Tightened: error message must mention ``current_token_async`` so
+        # callers know the right async accessor to use, not just that "the
+        # resolver hasn't run". Substring check on "current_token_async"
+        # is escaped via ``re.escape`` so the underscore isn't treated as a
+        # regex token (it isn't, but be explicit).
+        with pytest.raises(AuthenticationError, match=r"current_token_async"):
             _ = adapter.current_token
 
     @pytest.mark.asyncio
     async def test_resolver_returning_empty_string_raises(self):
         def resolver() -> str:
             return ""
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        with pytest.raises(AuthenticationError, match="empty or non-string"):
+            await adapter.current_token_async()
+
+    @pytest.mark.asyncio
+    async def test_resolver_returning_none_raises(self):
+        """Non-string ``None`` return must be rejected, not silently used."""
+
+        def resolver() -> Any:
+            return None
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        with pytest.raises(AuthenticationError, match="empty or non-string"):
+            await adapter.current_token_async()
+
+    @pytest.mark.asyncio
+    async def test_resolver_returning_int_raises(self):
+        """Non-string ``int`` (e.g. accidental ``return 0``) must be rejected."""
+
+        def resolver() -> Any:
+            return 12345
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        with pytest.raises(AuthenticationError, match="empty or non-string"):
+            await adapter.current_token_async()
+
+    @pytest.mark.asyncio
+    async def test_resolver_returning_dict_raises(self):
+        """Non-string ``dict`` (e.g. returning the secret-manager response object) must be rejected."""
+
+        def resolver() -> Any:
+            return {"token": "xoxb-buried-in-dict"}
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
         with pytest.raises(AuthenticationError, match="empty or non-string"):
@@ -663,13 +701,17 @@ class TestSecurityProperties:
 
         A regression to ``==`` would leak signature bytes via timing. This
         test inspects the source of ``_verify_signature`` to assert the
-        primitive has not been swapped out.
+        primitive has not been swapped out. The regex requires an actual
+        ``hmac.compare_digest(`` call — a passing mention in a comment or
+        docstring (e.g. ``# use hmac.compare_digest, never ==``) does not
+        satisfy the assertion.
         """
         import inspect as _inspect
+        import re as _re
 
         src = _inspect.getsource(SlackAdapter._verify_signature)
-        assert "compare_digest" in src, (
-            "default signature verifier must use hmac.compare_digest for constant-time comparison"
+        assert _re.search(r"\bhmac\.compare_digest\s*\(", src), (
+            "default signature verifier must call hmac.compare_digest(...) for constant-time comparison"
         )
 
     @pytest.mark.asyncio
@@ -701,3 +743,267 @@ class TestSecurityProperties:
         )
         response = await adapter.handle_webhook(request)
         assert response["status"] == 200, "custom verifier must be able to accept requests the default check rejects"
+
+
+# ---------------------------------------------------------------------------
+# Rotation safety: schedule_message().cancel() and Attachment.fetch_data
+#
+# These two paths build a closure that runs *after* the originating webhook
+# context has unwound. The contract is:
+#
+# - Single-workspace mode: re-resolve the token at call time so a dynamic
+#   ``bot_token`` resolver picks up rotated tokens (Slack rotation TTL is 12h
+#   and a scheduled message / queued attachment can outlive its origin token).
+# - Multi-workspace mode: snapshot the per-team token from the request
+#   context at construction time — the per-team InstallationStore lookup
+#   already happened at webhook entry, and ``cancel`` / ``fetch_data`` may
+#   run outside any ContextVar frame.
+# ---------------------------------------------------------------------------
+
+
+def _install_mock_slack_client(adapter: SlackAdapter) -> dict[str, Any]:
+    """Patch ``adapter._get_client`` to return a recording mock.
+
+    Returns a dict containing ``calls`` (list of (method, kwargs, token)
+    tuples) and ``tokens`` (set of tokens the adapter requested clients for).
+    """
+    record: dict[str, Any] = {"calls": [], "tokens": []}
+
+    class _Client:
+        def __init__(self, token: str) -> None:
+            self._token = token
+
+        async def chat_scheduleMessage(self, **kwargs: Any) -> dict[str, Any]:
+            record["calls"].append(("chat_scheduleMessage", kwargs, self._token))
+            return {"scheduled_message_id": "Q-test", "ok": True}
+
+        async def chat_deleteScheduledMessage(self, **kwargs: Any) -> dict[str, Any]:
+            record["calls"].append(("chat_deleteScheduledMessage", kwargs, self._token))
+            return {"ok": True}
+
+    def _get_client(token: str | None = None) -> Any:
+        resolved = token if token is not None else adapter._get_token()
+        record["tokens"].append(resolved)
+        return _Client(resolved)
+
+    adapter._get_client = _get_client  # type: ignore[method-assign]
+    return record
+
+
+class TestScheduleMessageCancelRotationSafety:
+    @pytest.mark.asyncio
+    async def test_schedule_message_cancel_re_resolves_token_in_single_workspace_mode(self):
+        """In single-workspace mode, ``cancel()`` invokes the resolver again.
+
+        The contract: a dynamic ``bot_token`` resolver must pick up rotated
+        tokens between ``schedule_message()`` and ``cancel()``. We assert
+        the resolver is called twice and that ``cancel()`` reaches Slack
+        with the *new* token.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        tokens = ["xoxb-old", "xoxb-new"]
+        i = [0]
+
+        def resolver() -> str:
+            t = tokens[i[0]]
+            i[0] += 1
+            return t
+
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                signing_secret="test-signing-secret",
+                bot_token=resolver,
+            )
+        )
+        record = _install_mock_slack_client(adapter)
+
+        future = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        scheduled = await adapter.schedule_message("slack:C123:1234567890.000000", "hello", future)
+
+        # First call to resolver happened during schedule_message itself.
+        schedule_call = next(c for c in record["calls"] if c[0] == "chat_scheduleMessage")
+        assert schedule_call[2] == "xoxb-old"
+
+        await scheduled.cancel()
+
+        # Cancel must have re-invoked the resolver and used the rotated token.
+        assert i[0] == 2, f"resolver should be invoked twice (schedule + cancel), got {i[0]}"
+        cancel_call = next(c for c in record["calls"] if c[0] == "chat_deleteScheduledMessage")
+        assert cancel_call[2] == "xoxb-new", (
+            "cancel() in single-workspace mode must re-resolve the token so rotated "
+            "credentials are picked up; got the original 'xoxb-old' instead"
+        )
+
+    @pytest.mark.asyncio
+    async def test_schedule_message_cancel_uses_snapshot_in_multi_workspace_mode(self):
+        """In multi-workspace mode, ``cancel()`` uses the snapshotted per-team token.
+
+        Rationale: ``cancel()`` may run outside any ContextVar frame (e.g.
+        from a cron job) — there's no per-team request context to consult.
+        We assert that ``cancel()`` does NOT call the InstallationStore a
+        second time, and uses the snapshot captured at ``schedule_message``
+        time.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret"))
+        await adapter.initialize(chat)
+
+        await adapter.set_installation(
+            "T_MWS",
+            SlackInstallation(bot_token="xoxb-team-mws", bot_user_id="U_MWS", team_name="MWS"),
+        )
+
+        record = _install_mock_slack_client(adapter)
+
+        # Spy on get_installation to assert ``cancel()`` does not re-consult it.
+        get_install_calls: list[str] = []
+        original_get = adapter.get_installation
+
+        async def get_install_spy(team_id: str) -> Any:
+            get_install_calls.append(team_id)
+            return await original_get(team_id)
+
+        adapter.get_installation = get_install_spy  # type: ignore[method-assign]
+
+        # Run schedule_message with the per-team token in context.
+        future = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+
+        async def do_schedule() -> Any:
+            return await adapter.schedule_message("slack:C123:1234567890.000000", "hi", future)
+
+        scheduled = await adapter.with_bot_token_async("xoxb-team-mws", do_schedule)
+
+        schedule_call = next(c for c in record["calls"] if c[0] == "chat_scheduleMessage")
+        assert schedule_call[2] == "xoxb-team-mws"
+
+        # Now run cancel OUTSIDE the request context — snapshot must be used.
+        get_install_calls.clear()
+        await scheduled.cancel()
+
+        cancel_call = next(c for c in record["calls"] if c[0] == "chat_deleteScheduledMessage")
+        assert cancel_call[2] == "xoxb-team-mws", (
+            "cancel() in multi-workspace mode must use the snapshotted ctx_token, "
+            "not re-resolve via the (absent) request context"
+        )
+        assert get_install_calls == [], (
+            f"cancel() must NOT re-consult InstallationStore in multi-workspace mode; got {get_install_calls!r}"
+        )
+
+
+class TestAttachmentFetchDataRotationSafety:
+    def _make_file(self) -> dict[str, Any]:
+        return {
+            "url_private": "https://files.slack.com/img.png",
+            "mimetype": "image/png",
+            "name": "img.png",
+            "size": 100,
+        }
+
+    @pytest.mark.asyncio
+    async def test_attachment_fetch_data_re_resolves_token_in_single_workspace_mode(self):
+        """``fetch_data`` re-invokes the resolver in single-workspace mode.
+
+        Same rotation contract as ``schedule_message().cancel()`` — a
+        queued message can outlive the bot token that minted it.
+        """
+        tokens = ["xoxb-att-old", "xoxb-att-new"]
+        i = [0]
+
+        def resolver() -> str:
+            t = tokens[i[0]]
+            i[0] += 1
+            return t
+
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                signing_secret="test-signing-secret",
+                bot_token=resolver,
+            )
+        )
+
+        # Stub _fetch_slack_file so we can assert which token it received.
+        fetched: list[tuple[str, str]] = []
+
+        async def fake_fetch(url: str, token: str) -> bytes:
+            fetched.append((url, token))
+            return b"bytes"
+
+        adapter._fetch_slack_file = fake_fetch  # type: ignore[method-assign]
+
+        # Build the attachment OUTSIDE any request context (single-workspace
+        # mode: no ctx token to snapshot — the closure must defer to the
+        # resolver at call time).
+        attachment = adapter._create_attachment(self._make_file())
+        assert attachment.fetch_data is not None
+        assert i[0] == 0, "resolver must NOT be invoked at attachment-creation time"
+
+        result = await attachment.fetch_data()
+        assert result == b"bytes"
+        assert i[0] == 1, "resolver must be invoked once at fetch_data() time"
+        assert fetched == [("https://files.slack.com/img.png", "xoxb-att-old")]
+
+        # Second fetch picks up the rotated token.
+        result2 = await attachment.fetch_data()
+        assert result2 == b"bytes"
+        assert i[0] == 2, "resolver must be invoked again on a second fetch (rotation)"
+        assert fetched[-1] == ("https://files.slack.com/img.png", "xoxb-att-new")
+
+    @pytest.mark.asyncio
+    async def test_attachment_fetch_data_uses_snapshot_in_multi_workspace_mode(self):
+        """``fetch_data`` uses the snapshotted per-team token in multi-workspace mode.
+
+        The closure must NOT consult the InstallationStore at fetch time —
+        the per-team token was already captured into the closure when the
+        webhook was being processed.
+        """
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret"))
+        await adapter.initialize(chat)
+
+        await adapter.set_installation(
+            "T_ATT",
+            SlackInstallation(bot_token="xoxb-att-team", bot_user_id="U_ATT", team_name="ATT"),
+        )
+
+        fetched: list[tuple[str, str]] = []
+
+        async def fake_fetch(url: str, token: str) -> bytes:
+            fetched.append((url, token))
+            return b"bytes"
+
+        adapter._fetch_slack_file = fake_fetch  # type: ignore[method-assign]
+
+        # Spy on get_installation — fetch_data must not consult it.
+        get_install_calls: list[str] = []
+        original_get = adapter.get_installation
+
+        async def get_install_spy(team_id: str) -> Any:
+            get_install_calls.append(team_id)
+            return await original_get(team_id)
+
+        adapter.get_installation = get_install_spy  # type: ignore[method-assign]
+
+        # Build the attachment INSIDE the per-team request context so the
+        # snapshot captures the team token.
+        async def build() -> Any:
+            return adapter._create_attachment(self._make_file(), team_id="T_ATT")
+
+        attachment = await adapter.with_bot_token_async("xoxb-att-team", build)
+        assert attachment.fetch_data is not None
+
+        # Now invoke fetch_data OUTSIDE any request context.
+        get_install_calls.clear()
+        result = await attachment.fetch_data()
+        assert result == b"bytes"
+        assert fetched == [("https://files.slack.com/img.png", "xoxb-att-team")], (
+            "fetch_data in multi-workspace mode must use the snapshotted ctx_token captured at attachment-creation time"
+        )
+        assert get_install_calls == [], (
+            "fetch_data must NOT re-consult InstallationStore at fetch time in "
+            f"multi-workspace mode; got {get_install_calls!r}"
+        )
