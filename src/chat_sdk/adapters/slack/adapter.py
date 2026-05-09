@@ -919,6 +919,35 @@ class SlackAdapter:
             if not self._verify_signature(body, timestamp, signature):
                 return {"body": "Invalid signature", "status": 401}
 
+        # URL verification is special: Slack sends a JSON ``url_verification``
+        # ping at app-install / event-subscription time and only expects the
+        # ``challenge`` echo. No token / API call is required — so resolve
+        # the JSON-payload short-circuit BEFORE invoking the bot-token
+        # resolver. A broken or down resolver (secrets manager outage, key
+        # rotation in flight) must NOT prevent URL verification from
+        # succeeding — that would block app installation and re-subscription.
+        # Mirrors upstream parity where ``getToken`` is only called at
+        # per-API-call sites, not at webhook entry.
+        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
+        early_payload: dict[str, Any] | None = None
+        if "application/json" in content_type or (not content_type and body and body.lstrip().startswith(("{", "["))):
+            try:
+                maybe = json.loads(body)
+                if isinstance(maybe, dict):
+                    early_payload = maybe
+            except (json.JSONDecodeError, ValueError):
+                early_payload = None
+            if (
+                early_payload is not None
+                and early_payload.get("type") == "url_verification"
+                and early_payload.get("challenge")
+            ):
+                return {
+                    "body": json.dumps({"challenge": early_payload["challenge"]}),
+                    "status": 200,
+                    "headers": {"Content-Type": "application/json"},
+                }
+
         # Resolve the default bot token via the (possibly async) resolver
         # before dispatching, so synchronous ``_get_token`` call sites
         # downstream see a primed cache. For static-string configs this is
@@ -936,7 +965,6 @@ class SlackAdapter:
                 raise
 
         # Form-urlencoded payloads (interactive + slash commands)
-        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
         if "application/x-www-form-urlencoded" in content_type:
             params = parse_qs(body, keep_blank_values=True)
 

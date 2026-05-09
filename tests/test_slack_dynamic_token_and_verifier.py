@@ -274,6 +274,36 @@ class TestBotTokenResolverConstruction:
             "ensure 'await result' is inside the try block"
         )
 
+    @pytest.mark.asyncio
+    async def test_url_verification_bypasses_broken_resolver(self):
+        """A broken bot-token resolver must not break Slack's URL verification.
+
+        URL verification is a one-time setup ping at app-install / event-
+        subscription time and only needs the ``challenge`` echo back. No API
+        call (and thus no token) is required.
+
+        What to fix if this fails: in
+        ``src/chat_sdk/adapters/slack/adapter.py`` ``handle_webhook``, the
+        ``url_verification`` short-circuit must run BEFORE
+        ``_resolve_default_token()``. Otherwise a flaky/down secret-manager
+        keeps Slack from re-subscribing the webhook, which blocks app
+        installation. Mirrors upstream where ``getToken`` is only called at
+        per-API-call sites, never at webhook entry.
+        """
+
+        def resolver() -> str:
+            raise RuntimeError("secret manager is down")
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        body = json.dumps({"type": "url_verification", "challenge": "abc-123"})
+        response = await adapter.handle_webhook(_signed_request(body, "s"))
+
+        assert response["status"] == 200, (
+            "URL verification must succeed even when the bot-token resolver is broken; "
+            "the resolver call must be deferred until after the url_verification short-circuit"
+        )
+        assert json.loads(response["body"]) == {"challenge": "abc-123"}
+
 
 # ---------------------------------------------------------------------------
 # Constructor: webhook_verifier
