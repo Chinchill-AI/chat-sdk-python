@@ -251,6 +251,11 @@ class SlackAdapter:
         # our minimal schedule mirrors that behavior with explicit caps.
         self._socket_initial_backoff_s = 1.0
         self._socket_max_backoff_s = 30.0
+        # Bound the initial Socket Mode handshake so ``initialize()`` doesn't
+        # block forever if slack_sdk's ``connect()`` hangs (hazard #11).
+        self._socket_connect_timeout_s: float = (
+            config.connect_timeout_s if config.connect_timeout_s is not None else 30.0
+        )
         self._logger: Logger = config.logger or ConsoleLogger("info")
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
@@ -805,6 +810,21 @@ class SlackAdapter:
                 event = json.loads(body)
             except (json.JSONDecodeError, ValueError):
                 return {"body": "Invalid JSON", "status": 400}
+            # Hazard #12 (replay): the shared bearer alone is not enough —
+            # without a freshness check, an old captured forwarded event
+            # could be replayed indefinitely. Mirror the 5-minute window
+            # ``_verify_signature`` enforces on signed webhook traffic.
+            ts_raw = event.get("timestamp") if isinstance(event, dict) else None
+            try:
+                ts_int = int(ts_raw) if ts_raw is not None else None
+            except (TypeError, ValueError):
+                ts_int = None
+            if ts_int is None or abs(int(time.time()) - ts_int) > 300:
+                self._logger.warn(
+                    "Forwarded socket event outside freshness window",
+                    {"timestamp": ts_raw},
+                )
+                return {"body": "Stale socket event", "status": 401}
             await self._handle_forwarded_socket_event(event, options)
             return {"body": "ok", "status": 200}
 
@@ -1370,12 +1390,29 @@ class SlackAdapter:
         # Wait for either the first successful connect or for the loop to
         # exit (which means the very first connect raised). Re-raise so the
         # caller learns about a hard config failure (bad app token, network
-        # offline) instead of silently spinning forever.
+        # offline) instead of silently spinning forever. Bound the wait with
+        # ``connect_timeout_s`` so a hung handshake (slack_sdk's ``connect()``
+        # never returning) doesn't make ``initialize()`` block indefinitely
+        # (hazard #11).
         wait_task = asyncio.create_task(connected.wait())
-        first_done, pending = await asyncio.wait(
-            {wait_task, self._socket_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            first_done, pending = await asyncio.wait_for(
+                asyncio.shield(
+                    asyncio.wait(
+                        {wait_task, self._socket_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                ),
+                timeout=self._socket_connect_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            # Don't leak the wait task or the still-running socket loop —
+            # tear them down before surfacing the failure.
+            wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wait_task
+            await self.stop_socket_mode()
+            raise TimeoutError(f"Slack Socket Mode connect timed out after {self._socket_connect_timeout_s}s") from None
         # Hazard #5: if the loop task finished first, cancel the wait task
         # explicitly so the orphan ``connected.wait()`` doesn't sit forever.
         if wait_task in pending:
@@ -1409,9 +1446,9 @@ class SlackAdapter:
         self._socket_task = None
         if task is not None and not task.done():
             task.cancel()
-            # Cancellation is expected; any other exception was already
-            # logged inside the loop. Don't re-raise on shutdown.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            # Cancellation is expected on shutdown; surface anything else so
+            # surprising loop crashes aren't silently swallowed.
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
         if task is not None:
             self._logger.info("Slack socket mode disconnected")
@@ -1565,7 +1602,7 @@ class SlackAdapter:
                 # ``wait_until`` semantics: caller takes ownership.
                 options.wait_until(cast(Any, coro))
                 return
-            task = asyncio.get_event_loop().create_task(cast(Any, coro))
+            task = asyncio.get_running_loop().create_task(cast(Any, coro))
 
             def _log_exc(t: asyncio.Task[Any]) -> None:
                 if t.cancelled():
@@ -1589,13 +1626,18 @@ class SlackAdapter:
                     {"body_type": type(body).__name__},
                 )
                 return
+            # Match the webhook path's synthesized payload exactly. Upstream
+            # doesn't include ``is_ext_shared_channel`` here, and the webhook
+            # JSON we pass into ``_process_event_payload`` doesn't either —
+            # adding it on the socket path is a quiet socket-vs-webhook
+            # divergence (hazard #7). Keep the keys that flow into
+            # downstream handlers, drop the rest.
             payload: dict[str, Any] = {
                 "type": "event_callback",
                 "event": event,
                 "team_id": body.get("team_id"),
                 "event_id": body.get("event_id"),
                 "event_time": body.get("event_time"),
-                "is_ext_shared_channel": body.get("is_ext_shared_channel"),
             }
             # Multi-workspace: resolve token before dispatch (mirrors webhook
             # path). copy_context() keeps the ContextVar set on tasks spawned
@@ -1670,7 +1712,13 @@ class SlackAdapter:
                     "Error processing socket mode interactive",
                     {"error": str(exc)},
                 )
-                await ack()
+                # Hazard #15 (UX): an empty ack on view_submission silently
+                # closes the modal, so the user has no signal anything went
+                # wrong. Return ``response_action=errors`` so Slack keeps the
+                # modal open with a visible message. Safe for non-modal
+                # interactive types too — Slack ignores the field when the
+                # payload type doesn't expect it.
+                await ack({"response_action": "errors", "errors": {"_": "internal error"}})
                 return
 
             response_body: dict[str, Any] | None = None

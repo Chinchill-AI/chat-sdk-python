@@ -46,12 +46,8 @@ def _ensure_socket_mode_stub() -> None:
 
     sys.modules.setdefault("slack_sdk", ModuleType("slack_sdk"))
     sm_root = sys.modules.setdefault("slack_sdk.socket_mode", ModuleType("slack_sdk.socket_mode"))
-    sm_aio = sys.modules.setdefault(
-        "slack_sdk.socket_mode.aiohttp", ModuleType("slack_sdk.socket_mode.aiohttp")
-    )
-    sm_resp = sys.modules.setdefault(
-        "slack_sdk.socket_mode.response", ModuleType("slack_sdk.socket_mode.response")
-    )
+    sm_aio = sys.modules.setdefault("slack_sdk.socket_mode.aiohttp", ModuleType("slack_sdk.socket_mode.aiohttp"))
+    sm_resp = sys.modules.setdefault("slack_sdk.socket_mode.response", ModuleType("slack_sdk.socket_mode.response"))
 
     if not hasattr(sm_aio, "SocketModeClient"):
 
@@ -88,7 +84,7 @@ def _ensure_socket_mode_stub() -> None:
 
     sm_root.aiohttp = sm_aio  # type: ignore[attr-defined]
     sm_root.response = sm_resp  # type: ignore[attr-defined]
-    setattr(sys.modules["slack_sdk"], "socket_mode", sm_root)
+    sys.modules["slack_sdk"].socket_mode = sm_root  # type: ignore[attr-defined]
 
 
 _ensure_socket_mode_stub()
@@ -275,6 +271,8 @@ class TestForwardedSocketEvents:
         assert result["status"] == 405
 
     async def test_webhook_accepts_valid_socket_token(self):
+        import time as _time
+
         adapter = _make_socket_adapter()
         chat = _make_mock_chat()
         adapter._chat = chat
@@ -295,7 +293,7 @@ class TestForwardedSocketEvents:
                 },
                 "team_id": "T1",
             },
-            "timestamp": 0,
+            "timestamp": int(_time.time()),
         }
         request = _FakeRequest(
             json.dumps(forwarded),
@@ -646,3 +644,257 @@ class TestSocketContextVar:
         assert captured_tokens == ["xoxb-team-1"]
         # And the outer context wasn't polluted.
         assert adapter._request_context.get() is None
+
+    async def test_concurrent_events_for_different_teams_do_not_cross_contaminate(self):
+        """Two concurrent ``_route_socket_event(events_api)`` calls for
+        different teams must not see each other's tokens (hazard #6).
+
+        What to fix if this fails: the events_api branch in
+        ``_route_socket_event`` must use ``contextvars.copy_context()`` (or
+        equivalent isolation) so that a slow handler for team T1 doesn't
+        observe the ContextVar that another concurrent dispatch set for
+        team T2. Direct ``ContextVar.set()`` without isolation will leak
+        across ``asyncio.gather`` task boundaries.
+        """
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                mode="socket",
+                app_token="xapp-1-x",
+                client_id="cid",
+                client_secret="csec",
+            )
+        )
+        chat = _make_mock_chat()
+        adapter._chat = chat
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        # Per-team token lookup. The first lookup awaits long enough for
+        # the second to interleave; if isolation is broken the first will
+        # observe the second's token.
+        async def fake_resolve(team_id: str) -> RequestContext:
+            if team_id == "T1":
+                # Yield so the T2 dispatch can race in and set the
+                # ContextVar before T1's process_message runs.
+                await asyncio.sleep(0.02)
+            return RequestContext(token=f"xoxb-{team_id}")
+
+        adapter._resolve_token_for_team = AsyncMock(  # type: ignore[method-assign]
+            side_effect=fake_resolve
+        )
+
+        observed: dict[str, list[str | None]] = {"T1": [], "T2": []}
+
+        def capture(*args: Any, **kwargs: Any) -> None:
+            ctx = adapter._request_context.get()
+            tok = ctx.token if ctx else None
+            # Map back to the team via the token suffix we constructed.
+            if tok == "xoxb-T1":
+                observed["T1"].append(tok)
+            elif tok == "xoxb-T2":
+                observed["T2"].append(tok)
+            else:
+                observed.setdefault("other", []).append(tok)
+
+        chat.process_message = MagicMock(side_effect=capture)
+        ack = AsyncMock()
+
+        def body_for(team: str) -> dict[str, Any]:
+            return {
+                "team_id": team,
+                "event": {
+                    "type": "message",
+                    "channel": f"C-{team}",
+                    "ts": "1.0",
+                    "user": "U1",
+                    "text": "hi",
+                    "team": team,
+                },
+            }
+
+        # Fire both concurrently.
+        await asyncio.gather(
+            adapter._route_socket_event(body_for("T1"), "events_api", ack),
+            adapter._route_socket_event(body_for("T2"), "events_api", ack),
+        )
+
+        assert observed["T1"] == ["xoxb-T1"], f"T1 saw wrong token(s): {observed}"
+        assert observed["T2"] == ["xoxb-T2"], f"T2 saw wrong token(s): {observed}"
+        # Outer context wasn't polluted by either dispatch.
+        assert adapter._request_context.get() is None
+
+
+# ---------------------------------------------------------------------------
+# Review-finding regression tests (PR #86)
+# ---------------------------------------------------------------------------
+
+
+class TestSocketConnectTimeout:
+    """Regression for review finding #1.
+
+    What to fix if this fails: ``start_socket_mode`` must wrap the wait on
+    the initial connect with ``asyncio.wait_for(..., timeout=...)`` so a
+    hung ``SocketModeClient.connect()`` cannot block ``initialize()``
+    forever (hazard #11). On timeout the loop must be torn down.
+    """
+
+    async def test_hung_connect_raises_timeout_and_cleans_up(self, patched_socket_client):
+        original_connect = _FakeSocketModeClient.connect
+
+        async def hang_forever(self):
+            self.connect_calls += 1
+            # Sleep longer than any reasonable test timeout. The fix should
+            # cancel us via the outer ``asyncio.wait_for``.
+            await asyncio.sleep(60)
+
+        _FakeSocketModeClient.connect = hang_forever  # type: ignore[assignment]
+        try:
+            adapter = _make_socket_adapter()
+            adapter._socket_connect_timeout_s = 0.1
+            adapter._socket_initial_backoff_s = 0.01
+            with pytest.raises(TimeoutError, match="timed out"):
+                await adapter.start_socket_mode()
+            # The teardown path must clear the background task.
+            assert adapter._socket_task is None
+            assert adapter._socket_client is None
+        finally:
+            _FakeSocketModeClient.connect = original_connect  # type: ignore[assignment]
+
+    def test_connect_timeout_default_is_30s(self):
+        """Default surfaces in adapter state.
+
+        What to fix if this fails: ``SlackAdapterConfig.connect_timeout_s``
+        must default to ~30s and propagate into the adapter, otherwise the
+        timeout fix would silently regress to ``None`` / very small values.
+        """
+        adapter = _make_socket_adapter()
+        assert adapter._socket_connect_timeout_s == 30.0
+
+
+class TestForwardedSocketFreshness:
+    """Regression for review finding #2.
+
+    What to fix if this fails: ``handle_webhook`` must reject forwarded
+    socket events whose ``timestamp`` field is outside the 5-minute window
+    (mirroring ``_verify_signature``). Without this an attacker who
+    captures one forwarded payload can replay it indefinitely (hazard #12).
+    """
+
+    async def test_replay_old_event_rejected(self):
+        import time as _time
+
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+        forwarded = {
+            "type": "socket_event",
+            "eventType": "events_api",
+            "body": {"type": "event_callback", "event": {}},
+            "timestamp": int(_time.time()) - 6 * 60,  # 6 minutes old
+        }
+        request = _FakeRequest(
+            json.dumps(forwarded),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "fwd-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+        assert result["status"] == 401, "stale forwarded event must be rejected"
+
+    async def test_missing_timestamp_rejected(self):
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+        forwarded = {
+            "type": "socket_event",
+            "eventType": "events_api",
+            "body": {"type": "event_callback", "event": {}},
+            # No "timestamp" — must not pass freshness check.
+        }
+        request = _FakeRequest(
+            json.dumps(forwarded),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "fwd-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+        assert result["status"] == 401
+
+
+class TestInteractiveDispatchErrorAck:
+    """Regression for review finding #5.
+
+    What to fix if this fails: when ``_dispatch_interactive_payload`` raises
+    in the socket-mode interactive branch, the ack must include
+    ``response_action: errors`` instead of being empty. An empty ack on a
+    ``view_submission`` silently closes the modal — the user gets no signal
+    anything went wrong.
+    """
+
+    async def test_dispatch_exception_acks_with_errors_response_action(self):
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+        # Force the dispatcher to blow up.
+        adapter._dispatch_interactive_payload = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("kaboom")
+        )
+        ack = AsyncMock()
+        payload = {
+            "type": "view_submission",
+            "team": {"id": "T1"},
+            "user": {"id": "U1", "name": "x"},
+            "view": {"id": "V1", "callback_id": "cb", "private_metadata": "", "state": {"values": {}}},
+            "trigger_id": "trig",
+        }
+        await adapter._route_socket_event(payload, "interactive", ack)
+        assert ack.await_count == 1
+        ack_args = ack.call_args
+        assert ack_args.args, "ack must be called with a response payload, not empty"
+        body_arg = ack_args.args[0]
+        assert isinstance(body_arg, dict)
+        assert body_arg.get("response_action") == "errors"
+        assert "errors" in body_arg
+
+
+class TestSocketEventsApiPayloadParity:
+    """Regression for review finding #7.
+
+    What to fix if this fails: the synthesized ``event_callback`` payload
+    in the socket-mode events_api branch must match the webhook path.
+    Adding ``is_ext_shared_channel`` here is a quiet socket-vs-webhook
+    divergence — neither upstream nor the Python webhook path includes it.
+    """
+
+    async def test_synthesized_payload_does_not_include_is_ext_shared_channel(self):
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+
+        # Capture the payload handed to _process_event_payload.
+        captured: list[dict[str, Any]] = []
+
+        def fake_process(payload: dict[str, Any], _options: Any = None) -> None:
+            captured.append(payload)
+
+        adapter._process_event_payload = fake_process  # type: ignore[method-assign]
+        ack = AsyncMock()
+        body = {
+            "team_id": "T1",
+            "event_id": "Ev1",
+            "event_time": 1234,
+            "is_ext_shared_channel": True,  # Should be dropped.
+            "event": {
+                "type": "message",
+                "channel": "C1",
+                "ts": "1.0",
+                "user": "U1",
+                "text": "hi",
+                "team": "T1",
+            },
+        }
+        await adapter._route_socket_event(body, "events_api", ack)
+        assert len(captured) == 1
+        assert "is_ext_shared_channel" not in captured[0]
+        # Sanity: the keys we *do* synthesize are still present.
+        assert captured[0]["type"] == "event_callback"
+        assert captured[0]["team_id"] == "T1"
+        assert captured[0]["event_id"] == "Ev1"
+        assert captured[0]["event_time"] == 1234

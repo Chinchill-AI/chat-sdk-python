@@ -56,6 +56,11 @@ class SlackAdapterConfig:
     # Maximum number of cached AsyncWebClient instances (LRU-bounded).
     # Defaults to 100. Increase for large multi-workspace deployments.
     client_cache_max: int | None = None
+    # Maximum number of seconds to wait for the initial Socket Mode WebSocket
+    # handshake. If the slack_sdk ``connect()`` call hangs (e.g. Slack edge
+    # is degraded), ``start_socket_mode`` raises after this many seconds so
+    # ``initialize()`` doesn't block forever (hazard #11).
+    connect_timeout_s: float = 30.0
     # Override bot username (optional)
     user_name: str | None = None
 
