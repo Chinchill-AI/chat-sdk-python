@@ -1327,9 +1327,7 @@ class TestUnfurlMetadata:
         second = state._cache.get("slack:unfurls:1234567890.111111")
         assert second is not None
         assert second.get("https://b.example.com") is not None
-        assert second.get("https://a.example.com") is None, (
-            "second message_changed must overwrite, not merge"
-        )
+        assert second.get("https://a.example.com") is None, "second message_changed must overwrite, not merge"
         assert second["https://b.example.com"]["title"] == "Second"
 
     def test_extract_links_url_with_open_paren_survives_parser(self):
