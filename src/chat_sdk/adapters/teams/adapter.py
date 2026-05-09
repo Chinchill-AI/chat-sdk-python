@@ -1086,28 +1086,7 @@ class TeamsAdapter:
                 )
 
             chat_id = self._chat_id_from_context(graph_context, base_conversation_id)
-            graph_messages: list[dict[str, Any]]
-            has_more = False
-
-            if direction == "forward":
-                params: dict[str, Any] = {
-                    "$top": limit,
-                    "$orderby": "createdDateTime asc",
-                }
-                if cursor:
-                    params["$filter"] = f"createdDateTime gt {cursor}"
-                graph_messages = await self._graph_list_chat_messages(chat_id, params)
-                has_more = len(graph_messages) >= limit
-            else:
-                params = {
-                    "$top": limit,
-                    "$orderby": "createdDateTime desc",
-                }
-                if cursor:
-                    params["$filter"] = f"createdDateTime lt {cursor}"
-                graph_messages = await self._graph_list_chat_messages(chat_id, params)
-                graph_messages.reverse()
-                has_more = len(graph_messages) >= limit
+            graph_messages, has_more = await self._paginate_graph_chat_messages(chat_id, limit, direction, cursor)
 
             if thread_message_id and not graph_context:
                 graph_messages = [msg for msg in graph_messages if msg.get("id") and msg["id"] >= thread_message_id]
@@ -1210,19 +1189,9 @@ class TeamsAdapter:
                 # chat ID for the opaque Bot Framework conversation ID; no
                 # context (group chat) falls through to the raw ID.
                 chat_id = self._chat_id_from_context(graph_context, base_conversation_id)
-                if direction == "forward":
-                    params = {"$top": limit, "$orderby": "createdDateTime asc"}
-                    if options.cursor:
-                        params["$filter"] = f"createdDateTime gt {options.cursor}"
-                    graph_messages = await self._graph_list_chat_messages(chat_id, params)
-                    has_more = len(graph_messages) >= limit
-                else:
-                    params = {"$top": limit, "$orderby": "createdDateTime desc"}
-                    if options.cursor:
-                        params["$filter"] = f"createdDateTime lt {options.cursor}"
-                    graph_messages = await self._graph_list_chat_messages(chat_id, params)
-                    graph_messages.reverse()
-                    has_more = len(graph_messages) >= limit
+                graph_messages, has_more = await self._paginate_graph_chat_messages(
+                    chat_id, limit, direction, options.cursor
+                )
 
             messages = [self._map_graph_message(msg, channel_id) for msg in graph_messages if msg.get("id")]
 
@@ -1446,6 +1415,28 @@ class TeamsAdapter:
                 raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
             data = await response.json()
             return data.get("value", [])
+
+    async def _paginate_graph_chat_messages(
+        self,
+        chat_id: str,
+        limit: int,
+        direction: str,
+        cursor: str | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Issue a single Graph ``/chats/{chat_id}/messages`` page and report has_more.
+
+        Backward direction reverses the result so callers always see chronological
+        order; cursor filter clause is ``gt`` for forward, ``lt`` for backward.
+        """
+        order_by = "createdDateTime asc" if direction == "forward" else "createdDateTime desc"
+        filter_op = "gt" if direction == "forward" else "lt"
+        params: dict[str, Any] = {"$top": limit, "$orderby": order_by}
+        if cursor:
+            params["$filter"] = f"createdDateTime {filter_op} {cursor}"
+        graph_messages = await self._graph_list_chat_messages(chat_id, params)
+        if direction != "forward":
+            graph_messages.reverse()
+        return graph_messages, len(graph_messages) >= limit
 
     async def _graph_list_channel_messages(
         self,
