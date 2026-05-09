@@ -1314,7 +1314,11 @@ class TestUnfurlMetadata:
         await asyncio.sleep(0)
         first = state._cache.get("slack:unfurls:1234567890.111111")
         assert first is not None
-        assert "https://a.example.com" in first
+        # Use ``.get`` for explicit dict-key membership — avoids tripping
+        # CodeQL's URL-substring-sanitization heuristic which fires on
+        # bare ``url_literal in container`` even when ``container`` is a
+        # dict and ``in`` is a key check, not a substring check.
+        assert first.get("https://a.example.com") is not None
 
         # Second edit caches an unfurl for a DIFFERENT URL (URL_B).
         # If the implementation merged, URL_A would still be in the cache.
@@ -1322,8 +1326,10 @@ class TestUnfurlMetadata:
         await asyncio.sleep(0)
         second = state._cache.get("slack:unfurls:1234567890.111111")
         assert second is not None
-        assert "https://b.example.com" in second
-        assert "https://a.example.com" not in second, "second message_changed must overwrite, not merge"
+        assert second.get("https://b.example.com") is not None
+        assert second.get("https://a.example.com") is None, (
+            "second message_changed must overwrite, not merge"
+        )
         assert second["https://b.example.com"]["title"] == "Second"
 
     def test_extract_links_url_with_open_paren_survives_parser(self):
