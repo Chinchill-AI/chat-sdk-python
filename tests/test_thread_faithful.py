@@ -796,6 +796,7 @@ class TestStreaming:
     @pytest.mark.parametrize(
         ("label", "raw", "expected_team_id"),
         [
+            # Happy paths: each shape resolves to its expected team id.
             ("team_id", {"team_id": "T123", "type": "app_mention"}, "T123"),
             ("team string", {"team": "T234", "type": "message"}, "T234"),
             ("team.id object", {"team": {"id": "T345"}, "type": "block_actions"}, "T345"),
@@ -803,6 +804,40 @@ class TestStreaming:
                 "user.team_id fallback",
                 {"type": "block_actions", "user": {"team_id": "T456"}},
                 "T456",
+            ),
+            # Adversarial fall-throughs — each MUST cascade to the next
+            # resolution step rather than capturing a malformed value.
+            # See docs/SELF_REVIEW.md principle #1 (input sweep).
+            (
+                "team dict missing id falls through to user.team_id",
+                {"team": {"domain": "acme"}, "user": {"team_id": "T567"}},
+                "T567",
+            ),
+            (
+                "empty team_id string falls through to team string",
+                {"team_id": "", "team": "T678"},
+                "T678",
+            ),
+            (
+                "empty team string falls through to team.id object",
+                {"team_id": "", "team": "", "user": {"team_id": "T789"}},
+                "T789",
+            ),
+            # Final-fallback: nothing matches → None propagates as
+            # ``recipient_team_id=None``. The Slack adapter raises a clear
+            # multi-workspace error rather than calling Slack with the
+            # wrong workspace.
+            ("non-dict raw returns None", "not a dict", None),
+            ("empty dict returns None", {}, None),
+            (
+                "non-string user.team_id returns None",
+                {"user": {"team_id": 12345}},
+                None,
+            ),
+            (
+                "team dict with non-string id returns None",
+                {"team": {"id": 999}},
+                None,
             ),
         ],
     )

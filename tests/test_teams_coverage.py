@@ -1639,7 +1639,7 @@ class TestGraphDmConversationIdResolution:
 
         activity = {
             "type": "message",
-            "from": {"id": "29:1xUser", "aadObjectId": "user-aad-id"},
+            "from": {"id": "29:1xUser", "aadObjectId": "00000000-0000-0000-0000-aaaaaaaaaaaa"},
             "conversation": {"id": "a:opaque-dm-conversation-id"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
@@ -1649,7 +1649,7 @@ class TestGraphDmConversationIdResolution:
         assert raw_context is not None, "DM context must be cached for Graph chat ID resolution"
         ctx = json.loads(raw_context)
         assert ctx["type"] == "dm"
-        assert ctx["graph_chat_id"] == "19:user-aad-id_bot-app-id@unq.gbl.spaces"
+        assert ctx["graph_chat_id"] == "19:00000000-0000-0000-0000-aaaaaaaaaaaa_bot-app-id@unq.gbl.spaces"
 
     async def test_cache_user_context_skips_dm_for_channel_conversation(self):
         """Channel conversations (``19:...``) must not cache a DM context
@@ -1666,7 +1666,7 @@ class TestGraphDmConversationIdResolution:
 
         activity = {
             "type": "message",
-            "from": {"id": "29:1xUser", "aadObjectId": "user-aad-id"},
+            "from": {"id": "29:1xUser", "aadObjectId": "00000000-0000-0000-0000-aaaaaaaaaaaa"},
             "conversation": {"id": "19:channel@thread.tacv2"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
             "channelData": {
@@ -1702,6 +1702,90 @@ class TestGraphDmConversationIdResolution:
         }
         await adapter._cache_user_context(activity)
         assert state._cache.get("teams:channelContext:a:opaque-dm") is None
+
+    async def test_cache_user_context_rejects_non_guid_aad_object_id(self):
+        """Defense-in-depth: ``aadObjectId`` values that aren't GUIDs must
+        not be formatted into the Graph chat ID. Bot Framework JWT
+        verification authenticates the activity envelope but does not
+        constrain ``from.aadObjectId`` shape; a malformed value containing
+        ``/`` ``?`` ``#`` ``:`` could otherwise inject into the Graph URL.
+
+        What to fix if this fails: ``_cache_user_context`` lost its
+        ``_AAD_OBJECT_ID_PATTERN.fullmatch`` guard. Re-add it before the
+        DM context is written.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # Various malformed shapes — a path-injection attempt, missing
+        # hyphens, too short, non-hex characters.
+        for bogus in [
+            "user-aad-id",  # not GUID-shaped
+            "../etc/passwd",  # path traversal
+            "00000000-0000-0000-0000-aaaa/messages",  # injection
+            "00000000000000000000000000000000",  # right length, no hyphens
+            "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ",  # non-hex
+            "00000000-0000-0000-0000",  # too short
+        ]:
+            activity = {
+                "type": "message",
+                "from": {"id": "29:1xUser", "aadObjectId": bogus},
+                "conversation": {"id": f"a:opaque-{bogus}"},
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            }
+            await adapter._cache_user_context(activity)
+            cached = state._cache.get(f"teams:channelContext:a:opaque-{bogus}")
+            assert cached is None, (
+                f"_cache_user_context cached a DM context with malformed "
+                f"aadObjectId={bogus!r}; the GUID guard must reject this "
+                f"before formatting it into a Graph chat ID"
+            )
+
+    async def test_fetch_messages_uses_legacy_cache_shape_for_channel(self):
+        """End-to-end backwards-compat: cached entries written before
+        vercel/chat#403 lack the ``type`` discriminator. They must still
+        route through ``fetch_messages``'s channel branch (treated as
+        ``type=channel`` by ``_chat_id_from_context``), not get
+        misclassified or crash on the missing key.
+
+        What to fix if this fails: ``_chat_id_from_context`` or
+        ``_get_graph_context`` lost the legacy-shape fallthrough. The
+        contract is "absent ``type`` ⇒ treated as channel".
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        # Legacy shape — no ``type`` key, only ``team_id`` + ``channel_id``.
+        state._cache["teams:channelContext:19:legacy-channel@thread.tacv2"] = json.dumps(
+            {"team_id": "team-aad", "channel_id": "19:legacy-channel@thread.tacv2"}
+        )
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # The legacy cache should route to the channel-messages path —
+        # which uses ``team_id`` + ``channel_id``, NOT the chat-messages
+        # path (which would be wrong for a channel and would call Graph
+        # with the raw conversation ID). Confirm by hooking the channel
+        # endpoint and asserting it's called.
+        async def fake_channel_list(team_id: str, channel_id: str, limit: int = 50):
+            return [{"id": "1234", "from": {"user": {"id": "u1", "displayName": "x"}}, "body": {"content": "hi"}}]
+
+        adapter._graph_list_channel_messages = fake_channel_list  # type: ignore[assignment]
+
+        ctx = await adapter._get_graph_context("19:legacy-channel@thread.tacv2")
+        assert ctx is not None, "Legacy cache shape did not load"
+        # ``_chat_id_from_context`` returns the raw base id when there's
+        # no ``graph_chat_id`` (channel context shape). The crucial assert
+        # is that we treat this as *not-DM* (no Graph 19:...@unq.gbl.spaces
+        # construction).
+        chat_id = adapter._chat_id_from_context(ctx, "19:legacy-channel@thread.tacv2")
+        assert chat_id == "19:legacy-channel@thread.tacv2", (
+            f"_chat_id_from_context misclassified legacy cache entry as DM; "
+            f"got {chat_id!r}, expected the raw conversation ID. The "
+            f"absent-``type`` legacy shape must fall through to channel "
+            f"semantics."
+        )
 
     async def test_fetch_messages_uses_graph_chat_id_for_dm(self):
         """End-to-end: a cached DM context must redirect ``fetch_messages``

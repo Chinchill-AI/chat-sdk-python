@@ -63,6 +63,11 @@ from chat_sdk.types import (
 
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
 MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
+# AAD object IDs are GUIDs (8-4-4-4-12 hex). Used to gate ``aadObjectId``
+# values from incoming activities before formatting them into Microsoft
+# Graph chat IDs (vercel/chat#403). See ``_cache_user_context`` and
+# ``_chat_id_from_context``.
+_AAD_OBJECT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
 
 # Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
@@ -310,10 +315,13 @@ class TeamsAdapter:
         base_channel_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
 
         if team_aad_group_id and channel_data.get("channel", {}).get("id") and state:
+            # Wire-shape parity with upstream TS (#403): the channel branch
+            # omits the discriminator. ``_chat_id_from_context`` and
+            # ``_get_graph_context`` treat ``type != "dm"`` as channel, so
+            # the missing key is unambiguous.
             context: TeamsChannelContext = {
                 "team_id": team_aad_group_id,
                 "channel_id": channel_data["channel"]["id"],
-                "type": "channel",
             }
             await state.set(f"teams:channelContext:{base_channel_id}", json.dumps(context), ttl)
 
@@ -324,8 +332,21 @@ class TeamsAdapter:
         # ``19:{userAadId}_{botId}@unq.gbl.spaces``. ``aadObjectId`` is
         # only present for real Teams users (not bots), and DM conversation
         # IDs do not start with ``19:`` (channel/group chats do).
+        #
+        # Defense-in-depth: AAD object IDs are GUIDs (8-4-4-4-12 hex). Bot
+        # Framework JWT verification authenticates the activity envelope
+        # but does not constrain ``from.aadObjectId``; a malformed value
+        # could otherwise inject ``/`` / ``?`` / ``#`` into the Graph URL
+        # path and cause a misrouted request. Reject anything that doesn't
+        # match the GUID shape before formatting it into the chat ID.
         aad_object_id = from_user.get("aadObjectId")
-        if aad_object_id and self._app_id and not base_channel_id.startswith("19:") and state:
+        if (
+            aad_object_id
+            and self._app_id
+            and not base_channel_id.startswith("19:")
+            and state
+            and _AAD_OBJECT_ID_PATTERN.fullmatch(aad_object_id)
+        ):
             dm_context: TeamsDmContext = {
                 "graph_chat_id": f"19:{aad_object_id}_{self._app_id}@unq.gbl.spaces",
                 "type": "dm",
