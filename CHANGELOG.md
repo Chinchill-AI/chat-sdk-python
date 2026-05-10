@@ -26,36 +26,36 @@ intended in-flight signal.
 
 #### Core (`packages/chat/` → `src/chat_sdk/`)
 
-- [ ] **`chat.getUser(adapter, userId)`** for cross-platform user lookups (vercel/chat#391, upstream commit `a520797`). Adapter-side: each adapter exposes `getUser`. Touches `chat.py`, `types.py` (`User` type extension), and every adapter (`slack`, `teams`, `gchat`, `telegram`, `discord`, `whatsapp`, `github`, `linear`).
-- [ ] **`ExternalSelect.initial_option` + `option_groups`** (vercel/chat#410, `70281dc`). Type extension in `types.py`; Slack adapter must serialize `option_groups` to Block Kit.
-- [ ] **`thread.post()` streaming options** (vercel/chat#388, `9093292`). New params plumb through `Thread.post` → `chat.py` orchestrator.
-- [ ] **Slack streaming team ID fix for interactive payloads** (vercel/chat#330, `8a0c7b3`). Bug fix in the Slack streaming path; check `adapters/slack/adapter.py` request-context plumbing.
-- [ ] **Bundled guide markdown + templates manifest** (vercel/chat#423, `b0ab804`). Decision: skip or copy `packages/chat/resources/guides/*.md` and `templates.json` verbatim. Probably skip — these are TS-monorepo authoring resources, not runtime behavior.
+- [x] (PR #90) **`chat.getUser(adapter, userId)`** for cross-platform user lookups (vercel/chat#391, upstream commit `a520797`). Adapter-side: each adapter exposes `getUser`. Touches `chat.py`, `types.py` (`User` type extension), and every adapter (`slack`, `teams`, `gchat`, `telegram`, `discord`, `whatsapp`, `github`, `linear`).
+- [x] (PR #84) **`ExternalSelect.initial_option` + `option_groups`** (vercel/chat#410, `70281dc`). Type extension in `types.py`; Slack adapter must serialize `option_groups` to Block Kit.
+- [x] (already merged via PR #74) **`thread.post()` streaming options** (vercel/chat#388, `9093292`). New params plumb through `Thread.post` → `chat.py` orchestrator.
+- [x] (PR #85) **Slack streaming team ID fix for interactive payloads** (vercel/chat#330, `8a0c7b3`). Bug fix in the Slack streaming path; check `adapters/slack/adapter.py` request-context plumbing.
+- [⏭️] (out of scope) **Bundled guide markdown + templates manifest** (vercel/chat#423, `b0ab804`). Decision: skip or copy `packages/chat/resources/guides/*.md` and `templates.json` verbatim. Probably skip — these are TS-monorepo authoring resources, not runtime behavior.
 - [x] **`concurrency.maxConcurrent` honored in `concurrent` strategy** (vercel/chat#419, `d630e6c`). Already addressed in the Python port — see the existing `ConcurrencyConfig.max_concurrent` row in `docs/UPSTREAM_SYNC.md` (we enforce via `asyncio.Semaphore` and reject misconfiguration). Upstream has now caught up; on this sync the divergence row downgrades from "silent correctness bug upstream" to "behavior parity restored".
 
 #### Slack (`packages/adapter-slack/` → `src/chat_sdk/adapters/slack/`)
 
-- [ ] **Slack Socket Mode support** (vercel/chat#162, `7e9d0fc`). Big — adds a persistent WebSocket transport alongside HTTP webhooks. Decision: in scope or follow-up? Mirrors the Discord Gateway gap already documented in non-parity ("HTTP interactions only").
-- [ ] **Dynamic `bot_token` resolver + custom `webhookVerifier`** (vercel/chat#421, `2531e9c`). Multi-workspace pattern; touches `SlackAdapter.__init__` and request handling.
-- [ ] **External-select Block Kit support** (vercel/chat#397, `a179b29`). Pairs with the core `option_groups` change above.
+- [x] (PR #86) **Slack Socket Mode support** (vercel/chat#162, `7e9d0fc`). Big — adds a persistent WebSocket transport alongside HTTP webhooks. Decision: in scope or follow-up? Mirrors the Discord Gateway gap already documented in non-parity ("HTTP interactions only").
+- [x] (PR #87) **Dynamic `bot_token` resolver + custom `webhookVerifier`** (vercel/chat#421, `2531e9c`). Multi-workspace pattern; touches `SlackAdapter.__init__` and request handling.
+- [x] (PR #84) **External-select Block Kit support** (vercel/chat#397, `a179b29`). Pairs with the core `option_groups` change above.
 - [ ] **Native `markdown_text` for outgoing messages** (vercel/chat#440, post-release — Apr 17). NOTE: this commit is post-`f55378a` so technically out of `4.27.0` scope, but listed here because the team often picks up post-release fixes.
-- [ ] **Link-preview unfurl metadata enrichment** (vercel/chat#395, `ded6f78`).
-- [ ] **`@mention` regex preserves email addresses** (vercel/chat#394, `c26ee6c`).
-- [ ] **Guard against empty `threadTs` (`invalid_thread_ts` fix)** (vercel/chat#292, `53c6b68`).
+- [x] (PR #89) **Link-preview unfurl metadata enrichment** (vercel/chat#395, `ded6f78`).
+- [x] (PR #89) **`@mention` regex preserves email addresses** (vercel/chat#394, `c26ee6c`).
+- [x] (PR #89) **Guard against empty `threadTs` (`invalid_thread_ts` fix)** (vercel/chat#292, `53c6b68`).
 
 #### Teams (`packages/adapter-teams/` → `src/chat_sdk/adapters/teams/`)
 
-- [ ] **Native streaming for DMs via `emit`** (vercel/chat#416, `ed46bae`). Currently the Python port falls back to `_fallback_stream` for Teams; native streaming would lift that.
-- [ ] **DM conversation ID resolution for Graph API** (vercel/chat#403, `4c24c94`). Bug fix.
-- [ ] **Teams SDK 2.0.8 + `User-Agent` header** (vercel/chat#415, `885a471`). TS-side dependency bump; Python equivalent is to verify our `botbuilder` pin and propagate `User-Agent` if not already.
+- [x] (PR #88) **Native streaming for DMs via `emit`** (vercel/chat#416, `ed46bae`). Currently the Python port falls back to `_fallback_stream` for Teams; native streaming would lift that.
+- [x] (PR #85) **DM conversation ID resolution for Graph API** (vercel/chat#403, `4c24c94`). Bug fix.
+- [x] **Teams SDK 2.0.8 + `User-Agent` header** (vercel/chat#415, `885a471`). **N/A — JS-only.** Upstream's change bumps the `botbuilder` dependency and flips the bot client header from `X-User-Agent` to `User-Agent: Vercel.ChatSDK`. The Python Teams adapter does not depend on `botbuilder` (uses raw `aiohttp`), so there is no equivalent dependency to bump. The optional `User-Agent` header propagation is a defense-in-depth nice-to-have; documented as a deferred enhancement in `docs/UPSTREAM_SYNC.md` rather than landed in this sync.
 
 #### Telegram
 
-- [ ] **MarkdownV2 rendering fixes** (vercel/chat#407, `b9a1961`). Pairs with the streaming-chunk safety trim in vercel/chat#446 (post-`f55378a`).
+- [x] (PR #89) **MarkdownV2 rendering fixes** (vercel/chat#407, `b9a1961`). Pairs with the streaming-chunk safety trim in vercel/chat#446 (post-`f55378a`).
 
 #### Discord
 
-- [ ] **Don't duplicate text when posting card messages** (vercel/chat#256, `7e5b447`). Confirm Python port's `discord/cards.py` doesn't have the same bug.
+- [x] (PR #89) **Don't duplicate text when posting card messages** (vercel/chat#256, `7e5b447`). Confirm Python port's `discord/cards.py` doesn't have the same bug.
 
 #### Out of scope for this Python port
 

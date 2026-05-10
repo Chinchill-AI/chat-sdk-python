@@ -503,6 +503,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams `dialog_open_timeout_ms` config | Not implemented | Configurable | Low demand |
 | Google Chat file uploads | Ignored in message parse | Supported | API complexity; can add later |
 | Discord Gateway WebSocket | HTTP interactions only | Both HTTP and Gateway | Gateway requires persistent connection |
+| Teams `User-Agent: Vercel.ChatSDK` outbound header | Not set on `aiohttp` calls | Propagated by `botbuilder` 2.0.8 | Python Teams adapter doesn't use `botbuilder` (raw `aiohttp`). Upstream's vercel/chat#415 was a JS-only `botbuilder` SDK bump that flipped `X-User-Agent` → `User-Agent`. No equivalent dependency to bump on the Python side. Setting a `User-Agent` on the ~9 outbound `aiohttp` call sites would be a defense-in-depth nice-to-have; deferred to a follow-up. |
 
 ### Serialization differences
 
