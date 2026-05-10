@@ -435,6 +435,15 @@ class TeamsAdapter:
         # task — the local ``await`` is purely so we know when to reap the
         # session.
         session = _TeamsStreamSession()
+        # Keyed by ``thread_id`` to match upstream ``activeStreams.set(threadId, …)``
+        # in ``packages/chat-teams/src/index.ts``. Safe because the default
+        # per-thread concurrency strategy in ``Chat.handle_incoming_message``
+        # serialises DM handlers for the same thread (overlapping webhooks are
+        # deduped or dropped before they reach a handler, so two ``stream()``
+        # calls cannot share a session). A per-handler ``ContextVar`` would
+        # decouple this from the concurrency strategy but would be a Python-only
+        # divergence — tracked as a follow-up rather than landed inside the
+        # parity sync.
         self._active_streams[thread_id] = session
         loop = asyncio.get_running_loop()
         processing_done: asyncio.Future[None] = loop.create_future()
