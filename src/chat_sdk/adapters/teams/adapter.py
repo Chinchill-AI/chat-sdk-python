@@ -468,12 +468,34 @@ class TeamsAdapter:
             # cannot starve due to a misbehaving caller-supplied hook.
             _resolve_processing(task)
             if upstream_wait_until is not None:
-                upstream_wait_until(task)
+                # Catch synchronous failures in the caller's hook. If we
+                # let it escape, ``Chat.process_message`` propagates the
+                # exception, the outer ``try`` skips ``await processing_done``,
+                # and the ``finally`` tears down the session while the
+                # underlying chat task is still scheduled — handlers that
+                # later call ``thread.stream()`` would then miss native
+                # streaming and fall back to a normal post. Logging keeps
+                # the failure visible without breaking the streaming path.
+                try:
+                    upstream_wait_until(task)
+                except Exception as exc:
+                    self._logger.warn(
+                        "Caller-supplied WebhookOptions.wait_until raised",
+                        {"threadId": thread_id, "error": str(exc)},
+                    )
 
         chained_options = WebhookOptions(wait_until=_chained_wait_until)
 
         try:
             self._chat.process_message(self, thread_id, message, chained_options)
+            # If ``process_message`` returned without invoking
+            # ``wait_until`` synchronously, no chat task was scheduled
+            # (deduped, dropped by the concurrency strategy, or the
+            # message wasn't admitted for handling). Resolve the gate
+            # immediately so ``await processing_done`` doesn't hang
+            # forever — there is no in-flight handler to wait on.
+            if not processing_done.done():
+                processing_done.set_result(None)
             try:
                 await processing_done
             except asyncio.CancelledError:

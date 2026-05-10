@@ -540,7 +540,79 @@ class TestHandleMessageActivityLifecycle:
     """Verify the message-activity → process_message → stream → close flow."""
 
     @pytest.mark.asyncio
-    async def test_dm_message_registers_session_and_closes_after_processing(self):
+    async def test_caller_wait_until_raise_does_not_kill_native_streaming(self):
+        """A caller-supplied ``WebhookOptions.wait_until`` that raises must
+        NOT tear down the DM streaming session before the chat task runs.
+
+        What to fix if this fails: in
+        ``src/chat_sdk/adapters/teams/adapter.py`` ``_chained_wait_until``,
+        the call to the upstream ``wait_until`` must be wrapped in
+        ``try/except`` (and logged). Otherwise the synchronous raise
+        escapes through ``Chat.process_message``, the outer ``try`` skips
+        ``await processing_done``, and the ``finally`` removes the session
+        while the chat task is still scheduled. The handler's later
+        ``thread.stream()`` call would then miss native streaming and
+        fall back to a normal post.
+        """
+        adapter = _make_adapter()
+        adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
+
+        tid = _dm_thread_id(adapter)
+
+        # Build a chat that schedules the streaming task AND invokes
+        # a deliberately-raising upstream wait_until.
+        chat = MagicMock()
+        chat.get_state = MagicMock(return_value=None)
+        stream_calls: list[str] = []
+
+        def process_message(adapter_arg, thread_id, message, options):
+            async def _do_stream():
+                async def gen():
+                    yield "hi"
+
+                # Snapshot whether native streaming is still wired up at
+                # the moment the chat task runs.
+                stream_calls.append(
+                    "native" if thread_id in adapter_arg._active_streams else "fallback"
+                )
+                await adapter_arg.stream(thread_id, gen())
+
+            task = asyncio.get_running_loop().create_task(_do_stream())
+            # Caller-supplied wait_until raises synchronously. The chained
+            # wrapper must swallow this so processing_done still resolves.
+            options.wait_until(task)
+
+        chat.process_message = process_message
+        adapter._chat = chat
+
+        # Inject a raising upstream wait_until via WebhookOptions.
+        from chat_sdk.types import WebhookOptions
+
+        def raising_wait_until(_task: Any) -> None:
+            raise RuntimeError("caller wait_until exploded")
+
+        upstream_options = WebhookOptions(wait_until=raising_wait_until)
+
+        activity = {
+            "type": "message",
+            "id": "incoming-1",
+            "text": "user said something",
+            "from": {"id": "user-1", "name": "User One"},
+            "conversation": {"id": "a:1Abc-DM-conversation-id"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+
+        # Should NOT raise — the chained wrapper logs and continues.
+        await adapter._handle_message_activity(activity, upstream_options)
+
+        # The streaming task ran while the session was still registered.
+        assert stream_calls == ["native"], (
+            "Caller wait_until raise tore down the session before the chat "
+            "task ran; the handler fell back to a normal post instead of "
+            "native Teams streaming"
+        )
+        # Session was cleaned up after the task finished.
+        assert tid not in adapter._active_streams
         """A DM message activity registers a session, awaits processing, then drops it."""
         adapter = _make_adapter()
         adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
