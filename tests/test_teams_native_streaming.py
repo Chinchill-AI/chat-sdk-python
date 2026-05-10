@@ -572,9 +572,7 @@ class TestHandleMessageActivityLifecycle:
 
                 # Snapshot whether native streaming is still wired up at
                 # the moment the chat task runs.
-                stream_calls.append(
-                    "native" if thread_id in adapter_arg._active_streams else "fallback"
-                )
+                stream_calls.append("native" if thread_id in adapter_arg._active_streams else "fallback")
                 await adapter_arg.stream(thread_id, gen())
 
             task = asyncio.get_running_loop().create_task(_do_stream())
