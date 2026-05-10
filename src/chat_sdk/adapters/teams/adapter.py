@@ -458,8 +458,15 @@ class TeamsAdapter:
                 processing_done.set_result(None)
 
         upstream_wait_until = options.wait_until if options is not None else None
+        # Track whether the chained wait_until fired synchronously during
+        # ``process_message``. Used below to detect deduped/dropped
+        # messages where no chat task was scheduled and we'd otherwise
+        # hang on ``await processing_done``.
+        wait_until_invoked = False
 
         def _chained_wait_until(task: Awaitable[Any]) -> None:
+            nonlocal wait_until_invoked
+            wait_until_invoked = True
             # Resolve our own gate FIRST, before invoking the upstream
             # ``wait_until`` callback. This way, even if the upstream
             # callback raises, blocks, or never fires, ``processing_done``
@@ -494,7 +501,11 @@ class TeamsAdapter:
             # message wasn't admitted for handling). Resolve the gate
             # immediately so ``await processing_done`` doesn't hang
             # forever — there is no in-flight handler to wait on.
-            if not processing_done.done():
+            # Note: we check ``wait_until_invoked`` rather than
+            # ``processing_done.done()`` because the latter is set via
+            # an ``add_done_callback`` on task COMPLETION; the task is
+            # scheduled but has not run yet at this point.
+            if not wait_until_invoked and not processing_done.done():
                 processing_done.set_result(None)
             try:
                 await processing_done
