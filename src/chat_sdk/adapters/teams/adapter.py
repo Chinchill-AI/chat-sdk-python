@@ -1141,16 +1141,22 @@ class TeamsAdapter:
                 if not text:
                     continue
 
-                accumulated += text
+                # Build a CANDIDATE accumulated value — only commit to
+                # ``accumulated`` after a successful ``_teams_send``. If the
+                # send raises (429, network error, etc.) we treat it as a
+                # soft cancel below; the partial ``RawMessage`` returned to
+                # the caller and ``session._text`` (which feeds the final
+                # close-activity) must NOT contain text Teams rejected.
+                candidate_accumulated = accumulated + text
                 # Emit each chunk as an incremental typing activity. We send
                 # the cumulative text (not deltas) — Teams clients render the
                 # latest text on every streaming activity. Matches upstream's
                 # ``stream.emit(text)`` semantics where the SDK accumulates
                 # under the hood and ships the latest snapshot.
-                session.sequence += 1
+                next_sequence = session.sequence + 1
                 channel_data: dict[str, Any] = {
                     "streamType": _STREAM_TYPE_STREAMING,
-                    "streamSequence": session.sequence,
+                    "streamSequence": next_sequence,
                 }
                 # Hazard #7 — only include ``streamId`` once the server has
                 # assigned one. Sending ``"streamId": None`` on the first
@@ -1160,13 +1166,13 @@ class TeamsAdapter:
 
                 activity_payload: dict[str, Any] = {
                     "type": "typing",
-                    "text": accumulated,
+                    "text": candidate_accumulated,
                     "channelData": channel_data,
                     "entities": [
                         {
                             "type": "streaminfo",
                             "streamType": _STREAM_TYPE_STREAMING,
-                            "streamSequence": session.sequence,
+                            "streamSequence": next_sequence,
                         }
                     ],
                 }
@@ -1177,15 +1183,21 @@ class TeamsAdapter:
                     # 429 mid-stream is the most common transient — treat
                     # any send failure as a soft cancel: stop emitting,
                     # leave the session canceled so close() won't try to
-                    # finalize, and log. The caller still gets a
-                    # RawMessage with whatever text was already accepted
-                    # so SentMessage history is consistent.
+                    # finalize, and log. ``accumulated`` and
+                    # ``session.sequence`` are NOT updated, so the partial
+                    # RawMessage returned to the caller (and the final
+                    # close activity, if any) only carry text Teams
+                    # actually accepted.
                     self._logger.warn(
                         "Teams stream emit failed; canceling stream",
                         {"threadId": thread_id, "error": str(exc)},
                     )
                     session.cancel()
                     break
+
+                # Send succeeded — commit the accumulated state.
+                accumulated = candidate_accumulated
+                session.sequence = next_sequence
 
                 if session.stream_id is None:
                     chunk_id = result.get("id") or ""

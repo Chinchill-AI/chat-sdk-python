@@ -394,7 +394,17 @@ class TestStreamErrors:
 
     @pytest.mark.asyncio
     async def test_emit_send_failure_cancels_session(self):
-        """A 429 / network error mid-stream cancels the session, no exception."""
+        """A 429 / network error mid-stream cancels the session, no exception.
+
+        What to fix if this fails: ``_stream_via_emit`` must update
+        ``accumulated`` ONLY after a successful ``_teams_send``. If the send
+        raises, ``accumulated`` (and the partial ``RawMessage`` returned to
+        the caller + ``session._text`` feeding the final close-activity)
+        must NOT contain the rejected chunk's text — Teams never displayed
+        it to the user. See ``src/chat_sdk/adapters/teams/adapter.py``
+        around line 1144 (build ``candidate_accumulated`` first, commit
+        only on success).
+        """
         adapter = _make_adapter()
         adapter._teams_send = AsyncMock(
             side_effect=[
@@ -416,9 +426,18 @@ class TestStreamErrors:
         assert session.canceled is True
         # Two attempted sends (first ok, second failed); no third.
         assert adapter._teams_send.await_count == 2
-        # RawMessage carries the accumulated text including the failed-send chunk
-        # (which the user already saw rendered locally).
-        assert result.raw["text"] == "helloworld"
+        # The rejected "world" chunk MUST NOT appear in the partial
+        # RawMessage. Teams never accepted it, so SentMessage history must
+        # match what the user actually saw.
+        assert result.raw["text"] == "hello", (
+            "Partial RawMessage on send failure must contain only "
+            "successfully-sent text. Found 'world' (rejected by Teams) "
+            "in the result, indicating accumulated was updated before "
+            "the send confirmed."
+        )
+        # session.sequence stays at 1 (first send incremented it; second
+        # didn't because it failed before commit).
+        assert session.sequence == 1
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_and_marks_session_canceled(self):
