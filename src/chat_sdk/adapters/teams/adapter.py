@@ -1184,11 +1184,12 @@ class TeamsAdapter:
                     continue
 
                 # Build a CANDIDATE accumulated value — only commit to
-                # ``accumulated`` after a successful ``_teams_send``. If the
-                # send raises (429, network error, etc.) we treat it as a
-                # soft cancel below; the partial ``RawMessage`` returned to
-                # the caller and ``session._text`` (which feeds the final
-                # close-activity) must NOT contain text Teams rejected.
+                # ``accumulated`` after a successful ``_teams_send``. The
+                # except below re-raises, so this matters mostly for any
+                # callers introspecting state on a raised stream (and for
+                # symmetry with ``session.sequence`` which is committed in
+                # the same step): neither buffer is left holding text Teams
+                # never accepted.
                 candidate_accumulated = accumulated + text
                 # Emit each chunk as an incremental typing activity. We send
                 # the cumulative text (not deltas) — Teams clients render the
@@ -1222,20 +1223,23 @@ class TeamsAdapter:
                 try:
                     result = await self._teams_send(decoded, activity_payload)
                 except Exception as exc:
-                    # 429 mid-stream is the most common transient — treat
-                    # any send failure as a soft cancel: stop emitting,
-                    # leave the session canceled so close() won't try to
-                    # finalize, and log. ``accumulated`` and
-                    # ``session.sequence`` are NOT updated, so the partial
-                    # RawMessage returned to the caller (and the final
-                    # close activity, if any) only carry text Teams
-                    # actually accepted.
+                    # Propagate the send failure to the caller. The outer
+                    # ``Thread.stream`` accumulates each chunk in its own
+                    # local buffer BEFORE yielding to the adapter; if we
+                    # swallowed the exception here, that outer buffer would
+                    # be used as the SentMessage body / message-history
+                    # entry even though Teams never accepted the chunk.
+                    # Raising propagates through ``_wrapped_stream`` and
+                    # short-circuits the post-stream history append so the
+                    # SDK's record matches what the user actually saw.
+                    # Still cancel the session so the close path doesn't
+                    # post a final activity, and log for diagnostics.
                     self._logger.warn(
                         "Teams stream emit failed; canceling stream",
                         {"threadId": thread_id, "error": str(exc)},
                     )
                     session.cancel()
-                    break
+                    raise
 
                 # Send succeeded — commit the accumulated state.
                 accumulated = candidate_accumulated
