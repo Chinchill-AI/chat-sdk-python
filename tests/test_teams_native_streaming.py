@@ -604,6 +604,9 @@ class TestHandleMessageActivityLifecycle:
         )
         # Session was cleaned up after the task finished.
         assert tid not in adapter._active_streams
+
+    @pytest.mark.asyncio
+    async def test_dm_message_activity_registers_session_and_finalizes(self):
         """A DM message activity registers a session, awaits processing, then drops it."""
         adapter = _make_adapter()
         adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
@@ -691,8 +694,16 @@ class TestHandleMessageActivityLifecycle:
         assert adapter._active_streams == {}
 
     @pytest.mark.asyncio
-    async def test_handler_exception_still_drops_session_and_closes(self):
-        """A failing handler doesn't leak the session — finally always cleans up."""
+    async def test_handler_exception_after_partial_stream_drops_session_and_closes(self):
+        """A handler that raises AFTER streaming still ships the final close
+        activity and drops the session.
+
+        Streams one chunk, then raises. The session must be removed from the
+        registry, and ``_close_stream_session`` must still have shipped a
+        final ``message`` activity (``streamType: "final"``) carrying the
+        text the user already saw — otherwise the Teams streaming UI keeps
+        spinning until Teams times the session out client-side.
+        """
         adapter = _make_adapter()
         adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
 
@@ -702,10 +713,14 @@ class TestHandleMessageActivityLifecycle:
         chat.get_state = MagicMock(return_value=None)
 
         def process_message(adapter_arg, thread_id, message, options):
-            async def _failing():
+            async def _stream_then_fail():
+                async def gen():
+                    yield "partial"
+
+                await adapter_arg.stream(thread_id, gen())
                 raise RuntimeError("handler boom")
 
-            task = asyncio.get_running_loop().create_task(_failing())
+            task = asyncio.get_running_loop().create_task(_stream_then_fail())
             options.wait_until(task)
 
         chat.process_message = process_message
@@ -720,10 +735,25 @@ class TestHandleMessageActivityLifecycle:
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
 
-        # Exception is swallowed by the chat's task error path; what we
-        # care about here is no leaked session.
         await adapter._handle_message_activity(activity)
+
+        # Registry was cleaned up.
         assert tid not in adapter._active_streams
+        # And the close path actually fired: typing chunk + final message,
+        # in that order. Without the final message the Teams streaming UI
+        # would keep spinning until Teams times the session out.
+        send_payloads = [c.args[1] for c in adapter._teams_send.await_args_list]
+        types = [p["type"] for p in send_payloads]
+        assert "typing" in types, "Streaming chunk before the raise was never sent"
+        assert "message" in types, (
+            "Final close activity was not sent after the handler raised — "
+            "_close_stream_session must run from the adapter's finally even "
+            "when the chat task raised"
+        )
+        final_payload = next(p for p in send_payloads if p["type"] == "message")
+        assert final_payload["channelData"]["streamType"] == _STREAM_TYPE_FINAL
+        # And the final activity carries the text the user actually saw.
+        assert final_payload["text"] == "partial"
 
 
 # ---------------------------------------------------------------------------
