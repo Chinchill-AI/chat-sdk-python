@@ -102,6 +102,8 @@ def _modal_child_to_block(child: ModalChild) -> SlackBlock:
         return _text_input_to_block(child)  # type: ignore[arg-type]
     if child_type == "select":
         return _select_to_block(child)  # type: ignore[arg-type]
+    if child_type == "external_select":
+        return _external_select_to_block(child)  # type: ignore[arg-type]
     if child_type == "radio_select":
         return _radio_select_to_block(child)  # type: ignore[arg-type]
     if child_type == "text":
@@ -169,6 +171,58 @@ def _select_to_block(select: dict[str, Any]) -> SlackBlock:
         initial_opt = next((o for o in options if o["value"] == initial_option), None)
         if initial_opt:
             element["initial_option"] = initial_opt
+
+    return {
+        "type": "input",
+        "block_id": select.get("id", ""),
+        "optional": select.get("optional", False),
+        "label": {"type": "plain_text", "text": select.get("label", "")},
+        "element": element,
+    }
+
+
+def _external_select_to_block(select: dict[str, Any]) -> SlackBlock:
+    """Convert an :class:`ExternalSelectElement` to a Slack input block with external_select.
+
+    Mirrors upstream ``externalSelectToBlock``. Options are loaded at runtime
+    by an ``onOptionsLoad`` handler — this just emits the placeholder element.
+    Optional fields (``placeholder``, ``min_query_length``, ``initial_option``)
+    are omitted from the output when not set, matching upstream behavior.
+    """
+    element: dict[str, Any] = {
+        "type": "external_select",
+        "action_id": select.get("id", ""),
+    }
+
+    placeholder = select.get("placeholder")
+    if placeholder:
+        element["placeholder"] = {"type": "plain_text", "text": placeholder}
+
+    min_query_length = select.get("min_query_length")
+    # Use ``is not None`` (hazard #1): ``0`` is a valid Slack value meaning
+    # "fire on every keystroke" and must not silently fall back to omitting
+    # the key (which would default to Slack's 3-character minimum).
+    if min_query_length is not None:
+        element["min_query_length"] = min_query_length
+
+    initial_option = select.get("initial_option")
+    if initial_option is not None:
+        # Hazard #1: ``is not None`` (not truthiness) so a hand-constructed
+        # empty dict ``{}`` doesn't silently render as no initial_option,
+        # matching the TS ``if (select.initialOption)`` semantics where
+        # ``{}`` is truthy. Also keeps consistency with the
+        # ``min_query_length is not None`` check above.
+        # Unlike static select, ``initial_option`` is the full
+        # ``{label, value}`` object — the loader hasn't run yet so a value
+        # string would be ambiguous. Mirrors selectOptionToSlackOption.
+        slack_initial: dict[str, Any] = {
+            "text": {"type": "plain_text", "text": initial_option.get("label", "")},
+            "value": initial_option.get("value", ""),
+        }
+        desc = initial_option.get("description")
+        if desc:
+            slack_initial["description"] = {"type": "plain_text", "text": desc}
+        element["initial_option"] = slack_initial
 
     return {
         "type": "input",
