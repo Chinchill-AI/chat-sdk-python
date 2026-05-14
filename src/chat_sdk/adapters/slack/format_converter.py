@@ -200,7 +200,7 @@ class SlackFormatConverter(BaseFormatConverter):
 
     def _convert_mentions_to_slack(self, text: str) -> str:
         """Convert @mentions to Slack format: @name -> <@name>."""
-        return re.sub(r"(?<!<)@(\w+)", r"<@\1>", text)
+        return re.sub(r"(?<![\w<])@(\w+)", r"<@\1>", text)
 
     def _node_to_mrkdwn(self, node: Content) -> str:
         """Convert a single AST node to Slack mrkdwn."""
@@ -215,7 +215,7 @@ class SlackFormatConverter(BaseFormatConverter):
 
         if node_type == "text":
             value = node.get("value", "")
-            return re.sub(r"(?<!<)@(\w+)", r"<@\1>", value)
+            return re.sub(r"(?<![\w<])@(\w+)", r"<@\1>", value)
 
         if node_type == "strong":
             content = "".join(self._node_to_mrkdwn(c) for c in children)
