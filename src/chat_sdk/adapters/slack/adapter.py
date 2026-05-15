@@ -252,10 +252,10 @@ class SlackAdapter:
         self._socket_initial_backoff_s = 1.0
         self._socket_max_backoff_s = 30.0
         # Bound the initial Socket Mode handshake so ``initialize()`` doesn't
-        # block forever if slack_sdk's ``connect()`` hangs (hazard #11).
-        self._socket_connect_timeout_s: float = (
-            config.connect_timeout_s if config.connect_timeout_s is not None else 30.0
-        )
+        # block forever if slack_sdk's ``connect()`` hangs (hazard #11). The
+        # config field is typed ``float`` with a 30s default, so this is just
+        # a read.
+        self._socket_connect_timeout_s: float = config.connect_timeout_s
         self._logger: Logger = config.logger or ConsoleLogger("info")
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
@@ -964,7 +964,11 @@ class SlackAdapter:
 
         event: dict[str, Any] = payload["event"]
 
-        # Track external/shared channel status
+        # Track external/shared channel status. Note: socket-mode payloads
+        # synthesized in ``_route_socket_event`` never carry this field, which
+        # mirrors upstream's ``routeSocketEvent`` shape. Socket-mode adapters
+        # therefore won't populate ``_external_channels`` from this path —
+        # documented as a known divergence in ``docs/UPSTREAM_SYNC.md``.
         if payload.get("is_ext_shared_channel"):
             channel_id = event.get("channel") or (event.get("item", {}).get("channel") if "item" in event else None)
             if channel_id:
@@ -1405,6 +1409,12 @@ class SlackAdapter:
         # (hazard #11).
         wait_task = asyncio.create_task(connected.wait())
         try:
+            # ``shield`` keeps the inner ``asyncio.wait`` alive when
+            # ``wait_for`` times out, so we can deterministically tear
+            # ``wait_task`` and ``_socket_task`` down ourselves in the
+            # except branch. Both tasks are cancelled there (``wait_task``
+            # directly, ``_socket_task`` via ``stop_socket_mode``), so the
+            # shielded inner wait always resolves shortly after — no orphan.
             first_done, pending = await asyncio.wait_for(
                 asyncio.shield(
                     asyncio.wait(
@@ -1674,6 +1684,11 @@ class SlackAdapter:
             return
 
         if event_type == "slash_commands":
+            # Slash responses are out-of-band via ``response_url`` (Slack's
+            # delayed-response pattern), not the WebSocket ack. The empty ack
+            # here just tells Slack we received the command; the body of the
+            # reply flows through ``_handle_slash_command`` posting to the
+            # response_url. Matches upstream's `routeSocketEvent`.
             await ack()
             # slash_commands payload is a flat dict mirroring the
             # form-urlencoded fields; convert to the parse_qs shape that
