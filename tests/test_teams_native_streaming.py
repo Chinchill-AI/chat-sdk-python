@@ -256,16 +256,22 @@ class TestNativeStreamingThrottle:
     """
 
     @pytest.mark.asyncio
-    async def test_chunks_within_throttle_interval_are_coalesced(self):
-        """Multiple chunks arriving in the same window collapse to one emit.
+    async def test_intermediate_chunks_within_window_are_coalesced(self):
+        """Mid-stream chunks in the same throttle window collapse to one emit.
 
         Without coalescing, a typical LLM token stream (10+ tokens/s) would
         rate-limit on the Bot Framework streaming endpoint within the
         first second and the response would be cancelled mid-flight.
+
+        Two sends total: the first chunk's intermediate emit + the
+        end-of-stream flush that ships everything else (see
+        ``test_buffered_text_flushed_at_end_of_stream`` for why the
+        flush exists).
         """
         # ``clock_step_ms=0`` means every clock check returns the same
         # value, so every chunk after the first lands inside the throttle
-        # window. Only the first chunk should emit.
+        # window. Only the first chunk emits intermediately; the rest
+        # ride out in the end-of-stream flush.
         adapter = _make_adapter(clock_step_ms=0.0)
         adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
         tid = _dm_thread_id(adapter)
@@ -280,21 +286,22 @@ class TestNativeStreamingThrottle:
 
         result = await adapter._stream_via_emit(tid, text_gen(), session)
 
-        # Only one ``typing`` activity actually went out.
-        assert adapter._teams_send.await_count == 1, (
-            "Coalescing failed — every chunk emitted its own activity. "
-            "Real LLM streams will 429 the Bot Framework streaming "
-            "endpoint without this throttle."
+        # Two ``typing`` activities: the first chunk's intermediate emit
+        # plus the end-of-stream flush. The middle two chunks did not
+        # each get their own emit — they were coalesced.
+        assert adapter._teams_send.await_count == 2, (
+            "Throttle should coalesce intermediate chunks within the same window. "
+            "Without this, real LLM streams (10+ tokens/s) would 429 the Bot "
+            "Framework streaming endpoint within the first second."
         )
-        # The single emit carried only the first chunk's text — the
-        # later chunks were buffered for the next eligible emit, which
-        # never came because the iterator ended.
-        emitted_text = adapter._teams_send.await_args_list[0].args[1]["text"]
-        assert emitted_text == "Hel"
-        # But the full cumulative text is preserved in the session for
-        # the close path to ship in the final ``message`` activity, so
-        # the user never loses content — they just see fewer
-        # intermediate updates.
+        payloads = [c.args[1] for c in adapter._teams_send.await_args_list]
+        # Initial intermediate emit: just the first chunk's text.
+        assert payloads[0]["text"] == "Hel"
+        # End-of-stream flush: the full cumulative text.
+        assert payloads[1]["text"] == "Hello world!"
+        # Both are streaming activities (not the final ``message``).
+        assert payloads[0]["type"] == "typing"
+        assert payloads[1]["type"] == "typing"
         assert session.text == "Hello world!"
         assert result.raw["text"] == "Hello world!"
 
@@ -356,14 +363,144 @@ class TestNativeStreamingThrottle:
         )
 
     @pytest.mark.asyncio
-    async def test_coalesced_text_ships_in_final_close_activity(self):
-        """Even when an emit gets coalesced, the close path ships the full text.
+    async def test_buffered_text_flushed_at_end_of_stream(self):
+        """End-of-stream flush guarantees Teams accepted every byte before return.
 
-        Regression for the worry that throttling could drop content:
-        the iterator might end inside a throttle window, leaving text
-        that was never sent in an intermediate ``typing`` activity. The
-        final ``message`` from ``_close_stream_session`` always carries
-        ``session.text``, which holds every chunk seen — coalesced or not.
+        **What this prevents (Codex P2):** without the flush, chunks coalesced
+        in a throttle window would only ship in the close-path ``message``
+        activity — and if THAT send fails (429, network blip), ``Thread.stream``
+        would already have built a ``SentMessage`` from this method's return
+        value containing text Teams never accepted. The chat handler returns
+        and ``SentMessage`` is created BEFORE the close runs from the
+        handler's finally block, so a swallowed close failure produces a
+        message-history entry the user never saw.
+
+        With the flush, ``accumulated`` is confirmed-accepted via a forced
+        ``typing`` emit before ``_stream_via_emit`` returns, so the
+        ``SentMessage`` matches reality even if the close fails.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "Hello"
+            yield " coalesced"
+            yield " world"
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Two typing sends: the first chunk + the end-of-stream flush.
+        assert adapter._teams_send.await_count == 2
+        payloads = [c.args[1] for c in adapter._teams_send.await_args_list]
+        assert payloads[0]["text"] == "Hello"
+        assert payloads[1]["text"] == "Hello coalesced world", (
+            "End-of-stream flush must carry the full accumulated text. "
+            "Without this, Thread.stream would record a SentMessage with "
+            "text Teams never accepted on a close-path send failure."
+        )
+        # Both are streaming typing activities, sequence increments.
+        assert payloads[0]["channelData"]["streamSequence"] == 1
+        assert payloads[1]["channelData"]["streamSequence"] == 2
+        # The flush is what Thread.stream's SentMessage will be built from.
+        assert result.raw["text"] == "Hello coalesced world"
+        assert session.text == "Hello coalesced world"
+
+    @pytest.mark.asyncio
+    async def test_flush_failure_propagates_and_cancels_session(self):
+        """If the end-of-stream flush fails, re-raise — same shape as in-loop emits.
+
+        A close-path failure is now logged at warn (the user already saw
+        the text via the flush), but a flush failure means buffered text
+        was never accepted by Teams. Swallowing it would let
+        ``Thread.stream`` record the buffered text in ``SentMessage`` /
+        ``_message_history`` even though the user never saw it. Re-raise
+        so the outer ``Thread.stream`` short-circuits the history append.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(
+            side_effect=[
+                {"id": "first-id"},  # initial chunk emit succeeds
+                RuntimeError("429 on flush"),  # end-of-stream flush fails
+            ]
+        )
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "first"
+            yield " buffered"
+
+        with pytest.raises(RuntimeError, match="429 on flush"):
+            await adapter._stream_via_emit(tid, text_gen(), session)
+        # Session canceled so the close path skips its final-message activity.
+        assert session.canceled is True
+        # Two attempted sends: the first chunk + the flush attempt.
+        assert adapter._teams_send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_flush_when_iterator_ended_at_window_boundary(self):
+        """No redundant flush when the last chunk already triggered an emit.
+
+        Regression: the flush should ONLY run when there's buffered text
+        that hasn't been emitted. If every chunk landed beyond the
+        throttle window (each got its own emit), there's nothing to
+        flush and we shouldn't add a redundant duplicate-text send.
+        """
+        adapter = _make_adapter(clock_step_ms=2000.0)
+        adapter._teams_send = AsyncMock(side_effect=[{"id": "first"}, {"id": "ignored"}])
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "one "
+            yield "two"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+        # Exactly two sends — one per chunk. No flush because each chunk
+        # was already emitted intermediately.
+        assert adapter._teams_send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_flush_after_session_canceled_mid_stream(self):
+        """Mid-stream cancellation skips the end-of-stream flush.
+
+        ``session.cancel()`` may be set by a user-initiated abort or by
+        an upstream supervisor; either way, we shouldn't ship buffered
+        text the user explicitly canceled out of.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "first"
+            session.cancel()
+            # These two are buffered (within window) but session is now
+            # canceled — the flush should NOT ship them.
+            yield " buffered"
+            yield " more"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+        # Only the pre-cancel emit. No flush of buffered text since
+        # session.canceled is True at end-of-loop.
+        assert adapter._teams_send.await_count == 1
+        assert adapter._teams_send.await_args_list[0].args[1]["text"] == "first"
+
+    @pytest.mark.asyncio
+    async def test_close_path_final_message_carries_full_accumulated_text(self):
+        """The close-path final ``message`` activity carries the full text.
+
+        This is what switches the Teams streaming UI from typing indicator
+        to message bubble. After the end-of-stream flush, this text is
+        redundant content-wise (already confirmed via the flush typing
+        emit), but the activity-type change is what the client UI needs.
         """
         adapter = _make_adapter(clock_step_ms=0.0)
         adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
@@ -377,15 +514,18 @@ class TestNativeStreamingThrottle:
             yield " world"
 
         await adapter._stream_via_emit(tid, text_gen(), session)
-        # Only the first chunk emitted as ``typing`` (the rest fell in
-        # the same window and got buffered).
-        assert adapter._teams_send.await_count == 1
+        # Two typing sends so far (initial + end-of-stream flush).
+        assert adapter._teams_send.await_count == 2
         assert adapter._teams_send.await_args_list[0].args[1]["text"] == "Hello"
+        assert adapter._teams_send.await_args_list[1].args[1]["text"] == "Hello coalesced world"
 
-        # Now close: the final ``message`` activity carries the FULL
-        # accumulated text — buffered chunks are not lost.
+        # Now close: the final ``message`` activity carries the full
+        # accumulated text — switching the streaming UI from typing
+        # indicator to message bubble. Index [2] because the flush
+        # already emitted at index [1].
         await adapter._close_stream_session(tid, session)
-        final_payload = adapter._teams_send.await_args_list[1].args[1]
+        assert adapter._teams_send.await_count == 3
+        final_payload = adapter._teams_send.await_args_list[2].args[1]
         assert final_payload["type"] == "message"
         assert final_payload["text"] == "Hello coalesced world"
 
