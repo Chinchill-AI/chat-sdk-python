@@ -252,6 +252,12 @@ class TeamsAdapter:
         # ``asyncio.sleep`` would observe. The lazy lambda is intentional:
         # there is no running loop at ``__init__`` time.
         self._stream_clock_ms: Callable[[], float] = lambda: asyncio.get_running_loop().time() * 1000.0
+        # Awaitable sleep keyed by milliseconds. Pairs with
+        # ``_stream_clock_ms`` so the end-of-stream flush can honor the
+        # throttle window without forcing real ``asyncio.sleep`` calls in
+        # tests. Default = real ``asyncio.sleep``; tests substitute an
+        # AsyncMock so they don't actually wait the configured interval.
+        self._stream_sleep_ms: Callable[[float], Awaitable[None]] = lambda ms: asyncio.sleep(ms / 1000.0)
 
     @property
     def name(self) -> str:
@@ -1287,6 +1293,25 @@ class TeamsAdapter:
         # loop above without an exception, and we shouldn't flush text the
         # user explicitly canceled out of.
         if not session.canceled and accumulated != last_committed_text:
+            # Honor the throttle even for the end-of-stream flush — a fast
+            # LLM stream that finishes inside the throttle window after the
+            # last successful emit would 429 the Bot Framework streaming
+            # endpoint otherwise (1 req/sec quota), cancelling the stream
+            # mid-flight. Wait for the remaining window before shipping.
+            elapsed_ms = self._stream_clock_ms() - last_emit_at_ms
+            if elapsed_ms < emit_interval_ms:
+                await self._stream_sleep_ms(emit_interval_ms - elapsed_ms)
+                # Cancellation may have arrived during the wait (the chat
+                # handler can call ``session.cancel()`` from another task).
+                # Re-check before emitting so we don't ship text the user
+                # explicitly canceled out of.
+                if session.canceled:
+                    session._text = accumulated  # noqa: SLF001
+                    return RawMessage(
+                        id=session.first_chunk_id,
+                        thread_id=thread_id,
+                        raw={"text": accumulated},
+                    )
             result = await self._emit_streaming_activity(
                 decoded=decoded,
                 thread_id=thread_id,
