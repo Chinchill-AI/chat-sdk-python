@@ -1651,7 +1651,7 @@ class SlackAdapter:
             return text
         state = self._chat.get_state()
 
-        mention_pattern = re.compile(r"(?<!\w)@(\w+)")
+        mention_pattern = re.compile(r"(?<![\w<])@(\w+)")
         mentions: dict[str, list[str]] = {}
 
         for match in mention_pattern.finditer(text):
