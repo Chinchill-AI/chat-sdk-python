@@ -339,7 +339,7 @@ class TestTeamsFetchMessages:
 
         # Mock the Graph API methods
         adapter._get_graph_token = AsyncMock(return_value="fake-token")
-        adapter._get_channel_context = AsyncMock(return_value=None)
+        adapter._get_graph_context = AsyncMock(return_value=None)
 
         fake_graph_messages = [
             {

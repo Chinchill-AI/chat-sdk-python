@@ -16,7 +16,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, cast
 from urllib.parse import urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
@@ -24,6 +24,8 @@ from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
     TeamsChannelContext,
+    TeamsDmContext,
+    TeamsGraphContext,
     TeamsThreadId,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
@@ -61,6 +63,11 @@ from chat_sdk.types import (
 
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
 MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
+# AAD object IDs are GUIDs (8-4-4-4-12 hex). Used to gate ``aadObjectId``
+# values from incoming activities before formatting them into Microsoft
+# Graph chat IDs (vercel/chat#403). See ``_cache_user_context`` and
+# ``_chat_id_from_context``.
+_AAD_OBJECT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
 
 # Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
@@ -308,11 +315,43 @@ class TeamsAdapter:
         base_channel_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
 
         if team_aad_group_id and channel_data.get("channel", {}).get("id") and state:
+            # Wire-shape parity with upstream TS (#403): the channel branch
+            # omits the discriminator. ``_chat_id_from_context`` and
+            # ``_get_graph_context`` treat ``type != "dm"`` as channel, so
+            # the missing key is unambiguous.
             context: TeamsChannelContext = {
                 "team_id": team_aad_group_id,
                 "channel_id": channel_data["channel"]["id"],
             }
             await state.set(f"teams:channelContext:{base_channel_id}", json.dumps(context), ttl)
+
+        # Cache DM context for Microsoft Graph chat ID resolution
+        # (vercel/chat#403). Bot Framework hands out opaque DM conversation
+        # IDs that Graph's ``/chats/{chat-id}/messages`` endpoint rejects;
+        # the canonical Graph chat ID for a 1:1 DM is
+        # ``19:{userAadId}_{botId}@unq.gbl.spaces``. ``aadObjectId`` is
+        # only present for real Teams users (not bots), and DM conversation
+        # IDs do not start with ``19:`` (channel/group chats do).
+        #
+        # Defense-in-depth: AAD object IDs are GUIDs (8-4-4-4-12 hex). Bot
+        # Framework JWT verification authenticates the activity envelope
+        # but does not constrain ``from.aadObjectId``; a malformed value
+        # could otherwise inject ``/`` / ``?`` / ``#`` into the Graph URL
+        # path and cause a misrouted request. Reject anything that doesn't
+        # match the GUID shape before formatting it into the chat ID.
+        aad_object_id = from_user.get("aadObjectId")
+        if (
+            aad_object_id
+            and self._app_id
+            and not base_channel_id.startswith("19:")
+            and state
+            and _AAD_OBJECT_ID_PATTERN.fullmatch(aad_object_id)
+        ):
+            dm_context: TeamsDmContext = {
+                "graph_chat_id": f"19:{aad_object_id}_{self._app_id}@unq.gbl.spaces",
+                "type": "dm",
+            }
+            await state.set(f"teams:channelContext:{base_channel_id}", json.dumps(dm_context), ttl)
 
     async def _handle_message_activity(
         self,
@@ -1036,7 +1075,13 @@ class TeamsAdapter:
         thread_message_id = message_id_match.group(1) if message_id_match else None
         base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
 
-        channel_context = await self._get_channel_context(base_conversation_id) if thread_message_id else None
+        # vercel/chat#403: always look up the Graph context, not just for
+        # channel threads — DMs need it to map the opaque Bot Framework
+        # conversation ID to the canonical Graph chat ID
+        # (``19:{aadId}_{botId}@unq.gbl.spaces``) that ``/chats/{id}``
+        # accepts.
+        graph_context = await self._get_graph_context(base_conversation_id)
+        context_type: str | None = graph_context.get("type") if graph_context else None
 
         try:
             self._logger.debug(
@@ -1044,14 +1089,16 @@ class TeamsAdapter:
                 {
                     "conversationId": base_conversation_id,
                     "threadMessageId": thread_message_id,
-                    "hasChannelContext": channel_context is not None,
+                    "contextType": context_type or "none",
                     "limit": limit,
                     "cursor": cursor,
                     "direction": direction,
                 },
             )
 
-            if channel_context and thread_message_id:
+            if graph_context and context_type != "dm" and thread_message_id:
+                # Narrowed: channel context for a channel thread.
+                channel_context = cast(TeamsChannelContext, graph_context)
                 return await self._fetch_channel_thread_messages(
                     channel_context,
                     thread_message_id,
@@ -1059,30 +1106,10 @@ class TeamsAdapter:
                     options,
                 )
 
-            graph_messages: list[dict[str, Any]]
-            has_more = False
+            chat_id = self._chat_id_from_context(graph_context, base_conversation_id)
+            graph_messages, has_more = await self._paginate_graph_chat_messages(chat_id, limit, direction, cursor)
 
-            if direction == "forward":
-                params: dict[str, Any] = {
-                    "$top": limit,
-                    "$orderby": "createdDateTime asc",
-                }
-                if cursor:
-                    params["$filter"] = f"createdDateTime gt {cursor}"
-                graph_messages = await self._graph_list_chat_messages(base_conversation_id, params)
-                has_more = len(graph_messages) >= limit
-            else:
-                params = {
-                    "$top": limit,
-                    "$orderby": "createdDateTime desc",
-                }
-                if cursor:
-                    params["$filter"] = f"createdDateTime lt {cursor}"
-                graph_messages = await self._graph_list_chat_messages(base_conversation_id, params)
-                graph_messages.reverse()
-                has_more = len(graph_messages) >= limit
-
-            if thread_message_id and not channel_context:
+            if thread_message_id and not graph_context:
                 graph_messages = [msg for msg in graph_messages if msg.get("id") and msg["id"] >= thread_message_id]
                 self._logger.debug(
                     "Filtered group chat messages to thread",
@@ -1134,13 +1161,14 @@ class TeamsAdapter:
         direction = options.direction or "backward"
 
         try:
-            channel_context = await self._get_channel_context(base_conversation_id)
+            graph_context = await self._get_graph_context(base_conversation_id)
+            context_type = graph_context.get("type") if graph_context else None
 
             self._logger.debug(
                 "Teams Graph API: fetchChannelMessages",
                 {
                     "conversationId": base_conversation_id,
-                    "hasChannelContext": channel_context is not None,
+                    "contextType": context_type or "none",
                     "limit": limit,
                     "direction": direction,
                 },
@@ -1149,7 +1177,8 @@ class TeamsAdapter:
             graph_messages: list[dict[str, Any]]
             has_more = False
 
-            if channel_context:
+            if graph_context and context_type != "dm":
+                channel_context = cast(TeamsChannelContext, graph_context)
                 if direction == "forward":
                     graph_messages = await self._graph_list_channel_messages(
                         channel_context["team_id"],
@@ -1176,19 +1205,14 @@ class TeamsAdapter:
                     )
                     graph_messages.reverse()
                     has_more = len(graph_messages) >= limit
-            elif direction == "forward":
-                params = {"$top": limit, "$orderby": "createdDateTime asc"}
-                if options.cursor:
-                    params["$filter"] = f"createdDateTime gt {options.cursor}"
-                graph_messages = await self._graph_list_chat_messages(base_conversation_id, params)
-                has_more = len(graph_messages) >= limit
             else:
-                params = {"$top": limit, "$orderby": "createdDateTime desc"}
-                if options.cursor:
-                    params["$filter"] = f"createdDateTime lt {options.cursor}"
-                graph_messages = await self._graph_list_chat_messages(base_conversation_id, params)
-                graph_messages.reverse()
-                has_more = len(graph_messages) >= limit
+                # vercel/chat#403: DM contexts substitute the canonical Graph
+                # chat ID for the opaque Bot Framework conversation ID; no
+                # context (group chat) falls through to the raw ID.
+                chat_id = self._chat_id_from_context(graph_context, base_conversation_id)
+                graph_messages, has_more = await self._paginate_graph_chat_messages(
+                    chat_id, limit, direction, options.cursor
+                )
 
             messages = [self._map_graph_message(msg, channel_id) for msg in graph_messages if msg.get("id")]
 
@@ -1225,7 +1249,14 @@ class TeamsAdapter:
         base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
         is_dm = not conversation_id.startswith("19:")
 
-        channel_context = await self._get_channel_context(base_conversation_id) if not is_dm else None
+        # vercel/chat#403: only call into the Graph teams/channels
+        # endpoint for true channel contexts. A cached DM context (now
+        # possible when ``aadObjectId`` was present on the activity)
+        # must not be treated as a channel.
+        graph_context = await self._get_graph_context(base_conversation_id) if not is_dm else None
+        channel_context: TeamsChannelContext | None = None
+        if graph_context and graph_context.get("type") != "dm":
+            channel_context = cast(TeamsChannelContext, graph_context)
 
         if channel_context:
             try:
@@ -1344,8 +1375,19 @@ class TeamsAdapter:
     # Graph API — internal helpers
     # =========================================================================
 
-    async def _get_channel_context(self, base_conversation_id: str) -> TeamsChannelContext | None:
-        """Look up cached channel context (team_id, channel_id) for a conversation."""
+    async def _get_graph_context(self, base_conversation_id: str) -> TeamsGraphContext | None:
+        """Look up cached Microsoft Graph context for a conversation.
+
+        Returns either a :class:`TeamsChannelContext` (channel/team
+        thread) or a :class:`TeamsDmContext` (1:1 DM with a resolved
+        Graph chat ID). For group chats, no entry is cached — the raw
+        conversation ID works as-is with Graph's ``/chats`` endpoints.
+
+        Backwards compat: cached entries written before vercel/chat#403
+        omit the ``type`` discriminator and are treated as
+        ``"channel"`` by :meth:`_chat_id_from_context` and the call
+        sites that branch on context type.
+        """
         if not self._chat:
             return None
         state = self._chat.get_state()
@@ -1358,6 +1400,21 @@ class TeamsAdapter:
             except (json.JSONDecodeError, ValueError):
                 pass
         return None
+
+    @staticmethod
+    def _chat_id_from_context(
+        context: TeamsGraphContext | None,
+        base_conversation_id: str,
+    ) -> str:
+        """Resolve the Microsoft Graph chat ID for a non-channel conversation.
+
+        Uses the DM context's ``graph_chat_id`` when present, otherwise
+        falls back to the raw Bot Framework conversation ID (which works
+        as-is for group chats and the legacy pre-#403 cache shape).
+        """
+        if context is not None and context.get("type") == "dm":
+            return context["graph_chat_id"]
+        return base_conversation_id
 
     async def _graph_list_chat_messages(
         self,
@@ -1379,6 +1436,28 @@ class TeamsAdapter:
                 raise NetworkError("teams", f"Graph API error: {response.status} {error_text}")
             data = await response.json()
             return data.get("value", [])
+
+    async def _paginate_graph_chat_messages(
+        self,
+        chat_id: str,
+        limit: int,
+        direction: str,
+        cursor: str | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Issue a single Graph ``/chats/{chat_id}/messages`` page and report has_more.
+
+        Backward direction reverses the result so callers always see chronological
+        order; cursor filter clause is ``gt`` for forward, ``lt`` for backward.
+        """
+        order_by = "createdDateTime asc" if direction == "forward" else "createdDateTime desc"
+        filter_op = "gt" if direction == "forward" else "lt"
+        params: dict[str, Any] = {"$top": limit, "$orderby": order_by}
+        if cursor:
+            params["$filter"] = f"createdDateTime {filter_op} {cursor}"
+        graph_messages = await self._graph_list_chat_messages(chat_id, params)
+        if direction != "forward":
+            graph_messages.reverse()
+        return graph_messages, len(graph_messages) >= limit
 
     async def _graph_list_channel_messages(
         self,

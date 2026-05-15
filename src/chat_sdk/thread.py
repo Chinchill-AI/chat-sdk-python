@@ -141,6 +141,48 @@ def _is_async_iterable(value: Any) -> bool:
     return value is not None and hasattr(value, "__aiter__")
 
 
+def _extract_slack_recipient_team_id(raw: Any) -> str | None:
+    """Resolve the Slack workspace ID from a ``currentMessage.raw`` payload.
+
+    Slack carries the workspace ID in different shapes depending on the
+    webhook envelope:
+
+    - Message events (``message`` / ``app_mention``): top-level ``team_id``
+      (string) or ``team`` (string).
+    - Interactive payloads (``block_actions``, ``view_submission``, etc.):
+      nested ``team.id`` on a ``team`` object, with ``user.team_id`` as a
+      final fallback when ``team`` is missing entirely.
+
+    Upstream parity: vercel/chat#330. The previous extraction
+    (``raw.get("team_id") or raw.get("team")``) returned the entire ``team``
+    dict for block_actions, which then traveled to the Slack adapter as the
+    ``recipient_team_id`` and either crashed downstream API calls or sent
+    them to the wrong workspace.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    team_id = raw.get("team_id")
+    if isinstance(team_id, str) and team_id:
+        return team_id
+
+    team = raw.get("team")
+    if isinstance(team, str) and team:
+        return team
+    if isinstance(team, dict):
+        nested = team.get("id")
+        if isinstance(nested, str) and nested:
+            return nested
+
+    user = raw.get("user")
+    if isinstance(user, dict):
+        user_team_id = user.get("team_id")
+        if isinstance(user_team_id, str) and user_team_id:
+            return user_team_id
+
+    return None
+
+
 def _extract_message_content(
     message: AdapterPostableMessage,
 ) -> tuple[str, FormattedContent, list[Attachment]]:
@@ -615,9 +657,13 @@ class ThreadImpl:
         options = StreamOptions()
         if self._current_message is not None:
             options.recipient_user_id = self._current_message.author.user_id
-            raw = self._current_message.raw
-            if isinstance(raw, dict):
-                options.recipient_team_id = raw.get("team_id") or raw.get("team")
+            # recipient_team_id is only consumed by the Slack adapter; other
+            # adapters ignore it. Slack carries the workspace ID in different
+            # shapes depending on webhook type — message events use the
+            # top-level ``team_id`` / ``team`` (string), block_actions / view
+            # payloads use ``team.id`` (object), with ``user.team_id`` as a
+            # final fallback. Upstream parity: vercel/chat#330.
+            options.recipient_team_id = _extract_slack_recipient_team_id(self._current_message.raw)
 
         # Merge caller-supplied StreamingPlan options on top. Explicit fields win.
         if extra_options is not None:

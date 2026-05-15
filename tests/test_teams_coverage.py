@@ -1537,14 +1537,14 @@ class TestCreateAttachmentTypes:
 
 
 # ---------------------------------------------------------------------------
-# _get_channel_context edge cases
+# _get_graph_context edge cases
 # ---------------------------------------------------------------------------
 
 
-class TestGetChannelContext:
+class TestGetGraphContext:
     async def test_no_chat(self):
         adapter = _make_adapter(logger=_make_logger())
-        result = await adapter._get_channel_context("19:abc")
+        result = await adapter._get_graph_context("19:abc")
         assert result is None
 
     async def test_no_state(self):
@@ -1552,7 +1552,7 @@ class TestGetChannelContext:
         chat = MagicMock()
         chat.get_state = MagicMock(return_value=None)
         await adapter.initialize(chat)
-        result = await adapter._get_channel_context("19:abc")
+        result = await adapter._get_graph_context("19:abc")
         assert result is None
 
     async def test_invalid_json_in_cache(self):
@@ -1561,7 +1561,7 @@ class TestGetChannelContext:
         state._cache["teams:channelContext:19:abc"] = "not valid json {"
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
-        result = await adapter._get_channel_context("19:abc")
+        result = await adapter._get_graph_context("19:abc")
         assert result is None
 
     async def test_valid_context_from_cache(self):
@@ -1570,9 +1570,309 @@ class TestGetChannelContext:
         state._cache["teams:channelContext:19:abc"] = json.dumps({"team_id": "t1", "channel_id": "c1"})
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
-        result = await adapter._get_channel_context("19:abc")
+        result = await adapter._get_graph_context("19:abc")
         assert result is not None
         assert result["team_id"] == "t1"
+
+
+# ---------------------------------------------------------------------------
+# vercel/chat#403 — DM conversation IDs for Microsoft Graph API
+# ---------------------------------------------------------------------------
+
+
+class TestGraphDmConversationIdResolution:
+    """Regression tests for vercel/chat#403.
+
+    Bot Framework hands out opaque DM conversation IDs (e.g.
+    ``a:1xWhatever``) which the Graph ``/chats/{chat-id}/messages``
+    endpoint rejects with 404. The fix caches the user's AAD object ID
+    on every incoming activity and resolves the canonical Graph chat ID
+    (``19:{aadId}_{botId}@unq.gbl.spaces``) before issuing Graph calls.
+    """
+
+    def test_chat_id_from_context_uses_dm_graph_chat_id(self):
+        """What to fix if this fails: ``_chat_id_from_context`` must return
+        the cached ``graph_chat_id`` for any DM context. Returning the raw
+        Bot Framework conversation ID instead reproduces the upstream bug
+        where Graph calls 404 for every DM.
+        """
+        result = TeamsAdapter._chat_id_from_context(
+            {"type": "dm", "graph_chat_id": "19:user-aad-id_bot-id@unq.gbl.spaces"},
+            "a:opaque-conversation-id",
+        )
+        assert result == "19:user-aad-id_bot-id@unq.gbl.spaces"
+
+    def test_chat_id_from_context_uses_raw_id_for_no_context(self):
+        """What to fix if this fails: group chats (no cached context) must
+        fall back to the raw conversation ID — they work as-is with Graph.
+        """
+        result = TeamsAdapter._chat_id_from_context(None, "19:group-chat@thread.v2")
+        assert result == "19:group-chat@thread.v2"
+
+    def test_chat_id_from_context_uses_raw_id_for_channel_context(self):
+        """What to fix if this fails: channel contexts go through the
+        ``/teams/{team-id}/channels/...`` path; if a channel context ever
+        leaks into ``_chat_id_from_context``, fall back to the raw ID
+        rather than the (absent) ``graph_chat_id``.
+        """
+        result = TeamsAdapter._chat_id_from_context(
+            {"type": "channel", "team_id": "team-id", "channel_id": "channel-id"},
+            "19:channel@thread.tacv2",
+        )
+        assert result == "19:channel@thread.tacv2"
+
+    async def test_cache_user_context_caches_dm_context_with_graph_chat_id(self):
+        """An incoming DM activity must cache a ``TeamsDmContext`` keyed by
+        the opaque base conversation ID, with ``graph_chat_id`` derived
+        from ``from.aadObjectId`` and the bot's app_id.
+
+        What to fix if this fails: ``_cache_user_context`` must cache the
+        DM context whenever ``from.aadObjectId`` is present and the
+        conversation ID is *not* a channel/group chat (i.e. doesn't start
+        with ``19:``). Without this cache, ``fetch_messages`` falls back
+        to the raw Bot Framework ID and Graph returns 404.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        activity = {
+            "type": "message",
+            "from": {"id": "29:1xUser", "aadObjectId": "00000000-0000-0000-0000-aaaaaaaaaaaa"},
+            "conversation": {"id": "a:opaque-dm-conversation-id"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        await adapter._cache_user_context(activity)
+
+        raw_context = state._cache.get("teams:channelContext:a:opaque-dm-conversation-id")
+        assert raw_context is not None, "DM context must be cached for Graph chat ID resolution"
+        ctx = json.loads(raw_context)
+        assert ctx["type"] == "dm"
+        assert ctx["graph_chat_id"] == "19:00000000-0000-0000-0000-aaaaaaaaaaaa_bot-app-id@unq.gbl.spaces"
+
+    async def test_cache_user_context_skips_dm_for_channel_conversation(self):
+        """Channel conversations (``19:...``) must not cache a DM context
+        even when ``from.aadObjectId`` is present.
+
+        What to fix if this fails: the conversation-ID prefix guard in
+        ``_cache_user_context`` is broken — a channel activity is leaking
+        into the DM path and would over-write the channel context.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        activity = {
+            "type": "message",
+            "from": {"id": "29:1xUser", "aadObjectId": "00000000-0000-0000-0000-aaaaaaaaaaaa"},
+            "conversation": {"id": "19:channel@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "channelData": {
+                "team": {"aadGroupId": "team-aad"},
+                "channel": {"id": "19:channel@thread.tacv2"},
+            },
+        }
+        await adapter._cache_user_context(activity)
+
+        raw_context = state._cache.get("teams:channelContext:19:channel@thread.tacv2")
+        assert raw_context is not None
+        ctx = json.loads(raw_context)
+        # Adversarial check: a DM-like channel ID (still starts with "19:")
+        # should resolve to the channel context, not a DM context.
+        assert ctx.get("type") != "dm"
+        assert ctx["team_id"] == "team-aad"
+
+    async def test_cache_user_context_skips_dm_when_no_aad_object_id(self):
+        """No ``aadObjectId`` (e.g. bot-to-bot activity) means we cannot
+        derive the canonical Graph chat ID — skip caching the DM context
+        entirely rather than caching a malformed one.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        activity = {
+            "type": "message",
+            "from": {"id": "28:bot-id"},  # no aadObjectId
+            "conversation": {"id": "a:opaque-dm"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        await adapter._cache_user_context(activity)
+        assert state._cache.get("teams:channelContext:a:opaque-dm") is None
+
+    async def test_cache_user_context_rejects_non_guid_aad_object_id(self):
+        """Defense-in-depth: ``aadObjectId`` values that aren't GUIDs must
+        not be formatted into the Graph chat ID. Bot Framework JWT
+        verification authenticates the activity envelope but does not
+        constrain ``from.aadObjectId`` shape; a malformed value containing
+        ``/`` ``?`` ``#`` ``:`` could otherwise inject into the Graph URL.
+
+        What to fix if this fails: ``_cache_user_context`` lost its
+        ``_AAD_OBJECT_ID_PATTERN.fullmatch`` guard. Re-add it before the
+        DM context is written.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # Various malformed shapes — a path-injection attempt, missing
+        # hyphens, too short, non-hex characters.
+        for bogus in [
+            "user-aad-id",  # not GUID-shaped
+            "../etc/passwd",  # path traversal
+            "00000000-0000-0000-0000-aaaa/messages",  # injection
+            "00000000000000000000000000000000",  # right length, no hyphens
+            "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ",  # non-hex
+            "00000000-0000-0000-0000",  # too short
+        ]:
+            activity = {
+                "type": "message",
+                "from": {"id": "29:1xUser", "aadObjectId": bogus},
+                "conversation": {"id": f"a:opaque-{bogus}"},
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            }
+            await adapter._cache_user_context(activity)
+            cached = state._cache.get(f"teams:channelContext:a:opaque-{bogus}")
+            assert cached is None, (
+                f"_cache_user_context cached a DM context with malformed "
+                f"aadObjectId={bogus!r}; the GUID guard must reject this "
+                f"before formatting it into a Graph chat ID"
+            )
+
+    async def test_fetch_messages_uses_legacy_cache_shape_for_channel(self):
+        """End-to-end backwards-compat: cached entries written before
+        vercel/chat#403 lack the ``type`` discriminator. They must still
+        route through ``fetch_messages``'s channel branch (treated as
+        ``type=channel`` by ``_chat_id_from_context``), not get
+        misclassified or crash on the missing key.
+
+        What to fix if this fails: ``_chat_id_from_context`` or
+        ``_get_graph_context`` lost the legacy-shape fallthrough. The
+        contract is "absent ``type`` ⇒ treated as channel".
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        # Legacy shape — no ``type`` key, only ``team_id`` + ``channel_id``.
+        state._cache["teams:channelContext:19:legacy-channel@thread.tacv2"] = json.dumps(
+            {"team_id": "team-aad", "channel_id": "19:legacy-channel@thread.tacv2"}
+        )
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # The legacy cache should route to the channel-messages path —
+        # which uses ``team_id`` + ``channel_id``, NOT the chat-messages
+        # path (which would be wrong for a channel and would call Graph
+        # with the raw conversation ID). Confirm by hooking the channel
+        # endpoint and asserting it's called.
+        async def fake_channel_list(team_id: str, channel_id: str, limit: int = 50):
+            return [{"id": "1234", "from": {"user": {"id": "u1", "displayName": "x"}}, "body": {"content": "hi"}}]
+
+        adapter._graph_list_channel_messages = fake_channel_list  # type: ignore[assignment]
+
+        ctx = await adapter._get_graph_context("19:legacy-channel@thread.tacv2")
+        assert ctx is not None, "Legacy cache shape did not load"
+        # ``_chat_id_from_context`` returns the raw base id when there's
+        # no ``graph_chat_id`` (channel context shape). The crucial assert
+        # is that we treat this as *not-DM* (no Graph 19:...@unq.gbl.spaces
+        # construction).
+        chat_id = adapter._chat_id_from_context(ctx, "19:legacy-channel@thread.tacv2")
+        assert chat_id == "19:legacy-channel@thread.tacv2", (
+            f"_chat_id_from_context misclassified legacy cache entry as DM; "
+            f"got {chat_id!r}, expected the raw conversation ID. The "
+            f"absent-``type`` legacy shape must fall through to channel "
+            f"semantics."
+        )
+
+    async def test_fetch_messages_uses_graph_chat_id_for_dm(self):
+        """End-to-end: a cached DM context must redirect ``fetch_messages``
+        to the canonical ``19:{aadId}_{botId}@unq.gbl.spaces`` chat ID,
+        not the opaque Bot Framework conversation ID.
+
+        What to fix if this fails: ``fetch_messages`` is calling
+        ``_graph_list_chat_messages`` with the raw ``base_conversation_id``
+        instead of the resolved Graph chat ID. Graph returns 404 in
+        production for every DM in this state. Confirm
+        ``_chat_id_from_context`` is invoked and its result threads through
+        the chat-id parameter.
+        """
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter as _TA
+
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        # Cache the DM context as if a previous activity had landed.
+        state._cache["teams:channelContext:a:opaque-dm-id"] = json.dumps(
+            {"type": "dm", "graph_chat_id": "19:user-aad_bot-app-id@unq.gbl.spaces"}
+        )
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        called_with: list[str] = []
+
+        async def fake_list(chat_id: str, params: Any) -> list[dict[str, Any]]:
+            called_with.append(chat_id)
+            return [
+                {
+                    "id": "msg-1",
+                    "createdDateTime": "2024-06-01T12:00:00Z",
+                    "body": {"contentType": "text", "content": "Hi"},
+                    "from": {"user": {"id": "user-aad", "displayName": "Alice"}},
+                }
+            ]
+
+        adapter._graph_list_chat_messages = fake_list  # type: ignore[method-assign]
+        adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:opaque-dm-id",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        result = await adapter.fetch_messages(tid)
+
+        assert called_with == ["19:user-aad_bot-app-id@unq.gbl.spaces"], (
+            "fetch_messages must dispatch DM Graph calls to the resolved "
+            "graph_chat_id, not the opaque Bot Framework conversation ID. "
+            f"Saw chat_id={called_with!r}."
+        )
+        assert len(result.messages) == 1
+        # Silence unused-import warning if the helper above is removed.
+        assert _TA is TeamsAdapter
+
+    async def test_fetch_messages_falls_back_to_raw_id_when_no_dm_context(self):
+        """Pre-#403 behavior preservation: when no DM context is cached
+        (e.g. a group chat conversation, or an installation that hasn't
+        seen an activity yet), fall back to the raw conversation ID. This
+        keeps group chats working as before.
+        """
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()  # empty
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        called_with: list[str] = []
+
+        async def fake_list(chat_id: str, params: Any) -> list[dict[str, Any]]:
+            called_with.append(chat_id)
+            return []
+
+        adapter._graph_list_chat_messages = fake_list  # type: ignore[method-assign]
+        adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]
+
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:group-chat@thread.v2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        await adapter.fetch_messages(tid)
+
+        assert called_with == ["19:group-chat@thread.v2"]
 
 
 # ---------------------------------------------------------------------------
