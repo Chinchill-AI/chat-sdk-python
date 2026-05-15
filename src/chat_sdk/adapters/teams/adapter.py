@@ -242,6 +242,16 @@ class TeamsAdapter:
         # between native streaming via emit and the accumulate-and-post
         # fallback path.
         self._active_streams: dict[str, _TeamsStreamSession] = {}
+        # Throttle for native DM streaming — Bot Framework streaming is
+        # ~1 request/second; Microsoft recommends 1.5-2s buffering. See the
+        # field docstring on TeamsAdapterConfig for full context.
+        self._native_stream_min_emit_interval_ms: int = config.native_stream_min_emit_interval_ms
+        # Monotonic-clock callable returning milliseconds since some epoch.
+        # Injectable so tests can drive throttle behavior without real sleeps.
+        # Default reads the running event loop's clock — matches what
+        # ``asyncio.sleep`` would observe. The lazy lambda is intentional:
+        # there is no running loop at ``__init__`` time.
+        self._stream_clock_ms: Callable[[], float] = lambda: asyncio.get_running_loop().time() * 1000.0
 
     @property
     def name(self) -> str:
@@ -1096,7 +1106,7 @@ class TeamsAdapter:
         self,
         thread_id: str,
         text_stream: Any,
-        _options: StreamOptions | None = None,
+        options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream responses to a Teams conversation.
 
@@ -1111,7 +1121,7 @@ class TeamsAdapter:
         """
         session = self._active_streams.get(thread_id)
         if session is not None and not session.canceled:
-            return await self._stream_via_emit(thread_id, text_stream, session)
+            return await self._stream_via_emit(thread_id, text_stream, session, options)
 
         # No native streamer (group chats, proactive messages, or DMs whose
         # session was already canceled). Accumulate and post once.
@@ -1147,6 +1157,7 @@ class TeamsAdapter:
         thread_id: str,
         text_stream: Any,
         session: _TeamsStreamSession,
+        options: StreamOptions | None = None,
     ) -> RawMessage:
         """Native Bot Framework streaming: typing chunks + final message.
 
@@ -1154,12 +1165,26 @@ class TeamsAdapter:
 
         - Each non-empty chunk is a ``typing`` activity with
           ``channelData = {streamType: "streaming", streamSequence: N,
-          streamId?: <id>}`` and a parallel ``streaminfo`` entity. The
-          first chunk omits ``streamId`` — the REST response's ``id`` is
-          captured and used for every subsequent chunk and the final
-          message.
+          streamId?: <id>}`` and a parallel ``streaminfo`` entity. Per
+          the Bot Framework streaming contract, ``streamId`` MUST appear
+          on the ``streaminfo`` entity (not just ``channelData``) for
+          subsequent and final activities; the first chunk omits it
+          everywhere because the server hasn't assigned an id yet.
         - On stream completion, a final ``message`` activity is sent by
           :meth:`_close_stream_session` (it carries ``streamType: "final"``).
+
+        Throttling: Teams' streaming endpoint enforces ~1 request/second
+        and Microsoft recommends 1.5-2s buffering. We accumulate every
+        non-empty chunk locally but only ship a ``typing`` activity once
+        the emit interval has elapsed since the previous send; in-window
+        chunks are coalesced into the next eligible emit. The interval
+        defaults to ``TeamsAdapterConfig.native_stream_min_emit_interval_ms``
+        (1500ms) and is overridden per-call by
+        ``StreamOptions.update_interval_ms`` when provided. Any text that
+        was buffered when the iterator ends still ships in the final
+        ``message`` activity that :meth:`_close_stream_session` posts, so
+        the user never loses content — they just see slightly fewer
+        intermediate updates.
 
         We never emit a chunk after :attr:`_TeamsStreamSession.canceled` is
         set, and we surface stream-iterator exceptions to the caller after
@@ -1168,6 +1193,17 @@ class TeamsAdapter:
         """
         decoded = self.decode_thread_id(thread_id)
         accumulated = ""
+
+        emit_interval_ms: int = (
+            options.update_interval_ms
+            if options is not None and options.update_interval_ms is not None
+            else self._native_stream_min_emit_interval_ms
+        )
+        # Tracks when the most recent successful emit landed, in the same
+        # ms-since-arbitrary-epoch frame as ``self._stream_clock_ms()``.
+        # ``-inf`` so the first chunk always passes the interval gate
+        # regardless of what value the clock returns on its first call.
+        last_emit_at_ms: float = float("-inf")
 
         try:
             async for chunk in text_stream:
@@ -1183,41 +1219,49 @@ class TeamsAdapter:
                 if not text:
                     continue
 
-                # Build a CANDIDATE accumulated value — only commit to
-                # ``accumulated`` after a successful ``_teams_send``. The
-                # except below re-raises, so this matters mostly for any
-                # callers introspecting state on a raised stream (and for
-                # symmetry with ``session.sequence`` which is committed in
-                # the same step): neither buffer is left holding text Teams
-                # never accepted.
-                candidate_accumulated = accumulated + text
-                # Emit each chunk as an incremental typing activity. We send
-                # the cumulative text (not deltas) — Teams clients render the
-                # latest text on every streaming activity. Matches upstream's
-                # ``stream.emit(text)`` semantics where the SDK accumulates
-                # under the hood and ships the latest snapshot.
+                # Always accumulate locally so the close-path final
+                # ``message`` activity carries the full user-visible
+                # text. The decision below only governs whether THIS
+                # chunk triggers an intermediate ``typing`` send.
+                accumulated += text
+
+                now_ms = self._stream_clock_ms()
+                if now_ms - last_emit_at_ms < emit_interval_ms:
+                    # Inside the throttle window — coalesce. The next
+                    # eligible chunk (or the final close activity) ships
+                    # the cumulative text including this one.
+                    continue
+
+                # Emit a typing activity carrying the cumulative text
+                # snapshot. Teams clients render the latest text on
+                # every streaming activity, so deltas aren't needed.
                 next_sequence = session.sequence + 1
                 channel_data: dict[str, Any] = {
                     "streamType": _STREAM_TYPE_STREAMING,
                     "streamSequence": next_sequence,
                 }
-                # Hazard #7 — only include ``streamId`` once the server has
-                # assigned one. Sending ``"streamId": None`` on the first
-                # chunk would cause Teams to reject the activity.
+                stream_info_entity: dict[str, Any] = {
+                    "type": "streaminfo",
+                    "streamType": _STREAM_TYPE_STREAMING,
+                    "streamSequence": next_sequence,
+                }
+                # Hazard #7 — only include ``streamId`` once the server
+                # has assigned one. Sending ``"streamId": None`` on the
+                # first chunk would cause Teams to reject the activity.
+                # Bot Framework REST contract requires ``streamId`` on
+                # BOTH ``channelData`` and the ``streaminfo`` entity for
+                # subsequent/final activities — earlier code only set it
+                # on ``channelData``, which Teams treats as a malformed
+                # continuation and may detach from the initial stream.
                 if session.stream_id is not None:
                     channel_data["streamId"] = session.stream_id
+                    stream_info_entity["streamId"] = session.stream_id
 
                 activity_payload: dict[str, Any] = {
                     "type": "typing",
-                    "text": candidate_accumulated,
+                    "text": accumulated,
                     "channelData": channel_data,
-                    "entities": [
-                        {
-                            "type": "streaminfo",
-                            "streamType": _STREAM_TYPE_STREAMING,
-                            "streamSequence": next_sequence,
-                        }
-                    ],
+                    "entities": [stream_info_entity],
                 }
 
                 try:
@@ -1241,9 +1285,9 @@ class TeamsAdapter:
                     session.cancel()
                     raise
 
-                # Send succeeded — commit the accumulated state.
-                accumulated = candidate_accumulated
+                # Send succeeded — commit the wire-protocol state.
                 session.sequence = next_sequence
+                last_emit_at_ms = now_ms
 
                 if session.stream_id is None:
                     chunk_id = result.get("id") or ""
@@ -1305,25 +1349,27 @@ class TeamsAdapter:
         channel_data: dict[str, Any] = {
             "streamType": _STREAM_TYPE_FINAL,
         }
+        stream_info_entity: dict[str, Any] = {
+            "type": "streaminfo",
+            "streamType": _STREAM_TYPE_FINAL,
+        }
         # Hazard #7 — only include ``streamId`` when we actually have one.
         # The Bot Framework REST response can return ``id=""`` even on a
         # 200, in which case ``stream_id`` stays ``None`` (see emit guard
         # in ``_stream_via_emit``); ship the final without a ``streamId``
-        # rather than skipping the send.
+        # rather than skipping the send. When present, ``streamId`` must
+        # appear on BOTH ``channelData`` and the ``streaminfo`` entity
+        # per the Bot Framework streaming contract for the final activity.
         if session.stream_id is not None:
             channel_data["streamId"] = session.stream_id
+            stream_info_entity["streamId"] = session.stream_id
 
         final_activity: dict[str, Any] = {
             "type": "message",
             "text": session.text,
             "textFormat": "markdown",
             "channelData": channel_data,
-            "entities": [
-                {
-                    "type": "streaminfo",
-                    "streamType": _STREAM_TYPE_FINAL,
-                }
-            ],
+            "entities": [stream_info_entity],
         }
         try:
             await self._teams_send(decoded, final_activity)

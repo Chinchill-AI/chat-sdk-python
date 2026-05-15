@@ -29,19 +29,56 @@ from chat_sdk.adapters.teams.adapter import (
 from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
 
 
-def _make_adapter() -> TeamsAdapter:
-    return TeamsAdapter(
-        TeamsAdapterConfig(
-            app_id="test-app-id",
-            app_password="test-password",
-            logger=MagicMock(
-                debug=MagicMock(),
-                info=MagicMock(),
-                warn=MagicMock(),
-                error=MagicMock(),
-            ),
-        )
-    )
+def _make_adapter(
+    *,
+    native_stream_min_emit_interval_ms: int | None = None,
+    clock_step_ms: float = 2000.0,
+) -> TeamsAdapter:
+    """Build a TeamsAdapter with a deterministic native-stream clock.
+
+    The native streaming path throttles emits via
+    ``_stream_clock_ms()`` (defaults to ``loop.time() * 1000``). Tests
+    can't rely on real elapsed time without sleeping, so we substitute
+    a counter-based clock that advances by ``clock_step_ms`` per call.
+    With the default 2000ms step (> the 1500ms throttle), every chunk
+    clears the interval gate — matching the pre-throttle test
+    expectations of "one emit per chunk." Tests that want to exercise
+    coalescing pass ``clock_step_ms=0`` (or a value below the configured
+    interval) so chunks land within the same throttle window.
+    """
+    config_kwargs: dict[str, Any] = {
+        "app_id": "test-app-id",
+        "app_password": "test-password",
+        "logger": MagicMock(
+            debug=MagicMock(),
+            info=MagicMock(),
+            warn=MagicMock(),
+            error=MagicMock(),
+        ),
+    }
+    if native_stream_min_emit_interval_ms is not None:
+        config_kwargs["native_stream_min_emit_interval_ms"] = native_stream_min_emit_interval_ms
+
+    adapter = TeamsAdapter(TeamsAdapterConfig(**config_kwargs))
+    adapter._stream_clock_ms = _advancing_clock(step_ms=clock_step_ms)
+    return adapter
+
+
+def _advancing_clock(*, start_ms: float = 0.0, step_ms: float = 2000.0):
+    """Returns a deterministic ms-clock that advances by ``step_ms`` per call.
+
+    With ``step_ms`` greater than the throttle interval, every call to
+    ``_stream_clock_ms`` reports enough elapsed time to clear the gate.
+    With ``step_ms == 0``, every call returns the same value so all
+    chunks land inside a single throttle window.
+    """
+    state = {"now": start_ms}
+
+    def clock() -> float:
+        state["now"] += step_ms
+        return state["now"]
+
+    return clock
 
 
 def _dm_thread_id(adapter: TeamsAdapter) -> str:
@@ -97,6 +134,11 @@ class TestNativeStreamingWireFormat:
         assert first_payload["channelData"]["streamType"] == _STREAM_TYPE_STREAMING
         assert first_payload["channelData"]["streamSequence"] == 1
         assert "streamId" not in first_payload["channelData"]
+        # ``streamId`` must also be absent from the streaminfo entity on
+        # the first chunk — there is no server-assigned id yet and
+        # sending ``"streamId": None`` (or "") would cause Teams to
+        # reject the activity.
+        assert "streamId" not in first_payload["entities"][0]
         # Subsequent chunks (none here) would inherit streamId from the
         # server response; verify the session captured it.
         assert session.stream_id == "stream-id-from-server"
@@ -183,7 +225,237 @@ class TestNativeStreamingWireFormat:
         assert payload["text"] == "Hello world"
         assert payload["channelData"]["streamType"] == _STREAM_TYPE_FINAL
         assert payload["channelData"]["streamId"] == "running-stream-id"
-        assert payload["entities"] == [{"type": "streaminfo", "streamType": _STREAM_TYPE_FINAL}]
+        # Bot Framework streaming contract requires ``streamId`` on the
+        # ``streaminfo`` entity (not just ``channelData``) for the final
+        # activity. Earlier versions of this adapter omitted it from the
+        # entity, which Teams may treat as a malformed close — leaving
+        # the streaming UI spinning until client-side timeout.
+        assert payload["entities"] == [
+            {
+                "type": "streaminfo",
+                "streamType": _STREAM_TYPE_FINAL,
+                "streamId": "running-stream-id",
+            }
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Throttling (Bot Framework streaming endpoint is ~1 req/sec)
+# ---------------------------------------------------------------------------
+
+
+class TestNativeStreamingThrottle:
+    """Pin the chunk-coalescing behavior that protects against Teams 429s.
+
+    Microsoft's Bot Framework streaming endpoint throttles to roughly
+    1 request/second and recommends buffering tokens for 1.5-2 seconds
+    before sending the next ``streaming`` activity. ``_stream_via_emit``
+    coalesces in-window chunks into the cumulative-text snapshot that
+    ships with the next eligible emit (or in the final ``message``
+    activity if the iterator ends inside the window).
+    """
+
+    @pytest.mark.asyncio
+    async def test_chunks_within_throttle_interval_are_coalesced(self):
+        """Multiple chunks arriving in the same window collapse to one emit.
+
+        Without coalescing, a typical LLM token stream (10+ tokens/s) would
+        rate-limit on the Bot Framework streaming endpoint within the
+        first second and the response would be cancelled mid-flight.
+        """
+        # ``clock_step_ms=0`` means every clock check returns the same
+        # value, so every chunk after the first lands inside the throttle
+        # window. Only the first chunk should emit.
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "Hel"
+            yield "lo "
+            yield "world"
+            yield "!"
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Only one ``typing`` activity actually went out.
+        assert adapter._teams_send.await_count == 1, (
+            "Coalescing failed — every chunk emitted its own activity. "
+            "Real LLM streams will 429 the Bot Framework streaming "
+            "endpoint without this throttle."
+        )
+        # The single emit carried only the first chunk's text — the
+        # later chunks were buffered for the next eligible emit, which
+        # never came because the iterator ended.
+        emitted_text = adapter._teams_send.await_args_list[0].args[1]["text"]
+        assert emitted_text == "Hel"
+        # But the full cumulative text is preserved in the session for
+        # the close path to ship in the final ``message`` activity, so
+        # the user never loses content — they just see fewer
+        # intermediate updates.
+        assert session.text == "Hello world!"
+        assert result.raw["text"] == "Hello world!"
+
+    @pytest.mark.asyncio
+    async def test_chunks_beyond_throttle_interval_emit_individually(self):
+        """When time advances past the interval, each chunk gets its own send."""
+        adapter = _make_adapter(clock_step_ms=2000.0)
+        adapter._teams_send = AsyncMock(side_effect=[{"id": "first"}, {"id": "ignored-1"}, {"id": "ignored-2"}])
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "one "
+            yield "two "
+            yield "three"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+        # All three chunks emitted because each clock check reports
+        # 2000ms elapsed (> the default 1500ms interval).
+        assert adapter._teams_send.await_count == 3
+        texts = [c.args[1]["text"] for c in adapter._teams_send.await_args_list]
+        assert texts == ["one ", "one two ", "one two three"]
+
+    @pytest.mark.asyncio
+    async def test_caller_update_interval_ms_overrides_default(self):
+        """``StreamOptions.update_interval_ms`` overrides the adapter default.
+
+        A caller (e.g. a ``StreamingPlan``) that asks for ``update_interval_ms=0``
+        gets one emit per chunk regardless of the adapter's configured
+        default. Mirrors how the fallback path treats the same field.
+        """
+        from chat_sdk.types import StreamOptions
+
+        # Even with a real (non-zero) default, a caller-supplied 0 should
+        # disable coalescing.
+        adapter = _make_adapter(
+            native_stream_min_emit_interval_ms=1500,
+            clock_step_ms=10.0,  # tiny steps so coalescing WOULD happen at 1500ms default
+        )
+        adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "a"
+            yield "b"
+            yield "c"
+
+        # Without the override, the 1500ms throttle + 10ms clock steps
+        # would coalesce everything into one emit. With override=0,
+        # every chunk should emit.
+        opts = StreamOptions()
+        opts.update_interval_ms = 0
+        await adapter._stream_via_emit(tid, text_gen(), session, opts)
+        assert adapter._teams_send.await_count == 3, (
+            "Caller-supplied StreamOptions.update_interval_ms=0 should disable coalescing entirely for this stream"
+        )
+
+    @pytest.mark.asyncio
+    async def test_coalesced_text_ships_in_final_close_activity(self):
+        """Even when an emit gets coalesced, the close path ships the full text.
+
+        Regression for the worry that throttling could drop content:
+        the iterator might end inside a throttle window, leaving text
+        that was never sent in an intermediate ``typing`` activity. The
+        final ``message`` from ``_close_stream_session`` always carries
+        ``session.text``, which holds every chunk seen — coalesced or not.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "Hello"
+            yield " coalesced"
+            yield " world"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+        # Only the first chunk emitted as ``typing`` (the rest fell in
+        # the same window and got buffered).
+        assert adapter._teams_send.await_count == 1
+        assert adapter._teams_send.await_args_list[0].args[1]["text"] == "Hello"
+
+        # Now close: the final ``message`` activity carries the FULL
+        # accumulated text — buffered chunks are not lost.
+        await adapter._close_stream_session(tid, session)
+        final_payload = adapter._teams_send.await_args_list[1].args[1]
+        assert final_payload["type"] == "message"
+        assert final_payload["text"] == "Hello coalesced world"
+
+
+# ---------------------------------------------------------------------------
+# streamInfo entity contract (Bot Framework REST: streamId on entity + channelData)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamInfoEntityContract:
+    """Pin the wire-format requirement that ``streamId`` lives on the entity too.
+
+    Per the Bot Framework streaming contract, the ``streaminfo`` entity
+    must carry ``streamId`` on subsequent and final activities, not just
+    ``channelData``. Earlier versions of this adapter only set it on
+    ``channelData``, which Teams treats as a malformed continuation
+    and may detach from the original stream.
+    """
+
+    @pytest.mark.asyncio
+    async def test_subsequent_chunk_streaminfo_entity_carries_stream_id(self):
+        adapter = _make_adapter(clock_step_ms=2000.0)
+        adapter._teams_send = AsyncMock(side_effect=[{"id": "stream-id-1"}, {"id": "ignored"}])
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "first"
+            yield " second"
+
+        await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # First chunk's entity has no streamId (server hasn't assigned).
+        first_entity = adapter._teams_send.await_args_list[0].args[1]["entities"][0]
+        assert "streamId" not in first_entity
+
+        # Second chunk's entity MUST carry the captured streamId.
+        second_entity = adapter._teams_send.await_args_list[1].args[1]["entities"][0]
+        assert second_entity["streamId"] == "stream-id-1", (
+            "Subsequent streaminfo entity must include streamId per Bot "
+            "Framework streaming contract. Setting it only on channelData "
+            "may cause Teams to detach the chunk from the initial stream."
+        )
+        # And the channelData level still has it too — both sites required.
+        second_channel_data = adapter._teams_send.await_args_list[1].args[1]["channelData"]
+        assert second_channel_data["streamId"] == "stream-id-1"
+
+    @pytest.mark.asyncio
+    async def test_final_streaminfo_entity_carries_stream_id(self):
+        """The final ``message`` activity's streaminfo entity also needs streamId."""
+        adapter = _make_adapter()
+        adapter._teams_send = AsyncMock(return_value={"id": "ignored"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        # Simulate a stream that ran and got a server-assigned id.
+        session.stream_id = "my-stream-id"
+        session._text = "complete reply"  # noqa: SLF001
+
+        await adapter._close_stream_session(tid, session)
+
+        payload = adapter._teams_send.await_args.args[1]
+        assert payload["entities"] == [
+            {
+                "type": "streaminfo",
+                "streamType": _STREAM_TYPE_FINAL,
+                "streamId": "my-stream-id",
+            }
+        ]
+        assert payload["channelData"]["streamId"] == "my-stream-id"
 
 
 # ---------------------------------------------------------------------------
