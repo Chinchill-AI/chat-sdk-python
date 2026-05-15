@@ -304,11 +304,13 @@ class TestMarkdownBoldConversion:
         widgets = gchat_card["card"]["sections"][0]["widgets"]
         assert widgets[0]["textParagraph"]["text"] == "*Project*: my-app, *Status*: active"
 
-    def test_preserves_single_asterisk(self):
-        card = Card(children=[CardText("Already *bold* in GChat format")])
+    def test_single_asterisk_markdown_italic_becomes_gchat_italic(self):
+        # *text* is markdown italic; the full converter renders it as _text_ (GChat italic),
+        # not *text* (GChat bold). Card content is always treated as markdown.
+        card = Card(children=[CardText("The *italic* word")])
         gchat_card = card_to_google_card(card)
         widgets = gchat_card["card"]["sections"][0]["widgets"]
-        assert widgets[0]["textParagraph"]["text"] == "Already *bold* in GChat format"
+        assert widgets[0]["textParagraph"]["text"] == "The _italic_ word"
 
     def test_converts_bold_in_field_values(self):
         card = Card(children=[Fields([Field(label="Status", value="**Active**")])])
@@ -329,6 +331,14 @@ class TestMarkdownBoldConversion:
         gchat_card = card_to_google_card(card)
         widgets = gchat_card["card"]["sections"][0]["widgets"]
         assert widgets[0]["textParagraph"]["text"] == "Plain text"
+
+    def test_markdown_bullet_list_with_bold_labels_renders_without_raw_markers(self):
+        # Agent responses use markdown lists with bold labels. The naive **→* regex
+        # left list markers and asterisks literal in textParagraph, rendering as "* *Jira:*".
+        card = Card(children=[CardText("- **Jira:** create issues\n- **Zendesk:** manage tickets")])
+        text = card_to_google_card(card)["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"]
+        assert "• " in text, "markdown list items must render as • bullets, not raw '- item'"
+        assert "**" not in text, "markdown **bold** must be converted to GChat *bold*"
 
 
 # ---------------------------------------------------------------------------
