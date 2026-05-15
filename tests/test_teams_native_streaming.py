@@ -632,7 +632,15 @@ class TestFlushThrottle:
 
     @pytest.mark.asyncio
     async def test_flush_skips_emit_if_session_canceled_during_wait(self):
-        """Cancellation during the throttle wait suppresses the flush emit."""
+        """Cancellation during the throttle wait suppresses the flush emit.
+
+        The returned ``RawMessage`` carries ONLY the text Teams actually
+        accepted (the pre-cancel in-loop emit), not the buffered suffix
+        the user canceled out of. ``Thread.stream``'s outer accumulator
+        builds the ``SentMessage`` body from this value, so the SDK's
+        recorded history must match what the user actually saw — not the
+        local buffer that never shipped.
+        """
         adapter = _make_adapter(clock_step_ms=0.0)
         adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
         tid = _dm_thread_id(adapter)
@@ -647,16 +655,67 @@ class TestFlushThrottle:
 
         async def text_gen():
             yield "Hello"
-            yield " world"
+            yield " world"  # coalesced into the throttle window, then canceled
 
         result = await adapter._stream_via_emit(tid, text_gen(), session)
 
         # Only the initial chunk emit — the flush bailed because the
         # session was canceled during the throttle wait.
         assert adapter._teams_send.await_count == 1
-        # But the cumulative text is still recorded so the caller has
-        # an accurate RawMessage / SentMessage history.
-        assert result.raw["text"] == "Hello world"
+        # ``Hello`` was committed by the first in-loop emit. `` world`` was
+        # buffered in the throttle window and the flush was canceled
+        # before shipping it. Return only what Teams accepted.
+        assert result.raw["text"] == "Hello", (
+            "RawMessage must carry only ``last_committed_text`` when the "
+            "session is canceled during the flush throttle wait. Returning "
+            "the buffered suffix would let Thread.stream record text the "
+            "user canceled out of."
+        )
+        # session._text mirrors the RawMessage so the (skipped) close
+        # path would also see only the accepted text.
+        assert session.text == "Hello"
+        assert session.canceled is True
+
+    @pytest.mark.asyncio
+    async def test_in_loop_cancellation_returns_only_committed_text(self):
+        """Mid-stream cancellation after a coalesced chunk returns only-emitted text.
+
+        Companion to the during-wait test above. When a chunk has been
+        accumulated locally but coalesced (inside the throttle window),
+        and then the session is canceled before the next emit, the loop's
+        ``if session.canceled: break`` exits without flushing. The bottom
+        return block must surface ``last_committed_text``, not the
+        locally-buffered ``accumulated``, for the same reason: the
+        ``SentMessage`` recorded by ``Thread.stream`` must match what
+        Teams actually accepted (which is what the user saw).
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "Hello"
+            yield " buffered"  # coalesced (inside window)
+            session.cancel()
+            yield " never-sent"  # cancel-check at top of next iter breaks
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Only the first chunk emit. The second chunk was coalesced
+        # (still inside the window) but the cancel-check at the top of
+        # iteration 3 broke the loop before another emit. The flush is
+        # gated on ``not session.canceled`` so it's skipped too.
+        assert adapter._teams_send.await_count == 1
+        assert result.raw["text"] == "Hello", (
+            "RawMessage must carry only what Teams actually shipped "
+            "(``last_committed_text``) when the session is canceled "
+            "with buffered text still pending. Returning ``accumulated`` "
+            "would let Thread.stream record `` buffered`` even though "
+            "the user never saw it."
+        )
+        assert session.text == "Hello"
         assert session.canceled is True
 
 

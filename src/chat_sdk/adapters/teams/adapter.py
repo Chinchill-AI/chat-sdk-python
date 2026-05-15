@@ -1301,39 +1301,46 @@ class TeamsAdapter:
             elapsed_ms = self._stream_clock_ms() - last_emit_at_ms
             if elapsed_ms < emit_interval_ms:
                 await self._stream_sleep_ms(emit_interval_ms - elapsed_ms)
-                # Cancellation may have arrived during the wait (the chat
-                # handler can call ``session.cancel()`` from another task).
-                # Re-check before emitting so we don't ship text the user
-                # explicitly canceled out of.
-                if session.canceled:
-                    session._text = accumulated  # noqa: SLF001
-                    return RawMessage(
-                        id=session.first_chunk_id,
-                        thread_id=thread_id,
-                        raw={"text": accumulated},
-                    )
-            result = await self._emit_streaming_activity(
-                decoded=decoded,
-                thread_id=thread_id,
-                session=session,
-                text=accumulated,
-            )
-            if session.stream_id is None:
-                chunk_id = result.get("id") or ""
-                session.first_chunk_id = chunk_id
-                if chunk_id:
-                    session.stream_id = chunk_id
+            # Re-check cancellation after the wait — the chat handler can
+            # call ``session.cancel()`` from another task while we sleep.
+            # If we're canceled, skip the emit entirely; the bottom return
+            # block will surface only ``last_committed_text`` so the
+            # ``SentMessage`` matches what Teams actually shipped to the
+            # user (not the buffered suffix the user explicitly canceled
+            # out of). Same shape as in-loop cancellation.
+            if not session.canceled:
+                result = await self._emit_streaming_activity(
+                    decoded=decoded,
+                    thread_id=thread_id,
+                    session=session,
+                    text=accumulated,
+                )
+                last_committed_text = accumulated
+                if session.stream_id is None:
+                    chunk_id = result.get("id") or ""
+                    session.first_chunk_id = chunk_id
+                    if chunk_id:
+                        session.stream_id = chunk_id
 
+        # Pick the cumulative text that Teams actually accepted: when
+        # canceled (in-loop break or during-wait cancellation), some
+        # text may have been buffered locally but never shipped — return
+        # only ``last_committed_text`` so ``Thread.stream``'s outer
+        # accumulator records what the user actually saw. When the stream
+        # ran to completion, ``last_committed_text`` and ``accumulated``
+        # are equal (the flush above committed the final batch), so this
+        # collapses to ``accumulated`` in the happy path.
+        final_text = last_committed_text if session.canceled else accumulated
         # Persist accumulated text on the session so close() can emit the
         # final ``message`` activity with the same content the user saw.
         # Direct ``_text`` write is the canonical mutator (the public
         # ``text`` property is read-only by design); both classes live in
         # the same module so this isn't a cross-module SLF001.
-        session._text = accumulated  # noqa: SLF001
+        session._text = final_text  # noqa: SLF001
         return RawMessage(
             id=session.first_chunk_id,
             thread_id=thread_id,
-            raw={"text": accumulated},
+            raw={"text": final_text},
         )
 
     async def _emit_streaming_activity(
