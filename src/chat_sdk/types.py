@@ -244,6 +244,23 @@ class Author:
 
 
 @dataclass
+class UserInfo:
+    """User information returned by :meth:`Adapter.get_user`.
+
+    Mirrors upstream ``UserInfo`` (``packages/chat/src/types.ts``).  Fields
+    that aren't universally available across platforms (``email``,
+    ``avatar_url``) are optional.
+    """
+
+    full_name: str
+    is_bot: bool
+    user_id: str
+    user_name: str
+    avatar_url: str | None = None
+    email: str | None = None
+
+
+@dataclass
 class MessageMetadata:
     """Message metadata."""
 
@@ -1201,6 +1218,14 @@ class Adapter(Protocol):
     async def handle_webhook(self, request: Any, options: WebhookOptions | None = None) -> Any: ...
     async def initialize(self, chat: ChatInstance) -> None: ...
 
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up user information by user ID.
+
+        Optional — not all platforms support this.  Returns ``None`` when the
+        user is not found or the lookup fails.
+        """
+        return None
+
 
 class BaseAdapter:
     """Base adapter with default implementations for optional methods.
@@ -1347,6 +1372,17 @@ class BaseAdapter:
     async def disconnect(self) -> None:
         """Cleanup hook called when the Chat instance is shut down."""
         raise ChatNotImplementedError(self.name, "disconnect")
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up user information by user ID.
+
+        Optional — not all platforms support this.  Concrete adapters that
+        can resolve users via a platform API should override this.  The
+        default raises :class:`~chat_sdk.errors.ChatNotImplementedError`,
+        which :meth:`~chat_sdk.chat.Chat.get_user` translates into a
+        ``"does not support get_user"`` :class:`~chat_sdk.errors.ChatError`.
+        """
+        raise ChatNotImplementedError(self.name, "getUser")
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on an attachment after deserialization.

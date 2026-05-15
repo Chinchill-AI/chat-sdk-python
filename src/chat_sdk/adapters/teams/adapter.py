@@ -17,7 +17,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -55,6 +55,7 @@ from chat_sdk.types import (
     ReactionEvent,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -213,6 +214,76 @@ class TeamsAdapter:
         self._chat = chat
         self._logger.info("Teams adapter initialized")
 
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a Teams user via Microsoft Graph ``GET /users/{id}``.
+
+        Teams Bot Framework user IDs (``29:...``) are not directly usable
+        by Graph — Graph needs the tenant-scoped AAD object ID. We cache
+        the ``aadObjectId`` from each inbound activity in
+        :meth:`_cache_user_context`, so this call only succeeds for users
+        that have interacted with the bot since the cache TTL.
+
+        Returns ``None`` when the user has never interacted (no cached
+        ``aadObjectId``), the chat instance isn't initialized, or the
+        Graph API call fails. Requires the ``User.Read.All`` application
+        permission on the bot's app registration.
+
+        Mirrors upstream ``TeamsAdapter.getUser`` (vercel/chat#404).
+        """
+        if not self._chat:
+            return None
+        try:
+            aad_object_id = await self._chat.get_state().get(f"teams:aadObjectId:{user_id}")
+        except Exception:
+            return None
+        if not aad_object_id:
+            self._logger.debug("No cached aadObjectId for user", {"userId": user_id})
+            return None
+        # Defense in depth: aadObjectId came from a webhook so it's already
+        # platform-trusted, but reject obvious junk before issuing a Graph
+        # call (avoids URL injection if the cache is ever populated from
+        # an attacker-controlled path). Reject the structural splitters
+        # that change URL semantics outright (`/`, `?`, `#`), then
+        # percent-encode the remainder via `quote(safe="")` (matches
+        # Discord's pattern) so whitespace, `\\`, `;`, etc. cannot escape
+        # the `/users/{id}` path segment.
+        aad_str = str(aad_object_id)
+        if not aad_str or "/" in aad_str or "?" in aad_str or "#" in aad_str:
+            return None
+        try:
+            token = await self._get_graph_token()
+            session = await self._get_http_session()
+            url = f"https://graph.microsoft.com/v1.0/users/{quote(aad_str, safe='')}"
+            async with session.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                if not response.ok:
+                    self._logger.warn(
+                        "Failed to fetch user info from Graph API",
+                        {"userId": user_id, "status": response.status},
+                    )
+                    return None
+                graph_user = await response.json()
+        except Exception as error:
+            self._logger.warn(
+                "Failed to fetch user info from Graph API",
+                {"userId": user_id, "error": str(error)},
+            )
+            return None
+        if not isinstance(graph_user, dict):
+            return None
+        display_name = graph_user.get("displayName") or aad_str
+        user_principal = graph_user.get("userPrincipalName")
+        return UserInfo(
+            user_id=user_id,
+            user_name=user_principal or display_name or user_id,
+            full_name=display_name,
+            is_bot=False,
+            email=graph_user.get("mail"),
+            avatar_url=None,
+        )
+
     async def handle_webhook(
         self,
         request: Any,
@@ -301,6 +372,14 @@ class TeamsAdapter:
         tenant_id = conversation.get("tenantId") or channel_data.get("tenant", {}).get("id")
         if tenant_id and state:
             await state.set(f"teams:tenantId:{user_id}", tenant_id, ttl)
+
+        # Cache aadObjectId for Microsoft Graph API user lookups (chat.get_user).
+        # Only Bot Framework user IDs ("29:...") are surfaced in incoming
+        # activities; the Graph API needs the tenant-scoped AAD object ID
+        # to call /users/{id}. Cache when present so get_user() can map.
+        aad_object_id = from_user.get("aadObjectId")
+        if aad_object_id and state:
+            await state.set(f"teams:aadObjectId:{user_id}", aad_object_id, ttl)
 
         # Cache channel context
         team_aad_group_id = channel_data.get("team", {}).get("aadGroupId")

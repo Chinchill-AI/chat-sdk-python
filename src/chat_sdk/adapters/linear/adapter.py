@@ -55,6 +55,7 @@ from chat_sdk.types import (
     RawMessage,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -257,6 +258,40 @@ class LinearAdapter:
             if self._access_token_expiry and time.time() > self._access_token_expiry:
                 self._logger.info("Linear access token expired, refreshing...")
                 await self._refresh_client_credentials_token()
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a Linear user by UUID via the GraphQL ``user`` query.
+
+        Returns ``None`` on any failure (auth missing, user not found,
+        network error). Mirrors upstream ``LinearAdapter.getUser``
+        (vercel/chat#391), which uses the official Linear SDK; we issue
+        the equivalent GraphQL query directly so we don't take a runtime
+        dependency on the JS SDK.
+        """
+        try:
+            await self._ensure_valid_token()
+            data = await self._graphql_query(
+                "query GetUser($id: String!) {  user(id: $id) {    id displayName name email avatarUrl  }}",
+                {"id": user_id},
+            )
+        except Exception:
+            return None
+        user = (data.get("data") or {}).get("user") if isinstance(data, dict) else None
+        if not user or not isinstance(user, dict):
+            return None
+        # Match upstream literally (vercel/chat#391):
+        #   userName: user.displayName, fullName: user.name
+        # No defensive `or` fallbacks — drift from upstream's exact field
+        # mapping creates cross-SDK inconsistency for callers building on
+        # `user_name` / `full_name` semantics.
+        return UserInfo(
+            user_id=user.get("id") or user_id,
+            user_name=user.get("displayName"),
+            full_name=user.get("name"),
+            is_bot=False,
+            avatar_url=user.get("avatarUrl"),
+            email=user.get("email"),
+        )
 
     async def handle_webhook(
         self,

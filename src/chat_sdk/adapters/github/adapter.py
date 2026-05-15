@@ -59,6 +59,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -213,6 +214,40 @@ class GitHubAdapter:
                 )
             except Exception as error:
                 self._logger.warn("Could not fetch bot user ID", {"error": str(error)})
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a GitHub user by numeric account ID.
+
+        Uses the ``GET /user/{account_id}`` endpoint, mirroring the
+        upstream Octokit ``GET /user/{account_id}`` call.
+
+        ``user_id`` must be a numeric string — GitHub account IDs are
+        integers, so we reject anything else before issuing a request
+        (defense against URL injection and a guard for callers that pass
+        a login name by mistake).
+
+        Returns ``None`` when the user is not found, the API returns an
+        error, or authentication is unavailable. Mirrors upstream
+        ``GitHubAdapter.getUser`` (vercel/chat#391).
+        """
+        if not user_id or not user_id.isdigit():
+            return None
+        try:
+            user = await self._github_api_request("GET", f"/user/{user_id}")
+        except Exception as error:
+            self._logger.debug("Failed to fetch user", {"userId": user_id, "error": str(error)})
+            return None
+        if not isinstance(user, dict):
+            return None
+        login = user.get("login") or user_id
+        return UserInfo(
+            user_id=str(user.get("id") if user.get("id") is not None else user_id),
+            user_name=login,
+            full_name=user.get("name") or login,
+            is_bot=user.get("type") == "Bot",
+            avatar_url=user.get("avatar_url"),
+            email=user.get("email"),
+        )
 
     async def _get_http_session(self) -> Any:
         """Return the shared aiohttp session, creating it lazily if needed."""

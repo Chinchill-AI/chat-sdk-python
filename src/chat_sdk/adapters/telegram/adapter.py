@@ -75,6 +75,7 @@ from chat_sdk.types import (
     RawMessage,
     ReactionEvent,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -374,6 +375,43 @@ class TelegramAdapter:
                     await self.start_polling(TelegramLongPollingConfig(delete_webhook=False))
             else:
                 await self.start_polling(polling_config)
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a Telegram user via ``getChat``.
+
+        Telegram has no public ``users.get`` API for bots — ``getChat``
+        with a ``chat_id`` of the user is the closest equivalent and only
+        succeeds when the user has interacted with the bot at least once
+        (so the bot has a private chat record). We restrict resolution to
+        ``type == "private"`` chats so a group/supergroup ID never gets
+        misreported as a user.
+
+        ``is_bot`` is always ``False`` because ``getChat`` does not expose
+        that field on the chat shape — callers needing bot detection
+        should use ``message.author.is_bot`` from incoming events.
+
+        Mirrors upstream ``TelegramAdapter.getUser`` (vercel/chat#391).
+        """
+        try:
+            chat = await self.telegram_fetch("getChat", {"chat_id": user_id})
+        except Exception:
+            return None
+        if not isinstance(chat, dict) or chat.get("type") != "private":
+            return None
+        first = chat.get("first_name") or ""
+        last = chat.get("last_name") or ""
+        full_name = " ".join(part for part in (first, last) if part)
+        chat_id_str = str(chat.get("id", user_id))
+        return UserInfo(
+            user_id=chat_id_str,
+            user_name=chat.get("username") or chat.get("first_name") or chat_id_str,
+            full_name=full_name or chat_id_str,
+            # Documented divergence from upstream parity: getChat doesn't
+            # expose is_bot. See docstring above.
+            is_bot=False,
+            email=None,
+            avatar_url=None,
+        )
 
     async def handle_webhook(
         self,

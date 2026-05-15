@@ -185,6 +185,7 @@ from chat_sdk.types import (
     Thread,
     ThreadInfo,
     ThreadSummary,
+    UserInfo,
     WebhookOptions,
     WellKnownEmoji,
 )
@@ -395,6 +396,7 @@ __all__ = [
     "Thread",
     "ThreadInfo",
     "ThreadSummary",
+    "UserInfo",
     "WebhookOptions",
     "WellKnownEmoji",
 ]

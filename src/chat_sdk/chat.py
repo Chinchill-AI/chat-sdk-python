@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
-from chat_sdk.errors import ChatError, LockError
+from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
     ThreadImpl,
@@ -60,6 +60,7 @@ from chat_sdk.types import (
     ReactionEvent,
     SlashCommandEvent,
     StateAdapter,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -72,8 +73,13 @@ DEFAULT_LOCK_TTL_MS = 30_000  # 30 seconds
 DEDUPE_TTL_MS = 5 * 60 * 1000  # 5 minutes
 MODAL_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
 
-SLACK_USER_ID_REGEX = re.compile(r"^U[A-Z0-9]+$", re.IGNORECASE)
+SLACK_USER_ID_REGEX = re.compile(r"^[UW][A-Z0-9]+$")
 DISCORD_SNOWFLAKE_REGEX = re.compile(r"^\d{17,19}$")
+LINEAR_UUID_REGEX = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+NUMERIC_REGEX = re.compile(r"^\d+$")
 
 # ---------------------------------------------------------------------------
 # Handler type aliases
@@ -1494,6 +1500,57 @@ class Chat:
             False,
         )
 
+    async def get_user(self, user: str | Author) -> UserInfo | None:
+        """Look up user information by user ID.
+
+        The adapter is automatically inferred from the user ID format
+        (Slack ``U.../W...``, Teams ``29:...``, Google Chat ``users/...``,
+        Linear UUID, or numeric for Discord/Telegram/GitHub — disambiguated
+        by which adapters are registered).
+
+        Returns user details including ``email`` and ``avatar_url`` when
+        available — both require appropriate scopes on some platforms (for
+        example ``users:read.email`` on Slack).
+
+        Parameters
+        ----------
+        user:
+            Platform-specific user ID string, or an :class:`Author` object.
+
+        Returns
+        -------
+        :class:`UserInfo` or ``None``
+            ``None`` is returned when the user is not found.
+
+        Raises
+        ------
+        :class:`~chat_sdk.errors.ChatError`
+            * ``Cannot infer adapter from userId "..."`` — the user ID does
+              not match any of the supported platform formats, or the
+              inferred adapter is not registered on this Chat instance.
+            * ``Numeric userId "..." is ambiguous between adapters: ...`` —
+              multiple registered adapters could resolve a numeric ID; call
+              the platform adapter's ``get_user`` directly instead.
+            * ``Adapter "<name>" does not support get_user`` — the resolved
+              adapter does not implement user lookup (e.g. WhatsApp).
+
+        Mirrors ``chat.getUser`` from the upstream TS SDK
+        (``vercel/chat#391``).
+
+        Examples
+        --------
+        ::
+
+            user = await chat.get_user("U123456")
+            print(user.email if user else "<not found>")
+        """
+        user_id = user if isinstance(user, str) else user.user_id
+        adapter = self._infer_adapter_from_user_id(user_id)
+        try:
+            return await adapter.get_user(user_id)
+        except ChatNotImplementedError as exc:
+            raise ChatError(f'Adapter "{adapter.name}" does not support get_user') from exc
+
     def channel(self, channel_id: str) -> ChannelImpl:
         """Get a Channel by its channel ID (e.g. 'slack:C123ABC')."""
         adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
@@ -1593,33 +1650,61 @@ class Chat:
     # ========================================================================
 
     def _infer_adapter_from_user_id(self, user_id: str) -> Adapter:
-        # Google Chat: users/...
+        # ── Unique-prefix formats — no collision possible across adapters ──
+
+        # Google Chat: "users/123456789"
         if user_id.startswith("users/"):
             adapter = self._adapters.get("gchat")
             if adapter:
                 return adapter
 
-        # Teams: 29:...
+        # Teams: "29:base64string..."
         if user_id.startswith("29:"):
             adapter = self._adapters.get("teams")
             if adapter:
                 return adapter
 
-        # Slack: U followed by alphanumeric
+        # Linear: UUID v4 (e.g. "8f1f3c7e-d4e1-4f9a-bf2b-1c3d4e5f6a7b")
+        if LINEAR_UUID_REGEX.match(user_id):
+            adapter = self._adapters.get("linear")
+            if adapter:
+                return adapter
+
+        # Slack: "U..." or "W..." (uppercase only, alphanumeric, 7+ chars).
+        # Case-sensitive on purpose — lowercase strings like "user123" are
+        # GitHub logins, not Slack IDs.
         if SLACK_USER_ID_REGEX.match(user_id):
             adapter = self._adapters.get("slack")
             if adapter:
                 return adapter
 
-        # Discord: snowflake
-        if DISCORD_SNOWFLAKE_REGEX.match(user_id):
-            adapter = self._adapters.get("discord")
-            if adapter:
-                return adapter
+        # Numeric IDs: shared by Discord (17-19 digit snowflakes), Telegram
+        # (positive integer up to 52 bits), and GitHub (numeric account_id).
+        # Disambiguate by which adapters the caller actually registered.
+        if NUMERIC_REGEX.match(user_id):
+            candidates: list[str] = []
+            if DISCORD_SNOWFLAKE_REGEX.match(user_id) and "discord" in self._adapters:
+                candidates.append("discord")
+            if "telegram" in self._adapters:
+                candidates.append("telegram")
+            if "github" in self._adapters:
+                candidates.append("github")
+
+            if len(candidates) == 1:
+                adapter = self._adapters.get(candidates[0])
+                if adapter:
+                    return adapter
+            if len(candidates) > 1:
+                raise ChatError(
+                    f'Numeric userId "{user_id}" is ambiguous between adapters: '
+                    f"{', '.join(candidates)}. Call the platform's adapter "
+                    "directly (e.g. `adapter.get_user(user_id)`)."
+                )
 
         raise ChatError(
             f'Cannot infer adapter from userId "{user_id}". '
-            "Expected: Slack (U...), Teams (29:...), Google Chat (users/...), Discord (numeric)."
+            'Expected: Slack ("U..."), Teams ("29:..."), Google Chat ("users/..."), '
+            "Linear (UUID), or Discord/Telegram/GitHub (numeric)."
         )
 
     # ========================================================================

@@ -195,6 +195,19 @@ class MockAdapter:
         # `thread_id` can still route by string key.
         return RawMessage(id="msg-1", thread_id=channel_id, raw={})
 
+    async def get_user(self, user_id: str) -> Any:
+        """Default mock implementation raises ``ChatNotImplementedError``.
+
+        Tests that exercise :meth:`Chat.get_user` should override this on
+        a per-instance basis (e.g. ``adapter.get_user = AsyncMock(...)``)
+        to mirror the upstream pattern of attaching ``vi.fn()`` per test.
+        Mirrors the upstream Vitest mock, where ``getUser`` is undefined
+        until the test explicitly sets it.
+        """
+        from chat_sdk.errors import ChatNotImplementedError
+
+        raise ChatNotImplementedError(self.name, "getUser")
+
 
 # ---------------------------------------------------------------------------
 # Mock State Adapter
