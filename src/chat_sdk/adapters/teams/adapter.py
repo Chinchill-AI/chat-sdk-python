@@ -1293,7 +1293,6 @@ class TeamsAdapter:
                 session=session,
                 text=accumulated,
             )
-            last_committed_text = accumulated
             if session.stream_id is None:
                 chunk_id = result.get("id") or ""
                 session.first_chunk_id = chunk_id
