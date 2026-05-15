@@ -1219,7 +1219,7 @@ class Adapter(Protocol):
         Optional — not all platforms support this.  Returns ``None`` when the
         user is not found or the lookup fails.
         """
-        ...
+        return None
 
 
 class BaseAdapter:
