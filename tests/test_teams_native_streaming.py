@@ -434,28 +434,12 @@ class TestStreamInfoEntityContract:
         second_channel_data = adapter._teams_send.await_args_list[1].args[1]["channelData"]
         assert second_channel_data["streamId"] == "stream-id-1"
 
-    @pytest.mark.asyncio
-    async def test_final_streaminfo_entity_carries_stream_id(self):
-        """The final ``message`` activity's streaminfo entity also needs streamId."""
-        adapter = _make_adapter()
-        adapter._teams_send = AsyncMock(return_value={"id": "ignored"})
-        tid = _dm_thread_id(adapter)
-        session = _TeamsStreamSession()
-        # Simulate a stream that ran and got a server-assigned id.
-        session.stream_id = "my-stream-id"
-        session._text = "complete reply"  # noqa: SLF001
-
-        await adapter._close_stream_session(tid, session)
-
-        payload = adapter._teams_send.await_args.args[1]
-        assert payload["entities"] == [
-            {
-                "type": "streaminfo",
-                "streamType": _STREAM_TYPE_FINAL,
-                "streamId": "my-stream-id",
-            }
-        ]
-        assert payload["channelData"]["streamId"] == "my-stream-id"
+    # Final-activity streaminfo+streamId is covered by
+    # ``TestNativeStreamingWireFormat.test_close_session_sends_final_message``;
+    # we don't duplicate it here. Subsequent-chunk coverage above is unique
+    # because the streaming-vs-final wire shapes diverge (different
+    # ``streamType``, the streaming chunks also carry ``streamSequence``),
+    # so each test targets a distinct activity type.
 
 
 # ---------------------------------------------------------------------------
