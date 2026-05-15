@@ -340,6 +340,13 @@ class TestMarkdownBoldConversion:
         assert "• " in text, "markdown list items must render as • bullets, not raw '- item'"
         assert "**" not in text, "markdown **bold** must be converted to GChat *bold*"
 
+    def test_muted_style_skips_markdown_conversion(self):
+        # Upstream TS explicitly reverts muted elements to plain emoji-only text.
+        # The full markdown converter must not run on muted content.
+        card = Card(children=[CardText("**bold text**", style="muted")])
+        widgets = card_to_google_card(card)["card"]["sections"][0]["widgets"]
+        assert widgets[0]["textParagraph"]["text"] == "**bold text**"
+
 
 # ---------------------------------------------------------------------------
 # CardLink

@@ -163,6 +163,8 @@ def _convert_text_to_widget(element: dict[str, Any]) -> dict[str, Any]:
 
     if element.get("style") == "bold":
         text = f"*{text}*"
+    elif element.get("style") == "muted":
+        text = convert_emoji(element.get("content", ""))
 
     return {"textParagraph": {"text": text}}
 
