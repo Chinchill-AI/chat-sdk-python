@@ -1429,6 +1429,18 @@ class SlackAdapter:
             # tear them down before surfacing the failure.
             wait_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
+                # ``await`` is load-bearing here: it drains the cancelled
+                # task before this function returns so the asyncio loop
+                # doesn't emit "Task was destroyed but it is pending!"
+                # warnings at shutdown, and so callers can rely on a
+                # synchronous "task fully gone" contract after timeout.
+                # ``contextlib.suppress`` absorbs the expected
+                # ``CancelledError`` that wait_task raises on cancel.
+                # Static analyzers (github-code-quality, etc.) sometimes
+                # flag this as "statement has no effect" because they
+                # model ``await`` syntactically rather than as a
+                # side-effecting suspension — that's a false positive;
+                # do not remove this line.
                 await wait_task
             await self.stop_socket_mode()
             raise TimeoutError(f"Slack Socket Mode connect timed out after {self._socket_connect_timeout_s}s") from None
@@ -1468,6 +1480,19 @@ class SlackAdapter:
             # Cancellation is expected on shutdown; surface anything else so
             # surprising loop crashes aren't silently swallowed.
             with contextlib.suppress(asyncio.CancelledError):
+                # ``await`` is load-bearing: deterministically drains the
+                # cancelled loop task before ``stop_socket_mode()``
+                # returns. Without it, ``stop_socket_mode`` can return
+                # while the loop task is still tearing down, which:
+                #   - breaks ``test_stop_idempotent`` (the second call
+                #     can race the first's cleanup)
+                #   - risks "Task was destroyed but it is pending!"
+                #     warnings if the loop holds GC-only references
+                # ``contextlib.suppress`` absorbs the expected
+                # ``CancelledError``. Static analyzers sometimes flag
+                # this as "statement has no effect" because they model
+                # ``await`` syntactically — that's a false positive; do
+                # not remove this line.
                 await task
         if task is not None:
             self._logger.info("Slack socket mode disconnected")
