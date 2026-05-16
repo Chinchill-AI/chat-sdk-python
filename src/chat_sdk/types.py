@@ -649,6 +649,18 @@ class RawMessage:
     id: str
     thread_id: str
     raw: Any
+    # Optional adapter-authoritative text snapshot. When set, callers
+    # like ``Thread.stream`` MUST prefer this over their own local
+    # accumulator when constructing the recorded ``SentMessage`` body /
+    # message-history entry. Used by adapters whose internal state
+    # (cancellation, throttling, partial commits) makes the local
+    # accumulator diverge from what the platform actually accepted —
+    # the Teams native streaming path sets this when a session is
+    # canceled mid-flight so ``Thread.stream`` records only the text
+    # Teams shipped, not the buffered suffix the user canceled out of.
+    # ``None`` means "use the caller's existing logic" — backward
+    # compatible for adapters that don't need this override.
+    text: str | None = None
 
 
 @dataclass

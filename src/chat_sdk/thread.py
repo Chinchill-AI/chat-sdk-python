@@ -644,9 +644,21 @@ class ThreadImpl:
                     yield chunk
 
             raw_result = await self.adapter.stream(self._id, _wrapped_stream(), options)  # type: ignore[union-attr]
+            # Adapters can override the recorded text via the optional
+            # ``text`` field on ``RawMessage`` when their internal state
+            # (cancellation, throttling, partial commits) makes the local
+            # ``accumulated`` buffer diverge from what the platform
+            # actually accepted. Default ``None`` falls back to the local
+            # buffer — backward-compatible for adapters that don't need
+            # the override (Slack, Discord, GitHub, Google Chat,
+            # Telegram, Linear, WhatsApp). The Teams native streaming
+            # path sets it on cancellation to short-circuit the buffered
+            # suffix that was coalesced into the throttle window but
+            # never emitted.
+            recorded_text = raw_result.text if raw_result.text is not None else accumulated
             sent = self._create_sent_message(
                 raw_result.id,
-                PostableMarkdown(markdown=accumulated),
+                PostableMarkdown(markdown=recorded_text),
                 raw_result.thread_id,
             )
             if self._message_history is not None:

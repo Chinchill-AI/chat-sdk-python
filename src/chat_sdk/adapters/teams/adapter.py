@@ -1337,10 +1337,15 @@ class TeamsAdapter:
         # ``text`` property is read-only by design); both classes live in
         # the same module so this isn't a cross-module SLF001.
         session._text = final_text  # noqa: SLF001
+        # Set ``text`` (the adapter-authoritative override) so
+        # ``Thread.stream`` records only what Teams actually shipped.
+        # Without this, ``Thread._handle_stream``'s local accumulator
+        # would still include the buffered suffix on cancellation.
         return RawMessage(
             id=session.first_chunk_id,
             thread_id=thread_id,
             raw={"text": final_text},
+            text=final_text,
         )
 
     async def _emit_streaming_activity(

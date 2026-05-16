@@ -677,6 +677,72 @@ class TestFlushThrottle:
         assert session.canceled is True
 
     @pytest.mark.asyncio
+    async def test_canceled_stream_sets_raw_message_text_override(self):
+        """``RawMessage.text`` carries the adapter-authoritative snapshot.
+
+        ``Thread.stream`` builds the recorded ``SentMessage`` from its
+        own local accumulator, which includes every chunk yielded to
+        the adapter — even chunks that were coalesced into the throttle
+        window and never shipped. When the session is canceled
+        mid-flight the adapter must surface the corrected text via the
+        explicit ``RawMessage.text`` override so ``Thread.stream`` can
+        prefer it over the local buffer; without this, the SDK records
+        text the user never saw.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def cancel_during_wait(_ms):
+            session.cancel()
+
+        adapter._stream_sleep_ms = AsyncMock(side_effect=cancel_during_wait)
+
+        async def text_gen():
+            yield "Hello"
+            yield " buffered"
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # ``RawMessage.text`` MUST be set (not None) on cancellation so
+        # ``Thread.stream`` can override its local accumulator.
+        assert result.text == "Hello", (
+            "Adapter must populate RawMessage.text on cancellation so "
+            "Thread.stream's recorded SentMessage matches what Teams "
+            "shipped. Returning None would silently fall back to "
+            "Thread.stream's local accumulator (which still contains "
+            "the buffered suffix the user canceled out of)."
+        )
+        # raw["text"] mirrors for backward-compat with callers that
+        # introspect raw directly.
+        assert result.raw["text"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_happy_path_stream_also_sets_raw_message_text(self):
+        """Non-canceled streams also set ``RawMessage.text`` (== accumulated).
+
+        Symmetry: the adapter always sets the override, so
+        ``Thread.stream`` always prefers it. Callers don't have to
+        special-case "is text set or not" — when the adapter ran to
+        completion the override equals the local accumulator anyway.
+        """
+        adapter = _make_adapter(clock_step_ms=2000.0)
+        adapter._teams_send = AsyncMock(side_effect=[{"id": "first"}, {"id": "ignored"}])
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield "Hello "
+            yield "world"
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+        assert result.text == "Hello world"
+        assert session.canceled is False
+
+    @pytest.mark.asyncio
     async def test_in_loop_cancellation_returns_only_committed_text(self):
         """Mid-stream cancellation after a coalesced chunk returns only-emitted text.
 
