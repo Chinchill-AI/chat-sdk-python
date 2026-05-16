@@ -784,6 +784,82 @@ class TestFlushThrottle:
         assert session.text == "Hello"
         assert session.canceled is True
 
+    @pytest.mark.asyncio
+    async def test_flush_wait_cancelled_error_cancels_session(self):
+        """``asyncio.CancelledError`` during the flush throttle wait cancels the session.
+
+        Without this guard, a supervisor-initiated task cancellation that
+        fires while ``_stream_sleep_ms`` is awaiting would propagate
+        ``CancelledError`` out of ``_stream_via_emit`` while
+        ``session.canceled`` is still ``False``. The adapter's finally-
+        block close path would then see a non-canceled session and the
+        invariant "any exception leaving _stream_via_emit implies
+        ``session.canceled``" would be violated. Mirrors the in-loop
+        try/except shape so the close path can safely rely on the
+        invariant when deciding whether to ship a final ``message``
+        activity.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def cancel_raising_sleep(_ms):
+            raise asyncio.CancelledError
+
+        adapter._stream_sleep_ms = AsyncMock(side_effect=cancel_raising_sleep)
+
+        async def text_gen():
+            yield "Hello"
+            yield " buffered"  # coalesced into the throttle window
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Invariant: any exception leaving ``_stream_via_emit`` MUST
+        # leave the session canceled. Without the flush-block try/except,
+        # ``session.canceled`` would still be False here.
+        assert session.canceled is True, (
+            "Flush-wait CancelledError must cancel the session so the "
+            "close path's final-message activity is skipped. Otherwise "
+            "an external task cancellation could leak past the in-loop "
+            "guard and leave the session in an inconsistent state."
+        )
+        # Only the in-loop emit landed; the flush emit never ran.
+        assert adapter._teams_send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_flush_wait_generic_exception_cancels_session(self):
+        """A non-CancelledError raised by the flush sleep also cancels the session.
+
+        Defense-in-depth for unusual ``_stream_sleep_ms`` implementations
+        (e.g. a custom sleep that raises a timeout/IO error). Mirrors the
+        ``except Exception`` branch in the in-loop try/except: cancel the
+        session before propagating so the close path doesn't ship a
+        final message containing buffered text Teams never accepted.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "first-id"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def raising_sleep(_ms):
+            raise RuntimeError("sleep impl failure")
+
+        adapter._stream_sleep_ms = AsyncMock(side_effect=raising_sleep)
+
+        async def text_gen():
+            yield "Hello"
+            yield " buffered"
+
+        with pytest.raises(RuntimeError, match="sleep impl failure"):
+            await adapter._stream_via_emit(tid, text_gen(), session)
+
+        assert session.canceled is True
+        assert adapter._teams_send.await_count == 1
+
 
 class TestStreamInfoEntityContract:
     """Pin the wire-format requirement that ``streamId`` lives on the entity too.

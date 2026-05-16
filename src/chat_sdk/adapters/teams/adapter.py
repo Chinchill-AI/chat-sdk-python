@@ -1293,34 +1293,62 @@ class TeamsAdapter:
         # loop above without an exception, and we shouldn't flush text the
         # user explicitly canceled out of.
         if not session.canceled and accumulated != last_committed_text:
-            # Honor the throttle even for the end-of-stream flush — a fast
-            # LLM stream that finishes inside the throttle window after the
-            # last successful emit would 429 the Bot Framework streaming
-            # endpoint otherwise (1 req/sec quota), cancelling the stream
-            # mid-flight. Wait for the remaining window before shipping.
-            elapsed_ms = self._stream_clock_ms() - last_emit_at_ms
-            if elapsed_ms < emit_interval_ms:
-                await self._stream_sleep_ms(emit_interval_ms - elapsed_ms)
-            # Re-check cancellation after the wait — the chat handler can
-            # call ``session.cancel()`` from another task while we sleep.
-            # If we're canceled, skip the emit entirely; the bottom return
-            # block will surface only ``last_committed_text`` so the
-            # ``SentMessage`` matches what Teams actually shipped to the
-            # user (not the buffered suffix the user explicitly canceled
-            # out of). Same shape as in-loop cancellation.
-            if not session.canceled:
-                result = await self._emit_streaming_activity(
-                    decoded=decoded,
-                    thread_id=thread_id,
-                    session=session,
-                    text=accumulated,
-                )
-                last_committed_text = accumulated
-                if session.stream_id is None:
-                    chunk_id = result.get("id") or ""
-                    session.first_chunk_id = chunk_id
-                    if chunk_id:
-                        session.stream_id = chunk_id
+            # Wrap the throttle wait + emit in the same control-flow guard
+            # as the in-loop try/except: ``_stream_sleep_ms`` (and the
+            # clock read above it) can raise — most importantly
+            # ``asyncio.CancelledError`` when the chat task is cancelled by
+            # a supervisor mid-wait. Without this guard the session is
+            # left ``canceled=False`` while the exception propagates,
+            # and the finally-block close path would proceed as if the
+            # stream ran to completion. Mirroring the in-loop pattern
+            # keeps the close path's invariant consistent: any exception
+            # leaving this method implies ``session.canceled`` is True.
+            try:
+                # Honor the throttle even for the end-of-stream flush — a
+                # fast LLM stream that finishes inside the throttle window
+                # after the last successful emit would 429 the Bot Framework
+                # streaming endpoint otherwise (1 req/sec quota), cancelling
+                # the stream mid-flight. Wait for the remaining window
+                # before shipping.
+                elapsed_ms = self._stream_clock_ms() - last_emit_at_ms
+                if elapsed_ms < emit_interval_ms:
+                    await self._stream_sleep_ms(emit_interval_ms - elapsed_ms)
+                # Re-check cancellation after the wait — the chat handler can
+                # call ``session.cancel()`` from another task while we sleep.
+                # If we're canceled, skip the emit entirely; the bottom return
+                # block will surface only ``last_committed_text`` so the
+                # ``SentMessage`` matches what Teams actually shipped to the
+                # user (not the buffered suffix the user explicitly canceled
+                # out of). Same shape as in-loop cancellation.
+                if not session.canceled:
+                    result = await self._emit_streaming_activity(
+                        decoded=decoded,
+                        thread_id=thread_id,
+                        session=session,
+                        text=accumulated,
+                    )
+                    last_committed_text = accumulated
+                    if session.stream_id is None:
+                        chunk_id = result.get("id") or ""
+                        session.first_chunk_id = chunk_id
+                        if chunk_id:
+                            session.stream_id = chunk_id
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+                # Control-flow exceptions during the flush wait or emit:
+                # cancel the session so the finally-block close path skips
+                # its final ``message`` activity. ``_emit_streaming_activity``
+                # already calls ``session.cancel()`` on its own failures
+                # before re-raising, so this is a no-op there; the cancel
+                # here is what covers the throttle-wait path.
+                session.cancel()
+                raise
+            except Exception:
+                # Same shape as the in-loop ``except Exception``: cancel
+                # the session before propagating so the close path doesn't
+                # ship a final ``message`` containing text Teams never
+                # accepted via this flush emit.
+                session.cancel()
+                raise
 
         # Pick the cumulative text that Teams actually accepted: when
         # canceled (in-loop break or during-wait cancellation), some
