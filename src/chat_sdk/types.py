@@ -660,6 +660,14 @@ class RawMessage:
     # Teams shipped, not the buffered suffix the user canceled out of.
     # ``None`` means "use the caller's existing logic" — backward
     # compatible for adapters that don't need this override.
+    #
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's
+    # ``RawMessage`` interface (packages/chat/src/types.ts) has only
+    # ``id``, ``raw``, ``threadId``; the override is Python-only because
+    # we hand-roll Teams native streaming (upstream uses
+    # ``@microsoft/teams.apps``'s ``IStreamer.emit`` which owns the
+    # cancellation-text reconciliation internally). Will simplify or
+    # disappear once we migrate to ``microsoft-teams-apps`` (Python).
     text: str | None = None
 
 
