@@ -286,6 +286,80 @@ class TestStreaming:
         # Should NOT call postMessage for fallback
         assert len(adapter._post_calls) == 0
 
+    @pytest.mark.asyncio
+    async def test_should_prefer_raw_message_text_override_over_local_accumulator(self):
+        """When ``adapter.stream`` returns ``RawMessage`` with ``text`` set, the
+        recorded ``SentMessage`` body MUST come from that override, not from
+        Thread.stream's local accumulator.
+
+        This is the contract that makes Teams native streaming's
+        cancellation path consistent: ``Thread._handle_stream``
+        accumulates each chunk into a local buffer BEFORE yielding to
+        the adapter, so on cancellation the buffer includes text the
+        adapter never shipped to the platform. The adapter signals the
+        corrected snapshot via ``RawMessage.text``; without honoring it
+        the SDK's recorded ``SentMessage`` would diverge from what the
+        user actually saw.
+        """
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        # Adapter drains the iterator (matching the real-world contract —
+        # ``_wrapped_stream`` only populates Thread.stream's local
+        # accumulator if the adapter actually iterates it) and reports
+        # back via the override that only "Hello" was shipped even though
+        # "Hello world" was yielded.
+        async def mock_stream(thread_id, text_stream, options=None):
+            async for _chunk in text_stream:
+                pass
+            return RawMessage(
+                id="msg-1",
+                thread_id="t1",
+                raw={"text": "Hello"},
+                text="Hello",
+            )
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello", " world"])
+        result = await thread.post(text_stream)
+
+        assert result.text == "Hello", (
+            "Thread.stream must prefer RawMessage.text over its local "
+            "accumulator. Returning the local 'Hello world' would let "
+            "Thread.stream record text the adapter said was never shipped."
+        )
+
+    @pytest.mark.asyncio
+    async def test_should_fall_back_to_local_accumulator_when_text_override_is_none(self):
+        """Default behavior: when ``RawMessage.text`` is ``None`` (the
+        backward-compatible default for adapters that don't set it),
+        Thread.stream falls back to its local accumulator.
+
+        Critical for adapters like Slack/Discord/GitHub/Linear/etc. that
+        don't need the override — adding the new field must not change
+        their recorded text.
+        """
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        # No ``text`` set — defaults to None. Adapter drains the
+        # iterator so Thread.stream's local accumulator populates.
+        async def mock_stream(thread_id, text_stream, options=None):
+            async for _chunk in text_stream:
+                pass
+            return RawMessage(id="msg-1", thread_id="t1", raw={})
+
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello", " ", "world"])
+        result = await thread.post(text_stream)
+
+        # Local accumulator wins because the adapter didn't override.
+        assert result.text == "Hello world"
+
     # it("should fall back to post+edit when adapter has no native streaming")
     @pytest.mark.asyncio
     async def test_should_fall_back_to_postedit_when_adapter_has_no_native_streaming(self):

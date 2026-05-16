@@ -654,6 +654,26 @@ class RawMessage:
     id: str
     thread_id: str
     raw: Any
+    # Optional adapter-authoritative text snapshot. When set, callers
+    # like ``Thread.stream`` MUST prefer this over their own local
+    # accumulator when constructing the recorded ``SentMessage`` body /
+    # message-history entry. Used by adapters whose internal state
+    # (cancellation, throttling, partial commits) makes the local
+    # accumulator diverge from what the platform actually accepted —
+    # the Teams native streaming path sets this when a session is
+    # canceled mid-flight so ``Thread.stream`` records only the text
+    # Teams shipped, not the buffered suffix the user canceled out of.
+    # ``None`` means "use the caller's existing logic" — backward
+    # compatible for adapters that don't need this override.
+    #
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's
+    # ``RawMessage`` interface (packages/chat/src/types.ts) has only
+    # ``id``, ``raw``, ``threadId``; the override is Python-only because
+    # we hand-roll Teams native streaming (upstream uses
+    # ``@microsoft/teams.apps``'s ``IStreamer.emit`` which owns the
+    # cancellation-text reconciliation internally). Will simplify or
+    # disappear once we migrate to ``microsoft-teams-apps`` (Python).
+    text: str | None = None
 
 
 @dataclass
