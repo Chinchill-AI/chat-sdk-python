@@ -74,7 +74,15 @@ class _TeamsStreamSession:
     Bot Framework streaming protocol's wire shape stays valid.
     """
 
-    __slots__ = ("stream_id", "sequence", "canceled", "first_chunk_id", "_text")
+    __slots__ = (
+        "stream_id",
+        "sequence",
+        "canceled",
+        "first_chunk_id",
+        "_text",
+        "last_emit_at_ms",
+        "emit_interval_ms",
+    )
 
     def __init__(self) -> None:
         self.stream_id: str | None = None
@@ -87,6 +95,21 @@ class _TeamsStreamSession:
         # final message.
         self.first_chunk_id: str = ""
         self._text: str = ""
+        # Timestamp (ms, same frame as ``TeamsAdapter._stream_clock_ms``) of
+        # the most recent successful emit. Read by ``_close_stream_session``
+        # so the final ``message`` activity honors the same 1-req/sec quota
+        # as the streaming ``typing`` activities — Teams' streaming endpoint
+        # rate-limits ALL activities on a given streamId together, so a close
+        # immediately after a one-chunk emit would 429 without this throttle.
+        # ``-inf`` means "no emit happened" → close path skips the wait.
+        self.last_emit_at_ms: float = float("-inf")
+        # Per-stream emit interval (ms). Cached on the session by
+        # ``_stream_via_emit`` so ``_close_stream_session`` honors caller-
+        # supplied ``StreamOptions.update_interval_ms`` overrides without
+        # the close path needing access to ``options``. ``None`` means
+        # "use the adapter default" (e.g. for sessions constructed outside
+        # the normal stream path, like tests).
+        self.emit_interval_ms: int | None = None
 
     def cancel(self) -> None:
         """Mark the session canceled. ``stream()`` checks this each chunk."""
@@ -1221,6 +1244,10 @@ class TeamsAdapter:
             if options is not None and options.update_interval_ms is not None
             else self._native_stream_min_emit_interval_ms
         )
+        # Persist the resolved interval on the session so
+        # ``_close_stream_session`` can honor the same caller-supplied
+        # override when throttling the final ``message`` activity.
+        session.emit_interval_ms = emit_interval_ms
         # Tracks when the most recent successful emit landed, in the same
         # ms-since-arbitrary-epoch frame as ``self._stream_clock_ms()``.
         # ``-inf`` so the first chunk always passes the interval gate
@@ -1263,6 +1290,11 @@ class TeamsAdapter:
                 )
                 last_committed_text = accumulated
                 last_emit_at_ms = now_ms
+                # Persist for the close-path throttle (see
+                # ``_close_stream_session``). Same value as the local,
+                # mirrored on the session so close has access without
+                # plumbing an extra parameter through.
+                session.last_emit_at_ms = now_ms
 
                 if session.stream_id is None:
                     chunk_id = result.get("id") or ""
@@ -1328,6 +1360,11 @@ class TeamsAdapter:
                         text=accumulated,
                     )
                     last_committed_text = accumulated
+                    # Update the session timestamp post-emit so the
+                    # close-path throttle sees the FLUSH as the most
+                    # recent activity (not the prior in-loop emit).
+                    # Same frame as ``_stream_clock_ms``.
+                    session.last_emit_at_ms = self._stream_clock_ms()
                     if session.stream_id is None:
                         chunk_id = result.get("id") or ""
                         session.first_chunk_id = chunk_id
@@ -1458,6 +1495,40 @@ class TeamsAdapter:
         # emitted (empty stream, or stream canceled before first send).
         if not session.text:
             return
+
+        # Throttle the final ``message`` activity against the same
+        # ~1 req/sec quota the streaming ``typing`` activities honor.
+        # Teams' streaming endpoint rate-limits ALL activities sharing a
+        # ``streamId`` together — a close immediately after a successful
+        # one-chunk emit would 429 without this wait, and because the
+        # exception is swallowed below (fail-soft) Teams would never
+        # receive the final message while the SDK records the response
+        # as sent. ``last_emit_at_ms == -inf`` means no in-stream emit
+        # happened (shouldn't reach here in that case because
+        # ``session.text`` would be empty, but the guard is cheap).
+        if session.last_emit_at_ms != float("-inf"):
+            interval_ms = (
+                session.emit_interval_ms
+                if session.emit_interval_ms is not None
+                else self._native_stream_min_emit_interval_ms
+            )
+            elapsed_ms = self._stream_clock_ms() - session.last_emit_at_ms
+            if elapsed_ms < interval_ms:
+                try:
+                    await self._stream_sleep_ms(interval_ms - elapsed_ms)
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+                    # Supervisor-initiated cancellation during the wait.
+                    # Mark the session canceled so any subsequent dispatch
+                    # (none in normal flow, but cheap defense) sees the
+                    # right state, then re-raise so the caller's
+                    # cancellation propagates correctly.
+                    session.cancel()
+                    raise
+                # Cancellation may have arrived during the wait via
+                # ``session.cancel()`` from another task — check before
+                # shipping the final.
+                if session.canceled:
+                    return
 
         decoded = self.decode_thread_id(thread_id)
         channel_data: dict[str, Any] = {

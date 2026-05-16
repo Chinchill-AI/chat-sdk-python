@@ -861,6 +861,175 @@ class TestFlushThrottle:
         assert adapter._teams_send.await_count == 1
 
 
+class TestCloseStreamThrottle:
+    """Pin that the final ``message`` activity honors the 1 req/sec quota.
+
+    Teams' streaming endpoint rate-limits ALL activities sharing a
+    ``streamId`` together — the streaming ``typing`` activities AND the
+    final ``message`` activity. A short DM response (one chunk, emitted
+    immediately) followed by ``_close_stream_session`` would land two
+    requests in the same second without this throttle, risking a 429
+    that the close-path swallows fail-soft (leaving Teams' streaming UI
+    stuck while the SDK records the response as sent).
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_throttle_window_when_emit_was_recent(self):
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        # Simulate a session whose last in-stream emit happened at clock=0
+        # (just now, since the test clock returns 0 every call). The
+        # close-path should wait the full 1500ms default interval.
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        session.last_emit_at_ms = 0.0
+        session.emit_interval_ms = 1500
+
+        await adapter._close_stream_session(tid, session)
+
+        # The close path called sleep once with the full interval before
+        # sending the final activity.
+        assert adapter._stream_sleep_ms.await_count == 1
+        wait_arg = adapter._stream_sleep_ms.await_args.args[0]
+        assert wait_arg == 1500.0, (
+            f"Close path must throttle the final activity against the "
+            f"1 req/sec quota — got wait of {wait_arg}ms, expected 1500. "
+            f"Without this wait, a fast LLM stream followed by an "
+            f"immediate close would 429 and the swallowed exception "
+            f"would leave Teams' streaming UI stuck."
+        )
+        # The final activity DID ship after the wait.
+        assert adapter._teams_send.await_count == 1
+        final_payload = adapter._teams_send.await_args.args[1]
+        assert final_payload["channelData"]["streamType"] == _STREAM_TYPE_FINAL
+        assert final_payload["text"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_throttle_when_window_already_elapsed(self):
+        """If enough time passed since the last emit, close ships immediately."""
+        adapter = _make_adapter(clock_step_ms=2000.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        # Mark the last emit at clock=0; the clock advances by 2000ms each
+        # call so by the time the close-path checks, elapsed >= 2000ms > 1500ms.
+        session.last_emit_at_ms = 0.0
+        session.emit_interval_ms = 1500
+
+        await adapter._close_stream_session(tid, session)
+
+        # No sleep — window had already elapsed.
+        assert adapter._stream_sleep_ms.await_count == 0
+        # Final activity shipped.
+        assert adapter._teams_send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_close_honors_session_interval_override(self):
+        """``StreamOptions.update_interval_ms`` override propagates to close.
+
+        The interval is cached on the session by ``_stream_via_emit``
+        when the stream runs. The close path reads it instead of falling
+        back to the adapter default — so a caller that asked for
+        ``update_interval_ms=0`` (no throttle) gets immediate close even
+        when the last emit was recent.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        session.last_emit_at_ms = 0.0
+        # Caller asked for no throttle — close should skip the wait even
+        # though the last emit was at clock=0 (same instant).
+        session.emit_interval_ms = 0
+
+        await adapter._close_stream_session(tid, session)
+
+        assert adapter._stream_sleep_ms.await_count == 0
+        assert adapter._teams_send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_close_falls_back_to_adapter_default_when_session_interval_unset(self):
+        """If ``session.emit_interval_ms`` was never set (defensive path), use the adapter default."""
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        session.last_emit_at_ms = 0.0
+        # session.emit_interval_ms left at default (None)
+        assert session.emit_interval_ms is None
+
+        await adapter._close_stream_session(tid, session)
+
+        # Used the adapter default (1500ms).
+        assert adapter._stream_sleep_ms.await_count == 1
+        assert adapter._stream_sleep_ms.await_args.args[0] == 1500.0
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_throttle_when_no_emit_happened(self):
+        """If no in-stream emit happened (last_emit_at_ms == -inf), close skips the wait.
+
+        Shouldn't reach the throttle code in practice because
+        ``session.text`` would be empty and the close early-returns, but
+        the guard is cheap defense for sessions constructed manually
+        (e.g. tests) that set ``_text`` directly without an emit.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        # last_emit_at_ms left at default (-inf)
+        assert session.last_emit_at_ms == float("-inf")
+
+        await adapter._close_stream_session(tid, session)
+
+        # No sleep — no emit ever happened, no throttle to honor.
+        assert adapter._stream_sleep_ms.await_count == 0
+        assert adapter._teams_send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_close_cancellation_during_wait_skips_final_emit(self):
+        """If ``session.cancel()`` fires during the close-path wait, skip the final.
+
+        Mirrors the in-loop / flush cancellation invariant: text that
+        Teams never received shouldn't be marked as shipped.
+        """
+        adapter = _make_adapter(clock_step_ms=0.0)
+        adapter._teams_send = AsyncMock(return_value={"id": "final-id"})
+        tid = _dm_thread_id(adapter)
+
+        session = _TeamsStreamSession()
+        session._text = "Hello"  # noqa: SLF001
+        session.stream_id = "stream-1"
+        session.last_emit_at_ms = 0.0
+        session.emit_interval_ms = 1500
+
+        async def cancel_during_wait(_ms):
+            session.cancel()
+
+        adapter._stream_sleep_ms = AsyncMock(side_effect=cancel_during_wait)
+
+        await adapter._close_stream_session(tid, session)
+
+        # Sleep was called (entered the wait) but the final never shipped.
+        assert adapter._stream_sleep_ms.await_count == 1
+        assert adapter._teams_send.await_count == 0
+
+
 class TestStreamInfoEntityContract:
     """Pin the wire-format requirement that ``streamId`` lives on the entity too.
 
