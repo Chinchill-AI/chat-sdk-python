@@ -83,6 +83,7 @@ from chat_sdk.types import (
     ModalResponse,
     ModalSubmitEvent,
     OptionsLoadEvent,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     ScheduledMessage,
@@ -2543,14 +2544,23 @@ class SlackAdapter:
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
         # Normalize empty thread_ts to None to avoid Slack API "invalid_thread_ts" errors.
-        # Stream requires a real thread context — bail out when missing.
+        # ``chat.startStream`` rejects an empty thread_ts (top-level DMs have no
+        # parent thread to attach to), but ``chat.postMessage`` accepts it.
+        # Degrade DMs to a single accumulated post_message call so streaming
+        # replies aren't silently dropped (chat-sdk-python#94).
         thread_ts = decoded.thread_ts or None
         if not thread_ts:
-            self._logger.debug("Slack: stream skipped - no thread context")
-            raise ValidationError(
-                "slack",
-                "Slack streaming requires a valid thread context (non-empty thread_ts)",
+            self._logger.debug(
+                "Slack: stream degraded to post_message - no thread context",
+                {"channel": channel},
             )
+            accumulated = ""
+            async for chunk in text_stream:
+                if isinstance(chunk, str):
+                    accumulated += chunk
+                elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
+                    accumulated += chunk.text  # type: ignore[union-attr]
+            return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
         self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
         token = self._get_token()

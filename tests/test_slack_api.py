@@ -1365,9 +1365,11 @@ class TestEmptyThreadTsGuards:
 
     What to fix if this fails: each Slack API call (``chat_postMessage``,
     ``chat_postEphemeral``, ``chat_scheduleMessage``) must pass ``None``
-    instead of the empty string for ``thread_ts``. ``stream`` has stricter
-    requirements — it must raise ``ValidationError`` because the streaming
-    API has no top-level-DM concept.
+    instead of the empty string for ``thread_ts``. ``stream`` must degrade
+    to a single accumulated ``post_message`` call when ``thread_ts`` is
+    empty — ``chat.startStream`` rejects empty thread_ts but
+    ``chat.postMessage`` accepts it, and raising would silently drop
+    top-level DM streaming replies (chat-sdk-python#94).
     """
 
     @pytest.mark.asyncio
@@ -1386,27 +1388,79 @@ class TestEmptyThreadTsGuards:
         assert calls[0]["kwargs"]["thread_ts"] is None
 
     @pytest.mark.asyncio
-    async def test_stream_with_empty_thread_ts_raises_validation_error(self):
+    async def test_stream_with_empty_thread_ts_degrades_to_post_message(self):
+        """Top-level DMs (empty ``thread_ts``) must accumulate the stream and
+        post a single non-streamed message instead of raising.
+
+        What to fix if this fails: ``SlackAdapter.stream`` must, when
+        ``thread_ts`` is empty, drain ``text_stream`` (concatenating
+        ``str`` chunks and ``markdown_text`` chunk text), call
+        ``post_message`` exactly once with a ``PostableMarkdown``
+        wrapping the accumulated text, and never invoke
+        ``chat_stream``. Raising here silently drops top-level DM
+        replies because ``Thread._handle_stream`` does not catch
+        adapter exceptions (chat-sdk-python#94).
+        """
         adapter, client, _ = await _init_adapter()
-        # Stream needs a real thread context — top-level DMs can't stream.
-        # The guard must fire BEFORE chat_stream is invoked, otherwise
-        # Slack returns a generic invalid_thread_ts that's hard to debug.
+        # Streaming API mock that must NOT be touched on the empty-thread path.
         mock_streamer = MagicMock()
         mock_streamer.append = AsyncMock()
         mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "0"}})
         client.chat_stream = AsyncMock(return_value=mock_streamer)
+        client.set_response("chat_postMessage", {"ok": True, "ts": "5555.5555"})
+
+        from chat_sdk.types import MarkdownTextChunk
+
+        async def text_gen() -> AsyncIterator[str | StreamChunk]:
+            yield "Hello "
+            yield MarkdownTextChunk(text="from ")
+            yield "DM"
+
+        result = await adapter.stream(
+            "slack:C123:",
+            text_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        # Native streaming API must not have been used.
+        assert not client.chat_stream.called
+        # post_message was invoked exactly once with the accumulated text.
+        post_calls = client.get_calls("chat_postMessage")
+        assert len(post_calls) == 1
+        assert post_calls[0]["kwargs"]["channel"] == "C123"
+        assert post_calls[0]["kwargs"]["thread_ts"] is None
+        assert post_calls[0]["kwargs"]["text"] == "Hello from DM"
+        assert result.id == "5555.5555"
+
+    @pytest.mark.asyncio
+    async def test_stream_with_thread_ts_uses_native_streaming(self):
+        """Non-empty ``thread_ts`` must keep using ``chat_stream`` so the
+        channel-thread streaming path is not regressed by the DM fallback.
+
+        What to fix if this fails: the empty-``thread_ts`` guard in
+        ``SlackAdapter.stream`` must only fire when ``thread_ts`` is
+        falsy. For real thread contexts, ``chat_stream`` must still be
+        awaited and ``chat_postMessage`` must NOT be called.
+        """
+        adapter, client, _ = await _init_adapter()
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "9.9"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
 
         async def text_gen() -> AsyncIterator[str]:
-            yield "should not be sent"
+            yield "channel reply"
 
-        with pytest.raises(ValidationError, match="thread"):
-            await adapter.stream(
-                "slack:C123:",
-                text_gen(),
-                StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
-            )
-        # The mock should never have been touched.
-        assert not client.chat_stream.called
+        result = await adapter.stream(
+            "slack:C123:1234567890.000000",
+            text_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert client.chat_stream.called
+        assert client.chat_stream.call_args.kwargs["thread_ts"] == "1234567890.000000"
+        assert client.get_calls("chat_postMessage") == []
+        assert result.id == "9.9"
 
     @pytest.mark.asyncio
     async def test_post_message_with_zero_string_thread_ts_passes_through(self):
