@@ -5,6 +5,7 @@ Port of packages/adapter-slack/src/index.test.ts.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -746,7 +747,11 @@ class TestMessageSubtypes:
         return _make_signed_request(body)
 
     @pytest.mark.asyncio
-    async def test_ignores_message_changed(self):
+    async def test_message_changed_does_not_route_to_process_message(self):
+        # ``message_changed`` is now routed to the unfurl-cache handler
+        # (see TestUnfurlMetadata) rather than into ``chat.process_message``.
+        # The visible contract from the chat layer's perspective is the
+        # same: message_changed events do not surface as new messages.
         adapter = _make_adapter(bot_user_id="U_BOT")
         state = _make_mock_state()
         chat = _make_mock_chat(state)
@@ -991,3 +996,357 @@ class TestOAuthRedirectUri:
         )
         with pytest.raises(ValidationError, match="client_id"):
             await adapter.handle_oauth_callback(req)
+
+
+# ---------------------------------------------------------------------------
+# Link unfurl metadata enrichment (port of vercel/chat#395 / chat@4.27.0)
+# ---------------------------------------------------------------------------
+
+
+class TestUnfurlMetadata:
+    """Slack delivers link unfurl metadata via legacy ``attachments`` (and
+    via ``message_changed`` events that arrive ~100-2000ms later). We
+    enrich each ``LinkPreview`` so handlers see real metadata instead of
+    bare URLs.
+
+    What to fix if this fails:
+
+    - ``_extract_links`` must read ``event["attachments"]`` and merge
+      ``title``/``text``/``image_url``/``service_name`` into the link
+      preview.
+    - ``_handle_message_changed`` must store unfurl metadata in state
+      keyed by ``slack:unfurls:{ts}``.
+    - ``_enrich_links`` must read that key and merge it into the links.
+    - Trailing-slash mismatch between ``url`` and the attachment's
+      ``from_url`` must be tolerated in both directions.
+    """
+
+    def test_extract_links_inline_attachments_merge_title_and_description(self):
+        adapter = _make_adapter()
+        event = {
+            "text": "Check <https://example.com>",
+            "attachments": [
+                {
+                    "from_url": "https://example.com",
+                    "title": "Example Domain",
+                    "text": "An illustrative example",
+                    "image_url": "https://example.com/img.png",
+                    "service_name": "Example",
+                }
+            ],
+        }
+        links = adapter._extract_links(event)
+        assert len(links) == 1
+        link = links[0]
+        assert link.url == "https://example.com"
+        assert link.title == "Example Domain"
+        assert link.description == "An illustrative example"
+        assert link.image_url == "https://example.com/img.png"
+        assert link.site_name == "Example"
+
+    def test_extract_links_attachment_only_url_is_added(self):
+        # If the URL is only mentioned in an attachment (not the text),
+        # we still create a LinkPreview for it.
+        adapter = _make_adapter()
+        event = {
+            "text": "no urls here",
+            "attachments": [
+                {
+                    "from_url": "https://side.example.com",
+                    "title": "Side",
+                    "text": "Side preview",
+                },
+            ],
+        }
+        links = adapter._extract_links(event)
+        assert len(links) == 1
+        assert links[0].url == "https://side.example.com"
+        assert links[0].title == "Side"
+
+    def test_extract_links_attachment_without_title_or_text_is_skipped(self):
+        # Adversarial: bare attachment with from_url but no title/text —
+        # nothing useful to merge, don't pollute the URL set with it.
+        adapter = _make_adapter()
+        event = {
+            "text": "",
+            "attachments": [{"from_url": "https://no-meta.example.com"}],
+        }
+        links = adapter._extract_links(event)
+        assert links == []
+
+    def test_extract_links_trailing_slash_normalization(self):
+        # Slack canonicalizes URLs with a trailing slash. The event's text
+        # might say <https://example.com> while the attachment's from_url
+        # is https://example.com/. The two URLs become two LinkPreview
+        # entries (matching upstream TS), but both should pick up the
+        # unfurl metadata via the trailing-slash-tolerant lookup.
+        adapter = _make_adapter()
+        event = {
+            "text": "Look at <https://example.com>",
+            "attachments": [
+                {
+                    "from_url": "https://example.com/",  # trailing slash
+                    "title": "Example",
+                    "text": "Body",
+                },
+            ],
+        }
+        links = adapter._extract_links(event)
+        # Both URL variants get the unfurl title — neither is left bare.
+        titles = sorted((link.url, link.title) for link in links)
+        assert any(url == "https://example.com" and title == "Example" for url, title in titles), (
+            "text URL should pick up unfurl via trailing-slash-tolerant lookup"
+        )
+        assert any(url == "https://example.com/" and title == "Example" for url, title in titles), (
+            "attachment URL should still get its own unfurl"
+        )
+
+    @pytest.mark.asyncio
+    async def test_message_changed_caches_unfurls_in_state(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567890.222222",
+                    "message": {
+                        "ts": "1234567890.111111",
+                        "attachments": [
+                            {
+                                "from_url": "https://example.com",
+                                "title": "Cached Title",
+                                "text": "Cached body",
+                                "image_url": "https://example.com/i.png",
+                                "service_name": "Example",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        await adapter.handle_webhook(_make_signed_request(body))
+
+        # Give the spawned task a chance to run.
+        await asyncio.sleep(0)
+        cached = state._cache.get("slack:unfurls:1234567890.111111")
+        assert cached is not None
+        assert cached["https://example.com"]["title"] == "Cached Title"
+        # And process_message must NOT be called for message_changed.
+        assert not chat.process_message.called
+
+    @pytest.mark.asyncio
+    async def test_message_changed_with_no_unfurls_does_not_write_state(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567890.000001",
+                    "message": {
+                        "ts": "1234567890.000002",
+                        "text": "edited body, no unfurls",
+                    },
+                },
+            }
+        )
+        await adapter.handle_webhook(_make_signed_request(body))
+        await asyncio.sleep(0)
+        # Nothing should have been written to state.
+        assert not any(k.startswith("slack:unfurls:") for k in state._cache)
+
+    @pytest.mark.asyncio
+    async def test_enrich_links_pulls_from_state_cache(self):
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # Pre-seed the cache as if message_changed had already landed.
+        state._cache["slack:unfurls:1234567890.111111"] = {
+            "https://example.com": {
+                "title": "From Cache",
+                "description": "Cached body",
+                "image_url": None,
+                "site_name": None,
+            }
+        }
+
+        original = [_LinkPreview(url="https://example.com")]
+        enriched = await adapter._enrich_links(original, "1234567890.111111")
+        assert len(enriched) == 1
+        assert enriched[0].title == "From Cache"
+        assert enriched[0].description == "Cached body"
+
+    @pytest.mark.asyncio
+    async def test_enrich_links_preserves_user_supplied_title(self):
+        # Adversarial: link already has a title (e.g. extracted from a
+        # Slack message URL). Cached unfurl must NOT clobber it.
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        state._cache["slack:unfurls:t1"] = {
+            "https://example.com": {"title": "From Cache", "description": None},
+        }
+        original = [_LinkPreview(url="https://example.com", title="User Title")]
+        enriched = await adapter._enrich_links(original, "t1")
+        assert enriched[0].title == "User Title"
+
+    @pytest.mark.asyncio
+    async def test_enrich_links_returns_unchanged_with_no_chat(self):
+        # When chat isn't initialized, enrichment is a no-op.
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        original = [_LinkPreview(url="https://example.com")]
+        enriched = await adapter._enrich_links(original, "ts1")
+        assert enriched is original
+
+    @pytest.mark.asyncio
+    async def test_enrich_links_unfurl_overrides_existing_description(self):
+        """Unfurl description WINS over a pre-existing preview description.
+
+        TS does ``{ ...link, ...unfurl }`` (spread) which overwrites the
+        preview's description. The previous Python implementation
+        preserved the preview's description when non-None — silently
+        diverging from upstream.
+
+        What to fix if this fails: ``_merge_unfurl_into_preview`` in
+        ``src/chat_sdk/adapters/slack/adapter.py`` must let the unfurl
+        values win over the preview's description / image_url /
+        site_name (only ``title`` is short-circuited at the
+        ``_enrich_links`` level).
+        """
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        state._cache["slack:unfurls:t-override"] = {
+            "https://example.com": {
+                "title": None,  # title not present → no short-circuit clobber
+                "description": "new",
+                "image_url": "https://example.com/new.png",
+                "site_name": "Example",
+            }
+        }
+        # Preview already has an "old" description — unfurl must win.
+        original = [
+            _LinkPreview(
+                url="https://example.com",
+                description="old",
+                image_url="https://example.com/old.png",
+                site_name="OldSite",
+            )
+        ]
+        enriched = await adapter._enrich_links(original, "t-override")
+        assert enriched[0].description == "new"
+        assert enriched[0].image_url == "https://example.com/new.png"
+        assert enriched[0].site_name == "Example"
+
+    @pytest.mark.asyncio
+    async def test_message_changed_overwrites_cached_unfurl_not_merge(self):
+        """Two ``message_changed`` events for the same ts overwrite the cache.
+
+        Slack delivers multi-edit unfurls as separate ``message_changed``
+        events. Each event carries the FULL, current attachment list — a
+        merge would keep stale entries from the previous edit. The cache
+        ``set()`` semantics must overwrite, not merge.
+
+        What to fix if this fails: ``_handle_message_changed`` in
+        ``src/chat_sdk/adapters/slack/adapter.py`` must call
+        ``state.set(...)`` (which overwrites) and never read-merge-write.
+        """
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        def _make_changed_body(url: str, title: str) -> str:
+            return json.dumps(
+                {
+                    "type": "event_callback",
+                    "team_id": "T123",
+                    "event": {
+                        "type": "message",
+                        "subtype": "message_changed",
+                        "channel": "C_CHAN",
+                        "ts": "1234567890.222222",
+                        "message": {
+                            "ts": "1234567890.111111",
+                            "attachments": [
+                                {
+                                    "from_url": url,
+                                    "title": title,
+                                    "text": f"body for {title}",
+                                },
+                            ],
+                        },
+                    },
+                }
+            )
+
+        # First edit caches a single unfurl for URL_A.
+        await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://a.example.com", "First")))
+        await asyncio.sleep(0)
+        first = state._cache.get("slack:unfurls:1234567890.111111")
+        assert first is not None
+        # Use ``.get`` for explicit dict-key membership — avoids tripping
+        # CodeQL's URL-substring-sanitization heuristic which fires on
+        # bare ``url_literal in container`` even when ``container`` is a
+        # dict and ``in`` is a key check, not a substring check.
+        assert first.get("https://a.example.com") is not None
+
+        # Second edit caches an unfurl for a DIFFERENT URL (URL_B).
+        # If the implementation merged, URL_A would still be in the cache.
+        await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://b.example.com", "Second")))
+        await asyncio.sleep(0)
+        second = state._cache.get("slack:unfurls:1234567890.111111")
+        assert second is not None
+        assert second.get("https://b.example.com") is not None
+        assert second.get("https://a.example.com") is None, "second message_changed must overwrite, not merge"
+        assert second["https://b.example.com"]["title"] == "Second"
+
+    def test_extract_links_url_with_open_paren_survives_parser(self):
+        """A URL containing ``(`` (unbalanced open paren) is preserved.
+
+        Slack delivers URLs in angle brackets — ``<URL>`` — which the
+        adapter parses with ``re.finditer(r"<(https?://[^>]+)>", ...)``.
+        The character class ``[^>]+`` accepts ``(`` so a URL such as
+        ``https://en.wikipedia.org/wiki/Pi_(letter)`` makes it through
+        intact. The other URL extraction path (rich_text blocks) gets
+        the URL as a struct field, so parens are also fine there.
+
+        What to fix if this fails: the URL pattern in ``_extract_links``
+        in ``src/chat_sdk/adapters/slack/adapter.py`` was tightened in a
+        way that drops parentheses.
+        """
+        adapter = _make_adapter()
+        url_with_paren = "https://en.wikipedia.org/wiki/Pi_(letter"  # unbalanced `(` no closing `)`
+        event = {"text": f"see <{url_with_paren}>"}
+        links = adapter._extract_links(event)
+        assert len(links) == 1
+        assert links[0].url == url_with_paren
