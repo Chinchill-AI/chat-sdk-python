@@ -96,14 +96,24 @@ def _render_markdown_v2(node: Content) -> str:
 
     if node_type == "list":
         ordered = bool(node.get("ordered"))
+        # Preserve the list's ``start`` attribute (mdast carries it from
+        # ``<ol start="N">`` or markdown source ``5. five\n6. six``).
+        # Falling back to 1 silently renumbered every list from 1,
+        # which changed the user-visible numbering for any list that
+        # didn't start at 1.
+        start_value = node.get("start")
+        try:
+            start = int(start_value) if start_value is not None else 1
+        except (TypeError, ValueError):
+            start = 1
         rendered_items: list[str] = []
-        for i, item in enumerate(children):
+        for i, item in enumerate(children, start=start):
             if not isinstance(item, dict):
                 continue
             item_children = item.get("children", []) or []
             content = _render_children(item_children, join="\n")
             if ordered:
-                marker = escape_markdown_v2(f"{i + 1}.")
+                marker = escape_markdown_v2(f"{i}.")
                 rendered_items.append(f"{marker} {content}")
             else:
                 rendered_items.append(f"\\- {content}")

@@ -325,3 +325,84 @@ class TestMarkdownV2Escaping:
         # The period after each number must be escaped: `1\.`
         assert "1\\." in result
         assert "2\\." in result
+
+    def test_ordered_list_preserves_start_value(self):
+        """Ordered lists must honour the source's ``start`` value rather
+        than silently renumbering from 1. Markdown like ``5. five`` and
+        HTML like ``<ol start="5">`` parse to an mdast ``list`` node with
+        ``start: 5`` -- if the renderer ignores that, the user sees
+        ``1. five`` and meaning changes.
+        """
+        result = converter.from_ast(converter.to_ast("5. five\n6. six\n7. seven"))
+        # Source numbering must be preserved.
+        assert "5\\. five" in result
+        assert "6\\. six" in result
+        assert "7\\. seven" in result
+        # And the renderer must NOT renumber to 1./2./3.
+        assert "1\\." not in result
+        assert "2\\." not in result
+        assert "3\\." not in result
+
+    def test_ordered_list_with_explicit_start_attribute(self):
+        """Direct AST input with ``start=5`` and N items renders 5./6./.../N+4."""
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "list",
+                    "ordered": True,
+                    "start": 5,
+                    "children": [
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": f"item {n}"}],
+                                }
+                            ],
+                        }
+                        for n in range(3)
+                    ],
+                }
+            ],
+        }
+        result = converter.from_ast(ast)
+        assert "5\\. item 0" in result
+        assert "6\\. item 1" in result
+        assert "7\\. item 2" in result
+
+    def test_ordered_list_default_start_is_one(self):
+        """Sanity: without an explicit ``start``, lists still begin at 1."""
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "list",
+                    "ordered": True,
+                    "children": [
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": "a"}],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": "b"}],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+        result = converter.from_ast(ast)
+        assert "1\\. a" in result
+        assert "2\\. b" in result
