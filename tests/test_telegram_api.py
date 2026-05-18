@@ -17,6 +17,7 @@ import pytest
 
 from chat_sdk.adapters.telegram.adapter import (
     TelegramAdapter,
+    _trim_to_markdown_v2_safe_boundary,
     ends_with_orphan_backslash,
     find_unescaped_positions,
     truncate_for_telegram,
@@ -1183,6 +1184,68 @@ class TestTruncateForTelegramLinkDestination:
         text = "[x](https://example.com/foo_bar) _italic_"
         result = truncate_for_telegram(text, 4096, "MarkdownV2")
         assert result == text
+
+
+class TestTrimUnclosedLinkDestination:
+    """A truncated chunk can leave an inline link with balanced ``[]`` but
+    a dangling ``(`` (e.g. ``[label](https://example.com/very-long``).
+    Telegram rejects this as invalid MarkdownV2. The safe-boundary
+    trimmer must detect this and roll the chunk back to the opening
+    ``[``."""
+
+    def test_unclosed_link_destination_trimmed_to_opening_bracket(self):
+        """Bare unclosed destination is trimmed back to the ``[``."""
+        text = "[label](https://example.com/very-long-path"
+        result = _trim_to_markdown_v2_safe_boundary(text)
+        # The unsafe range starts at the opening ``[`` (position 0), so
+        # the entire chunk is trimmed.
+        assert result == ""
+
+    def test_unclosed_link_after_safe_prefix_keeps_prefix(self):
+        """Prefix before the dangling ``[`` is preserved."""
+        text = "hello world [label](https://example.com/very-long-path"
+        result = _trim_to_markdown_v2_safe_boundary(text)
+        # The prefix up to (but not including) the unclosed ``[`` survives.
+        assert result == "hello world "
+        # And it must not contain any ``[``.
+        assert "[" not in result
+
+    def test_closed_link_passes_through_unchanged(self):
+        """Sanity: a properly closed link must not be touched."""
+        text = "[ok](https://example.com/foo)"
+        result = _trim_to_markdown_v2_safe_boundary(text)
+        assert result == text
+
+    def test_unclosed_link_inside_inline_code_is_ignored(self):
+        """``[`` inside an inline code span is literal text per
+        MarkdownV2 -- the trimmer must not treat it as a link opener."""
+        text = "`[label](https://nope`"
+        result = _trim_to_markdown_v2_safe_boundary(text)
+        assert result == text
+
+    def test_truncated_over_limit_unclosed_link_is_handled(self):
+        """End-to-end via :func:`truncate_for_telegram`: an over-limit
+        message that slices into the middle of a link destination is
+        rolled back before the ``[``, preventing Telegram's
+        ``can't parse entities`` 400."""
+        prefix = "safe text "
+        text = prefix + "[label](" + "https://example.com/" + "x" * 5000
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        # Result must not contain an unclosed link.
+        assert result.count("[") == result.count("]")
+        # Every ``[``...``]`` pair followed by ``(`` must have a
+        # matching ``)`` before EOS.
+        assert "[label](" not in result or ")" in result.split("[label](", 1)[1]
+
+    def test_escaped_closing_paren_does_not_count_as_closer(self):
+        """``\\)`` inside a link destination is escaped per spec, so the
+        destination is still considered unclosed if no unescaped ``)``
+        follows."""
+        text = "[a](https://example.com/\\)abc"
+        result = _trim_to_markdown_v2_safe_boundary(text)
+        # The ``\)`` is escaped, so the destination has no real closer
+        # -> trim back to ``[``.
+        assert result == ""
 
 
 class TestTruncateForTelegramUtf16:
