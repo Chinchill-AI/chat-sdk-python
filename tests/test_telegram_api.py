@@ -1133,6 +1133,108 @@ class TestTruncateForTelegramStreamingChunks:
         assert result == text
 
 
+class TestTruncateForTelegramLinkDestination:
+    """Underscores (and other delimiter markers) that live inside a
+    MarkdownV2 link destination ``[label](url)`` are literal text per
+    Telegram's MarkdownV2 spec and must not be counted as unbalanced
+    italic/bold/strike openers by the safe-boundary trimmer.
+
+    Without the link-destination skip, an under-limit message like
+    ``[x](https://example.com/foo_bar)`` is truncated to
+    ``[x](https://example.com/foo`` and Telegram receives a broken link.
+    """
+
+    def test_preserves_url_with_single_underscore(self):
+        """A balanced under-limit link with one ``_`` in the URL round-trips."""
+        text = "[x](https://example.com/foo_bar)"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+    def test_preserves_url_with_multiple_underscores(self):
+        """Three underscores inside a URL must not be flagged as unpaired."""
+        text = "[link](https://example.com/a_b_c_d)"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+    def test_preserves_url_with_asterisk_and_tilde(self):
+        """``*`` and ``~`` inside a link destination are also literal."""
+        text = "[q](https://example.com/path?a=*&b=~foo)"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+    def test_unpaired_underscore_after_link_is_still_trimmed(self):
+        """A real unpaired ``_`` *after* the link is still trimmed off
+        even with the link-destination skip -- the skip must only mask
+        delimiters that fall inside ``(url)``, not legitimate openers
+        elsewhere in the message."""
+        # The URL has 1 ``_`` (skipped); after ``)`` there is 1 trailing
+        # ``_unclosed`` opener with no closer -> trimmer must remove the
+        # tail starting at that ``_``.
+        text = "[x](https://example.com/foo_bar) _unclosed"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        # The link survives intact (underscores in the URL not flagged).
+        assert "[x](https://example.com/foo_bar)" in result
+        # The trailing unpaired opener and everything after is gone.
+        assert "_unclosed" not in result
+
+    def test_preserves_url_with_underscore_followed_by_balanced_italic(self):
+        """A link with ``_`` in the URL followed by a balanced ``_x_``
+        renders without losing the link or the italic."""
+        text = "[x](https://example.com/foo_bar) _italic_"
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+
+class TestTruncateForTelegramUtf16:
+    """Length limits are measured in UTF-16 code units per Telegram's
+    documented caps. Non-BMP characters (emoji and other astral code
+    points) consume 2 UTF-16 code units each; using Python's ``len()``
+    (which counts codepoints) lets emoji-heavy MarkdownV2 messages
+    exceed Telegram's 4096 / 1024 limits and be rejected by the API."""
+
+    def test_markdown_v2_emoji_message_truncates_at_utf16_limit(self):
+        """4096 emoji is 8192 UTF-16 units -> must be truncated, not passed through.
+
+        Without the UTF-16 fix, ``len(text) == 4096 <= 4096`` returns
+        ``text`` unchanged and Telegram rejects the 8192-unit payload as
+        ``MESSAGE_TOO_LONG``.
+        """
+        text = "\U0001f600" * 4096  # grinning face emoji, each = 2 UTF-16 units
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        # Result must fit within Telegram's 4096 UTF-16-unit cap.
+        result_units = len(result.encode("utf-16-le")) // 2
+        assert result_units <= 4096
+        # And must actually be shorter than the input (truncation happened).
+        assert len(result) < len(text)
+
+    def test_plain_emoji_message_truncates_at_utf16_limit(self):
+        """Same defensive measurement for the plain branch via the helper."""
+        text = "\U0001f600" * 4096
+        result = truncate_for_telegram(text, 4096, "plain")
+        result_units = len(result.encode("utf-16-le")) // 2
+        assert result_units <= 4096
+        assert len(result) < len(text)
+
+    def test_emoji_message_under_utf16_limit_passes_through(self):
+        """A 100-emoji message is 200 UTF-16 units; under 4096 -> unchanged."""
+        text = "\U0001f600" * 100
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result == text
+
+    def test_markdown_v2_truncated_emoji_keeps_escaped_ellipsis(self):
+        """When truncation does happen on an emoji payload, the escaped
+        ellipsis is still appended and the slice does not split a surrogate
+        pair (each emoji is included whole or dropped whole)."""
+        text = "\U0001f600" * 4096
+        result = truncate_for_telegram(text, 4096, "MarkdownV2")
+        assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
+        # Each remaining emoji must be intact (no orphan high/low surrogate).
+        body = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
+        # Every character of the body should be the full emoji code point.
+        for ch in body:
+            assert ord(ch) == 0x1F600
+
+
 class TestFindUnescapedPositions:
     def test_finds_unescaped_markers(self):
         assert find_unescaped_positions("*a*", "*") == [0, 2]

@@ -142,6 +142,24 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def _slice_to_utf16_units(text: str, units: int) -> str:
+    """Return the longest prefix of *text* whose UTF-16 length is ``<= units``.
+
+    Never splits a non-BMP codepoint mid-surrogate-pair: each astral
+    character contributes 2 UTF-16 code units and is either included
+    fully or dropped entirely.
+    """
+    if units <= 0:
+        return ""
+    count = 0
+    for i, ch in enumerate(text):
+        ch_units = 2 if ord(ch) > 0xFFFF else 1
+        if count + ch_units > units:
+            return text[:i]
+        count += ch_units
+    return text
+
+
 def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
     """Truncate *text* so its UTF-16 length does not exceed *limit*.
 
@@ -208,20 +226,116 @@ def find_unescaped_positions(text: str, marker: str) -> list[int]:
     return positions
 
 
-def _find_unescaped_positions_outside_code(text: str, marker: str) -> list[int]:
+def _find_unescaped_positions_outside_code(
+    text: str,
+    marker: str,
+    *,
+    skip_link_dest: bool = False,
+) -> list[int]:
     """Like :func:`find_unescaped_positions` but skips occurrences inside
     fenced code blocks (```````) or inline code spans
     (`````). Inside those regions Telegram treats ``*``, ``_``, ``~``,
     ``[``, ``]`` as literal text.
+
+    When ``skip_link_dest`` is True, also skips occurrences inside a
+    MarkdownV2 link destination region (the ``(...)`` immediately
+    following ``]``). Per Telegram's MarkdownV2 spec, only ``)`` and
+    ``\\`` need escaping inside the destination -- ``_``, ``*``, ``~``
+    are literal text and must not be counted as unbalanced entity
+    delimiters by the safe-boundary trimmer. Without this, an under-limit
+    link like ``[x](https://example.com/foo_bar)`` would be truncated to
+    ``[x](https://example.com/foo`` because the trimmer saw the ``_`` as
+    an unpaired italic opener.
 
     Port of upstream ``findUnescapedPositionsOutsideCode`` (chat#446).
     """
     positions: list[int] = []
     in_fence = False
     in_inline = False
+    in_link_dest = False
     backslashes = 0
     i = 0
     n = len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch == "\\":
+            backslashes += 1
+            i += 1
+            continue
+
+        escaped = backslashes % 2 == 1
+        backslashes = 0
+
+        if ch == "`" and not escaped and not in_link_dest:
+            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
+            if is_triple and not in_inline:
+                in_fence = not in_fence
+                i += 3
+                continue
+            if not in_fence:
+                in_inline = not in_inline
+            i += 1
+            continue
+
+        # Enter a link destination when we see ``](`` outside code -- the
+        # ``]`` itself is still counted (the caller scans brackets in a
+        # separate pass), but the URL inside ``(...)`` is treated as
+        # literal text for delimiter-balance purposes.
+        if (
+            skip_link_dest
+            and not in_link_dest
+            and not in_fence
+            and not in_inline
+            and not escaped
+            and ch == "]"
+            and text[i + 1 : i + 2] == "("
+        ):
+            if ch == marker:
+                positions.append(i)
+            in_link_dest = True
+            i += 2  # consume ``](``
+            continue
+
+        if in_link_dest and not escaped and ch == ")":
+            in_link_dest = False
+            i += 1
+            continue
+
+        if ch == marker and not escaped and not in_fence and not in_inline and not in_link_dest:
+            positions.append(i)
+        i += 1
+
+    return positions
+
+
+def ends_with_orphan_backslash(text: str) -> bool:
+    """Return True if *text* ends with an odd number of trailing ``\\``."""
+    trailing = 0
+    i = len(text) - 1
+    while i >= 0 and text[i] == "\\":
+        trailing += 1
+        i -= 1
+    return trailing % 2 == 1
+
+
+def _find_unclosed_link_dest_open_bracket(text: str) -> int | None:
+    """Return the position of the ``[`` that opens an inline link whose
+    destination ``(`` is never closed by ``)``.
+
+    A truncated chunk like ``[label](https://example.com/very-long`` has
+    balanced ``[]`` brackets but a dangling ``(`` -- Telegram rejects this
+    as invalid MarkdownV2. The detector walks the text honouring fenced/
+    inline code regions and escape backslashes, finds each ``](`` pair,
+    and reports the corresponding ``[`` position if no unescaped ``)``
+    closes the destination before end-of-string.
+    """
+    n = len(text)
+    in_fence = False
+    in_inline = False
+    backslashes = 0
+    bracket_stack: list[int] = []  # positions of unmatched ``[`` outside code
+    i = 0
     while i < n:
         ch = text[i]
 
@@ -244,21 +358,44 @@ def _find_unescaped_positions_outside_code(text: str, marker: str) -> list[int]:
             i += 1
             continue
 
-        if ch == marker and not escaped and not in_fence and not in_inline:
-            positions.append(i)
+        if escaped or in_fence or in_inline:
+            i += 1
+            continue
+
+        if ch == "[":
+            bracket_stack.append(i)
+            i += 1
+            continue
+
+        if ch == "]" and bracket_stack:
+            open_pos = bracket_stack.pop()
+            # If immediately followed by ``(``, this is an inline link
+            # destination. Scan forward to verify there's an unescaped
+            # closing ``)`` before EOS.
+            if text[i + 1 : i + 2] == "(":
+                j = i + 2
+                inner_backslashes = 0
+                closed = False
+                while j < n:
+                    cj = text[j]
+                    if cj == "\\":
+                        inner_backslashes += 1
+                        j += 1
+                        continue
+                    inner_escaped = inner_backslashes % 2 == 1
+                    inner_backslashes = 0
+                    if cj == ")" and not inner_escaped:
+                        closed = True
+                        break
+                    j += 1
+                if not closed:
+                    return open_pos
+            i += 1
+            continue
+
         i += 1
 
-    return positions
-
-
-def ends_with_orphan_backslash(text: str) -> bool:
-    """Return True if *text* ends with an odd number of trailing ``\\``."""
-    trailing = 0
-    i = len(text) - 1
-    while i >= 0 and text[i] == "\\":
-        trailing += 1
-        i -= 1
-    return trailing % 2 == 1
+    return None
 
 
 def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
@@ -269,6 +406,9 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
       - unclosed entity delimiter (``*``, ``_``, ``~``, `` ` ``) whose closer
         was cut off
       - unmatched ``[`` from a link whose closer was cut off
+      - inline link with balanced ``[]`` but unclosed ``(`` destination
+        (e.g. ``[label](https://example.com/very-long``) -- chunk is
+        trimmed back to the opening ``[``
 
     Best-effort: may drop more than strictly necessary in edge cases, but
     guarantees the output is parseable MarkdownV2 (when the input was).
@@ -287,7 +427,7 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
             if marker == "`":
                 positions = find_unescaped_positions(current, marker)
             else:
-                positions = _find_unescaped_positions_outside_code(current, marker)
+                positions = _find_unescaped_positions_outside_code(current, marker, skip_link_dest=True)
             if len(positions) % 2 == 1:
                 last_unpaired = positions[-1] if positions else len(current)
                 if last_unpaired < min_unsafe_position:
@@ -300,6 +440,10 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
             if last_open < min_unsafe_position:
                 min_unsafe_position = last_open
 
+        unclosed_link_open = _find_unclosed_link_dest_open_bracket(current)
+        if unclosed_link_open is not None and unclosed_link_open < min_unsafe_position:
+            min_unsafe_position = unclosed_link_open
+
         if min_unsafe_position >= len(current):
             return current
 
@@ -309,7 +453,7 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
 
 
 def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
-    """Truncate *text* to *limit* characters, appending an ellipsis.
+    """Truncate *text* to *limit* UTF-16 code units, appending an ellipsis.
 
     For MarkdownV2 (``parse_mode == "MarkdownV2"``), uses an escaped
     ellipsis (``\\.\\.\\.``) and trims back past any unbalanced entity
@@ -321,19 +465,19 @@ def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
     with transiently unpaired entity markers don't trigger Telegram's
     ``can't parse entities`` 400 (port of chat#446 / upstream f46a6fb).
 
-    Limit is interpreted in Python ``len()`` units (== UTF-16 code units
-    for the BMP, == 1 for astral characters). Telegram's 4096 / 1024
-    caps are documented in UTF-16 code units; for parity with upstream
-    we follow upstream's `string.length` semantics here. Pre-existing
-    UTF-16-aware truncation is reserved for non-MarkdownV2 paths.
+    ``limit`` is interpreted in UTF-16 code units to match Telegram's
+    documented 4096 / 1024 caps and upstream JavaScript's ``string.length``
+    semantics. Non-BMP characters (e.g. emoji) consume 2 UTF-16 code
+    units each, so a 4096-emoji MarkdownV2 message would otherwise sail
+    past this check and be rejected by Telegram as too long.
     """
     is_markdown_v2 = parse_mode == "MarkdownV2"
 
-    if len(text) <= limit:
+    if _utf16_len(text) <= limit:
         return _trim_to_markdown_v2_safe_boundary(text) if is_markdown_v2 else text
 
     ellipsis = _MARKDOWN_V2_ELLIPSIS if is_markdown_v2 else _PLAIN_ELLIPSIS
-    sliced = text[: limit - len(ellipsis)]
+    sliced = _slice_to_utf16_units(text, limit - _utf16_len(ellipsis))
 
     if is_markdown_v2:
         sliced = _trim_to_markdown_v2_safe_boundary(sliced)
