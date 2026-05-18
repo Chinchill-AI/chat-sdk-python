@@ -1575,11 +1575,13 @@ class TestCardContentDedup:
         await adapter.post_message("discord:guild1:channel456", card_message)
 
         payload = adapter._discord_fetch.call_args[0][2]
-        # Either 'content' is absent entirely, or it's empty/falsy. Both
-        # are acceptable — Discord won't render duplicate text in either
-        # case. The key invariant is that the card body text doesn't show
-        # up as a separate plain message above the embed.
-        assert not payload.get("content")
+        # The omit-content contract for card posts: ``content`` must be
+        # absent (or explicitly ``None``) -- NOT an empty string. Sending
+        # ``content=""`` on a new post would still let a regression slip
+        # through where the duplicate-text bug is "fixed" by sending
+        # empty content instead of omitting the key, and Discord's
+        # behavior could differ for future clients/embed types.
+        assert "content" not in payload or payload["content"] is None
         assert "embeds" in payload and len(payload["embeds"]) > 0
 
     @pytest.mark.asyncio
@@ -1622,7 +1624,9 @@ class TestCardContentDedup:
         await adapter.post_message("discord:guild1:channel456", card_message)
 
         payload = adapter._discord_fetch.call_args[0][2]
-        assert not payload.get("content")
+        # Same omit-content contract: ``content`` must be absent (or
+        # explicitly ``None``), never an empty string.
+        assert "content" not in payload or payload["content"] is None
 
 
 # ============================================================================
