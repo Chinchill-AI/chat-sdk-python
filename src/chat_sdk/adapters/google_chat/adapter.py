@@ -451,6 +451,8 @@ class GoogleChatAdapter:
                     {"botUserId": self._bot_user_id},
                 )
 
+        self._logger.info("Google Chat adapter initialized")
+
     async def disconnect(self) -> None:
         """Disconnect the adapter and close the shared HTTP session."""
         if self._http_session and not self._http_session.closed:

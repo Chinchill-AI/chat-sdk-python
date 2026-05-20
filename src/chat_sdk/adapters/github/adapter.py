@@ -214,6 +214,8 @@ class GitHubAdapter:
             except Exception as error:
                 self._logger.warn("Could not fetch bot user ID", {"error": str(error)})
 
+        self._logger.info("GitHub adapter initialized")
+
     async def _get_http_session(self) -> Any:
         """Return the shared aiohttp session, creating it lazily if needed."""
         import aiohttp
