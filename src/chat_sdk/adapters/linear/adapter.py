@@ -281,13 +281,16 @@ class LinearAdapter:
             return None
         # Match upstream literally (vercel/chat#391):
         #   userName: user.displayName, fullName: user.name
-        # No defensive `or` fallbacks — drift from upstream's exact field
-        # mapping creates cross-SDK inconsistency for callers building on
-        # `user_name` / `full_name` semantics.
+        # Fall back to `user_id` when either field is missing — matches
+        # the convention used by every other adapter's `get_user`
+        # (slack/discord/github/teams/telegram) and satisfies the
+        # non-Optional `str` typing of ``UserInfo.user_name`` /
+        # ``UserInfo.full_name`` that JS's ``undefined`` would otherwise
+        # violate.
         return UserInfo(
             user_id=user.get("id") or user_id,
-            user_name=user.get("displayName"),
-            full_name=user.get("name"),
+            user_name=user.get("displayName") or user_id,
+            full_name=user.get("name") or user_id,
             is_bot=False,
             avatar_url=user.get("avatarUrl"),
             email=user.get("email"),
