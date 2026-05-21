@@ -408,6 +408,16 @@ def _get_client(self):
 
 Rule: no optional adapter dependency imports at module top level.
 
+**Sub-rule: prefer official SDKs over hand-rolling.** When an official
+maintained SDK exists for a platform, use it as an optional dependency
+(per the lazy-import rule above) rather than hand-rolling the wire
+format. Hand-rolled wire formats become wide bot-finding surfaces —
+every protocol quirk the SDK abstracts becomes a defect waiting to be
+flagged in review. See [Review-Loop Discipline](#review-loop-discipline)
+item 2 for the cost-accounting from the 4.27 Teams streaming PR.
+Justify any hand-roll in the PR description (SDK missing the feature,
+unmaintained, Python-version incompatible, etc.).
+
 ### 11. Session and Connection Lifecycle Matter More in Python
 
 Ported code often starts with per-request HTTP clients. In Python async code, shared sessions plus explicit cleanup are usually the right design.
@@ -446,7 +456,11 @@ Rule: behavior changes need regression tests, not just matching types.
 
 ## Review Checklist for Upstream Ports
 
-Before merging an upstream-derived change, check:
+Before **opening** an upstream-derived PR (not before merging — see
+[Review-Loop Discipline](#review-loop-discipline) for why timing
+matters), check:
+
+### Correctness
 
 - [ ] Are any `or default` patterns incorrectly changing valid falsy values?
 - [ ] Did any camelCase keys leak into internal Python event/state objects?
@@ -460,6 +474,120 @@ Before merging an upstream-derived change, check:
 - [ ] Is any randomness security-sensitive?
 - [ ] Did markdown or streaming behavior change?
 - [ ] Does this need replay coverage rather than only unit coverage?
+
+### Review-loop economics
+
+- [ ] **Did I run [`docs/SELF_REVIEW.md`](SELF_REVIEW.md) before opening?**
+      (Catches what bots would flag in rounds 2–5; pays back ~10×.)
+- [ ] **Am I hand-rolling a wire format an official SDK provides?**
+      If yes, justify in the PR description or use the SDK instead
+      (Microsoft `microsoft-teams-apps`, Slack `slack_sdk`, etc.).
+- [ ] **Did I trace fix cascades end-to-end?** If a fix in module X
+      changes the contract module Y depends on, walk the chain before
+      pushing — don't ship and wait for the bot to find Y.
+- [ ] **Is this opening as ready-for-review, not draft?** Bots skip
+      drafts in this repo's config.
+- [ ] **How many in-flight drafts will this make on the sync branch?**
+      Cap at 3–4.
+
+## Review-Loop Discipline
+
+Each round of automated review (Codex, CodeRabbit, github-code-quality)
+costs ~1–2 hours of wall time per PR: push → bot runs → triage → fix →
+push. The 4.27 sync wave averaged 5+ rounds per PR before convergence;
+most of that cost was avoidable. Apply the rules below on every sync
+PR, not as an after-the-fact patch once a third or fourth review round
+hits.
+
+### Before opening the PR
+
+1. **Run [`docs/SELF_REVIEW.md`](SELF_REVIEW.md) first, not after bots converge.**
+   Five minutes of honest adversarial review catches what the bots will
+   eventually find, in the original commit — eliminating 3–5 sequential
+   review rounds. PR #88's formal self-review pass caught two real
+   defects Codex had missed across 5 rounds; running it first would
+   have caught them in commit 1.
+
+2. **Prefer official SDKs over hand-rolled wire formats.** When an
+   official maintained SDK exists for a platform (Slack `slack_sdk`,
+   Microsoft `microsoft-teams-apps`, Discord `discord.py`, etc.), use
+   it. Each hand-rolled wire format is a wide bot-finding surface:
+   every protocol quirk the SDK abstracts becomes a defect waiting to
+   be flagged. PR #88's Teams native streaming consumed ~6 of 9 review
+   rounds on Bot Framework REST details that `microsoft-teams-apps`
+   handles internally. Cost of using an SDK: optional dependency
+   surface, possibly a Python-version floor bump. Saved: most of the
+   adapter-PR bot-iteration cost.
+
+3. **Trace fix cascades end-to-end before pushing.** When a fix in
+   module X might affect downstream consumers in module Y, walk the
+   chain before committing. Pushing fix A, waiting for the bot to flag
+   B, fixing B, waiting for the bot to flag C is the most expensive
+   pattern. PR #88's cancellation-text chain was 5 sequential commits
+   because the adapter-level fix kept revealing downstream integration
+   gaps in `Thread.stream`. One end-to-end trace before the first
+   commit would have collapsed it.
+
+### Opening the PR
+
+4. **Open as ready-for-review, not draft.** Draft mode delays serious
+   bot review in this repo's config (CodeRabbit's "Review skipped"
+   message appears on every draft PR). Either the PR is ready and you
+   want feedback now, or it isn't ready and shouldn't be open. The
+   "open as draft and let it bake" pattern bought nothing in the 4.27
+   wave — bots didn't engage until PRs flipped to ready anyway, so the
+   incubation time was pure lag.
+
+5. **Cap in-flight drafts at 3–4 per sync wave.** Each open PR is its
+   own review queue and context switch. Smaller batches ship faster
+   than bigger batches. The 4.27 wave had 7 drafts open simultaneously
+   for over a week; reducing to 3–4 concurrent and merging in series
+   would have shipped sooner.
+
+### After bot findings land
+
+6. **Triage every finding with a clear rubric**:
+
+   | Severity | Action |
+   |---|---|
+   | **P1** (real defect, exploitable) | Fix today |
+   | **P2** (correctness gap, narrow scope) | Fix if small + scope-preserving |
+   | **Nit / style** | Batch into a single cleanup commit, OR skip if not a concrete defect |
+   | **False positive** | Reply once with rationale; add an in-code comment if the pattern will keep recurring; then stop engaging on re-flags |
+   | **Stale** (references prior PR state) | Reply with a brief commit-history pointer; no code change |
+
+7. **Bundle fixes when iterating.** Multiple back-to-back commits
+   trigger multiple bot reviews of overlapping content. Squash before
+   push when fixing related findings — same outcome, one round-trip
+   cost instead of N.
+
+8. **Don't engage every bot re-flag.** `github-code-quality` re-flags
+   the same site on every push regardless of prior threads. Reply once
+   with the rationale, drop an in-code comment explaining the
+   load-bearing semantics (e.g. `await task` inside
+   `contextlib.suppress` for deterministic drain), then ignore repeats.
+   PR #86 burned context responding to 4+ re-flags of the same false
+   positive before this rule was applied.
+
+### Author / agent practices
+
+9. **Detect echoes; stay silent.** Don't reply to your own webhook
+   echoes (the system sometimes re-broadcasts a comment you just
+   posted). A silent acknowledgment is sufficient.
+
+10. **Parallelize multi-PR triage on day one.** When several PRs are
+    in the same review state, dispatch parallel agents (one per PR,
+    each with its own `git worktree add`) immediately. The 4.27 wave
+    converged 6 PRs in ~1 hour of wall time once parallelized; running
+    them sequentially would have taken days.
+
+### Compounding effect
+
+Items (1) + (2) + (6) alone would have shaved most of the lag on
+PR #88: from ~9 review rounds spanning days to ~2–3 rounds spanning
+hours. The economics never favor "let bots find issues so I don't
+have to" — a single sequential push-wait-fix loop costs more than the
+self-review that would have pre-empted it.
 
 ## Known Non-Parity with TypeScript SDK
 
