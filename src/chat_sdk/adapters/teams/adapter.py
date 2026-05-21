@@ -1413,7 +1413,7 @@ class TeamsAdapter:
         as-is for group chats and the legacy pre-#403 cache shape).
         """
         if context is not None and context.get("type") == "dm":
-            return context["graph_chat_id"]
+            return cast("TeamsDmContext", context)["graph_chat_id"]
         return base_conversation_id
 
     async def _graph_list_chat_messages(
