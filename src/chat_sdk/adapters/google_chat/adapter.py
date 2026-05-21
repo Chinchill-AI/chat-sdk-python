@@ -1614,6 +1614,10 @@ class GoogleChatAdapter:
         async for chunk in text_stream:
             if isinstance(chunk, str):
                 accumulated += chunk
+            elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                text_value = chunk.get("text")
+                if isinstance(text_value, str):
+                    accumulated += text_value
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":
                 accumulated += chunk.text
         return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
