@@ -146,3 +146,75 @@ def test_dump_baseline_tree_size(mixed_content_markdown: str) -> None:
     )
     for required in required_types:
         assert required in types, f"Fixture missing required node type: {required}"
+
+
+# ---------------------------------------------------------------------------
+# Completeness gap (what each parser actually recognises on hard constructs)
+# ---------------------------------------------------------------------------
+
+
+def _collect_recognised_types(node: Any) -> set[str]:
+    """Set of all `type` values appearing anywhere in the tree."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        t = node.get("type")
+        if isinstance(t, str):
+            found.add(t)
+        for child in node.get("children") or []:
+            found |= _collect_recognised_types(child)
+    return found
+
+
+# Construct -> expected mdast `type` (or set of types) when recognised.
+# A parser that returns *none* of these for the gap fixture has silently
+# flattened the construct to paragraph/text. The baseline is documented
+# as not handling any of these, so it sets the floor.
+GAP_CONSTRUCTS: dict[str, set[str]] = {
+    "setext heading": {"heading"},  # heading must appear from a setext source
+    "indented code block": {"code"},  # raw 4-space indented block
+    "footnote definition": {"footnoteDefinition", "footnoteReference"},
+    "inline HTML": {"html", "inlineHTML"},
+    "task list item": {"listItem"},  # mdast: listItem with `checked` attr
+    "definition list": {"definition", "descriptionList", "termTitle"},
+}
+
+
+def test_report_completeness_gap(gap_cases_markdown: str) -> None:
+    """Print which gap constructs each parser actually recognised.
+
+    The baseline parser is *known* to not handle these (see
+    docs/UPSTREAM_SYNC.md non-parity table). This report quantifies how
+    many it silently drops vs each library candidate.
+
+    Run with ``pytest -s`` to see the report inline.
+    """
+    print("\n" + "=" * 70)
+    print("Completeness gap report (gap_cases.md)")
+    print("=" * 70)
+
+    parsers = [("baseline (hand)", baseline_parse), *CANDIDATES]
+    rows: list[tuple[str, set[str]]] = []
+    for name, parser in parsers:
+        types = _collect_recognised_types(parser(gap_cases_markdown))
+        rows.append((name, types))
+
+    # Construct table: rows = constructs, columns = parsers
+    print(f"\n{'construct':<24}", end="")
+    for name, _ in rows:
+        print(f" {name[:14]:>15}", end="")
+    print()
+    print("-" * (24 + 16 * len(rows)))
+
+    for construct, expected in GAP_CONSTRUCTS.items():
+        print(f"{construct:<24}", end="")
+        for _, types in rows:
+            recognised = bool(expected & types)
+            print(f" {'recognised' if recognised else 'silent drop':>15}", end="")
+        print()
+
+    print()
+    # Per-parser unique-type counts on this fixture
+    print("Distinct mdast types emitted on gap fixture:")
+    for name, types in rows:
+        type_list = sorted(types)
+        print(f"  {name:<20} {len(type_list):>2}  -> {type_list}")

@@ -47,11 +47,11 @@ is met by the baseline alone.
 All three fit comfortably. mistune and marko both come in under 165
 lines for the translator layer.
 
-### mdast fidelity vs the baseline
+### mdast fidelity on the happy path (`mixed_content.md`)
 
-Tested against the `tests/parser_spike/fixtures/mixed_content.md`
-corpus (≈3KB of mixed headings, tables, code blocks, lists, links,
-images, blockquotes, emphasis).
+Tested against a ≈3KB corpus of headings, tables, code blocks, lists,
+links, images, blockquotes, emphasis — constructs the baseline parser
+*does* handle.
 
 | library         | divergences |
 |-----------------|------------:|
@@ -81,49 +81,103 @@ The one candidate-side bug surfaced was marko losing GFM table
 alignment metadata (a translator fix; not investigated further in the
 spike).
 
+### Completeness gap on hard constructs (`gap_cases.md`)
+
+The happy-path comparison above is **not the whole picture**: the
+baseline parser is documented as not handling several CommonMark / GFM
+constructs at all (see `docs/UPSTREAM_SYNC.md:442`). On those
+constructs it silently flattens to `text` / `paragraph` nodes — the
+same surface area issue #69 was opened to address.
+
+`fixtures/gap_cases.md` exercises six gap constructs. **Silent drop**
+means the construct was parsed as ordinary text/paragraph; **recognised**
+means the parser emitted the correct mdast node type.
+
+| construct             | baseline    | mistune    | markdown-it-py | marko       |
+|-----------------------|-------------|------------|----------------|-------------|
+| setext heading        | silent drop | recognised | recognised     | recognised  |
+| indented code block   | silent drop | recognised | recognised     | recognised  |
+| task list item        | recognised¹ | silent drop| recognised     | recognised  |
+| footnote definition   | silent drop | silent drop| silent drop²   | silent drop |
+| inline HTML           | silent drop | silent drop| silent drop    | silent drop |
+| definition list       | silent drop | silent drop| silent drop    | silent drop |
+| **silent-drop count** | **5**       | **4**      | **3**          | **3**       |
+
+¹ Baseline matches `- [x]` as a list item but doesn't extract the
+checkbox state.
+² markdown-it-py supports footnotes via the `mdit-py-plugins` package
+(not pulled in by the spike); enabling it would drop the silent-drop
+count to 2.
+
+**The baseline is strictly worse on completeness than every
+candidate.** That's the half of the perf comparison the happy-path
+numbers don't show: baseline runs faster partly because it does less
+work per byte — setext headings, indented code, multi-backtick spans,
+escaped chars, and raw HTML all skip straight through the inline
+fast-paths instead of being parsed.
+
 ## Implication for the Option A/B/C decision
 
-The original Option B framing assumed a library swap would be a clear
-win. The spike data adds nuance:
+The spike data argues against a clean recommendation in either
+direction:
 
-1. **Performance budget fails on every candidate** at the 5ms target
-   set in the issue. The baseline is the only parser that meets it,
-   and it does so by a wide margin (2.59ms vs 11-47ms).
+1. **Performance**: baseline wins at 2.59ms median vs 11-47ms for the
+   candidates. But that win is at least partly a function of doing
+   *less work per byte*: the baseline skips entire construct families
+   on the fast path, while the libraries fully tokenise them. Apples
+   to apples requires either teaching the baseline to handle setext +
+   indented code + escaped chars (Option A) and re-measuring, or
+   accepting that the perf gap pays for genuine completeness.
 
-2. **mdast fidelity is a wash**: all three candidates are roughly
-   equivalent and each closes some baseline correctness bugs. None is
-   "closer to the existing output" — all diverge from it in similar
-   ways, mostly toward greater spec compliance.
+2. **mdast fidelity on the happy path**: all three candidates are
+   roughly equivalent (24-27 minor divergences) and each closes some
+   baseline correctness bugs. mostly toward greater spec compliance.
 
-3. **Translator LOC is not a blocker**: all under the 250-line budget.
+3. **Completeness on hard constructs**: the baseline is strictly
+   worse than every candidate. It silently flattens setext, indented
+   code, multi-backtick spans, escaped chars, raw HTML, and definition
+   lists into plain text — the exact gap list issue #69 enumerated.
 
-This argues for a **revisited Option D**: keep the fast hand-rolled
-parser for the static parse path, and port the upstream `remend` npm
-package to Python for the streaming-completion path. The three
-production bugs from issue #69 all lived in `_remend` /
-`_get_committable_prefix`, not in `markdown_parser.py`. A direct
-remend port would close that gap without taking the 5× perf hit.
+4. **Translator LOC**: all under the 250-line budget.
 
-The parser-side gaps from issue #69 (setext, footnotes, escaped chars,
-multi-backtick spans, raw HTML, indented code) would remain
-unaddressed under Option D. If they become a recurring problem, Option
-B can still be reconsidered later — the spike scaffolding stays here
-for re-runs.
+### Three options now, not two
+
+- **Option A (close baseline gaps in-tree)**: write parser code for
+  setext, indented code, escaped chars, multi-backtick spans (the
+  ones #69 listed as common in LLM output). Estimated ~300-400 LOC of
+  carefully-tested regex / state-machine work, plus the existing
+  parser keeps its 2.6ms perf. Doesn't address `_remend` gaps from the
+  issue #69 follow-up comment.
+
+- **Option B (library swap)**: pay the 5× perf hit (10-15ms median)
+  for `mistune` or `markdown-it-py`, eat ~150-215 LOC of translator,
+  close the completeness gap *and* most `_remend` gaps in one motion.
+  **markdown-it-py is now the preferred candidate** (best
+  completeness score, only 1.5ms slower than mistune), with
+  `mdit-py-plugins` available for footnotes if needed later. mistune
+  is the runner-up. marko drops out on performance.
+
+- **Option D (split the problem)**: keep the fast hand-rolled parser
+  *and* close gaps in-tree (Option A), but separately port upstream
+  `remend` directly for the streaming side. Two efforts, two PRs, but
+  preserves perf while closing both bug classes. More total work than
+  Option B but no dependency added.
 
 ### Recommendation
 
-Before committing to a path, the team should weigh:
+The right answer depends on team priorities the spike can't answer:
 
-- How much does the 5ms parse target actually matter for chat
-  streaming workloads? (A 10ms median may be entirely fine relative to
-  LLM token latency.)
-- How frequently are users hitting the parser-side gaps vs the
-  streaming-side bugs?
-- Is the structural mdast improvement (better link/paragraph splitting,
-  spec-correct softbreaks) worth the dependency cost?
+- **If 10ms median parse time is fine** (likely true for chat
+  streaming, where LLM token latency dwarfs this), **Option B with
+  markdown-it-py is the cleanest path**. One PR, one dep, both gap
+  lists close.
+- **If we want zero-dep core preserved**, **Option D** is the only
+  path that keeps the install footprint small while closing both bug
+  classes. Highest total effort.
+- **If neither perf nor zero-dep is sacred**, Option B still wins on
+  effort per fix delivered.
 
-If those answers come out in favor of the swap, **mistune is the
-preferred candidate**: lowest divergence count, smallest translator
-LOC, fastest of the three candidates. markdown-it-py is the runner-up
-if richer plugin extensibility becomes important (footnotes, tasks,
-custom containers). marko drops out on performance alone.
+Option C (selective parser-side fixes only, the original framing in
+the issue) leaves the streaming-side bugs from the #69 follow-up
+comment unaddressed and should be ruled out unless we ship it
+alongside a separate `_remend` fix.
