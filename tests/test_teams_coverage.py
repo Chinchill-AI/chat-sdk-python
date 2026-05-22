@@ -1743,6 +1743,53 @@ class TestGraphDmConversationIdResolution:
                 f"before formatting it into a Graph chat ID"
             )
 
+    async def test_cache_user_context_handles_non_string_aad_object_id(self):
+        """Non-string ``from.aadObjectId`` values (int, dict, list, None)
+        must not crash ``_cache_user_context``. Bot Framework JWT
+        verification authenticates the activity envelope but does not
+        constrain the JSON *type* of ``from.aadObjectId``; a malformed
+        non-string value would otherwise cause ``re.fullmatch`` to raise
+        ``TypeError`` and surface up to ``handle_webhook`` as a 500.
+        Malformed activities must be silently skipped (no DM caching).
+
+        What to fix if this fails: ``_cache_user_context`` is calling
+        ``_AAD_OBJECT_ID_PATTERN.fullmatch`` on a non-string value.
+        Gate the regex with an ``isinstance(..., str)`` check first.
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        # Each non-string shape that a malformed/non-conforming activity
+        # could realistically send. ``None`` is already short-circuited
+        # by the existing truthiness check via ``isinstance`` here, but
+        # we still assert it doesn't raise.
+        for bogus in [
+            123,
+            {"key": "val"},
+            ["a", "b"],
+            None,
+            True,
+        ]:
+            activity = {
+                "type": "message",
+                "from": {"id": "29:1xUser", "aadObjectId": bogus},
+                "conversation": {"id": f"a:opaque-{type(bogus).__name__}"},
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            }
+            # The key assertion: this must not raise. Before the fix,
+            # ``re.fullmatch`` raised ``TypeError`` for non-string inputs,
+            # escaping ``handle_webhook`` and turning a malformed field
+            # into a 500 webhook failure.
+            await adapter._cache_user_context(activity)
+            cached = state._cache.get(f"teams:channelContext:a:opaque-{type(bogus).__name__}")
+            assert cached is None, (
+                f"_cache_user_context cached a DM context with non-string "
+                f"aadObjectId={bogus!r}; the type guard must reject this "
+                f"before invoking the regex"
+            )
+
     async def test_fetch_messages_uses_legacy_cache_shape_for_channel(self):
         """End-to-end backwards-compat: cached entries written before
         vercel/chat#403 lack the ``type`` discriminator. They must still

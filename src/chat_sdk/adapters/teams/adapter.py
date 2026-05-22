@@ -341,7 +341,7 @@ class TeamsAdapter:
         # match the GUID shape before formatting it into the chat ID.
         aad_object_id = from_user.get("aadObjectId")
         if (
-            aad_object_id
+            isinstance(aad_object_id, str)
             and self._app_id
             and not base_channel_id.startswith("19:")
             and state
