@@ -524,6 +524,105 @@ class TestWebhookVerifierConstruction:
             else:
                 os.environ["SLACK_SIGNING_SECRET"] = old_secret
 
+    def test_empty_string_bot_token_rejected_at_construction(self):
+        """Explicit ``bot_token=""`` must fail validation at adapter init.
+
+        Companion to :meth:`test_empty_signing_secret_rejected_at_construction`
+        — the same hazard for ``signing_secret=""`` exists for a
+        user-configured ``bot_token=""``: ``_default_bot_token_cache`` would
+        be primed with ``""`` and the sync ``_get_token`` path would happily
+        return it, producing ``Authorization: Bearer `` API calls and
+        opaque ``invalid_auth`` errors from Slack. The async resolver path
+        catches this later, but failing fast at construction is strictly
+        better than failing on every Slack API call in production.
+
+        Callable resolvers are unaffected: they may return any string at
+        resolve time and the empty-result case is already validated in
+        ``_resolve_default_token``.
+        """
+        old_secret = os.environ.pop("SLACK_SIGNING_SECRET", None)
+        old_token = os.environ.pop("SLACK_BOT_TOKEN", None)
+        try:
+            with pytest.raises(ValidationError, match="bot_token"):
+                SlackAdapter(SlackAdapterConfig(signing_secret="ok", bot_token=""))
+        finally:
+            if old_secret is not None:
+                os.environ["SLACK_SIGNING_SECRET"] = old_secret
+            if old_token is not None:
+                os.environ["SLACK_BOT_TOKEN"] = old_token
+
+    def test_empty_client_id_does_not_fall_back_to_env(self):
+        """Explicit ``client_id=""`` is honored as "not configured", not env-shadowed.
+
+        Regression for hazard #1 (truthiness trap) in the OAuth field
+        cascade. The previous ``config.client_id or env`` pattern silently
+        converted ``client_id=""`` into the env value when ``zero_config``
+        was true, and into ``None`` when it wasn't — neither matches the
+        user's intent. Using ``is not None`` makes the behavior explicit:
+        an explicit (even empty) user config value wins over env.
+        """
+        old_id = os.environ.get("SLACK_CLIENT_ID")
+        old_secret = os.environ.get("SLACK_CLIENT_SECRET")
+        os.environ["SLACK_CLIENT_ID"] = "env-id-should-not-be-used"
+        os.environ["SLACK_CLIENT_SECRET"] = "env-secret-should-not-be-used"
+        try:
+            # Explicit empty user config — env must NOT shadow it. With a
+            # bot_token set, zero_config is False anyway, so env wouldn't be
+            # read; this test exercises the multi-workspace zero_config path
+            # to confirm the per-field ``is not None`` gate also rejects env
+            # when the user passed an explicit empty value.
+            adapter = SlackAdapter(SlackAdapterConfig(signing_secret="ok", client_id="", client_secret=""))
+            assert adapter._client_id == ""
+            assert adapter._client_secret == ""
+        finally:
+            if old_id is None:
+                os.environ.pop("SLACK_CLIENT_ID", None)
+            else:
+                os.environ["SLACK_CLIENT_ID"] = old_id
+            if old_secret is None:
+                os.environ.pop("SLACK_CLIENT_SECRET", None)
+            else:
+                os.environ["SLACK_CLIENT_SECRET"] = old_secret
+
+    def test_empty_env_client_id_treated_as_unset(self):
+        """``SLACK_CLIENT_ID=""`` env must not become the resolved client_id.
+
+        Mirrors the SLACK_BOT_TOKEN-empty rule from ``2ecd451``: an empty
+        env value is the system telling us "nothing here", not a valid
+        configured value. Empty env client_id would surface as opaque
+        OAuth ``invalid_client`` errors mid-flow rather than a clear "OAuth
+        not configured" state.
+        """
+        old_token = os.environ.get("SLACK_BOT_TOKEN")
+        old_secret = os.environ.get("SLACK_SIGNING_SECRET")
+        old_id = os.environ.get("SLACK_CLIENT_ID")
+        old_csecret = os.environ.get("SLACK_CLIENT_SECRET")
+        os.environ.pop("SLACK_BOT_TOKEN", None)
+        os.environ["SLACK_SIGNING_SECRET"] = "valid-signing-secret"
+        os.environ["SLACK_CLIENT_ID"] = ""
+        os.environ["SLACK_CLIENT_SECRET"] = ""
+        try:
+            adapter = SlackAdapter()
+            assert adapter._client_id is None
+            assert adapter._client_secret is None
+        finally:
+            if old_token is None:
+                os.environ.pop("SLACK_BOT_TOKEN", None)
+            else:
+                os.environ["SLACK_BOT_TOKEN"] = old_token
+            if old_secret is None:
+                os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                os.environ["SLACK_SIGNING_SECRET"] = old_secret
+            if old_id is None:
+                os.environ.pop("SLACK_CLIENT_ID", None)
+            else:
+                os.environ["SLACK_CLIENT_ID"] = old_id
+            if old_csecret is None:
+                os.environ.pop("SLACK_CLIENT_SECRET", None)
+            else:
+                os.environ["SLACK_CLIENT_SECRET"] = old_csecret
+
 
 # ---------------------------------------------------------------------------
 # handle_webhook with custom verifier

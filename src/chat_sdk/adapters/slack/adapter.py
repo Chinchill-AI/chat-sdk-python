@@ -263,6 +263,20 @@ class SlackAdapter:
         )
 
         bot_token_config: SlackBotToken | None = config.bot_token
+        # Reject explicit empty-string ``bot_token`` at init for the same
+        # reason ``signing_secret=""`` is rejected: it would prime
+        # ``_default_bot_token_cache`` with ``""`` and the sync ``_get_token``
+        # path would happily return it, producing ``Authorization: Bearer ``
+        # API calls and opaque ``invalid_auth`` errors from Slack. (The async
+        # resolver path catches this later, but failing fast at construction
+        # is strictly better.) Callable resolvers may legitimately *return*
+        # non-string values at resolve time — that case is already validated
+        # in ``_resolve_default_token``.
+        if isinstance(bot_token_config, str) and bot_token_config == "":
+            raise ValidationError(
+                "slack",
+                "bot_token must be a non-empty string or a callable resolver; got an empty string.",
+            )
         if bot_token_config is None and zero_config:
             env_token = os.environ.get("SLACK_BOT_TOKEN")
             # Same empty-string-as-missing rule as ``signing_secret``: an empty
@@ -308,11 +322,26 @@ class SlackAdapter:
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
         self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
 
-        # Multi-workspace OAuth fields
-        self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
-        self._client_secret: str | None = config.client_secret or (
-            os.environ.get("SLACK_CLIENT_SECRET") if zero_config else None
-        )
+        # Multi-workspace OAuth fields.
+        # ``is not None`` (not truthiness) so an explicit empty-string user
+        # config does not silently fall back to env (hazard #1). Empty env
+        # values are treated as "unset" (mirrors SLACK_BOT_TOKEN env rule):
+        # an empty SLACK_CLIENT_ID would be useless downstream and produce
+        # opaque OAuth failures rather than a clear "not configured" state.
+        if config.client_id is not None:
+            self._client_id: str | None = config.client_id
+        elif zero_config:
+            env_client_id = os.environ.get("SLACK_CLIENT_ID")
+            self._client_id = env_client_id if env_client_id else None
+        else:
+            self._client_id = None
+        if config.client_secret is not None:
+            self._client_secret: str | None = config.client_secret
+        elif zero_config:
+            env_client_secret = os.environ.get("SLACK_CLIENT_SECRET")
+            self._client_secret = env_client_secret if env_client_secret else None
+        else:
+            self._client_secret = None
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
 
         encryption_key_raw = config.encryption_key or os.environ.get("SLACK_ENCRYPTION_KEY")
