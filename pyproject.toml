@@ -112,6 +112,14 @@ dev = [
     "ruff>=0.4.0",
     "pyrefly==0.61.1",
 ]
+# Spike for issue #69 Option B (parser-replacement bake-off).
+# Three CommonMark/GFM libraries evaluated as candidates for replacing the
+# hand-rolled `shared/markdown_parser.py`. Not a runtime dep -- spike only.
+spike-parser = [
+    "mistune>=3.0",
+    "markdown-it-py>=3.0",
+    "marko>=2.0",
+]
 
 # ---------------------------------------------------------------------------
 # Pyrefly type checker configuration
