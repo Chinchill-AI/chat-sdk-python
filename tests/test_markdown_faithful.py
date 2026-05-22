@@ -430,6 +430,22 @@ class TestStringifyMarkdown:
             out = stringify_markdown(parse_markdown(src))
             assert "\\" not in out, f"over-escape on {src!r}: {out!r}"
 
+    def test_roundtrip_preserves_escaped_block_markers_after_soft_break(self):
+        # A paragraph text leaf can contain `\n` (from a soft break + a
+        # following line that doesn't qualify as a block construct
+        # because the marker was originally escaped). The line-2 marker
+        # also needs re-escaping or stringify drops it.
+        for src in [
+            "Here is a paragraph\n\\# 1 is not a heading",
+            "first line\n\\> not quote",
+            "line one\n\\- not list",
+            "alpha\n1\\. not ordered",
+            "alpha\n\\---",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"soft-break drift on {src!r}"
+
 
 # ============================================================================
 # toPlainText Tests

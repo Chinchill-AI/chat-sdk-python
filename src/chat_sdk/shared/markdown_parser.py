@@ -261,33 +261,49 @@ _BLOCK_ORDERED_RE = re.compile(r"^(\d+)([.)])(?=\s)")
 _BLOCK_THEMATIC_DASH_RE = re.compile(r"^(-\s*){3,}\s*$")
 
 
-def _escape_paragraph_block_markers(text: str) -> str:
-    """Re-escape block-level markers at the start of a paragraph.
-
-    Applied to the joined output of a `paragraph` node only. Block-level
-    constructs (heading, blockquote, list, thematic break) only fire at
-    line start, so mid-text occurrences of ``#`` / ``>`` / ``-`` / ``+``
-    are safe and don't need escaping. ``*``-based thematic breaks and
-    ``_``-based ones are already handled by :func:`_escape_text_leaf`
-    since both characters are in `_TEXT_DELIMITERS`.
-    """
-    if not text:
-        return text
-    if _BLOCK_HEADING_RE.match(text):
-        return "\\" + text
-    if _BLOCK_BLOCKQUOTE_RE.match(text):
-        return "\\" + text
-    if _BLOCK_UNORDERED_RE.match(text):
-        return "\\" + text
-    m = _BLOCK_ORDERED_RE.match(text)
+def _escape_block_marker_line(line: str) -> str:
+    """Re-escape a block-level marker at the start of a single line."""
+    if not line:
+        return line
+    if _BLOCK_HEADING_RE.match(line):
+        return "\\" + line
+    if _BLOCK_BLOCKQUOTE_RE.match(line):
+        return "\\" + line
+    if _BLOCK_UNORDERED_RE.match(line):
+        return "\\" + line
+    m = _BLOCK_ORDERED_RE.match(line)
     if m:
         # Escape the . or ) marker, not the digits -- `\1` isn't a
         # CommonMark escape (digits aren't in escapable punct), so a
         # leading-backslash placement wouldn't survive `_unescape_punct`.
-        return f"{m.group(1)}\\{m.group(2)}{text[m.end() :]}"
-    if _BLOCK_THEMATIC_DASH_RE.match(text):
-        return "\\" + text
-    return text
+        return f"{m.group(1)}\\{m.group(2)}{line[m.end() :]}"
+    if _BLOCK_THEMATIC_DASH_RE.match(line):
+        return "\\" + line
+    return line
+
+
+def _escape_paragraph_block_markers(text: str) -> str:
+    """Re-escape block-level markers at the start of every line in a
+    paragraph's joined output.
+
+    Applied to the joined output of a `paragraph` node. Block-level
+    constructs (heading, blockquote, list, thematic break) only fire at
+    line start, so mid-line occurrences of ``#`` / ``>`` / ``-`` / ``+``
+    are safe. But a paragraph text leaf may contain ``\\n`` (from
+    `_unescape_punct` resolving an escaped marker after a soft line
+    break, or from joining text leaves around a hard break); each line
+    of the joined output needs the same escape treatment as line 1, or
+    re-parse will split the paragraph at the embedded marker.
+
+    ``*``-based and ``_``-based thematic breaks are already handled by
+    :func:`_escape_text_leaf` since both characters are in
+    `_TEXT_DELIMITERS`.
+    """
+    if not text:
+        return text
+    if "\n" not in text:
+        return _escape_block_marker_line(text)
+    return "\n".join(_escape_block_marker_line(line) for line in text.split("\n"))
 
 
 def _parse_inline_plain(text: str) -> list[Content]:
