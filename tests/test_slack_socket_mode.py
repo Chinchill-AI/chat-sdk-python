@@ -465,6 +465,34 @@ class TestRouteSocketEvent:
 # ---------------------------------------------------------------------------
 
 
+class TestSocketModeImportError:
+    """Regression: the import-error hint must point at the correct extra.
+
+    The aiohttp transport lives behind the ``chat-sdk[slack-socket]`` extra
+    (which pulls in both ``slack-sdk`` and ``aiohttp``), NOT the plain
+    ``chat-sdk[slack]`` extra. If the message ever drifts back to ``[slack]``
+    users following the hint end up in a broken loop because ``aiohttp``
+    is still missing after reinstall.
+    """
+
+    async def test_missing_aiohttp_transport_message_points_at_slack_socket_extra(self, monkeypatch):
+        import slack_sdk.socket_mode.aiohttp as sm
+
+        # Simulate ``aiohttp`` (and therefore the transport submodule) being
+        # absent at import time.
+        monkeypatch.delattr(sm, "SocketModeClient", raising=False)
+        monkeypatch.delitem(sys.modules, "slack_sdk.socket_mode.aiohttp", raising=False)
+
+        adapter = _make_socket_adapter()
+        with pytest.raises(ValidationError) as exc_info:
+            await adapter.start_socket_mode()
+
+        msg = str(exc_info.value)
+        assert "chat-sdk[slack-socket]" in msg, msg
+        # Guard against regressing back to the wrong extra name.
+        assert "chat-sdk[slack]`" not in msg, msg
+
+
 class _FakeSocketModeClient:
     """In-process stand-in for slack_sdk's SocketModeClient."""
 

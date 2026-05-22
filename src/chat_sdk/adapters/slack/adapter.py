@@ -1389,7 +1389,8 @@ class SlackAdapter:
         except ImportError as exc:  # pragma: no cover - import-time failure
             raise ValidationError(
                 "slack",
-                "slack_sdk is not installed. Install with `pip install chat-sdk[slack]`.",
+                "slack_sdk Socket Mode dependencies are not installed. "
+                "Install with `pip install chat-sdk[slack-socket]`.",
             ) from exc
 
         self._socket_shutdown_event.clear()
