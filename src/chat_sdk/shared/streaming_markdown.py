@@ -54,6 +54,30 @@ def _strip_fenced_code(text: str) -> str:
     return "\n".join(result_lines)
 
 
+def _is_list_marker(stripped: str, run_start: int, run_len: int, ch: str) -> bool:
+    """Whether a run of *ch* at *run_start* is a list marker, not emphasis.
+
+    Only ``*`` is ambiguous -- it's both an inline emphasis marker and a
+    bullet-list marker. A list marker is a single character preceded only
+    by horizontal whitespace (or start of text) since the previous newline,
+    and followed by a horizontal whitespace character.
+    """
+    if ch != "*" or run_len != 1:
+        return False
+    j = run_start - 1
+    while j >= 0:
+        c = stripped[j]
+        if c == "\n":
+            break
+        if c not in (" ", "\t"):
+            return False
+        j -= 1
+    after = run_start + run_len
+    if after >= len(stripped):
+        return False
+    return stripped[after] in (" ", "\t")
+
+
 def _close_emphasis(result: str, stripped: str, ch: str) -> str:
     """Close unclosed bold/italic emphasis for a single marker character.
 
@@ -65,6 +89,10 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
     The algorithm mirrors CommonMark's emphasis handling at a simplified
     level: a run of 2+ characters opens/closes bold first, then any
     remaining single character opens/closes italic.
+
+    Line-leading ``*`` runs followed by whitespace are treated as list
+    markers and excluded from the emphasis tally -- mirroring upstream
+    ``remend``'s list-marker awareness (issue #69).
 
     To guarantee idempotency the suffix is separated from any trailing
     marker run by a zero-width space so it cannot merge with existing
@@ -78,10 +106,13 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
             i += 2
             continue
         if stripped[i] == ch:
+            run_start = i
             run_len = 0
             while i < len(stripped) and stripped[i] == ch:
                 run_len += 1
                 i += 1
+            if _is_list_marker(stripped, run_start, run_len, ch):
+                continue
             runs.append(run_len)
         else:
             i += 1
@@ -231,6 +262,7 @@ def _get_committable_prefix(text: str) -> str:
     # Walk backward to find consecutive table-like lines at the end
     held_count = 0
     separator_found = False
+    separator_idx = -1
 
     for i in range(len(lines) - 1, -1, -1):
         trimmed = lines[i].strip()
@@ -241,6 +273,7 @@ def _get_committable_prefix(text: str) -> str:
 
         if TABLE_SEPARATOR_RE.match(trimmed):
             separator_found = True
+            separator_idx = i
             break
 
         if TABLE_ROW_RE.match(trimmed):
@@ -248,10 +281,24 @@ def _get_committable_prefix(text: str) -> str:
         else:
             break
 
-    if separator_found or held_count == 0:
+    if separator_found and held_count == 0:
+        # Separator present but no body row beneath it yet. Append-only
+        # consumers (Slack `chat.appendStream`, etc.) parse each delta
+        # independently; emitting a header+separator without rows produces
+        # broken syntax. Hold the entire pre-separator table block until a
+        # row arrives (issue #69).
+        table_start = separator_idx
+        for i in range(separator_idx - 1, -1, -1):
+            trimmed = lines[i].strip()
+            if trimmed == "" or TABLE_ROW_RE.match(trimmed) is None:
+                break
+            table_start = i
+        commit_line_count = table_start
+    elif separator_found or held_count == 0:
         return text
+    else:
+        commit_line_count = len(lines) - held_count
 
-    commit_line_count = len(lines) - held_count
     committed_lines = lines[:commit_line_count]
 
     result = "\n".join(committed_lines)
