@@ -1386,7 +1386,7 @@ class SlackAdapter:
         # Lazy import (hazard #10) — slack_sdk is an optional dependency.
         try:
             from slack_sdk.socket_mode.aiohttp import SocketModeClient  # noqa: F401
-        except ImportError as exc:  # pragma: no cover - import-time failure
+        except ImportError as exc:
             raise ValidationError(
                 "slack",
                 "slack_sdk Socket Mode dependencies are not installed. "
