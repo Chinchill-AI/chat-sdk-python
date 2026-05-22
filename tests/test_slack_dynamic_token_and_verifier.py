@@ -425,6 +425,105 @@ class TestWebhookVerifierConstruction:
             else:
                 os.environ["SLACK_SIGNING_SECRET"] = old
 
+    def test_empty_signing_secret_rejected_at_construction(self):
+        """Explicit ``signing_secret=""`` must fail validation at adapter init.
+
+        Regression for Codex P1 on PR #87: the ``is not None`` cascade in
+        commit ``5a648ec`` over-corrected the truthiness trap — it correctly
+        stopped empty strings from silently falling through to the env
+        fallback, but then *accepted* the empty string as a valid signing
+        secret. ``_verify_signature`` short-circuits with
+        ``if not self._signing_secret`` and returns ``False`` for every
+        webhook, leaving the adapter responding ``401`` to Slack on every
+        request rather than failing fast at construction. Empty-string is
+        an unusable value: it must be treated as "not provided" by the
+        validation guard so the misconfiguration surfaces here, not on the
+        production webhook path.
+        """
+        old = os.environ.pop("SLACK_SIGNING_SECRET", None)
+        try:
+            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+                SlackAdapter(SlackAdapterConfig(signing_secret=""))
+            # Also fails when an otherwise-valid bot_token is set: the
+            # signing_secret value is what matters, not the rest of the
+            # config.
+            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+                SlackAdapter(SlackAdapterConfig(signing_secret="", bot_token="xoxb-test"))
+        finally:
+            if old is not None:
+                os.environ["SLACK_SIGNING_SECRET"] = old
+
+    def test_empty_signing_secret_does_not_fall_back_to_env(self):
+        """Empty-string ``signing_secret`` is rejected even with SLACK_SIGNING_SECRET set.
+
+        Pairs with :meth:`test_empty_signing_secret_rejected_at_construction`:
+        normalizing ``""`` to ``None`` *after* the env-fallback cascade
+        means the explicit empty string still suppresses the env fallback
+        (that part of ``5a648ec`` is correct), and the resulting ``None``
+        then fails the ``signing_secret is None and webhook_verifier is
+        None`` guard. The user's explicit (if empty) config wins over env.
+        """
+        old = os.environ.get("SLACK_SIGNING_SECRET")
+        os.environ["SLACK_SIGNING_SECRET"] = "env-secret-should-not-be-used"
+        try:
+            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+                SlackAdapter(SlackAdapterConfig(signing_secret="", bot_token="xoxb-test"))
+        finally:
+            if old is None:
+                os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                os.environ["SLACK_SIGNING_SECRET"] = old
+
+    def test_empty_signing_secret_with_verifier_is_accepted(self):
+        """``signing_secret=""`` + ``webhook_verifier`` => verifier path takes over.
+
+        The validation guard fails only when *both* are unusable. An empty
+        signing secret with an explicit verifier normalizes to "no signing
+        secret, use the verifier" — consistent with the documented
+        precedence rule (a non-empty signing_secret would win, an empty
+        one is treated as absent).
+        """
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                signing_secret="",
+                bot_token="xoxb-test",
+                webhook_verifier=lambda req, body: True,
+            )
+        )
+        assert adapter._signing_secret is None
+        assert adapter._webhook_verifier is not None
+
+    def test_empty_env_slack_bot_token_does_not_become_static_token(self):
+        """``SLACK_BOT_TOKEN=""`` must not be cached as the default bot token.
+
+        Regression companion to the empty-signing_secret fix: the env
+        fallback for ``SLACK_BOT_TOKEN`` was updated in ``5a648ec`` to
+        use ``if env_token is not None`` to match the
+        "explicit-empty-is-config" rule. But unlike user config, an empty
+        env var is the system telling us "no token here" — caching
+        ``""`` as the default bot token would propagate to every Slack
+        API call as ``Authorization: Bearer `` and surface as opaque
+        ``invalid_auth`` errors. Treat env ``""`` as unset.
+        """
+        old_token = os.environ.get("SLACK_BOT_TOKEN")
+        old_secret = os.environ.get("SLACK_SIGNING_SECRET")
+        os.environ["SLACK_BOT_TOKEN"] = ""
+        os.environ["SLACK_SIGNING_SECRET"] = "valid-signing-secret"
+        try:
+            # Zero-config path is what triggers the env fallback.
+            adapter = SlackAdapter()
+            assert adapter._default_bot_token_cache is None
+            assert adapter._default_bot_token_provider is None
+        finally:
+            if old_token is None:
+                os.environ.pop("SLACK_BOT_TOKEN", None)
+            else:
+                os.environ["SLACK_BOT_TOKEN"] = old_token
+            if old_secret is None:
+                os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                os.environ["SLACK_SIGNING_SECRET"] = old_secret
+
 
 # ---------------------------------------------------------------------------
 # handle_webhook with custom verifier

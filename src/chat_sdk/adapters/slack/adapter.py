@@ -230,18 +230,25 @@ class SlackAdapter:
         # Use explicit ``is not None`` checks rather than truthiness fallbacks
         # (per docs/UPSTREAM_SYNC.md hazard #1): an explicit empty string for
         # ``signing_secret`` should fail validation, not silently fall through
-        # to ``SLACK_SIGNING_SECRET`` from the environment.
+        # to ``SLACK_SIGNING_SECRET`` from the environment. *But* an empty
+        # string is itself unusable downstream (``_verify_signature`` would
+        # short-circuit with ``if not self._signing_secret`` and reject every
+        # webhook with 401), so after the cascade we normalize ``""`` to
+        # ``None`` to surface the misconfiguration here at init rather than
+        # silently failing on every request.
         webhook_verifier = config.webhook_verifier
         signing_secret = (
             config.signing_secret
             if config.signing_secret is not None
             else (None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET"))
         )
+        if signing_secret == "":
+            signing_secret = None
         if signing_secret is None and webhook_verifier is None:
             raise ValidationError(
                 "slack",
                 "signingSecret or webhookVerifier is required. Set SLACK_SIGNING_SECRET, "
-                "provide signing_secret in config, or provide a webhook_verifier.",
+                "provide a non-empty signing_secret in config, or provide a webhook_verifier.",
             )
 
         # Auth fields: botToken presence selects single-workspace mode.
@@ -258,7 +265,13 @@ class SlackAdapter:
         bot_token_config: SlackBotToken | None = config.bot_token
         if bot_token_config is None and zero_config:
             env_token = os.environ.get("SLACK_BOT_TOKEN")
-            if env_token is not None:
+            # Same empty-string-as-missing rule as ``signing_secret``: an empty
+            # SLACK_BOT_TOKEN would cache ``""`` in
+            # ``_default_bot_token_cache`` and ``_get_token`` would happily
+            # return it, producing opaque "invalid_auth" errors from Slack on
+            # every API call. Treat ``""`` as unset so the adapter falls
+            # through to multi-workspace mode (or fails clearly later).
+            if env_token is not None and env_token != "":
                 bot_token_config = env_token
 
         bot_token_provider = _normalize_bot_token_provider(bot_token_config)
