@@ -181,3 +181,83 @@ Option C (selective parser-side fixes only, the original framing in
 the issue) leaves the streaming-side bugs from the #69 follow-up
 comment unaddressed and should be ruled out unless we ship it
 alongside a separate `_remend` fix.
+
+## Triggers to revisit this decision
+
+The chat-scoped Option A (PRs #99 + #101) is the right call **for the
+SDK's current scope** -- LLM output rendered into chat platforms. The
+moment the input source or rendering target changes, the spike data
+should be re-run with a workload-shaped fixture before deciding
+anything.
+
+Concrete triggers that should cause us to re-open this:
+
+- **A non-chat input surface lands.** The chat-scoped assumption is
+  "input comes from an LLM; humans don't write the markdown we parse."
+  That breaks the moment we start parsing markdown that humans (or
+  external corpora) authored:
+  - User-authored memory / notes / scratchpads stored in the SDK
+  - Ingestion of `*.md` files for RAG-style workflows
+  - Parsing incoming GitHub PR/issue bodies for structure extraction
+    (today the GitHub adapter mostly emits, not parses)
+  - Any "import markdown" public API
+  Human-authored content routinely uses setext, indented code,
+  footnotes, raw HTML, and multi-backtick spans -- exactly the gaps
+  the baseline silently drops.
+
+- **A long-form artifact output surface lands.** When agents start
+  emitting research-summary / report / document artifacts (not chat
+  messages), the workload shifts toward CommonMark fidelity:
+  - Footnotes for citations
+  - Math regions rendered (not just sanitised)
+  - Multi-backtick code spans for technical documentation
+  - Tables with richer cell content
+  Parsing for an artifact also happens once per document, not per
+  stream chunk -- which makes the 5-18× perf cost of Option B much
+  more tolerable than it is for streaming.
+
+- **A web rendering surface for chat-sdk-python.** Upstream added
+  `@chat-adapter/web` in v4.27.0 (a browser-side chat UI). It's
+  explicitly out of scope for chat-sdk-python today (see PR #83 sync
+  scope). If that ever ships in Python, the rendering target tolerates
+  richer markdown because the browser can display setext / footnotes /
+  HTML natively.
+
+- **A new chat platform that demands richer parsing.** Unlikely in
+  the near term -- the existing eight platforms all render a similar
+  CommonMark subset. But e.g. a platform with native footnote support
+  could surface a gap.
+
+### Upstream check (May 2026)
+
+Spot-checked `vercel/chat`'s `packages/` directory at the time of
+writing. The only relevant package besides the eight chat adapters and
+the core/state packages is **`adapter-web`** (added in v4.27.0, Python
+port deferred). No artifact-rendering, RAG, document-ingestion, or
+standalone markdown-rendering packages exist upstream. The triggers
+above are forward-looking -- none are imminent in upstream-tracked
+work.
+
+### Playbook for re-running
+
+When a trigger materialises:
+
+1. Author a fixture file under `tests/parser_spike/fixtures/` that
+   represents the new surface's actual content (not generic
+   CommonMark -- workload-shaped).
+2. Re-run `pytest tests/parser_spike/test_mdast_parity.py -s` and
+   `python scripts/parser_spike/benchmark.py`. Both pick up the new
+   fixture automatically if added to `conftest.py`.
+3. Compare the silent-drop count and benchmark numbers against the
+   chat-scoped findings above. The decision matrix shifts toward
+   Option B when:
+   - Silent-drop count is materially higher on the new fixture
+     (≥6 constructs that the new surface needs)
+   - Parse latency is one-shot rather than per-stream-chunk
+   - The team is OK adding a dependency to the runtime core
+4. If thresholds are met, promote `markdown-it-py` translator from
+   `parser_spike/` into runtime (it's the preferred candidate per
+   the spike data). Add `markdown-it-py` to the relevant extras
+   group (not `dependencies`, to preserve zero-dep core install for
+   chat-only consumers).
+
