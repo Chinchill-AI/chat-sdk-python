@@ -1399,6 +1399,55 @@ class TestStreamEdgeCases:
         assert adapter._teams_send.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_markdown_text_chunk_dataclass_extract_text(self):
+        """``MarkdownTextChunk`` dataclass instances extract text just like dicts.
+
+        ``Thread.stream``'s ``_wrapped_stream`` handles three chunk shapes:
+        ``str``, ``dict`` with ``type == "markdown_text"``, and any object
+        with ``.type == "markdown_text"`` (the dataclass form). The Teams
+        adapter must mirror all three so its local ``accumulated`` stays
+        in sync with Thread's. Without this branch, a caller that yields
+        ``MarkdownTextChunk(text="Hello")`` instances would have Thread
+        accumulate the text while the adapter silently dropped it —
+        Teams would never receive the chunks, ``RawMessage.text`` (set
+        unconditionally on the happy path) would record empty text, and
+        ``Thread.stream`` would override its own correct accumulator
+        with the empty adapter view. Result: ``SentMessage`` and
+        ``_message_history`` both record an empty string while the user
+        sees nothing in Teams.
+        """
+        from chat_sdk.types import MarkdownTextChunk, PlanUpdateChunk, TaskUpdateChunk
+
+        adapter = _make_adapter()
+        adapter._teams_send = AsyncMock(return_value={"id": "id-1"})
+        tid = _dm_thread_id(adapter)
+        session = _TeamsStreamSession()
+        adapter._active_streams[tid] = session
+
+        async def text_gen():
+            yield MarkdownTextChunk(text="Hello ")
+            # Non-text StreamChunk variants are skipped (their ``text``
+            # is absent / their ``type`` doesn't match), matching
+            # ``Thread.stream``'s behavior.
+            yield TaskUpdateChunk(id="t-1", title="step", status="in_progress")
+            yield PlanUpdateChunk(title="Plan")
+            yield MarkdownTextChunk(text="world")
+
+        result = await adapter._stream_via_emit(tid, text_gen(), session)
+
+        # Both ``raw["text"]`` and the ``text`` override carry the full
+        # concatenated string from the markdown_text chunks.
+        assert result.raw["text"] == "Hello world", (
+            "Teams adapter must accumulate text from MarkdownTextChunk "
+            "dataclasses. Without this, Thread.stream's recorded "
+            "SentMessage would silently lose all object-form chunks."
+        )
+        assert result.text == "Hello world"
+        # Two teams_send calls — one per markdown_text chunk (clock
+        # steps 2000ms per call, so each chunk clears the throttle).
+        assert adapter._teams_send.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_stream_sequence_no_overflow_concern(self):
         """``streamSequence`` is a Python ``int`` — overflow is not a concern.
 

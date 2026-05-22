@@ -1265,6 +1265,21 @@ class TeamsAdapter:
                     text = chunk
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     text = chunk.get("text", "")
+                elif getattr(chunk, "type", None) == "markdown_text":
+                    # Dataclass form (``MarkdownTextChunk``) — mirror
+                    # ``Thread.stream``'s ``_wrapped_stream`` extraction so
+                    # the adapter's local accumulator stays in sync with
+                    # Thread's. Without this branch, callers that yield
+                    # ``MarkdownTextChunk(text=...)`` would have Thread
+                    # accumulate the text while the adapter dropped it,
+                    # causing the ``RawMessage.text`` happy-path override
+                    # (set unconditionally below) to record empty text in
+                    # the ``SentMessage`` / message history while Teams
+                    # never sees the chunks either. Non-text StreamChunk
+                    # variants (``TaskUpdateChunk``, ``PlanUpdateChunk``)
+                    # fall through with ``text == ""`` and are skipped,
+                    # matching Thread's behavior.
+                    text = getattr(chunk, "text", "") or ""
                 if not text:
                     continue
 
