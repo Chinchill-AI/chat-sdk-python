@@ -360,6 +360,44 @@ class TestStringifyMarkdown:
         reparsed = parse_markdown(result)
         assert len(reparsed["children"]) == len(ast["children"])
 
+    def test_roundtrip_preserves_escaped_punctuation_in_text(self):
+        # PR #101 downstream review: text leaves carrying delimiter chars
+        # (post-unescape) must be re-escaped on stringify so re-parse
+        # doesn't form a new emphasis / link / strike node.
+        for src in [
+            r"Use \*literal\*",
+            r"see \[brackets\] here",
+            r"backtick \` literal",
+            r"\~\~not strike\~\~",
+            r"path with \\backslash",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"AST diverged after roundtrip on {src!r}"
+
+    def test_roundtrip_preserves_task_list_state(self):
+        # PR #101 downstream review: listItem.checked must be re-emitted
+        # so the checkbox isn't silently dropped on stringify.
+        for src in ["- [x] done", "- [ ] todo", "- [x] a\n- [ ] b\n- regular"]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"task-list AST diverged after roundtrip on {src!r}"
+
+    def test_roundtrip_preserves_empty_task_item(self):
+        ast = parse_markdown("- [ ]")
+        out = stringify_markdown(ast)
+        # The "[ ]" marker must survive the roundtrip
+        assert "[ ]" in out
+        ast2 = parse_markdown(out)
+        assert ast == ast2
+
+    def test_stringify_does_not_over_escape_ordinary_text(self):
+        # Only delimiter characters get backslash-prefixed; ordinary
+        # punctuation (periods, commas, !) stays clean.
+        ast = parse_markdown("Hello, world! It is fine.")
+        out = stringify_markdown(ast)
+        assert "\\" not in out
+
 
 # ============================================================================
 # toPlainText Tests

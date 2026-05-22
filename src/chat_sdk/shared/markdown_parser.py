@@ -222,6 +222,32 @@ def _unescape_punct(text: str) -> str:
     return "".join(out)
 
 
+# Inverse of `_unescape_punct`: characters that, if present literally in
+# a text leaf, would be parsed as the start of a markdown construct on
+# the next ``parse_markdown`` call. Re-escape these at stringify time so
+# the AST round-trips. Over-escaping ordinary punctuation produces noisy
+# output without improving correctness -- only delimiters need it.
+_TEXT_DELIMITERS = frozenset("*_~`[]\\")
+
+
+def _escape_text_leaf(value: str) -> str:
+    """Re-escape delimiter characters so a text leaf round-trips through
+    parse_markdown unchanged.
+
+    Inverse of :func:`_unescape_punct` -- a text node carrying the value
+    ``"*literal*"`` came from input ``\\*literal\\*``; stringify must
+    emit the backslashes or re-parse will form an emphasis node.
+    """
+    if not any(c in _TEXT_DELIMITERS for c in value):
+        return value
+    out: list[str] = []
+    for c in value:
+        if c in _TEXT_DELIMITERS:
+            out.append("\\")
+        out.append(c)
+    return "".join(out)
+
+
 def _parse_inline_plain(text: str) -> list[Content]:
     """Parse plain text that contains no inline formatting.
 
@@ -632,7 +658,7 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
     node_type = node.get("type")
 
     if node_type == "text":
-        return node.get("value", "")
+        return _escape_text_leaf(node.get("value", ""))
 
     if node_type == "break":
         return "\n"
@@ -680,7 +706,7 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
         return f"[{text}]({url})"
 
     if node_type == "image":
-        alt = node.get("alt", "")
+        alt = _escape_text_leaf(node.get("alt", ""))
         url = node.get("url", "")
         title = node.get("title")
         if title:
@@ -694,7 +720,19 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
         lines: list[str] = []
         for idx, item in enumerate(items):
             prefix = f"{start + idx}." if ordered else bullet
+            # GFM task-list marker, only on unordered items with `checked` set.
+            checked = item.get("checked") if not ordered else None
+            task_marker = ""
+            if checked is True:
+                task_marker = "[x] "
+            elif checked is False:
+                task_marker = "[ ] "
             item_children = item.get("children", [])
+            if not item_children:
+                # Empty item -- still emit the prefix (and any task marker)
+                # so the round-trip preserves an empty `- [ ]` task.
+                lines.append(f"{prefix} {task_marker}".rstrip())
+                continue
             for ci, child in enumerate(item_children):
                 child_type = child.get("type")
                 if child_type == "list":
@@ -706,7 +744,7 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
                 else:
                     text = _stringify_node(child, emphasis=emphasis, bullet=bullet) or ""
                     if ci == 0:
-                        lines.append(f"{prefix} {text}")
+                        lines.append(f"{prefix} {task_marker}{text}")
                     else:
                         lines.append(f"  {text}")
         return "\n".join(lines)
