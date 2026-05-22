@@ -1590,13 +1590,124 @@ class TestGetUser:
         assert user.full_name == "Discord User"
 
     # TS: "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"
-    async def test_should_throw_ambiguous_when_numeric_matches_multiple_registered(self):
-        discord = create_mock_adapter("discord")
+    # Python divergence: Discord snowflakes (17-19 digits) deterministically
+    # route to Discord when registered, so the remaining ambiguous case is
+    # Telegram + GitHub with a short numeric id outside the snowflake range.
+    async def test_should_throw_ambiguous_when_short_numeric_matches_telegram_and_github(self):
         telegram = create_mock_adapter("telegram")
+        github = create_mock_adapter("github")
+        chat, _ = await _init_multi_chat({"telegram": telegram, "github": github})
+
+        # 10 digits — well below the 17-digit Discord snowflake floor.
+        with pytest.raises(ChatError, match="ambiguous"):
+            await chat.get_user("1234567890")
+
+    # Regression for PR #90 Codex P1 finding (discussion_r3284323050): a
+    # Discord snowflake must route to Discord even when Telegram is also
+    # registered. Before the fix, _infer_adapter_from_user_id treated every
+    # numeric id as a candidate for Telegram/GitHub regardless of length,
+    # which broke `get_user` and `open_dm` in Discord+Telegram deployments.
+    async def test_discord_snowflake_routes_to_discord_when_telegram_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="discordbot",
+                full_name="Discord User",
+                is_bot=False,
+            )
+        )
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(side_effect=AssertionError("Telegram should not be called"))  # type: ignore[method-assign]
         chat, _ = await _init_multi_chat({"discord": discord, "telegram": telegram})
 
-        with pytest.raises(ChatError, match="ambiguous"):
-            await chat.get_user("175928847299117063")
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.full_name == "Discord User"
+        discord.get_user.assert_awaited_once_with("175928847299117063")
+        telegram.get_user.assert_not_called()
+
+    # Companion regression: when the numeric id is OUTSIDE the Discord
+    # snowflake range (e.g. 10 digits), Discord must not be a candidate;
+    # routing should fall through to Telegram unambiguously.
+    async def test_short_numeric_id_routes_to_telegram_when_discord_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(side_effect=AssertionError("Discord should not be called"))  # type: ignore[method-assign]
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="1234567890",
+                user_name="alice",
+                full_name="Alice",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"discord": discord, "telegram": telegram})
+
+        user = await chat.get_user("1234567890")
+        assert user is not None
+        assert user.user_name == "alice"
+        telegram.get_user.assert_awaited_once_with("1234567890")
+        discord.get_user.assert_not_called()
+
+    # Same Codex P1 case for the Discord + GitHub pairing — a snowflake
+    # must not be misrouted as a GitHub numeric account_id.
+    async def test_discord_snowflake_routes_to_discord_when_github_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="discordbot",
+                full_name="Discord User",
+                is_bot=False,
+            )
+        )
+        github = create_mock_adapter("github")
+        github.get_user = AsyncMock(side_effect=AssertionError("GitHub should not be called"))  # type: ignore[method-assign]
+        chat, _ = await _init_multi_chat({"discord": discord, "github": github})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.full_name == "Discord User"
+        discord.get_user.assert_awaited_once_with("175928847299117063")
+        github.get_user.assert_not_called()
+
+    # Pin the reverse: when only Telegram is registered, an 18-digit id
+    # (within the Discord snowflake range) must still route to Telegram —
+    # the snowflake guard only kicks in when Discord is actually registered,
+    # so we don't accidentally over-restrict single-adapter deployments.
+    async def test_snowflake_length_id_routes_to_telegram_when_discord_not_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="alice",
+                full_name="Alice",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"telegram": telegram})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.user_name == "alice"
+        telegram.get_user.assert_awaited_once_with("175928847299117063")
 
     # TS: "should not match GitHub-style logins as Slack ids (case sensitivity)"
     async def test_should_not_match_github_style_logins_as_slack_ids(self):

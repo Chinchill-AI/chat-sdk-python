@@ -1683,12 +1683,25 @@ class Chat:
         # Disambiguate by which adapters the caller actually registered.
         if NUMERIC_REGEX.match(user_id):
             candidates: list[str] = []
-            if DISCORD_SNOWFLAKE_REGEX.match(user_id) and "discord" in self._adapters:
+            is_discord_snowflake = bool(DISCORD_SNOWFLAKE_REGEX.match(user_id))
+            discord_registered = "discord" in self._adapters
+            if is_discord_snowflake and discord_registered:
                 candidates.append("discord")
-            if "telegram" in self._adapters:
-                candidates.append("telegram")
-            if "github" in self._adapters:
-                candidates.append("github")
+            # Telegram and GitHub numeric IDs are shorter than Discord
+            # snowflakes (17-19 digits) in practice. When the id falls in
+            # the snowflake range AND Discord is registered, exclude
+            # Telegram and GitHub from candidates so Discord routes
+            # deterministically. Without this guard, Discord+Telegram
+            # deployments raise ambiguity on every Discord user lookup
+            # — see PR #90 Codex review (discussion_r3284323050). When
+            # Discord is not registered, an 18-digit id can legitimately
+            # be a Telegram or GitHub id, so keep them as candidates to
+            # avoid over-restricting single-adapter deployments.
+            if not (is_discord_snowflake and discord_registered):
+                if "telegram" in self._adapters:
+                    candidates.append("telegram")
+                if "github" in self._adapters:
+                    candidates.append("github")
 
             if len(candidates) == 1:
                 adapter = self._adapters.get(candidates[0])
