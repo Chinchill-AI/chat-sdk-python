@@ -1718,6 +1718,38 @@ class TestGetUser:
         with pytest.raises(ChatError, match='Cannot infer adapter from userId "user123"'):
             await chat.get_user("user123")
 
+    # Codex P2 (discussion_r3285678546): legacy adapters built before the
+    # ``Adapter.get_user`` Protocol method was added don't define
+    # ``get_user`` at all. Calling ``chat.get_user`` previously raised a
+    # raw ``AttributeError`` for these adapters, breaking the SDK's
+    # error contract. The fix translates the missing-method case to the
+    # same ``ChatError`` used for adapters that explicitly raise
+    # ``ChatNotImplementedError``.
+    async def test_legacy_adapter_without_get_user_raises_chat_error(self):
+        # Minimal legacy adapter — name "slack" so the existing
+        # ``SLACK_USER_ID_REGEX`` routes ``U123456`` to it. Crucially, no
+        # ``get_user`` attribute is defined anywhere on the instance or
+        # class chain, mirroring third-party adapters that predate the
+        # port. Without the fix, ``chat.get_user`` would surface a raw
+        # ``AttributeError`` rather than a translated ``ChatError``.
+        class _LegacyAdapter:
+            name = "slack"
+
+            async def initialize(self, chat: Any) -> None:
+                return None
+
+            async def handle_webhook(self, request: Any, options: Any = None) -> Any:
+                return None
+
+        legacy = _LegacyAdapter()
+        assert getattr(legacy, "get_user", None) is None
+
+        chat, _ = await _init_multi_chat({"slack": legacy})  # type: ignore[dict-item]
+
+        # AttributeError must NOT escape — callers depend on ChatError.
+        with pytest.raises(ChatError, match='Adapter "slack" does not support get_user'):
+            await chat.get_user("U123456")
+
 
 # ============================================================================
 # thread() factory

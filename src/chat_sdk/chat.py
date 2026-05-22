@@ -1546,8 +1546,17 @@ class Chat:
         """
         user_id = user if isinstance(user, str) else user.user_id
         adapter = self._infer_adapter_from_user_id(user_id)
+        # Legacy adapters built before the chat.get_user port may not
+        # define ``get_user`` at all — calling on them would raise
+        # ``AttributeError`` and break the SDK's error contract. Translate
+        # both the missing-method (legacy) and explicitly-raised
+        # ``ChatNotImplementedError`` (modern) cases to the same
+        # ``ChatError`` so callers can rely on a single failure mode.
+        get_user_method = getattr(adapter, "get_user", None)
+        if get_user_method is None:
+            raise ChatError(f'Adapter "{adapter.name}" does not support get_user')
         try:
-            return await adapter.get_user(user_id)
+            return await get_user_method(user_id)
         except ChatNotImplementedError as exc:
             raise ChatError(f'Adapter "{adapter.name}" does not support get_user') from exc
 
