@@ -234,12 +234,14 @@ def _remend(text: str) -> str:
 
     # Strip fenced code blocks so their contents don't affect inline counts.
     outside_fences = _strip_fenced_code(result)
-    # Drop math regions ($...$ and $$...$$) -- markers inside math are
-    # literal, not delimiters (issue #69 follow-up).
-    outside_fences = _strip_math_regions(outside_fences)
-    # Drop ASCII-punct escape sequences (`\*`, `\~`, `\[`, etc.) so the
-    # tilde / backtick / bracket counters below see the post-escape text.
+    # Drop ASCII-punct escape sequences BEFORE math-region stripping --
+    # otherwise an escaped ``\$`` could pair with a later unescaped ``$``
+    # and the inline-math regex would eat content between them, including
+    # any emphasis openers (PR #101 review finding).
     outside_fences = _strip_escape_sequences(outside_fences)
+    # Drop math regions ($...$ and $$...$$) -- markers inside math are
+    # literal, not delimiters.
+    outside_fences = _strip_math_regions(outside_fences)
 
     # --- inline code backticks ---
     # Count total backtick characters outside code fences. If odd, one code

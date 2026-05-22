@@ -227,6 +227,10 @@ class TestEscapedCharacters:
     def test_escaped_tilde_does_not_form_strikethrough(self):
         children = self._para_children(r"\~~not strike\~~")
         assert all(c.get("type") != "delete" for c in children)
+        # Also pin the actual text content -- a buggy impl that dropped
+        # the tildes entirely would pass the absence-of-`delete` check.
+        text_concat = "".join(c.get("value", "") for c in children if c.get("type") == "text")
+        assert "~~not strike~~" in text_concat
 
     def test_escaped_backslash_yields_single_backslash(self):
         children = self._para_children(r"path with \\backslash")
@@ -302,6 +306,18 @@ class TestTaskListItems:
         lst = ast["children"][0]
         assert lst["type"] == "list" and lst["ordered"] is True
         assert "checked" not in lst["children"][0]
+
+    def test_empty_unchecked_task_item_no_content(self):
+        # `- [ ]` with no trailing whitespace or content should still
+        # produce a checked listItem (PR #101 review finding).
+        lst = self._list("- [ ]")
+        assert lst["children"][0]["checked"] is False
+        assert lst["children"][0]["children"] == []
+
+    def test_empty_checked_task_item_no_content(self):
+        lst = self._list("- [x]")
+        assert lst["children"][0]["checked"] is True
+        assert lst["children"][0]["children"] == []
 
 
 # ============================================================================

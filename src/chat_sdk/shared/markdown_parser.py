@@ -359,8 +359,10 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
     i = start
     item_re = re.compile(r"^(\d+)[.)]\s+(.*)") if ordered else re.compile(r"^[-*+]\s+(.*)")
     # GFM task list extension: `- [ ]` or `- [x]` at the start of an
-    # unordered item maps to `listItem.checked = False` / `True`.
-    task_re = re.compile(r"^\[([ xX])\]\s+(.*)")
+    # unordered item maps to `listItem.checked = False` / `True`. The
+    # trailing whitespace + content group is optional so an empty task
+    # item (``- [ ]`` with nothing after) still produces ``checked``.
+    task_re = re.compile(r"^\[([ xX])\](?:\s+(.*))?$")
 
     while i < len(lines):
         line = lines[i]
@@ -373,7 +375,9 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
                 task_m = task_re.match(item_text)
                 if task_m:
                     checked = task_m.group(1) in ("x", "X")
-                    item_text = task_m.group(2)
+                    # group(2) is None for an empty task item (`- [ ]`)
+                    # with no trailing whitespace/content.
+                    item_text = task_m.group(2) or ""
 
             item_children_lines = [item_text]
             i += 1

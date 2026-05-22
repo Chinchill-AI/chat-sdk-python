@@ -1114,3 +1114,18 @@ class TestRemendChatCompleteness:
         # An escaped delimiter that wasn't going to imbalance anything
         # is still left untouched.
         assert _remend(r"foo \* bar") == r"foo \* bar"
+
+    # --- Escape-before-math ordering (PR #101 review #1) ---------------------
+
+    def test_remend_escaped_dollar_does_not_pair_with_unescaped_dollar(self):
+        # Without the escape-strip-before-math-strip ordering, the math
+        # regex would pair these two `$`s and eat the `*` opener inside,
+        # leaving italic unclosed.
+        text = r"\$opener *unclosed text closer\$"
+        assert _remend(text) == text + "*"
+
+    def test_remend_escaped_dollar_does_not_create_phantom_math_region(self):
+        # `\$5` is a literal dollar amount; the `$10` later is not part of
+        # any math region (one un-escaped `$` doesn't form `$...$`).
+        # The italic at the end still gets closed normally.
+        assert _remend(r"\$5 and $10 *italic") == r"\$5 and $10 *italic*"
