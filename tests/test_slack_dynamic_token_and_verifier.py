@@ -304,6 +304,55 @@ class TestBotTokenResolverConstruction:
         )
         assert json.loads(response["body"]) == {"challenge": "abc-123"}
 
+    @pytest.mark.asyncio
+    async def test_resolver_refreshes_sync_token_cache(self):
+        """After the resolver runs, sync ``current_token`` sees the resolved token.
+
+        Regression for CodeRabbit r3285672709: ``_resolve_default_token``
+        previously only wrote the per-request ContextVar, so callers reading
+        ``current_token`` *outside* that ContextVar scope (e.g. from a sync
+        helper invoked from a different task) still saw the pre-resolution
+        state and raised ``AuthenticationError``. The resolver must also
+        refresh the process-wide ``_default_bot_token_cache`` so the sync
+        path returns the freshly resolved value.
+
+        What to fix if this fails: in ``_resolve_default_token``
+        (``adapters/slack/adapter.py``), after the
+        ``isinstance(token, str)`` / non-empty validation and before
+        ``self._resolved_default_token.set(token)``, assign
+        ``self._default_bot_token_cache = token``.
+        """
+
+        def resolver() -> str:
+            return "xoxb-resolved-token"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+
+        # Sanity: before the resolver runs, sync ``current_token`` must raise
+        # (matches ``test_sync_current_token_with_resolver_before_resolution_raises``).
+        with pytest.raises(AuthenticationError, match=r"current_token_async"):
+            _ = adapter.current_token
+
+        # Invoke the resolver via the documented async entry point.
+        token = await adapter.current_token_async()
+        assert token == "xoxb-resolved-token"
+
+        # Now read sync ``current_token`` from a context *without* the
+        # ContextVar set by the resolver — running the read inside a fresh
+        # ``asyncio.to_thread`` would copy the ContextVar, so use a brand-new
+        # asyncio task with the default (empty) ContextVar state by spawning
+        # a new task and clearing the per-request var.
+        #
+        # Simpler equivalent: directly clear the ContextVar and read. The
+        # per-request var being reset back to ``None`` mirrors the "different
+        # task, no ContextVar copy" scenario described in the finding.
+        adapter._resolved_default_token.set(None)
+        assert adapter.current_token == "xoxb-resolved-token", (
+            "sync current_token must read from the refreshed "
+            "_default_bot_token_cache after the resolver succeeds; the "
+            "ContextVar-only cache breaks sync access outside the request scope"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Constructor: webhook_verifier

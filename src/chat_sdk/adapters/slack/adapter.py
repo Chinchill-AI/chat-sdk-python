@@ -226,11 +226,18 @@ class SlackAdapter:
         # An explicit ``webhook_verifier`` opts out of the SLACK_SIGNING_SECRET
         # env fallback — otherwise an env-configured deployment would silently
         # shadow the verifier the caller intended to use.
+        #
+        # Use explicit ``is not None`` checks rather than truthiness fallbacks
+        # (per docs/UPSTREAM_SYNC.md hazard #1): an explicit empty string for
+        # ``signing_secret`` should fail validation, not silently fall through
+        # to ``SLACK_SIGNING_SECRET`` from the environment.
         webhook_verifier = config.webhook_verifier
-        signing_secret = config.signing_secret or (
-            None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET")
+        signing_secret = (
+            config.signing_secret
+            if config.signing_secret is not None
+            else (None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET"))
         )
-        if not (signing_secret or webhook_verifier):
+        if signing_secret is None and webhook_verifier is None:
             raise ValidationError(
                 "slack",
                 "signingSecret or webhookVerifier is required. Set SLACK_SIGNING_SECRET, "
@@ -238,12 +245,20 @@ class SlackAdapter:
             )
 
         # Auth fields: botToken presence selects single-workspace mode.
-        zero_config = not (config.signing_secret or config.bot_token or config.client_id or config.client_secret)
+        # Explicit ``is not None`` to mirror the truthiness-trap rule above:
+        # an explicit empty string for any of these should still count as
+        # "config provided" and disable the env-fallback path.
+        zero_config = (
+            config.signing_secret is None
+            and config.bot_token is None
+            and config.client_id is None
+            and config.client_secret is None
+        )
 
         bot_token_config: SlackBotToken | None = config.bot_token
         if bot_token_config is None and zero_config:
             env_token = os.environ.get("SLACK_BOT_TOKEN")
-            if env_token:
+            if env_token is not None:
                 bot_token_config = env_token
 
         bot_token_provider = _normalize_bot_token_provider(bot_token_config)
@@ -472,6 +487,11 @@ class SlackAdapter:
                 "slack",
                 "Bot token resolver returned an empty or non-string value.",
             )
+        # Refresh the process-wide cache so sync ``current_token`` /
+        # ``current_client`` access outside the request ContextVar scope
+        # (e.g. callers reading the most recently resolved token from a
+        # different task) still observes the freshly resolved value.
+        self._default_bot_token_cache = token
         # Per-request cache for downstream sync ``_get_token`` calls.
         self._resolved_default_token.set(token)
         return token
