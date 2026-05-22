@@ -398,6 +398,38 @@ class TestStringifyMarkdown:
         out = stringify_markdown(ast)
         assert "\\" not in out
 
+    def test_roundtrip_preserves_escaped_block_markers_at_paragraph_start(self):
+        # Block-level constructs (heading, blockquote, list, thematic
+        # break, ordered list) only fire at line start. When the user
+        # writes `\#`, `\>`, `\-`, etc. at paragraph start, stringify
+        # must re-emit the backslash or re-parse promotes the paragraph
+        # into the corresponding block construct.
+        for src in [
+            r"\# not heading",
+            r"\> not quote",
+            r"\- not list",
+            r"\+ also not list",
+            r"1\. not ordered",
+            r"2\) other ordered",
+            r"\* not bullet",
+            r"\---",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"paragraph-start drift on {src!r}"
+
+    def test_stringify_does_not_over_escape_mid_text_block_markers(self):
+        # `#` / `>` / `-` / digits-with-dot are only block markers at
+        # line start. Mid-text they're literal -- shouldn't be escaped.
+        for src in [
+            "see > arrow operator",
+            "Step 1. Then 2. Then 3.",
+            "use - dash here",
+            "ordinary # hash inline",
+        ]:
+            out = stringify_markdown(parse_markdown(src))
+            assert "\\" not in out, f"over-escape on {src!r}: {out!r}"
+
 
 # ============================================================================
 # toPlainText Tests

@@ -248,6 +248,48 @@ def _escape_text_leaf(value: str) -> str:
     return "".join(out)
 
 
+# Block-level constructs only fire at line start. When a paragraph's
+# joined text begins with one of these patterns -- typically after
+# `_unescape_punct` resolved a ``\#`` or ``\>`` -- naive stringify would
+# re-form the construct on the next parse. These regexes match the
+# minimal opener pattern; `_escape_paragraph_block_markers` inserts the
+# backslash at the right position.
+_BLOCK_HEADING_RE = re.compile(r"^#{1,6}(?=\s|$)")
+_BLOCK_BLOCKQUOTE_RE = re.compile(r"^>")
+_BLOCK_UNORDERED_RE = re.compile(r"^[-+](?=\s)")
+_BLOCK_ORDERED_RE = re.compile(r"^(\d+)([.)])(?=\s)")
+_BLOCK_THEMATIC_DASH_RE = re.compile(r"^(-\s*){3,}\s*$")
+
+
+def _escape_paragraph_block_markers(text: str) -> str:
+    """Re-escape block-level markers at the start of a paragraph.
+
+    Applied to the joined output of a `paragraph` node only. Block-level
+    constructs (heading, blockquote, list, thematic break) only fire at
+    line start, so mid-text occurrences of ``#`` / ``>`` / ``-`` / ``+``
+    are safe and don't need escaping. ``*``-based thematic breaks and
+    ``_``-based ones are already handled by :func:`_escape_text_leaf`
+    since both characters are in `_TEXT_DELIMITERS`.
+    """
+    if not text:
+        return text
+    if _BLOCK_HEADING_RE.match(text):
+        return "\\" + text
+    if _BLOCK_BLOCKQUOTE_RE.match(text):
+        return "\\" + text
+    if _BLOCK_UNORDERED_RE.match(text):
+        return "\\" + text
+    m = _BLOCK_ORDERED_RE.match(text)
+    if m:
+        # Escape the . or ) marker, not the digits -- `\1` isn't a
+        # CommonMark escape (digits aren't in escapable punct), so a
+        # leading-backslash placement wouldn't survive `_unescape_punct`.
+        return f"{m.group(1)}\\{m.group(2)}{text[m.end() :]}"
+    if _BLOCK_THEMATIC_DASH_RE.match(text):
+        return "\\" + text
+    return text
+
+
 def _parse_inline_plain(text: str) -> list[Content]:
     """Parse plain text that contains no inline formatting.
 
@@ -665,7 +707,8 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
 
     if node_type == "paragraph":
         children = node.get("children", [])
-        return "".join(_stringify_node(c, emphasis=emphasis, bullet=bullet) or "" for c in children)
+        joined = "".join(_stringify_node(c, emphasis=emphasis, bullet=bullet) or "" for c in children)
+        return _escape_paragraph_block_markers(joined)
 
     if node_type == "heading":
         depth = node.get("depth", 1)
