@@ -994,6 +994,19 @@ class TestIssue69Regressions:
         # Up to leading whitespace before the bullet -- still a list marker.
         assert _remend("  * nested item\n") == "  * nested item\n"
 
+    def test_remend_skips_whitespace_flanked_asterisk_mid_line(self):
+        # CommonMark: `*` flanked by whitespace on both sides isn't a valid
+        # delimiter. Previously counted as an italic opener.
+        assert _remend("use the * operator") == "use the * operator"
+
+    def test_remend_skips_trailing_asterisk_at_end_of_line(self):
+        # `*\n` -- next char is whitespace, prev is whitespace -- not a delimiter.
+        assert _remend("trailing star *\nmore text") == "trailing star *\nmore text"
+
+    def test_remend_skips_bare_asterisk_at_end_of_buffer(self):
+        # `*` at end of stream with whitespace before -- not a delimiter yet.
+        assert _remend("partial *") == "partial *"
+
     def test_table_header_plus_separator_alone_is_held(self):
         # Header+separator without a body row would be emitted as broken
         # markup to append-only consumers. Hold the whole block.

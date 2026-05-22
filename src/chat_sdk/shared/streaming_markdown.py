@@ -54,28 +54,27 @@ def _strip_fenced_code(text: str) -> str:
     return "\n".join(result_lines)
 
 
-def _is_list_marker(stripped: str, run_start: int, run_len: int, ch: str) -> bool:
-    """Whether a run of *ch* at *run_start* is a list marker, not emphasis.
+def _is_excluded_asterisk(stripped: str, run_start: int, run_len: int, ch: str) -> bool:
+    """Whether a single-``*`` run at *run_start* should be excluded from the
+    emphasis tally per CommonMark's flanking rules.
 
-    Only ``*`` is ambiguous -- it's both an inline emphasis marker and a
-    bullet-list marker. A list marker is a single character preceded only
-    by horizontal whitespace (or start of text) since the previous newline,
-    and followed by a horizontal whitespace character.
+    A ``*`` flanked by whitespace (space, tab, newline, or text boundary)
+    on both sides is not a valid emphasis delimiter, and this same check
+    covers line-leading bullet list markers (``* item``). Mirrors
+    ``shouldSkipAsterisk`` in upstream remend's ``emphasis-handlers.ts``.
+
+    Only single-``*`` runs are subject to this check -- ``**`` / ``***``
+    runs are evaluated by the bold pairing logic and have their own
+    word-boundary semantics. ``_``-emphasis isn't ambiguous with list
+    markers, so it's not affected here either.
     """
     if ch != "*" or run_len != 1:
         return False
-    j = run_start - 1
-    while j >= 0:
-        c = stripped[j]
-        if c == "\n":
-            break
-        if c not in (" ", "\t"):
-            return False
-        j -= 1
-    after = run_start + run_len
-    if after >= len(stripped):
-        return False
-    return stripped[after] in (" ", "\t")
+    prev_char = stripped[run_start - 1] if run_start > 0 else None
+    next_char = stripped[run_start + run_len] if run_start + run_len < len(stripped) else None
+    prev_ws = prev_char is None or prev_char in (" ", "\t", "\n")
+    next_ws = next_char is None or next_char in (" ", "\t", "\n")
+    return prev_ws and next_ws
 
 
 def _close_emphasis(result: str, stripped: str, ch: str) -> str:
@@ -90,9 +89,10 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
     level: a run of 2+ characters opens/closes bold first, then any
     remaining single character opens/closes italic.
 
-    Line-leading ``*`` runs followed by whitespace are treated as list
-    markers and excluded from the emphasis tally -- mirroring upstream
-    ``remend``'s list-marker awareness (issue #69).
+    Whitespace-flanked single ``*`` runs are excluded via
+    :func:`_is_excluded_asterisk` -- this covers line-leading bullets
+    (``* item``) and any other non-delimiter asterisks per CommonMark's
+    flanking rules (issue #69).
 
     To guarantee idempotency the suffix is separated from any trailing
     marker run by a zero-width space so it cannot merge with existing
@@ -111,7 +111,7 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
             while i < len(stripped) and stripped[i] == ch:
                 run_len += 1
                 i += 1
-            if _is_list_marker(stripped, run_start, run_len, ch):
+            if _is_excluded_asterisk(stripped, run_start, run_len, ch):
                 continue
             runs.append(run_len)
         else:
