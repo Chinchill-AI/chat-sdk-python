@@ -344,7 +344,16 @@ class SlackAdapter:
             self._client_secret = None
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
 
-        encryption_key_raw = config.encryption_key or os.environ.get("SLACK_ENCRYPTION_KEY")
+        # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``
+        # is treated as "user explicitly opted out" and is NOT silently
+        # shadowed by ``SLACK_ENCRYPTION_KEY`` from the env. Mirrors the
+        # client_id / client_secret rule above (hazard #1). An empty user
+        # config still short-circuits ``decode_key`` via the final
+        # ``if encryption_key_raw`` guard, so no broken key is built.
+        if config.encryption_key is not None:
+            encryption_key_raw: str | None = config.encryption_key
+        else:
+            encryption_key_raw = os.environ.get("SLACK_ENCRYPTION_KEY")
         self._encryption_key: bytes | None = None
         if encryption_key_raw:
             self._encryption_key = decode_key(encryption_key_raw)

@@ -623,6 +623,40 @@ class TestWebhookVerifierConstruction:
             else:
                 os.environ["SLACK_CLIENT_SECRET"] = old_csecret
 
+    def test_empty_encryption_key_does_not_fall_back_to_env(self):
+        """Explicit ``encryption_key=""`` is honored as "user opted out", not env-shadowed.
+
+        Companion to the ``client_id=""`` / ``client_secret=""`` fix in
+        ``7c30c13``: the previous ``config.encryption_key or env`` pattern
+        silently substituted ``SLACK_ENCRYPTION_KEY`` whenever the user
+        explicitly passed an empty string. That violates hazard #1 — an
+        explicit user config value (even ``""``) must win over env.
+
+        Functional impact is narrower than the client_id case because the
+        end result is gated by ``if encryption_key_raw``, so an empty user
+        config eventually becomes ``self._encryption_key = None``. But with
+        env set, env would *replace* the user's explicit "off" intent and
+        downstream installation tokens would be encrypted with a key the
+        user didn't ask for — surprising at minimum, and load-bearing for
+        callers who rotate keys by clearing the explicit config.
+        """
+        import base64
+
+        old_key = os.environ.get("SLACK_ENCRYPTION_KEY")
+        # 32 bytes of `x`, base64-encoded — a valid key shape.
+        os.environ["SLACK_ENCRYPTION_KEY"] = base64.b64encode(b"x" * 32).decode()
+        try:
+            adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", encryption_key=""))
+            assert adapter._encryption_key is None, (
+                "explicit encryption_key='' must opt out of encryption, not "
+                "silently fall back to SLACK_ENCRYPTION_KEY from env"
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("SLACK_ENCRYPTION_KEY", None)
+            else:
+                os.environ["SLACK_ENCRYPTION_KEY"] = old_key
+
 
 # ---------------------------------------------------------------------------
 # handle_webhook with custom verifier
