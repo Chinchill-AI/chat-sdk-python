@@ -1056,3 +1056,61 @@ class TestIssue69Regressions:
         final = r.finish()
         assert "| H |" in final
         assert "|---|" in final
+
+
+# ============================================================================
+# Chat / AI agent completeness (issue #69 follow-up)
+# ============================================================================
+
+
+class TestRemendChatCompleteness:
+    """``_remend`` parity with upstream remend on chat-content patterns.
+
+    Each gap below comes from the [issue #69 follow-up
+    catalog](https://github.com/Chinchill-AI/chat-sdk-python/issues/69#issuecomment-4514898801).
+    Word-internal asterisks (``5*3=15``) are tracked separately under
+    Option A -- they need a proper CommonMark delimiter-stack algorithm
+    to avoid breaking paired-emphasis cases like ``text*foo*``.
+    """
+
+    # --- Math regions ($...$, $$...$$) -----------------------------------
+
+    def test_remend_skips_markers_inside_inline_math(self):
+        assert _remend("$a^* + b^*$") == "$a^* + b^*$"
+
+    def test_remend_skips_markers_inside_display_math(self):
+        text = "$$\\int_0^* e^{-x} dx$$"
+        assert _remend(text) == text
+
+    def test_remend_still_closes_emphasis_outside_math(self):
+        # Math region is stripped for counting; the trailing italic still
+        # gets closed normally.
+        assert _remend("$a^2$ and *italic") == "$a^2$ and *italic*"
+
+    def test_remend_skips_strike_marker_inside_math(self):
+        assert _remend("$a ~~ b$") == "$a ~~ b$"
+
+    def test_remend_does_not_open_bracket_inside_math(self):
+        # Math regions are dropped from the bracket walk too -- a literal
+        # `[` inside math shouldn't add a phantom `]` closer.
+        assert _remend("note $f[x]$ here") == "note $f[x]$ here"
+
+    # --- Escape-aware tilde / backtick / bracket counters ----------------
+
+    def test_remend_does_not_add_strike_for_escaped_tilde_pair(self):
+        assert _remend(r"foo \~~bar") == r"foo \~~bar"
+
+    def test_remend_does_not_add_bracket_for_escaped_open(self):
+        assert _remend(r"see \[item") == r"see \[item"
+
+    def test_remend_does_not_add_backtick_for_escaped(self):
+        assert _remend(r"foo \` bar") == r"foo \` bar"
+
+    def test_remend_handles_mixed_escaped_and_real_unclosed(self):
+        # `\~~` is literal; the trailing real `~~` is unclosed -> close it.
+        assert _remend(r"a \~~b and ~~real") == r"a \~~b and ~~real~~"
+
+    def test_remend_does_not_affect_escape_outside_relevant_counters(self):
+        # An escaped delimiter that wasn't going to imbalance anything
+        # is still left untouched.
+        assert _remend(r"foo \* bar") == r"foo \* bar"

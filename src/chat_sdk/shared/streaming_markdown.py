@@ -54,6 +54,54 @@ def _strip_fenced_code(text: str) -> str:
     return "\n".join(result_lines)
 
 
+# ASCII-punctuation characters that can be backslash-escaped per CommonMark.
+# When `\X` precedes one of these, the resulting char is literal, not a
+# delimiter -- so the inline-marker counters in `_remend` should ignore it.
+_ESCAPABLE_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def _strip_escape_sequences(text: str) -> str:
+    """Remove ``\\X`` pairs from *text* so escape-aware counters work.
+
+    For each ``\\X`` where X is an ASCII punctuation char, drop both
+    characters from the result. The cleaned text is only used for
+    *counting* delimiters (``*``, ``~~``, `` ` ``, ``[``, ``]``);
+    positions in the cleaned text don't map back to the original, so
+    truncating is safe.
+    """
+    if "\\" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in _ESCAPABLE_PUNCT:
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _strip_math_regions(text: str) -> str:
+    """Replace ``$$...$$`` and ``$...$`` math spans with empty strings.
+
+    LLMs frequently emit TeX-style math in technical chat content. Inline
+    markers inside math (e.g. ``$a^* + b^*$``) are literal, not delimiters,
+    so they shouldn't count toward the unclosed-emphasis tally. Math is
+    line-scoped here -- a ``$`` that doesn't close on the same line is
+    left alone so it doesn't gobble unrelated prose. The double-dollar
+    pass runs first so ``$$`` blocks don't get mis-paired by the single
+    pass.
+    """
+    if "$" not in text:
+        return text
+    # Display math: $$...$$ may span multiple lines.
+    text = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
+    # Inline math: $...$ within a single line, non-greedy, no embedded $.
+    text = re.sub(r"\$[^\$\n]+\$", "", text)
+    return text
+
+
 def _is_excluded_asterisk(stripped: str, run_start: int, run_len: int, ch: str) -> bool:
     """Whether a single-``*`` run at *run_start* should be excluded from the
     emphasis tally per CommonMark's flanking rules.
@@ -62,6 +110,12 @@ def _is_excluded_asterisk(stripped: str, run_start: int, run_len: int, ch: str) 
     on both sides is not a valid emphasis delimiter, and this same check
     covers line-leading bullet list markers (``* item``). Mirrors
     ``shouldSkipAsterisk`` in upstream remend's ``emphasis-handlers.ts``.
+
+    Note: a simpler word-internal exclusion (e.g. ``5*3=15``) was
+    considered but breaks paired emphasis like ``text*foo*`` whose
+    asterisks are also word-flanked. Distinguishing the two needs a
+    proper CommonMark delimiter-stack algorithm, tracked under issue #69
+    Option A as the next chat-completeness item.
 
     Only single-``*`` runs are subject to this check -- ``**`` / ``***``
     runs are evaluated by the bold pairing logic and have their own
@@ -180,6 +234,12 @@ def _remend(text: str) -> str:
 
     # Strip fenced code blocks so their contents don't affect inline counts.
     outside_fences = _strip_fenced_code(result)
+    # Drop math regions ($...$ and $$...$$) -- markers inside math are
+    # literal, not delimiters (issue #69 follow-up).
+    outside_fences = _strip_math_regions(outside_fences)
+    # Drop ASCII-punct escape sequences (`\*`, `\~`, `\[`, etc.) so the
+    # tilde / backtick / bracket counters below see the post-escape text.
+    outside_fences = _strip_escape_sequences(outside_fences)
 
     # --- inline code backticks ---
     # Count total backtick characters outside code fences. If odd, one code

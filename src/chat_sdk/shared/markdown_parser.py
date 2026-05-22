@@ -104,9 +104,16 @@ def make_list(children: list[Content], *, ordered: bool = False, start: int = 1)
     return node
 
 
-def make_list_item(children: list[Content]) -> Content:
-    """Create a list item node."""
-    return {"type": "listItem", "children": children}
+def make_list_item(children: list[Content], *, checked: bool | None = None) -> Content:
+    """Create a list item node.
+
+    *checked* follows the mdast GFM task-list extension: ``True`` for
+    ``- [x]``, ``False`` for ``- [ ]``, ``None`` for a regular list item.
+    """
+    node: Content = {"type": "listItem", "children": children}
+    if checked is not None:
+        node["checked"] = checked
+    return node
 
 
 def make_thematic_break() -> Content:
@@ -162,43 +169,75 @@ def get_node_value(node: Content) -> str:
 # Inline parser
 # ---------------------------------------------------------------------------
 
+# ASCII-punctuation characters that may be backslash-escaped per
+# CommonMark. A preceding `\` makes the next character literal -- not a
+# delimiter -- which the lookbehinds in the patterns below honour.
+_ESCAPABLE_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
 # Regex patterns for inline elements, ordered by priority.
-# Each pattern captures a full inline construct.
+# Each pattern captures a full inline construct. Every opening delimiter
+# uses a ``(?<!\\)`` lookbehind so an escaped opener (``\*``, ``\[``, etc.)
+# is treated as literal text rather than as a delimiter run. Bracket
+# contents (link / image) also tolerate inner ``\]`` / ``\[`` via the
+# ``(?:[^\]\\]|\\.)*`` pattern.
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
-    ("image", re.compile(r'!\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("image", re.compile(r'(?<!\\)!\[((?:[^\]\\]|\\.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("link", re.compile(r'(?<!\\)\[((?:[^\]\\]|\\.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Inline code: `code`
-    ("inlineCode", re.compile(r"`([^`]+)`")),
+    ("inlineCode", re.compile(r"(?<!\\)`([^`]+)`")),
     # Bold: **text**
-    ("strong_star", re.compile(r"\*\*(.+?)\*\*")),
+    ("strong_star", re.compile(r"(?<!\\)\*\*((?:[^\\]|\\.)+?)\*\*")),
     # Bold: __text__
-    ("strong_under", re.compile(r"__(.+?)__")),
+    ("strong_under", re.compile(r"(?<!\\)__((?:[^\\]|\\.)+?)__")),
     # Strikethrough: ~~text~~
-    ("delete", re.compile(r"~~(.+?)~~")),
+    ("delete", re.compile(r"(?<!\\)~~((?:[^\\]|\\.)+?)~~")),
     # Emphasis: *text*  (not preceded/followed by *)
-    ("emphasis_star", re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")),
+    ("emphasis_star", re.compile(r"(?<![*\\])\*(?!\*)((?:[^\\]|\\.)+?)(?<!\*)\*(?!\*)")),
     # Emphasis: _text_  (not preceded/followed by _)
-    ("emphasis_under", re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")),
+    ("emphasis_under", re.compile(r"(?<![_\\])_(?!_)((?:[^\\]|\\.)+?)(?<!_)_(?!_)")),
 ]
+
+
+def _unescape_punct(text: str) -> str:
+    """Resolve backslash-escapes of ASCII punctuation to their literal char.
+
+    Applied at text-leaf emission only -- inline delimiters were already
+    consumed by the patterns above with escape-aware lookbehinds, so by
+    the time we reach a text leaf, any remaining ``\\X`` pair where X is
+    ASCII punct is unambiguously a literal X.
+    """
+    if "\\" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in _ESCAPABLE_PUNCT:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def _parse_inline_plain(text: str) -> list[Content]:
     """Parse plain text that contains no inline formatting.
 
-    Handles hard line breaks (two trailing spaces + newline).
+    Handles hard line breaks (two trailing spaces + newline) and resolves
+    backslash escapes of ASCII punctuation to their literal character.
     """
     if "  \n" in text:
         parts: list[Content] = []
         segments = text.split("  \n")
         for i, seg in enumerate(segments):
             if seg:
-                parts.append(make_text(seg))
+                parts.append(make_text(_unescape_punct(seg)))
             if i < len(segments) - 1:
                 parts.append(make_break())
-        return parts if parts else [make_text(text)]
-    return [make_text(text)]
+        return parts if parts else [make_text(_unescape_punct(text))]
+    return [make_text(_unescape_punct(text))]
 
 
 def _parse_inline(text: str) -> list[Content]:
@@ -242,7 +281,7 @@ def _parse_inline(text: str) -> list[Content]:
 
         # The matched construct (content recursion is bounded by match length)
         if best_kind == "image":
-            alt = best_match.group(1)
+            alt = _unescape_punct(best_match.group(1))
             url = best_match.group(2)
             title = best_match.group(3)
             nodes.append(make_image(url, alt, title))
@@ -319,12 +358,22 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
     items: list[Content] = []
     i = start
     item_re = re.compile(r"^(\d+)[.)]\s+(.*)") if ordered else re.compile(r"^[-*+]\s+(.*)")
+    # GFM task list extension: `- [ ]` or `- [x]` at the start of an
+    # unordered item maps to `listItem.checked = False` / `True`.
+    task_re = re.compile(r"^\[([ xX])\]\s+(.*)")
 
     while i < len(lines):
         line = lines[i]
         m = item_re.match(line)
         if m:
             item_text = m.group(2) if ordered else m.group(1)
+
+            checked: bool | None = None
+            if not ordered:
+                task_m = task_re.match(item_text)
+                if task_m:
+                    checked = task_m.group(1) in ("x", "X")
+                    item_text = task_m.group(2)
 
             item_children_lines = [item_text]
             i += 1
@@ -350,7 +399,7 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
 
             # Parse nested content in the item
             nested_children = _parse_list_item_content(item_children_lines)
-            items.append(make_list_item(nested_children))
+            items.append(make_list_item(nested_children, checked=checked))
         else:
             break
 

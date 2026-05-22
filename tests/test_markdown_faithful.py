@@ -190,6 +190,121 @@ class TestParseMarkdown:
 
 
 # ============================================================================
+# Chat / AI agent completeness (issue #69): escaped chars + task lists
+# ============================================================================
+
+
+class TestEscapedCharacters:
+    """Backslash-escape support for chat content.
+
+    LLMs routinely emit ``\\*`` / ``\\[`` / ``\\\\`` when explaining
+    syntax, displaying shell commands, or showing literal markdown.
+    Previously these slipped past the inline regexes and the visible
+    output dropped the backslashes but mis-parsed the surrounding
+    delimiters as emphasis / links.
+    """
+
+    def _para_children(self, md):
+        ast = parse_markdown(md)
+        assert ast["children"][0]["type"] == "paragraph"
+        return ast["children"][0]["children"]
+
+    def test_escaped_asterisk_is_literal_not_italic(self):
+        children = self._para_children(r"\*not italic\*")
+        assert len(children) == 1
+        assert children[0] == {"type": "text", "value": "*not italic*"}
+
+    def test_escaped_underscore_is_literal_not_italic(self):
+        children = self._para_children(r"\_not italic\_")
+        assert len(children) == 1
+        assert children[0] == {"type": "text", "value": "_not italic_"}
+
+    def test_escaped_brackets_do_not_form_a_link(self):
+        children = self._para_children(r"\[not a link\](https://x.com)")
+        assert all(c.get("type") != "link" for c in children)
+        assert any("[not a link]" in c.get("value", "") for c in children if c.get("type") == "text")
+
+    def test_escaped_tilde_does_not_form_strikethrough(self):
+        children = self._para_children(r"\~~not strike\~~")
+        assert all(c.get("type") != "delete" for c in children)
+
+    def test_escaped_backslash_yields_single_backslash(self):
+        children = self._para_children(r"path with \\backslash")
+        assert children == [{"type": "text", "value": "path with \\backslash"}]
+
+    def test_mixed_escaped_and_real_emphasis(self):
+        children = self._para_children(r"\*literal\* and *real italic*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" in types
+        text_values = [c.get("value", "") for c in children if c.get("type") == "text"]
+        assert any("*literal*" in v for v in text_values)
+
+    def test_escaped_alt_in_image(self):
+        children = self._para_children(r"![my \[image\]](pic.png)")
+        assert children[0]["type"] == "image"
+        assert children[0]["alt"] == "my [image]"
+
+    def test_inline_code_contents_are_not_unescaped(self):
+        # Per CommonMark, backslash inside `code` is literal.
+        children = self._para_children(r"a `\*literal\*` b")
+        code_nodes = [c for c in children if c.get("type") == "inlineCode"]
+        assert len(code_nodes) == 1
+        assert code_nodes[0]["value"] == r"\*literal\*"
+
+
+class TestTaskListItems:
+    """GFM task list checkbox extraction.
+
+    Maps ``- [ ] item`` / ``- [x] item`` to mdast ``listItem`` with a
+    ``checked`` attribute. Plain list items stay as before (no attr).
+    """
+
+    def _list(self, md):
+        ast = parse_markdown(md)
+        lists = [c for c in ast["children"] if c.get("type") == "list"]
+        assert len(lists) == 1
+        return lists[0]
+
+    def test_unchecked_task_item_sets_checked_false(self):
+        lst = self._list("- [ ] todo")
+        assert lst["children"][0]["checked"] is False
+
+    def test_checked_task_item_sets_checked_true(self):
+        lst = self._list("- [x] done")
+        assert lst["children"][0]["checked"] is True
+
+    def test_uppercase_x_also_counts_as_checked(self):
+        lst = self._list("- [X] done")
+        assert lst["children"][0]["checked"] is True
+
+    def test_plain_item_has_no_checked_attr(self):
+        lst = self._list("- regular item")
+        assert "checked" not in lst["children"][0]
+
+    def test_mixed_list_preserves_per_item_state(self):
+        lst = self._list("- [x] done\n- [ ] pending\n- regular")
+        items = lst["children"]
+        assert items[0]["checked"] is True
+        assert items[1]["checked"] is False
+        assert "checked" not in items[2]
+
+    def test_task_marker_strips_from_content(self):
+        lst = self._list("- [x] do the thing")
+        para = lst["children"][0]["children"][0]
+        # Content should be "do the thing", not "[x] do the thing".
+        text_concat = "".join(c.get("value", "") for c in para["children"])
+        assert text_concat == "do the thing"
+
+    def test_ordered_list_with_bracket_content_is_not_a_task(self):
+        # `1. [x] foo` should NOT be treated as a task -- task lists are
+        # a bullet-only convention in GFM.
+        ast = parse_markdown("1. [x] foo")
+        lst = ast["children"][0]
+        assert lst["type"] == "list" and lst["ordered"] is True
+        assert "checked" not in lst["children"][0]
+
+
+# ============================================================================
 # stringifyMarkdown Tests
 # ============================================================================
 
