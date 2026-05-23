@@ -171,53 +171,31 @@ def get_node_value(node: Content) -> str:
 
 # ASCII-punctuation characters that may be backslash-escaped per
 # CommonMark. A preceding `\` makes the next character literal -- not a
-# delimiter -- which the lookbehinds in the patterns below honour.
+# delimiter -- which `_protect_escapes` consumes into a sentinel-prefixed
+# pair before the inline regexes run.
 _ESCAPABLE_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
-# Regex patterns for inline elements, ordered by priority.
-# Each pattern captures a full inline construct. Every opening delimiter
-# uses a ``(?<!\\)`` lookbehind so an escaped opener (``\*``, ``\[``, etc.)
-# is treated as literal text rather than as a delimiter run. Bracket
-# contents (link / image) also tolerate inner ``\]`` / ``\[`` via the
-# ``(?:[^\]\\]|\\.)*`` pattern.
-#
-# Known limitation (issue #69 follow-up): the fixed-width lookbehind
-# can only check the immediately preceding character, so ``\\*foo*``
-# (an escaped backslash followed by genuine emphasis) is treated as
-# escaped emphasis and falls through to plain text -- the resulting
-# AST loses the italic semantics. Fixing this requires either a
-# variable-width lookbehind (Python's ``re`` doesn't support that) or
-# a placeholder-based pre-pass that protects escape sequences before
-# the regex runs. Tracked for the next chat-completeness pass; the
-# pattern is rare enough in LLM/chat output to defer (LLMs explaining
-# regex syntax usually use code fences).
-_INLINE_PATTERNS = [
-    # Images: ![alt](url) or ![alt](url "title")
-    ("image", re.compile(r'(?<!\\)!\[((?:[^\]\\]|\\.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
-    # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'(?<!\\)\[((?:[^\]\\]|\\.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
-    # Inline code: `code`
-    ("inlineCode", re.compile(r"(?<!\\)`([^`]+)`")),
-    # Bold: **text**
-    ("strong_star", re.compile(r"(?<!\\)\*\*((?:[^\\]|\\.)+?)\*\*")),
-    # Bold: __text__
-    ("strong_under", re.compile(r"(?<!\\)__((?:[^\\]|\\.)+?)__")),
-    # Strikethrough: ~~text~~
-    ("delete", re.compile(r"(?<!\\)~~((?:[^\\]|\\.)+?)~~")),
-    # Emphasis: *text*  (not preceded/followed by *)
-    ("emphasis_star", re.compile(r"(?<![*\\])\*(?!\*)((?:[^\\]|\\.)+?)(?<!\*)\*(?!\*)")),
-    # Emphasis: _text_  (not preceded/followed by _)
-    ("emphasis_under", re.compile(r"(?<![_\\])_(?!_)((?:[^\\]|\\.)+?)(?<!_)_(?!_)")),
-]
+# Sentinel character used by `_protect_escapes` to mark every ``\X``
+# escape sequence as ``<SENTINEL>X``. The sentinel is a control codepoint
+# (U+0001) that never legitimately appears in chat-content markdown, so
+# any occurrence in the protected text unambiguously marks an escape.
+# The inline-pattern lookbehinds reject delimiters preceded by this
+# sentinel; everything else (including any number of literal
+# backslashes) is treated as a real delimiter -- which closes the
+# doubled-backslash gap that fixed-width lookbehind on ``\`` couldn't.
+_ESCAPE_SENTINEL = "\x01"
 
 
-def _unescape_punct(text: str) -> str:
-    """Resolve backslash-escapes of ASCII punctuation to their literal char.
+def _protect_escapes(text: str) -> str:
+    """Replace every ``\\X`` escape pair with ``<SENTINEL>X`` in *text*.
 
-    Applied at text-leaf emission only -- inline delimiters were already
-    consumed by the patterns above with escape-aware lookbehinds, so by
-    the time we reach a text leaf, any remaining ``\\X`` pair where X is
-    ASCII punct is unambiguously a literal X.
+    Used as a pre-pass before the inline regex matching. Each escaped
+    delimiter character is marked so the regex lookbehinds can skip it
+    via ``(?<!\\x01)``. Unlike the previous ``(?<!\\\\)`` approach, this
+    correctly handles any number of preceding backslashes because the
+    pre-pass consumes the backslash itself -- a ``*`` preceded by a
+    literal backslash (i.e. an *escaped* backslash followed by a real
+    emphasis opener) has no sentinel before it and matches normally.
     """
     if "\\" not in text:
         return text
@@ -225,6 +203,7 @@ def _unescape_punct(text: str) -> str:
     i = 0
     while i < len(text):
         if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in _ESCAPABLE_PUNCT:
+            out.append(_ESCAPE_SENTINEL)
             out.append(text[i + 1])
             i += 2
             continue
@@ -233,11 +212,95 @@ def _unescape_punct(text: str) -> str:
     return "".join(out)
 
 
-# Inverse of `_unescape_punct`: characters that, if present literally in
-# a text leaf, would be parsed as the start of a markdown construct on
-# the next ``parse_markdown`` call. Re-escape these at stringify time so
-# the AST round-trips. Over-escaping ordinary punctuation produces noisy
-# output without improving correctness -- only delimiters need it.
+def _restore_escapes(text: str) -> str:
+    """Inverse of :func:`_protect_escapes` for text-leaf emission.
+
+    Replaces each ``<SENTINEL>X`` pair with literal ``X``. The
+    backslash is dropped because the escape sequence resolved to a
+    literal character at the AST text leaf.
+    """
+    if _ESCAPE_SENTINEL not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == _ESCAPE_SENTINEL and i + 1 < len(text):
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _restore_escapes_as_literal_pair(text: str) -> str:
+    """Inverse for inline-code emission: ``<SENTINEL>X`` -> ``\\X``.
+
+    Per CommonMark, backslashes inside inline code spans are preserved
+    literally -- ``\\*`` inside a code span stays as ``\\*``, not ``*``.
+    """
+    if _ESCAPE_SENTINEL not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == _ESCAPE_SENTINEL and i + 1 < len(text):
+            out.append("\\")
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+# Regex patterns for inline elements, ordered by priority. Each pattern
+# captures a full inline construct.
+#
+# The patterns operate on text that has already been through
+# `_protect_escapes`, so escaped delimiters appear as ``<SENTINEL>X``
+# (where SENTINEL = U+0001). The ``(?<!\x01)`` lookbehind on each
+# opener rejects those, while real backslash characters in the
+# protected text -- which can only come from escaped backslashes
+# (``\\\\`` -> ``<SENTINEL>\\``) -- are left as literal ``\`` and don't
+# trigger the lookbehind, so the following delimiter is correctly
+# recognised as a real opener (closing the doubled-backslash gap).
+#
+# Bracket content groups still need ``(?:[^\]\x01]|\x01.)+?`` so that
+# escaped ``\]`` / ``\[`` inside link text don't prematurely terminate
+# the match -- the alternation consumes a ``<SENTINEL>X`` pair as a
+# single unit.
+_INLINE_PATTERNS = [
+    # Images: ![alt](url) or ![alt](url "title")
+    ("image", re.compile(r'(?<!\x01)!\[((?:[^\]\x01]|\x01.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    # Links: [text](url) or [text](url "title")
+    ("link", re.compile(r'(?<!\x01)\[((?:[^\]\x01]|\x01.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    # Inline code: `code`
+    ("inlineCode", re.compile(r"(?<!\x01)`([^`]+)`")),
+    # Bold: **text**
+    ("strong_star", re.compile(r"(?<!\x01)\*\*(.+?)\*\*")),
+    # Bold: __text__
+    ("strong_under", re.compile(r"(?<!\x01)__(.+?)__")),
+    # Strikethrough: ~~text~~
+    ("delete", re.compile(r"(?<!\x01)~~(.+?)~~")),
+    # Emphasis: *text*  (not preceded/followed by * or sentinel)
+    ("emphasis_star", re.compile(r"(?<![*\x01])\*(?!\*)(.+?)(?<![*\x01])\*(?!\*)")),
+    # Emphasis: _text_  (not preceded/followed by _ or sentinel)
+    ("emphasis_under", re.compile(r"(?<![_\x01])_(?!_)(.+?)(?<![_\x01])_(?!_)")),
+]
+
+
+# Note: `_unescape_punct` was removed in favour of the sentinel-based
+# `_protect_escapes` / `_restore_escapes` pair above, which correctly
+# handles any number of preceding backslashes (the previous fixed-width
+# lookbehind couldn't distinguish ``\\*foo*`` from ``\*foo\*``).
+
+
+# Characters that, if present literally in a text leaf, would be parsed
+# as the start of a markdown construct on the next ``parse_markdown``
+# call. Re-escape these at stringify time so the AST round-trips.
+# Over-escaping ordinary punctuation produces noisy output without
+# improving correctness -- only delimiters need it.
 _TEXT_DELIMITERS = frozenset("*_~`[]\\")
 
 
@@ -245,9 +308,9 @@ def _escape_text_leaf(value: str) -> str:
     """Re-escape delimiter characters so a text leaf round-trips through
     parse_markdown unchanged.
 
-    Inverse of :func:`_unescape_punct` -- a text node carrying the value
-    ``"*literal*"`` came from input ``\\*literal\\*``; stringify must
-    emit the backslashes or re-parse will form an emphasis node.
+    Counterpart of :func:`_restore_escapes` -- a text node carrying the
+    value ``"*literal*"`` came from input ``\\*literal\\*``; stringify
+    must emit the backslashes or re-parse will form an emphasis node.
     """
     if not any(c in _TEXT_DELIMITERS for c in value):
         return value
@@ -261,10 +324,10 @@ def _escape_text_leaf(value: str) -> str:
 
 # Block-level constructs only fire at line start. When a paragraph's
 # joined text begins with one of these patterns -- typically after
-# `_unescape_punct` resolved a ``\#`` or ``\>`` -- naive stringify would
-# re-form the construct on the next parse. These regexes match the
-# minimal opener pattern; `_escape_paragraph_block_markers` inserts the
-# backslash at the right position.
+# `_restore_escapes` resolved a ``\#`` or ``\>`` to its literal char --
+# naive stringify would re-form the construct on the next parse. These
+# regexes match the minimal opener pattern; `_escape_paragraph_block_markers`
+# inserts the backslash at the right position.
 _BLOCK_HEADING_RE = re.compile(r"^#{1,6}(?=\s|$)")
 _BLOCK_BLOCKQUOTE_RE = re.compile(r"^>")
 _BLOCK_UNORDERED_RE = re.compile(r"^[-+](?=\s)")
@@ -286,7 +349,7 @@ def _escape_block_marker_line(line: str) -> str:
     if m:
         # Escape the . or ) marker, not the digits -- `\1` isn't a
         # CommonMark escape (digits aren't in escapable punct), so a
-        # leading-backslash placement wouldn't survive `_unescape_punct`.
+        # leading-backslash placement wouldn't survive `_restore_escapes`.
         return f"{m.group(1)}\\{m.group(2)}{line[m.end() :]}"
     if _BLOCK_THEMATIC_DASH_RE.match(line):
         return "\\" + line
@@ -301,7 +364,7 @@ def _escape_paragraph_block_markers(text: str) -> str:
     constructs (heading, blockquote, list, thematic break) only fire at
     line start, so mid-line occurrences of ``#`` / ``>`` / ``-`` / ``+``
     are safe. But a paragraph text leaf may contain ``\\n`` (from
-    `_unescape_punct` resolving an escaped marker after a soft line
+    `_restore_escapes` resolving an escaped marker after a soft line
     break, or from joining text leaves around a hard break); each line
     of the joined output needs the same escape treatment as line 1, or
     re-parse will split the paragraph at the embedded marker.
@@ -320,26 +383,32 @@ def _escape_paragraph_block_markers(text: str) -> str:
 def _parse_inline_plain(text: str) -> list[Content]:
     """Parse plain text that contains no inline formatting.
 
-    Handles hard line breaks (two trailing spaces + newline) and resolves
-    backslash escapes of ASCII punctuation to their literal character.
+    Handles hard line breaks (two trailing spaces + newline) and
+    restores escape-sentinel pairs to their literal character.  The
+    caller is expected to have run ``_protect_escapes`` on the input.
     """
     if "  \n" in text:
         parts: list[Content] = []
         segments = text.split("  \n")
         for i, seg in enumerate(segments):
             if seg:
-                parts.append(make_text(_unescape_punct(seg)))
+                parts.append(make_text(_restore_escapes(seg)))
             if i < len(segments) - 1:
                 parts.append(make_break())
-        return parts if parts else [make_text(_unescape_punct(text))]
-    return [make_text(_unescape_punct(text))]
+        return parts if parts else [make_text(_restore_escapes(text))]
+    return [make_text(_restore_escapes(text))]
 
 
-def _parse_inline(text: str) -> list[Content]:
+def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Content]:
     """Parse inline markdown elements into AST nodes.
 
     Handles: strong, emphasis, delete, inlineCode, link, image.
     Returns a list of inline Content nodes.
+
+    Runs ``_protect_escapes`` on entry so the inline regex patterns can
+    use sentinel-based lookbehinds. Recursive calls (e.g. into link
+    text or emphasis content) pass ``_already_protected=True`` because
+    the captured group is already in the protected form.
 
     The suffix (text after a match) is processed iteratively to avoid
     unbounded recursion on long strings.  Content *inside* a match
@@ -348,6 +417,8 @@ def _parse_inline(text: str) -> list[Content]:
     """
     if not text:
         return []
+    if not _already_protected:
+        text = _protect_escapes(text)
 
     nodes: list[Content] = []
     remaining = text
@@ -376,23 +447,30 @@ def _parse_inline(text: str) -> list[Content]:
 
         # The matched construct (content recursion is bounded by match length)
         if best_kind == "image":
-            alt = _unescape_punct(best_match.group(1))
-            url = best_match.group(2)
+            alt = _restore_escapes(best_match.group(1))
+            url = _restore_escapes(best_match.group(2))
             title = best_match.group(3)
+            if title is not None:
+                title = _restore_escapes(title)
             nodes.append(make_image(url, alt, title))
         elif best_kind == "link":
             link_text = best_match.group(1)
-            url = best_match.group(2)
+            url = _restore_escapes(best_match.group(2))
             title = best_match.group(3)
-            nodes.append(make_link(url, _parse_inline(link_text), title))
+            if title is not None:
+                title = _restore_escapes(title)
+            nodes.append(make_link(url, _parse_inline(link_text, _already_protected=True), title))
         elif best_kind == "inlineCode":
-            nodes.append(make_inline_code(best_match.group(1)))
+            # CommonMark: backslashes inside inline code are literal,
+            # so restore sentinel pairs as `\X` rather than dropping the
+            # backslash.
+            nodes.append(make_inline_code(_restore_escapes_as_literal_pair(best_match.group(1))))
         elif best_kind in ("strong_star", "strong_under"):
-            nodes.append(make_strong(_parse_inline(best_match.group(1))))
+            nodes.append(make_strong(_parse_inline(best_match.group(1), _already_protected=True)))
         elif best_kind == "delete":
-            nodes.append(make_delete(_parse_inline(best_match.group(1))))
+            nodes.append(make_delete(_parse_inline(best_match.group(1), _already_protected=True)))
         elif best_kind in ("emphasis_star", "emphasis_under"):
-            nodes.append(make_emphasis(_parse_inline(best_match.group(1))))
+            nodes.append(make_emphasis(_parse_inline(best_match.group(1), _already_protected=True)))
 
         # Advance past the match (iterative, not recursive)
         remaining = remaining[best_match.end() :]

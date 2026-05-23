@@ -255,6 +255,29 @@ class TestEscapedCharacters:
         assert len(code_nodes) == 1
         assert code_nodes[0]["value"] == r"\*literal\*"
 
+    def test_escaped_backslash_followed_by_real_emphasis(self):
+        # PR #101 review #4 (chatgpt-codex P2): ``\\*foo*`` is literal
+        # backslash + italic. The fixed-width ``(?<!\\)`` lookbehind
+        # couldn't distinguish odd vs even backslash runs; the
+        # ``_protect_escapes`` pre-pass consumes the escape and lets the
+        # regex see a clean ``*foo*`` delimiter pair.
+        children = self._para_children("\\\\*real italic*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" in types, f"expected emphasis, got {types}"
+        # Literal backslash precedes the emphasis as a text node.
+        text_values = [c.get("value", "") for c in children if c.get("type") == "text"]
+        assert "\\" in text_values
+
+    def test_triple_backslash_before_star_is_fully_escaped(self):
+        # ``\\\*foo*`` = escaped backslash + escaped asterisk + ``foo*``.
+        # The leading two-char ``\\`` resolves to literal ``\`` and the
+        # next ``\*`` resolves to literal ``*``. The trailing ``*`` has
+        # no opener so there's no emphasis -- the result is literal
+        # text.
+        children = self._para_children("\\\\\\*foo*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" not in types
+
 
 class TestTaskListItems:
     """GFM task list checkbox extraction.
