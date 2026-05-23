@@ -17,12 +17,24 @@ from typing import Any
 
 import pytest
 
-from chat_sdk.shared.markdown_parser import parse_markdown as baseline_parse
-from chat_sdk.shared.parser_spike.markdown_it_translator import (
+# The spike candidate libraries live in the optional `spike-parser`
+# dependency group, which CI's default `uv sync --group dev` does NOT
+# install. Skip the whole module (rather than erroring at collection)
+# when they're absent so the standard test job stays green.
+pytest.importorskip("mistune")
+pytest.importorskip("markdown_it")
+pytest.importorskip("marko")
+
+from chat_sdk.shared.markdown_parser import parse_markdown as baseline_parse  # noqa: E402
+from chat_sdk.shared.parser_spike.markdown_it_translator import (  # noqa: E402
     parse_markdown as markdown_it_parse,
 )
-from chat_sdk.shared.parser_spike.marko_translator import parse_markdown as marko_parse
-from chat_sdk.shared.parser_spike.mistune_translator import parse_markdown as mistune_parse
+from chat_sdk.shared.parser_spike.marko_translator import (  # noqa: E402
+    parse_markdown as marko_parse,
+)
+from chat_sdk.shared.parser_spike.mistune_translator import (  # noqa: E402
+    parse_markdown as mistune_parse,
+)
 
 CANDIDATES = [
     ("mistune", mistune_parse),
