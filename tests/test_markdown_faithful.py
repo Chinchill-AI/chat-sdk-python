@@ -319,6 +319,20 @@ class TestTaskListItems:
         assert lst["children"][0]["checked"] is True
         assert lst["children"][0]["children"] == []
 
+    def test_task_item_with_only_nested_list_keeps_parent_prefix(self):
+        # PR #101 review #2: when a task item's only children are a
+        # nested list, stringify must still emit the parent prefix line
+        # (with task marker) before recursing -- otherwise the parent
+        # disappears entirely and re-parse loses the list structure.
+        src = "- [ ]\n  - child"
+        ast = parse_markdown(src)
+        out = stringify_markdown(ast)
+        # The parent task item must appear with its checkbox marker.
+        assert "[ ]" in out
+        # And the round-trip must preserve the structure.
+        ast2 = parse_markdown(out)
+        assert ast == ast2
+
 
 # ============================================================================
 # stringifyMarkdown Tests

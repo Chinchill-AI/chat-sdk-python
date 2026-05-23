@@ -123,6 +123,13 @@ class BaseFormatConverter(ABC):
             is_first_content = True
             for child in get_node_children(item):
                 if child.get("type") == "list":
+                    if is_first_content:
+                        # No text child before this nested list -- emit
+                        # the parent prefix on its own line BEFORE the
+                        # nested list, or the checkbox/parent ordering
+                        # ends up reversed (PR #101 review finding).
+                        lines.append(f"{indent}{prefix} {task_marker}".rstrip())
+                        is_first_content = False
                     lines.append(self._render_list(child, depth + 1, node_converter, unordered_bullet))
                     continue
                 text = node_converter(child)
@@ -133,8 +140,9 @@ class BaseFormatConverter(ABC):
                     is_first_content = False
                 else:
                     lines.append(f"{indent}  {text}")
-            # Empty task item -- still emit a line so the marker isn't lost.
-            if is_first_content and task_marker:
+            # Item with zero rendered children -- still emit a line so the
+            # listItem (and any task marker) isn't lost.
+            if is_first_content:
                 lines.append(f"{indent}{prefix} {task_marker}".rstrip())
 
         return "\n".join(lines)

@@ -1129,3 +1129,10 @@ class TestRemendChatCompleteness:
         # any math region (one un-escaped `$` doesn't form `$...$`).
         # The italic at the end still gets closed normally.
         assert _remend(r"\$5 and $10 *italic") == r"\$5 and $10 *italic*"
+
+    def test_remend_unescaped_currency_does_not_pair_as_math(self):
+        # PR #101 review #1: text like `prices are $5 and $10` would
+        # previously match `$5 and $10` as inline math (because the
+        # regex didn't require non-whitespace around the delimiters).
+        # The italic at end must still get closed normally.
+        assert _remend("prices are $5 and $10 *italic") == "prices are $5 and $10 *italic*"

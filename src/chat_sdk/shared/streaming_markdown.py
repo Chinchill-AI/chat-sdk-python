@@ -92,13 +92,19 @@ def _strip_math_regions(text: str) -> str:
     left alone so it doesn't gobble unrelated prose. The double-dollar
     pass runs first so ``$$`` blocks don't get mis-paired by the single
     pass.
+
+    Inline math requires a non-whitespace char immediately after the
+    opening ``$`` and immediately before the closing ``$`` (standard
+    pandoc/markdown-it heuristic). This prevents false positives on
+    currency text like ``"prices are $5 and $10"`` which would otherwise
+    pair up the two dollar signs as math (PR #101 review finding).
     """
     if "$" not in text:
         return text
     # Display math: $$...$$ may span multiple lines.
-    text = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
-    # Inline math: $...$ within a single line, non-greedy, no embedded $.
-    text = re.sub(r"\$[^\$\n]+\$", "", text)
+    text = re.sub(r"\$\$.+?\$\$", "", text, flags=re.DOTALL)
+    # Inline math: $X...Y$ on a single line where X and Y are non-whitespace.
+    text = re.sub(r"\$(?!\s)[^\$\n]+?(?<!\s)\$", "", text)
     return text
 
 

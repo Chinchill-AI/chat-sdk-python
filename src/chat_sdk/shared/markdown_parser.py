@@ -792,18 +792,28 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
                 # so the round-trip preserves an empty `- [ ]` task.
                 lines.append(f"{prefix} {task_marker}".rstrip())
                 continue
-            for ci, child in enumerate(item_children):
+            # Track whether the parent prefix has been written so a
+            # listItem whose only children are nested lists still gets
+            # its own line (PR #101 review finding).
+            prefix_emitted = False
+            for child in item_children:
                 child_type = child.get("type")
                 if child_type == "list":
+                    if not prefix_emitted:
+                        # No text child before this nested list -- emit
+                        # the parent prefix on its own line so the
+                        # listItem and any checkbox state survive.
+                        lines.append(f"{prefix} {task_marker}".rstrip())
+                        prefix_emitted = True
                     nested = _stringify_node(child, emphasis=emphasis, bullet=bullet)
                     if nested:
-                        # Indent nested list
                         for nl in nested.split("\n"):
                             lines.append(f"  {nl}")
                 else:
                     text = _stringify_node(child, emphasis=emphasis, bullet=bullet) or ""
-                    if ci == 0:
+                    if not prefix_emitted:
                         lines.append(f"{prefix} {task_marker}{text}")
+                        prefix_emitted = True
                     else:
                         lines.append(f"  {text}")
         return "\n".join(lines)
