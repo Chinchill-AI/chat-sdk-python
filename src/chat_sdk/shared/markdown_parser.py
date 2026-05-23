@@ -180,6 +180,17 @@ _ESCAPABLE_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 # is treated as literal text rather than as a delimiter run. Bracket
 # contents (link / image) also tolerate inner ``\]`` / ``\[`` via the
 # ``(?:[^\]\\]|\\.)*`` pattern.
+#
+# Known limitation (issue #69 follow-up): the fixed-width lookbehind
+# can only check the immediately preceding character, so ``\\*foo*``
+# (an escaped backslash followed by genuine emphasis) is treated as
+# escaped emphasis and falls through to plain text -- the resulting
+# AST loses the italic semantics. Fixing this requires either a
+# variable-width lookbehind (Python's ``re`` doesn't support that) or
+# a placeholder-based pre-pass that protects escape sequences before
+# the regex runs. Tracked for the next chat-completeness pass; the
+# pattern is rare enough in LLM/chat output to defer (LLMs explaining
+# regex syntax usually use code fences).
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
     ("image", re.compile(r'(?<!\\)!\[((?:[^\]\\]|\\.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
