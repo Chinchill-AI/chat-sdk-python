@@ -271,6 +271,24 @@ class TestEscapedCharacters:
         assert len(code_nodes) == 1
         assert code_nodes[0]["value"] == r"\*literal\*"
 
+    def test_code_span_ending_in_backslash_does_not_leak_sentinel(self):
+        # PR #101 re-review (holistic): a code span ending in `\` (e.g.
+        # `` `C:\` ``) used to leave the escape sentinel (U+FDD0)
+        # dangling in the captured content, leaking the noncharacter
+        # into output. The dangling sentinel now resolves to a literal
+        # backslash (CommonMark: backslash is literal inside code spans).
+        for src, expected_code in [
+            ("Use `C:\\` as root", "C:\\"),
+            ("regex `\\d+\\` here", "\\d+\\"),
+            ("a `b\\` c", "b\\"),
+        ]:
+            children = self._para_children(src)
+            code_nodes = [c for c in children if c.get("type") == "inlineCode"]
+            assert len(code_nodes) == 1, f"expected 1 code span in {src!r}"
+            assert code_nodes[0]["value"] == expected_code
+            # The sentinel codepoint must never reach output.
+            assert "﷐" not in code_nodes[0]["value"]
+
     def test_escaped_backslash_followed_by_real_emphasis(self):
         # PR #101 review #4 (chatgpt-codex P2): ``\\*foo*`` is literal
         # backslash + italic. The fixed-width ``(?<!\\)`` lookbehind

@@ -226,15 +226,28 @@ def _restore_escapes(text: str) -> str:
     Replaces each ``<SENTINEL>X`` pair with literal ``X``. The
     backslash is dropped because the escape sequence resolved to a
     literal character at the AST text leaf.
+
+    A *dangling* sentinel (one with no following char, which arises when
+    the escaped character was consumed as a delimiter -- e.g. a code
+    span ending in ``\\``, where the backtick that followed the sentinel
+    became the closing delimiter) resolves to a literal backslash. This
+    must never emit the raw sentinel codepoint, which would leak U+FDD0
+    into user-visible output.
     """
     if _ESCAPE_SENTINEL not in text:
         return text
     out: list[str] = []
     i = 0
     while i < len(text):
-        if text[i] == _ESCAPE_SENTINEL and i + 1 < len(text):
-            out.append(text[i + 1])
-            i += 2
+        if text[i] == _ESCAPE_SENTINEL:
+            if i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 2
+            else:
+                # Dangling sentinel: the escaped char was consumed
+                # elsewhere; keep the backslash, never the sentinel.
+                out.append("\\")
+                i += 1
             continue
         out.append(text[i])
         i += 1
@@ -246,16 +259,26 @@ def _restore_escapes_as_literal_pair(text: str) -> str:
 
     Per CommonMark, backslashes inside inline code spans are preserved
     literally -- ``\\*`` inside a code span stays as ``\\*``, not ``*``.
+
+    A dangling sentinel (e.g. from a code span ending in ``\\`` where the
+    closing backtick was the sentinel's paired char) resolves to a bare
+    backslash, matching CommonMark's "backslash is literal in code"
+    rule. Never emits the raw sentinel codepoint.
     """
     if _ESCAPE_SENTINEL not in text:
         return text
     out: list[str] = []
     i = 0
     while i < len(text):
-        if text[i] == _ESCAPE_SENTINEL and i + 1 < len(text):
+        if text[i] == _ESCAPE_SENTINEL:
             out.append("\\")
-            out.append(text[i + 1])
-            i += 2
+            if i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 2
+            else:
+                # Dangling sentinel (e.g. code span ending in `\`): the
+                # paired char became a delimiter; keep the backslash only.
+                i += 1
             continue
         out.append(text[i])
         i += 1
