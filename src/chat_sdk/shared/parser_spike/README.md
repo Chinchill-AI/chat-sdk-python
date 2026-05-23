@@ -36,16 +36,16 @@ The baseline is **~5× faster** than mistune and markdown-it-py and
 **~18× faster** than marko. The 5ms acceptance criterion from issue #69
 is met by the baseline alone.
 
-### Translator LOC (excluding blank lines + line comments)
+### Translator LOC (excluding blank lines, line comments, and docstrings)
 
 | library         | LOC | 250-LOC budget |
 |-----------------|----:|----------------|
-| mistune         | 161 | ✓               |
-| markdown-it-py  | 215 | ✓               |
-| marko           | 152 | ✓               |
+| mistune         | 149 | ✓               |
+| markdown-it-py  | 194 | ✓               |
+| marko           | 147 | ✓               |
 
-All three fit comfortably. mistune and marko both come in under 165
-lines for the translator layer.
+All three fit comfortably. mistune and marko both come in under 150
+lines of logic for the translator layer.
 
 ### mdast fidelity on the happy path (`mixed_content.md`)
 

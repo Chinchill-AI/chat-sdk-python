@@ -134,7 +134,6 @@ def _consume_list(tokens: list[Token], i: int, end_type: str) -> tuple[list[Cont
 
 def _consume_table(tokens: list[Token], i: int) -> tuple[Content, int]:
     rows: list[Content] = []
-    align: list[str | None] = []
     in_header = False
     header_aligns: list[str | None] = []
     current_row: list[Content] = []
@@ -155,7 +154,6 @@ def _consume_table(tokens: list[Token], i: int) -> tuple[Content, int]:
             rows.append(make_table_row(current_row))
             if in_header:
                 header_aligns = current_aligns
-            align = current_aligns
         elif tok.type in ("th_open", "td_open"):
             style = (tok.attrs or {}).get("style", "")
             cell_align: str | None = None
@@ -172,26 +170,29 @@ def _consume_table(tokens: list[Token], i: int) -> tuple[Content, int]:
             i += 3  # th/td_open, inline, th/td_close
             continue
         i += 1
-    _ = align  # quiet unused-var without changing semantics
     return make_table(rows, align=header_aligns if any(header_aligns) else None), i
 
 
 def _translate_inline(tokens: list[Token]) -> list[Content]:
     out: list[Content] = []
-    stack: list[tuple[str, list[Content]]] = []
+    # Each stack frame holds (parent_list, meta) -- meta is None for plain
+    # containers (strong/emphasis/delete) and a (href, title) tuple for
+    # links. Using a tuple instead of pipe-stuffing a string sidesteps the
+    # fragility of URLs/titles that contain pipe characters.
+    stack: list[tuple[list[Content], tuple[str, str | None] | None]] = []
     current = out
 
-    def open_container(kind: str) -> None:
+    def open_container() -> None:
         nonlocal current
         new_children: list[Content] = []
-        stack.append((kind, current))  # type: ignore[arg-type]
+        stack.append((current, None))
         current = new_children
 
     def close_container(make: Any) -> None:
         nonlocal current
         kids = current
-        _kind, parent = stack.pop()
-        current = parent  # type: ignore[assignment]
+        parent, _meta = stack.pop()
+        current = parent
         current.append(make(kids))
 
     for tok in tokens:
@@ -205,30 +206,29 @@ def _translate_inline(tokens: list[Token]) -> list[Content]:
         elif t == "code_inline":
             current.append(make_inline_code(tok.content))
         elif t == "strong_open":
-            open_container("strong")
+            open_container()
         elif t == "strong_close":
             close_container(make_strong)
         elif t == "em_open":
-            open_container("emphasis")
+            open_container()
         elif t == "em_close":
             close_container(make_emphasis)
         elif t == "s_open":
-            open_container("delete")
+            open_container()
         elif t == "s_close":
             close_container(make_delete)
         elif t == "link_open":
             attrs = tok.attrs or {}
-            stack.append(("link", current))  # type: ignore[arg-type]
+            href = str(attrs.get("href", ""))
+            title = attrs.get("title")
             link_children: list[Content] = []
-            stack.append((f"_link_meta:{attrs.get('href', '')}|{attrs.get('title') or ''}", current))  # type: ignore[arg-type]
+            stack.append((current, (href, title)))
             current = link_children
         elif t == "link_close":
             kids = current
-            meta_kind, _ = stack.pop()
-            _, parent = stack.pop()
-            current = parent  # type: ignore[assignment]
-            payload = meta_kind.removeprefix("_link_meta:")
-            href, _, title = payload.partition("|")
+            parent, meta = stack.pop()
+            current = parent
+            href, title = meta if meta else ("", None)
             current.append(make_link(href, kids, title=title or None))
         elif t == "image":
             attrs = tok.attrs or {}

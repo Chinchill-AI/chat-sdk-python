@@ -50,6 +50,15 @@ def _time_one(fn, text: str, iterations: int) -> list[float]:
 
 
 def _translator_loc() -> dict[str, int]:
+    """Count lines of code per translator, excluding blanks, line comments,
+    and docstrings.
+
+    The docstring exclusion uses ``ast`` to identify ``Expr(Constant(str))``
+    statements -- the canonical docstring shape -- so we don't over-count
+    multi-line docstrings as logic LOC against the 250-LOC budget.
+    """
+    import ast
+
     root = Path(__file__).resolve().parents[2] / "src" / "chat_sdk" / "shared" / "parser_spike"
     out = {}
     for name, path in [
@@ -58,9 +67,34 @@ def _translator_loc() -> dict[str, int]:
         ("marko", root / "marko_translator.py"),
     ]:
         text = path.read_text(encoding="utf-8")
-        code_lines = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
-        # Subtract docstrings as a rough heuristic.
-        out[name] = len(code_lines)
+        # Identify docstring line ranges via AST: any Expr(Constant(str))
+        # immediately under a module, class, or function definition.
+        tree = ast.parse(text)
+        docstring_lines: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            body = getattr(node, "body", None)
+            if not body:
+                continue
+            first = body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                end_lineno = first.end_lineno or first.lineno
+                docstring_lines.update(range(first.lineno, end_lineno + 1))
+
+        code_lines = 0
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if lineno in docstring_lines:
+                continue
+            code_lines += 1
+        out[name] = code_lines
     return out
 
 
@@ -91,7 +125,7 @@ def main() -> None:
         p95 = timings[int(len(timings) * 0.95)]
         print(f"{name:<20} {median:>12.2f} {p95:>12.2f} {min(timings):>12.2f} {max(timings):>12.2f}")
 
-    print("\nTranslator LOC (excluding blank lines + line comments):")
+    print("\nTranslator LOC (excluding blank lines, line comments, and docstrings):")
     print("-" * 70)
     for name, loc in _translator_loc().items():
         budget_marker = " ✓" if loc < 250 else " ✗ (over 250-LOC budget)"
