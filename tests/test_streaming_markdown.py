@@ -1056,3 +1056,36 @@ class TestIssue69Regressions:
         final = r.finish()
         assert "| H |" in final
         assert "|---|" in final
+
+    def test_back_to_back_tables_keep_committable_monotonic(self):
+        # PR #99 review #2: when a second table's separator arrives in a
+        # stream that already had one confirmed table (and no blank line
+        # between them), the backward "hold pre-separator block" walk
+        # would roll back into the previously-committed first-table
+        # body. Verify get_committable_text() never shrinks.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        chunks = [
+            "|A|B|\n|---|---|\n|1|2|\n",  # full first table
+            "|C|D|\n",  # second table's header (committed as body of first)
+            "|---|---|\n",  # second table's separator -- must not roll back
+        ]
+        last = ""
+        for chunk in chunks:
+            r.push(chunk)
+            cur = r.get_committable_text()
+            assert cur.startswith(last), (
+                f"monotonicity violated: prior committed prefix={last!r} not a prefix of new committed={cur!r}"
+            )
+            last = cur
+
+    def test_second_table_after_blank_line_still_holds_header(self):
+        # The fix above must NOT regress the well-formed multi-table
+        # case where tables are separated by a blank line.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("| A | B |\n|---|---|\n| 1 | 2 |\n")
+        r.push("\n| X | Y |\n")  # blank line then new header
+        r.push("|---|---|\n")  # new separator
+        # `| X | Y |` is still held -- second table has no body row yet.
+        committable = r.get_committable_text()
+        assert "| X | Y |" not in committable
+        assert "| 1 | 2 |" in committable

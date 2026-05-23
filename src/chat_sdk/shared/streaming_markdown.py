@@ -287,12 +287,26 @@ def _get_committable_prefix(text: str) -> str:
         # independently; emitting a header+separator without rows produces
         # broken syntax. Hold the entire pre-separator table block until a
         # row arrives (issue #69).
+        #
+        # The backward walk must also stop at empty lines (end of the
+        # current block) and at prior separators -- prior separators mean
+        # the candidate "new header" rows above them were already
+        # committed as body rows of a previously confirmed table.
+        # Rolling them back would violate the monotonic append-only
+        # contract; in that case fall through to "commit everything"
+        # instead (PR #99 review finding).
         table_start = separator_idx
+        rolled_back = False
         for i in range(separator_idx - 1, -1, -1):
             trimmed = lines[i].strip()
             if trimmed == "" or TABLE_ROW_RE.match(trimmed) is None:
                 break
+            if TABLE_SEPARATOR_RE.match(trimmed):
+                rolled_back = True
+                break
             table_start = i
+        if rolled_back:
+            return text
         commit_line_count = table_start
     elif separator_found or held_count == 0:
         return text
