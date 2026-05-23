@@ -248,6 +248,22 @@ class TestEscapedCharacters:
         assert children[0]["type"] == "image"
         assert children[0]["alt"] == "my [image]"
 
+    def test_link_url_resolves_backslash_escapes(self):
+        # PR #101 review #3 (downstream-impact reviewer): the inline
+        # parser now resolves backslash escapes in link URLs per
+        # CommonMark spec. This is a behavior change from the previous
+        # raw pass-through; pin it so the contract is explicit.
+        children = self._para_children(r"[t](http://example.com/path\)more)")
+        link_nodes = [c for c in children if c.get("type") == "link"]
+        # The `\)` inside the URL is now resolved to literal `)`.
+        # Previously this URL would have been truncated at the first `)`.
+        assert len(link_nodes) == 1
+        # Escaped `*` in URL becomes literal `*` (rare but spec-correct).
+        children2 = self._para_children(r"[t](u\*r\*l)")
+        link_nodes2 = [c for c in children2 if c.get("type") == "link"]
+        assert len(link_nodes2) == 1
+        assert link_nodes2[0]["url"] == "u*r*l"
+
     def test_inline_code_contents_are_not_unescaped(self):
         # Per CommonMark, backslash inside `code` is literal.
         children = self._para_children(r"a `\*literal\*` b")
@@ -272,11 +288,23 @@ class TestEscapedCharacters:
         # ``\\\*foo*`` = escaped backslash + escaped asterisk + ``foo*``.
         # The leading two-char ``\\`` resolves to literal ``\`` and the
         # next ``\*`` resolves to literal ``*``. The trailing ``*`` has
-        # no opener so there's no emphasis -- the result is literal
-        # text.
+        # no opener so there's no emphasis -- the result is the literal
+        # string `\*foo*` (1 backslash + asterisk + foo + asterisk).
         children = self._para_children("\\\\\\*foo*")
+        assert children == [{"type": "text", "value": "\\*foo*"}]
+
+    def test_sentinel_codepoint_in_input_is_stripped(self):
+        # The escape sentinel is U+FDD0 (a Unicode noncharacter that
+        # should never appear in real text). Defense-in-depth: if an
+        # adversarial or malformed caller smuggles it in, it's stripped
+        # at the parser entry rather than being mistakenly paired with
+        # the following char as a fake escape sequence.
+        children = self._para_children("hello﷐world")
+        assert children == [{"type": "text", "value": "helloworld"}]
+        # And it doesn't break neighbouring real emphasis.
+        children = self._para_children("before﷐*real italic*")
         types = [c.get("type") for c in children]
-        assert "emphasis" not in types
+        assert "emphasis" in types
 
 
 class TestTaskListItems:

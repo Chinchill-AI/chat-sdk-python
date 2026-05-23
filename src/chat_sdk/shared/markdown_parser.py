@@ -176,14 +176,14 @@ def get_node_value(node: Content) -> str:
 _ESCAPABLE_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 # Sentinel character used by `_protect_escapes` to mark every ``\X``
-# escape sequence as ``<SENTINEL>X``. The sentinel is a control codepoint
-# (U+0001) that never legitimately appears in chat-content markdown, so
-# any occurrence in the protected text unambiguously marks an escape.
-# The inline-pattern lookbehinds reject delimiters preceded by this
-# sentinel; everything else (including any number of literal
-# backslashes) is treated as a real delimiter -- which closes the
-# doubled-backslash gap that fixed-width lookbehind on ``\`` couldn't.
-_ESCAPE_SENTINEL = "\x01"
+# escape sequence as ``<SENTINEL>X``. U+FDD0 is one of the 32 BMP
+# "noncharacters" permanently reserved by the Unicode standard for
+# process-internal application use -- by definition, no real text
+# interchange uses these codepoints. `_protect_escapes` also strips
+# any pre-existing occurrence from the input as a defense-in-depth
+# measure, so the sentinel-based round trip is robust even when an
+# adversarial caller smuggles the codepoint in.
+_ESCAPE_SENTINEL = "﷐"
 
 
 def _protect_escapes(text: str) -> str:
@@ -191,12 +191,20 @@ def _protect_escapes(text: str) -> str:
 
     Used as a pre-pass before the inline regex matching. Each escaped
     delimiter character is marked so the regex lookbehinds can skip it
-    via ``(?<!\\x01)``. Unlike the previous ``(?<!\\\\)`` approach, this
-    correctly handles any number of preceding backslashes because the
-    pre-pass consumes the backslash itself -- a ``*`` preceded by a
+    via ``(?<!<SENTINEL>)``. Unlike the previous ``(?<!\\\\)`` approach,
+    this correctly handles any number of preceding backslashes because
+    the pre-pass consumes the backslash itself -- a ``*`` preceded by a
     literal backslash (i.e. an *escaped* backslash followed by a real
     emphasis opener) has no sentinel before it and matches normally.
+
+    Strips any pre-existing occurrence of the sentinel codepoint from
+    *text* before the escape walk so that adversarial / malformed input
+    can't smuggle in a fake escape sequence. The sentinel is a Unicode
+    noncharacter (U+FDD0) which should never appear in real text; this
+    is belt-and-suspenders for the rare case that it does.
     """
+    if _ESCAPE_SENTINEL in text:
+        text = text.replace(_ESCAPE_SENTINEL, "")
     if "\\" not in text:
         return text
     out: list[str] = []
@@ -259,34 +267,35 @@ def _restore_escapes_as_literal_pair(text: str) -> str:
 #
 # The patterns operate on text that has already been through
 # `_protect_escapes`, so escaped delimiters appear as ``<SENTINEL>X``
-# (where SENTINEL = U+0001). The ``(?<!\x01)`` lookbehind on each
-# opener rejects those, while real backslash characters in the
-# protected text -- which can only come from escaped backslashes
-# (``\\\\`` -> ``<SENTINEL>\\``) -- are left as literal ``\`` and don't
-# trigger the lookbehind, so the following delimiter is correctly
-# recognised as a real opener (closing the doubled-backslash gap).
+# (where SENTINEL = U+FDD0 -- the f-string ``﷐`` below). The
+# ``(?<!﷐)`` lookbehind on each opener rejects those, while real
+# backslash characters in the protected text -- which can only come
+# from escaped backslashes (``\\\\`` -> ``<SENTINEL>\\``) -- are left
+# as literal ``\`` and don't trigger the lookbehind, so the following
+# delimiter is correctly recognised as a real opener (closing the
+# doubled-backslash gap).
 #
-# Bracket content groups still need ``(?:[^\]\x01]|\x01.)+?`` so that
-# escaped ``\]`` / ``\[`` inside link text don't prematurely terminate
-# the match -- the alternation consumes a ``<SENTINEL>X`` pair as a
-# single unit.
+# Bracket content groups still need ``(?:[^\]﷐]|﷐.)+?`` so
+# that escaped ``\]`` / ``\[`` inside link text don't prematurely
+# terminate the match -- the alternation consumes a ``<SENTINEL>X``
+# pair as a single unit.
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
-    ("image", re.compile(r'(?<!\x01)!\[((?:[^\]\x01]|\x01.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'(?<!\x01)\[((?:[^\]\x01]|\x01.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("link", re.compile(r'(?<!﷐)\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Inline code: `code`
-    ("inlineCode", re.compile(r"(?<!\x01)`([^`]+)`")),
+    ("inlineCode", re.compile(r"(?<!﷐)`([^`]+)`")),
     # Bold: **text**
-    ("strong_star", re.compile(r"(?<!\x01)\*\*(.+?)\*\*")),
+    ("strong_star", re.compile(r"(?<!﷐)\*\*(.+?)\*\*")),
     # Bold: __text__
-    ("strong_under", re.compile(r"(?<!\x01)__(.+?)__")),
+    ("strong_under", re.compile(r"(?<!﷐)__(.+?)__")),
     # Strikethrough: ~~text~~
-    ("delete", re.compile(r"(?<!\x01)~~(.+?)~~")),
+    ("delete", re.compile(r"(?<!﷐)~~(.+?)~~")),
     # Emphasis: *text*  (not preceded/followed by * or sentinel)
-    ("emphasis_star", re.compile(r"(?<![*\x01])\*(?!\*)(.+?)(?<![*\x01])\*(?!\*)")),
+    ("emphasis_star", re.compile(r"(?<![*﷐])\*(?!\*)(.+?)(?<![*﷐])\*(?!\*)")),
     # Emphasis: _text_  (not preceded/followed by _ or sentinel)
-    ("emphasis_under", re.compile(r"(?<![_\x01])_(?!_)(.+?)(?<![_\x01])_(?!_)")),
+    ("emphasis_under", re.compile(r"(?<![_﷐])_(?!_)(.+?)(?<![_﷐])_(?!_)")),
 ]
 
 
