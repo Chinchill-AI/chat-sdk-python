@@ -237,6 +237,33 @@ class SlackAdapter:
         # ``None`` to surface the misconfiguration here at init rather than
         # silently failing on every request.
         webhook_verifier = config.webhook_verifier
+        # Reject an explicit empty-string ``signing_secret`` at construction —
+        # even when a ``webhook_verifier`` is set. An explicit ``""`` is a
+        # config typo (e.g. an unset env var interpolated into the field), and
+        # silently normalizing it to ``None`` would flip the adapter from the
+        # built-in HMAC check to the custom verifier *without the caller's
+        # knowledge*. Fail fast here so the typo surfaces at init rather than
+        # silently altering which verification path runs in production. (An
+        # unset/``None`` signing_secret still legitimately defers to the
+        # verifier or the env fallback below — only the explicit ``""`` is a
+        # hard error.)
+        if config.signing_secret == "":
+            raise ValidationError(
+                "slack",
+                "signing_secret must be a non-empty string when provided.",
+            )
+        # Reject a non-callable ``webhook_verifier`` at construction. A typo
+        # such as ``webhook_verifier=""`` / ``False`` / ``123`` passes the
+        # ``is not None`` guard below, then ``handle_webhook`` tries to *call*
+        # it, the resulting ``TypeError`` is caught and reported as an invalid
+        # signature, and every webhook fails closed with 401 — an opaque
+        # production outage from a one-character mistake. ``None`` (unset) is
+        # fine; anything else must be callable.
+        if webhook_verifier is not None and not callable(webhook_verifier):
+            raise ValidationError(
+                "slack",
+                "webhook_verifier must be callable.",
+            )
         signing_secret = (
             config.signing_secret
             if config.signing_secret is not None

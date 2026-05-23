@@ -435,19 +435,20 @@ class TestWebhookVerifierConstruction:
         secret. ``_verify_signature`` short-circuits with
         ``if not self._signing_secret`` and returns ``False`` for every
         webhook, leaving the adapter responding ``401`` to Slack on every
-        request rather than failing fast at construction. Empty-string is
-        an unusable value: it must be treated as "not provided" by the
-        validation guard so the misconfiguration surfaces here, not on the
-        production webhook path.
+        request rather than failing fast at construction. An explicit empty
+        string is now rejected outright by a dedicated construction guard
+        (see :meth:`test_empty_signing_secret_rejected_even_with_verifier`),
+        so the misconfiguration surfaces here, not on the production webhook
+        path.
         """
         old = os.environ.pop("SLACK_SIGNING_SECRET", None)
         try:
-            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+            with pytest.raises(ValidationError, match="signing_secret must be a non-empty string"):
                 SlackAdapter(SlackAdapterConfig(signing_secret=""))
             # Also fails when an otherwise-valid bot_token is set: the
             # signing_secret value is what matters, not the rest of the
             # config.
-            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+            with pytest.raises(ValidationError, match="signing_secret must be a non-empty string"):
                 SlackAdapter(SlackAdapterConfig(signing_secret="", bot_token="xoxb-test"))
         finally:
             if old is not None:
@@ -457,16 +458,15 @@ class TestWebhookVerifierConstruction:
         """Empty-string ``signing_secret`` is rejected even with SLACK_SIGNING_SECRET set.
 
         Pairs with :meth:`test_empty_signing_secret_rejected_at_construction`:
-        normalizing ``""`` to ``None`` *after* the env-fallback cascade
-        means the explicit empty string still suppresses the env fallback
-        (that part of ``5a648ec`` is correct), and the resulting ``None``
-        then fails the ``signing_secret is None and webhook_verifier is
-        None`` guard. The user's explicit (if empty) config wins over env.
+        an explicit empty string is a hard error at construction (the
+        dedicated guard fires before the env-fallback cascade), so a
+        deployment-set ``SLACK_SIGNING_SECRET`` cannot rescue the typo. The
+        user's explicit (if empty) config loses to nothing — it fails fast.
         """
         old = os.environ.get("SLACK_SIGNING_SECRET")
         os.environ["SLACK_SIGNING_SECRET"] = "env-secret-should-not-be-used"
         try:
-            with pytest.raises(ValidationError, match="signingSecret or webhookVerifier"):
+            with pytest.raises(ValidationError, match="signing_secret must be a non-empty string"):
                 SlackAdapter(SlackAdapterConfig(signing_secret="", bot_token="xoxb-test"))
         finally:
             if old is None:
@@ -474,24 +474,60 @@ class TestWebhookVerifierConstruction:
             else:
                 os.environ["SLACK_SIGNING_SECRET"] = old
 
-    def test_empty_signing_secret_with_verifier_is_accepted(self):
-        """``signing_secret=""`` + ``webhook_verifier`` => verifier path takes over.
+    def test_empty_signing_secret_rejected_even_with_verifier(self):
+        """``signing_secret=""`` is rejected at construction even with a verifier.
 
-        The validation guard fails only when *both* are unusable. An empty
-        signing secret with an explicit verifier normalizes to "no signing
-        secret, use the verifier" — consistent with the documented
-        precedence rule (a non-empty signing_secret would win, an empty
-        one is treated as absent).
+        Regression for CodeRabbit Major on PR #87. An explicit empty-string
+        ``signing_secret`` is a config typo (e.g. an unset env var
+        interpolated into the field). Previously it normalized to ``None`` and,
+        when a ``webhook_verifier`` was also set, the guard passed and the
+        adapter silently switched from the built-in HMAC check to the custom
+        verifier — without the caller's knowledge. The explicit empty string
+        must now fail fast at construction regardless of whether a verifier is
+        provided, so the typo surfaces at init rather than silently altering
+        which verification path runs in production.
         """
-        adapter = SlackAdapter(
-            SlackAdapterConfig(
-                signing_secret="",
-                bot_token="xoxb-test",
-                webhook_verifier=lambda req, body: True,
-            )
-        )
-        assert adapter._signing_secret is None
-        assert adapter._webhook_verifier is not None
+        old = os.environ.pop("SLACK_SIGNING_SECRET", None)
+        try:
+            with pytest.raises(ValidationError, match="signing_secret must be a non-empty string"):
+                SlackAdapter(
+                    SlackAdapterConfig(
+                        signing_secret="",
+                        bot_token="xoxb-test",
+                        webhook_verifier=lambda req, body: True,
+                    )
+                )
+        finally:
+            if old is not None:
+                os.environ["SLACK_SIGNING_SECRET"] = old
+
+    def test_non_callable_webhook_verifier_rejected_at_construction(self):
+        """A non-callable ``webhook_verifier`` must fail validation at init.
+
+        Regression for Codex P2 on PR #87. A typo such as
+        ``webhook_verifier=""`` / ``False`` / ``123`` passed the ``is not
+        None`` guard, then ``handle_webhook`` tried to *call* it, the
+        resulting ``TypeError`` was caught and reported as an invalid
+        signature, and every webhook failed closed with 401 — an opaque
+        production outage from a one-character mistake. Reject any non-None,
+        non-callable value at construction so the typo surfaces immediately.
+        """
+        old = os.environ.get("SLACK_SIGNING_SECRET")
+        os.environ["SLACK_SIGNING_SECRET"] = "valid-signing-secret"
+        try:
+            for bad in ("", False, 123):
+                with pytest.raises(ValidationError, match="webhook_verifier must be callable"):
+                    SlackAdapter(
+                        SlackAdapterConfig(
+                            bot_token="xoxb-test",
+                            webhook_verifier=bad,  # type: ignore[arg-type]
+                        )
+                    )
+        finally:
+            if old is None:
+                os.environ.pop("SLACK_SIGNING_SECRET", None)
+            else:
+                os.environ["SLACK_SIGNING_SECRET"] = old
 
     def test_empty_env_slack_bot_token_does_not_become_static_token(self):
         """``SLACK_BOT_TOKEN=""`` must not be cached as the default bot token.
