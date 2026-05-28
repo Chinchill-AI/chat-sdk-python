@@ -4029,7 +4029,7 @@ class SlackAdapter:
         )
 
         client = self._get_client()
-        kwargs: dict[str, Any] = {"channel_id": channel, "file_uploads": file_uploads}
+        kwargs: dict[str, Any] = {"channel": channel, "file_uploads": file_uploads}
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
 

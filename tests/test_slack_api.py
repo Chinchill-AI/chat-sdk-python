@@ -237,6 +237,32 @@ class TestPostMessage:
         assert len(client.get_calls("chat_postMessage")) == chat_post_calls_before
 
     @pytest.mark.asyncio
+    async def test_file_upload_uses_channel_kwarg_not_channel_id(self):
+        """Regression: slack-sdk's files_upload_v2 takes ``channel=``, not ``channel_id=``.
+
+        Passing ``channel_id=`` collides with the kwarg slack-sdk adds internally
+        when it forwards to files_completeUploadExternal, raising a TypeError on
+        every upload. See issue #102.
+        """
+        adapter, client, _ = await _init_adapter()
+        client.set_response("files_upload_v2", {"ok": True, "files": [{"files": [{"id": "F999"}]}]})
+
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        msg = PostableMarkdown(
+            markdown="",
+            files=[FileUpload(data=b"hello", filename="test.txt")],
+        )
+        await adapter.post_message("slack:C789:1234567890.000000", msg)
+
+        upload_calls = client.get_calls("files_upload_v2")
+        assert len(upload_calls) == 1
+        kwargs = upload_calls[0]["kwargs"]
+        assert kwargs["channel"] == "C789"
+        assert "channel_id" not in kwargs
+        assert kwargs["thread_ts"] == "1234567890.000000"
+
+    @pytest.mark.asyncio
     async def test_thread_reply(self):
         """postMessage to a thread should include thread_ts."""
         adapter, client, _ = await _init_adapter()
