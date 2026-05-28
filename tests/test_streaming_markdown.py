@@ -122,15 +122,25 @@ class TestStreamingMarkdownTables:
         assert "| A | B |" not in result
         assert "Text" in result
 
-    def test_should_confirm_table_when_separator_arrives(self):
+    def test_should_confirm_table_when_separator_and_body_row_arrive(self):
         r = StreamingMarkdownRenderer()
         r.push("Text\n\n| A | B |\n")
         assert "| A | B |" not in r.render()
 
+        # Separator alone with no body row is still held back: append-only
+        # consumers (e.g. Slack chat.appendStream) parse each delta
+        # independently and a header+separator emission with zero rows is
+        # broken syntax. See issue #69.
         r.push("|---|---|\n")
+        assert "| A | B |" not in r.render()
+        assert "|---|---|" not in r.render()
+
+        # First body row releases the entire confirmed table atomically.
+        r.push("| 1 | 2 |\n")
         result = r.render()
         assert "| A | B |" in result
         assert "|---|---|" in result
+        assert "| 1 | 2 |" in result
 
     def test_should_release_held_lines_when_next_line_is_not_a_table_row(self):
         r = StreamingMarkdownRenderer()
@@ -240,19 +250,33 @@ class TestStreamingMarkdownTables:
         r.push("| Left | Center | Right |\n")
         assert "| Left |" not in r.render()
 
+        # Separator alone is held; first body row releases the table.
         r.push("|:---|:---:|---:|\n")
+        assert "| Left |" not in r.render()
+
+        r.push("| 1 | 2 | 3 |\n")
         result = r.render()
         assert "| Left | Center | Right |" in result
         assert "|:---|:---:|---:|" in result
+        assert "| 1 | 2 | 3 |" in result
 
     def test_should_not_hold_data_rows_after_confirmed_separator(self):
         r = StreamingMarkdownRenderer()
+        # Header+separator alone is held until a body row arrives (issue #69).
         r.push("| A | B |\n|---|---|\n")
-        assert "|---|---|" in r.render()
+        assert "|---|---|" not in r.render()
 
+        # First body row releases the entire table block atomically.
         r.push("| 1 | 2 |\n")
         result = r.render()
+        assert "| A | B |" in result
+        assert "|---|---|" in result
         assert "| 1 | 2 |" in result
+
+        # Subsequent rows commit immediately.
+        r.push("| 3 | 4 |\n")
+        result = r.render()
+        assert "| 3 | 4 |" in result
 
     def test_should_handle_multiple_push_calls_before_single_render(self):
         r = StreamingMarkdownRenderer()
@@ -273,7 +297,12 @@ class TestStreamingMarkdownTables:
         r.push(" | B |\n")
         assert "| A | B |" not in r.render()
 
+        # Separator alone keeps the table held (issue #69).
         r.push("|---|---|\n")
+        assert "| A | B |" not in r.render()
+
+        # First body row releases the assembled table.
+        r.push("| 1 | 2 |\n")
         assert "| A | B |" in r.render()
 
 
@@ -450,22 +479,23 @@ class TestGetCommittableTextDelta:
         delta = committable[len(last_appended) :]
         assert delta == ""
 
-        # Push separator -- table confirmed
+        # Push separator -- still held; header+separator without a body row
+        # would be broken markup for append-only consumers (issue #69).
         r.push("|---|---|\n")
+        committable = r.get_committable_text()
+        delta = committable[len(last_appended) :]
+        assert delta == ""
+
+        # First data row releases header+separator+row atomically.
+        r.push("| 1 | 2 |\n")
         committable = r.get_committable_text()
         delta = committable[len(last_appended) :]
         assert "```" in delta
         assert "| A | B |" in delta
         assert "|---|---|" in delta
-        last_appended = committable
-
-        # Push data row
-        r.push("| 1 | 2 |\n")
-        committable = r.get_committable_text()
-        delta = committable[len(last_appended) :]
         assert "| 1 | 2 |" in delta
         # Should NOT have a closing ```
-        assert "```" not in delta
+        assert "```\n```" not in delta
         last_appended = committable
 
         # Blank line ends table -- closes code fence
@@ -740,13 +770,17 @@ class TestStreamingMarkdownRealWorld:
         assert "| ID |" not in result
         assert "Here's a table" in result
 
+        # Separator alone is held -- need a body row to confirm (issue #69).
         r.push("| - | - | - | - | - | - | - | - |\n")
+        result = r.render()
+        assert "| ID |" not in result
+        assert "| - |" not in result
+
+        # First body row releases header+separator+row atomically.
+        r.push("| 1 | Sarah Johnson | Engineering | 32 | $95,000 | Seattle | 2019-03-15 | Active |\n")
         result = r.render()
         assert "| ID |" in result
         assert "| - |" in result
-
-        r.push("| 1 | Sarah Johnson | Engineering | 32 | $95,000 | Seattle | 2019-03-15 | Active |\n")
-        result = r.render()
         assert "Sarah Johnson" in result
 
         r.push("| 2 | Michael")
@@ -910,3 +944,148 @@ class TestExhaustivePrefixInvariants:
                 f'("{self.COMPLEX_MARKDOWN[: i + 1][-20:]}") has unclosed markers: '
                 f'"{committable[-40:]}"'
             )
+
+
+# ============================================================================
+# Issue #69 regressions: list-marker awareness + table chunk-boundary
+# ============================================================================
+
+
+class TestIssue69Regressions:
+    """Pin the three production bugs from issue #69 (comment 4514752058).
+
+    The hand-rolled ``_remend`` previously confused line-leading bullet
+    markers with italic openers, and ``_get_committable_prefix`` emitted
+    table header+separator without a body row -- both produced visible
+    corruption in Slack streaming.
+    """
+
+    def test_remend_does_not_treat_line_leading_star_as_italic(self):
+        # Single bullet item -- a literal `* item one\n` is unchanged.
+        assert _remend("* item one\n") == "* item one\n"
+
+    def test_remend_does_not_close_italic_on_multi_bullet_list(self):
+        # Three bullets, odd count: previously appended a stray `*`.
+        text = "* item one\n* item two\n* item three\n"
+        assert _remend(text) == text
+
+    def test_finish_on_odd_count_bullet_list_does_not_corrupt(self):
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("* item one\n* item two\n* item three\n")
+        assert r.finish() == "* item one\n* item two\n* item three\n"
+
+    def test_remend_still_closes_genuine_italic(self):
+        # *hello (no following whitespace) is genuine emphasis, not a list.
+        assert _remend("*hello") == "*hello*"
+
+    def test_remend_still_closes_genuine_bold(self):
+        assert _remend("**bold") == "**bold**"
+
+    def test_remend_handles_bold_inside_list_item(self):
+        # Bullet marker is skipped; bold inside the item is balanced.
+        text = "* **important** item\n"
+        assert _remend(text) == text
+
+    def test_remend_closes_unclosed_bold_inside_list_item(self):
+        # Bullet skipped, then an unclosed `**` should still get closed.
+        assert _remend("* **important") == "* **important**"
+
+    def test_remend_handles_indented_bullet(self):
+        # Up to leading whitespace before the bullet -- still a list marker.
+        assert _remend("  * nested item\n") == "  * nested item\n"
+
+    def test_remend_skips_whitespace_flanked_asterisk_mid_line(self):
+        # CommonMark: `*` flanked by whitespace on both sides isn't a valid
+        # delimiter. Previously counted as an italic opener.
+        assert _remend("use the * operator") == "use the * operator"
+
+    def test_remend_skips_trailing_asterisk_at_end_of_line(self):
+        # `*\n` -- next char is whitespace, prev is whitespace -- not a delimiter.
+        assert _remend("trailing star *\nmore text") == "trailing star *\nmore text"
+
+    def test_remend_skips_bare_asterisk_at_end_of_buffer(self):
+        # `*` at end of stream with whitespace before -- not a delimiter yet.
+        assert _remend("partial *") == "partial *"
+
+    def test_table_header_plus_separator_alone_is_held(self):
+        # Header+separator without a body row would be emitted as broken
+        # markup to append-only consumers. Hold the whole block.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("| ID | Status |\n|---|---|\n")
+        assert r.get_committable_text() == ""
+
+    def test_table_chunk_boundary_emits_atomic_header_separator_row(self):
+        # Reproduces the exact chunk sequence from issue #69 comment.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        chunks = [
+            "Header:\n\n",
+            "| ID",
+            " | Status |\n",
+            "|---|---|\n",
+            "| 1 | Open |\n",
+            "| 2 | Closed |\n",
+        ]
+        last = ""
+        deltas: list[str] = []
+        for c in chunks:
+            r.push(c)
+            cur = r.get_committable_text()
+            deltas.append(cur[len(last) :])
+            last = cur
+
+        assert deltas[0] == "Header:\n\n"
+        # Header line, separator line, and split-header chunk all held.
+        assert deltas[1] == ""
+        assert deltas[2] == ""
+        assert deltas[3] == ""
+        # First body row releases the assembled table atomically.
+        assert deltas[4] == "| ID | Status |\n|---|---|\n| 1 | Open |\n"
+        # Subsequent rows commit immediately.
+        assert deltas[5] == "| 2 | Closed |\n"
+
+    def test_table_with_preceding_text_holds_only_table_block(self):
+        # Prose above an unconfirmed table commits; only the table holds.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("Intro paragraph.\n\n| H |\n|---|\n")
+        assert r.get_committable_text() == "Intro paragraph.\n\n"
+
+    def test_table_held_block_flushes_on_finish_even_without_body_row(self):
+        # finish() is the terminal flush -- even an incomplete table is emitted.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("| H |\n|---|\n")
+        final = r.finish()
+        assert "| H |" in final
+        assert "|---|" in final
+
+    def test_back_to_back_tables_keep_committable_monotonic(self):
+        # PR #99 review #2: when a second table's separator arrives in a
+        # stream that already had one confirmed table (and no blank line
+        # between them), the backward "hold pre-separator block" walk
+        # would roll back into the previously-committed first-table
+        # body. Verify get_committable_text() never shrinks.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        chunks = [
+            "|A|B|\n|---|---|\n|1|2|\n",  # full first table
+            "|C|D|\n",  # second table's header (committed as body of first)
+            "|---|---|\n",  # second table's separator -- must not roll back
+        ]
+        last = ""
+        for chunk in chunks:
+            r.push(chunk)
+            cur = r.get_committable_text()
+            assert cur.startswith(last), (
+                f"monotonicity violated: prior committed prefix={last!r} not a prefix of new committed={cur!r}"
+            )
+            last = cur
+
+    def test_second_table_after_blank_line_still_holds_header(self):
+        # The fix above must NOT regress the well-formed multi-table
+        # case where tables are separated by a blank line.
+        r = StreamingMarkdownRenderer(wrap_tables_for_append=False)
+        r.push("| A | B |\n|---|---|\n| 1 | 2 |\n")
+        r.push("\n| X | Y |\n")  # blank line then new header
+        r.push("|---|---|\n")  # new separator
+        # `| X | Y |` is still held -- second table has no body row yet.
+        committable = r.get_committable_text()
+        assert "| X | Y |" not in committable
+        assert "| 1 | 2 |" in committable
