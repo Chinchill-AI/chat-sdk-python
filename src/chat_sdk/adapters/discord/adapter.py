@@ -20,7 +20,6 @@ from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
     card_to_discord_payload,
-    card_to_fallback_text,
 )
 from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
 from chat_sdk.adapters.discord.types import (
@@ -62,6 +61,7 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -174,6 +174,39 @@ class DiscordAdapter:
         """Initialize the adapter."""
         self._chat = chat
         self._logger.info("Discord adapter initialized")
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a Discord user via ``GET /users/{user_id}``.
+
+        Returns ``None`` on any failure (network error, 4xx/5xx, missing
+        bot scope). Discord user IDs are 17-19 digit snowflakes — we
+        validate the shape here both as a lightweight typo guard and to
+        prevent path-segment injection (``/`` would escape the URL).
+
+        Mirrors upstream ``DiscordAdapter.getUser`` (vercel/chat#391).
+        """
+        # Hazard #12: never let user input reach a URL path unvalidated.
+        # Snowflakes are pure digits — anything else is rejected before
+        # the network call so a crafted "../foo" can't pivot the request.
+        if not user_id or not user_id.isdigit():
+            return None
+        try:
+            user = await self._discord_fetch(f"/users/{quote(user_id, safe='')}", "GET")
+        except Exception:
+            return None
+        if not isinstance(user, dict):
+            return None
+        avatar = user.get("avatar")
+        avatar_url = f"https://cdn.discordapp.com/avatars/{user.get('id')}/{avatar}.png" if avatar else None
+        username = user.get("username") or user_id
+        return UserInfo(
+            user_id=str(user.get("id") or user_id),
+            user_name=username,
+            full_name=user.get("global_name") or username,
+            is_bot=bool(user.get("bot", False)),
+            avatar_url=avatar_url,
+            email=None,
+        )
 
     async def handle_webhook(
         self,
@@ -747,7 +780,8 @@ class DiscordAdapter:
             card_payload = card_to_discord_payload(card)
             embeds.extend(card_payload["embeds"])
             components.extend(card_payload["components"])
-            payload["content"] = self._truncate_content(card_to_fallback_text(card))
+            # Don't include text — Discord renders both `content` and the card
+            # embed if `content` is set, so cards would post duplicate text.
         else:
             payload["content"] = self._truncate_content(
                 convert_emoji_placeholders(
@@ -848,7 +882,10 @@ class DiscordAdapter:
             card_payload = card_to_discord_payload(card)
             embeds.extend(card_payload["embeds"])
             components.extend(card_payload["components"])
-            payload["content"] = self._truncate_content(card_to_fallback_text(card))
+            # Clear content explicitly so leftover text from a previous edit
+            # doesn't render alongside the card. Discord PATCH preserves
+            # omitted fields, so we must send "" rather than skip the key.
+            payload["content"] = ""
         else:
             payload["content"] = self._truncate_content(
                 convert_emoji_placeholders(

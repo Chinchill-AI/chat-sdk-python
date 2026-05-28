@@ -2,10 +2,52 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, Literal, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
+
+# ---------------------------------------------------------------------------
+# Bot token resolver
+# ---------------------------------------------------------------------------
+
+# Bot token configuration. Either a static string or a zero-arg callable that
+# returns either ``str`` synchronously or an awaitable resolving to ``str``.
+# The callable is invoked each time a token is needed, enabling rotation or
+# lazy retrieval from a secret manager.
+#
+# Matches the upstream TS contract:
+#   ``type SlackBotToken = string | (() => string | Promise<string>)``
+SlackBotTokenResolver = Callable[[], "str | Awaitable[str]"]
+SlackBotToken: TypeAlias = str | SlackBotTokenResolver
+
+# Custom webhook verifier. Receives the original request object and the raw
+# body string already consumed by the adapter. Return:
+#   - ``True`` (or any truthy non-string value) to accept the request as-is.
+#   - A ``str`` to accept *and* substitute the verified body for downstream
+#     parsing (useful when the verifier canonicalizes the payload).
+#   - ``False``/falsy or raise to reject (adapter responds with 401).
+#
+# May be sync or async.
+#
+# SECURITY: When a custom verifier replaces ``signing_secret``, the adapter's
+# built-in HMAC + timestamp tolerance check is bypassed. The implementer is
+# responsible for:
+#   - constant-time signature comparison (use ``hmac.compare_digest``, never ``==``)
+#   - replay protection (validate ``x-slack-request-timestamp`` freshness)
+#   - any other freshness/origin checks the platform requires
+#   - body-substitution safety: when returning a ``str`` to substitute the body
+#     for downstream parsing, the returned bytes MUST be derived from a
+#     verified payload. Returning attacker-controlled bytes (e.g. echoing the
+#     unverified raw body or splicing in untrusted fields) grants payload
+#     injection — downstream parsing trusts the substituted body unconditionally.
+SlackWebhookVerifier = Callable[[Any, str], "bool | str | None | Awaitable[bool | str | None]"]
+
+# Connection mode for the Slack adapter. ``"webhook"`` (default) consumes
+# events via signed HTTP POSTs from Slack. ``"socket"`` opens a long-lived
+# WebSocket via Slack's Socket Mode and ACKs each event over the socket.
+SlackAdapterMode = Literal["webhook", "socket"]
 
 # =============================================================================
 # Configuration
@@ -16,8 +58,13 @@ from chat_sdk.logger import Logger
 class SlackAdapterConfig:
     """Configuration for the Slack adapter."""
 
+    # App-level token (xapp-...). Required when ``mode == "socket"``.
+    app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.
-    bot_token: str | None = None
+    # May be a string, or a zero-arg callable returning ``str`` or ``Awaitable[str]``
+    # (called on each use to support rotation or deferred resolution from a
+    # secret manager). See :data:`SlackBotToken`.
+    bot_token: SlackBotToken | None = None
     # Bot user ID (will be fetched if not provided)
     bot_user_id: str | None = None
     # Slack app client ID (required for OAuth / multi-workspace)
@@ -32,11 +79,36 @@ class SlackAdapterConfig:
     installation_key_prefix: str = "slack:installation"
     # Logger instance for error reporting. Defaults to ConsoleLogger.
     logger: Logger | None = None
-    # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var.
+    # Connection mode: ``"webhook"`` (default) or ``"socket"``. When set to
+    # ``"socket"`` the adapter opens a Slack Socket Mode WebSocket on
+    # ``initialize()`` and dispatches events over it. ``signing_secret`` is
+    # not required in socket mode (Slack does not sign socket events).
+    mode: SlackAdapterMode = "webhook"
+    # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var,
+    # *unless* ``webhook_verifier`` is provided — passing an explicit verifier opts
+    # out of the env fallback so a deployment-set ``SLACK_SIGNING_SECRET`` can't
+    # silently shadow the verifier. Required in webhook mode; optional in socket mode.
     signing_secret: str | None = None
+    # Custom webhook verifier. When provided, replaces the built-in HMAC + timestamp
+    # check. See :data:`SlackWebhookVerifier` for the SECURITY contract — the
+    # implementer is responsible for constant-time comparison and replay protection.
+    # When both ``signing_secret`` and ``webhook_verifier`` are set, ``signing_secret``
+    # takes precedence.
+    webhook_verifier: SlackWebhookVerifier | None = None
+    # Shared secret for authenticating events forwarded from a separate
+    # socket-mode listener via HTTP POST. Auto-detected from
+    # SLACK_SOCKET_FORWARDING_SECRET. Falls back to ``app_token`` if not set
+    # (matches upstream behavior; prefer setting this explicitly so the
+    # long-lived xapp- token isn't used as a bearer credential).
+    socket_forwarding_secret: str | None = None
     # Maximum number of cached AsyncWebClient instances (LRU-bounded).
     # Defaults to 100. Increase for large multi-workspace deployments.
     client_cache_max: int | None = None
+    # Maximum number of seconds to wait for the initial Socket Mode WebSocket
+    # handshake. If the slack_sdk ``connect()`` call hangs (e.g. Slack edge
+    # is degraded), ``start_socket_mode`` raises after this many seconds so
+    # ``initialize()`` doesn't block forever (hazard #11).
+    connect_timeout_s: float = 30.0
     # Override bot username (optional)
     user_name: str | None = None
 

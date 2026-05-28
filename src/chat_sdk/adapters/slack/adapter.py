@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -22,7 +23,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.slack.cards import (
@@ -47,8 +48,12 @@ from chat_sdk.adapters.slack.modals import (
 from chat_sdk.adapters.slack.types import (
     RequestContext,
     SlackAdapterConfig,
+    SlackAdapterMode,
+    SlackBotToken,
+    SlackBotTokenResolver,
     SlackInstallation,
     SlackThreadId,
+    SlackWebhookVerifier,
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -83,6 +88,7 @@ from chat_sdk.types import (
     ModalResponse,
     ModalSubmitEvent,
     OptionsLoadEvent,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     ScheduledMessage,
@@ -91,6 +97,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -122,10 +129,48 @@ _USER_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000  # 8 days
 _CHANNEL_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000
 _REVERSE_INDEX_TTL_MS = 8 * 24 * 60 * 60 * 1000
 
-# Ignored message subtypes (system/meta events)
+
+class SlackUserCacheEntry(TypedDict, total=False):
+    """Cached user shape returned by :meth:`SlackAdapter._lookup_user`.
+
+    The first five keys always exist on a successful lookup or
+    cache hit. ``_lookup_failed`` appears only on the failure path
+    (API exception or empty user payload) — callers like
+    :meth:`SlackAdapter.get_user` use it to return ``None`` instead of
+    a fallback ``UserInfo``. ``total=False`` because both the cache hit
+    branch and the failure branch omit ``_lookup_failed``.
+    """
+
+    display_name: str
+    real_name: str
+    email: str | None
+    avatar_url: str | None
+    is_bot: bool | None
+    _lookup_failed: bool
+
+
+def _make_slack_lookup_failed(user_id: str) -> SlackUserCacheEntry:
+    """Build the sentinel cache entry for a failed Slack user lookup.
+
+    Shared between the ``except`` path and the empty-user-payload path
+    so both produce the exact same fallback shape (and neither caches
+    it — see :meth:`SlackAdapter._lookup_user`).
+    """
+    return {
+        "display_name": user_id,
+        "real_name": user_id,
+        "email": None,
+        "avatar_url": None,
+        "is_bot": None,
+        "_lookup_failed": True,
+    }
+
+
+# Ignored message subtypes (system/meta events).
+# `message_changed` is NOT in this set — it is routed to
+# `_handle_message_changed` so we can capture link unfurl metadata.
 _IGNORED_SUBTYPES = frozenset(
     {
-        "message_changed",
         "message_deleted",
         "message_replied",
         "channel_join",
@@ -147,6 +192,15 @@ _IGNORED_SUBTYPES = frozenset(
     }
 )
 
+# Link-unfurl wait window: Slack delivers unfurled attachments via a
+# separate `message_changed` event ~100-2000ms after the original. We
+# poll briefly so the message handler sees enriched links instead of
+# bare URLs.
+_TRAILING_SLASH_PATTERN = re.compile(r"/$")
+_UNFURL_WAIT_MS = 2000
+_UNFURL_POLL_MS = 150
+_UNFURL_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -162,6 +216,28 @@ def _find_next_mention(text: str) -> int:
     if hash_idx == -1:
         return at_idx
     return min(at_idx, hash_idx)
+
+
+def _normalize_bot_token_provider(
+    value: SlackBotToken | None,
+) -> SlackBotTokenResolver | None:
+    """Normalize a ``bot_token`` config value to a zero-arg resolver.
+
+    Mirrors upstream's ``normalizeBotTokenProvider``. A static string becomes
+    a resolver that returns the same string; a callable is returned as-is so
+    rotation or async lookup is preserved. ``None`` -> ``None`` (no token).
+    """
+    if value is None:
+        return None
+    if callable(value):
+        # Already a resolver — keep the user's callable so rotation works.
+        return value
+    static = value
+
+    def _provider() -> str:
+        return static
+
+    return _provider
 
 
 # ---------------------------------------------------------------------------
@@ -187,24 +263,193 @@ class SlackAdapter:
         self._request_context: ContextVar[RequestContext | None] = ContextVar(
             f"slack_request_context_{id(self)}", default=None
         )
+        # Per-request cache of the resolved default bot token. Populated at the
+        # top of ``handle_webhook`` (after the signature/verifier check) and
+        # read by the sync ``_get_token`` path. Each concurrent request gets
+        # its own contextvar copy so dynamic resolvers returning different
+        # values per call cannot bleed between in-flight requests.
+        self._resolved_default_token: ContextVar[str | None] = ContextVar(
+            f"slack_resolved_default_token_{id(self)}", default=None
+        )
         if config is None:
             config = SlackAdapterConfig()
 
-        signing_secret = config.signing_secret or os.environ.get("SLACK_SIGNING_SECRET")
-        if not signing_secret:
+        mode = config.mode or "webhook"
+
+        # An explicit ``webhook_verifier`` opts out of the SLACK_SIGNING_SECRET
+        # env fallback — otherwise an env-configured deployment would silently
+        # shadow the verifier the caller intended to use.
+        #
+        # Use explicit ``is not None`` checks rather than truthiness fallbacks
+        # (per docs/UPSTREAM_SYNC.md hazard #1): an explicit empty string for
+        # ``signing_secret`` should fail validation, not silently fall through
+        # to ``SLACK_SIGNING_SECRET`` from the environment. *But* an empty
+        # string is itself unusable downstream (``_verify_signature`` would
+        # short-circuit with ``if not self._signing_secret`` and reject every
+        # webhook with 401), so after the cascade we normalize ``""`` to
+        # ``None`` to surface the misconfiguration here at init rather than
+        # silently failing on every request.
+        webhook_verifier = config.webhook_verifier
+        # Reject an explicit empty-string ``signing_secret`` at construction —
+        # even when a ``webhook_verifier`` is set. An explicit ``""`` is a
+        # config typo (e.g. an unset env var interpolated into the field), and
+        # silently normalizing it to ``None`` would flip the adapter from the
+        # built-in HMAC check to the custom verifier *without the caller's
+        # knowledge*. Fail fast here so the typo surfaces at init rather than
+        # silently altering which verification path runs in production. (An
+        # unset/``None`` signing_secret still legitimately defers to the
+        # verifier or the env fallback below — only the explicit ``""`` is a
+        # hard error.)
+        if config.signing_secret == "":
             raise ValidationError(
                 "slack",
-                "signingSecret is required. Set SLACK_SIGNING_SECRET or provide it in config.",
+                "signing_secret must be a non-empty string when provided.",
+            )
+        # Reject a non-callable ``webhook_verifier`` at construction. A typo
+        # such as ``webhook_verifier=""`` / ``False`` / ``123`` passes the
+        # ``is not None`` guard below, then ``handle_webhook`` tries to *call*
+        # it, the resulting ``TypeError`` is caught and reported as an invalid
+        # signature, and every webhook fails closed with 401 — an opaque
+        # production outage from a one-character mistake. ``None`` (unset) is
+        # fine; anything else must be callable.
+        if webhook_verifier is not None and not callable(webhook_verifier):
+            raise ValidationError(
+                "slack",
+                "webhook_verifier must be callable.",
+            )
+        signing_secret = (
+            config.signing_secret
+            if config.signing_secret is not None
+            else (None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET"))
+        )
+        if signing_secret == "":
+            signing_secret = None
+        # ``signing_secret`` is required in webhook mode (unless a
+        # ``webhook_verifier`` replaces the built-in HMAC check). Socket mode
+        # legitimately runs without a signing secret because Slack does not
+        # sign events delivered over the WebSocket — only HTTP-forwarded events
+        # need a separate ``socket_forwarding_secret`` bearer check.
+        if mode == "webhook" and signing_secret is None and webhook_verifier is None:
+            raise ValidationError(
+                "slack",
+                "signingSecret or webhookVerifier is required for webhook mode. Set "
+                "SLACK_SIGNING_SECRET, provide a non-empty signing_secret in config, "
+                "or provide a webhook_verifier.",
             )
 
         # Auth fields: botToken presence selects single-workspace mode.
-        zero_config = not (config.signing_secret or config.bot_token or config.client_id or config.client_secret)
+        # Explicit ``is not None`` to mirror the truthiness-trap rule above:
+        # an explicit empty string for any of these should still count as
+        # "config provided" and disable the env-fallback path. ``app_token``
+        # also participates (so socket-mode-only configs disable env fallbacks
+        # for the other secrets the same way bot-token-only configs do).
+        zero_config = (
+            config.signing_secret is None
+            and config.bot_token is None
+            and config.client_id is None
+            and config.client_secret is None
+            and config.app_token is None
+        )
 
-        bot_token = config.bot_token or (os.environ.get("SLACK_BOT_TOKEN") if zero_config else None)
+        bot_token_config: SlackBotToken | None = config.bot_token
+        # Reject explicit empty-string ``bot_token`` at init for the same
+        # reason ``signing_secret=""`` is rejected: it would prime
+        # ``_default_bot_token_cache`` with ``""`` and the sync ``_get_token``
+        # path would happily return it, producing ``Authorization: Bearer ``
+        # API calls and opaque ``invalid_auth`` errors from Slack. (The async
+        # resolver path catches this later, but failing fast at construction
+        # is strictly better.) Callable resolvers may legitimately *return*
+        # non-string values at resolve time — that case is already validated
+        # in ``_resolve_default_token``.
+        if isinstance(bot_token_config, str) and bot_token_config == "":
+            raise ValidationError(
+                "slack",
+                "bot_token must be a non-empty string or a callable resolver; got an empty string.",
+            )
+        if bot_token_config is None and zero_config:
+            env_token = os.environ.get("SLACK_BOT_TOKEN")
+            # Same empty-string-as-missing rule as ``signing_secret``: an empty
+            # SLACK_BOT_TOKEN would cache ``""`` in
+            # ``_default_bot_token_cache`` and ``_get_token`` would happily
+            # return it, producing opaque "invalid_auth" errors from Slack on
+            # every API call. Treat ``""`` as unset so the adapter falls
+            # through to multi-workspace mode (or fails clearly later).
+            if env_token is not None and env_token != "":
+                bot_token_config = env_token
+
+        bot_token_provider = _normalize_bot_token_provider(bot_token_config)
 
         self._name = "slack"
-        self._signing_secret = signing_secret
-        self._default_bot_token: str | None = bot_token
+        self._signing_secret: str | None = signing_secret
+        # ``webhook_verifier`` is honored only when ``signing_secret`` is not set —
+        # signing_secret takes precedence when both are provided (matches upstream).
+        self._webhook_verifier: SlackWebhookVerifier | None = None if signing_secret else webhook_verifier
+        # Resolver returning the default (single-workspace) bot token. ``None`` in
+        # multi-workspace mode where the token is resolved per-team from the
+        # InstallationStore. Single-workspace mode with a static string still
+        # uses a resolver under the hood (returns the same string each call).
+        self._default_bot_token_provider: SlackBotTokenResolver | None = bot_token_provider
+        # Last successfully resolved default token, kept for the sync ``current_token``
+        # accessor and for any code path that needs a token outside an awaitable
+        # context. Populated lazily on first await of the resolver and refreshed
+        # on each subsequent webhook entry. Static-string configs prime this at
+        # construction time so sync access works before any webhook fires.
+        self._default_bot_token_cache: str | None = bot_token_config if isinstance(bot_token_config, str) else None
+
+        # ------------------------------------------------------------------
+        # Socket mode wiring (PR #86). Resolved AFTER the bot-token resolver
+        # is set up so the eventual socket client can read the resolved token
+        # via ``_get_token`` / ``current_token_async``. ``app_token`` is the
+        # long-lived app-level secret used to open the WebSocket; the bot
+        # token (potentially resolver-backed) is still used for API calls.
+        # ------------------------------------------------------------------
+        app_token = config.app_token if config.app_token is not None else os.environ.get("SLACK_APP_TOKEN")
+        if app_token == "":
+            app_token = None
+        if mode == "socket":
+            if not app_token:
+                raise ValidationError(
+                    "slack",
+                    "appToken is required for socket mode. Set SLACK_APP_TOKEN or provide it in config.",
+                )
+            # Hazard #12: validate the long-lived secret format on init so a
+            # typo'd bot token (xoxb-) doesn't get silently used as an app
+            # token. Slack app-level tokens always start with ``xapp-``.
+            if not app_token.startswith("xapp-"):
+                raise ValidationError(
+                    "slack",
+                    "appToken must start with 'xapp-' (Slack app-level token). "
+                    "Bot tokens (xoxb-) are not valid for socket mode.",
+                )
+
+        # Socket mode state
+        self._mode: SlackAdapterMode = mode
+        self._app_token: str | None = app_token
+        self._socket_forwarding_secret: str | None = (
+            config.socket_forwarding_secret or os.environ.get("SLACK_SOCKET_FORWARDING_SECRET") or app_token
+        )
+        # The active SocketModeClient instance (when running in socket mode).
+        # Typed as ``Any`` because slack_sdk is an optional dependency.
+        self._socket_client: Any = None
+        # Background task that runs the connect/run/reconnect loop. Tracked so
+        # ``disconnect()`` can cancel it cleanly (hazard #5).
+        self._socket_task: asyncio.Task[None] | None = None
+        # Set when shutdown is requested so the reconnect loop knows to exit
+        # rather than retry on a clean disconnect. The Event also wakes up
+        # ``_socket_sleep_with_backoff`` immediately so ``stop_socket_mode``
+        # doesn't have to wait the full backoff window.
+        self._socket_shutdown_event: asyncio.Event = asyncio.Event()
+        # Default backoff schedule in seconds. Kept short so tests run fast,
+        # but capped low enough that a flapping Slack connection doesn't busy
+        # loop. Slack's recommended pattern is exponential backoff with jitter;
+        # our minimal schedule mirrors that behavior with explicit caps.
+        self._socket_initial_backoff_s = 1.0
+        self._socket_max_backoff_s = 30.0
+        # Bound the initial Socket Mode handshake so ``initialize()`` doesn't
+        # block forever if slack_sdk's ``connect()`` hangs (hazard #11). The
+        # config field is typed ``float`` with a 30s default, so this is just
+        # a read.
+        self._socket_connect_timeout_s: float = config.connect_timeout_s
         self._logger: Logger = config.logger or ConsoleLogger("info")
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
@@ -221,14 +466,38 @@ class SlackAdapter:
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
         self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
 
-        # Multi-workspace OAuth fields
-        self._client_id: str | None = config.client_id or (os.environ.get("SLACK_CLIENT_ID") if zero_config else None)
-        self._client_secret: str | None = config.client_secret or (
-            os.environ.get("SLACK_CLIENT_SECRET") if zero_config else None
-        )
+        # Multi-workspace OAuth fields.
+        # ``is not None`` (not truthiness) so an explicit empty-string user
+        # config does not silently fall back to env (hazard #1). Empty env
+        # values are treated as "unset" (mirrors SLACK_BOT_TOKEN env rule):
+        # an empty SLACK_CLIENT_ID would be useless downstream and produce
+        # opaque OAuth failures rather than a clear "not configured" state.
+        if config.client_id is not None:
+            self._client_id: str | None = config.client_id
+        elif zero_config:
+            env_client_id = os.environ.get("SLACK_CLIENT_ID")
+            self._client_id = env_client_id if env_client_id else None
+        else:
+            self._client_id = None
+        if config.client_secret is not None:
+            self._client_secret: str | None = config.client_secret
+        elif zero_config:
+            env_client_secret = os.environ.get("SLACK_CLIENT_SECRET")
+            self._client_secret = env_client_secret if env_client_secret else None
+        else:
+            self._client_secret = None
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
 
-        encryption_key_raw = config.encryption_key or os.environ.get("SLACK_ENCRYPTION_KEY")
+        # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``
+        # is treated as "user explicitly opted out" and is NOT silently
+        # shadowed by ``SLACK_ENCRYPTION_KEY`` from the env. Mirrors the
+        # client_id / client_secret rule above (hazard #1). An empty user
+        # config still short-circuits ``decode_key`` via the final
+        # ``if encryption_key_raw`` guard, so no broken key is built.
+        if config.encryption_key is not None:
+            encryption_key_raw: str | None = config.encryption_key
+        else:
+            encryption_key_raw = os.environ.get("SLACK_ENCRYPTION_KEY")
         self._encryption_key: bytes | None = None
         if encryption_key_raw:
             self._encryption_key = decode_key(encryption_key_raw)
@@ -260,6 +529,16 @@ class SlackAdapter:
     def persist_message_history(self) -> bool:
         return self._persist_message_history
 
+    @property
+    def mode(self) -> SlackAdapterMode:
+        """Connection mode (``"webhook"`` or ``"socket"``)."""
+        return self._mode
+
+    @property
+    def is_socket_mode(self) -> bool:
+        """``True`` when the adapter is configured for Socket Mode."""
+        return self._mode == "socket"
+
     # ------------------------------------------------------------------
     # Public request-context accessors
     #
@@ -276,11 +555,25 @@ class SlackAdapter:
 
         In multi-workspace mode this is the token resolved by the
         ``InstallationStore`` for the current request; in single-workspace
-        mode it is the default bot token. Raises
-        :class:`AuthenticationError` when called outside a request context
-        with no default token configured.
+        mode it is the default bot token (or the most recently resolved
+        token when a dynamic ``bot_token`` resolver is configured).
+
+        Synchronous: when ``bot_token`` is a resolver and this property is
+        accessed before the resolver has run for the first time, an
+        :class:`AuthenticationError` is raised. Use
+        :meth:`current_token_async` from async contexts to invoke the
+        resolver on demand.
         """
         return self._get_token()
+
+    async def current_token_async(self) -> str:
+        """Async variant of :attr:`current_token` that invokes the resolver.
+
+        Prefer this over :attr:`current_token` in async code paths when a
+        dynamic ``bot_token`` resolver is configured — it ensures the
+        resolver is awaited rather than relying on the cached value.
+        """
+        return await self._resolve_token_async()
 
     @property
     def current_client(self) -> Any:
@@ -302,19 +595,120 @@ class SlackAdapter:
     # ------------------------------------------------------------------
 
     def _get_token(self) -> str:
-        """Return the current bot token for API calls.
+        """Return the current bot token for API calls (sync path).
 
-        Checks request context (multi-workspace) -> default token (single-workspace) -> raises.
+        Checks (in order):
+
+        1. Multi-workspace request context (``_request_context``)
+        2. Per-request resolved default token (``_resolved_default_token``)
+           — primed by ``handle_webhook`` after invoking the resolver
+        3. Static default token cache (set by the constructor for
+           string-typed ``bot_token`` configs)
+        4. Raises :class:`AuthenticationError`
+
+        Synchronous: the token resolver is *not* invoked here. Webhook entry
+        paths call :meth:`_resolve_default_token` first so the per-request
+        cache is primed; static-string ``bot_token`` configs prime the
+        process-wide cache at construction time so this is a no-op for the
+        common case. Use :meth:`_resolve_token_async` from new async call
+        sites that need to invoke a resolver outside webhook flow (e.g.
+        cron jobs).
         """
         ctx = self._request_context.get()
         if ctx and ctx.token:
             return ctx.token
-        if self._default_bot_token:
-            return self._default_bot_token
+        per_request = self._resolved_default_token.get()
+        if per_request is not None:
+            return per_request
+        if self._default_bot_token_cache is not None:
+            return self._default_bot_token_cache
+        if self._default_bot_token_provider is not None:
+            # Resolver-based default token configured but never resolved. This
+            # is a programming error: the async entry path should have awaited
+            # ``_resolve_default_token()`` before reaching here.
+            raise AuthenticationError(
+                "slack",
+                "Bot token resolver has not been invoked yet. Use the async API "
+                "(handle_webhook / current_token_async) so the resolver runs first.",
+            )
         raise AuthenticationError(
             "slack",
             "No bot token available. In multi-workspace mode, ensure the webhook is being processed.",
         )
+
+    async def _resolve_token_async(self) -> str:
+        """Async equivalent of :meth:`_get_token` that invokes the resolver.
+
+        Calls the configured ``bot_token`` resolver (if any), refreshes the
+        per-request cache used by :meth:`_get_token`, and returns the
+        resulting token. Multi-workspace request context still wins.
+        """
+        ctx = self._request_context.get()
+        if ctx and ctx.token:
+            return ctx.token
+        if self._default_bot_token_provider is not None:
+            return await self._resolve_default_token()
+        if self._default_bot_token_cache is not None:
+            return self._default_bot_token_cache
+        raise AuthenticationError(
+            "slack",
+            "No bot token available. In multi-workspace mode, ensure the webhook is being processed.",
+        )
+
+    async def _resolve_default_token(self) -> str:
+        """Invoke the ``bot_token`` resolver and prime the per-request cache.
+
+        Per upstream, the resolver is called *every time a token is needed*
+        (it is the resolver's responsibility to memoize if desired) — this
+        method does not memoize across calls within a process. The result is
+        stashed in the per-request :attr:`_resolved_default_token` ContextVar
+        so the sync ``_get_token`` path inside that request sees the value
+        without re-invoking the resolver, while concurrent requests with
+        their own ContextVar copies are isolated from each other.
+
+        For static-string ``bot_token`` configs the resolver returns the
+        same string each call, but we still update the per-request cache to
+        keep the code path uniform.
+
+        Raises :class:`AuthenticationError` if no resolver is configured.
+        """
+        provider = self._default_bot_token_provider
+        if provider is None:
+            raise AuthenticationError(
+                "slack",
+                "No default bot token resolver configured (multi-workspace mode).",
+            )
+        try:
+            result = provider()
+            if inspect.isawaitable(result):
+                token = await result
+            else:
+                token = result
+        except Exception as exc:
+            self._logger.error("Bot token resolver raised", {"error": exc})
+            raise
+        if not isinstance(token, str) or not token:
+            raise AuthenticationError(
+                "slack",
+                "Bot token resolver returned an empty or non-string value.",
+            )
+        # Refresh the process-wide cache so sync ``current_token`` /
+        # ``current_client`` access outside the request ContextVar scope
+        # (e.g. callers reading the most recently resolved token from a
+        # different task) still observes the freshly resolved value.
+        self._default_bot_token_cache = token
+        # Per-request cache for downstream sync ``_get_token`` calls.
+        self._resolved_default_token.set(token)
+        return token
+
+    @property
+    def _is_single_workspace(self) -> bool:
+        """``True`` when a default bot token (static or resolver) is configured.
+
+        Multi-workspace mode is the absence of a default token, in which
+        case tokens are resolved per-team via the InstallationStore.
+        """
+        return self._default_bot_token_provider is not None
 
     def _get_client(self, token: str | None = None) -> Any:
         """Return an ``AsyncWebClient`` for the given (or current) token.
@@ -357,10 +751,13 @@ class SlackAdapter:
         """Initialize the adapter and optionally fetch bot identity."""
         self._chat = chat
 
-        # Single-workspace: fetch bot user ID via auth.test
-        if self._default_bot_token and not self._bot_user_id:
+        # Single-workspace: fetch bot user ID via auth.test. We resolve the
+        # bot token via the resolver here so dynamic resolvers work at init
+        # time without forcing the caller to seed a static token first.
+        if self._is_single_workspace and not self._bot_user_id:
             try:
-                client = self._get_client(self._default_bot_token)
+                token = await self._resolve_default_token()
+                client = self._get_client(token)
                 auth_result = await client.auth_test()
                 self._bot_user_id = auth_result.get("user_id")
                 self._bot_id = auth_result.get("bot_id") or None
@@ -374,11 +771,21 @@ class SlackAdapter:
             except Exception as exc:
                 self._logger.warn("Could not fetch bot user ID", {"error": exc})
 
-        if not self._default_bot_token:
+        if not self._is_single_workspace:
             self._logger.info("Slack adapter initialized in multi-workspace mode")
 
+        if self._mode == "socket":
+            await self.start_socket_mode()
+
     async def disconnect(self) -> None:
-        """No persistent connections to close."""
+        """Close any persistent connections held by the adapter.
+
+        In webhook mode this is a no-op. In socket mode it cancels the
+        background reconnect loop, closes the active ``SocketModeClient``,
+        and waits for the loop to settle. Idempotent — calling it twice or
+        before ``initialize()`` is safe.
+        """
+        await self.stop_socket_mode()
 
     # ==================================================================
     # Multi-workspace installation management
@@ -597,10 +1004,21 @@ class SlackAdapter:
     # User / Channel lookup with caching
     # ==================================================================
 
-    async def _lookup_user(self, user_id: str) -> dict[str, str]:
+    async def _lookup_user(self, user_id: str) -> SlackUserCacheEntry:
         """Look up user info from Slack API with caching.
 
-        Returns ``{"display_name": ..., "real_name": ...}``.
+        Returns a dict with keys ``display_name``, ``real_name``, and
+        (when available from the Slack API or from a cached entry) the
+        optional fields ``email``, ``avatar_url``, ``is_bot``.
+
+        On API failure — or when the API returns success but with an
+        empty/missing ``user`` payload — the returned dict is a fallback
+        shape (``display_name`` / ``real_name`` populated with the user
+        ID) and carries the private ``_lookup_failed: True`` sentinel so
+        callers that need to distinguish "really not found" from "fall
+        back to ID" — like :meth:`get_user` — can return ``None``
+        instead. The fallback entry is **not** cached so a subsequent
+        call retries the lookup.
         """
         cache_key = f"slack:user:{user_id}"
 
@@ -610,12 +1028,28 @@ class SlackAdapter:
                 return {
                     "display_name": cached.get("display_name", user_id),
                     "real_name": cached.get("real_name", user_id),
+                    "email": cached.get("email"),
+                    "avatar_url": cached.get("avatar_url"),
+                    "is_bot": cached.get("is_bot"),
                 }
 
         try:
             client = self._get_client()
             result = await client.users_info(user=user_id)
-            user = result.get("user", {})
+            user = result.get("user") or {}
+            # Slack can return `{"ok": True, "user": {}}` in some edge cases
+            # (rare, but observed when scopes are partial or the workspace
+            # rejects the lookup post-success). Treat a missing/empty user
+            # payload as a lookup failure so we don't poison the cache
+            # with a `UserInfo("Uxxx", "Uxxx", "Uxxx")` shape that
+            # `get_user` would then convert into a non-null fallback —
+            # diverging from the null-on-failure contract callers expect.
+            if not user:
+                self._logger.warn(
+                    "Slack users.info returned empty user payload",
+                    {"userId": user_id},
+                )
+                return _make_slack_lookup_failed(user_id)
             profile = user.get("profile", {})
 
             display_name = (
@@ -626,11 +1060,24 @@ class SlackAdapter:
                 or user_id
             )
             real_name = user.get("real_name") or profile.get("real_name") or display_name
+            email = profile.get("email")
+            # Upstream chose `image_192` (vs the older `image_72`) for
+            # better avatar quality — see vercel/chat#391.
+            avatar_url = profile.get("image_192")
+            is_bot = user.get("is_bot")
+
+            cached_entry: SlackUserCacheEntry = {
+                "display_name": display_name,
+                "real_name": real_name,
+                "email": email,
+                "avatar_url": avatar_url,
+                "is_bot": is_bot,
+            }
 
             if self._chat:
                 await self._chat.get_state().set(
                     cache_key,
-                    {"display_name": display_name, "real_name": real_name},
+                    cached_entry,
                     _USER_CACHE_TTL_MS,
                 )
                 # Reverse index: display name -> user IDs
@@ -649,10 +1096,16 @@ class SlackAdapter:
                 "Fetched user info",
                 {"userId": user_id, "displayName": display_name, "realName": real_name},
             )
-            return {"display_name": display_name, "real_name": real_name}
+            return cached_entry
         except Exception as exc:
             self._logger.warn("Could not fetch user info", {"userId": user_id, "error": exc})
-            return {"display_name": user_id, "real_name": user_id}
+            # Keep the fallback dict shape so existing callers (mention
+            # resolution, slash command author binding, message parsing)
+            # don't change behavior on transient lookup failures — they
+            # already used `display_name`/`real_name` and would have
+            # received the user ID either way. The private sentinel lets
+            # `get_user` distinguish "API failed" from "API returned data".
+            return _make_slack_lookup_failed(user_id)
 
     async def _lookup_channel(self, channel_id: str) -> str:
         """Look up channel name from Slack API with caching."""
@@ -677,6 +1130,53 @@ class SlackAdapter:
         except Exception as exc:
             self._logger.warn("Could not fetch channel info", {"channelId": channel_id, "error": exc})
             return channel_id
+
+    # ==================================================================
+    # Public user lookup (chat.get_user)
+    # ==================================================================
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up Slack user info via ``users.info``.
+
+        Returns ``None`` when the Slack API call fails (network error,
+        rate limit, missing scopes, unknown user). ``email`` requires the
+        ``users:read.email`` scope; ``avatar_url`` is the high-quality
+        ``image_192`` from the user's Slack profile.
+
+        Resolves the bot token via :meth:`_resolve_token_async` first so
+        callable ``bot_token`` resolvers work outside ``handle_webhook``
+        (cron jobs, background tasks) without forcing the caller to seed
+        the per-request cache themselves. Static-string ``bot_token`` and
+        in-webhook flow are unaffected (the resolver path is a no-op when
+        the per-request cache is already primed).
+
+        Mirrors upstream ``SlackAdapter.getUser`` (vercel/chat#391).
+        """
+        try:
+            # Prime the per-request token cache so the sync `_get_token`
+            # path inside `_lookup_user` -> `_get_client` finds a value
+            # even when called outside `handle_webhook` with a callable
+            # `bot_token` resolver. Mirrors the resolver pattern used by
+            # other public adapter methods reachable from background
+            # contexts (see #87 / docs/UPSTREAM_SYNC.md "bot_token
+            # resolver invocation site" row).
+            await self._resolve_token_async()
+        except AuthenticationError:
+            return None
+        try:
+            cached = await self._lookup_user(user_id)
+        except Exception:
+            return None
+        if cached.get("_lookup_failed"):
+            return None
+        return UserInfo(
+            user_id=user_id,
+            user_name=cached.get("display_name") or user_id,
+            full_name=cached.get("real_name") or user_id,
+            is_bot=bool(cached.get("is_bot")) if cached.get("is_bot") is not None else False,
+            email=cached.get("email"),
+            avatar_url=cached.get("avatar_url"),
+        )
 
     # ==================================================================
     # Webhook handling
@@ -722,21 +1222,137 @@ class SlackAdapter:
 
         # Extract headers
         headers = getattr(request, "headers", {})
-        timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
-        signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
 
-        if not self._verify_signature(body, timestamp, signature):
-            return {"body": "Invalid signature", "status": 401}
+        # Forwarded socket-mode events bypass Slack signature verification —
+        # they're authenticated by a shared bearer secret instead. This lets a
+        # separate process run the WebSocket and POST events back to the
+        # webhook endpoint over HTTP. Handled BEFORE any signature / verifier /
+        # resolver work because the auth model is entirely different: an
+        # ``x-slack-socket-token`` request never carries a Slack signature
+        # and shouldn't pay the resolver-call cost (or surface resolver
+        # failures) when its bearer is invalid. Hazard #12: refuse if no
+        # secret is configured rather than treating an empty header match as
+        # success.
+        socket_token = headers.get("x-slack-socket-token") or headers.get("X-Slack-Socket-Token")
+        if socket_token:
+            if not self._socket_forwarding_secret or not hmac.compare_digest(
+                socket_token, self._socket_forwarding_secret
+            ):
+                self._logger.warn("Invalid socket forwarding token")
+                return {"body": "Invalid socket token", "status": 401}
+            try:
+                event = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                return {"body": "Invalid JSON", "status": 400}
+            # Hazard #12 (replay): the shared bearer alone is not enough —
+            # without a freshness check, an old captured forwarded event
+            # could be replayed indefinitely. Mirror the 5-minute window
+            # ``_verify_signature`` enforces on signed webhook traffic.
+            #
+            # Wire format: upstream's ``forwardSocketEvent`` always emits
+            # ``timestamp: Date.now()`` — milliseconds since the Unix epoch
+            # (~1.78e12 today). Python's ``time.time()`` returns seconds.
+            # Auto-detect the unit by magnitude (anything > 10**11 is
+            # certainly milliseconds — that crossed in 2001) so we accept
+            # both the JS-emitted ms shape AND a Python-emitted seconds
+            # shape if a future ``forward_socket_event`` listener lands.
+            ts_raw = event.get("timestamp") if isinstance(event, dict) else None
+            try:
+                ts_int = int(ts_raw) if ts_raw is not None else None
+            except (TypeError, ValueError):
+                ts_int = None
+            ts_seconds = ts_int // 1000 if ts_int is not None and ts_int > 10**11 else ts_int
+            if ts_seconds is None or abs(int(time.time()) - ts_seconds) > 300:
+                self._logger.warn(
+                    "Forwarded socket event outside freshness window",
+                    {"timestamp": ts_raw},
+                )
+                return {"body": "Stale socket event", "status": 401}
+            await self._handle_forwarded_socket_event(event, options)
+            return {"body": "ok", "status": 200}
+
+        # In socket mode, refuse direct webhook POSTs — Slack delivers events
+        # over the WebSocket instead. We still allow forwarded events above.
+        if self._mode == "socket":
+            return {"body": "Webhooks are disabled in socket mode", "status": 405}
+
+        # Verify the request — custom verifier takes priority when configured
+        # without a signing_secret. The verifier may also return a string that
+        # replaces the body for downstream parsing (e.g. canonicalization).
+        if self._webhook_verifier is not None:
+            try:
+                verifier_result = self._webhook_verifier(request, body)
+                if inspect.isawaitable(verifier_result):
+                    verifier_result = await verifier_result
+            except Exception as exc:
+                self._logger.warn("Webhook verifier rejected request", {"error": exc})
+                return {"body": "Invalid signature", "status": 401}
+            if not verifier_result:
+                self._logger.warn("Webhook verifier rejected request")
+                return {"body": "Invalid signature", "status": 401}
+            if isinstance(verifier_result, str):
+                # Substitute the verifier-supplied canonical body before
+                # parsing.  Other truthy returns are pure verification.
+                body = verifier_result
+        else:
+            timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
+            signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
+            if not self._verify_signature(body, timestamp, signature):
+                return {"body": "Invalid signature", "status": 401}
+
+        # URL verification is special: Slack sends a JSON ``url_verification``
+        # ping at app-install / event-subscription time and only expects the
+        # ``challenge`` echo. No token / API call is required — so resolve
+        # the JSON-payload short-circuit BEFORE invoking the bot-token
+        # resolver. A broken or down resolver (secrets manager outage, key
+        # rotation in flight) must NOT prevent URL verification from
+        # succeeding — that would block app installation and re-subscription.
+        # Mirrors upstream parity where ``getToken`` is only called at
+        # per-API-call sites, not at webhook entry.
+        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
+        early_payload: dict[str, Any] | None = None
+        if "application/json" in content_type or (not content_type and body and body.lstrip().startswith(("{", "["))):
+            try:
+                maybe = json.loads(body)
+                if isinstance(maybe, dict):
+                    early_payload = maybe
+            except (json.JSONDecodeError, ValueError):
+                early_payload = None
+            if (
+                early_payload is not None
+                and early_payload.get("type") == "url_verification"
+                and early_payload.get("challenge")
+            ):
+                return {
+                    "body": json.dumps({"challenge": early_payload["challenge"]}),
+                    "status": 200,
+                    "headers": {"Content-Type": "application/json"},
+                }
+
+        # Resolve the default bot token via the (possibly async) resolver
+        # before dispatching, so synchronous ``_get_token`` call sites
+        # downstream see a primed cache. For static-string configs this is
+        # already primed at construction, so the resolver is a no-op identity
+        # closure. For dynamic resolvers we re-resolve on every webhook entry
+        # so rotation is observed.
+        if self._is_single_workspace:
+            try:
+                await self._resolve_default_token()
+            except Exception as exc:
+                # Resolver failures here would manifest as auth errors deeper
+                # in dispatch; surface them at the entry point so the caller
+                # gets a clean 500 instead of partial processing. Re-raise.
+                self._logger.error("Bot token resolver failed", {"error": exc})
+                raise
 
         # Form-urlencoded payloads (interactive + slash commands)
-        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
         if "application/x-www-form-urlencoded" in content_type:
             params = parse_qs(body, keep_blank_values=True)
 
             # Slash command
             if "command" in params and "payload" not in params:
                 team_id = (params.get("team_id") or [None])[0]
-                if not self._default_bot_token and team_id:
+                if not self._is_single_workspace and team_id:
                     ctx = await self._resolve_token_for_team(team_id)
                     if ctx:
                         tok = self._request_context.set(ctx)
@@ -748,7 +1364,7 @@ class SlackAdapter:
                 return await self._handle_slash_command(params, options)
 
             # Interactive payload
-            if not self._default_bot_token:
+            if not self._is_single_workspace:
                 team_id_interactive = self._extract_team_id_from_interactive(body)
                 if team_id_interactive:
                     ctx = await self._resolve_token_for_team(team_id_interactive)
@@ -781,7 +1397,7 @@ class SlackAdapter:
         # creates a task via asyncio.create_task).  The copied context is
         # isolated -- the ContextVar change does not leak back to the caller
         # and does not need an explicit reset.
-        if not self._default_bot_token and payload.get("type") == "event_callback":
+        if not self._is_single_workspace and payload.get("type") == "event_callback":
             team_id_event = payload.get("team_id")
             if team_id_event:
                 ctx = await self._resolve_token_for_team(team_id_event)
@@ -802,6 +1418,16 @@ class SlackAdapter:
     # ==================================================================
 
     def _verify_signature(self, body: str, timestamp: str | None, signature: str | None) -> bool:
+        # Defensive: ``_verify_signature`` should never be reached when only a
+        # ``webhook_verifier`` is configured (handle_webhook gates on that),
+        # but if a subclass calls this directly without a signing_secret,
+        # fail closed. This also covers the socket-mode case where
+        # ``signing_secret`` is legitimately ``None`` — without this guard a
+        # caller could call ``handle_webhook`` while in socket mode and
+        # silently pass verification with an empty secret.
+        if not self._signing_secret:
+            return False
+
         if not (timestamp and signature):
             return False
 
@@ -825,6 +1451,10 @@ class SlackAdapter:
         )
 
         try:
+            # ``hmac.compare_digest`` is the canonical constant-time comparison.
+            # Custom verifiers passed via ``webhook_verifier`` MUST do the
+            # same — a regression to ``==`` would leak signature bytes via
+            # timing.
             return hmac.compare_digest(signature, expected)
         except Exception:
             return False
@@ -840,7 +1470,11 @@ class SlackAdapter:
 
         event: dict[str, Any] = payload["event"]
 
-        # Track external/shared channel status
+        # Track external/shared channel status. Note: socket-mode payloads
+        # synthesized in ``_route_socket_event`` never carry this field, which
+        # mirrors upstream's ``routeSocketEvent`` shape. Socket-mode adapters
+        # therefore won't populate ``_external_channels`` from this path —
+        # documented as a known divergence in ``docs/UPSTREAM_SYNC.md``.
         if payload.get("is_ext_shared_channel"):
             channel_id = event.get("channel") or (event.get("item", {}).get("channel") if "item" in event else None)
             if channel_id:
@@ -881,6 +1515,18 @@ class SlackAdapter:
         except (json.JSONDecodeError, ValueError):
             return {"body": "Invalid payload JSON", "status": 400}
 
+        return await self._dispatch_interactive_payload(payload, options)
+
+    async def _dispatch_interactive_payload(
+        self,
+        payload: dict[str, Any],
+        options: WebhookOptions | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a pre-parsed interactive payload to the right handler.
+
+        Used by both the webhook path (after form-decoding) and the socket
+        mode path (which receives the payload as a JSON object directly).
+        """
         payload_type = payload.get("type")
 
         if payload_type == "block_actions":
@@ -1244,6 +1890,9 @@ class SlackAdapter:
     def _modal_response_to_slack(self, response: ModalResponse, context_id: str | None = None) -> SlackModalResponse:
         if response.action == "close":
             return {}
+        if response.action == "clear":
+            # Close the entire modal view stack (Slack ``response_action: clear``).
+            return {"response_action": "clear"}
         if response.action == "errors":
             return {"response_action": "errors", "errors": response.errors or {}}
         if response.action in ("update", "push"):
@@ -1260,6 +1909,465 @@ class SlackAdapter:
         return {}
 
     # ==================================================================
+    # Socket Mode
+    # ==================================================================
+
+    async def start_socket_mode(self) -> None:
+        """Open a Slack Socket Mode WebSocket and dispatch events.
+
+        Spawns a tracked background task that connects, runs the message
+        loop, and reconnects with exponential backoff on disconnect (per
+        Slack's recommendation). Returns once the initial connection has
+        been established.
+
+        Raises :class:`ValidationError` if the adapter wasn't configured
+        with ``app_token`` (must start with ``xapp-``).
+
+        Idempotent: a second call while connected is a no-op.
+        """
+        if not self._app_token:
+            raise ValidationError(
+                "slack",
+                "appToken is required for socket mode. Set SLACK_APP_TOKEN or provide it in config.",
+            )
+
+        if self._socket_task is not None and not self._socket_task.done():
+            # Already running.
+            return
+
+        # Lazy import (hazard #10) — slack_sdk is an optional dependency.
+        try:
+            from slack_sdk.socket_mode.aiohttp import SocketModeClient  # noqa: F401
+        except ImportError as exc:
+            raise ValidationError(
+                "slack",
+                "slack_sdk Socket Mode dependencies are not installed. "
+                "Install with `pip install chat-sdk[slack-socket]`.",
+            ) from exc
+
+        self._socket_shutdown_event.clear()
+        connected = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        # Hazard #5: track the task explicitly so ``stop_socket_mode`` can
+        # cancel it cleanly. Don't use ``asyncio.ensure_future`` without
+        # tracking — a stray reference loss would orphan the WebSocket.
+        self._socket_task = loop.create_task(self._socket_mode_loop(connected))
+
+        # Wait for either the first successful connect or for the loop to
+        # exit (which means the very first connect raised). Re-raise so the
+        # caller learns about a hard config failure (bad app token, network
+        # offline) instead of silently spinning forever. Bound the wait with
+        # ``connect_timeout_s`` so a hung handshake (slack_sdk's ``connect()``
+        # never returning) doesn't make ``initialize()`` block indefinitely
+        # (hazard #11).
+        wait_task = asyncio.create_task(connected.wait())
+        try:
+            # ``shield`` keeps the inner ``asyncio.wait`` alive when
+            # ``wait_for`` times out, so we can deterministically tear
+            # ``wait_task`` and ``_socket_task`` down ourselves in the
+            # except branch. Both tasks are cancelled there (``wait_task``
+            # directly, ``_socket_task`` via ``stop_socket_mode``), so the
+            # shielded inner wait always resolves shortly after — no orphan.
+            first_done, pending = await asyncio.wait_for(
+                asyncio.shield(
+                    asyncio.wait(
+                        {wait_task, self._socket_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                ),
+                timeout=self._socket_connect_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            # Don't leak the wait task or the still-running socket loop —
+            # tear them down before surfacing the failure.
+            wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                # ``await`` is load-bearing here: it drains the cancelled
+                # task before this function returns so the asyncio loop
+                # doesn't emit "Task was destroyed but it is pending!"
+                # warnings at shutdown, and so callers can rely on a
+                # synchronous "task fully gone" contract after timeout.
+                # ``contextlib.suppress`` absorbs the expected
+                # ``CancelledError`` that wait_task raises on cancel.
+                # Static analyzers (github-code-quality, etc.) sometimes
+                # flag this as "statement has no effect" because they
+                # model ``await`` syntactically rather than as a
+                # side-effecting suspension — that's a false positive;
+                # do not remove this line.
+                await wait_task
+            await self.stop_socket_mode()
+            raise TimeoutError(f"Slack Socket Mode connect timed out after {self._socket_connect_timeout_s}s") from None
+        # Hazard #5: if the loop task finished first, cancel the wait task
+        # explicitly so the orphan ``connected.wait()`` doesn't sit forever.
+        if wait_task in pending:
+            wait_task.cancel()
+        if connected.is_set():
+            return
+        # Socket loop exited before connecting — surface its exception.
+        for done in first_done:
+            if done is self._socket_task:
+                exc = done.exception()
+                if exc is not None:
+                    raise exc
+
+    async def stop_socket_mode(self) -> None:
+        """Close the Socket Mode connection and cancel the reconnect loop.
+
+        Idempotent. Safe to call from any task; it disconnects the active
+        client and waits for the background task to finish.
+        """
+        self._socket_shutdown_event.set()
+
+        client = self._socket_client
+        self._socket_client = None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                self._logger.warn("Error disconnecting Slack socket client", {"error": str(exc)})
+
+        task = self._socket_task
+        self._socket_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            # Cancellation is expected on shutdown; surface anything else so
+            # surprising loop crashes aren't silently swallowed.
+            with contextlib.suppress(asyncio.CancelledError):
+                # ``await`` is load-bearing: deterministically drains the
+                # cancelled loop task before ``stop_socket_mode()``
+                # returns. Without it, ``stop_socket_mode`` can return
+                # while the loop task is still tearing down, which:
+                #   - breaks ``test_stop_idempotent`` (the second call
+                #     can race the first's cleanup)
+                #   - risks "Task was destroyed but it is pending!"
+                #     warnings if the loop holds GC-only references
+                # ``contextlib.suppress`` absorbs the expected
+                # ``CancelledError``. Static analyzers sometimes flag
+                # this as "statement has no effect" because they model
+                # ``await`` syntactically — that's a false positive; do
+                # not remove this line.
+                await task
+        if task is not None:
+            self._logger.info("Slack socket mode disconnected")
+
+    async def _socket_mode_loop(self, connected: asyncio.Event) -> None:
+        """Connect/run/reconnect loop for Socket Mode.
+
+        Slack's Socket Mode WebSocket is long-lived but can disconnect for
+        many reasons (refresh, network blip, restart). We retry with
+        exponential backoff (with jitter) and reset the backoff once a
+        connection holds for any non-trivial time.
+        """
+        from slack_sdk.socket_mode.aiohttp import SocketModeClient
+
+        backoff = self._socket_initial_backoff_s
+        try:
+            while not self._socket_shutdown_event.is_set():
+                client = SocketModeClient(app_token=cast(str, self._app_token))
+                # Register our request handler. ``socket_mode_request_listeners``
+                # is the documented public extension point on the slack_sdk
+                # client; each listener is ``async (client, request) -> None``.
+                client.socket_mode_request_listeners.append(self._on_socket_request)
+                self._socket_client = client
+                try:
+                    await client.connect()
+                except Exception as exc:
+                    self._logger.error(
+                        "Slack socket mode connect failed",
+                        {"error": str(exc)},
+                    )
+                    self._socket_client = None
+                    if self._socket_shutdown_event.is_set():
+                        return
+                    if not connected.is_set():
+                        # First connect failed and nobody's listening yet —
+                        # surface the error to the caller of start_socket_mode.
+                        raise
+                    await self._socket_sleep_with_backoff(backoff)
+                    backoff = min(backoff * 2, self._socket_max_backoff_s)
+                    continue
+
+                # Connection established (or in progress) — let the caller of
+                # start_socket_mode resume.
+                self._logger.info("Slack socket mode connected")
+                connected.set()
+                backoff = self._socket_initial_backoff_s
+
+                # Wait until the socket disconnects or shutdown is requested.
+                while not self._socket_shutdown_event.is_set():
+                    if not client.is_connected():
+                        break
+                    await asyncio.sleep(1.0)
+
+                # Tear down the current client before reconnecting.
+                self._socket_client = None
+                try:
+                    await client.disconnect()
+                except Exception as exc:  # pragma: no cover - best-effort
+                    self._logger.warn(
+                        "Error disconnecting Slack socket client during reconnect",
+                        {"error": str(exc)},
+                    )
+
+                if self._socket_shutdown_event.is_set():
+                    return
+                self._logger.info("Slack socket mode disconnected, reconnecting")
+                await self._socket_sleep_with_backoff(backoff)
+                backoff = min(backoff * 2, self._socket_max_backoff_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Make sure first-connect failures propagate to the caller of
+            # start_socket_mode, but also log everything else loudly.
+            if not connected.is_set():
+                raise
+            self._logger.error(
+                "Slack socket mode loop crashed",
+                {"error": str(exc)},
+            )
+        finally:
+            client = self._socket_client
+            self._socket_client = None
+            if client is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover - best-effort
+                    await client.disconnect()
+
+    async def _socket_sleep_with_backoff(self, seconds: float) -> None:
+        """Sleep for ``seconds`` but wake immediately on shutdown.
+
+        Uses the per-adapter ``_socket_shutdown_event`` so ``stop_socket_mode``
+        can interrupt the backoff window without polling — wakeup latency is
+        bounded by event-loop scheduling, not the previous 0.25s poll.
+        """
+        try:
+            await asyncio.wait_for(self._socket_shutdown_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+
+    async def _on_socket_request(self, client: Any, request: Any) -> None:
+        """Listener invoked by ``SocketModeClient`` for each socket message.
+
+        Signature matches slack_sdk's documented hook:
+        ``async (client: SocketModeClient, request: SocketModeRequest) -> None``.
+        """
+        from slack_sdk.socket_mode.response import SocketModeResponse
+
+        envelope_id = getattr(request, "envelope_id", "") or ""
+        event_type = getattr(request, "type", "") or ""
+        payload = getattr(request, "payload", None) or {}
+        retry_attempt = getattr(request, "retry_attempt", 0) or 0
+
+        async def ack(response_payload: dict[str, Any] | None = None) -> None:
+            try:
+                await client.send_socket_mode_response(
+                    SocketModeResponse(envelope_id=envelope_id, payload=response_payload)
+                )
+            except Exception as exc:  # pragma: no cover - best-effort
+                self._logger.warn(
+                    "Failed to send socket mode ack",
+                    {"envelope_id": envelope_id, "error": str(exc)},
+                )
+
+        # Slack re-delivers events that weren't acked in time. Skip retries
+        # so we don't double-process — but still ack so Slack stops resending.
+        if retry_attempt and retry_attempt > 0:
+            await ack()
+            self._logger.debug("Skipping socket mode retry", {"retry_attempt": retry_attempt})
+            return
+
+        await self._route_socket_event(payload, event_type, ack)
+
+    async def _route_socket_event(
+        self,
+        body: dict[str, Any],
+        event_type: str,
+        ack: Callable[..., Awaitable[None]],
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Route a socket-mode event to the same handler the webhook path uses.
+
+        Mirrors upstream's ``routeSocketEvent``. The ``ack`` callback delivers
+        the SocketModeResponse back to Slack — for events_api and
+        slash_commands we ack immediately and let processing run in the
+        background; for interactive payloads we may attach a response body
+        (e.g. modal ``view_submission`` errors) onto the ack.
+        """
+
+        def wrap_async(coro: Awaitable[Any]) -> None:
+            """Run ``coro`` either via ``waitUntil`` or as a tracked task."""
+            if options is not None and options.wait_until is not None:
+                # ``wait_until`` semantics: caller takes ownership.
+                options.wait_until(cast(Any, coro))
+                return
+            task = asyncio.get_running_loop().create_task(cast(Any, coro))
+
+            def _log_exc(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self._logger.error(
+                        "Error in socket mode async handler",
+                        {"error": str(exc)},
+                    )
+
+            task.add_done_callback(_log_exc)
+            _pin_task(task)
+
+        if event_type == "events_api":
+            await ack()
+            event = body.get("event")
+            if not isinstance(event, dict):
+                self._logger.warn(
+                    "Socket mode events_api missing event field",
+                    {"body_type": type(body).__name__},
+                )
+                return
+            # Match the webhook path's synthesized payload exactly. Upstream
+            # doesn't include ``is_ext_shared_channel`` here, and the webhook
+            # JSON we pass into ``_process_event_payload`` doesn't either —
+            # adding it on the socket path is a quiet socket-vs-webhook
+            # divergence (hazard #7). Keep the keys that flow into
+            # downstream handlers, drop the rest.
+            payload: dict[str, Any] = {
+                "type": "event_callback",
+                "event": event,
+                "team_id": body.get("team_id"),
+                "event_id": body.get("event_id"),
+                "event_time": body.get("event_time"),
+            }
+            # Multi-workspace: resolve token before dispatch (mirrors webhook
+            # path). copy_context() keeps the ContextVar set on tasks spawned
+            # by handlers (hazard #6).
+            team_id_event = payload.get("team_id")
+            try:
+                if not self._is_single_workspace and team_id_event:
+                    ctx = await self._resolve_token_for_team(team_id_event)
+                    if ctx is None:
+                        self._logger.warn(
+                            "Could not resolve token for team",
+                            {"teamId": team_id_event},
+                        )
+                        return
+                    isolated = contextvars.copy_context()
+                    isolated.run(self._request_context.set, ctx)
+                    isolated.run(self._process_event_payload, payload, options)
+                else:
+                    self._process_event_payload(payload, options)
+            except Exception as exc:
+                self._logger.error(
+                    "Error processing socket mode events_api",
+                    {"error": str(exc)},
+                )
+            return
+
+        if event_type == "slash_commands":
+            # Slash responses are out-of-band via ``response_url`` (Slack's
+            # delayed-response pattern), not the WebSocket ack. The empty ack
+            # here just tells Slack we received the command; the body of the
+            # reply flows through ``_handle_slash_command`` posting to the
+            # response_url. Matches upstream's `routeSocketEvent`.
+            await ack()
+            # slash_commands payload is a flat dict mirroring the
+            # form-urlencoded fields; convert to the parse_qs shape that
+            # _handle_slash_command expects (each value wrapped in a list).
+            params: dict[str, list[str]] = {k: [v] for k, v in body.items() if isinstance(v, str)}
+
+            async def run_slash() -> None:
+                team_id_slash = (params.get("team_id") or [None])[0]
+                if not self._is_single_workspace and team_id_slash:
+                    ctx = await self._resolve_token_for_team(team_id_slash)
+                    if ctx is None:
+                        self._logger.warn("Could not resolve token for slash command")
+                        return
+                    tok = self._request_context.set(ctx)
+                    try:
+                        await self._handle_slash_command(params, options)
+                    finally:
+                        self._request_context.reset(tok)
+                else:
+                    await self._handle_slash_command(params, options)
+
+            wrap_async(run_slash())
+            return
+
+        if event_type == "interactive":
+            try:
+                # Multi-workspace: scope token resolution to the dispatch.
+                team_ref = body.get("team")
+                team_id_interactive = team_ref.get("id") if isinstance(team_ref, dict) else body.get("team_id")
+                if not self._is_single_workspace and team_id_interactive:
+                    ctx = await self._resolve_token_for_team(team_id_interactive)
+                    if ctx is None:
+                        self._logger.warn("Could not resolve token for interactive payload")
+                        await ack()
+                        return
+                    tok = self._request_context.set(ctx)
+                    try:
+                        result = await self._dispatch_interactive_payload(body, options)
+                    finally:
+                        self._request_context.reset(tok)
+                else:
+                    result = await self._dispatch_interactive_payload(body, options)
+            except Exception as exc:
+                self._logger.error(
+                    "Error processing socket mode interactive",
+                    {"error": str(exc)},
+                )
+                # Hazard #15 (UX): an empty ack on view_submission silently
+                # closes the modal, so the user has no signal anything went
+                # wrong. Return ``response_action=errors`` so Slack keeps the
+                # modal open with a visible message. Safe for non-modal
+                # interactive types too — Slack ignores the field when the
+                # payload type doesn't expect it.
+                await ack({"response_action": "errors", "errors": {"_": "internal error"}})
+                return
+
+            response_body: dict[str, Any] | None = None
+            body_str = result.get("body") if isinstance(result, dict) else None
+            if isinstance(body_str, str) and body_str:
+                content_type = result.get("headers", {}).get("Content-Type", "") if isinstance(result, dict) else ""
+                if "application/json" in content_type:
+                    try:
+                        parsed = json.loads(body_str)
+                        if isinstance(parsed, dict):
+                            response_body = parsed
+                    except (json.JSONDecodeError, ValueError):
+                        response_body = None
+            await ack(response_body)
+            return
+
+        # Unknown event type — still ack so Slack doesn't redeliver.
+        await ack()
+        self._logger.debug("Unhandled socket mode event type", {"type": event_type})
+
+    async def _handle_forwarded_socket_event(
+        self,
+        event: dict[str, Any],
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Process a socket-mode event forwarded over HTTP.
+
+        Companion to :meth:`_route_socket_event` for the serverless pattern
+        where a long-running listener runs in one process and posts events
+        to a webhook handler elsewhere. The ack already happened on the
+        listener side; we just route to the same handler dispatch.
+        """
+
+        async def noop_ack(_response: dict[str, Any] | None = None) -> None:
+            return None
+
+        body = event.get("body")
+        event_type = event.get("eventType") or event.get("event_type") or ""
+        if not isinstance(body, dict) or not isinstance(event_type, str):
+            self._logger.warn(
+                "Forwarded socket event has invalid shape",
+                {"event_type": type(event_type).__name__},
+            )
+            return
+        await self._route_socket_event(body, event_type, noop_ack, options)
+
+    # ==================================================================
     # Message events
     # ==================================================================
 
@@ -1269,6 +2377,9 @@ class SlackAdapter:
             return
 
         subtype = event.get("subtype")
+        if subtype == "message_changed":
+            self._handle_message_changed(event, options)
+            return
         if subtype and subtype in _IGNORED_SUBTYPES:
             self._logger.debug("Ignoring message subtype", {"subtype": subtype})
             return
@@ -1722,7 +2833,13 @@ class SlackAdapter:
     # ==================================================================
 
     def _extract_links(self, event: dict[str, Any]) -> list[LinkPreview]:
-        """Extract link URLs from a Slack event."""
+        """Extract link URLs from a Slack event.
+
+        Also merges any inline unfurl metadata that Slack already attached to
+        this same event (legacy ``attachments`` array). Cross-event unfurl
+        metadata (delivered later via ``message_changed``) is merged
+        asynchronously via :meth:`_enrich_links`.
+        """
         urls: set[str] = set()
 
         for block in event.get("blocks", []):
@@ -1738,7 +2855,176 @@ class SlackAdapter:
                 pipe_idx = raw.find("|")
                 urls.add(raw[:pipe_idx] if pipe_idx >= 0 else raw)
 
-        return [self._create_link_preview(url) for url in urls]
+        # Build unfurl metadata index from inline (same-event) attachments.
+        unfurls: dict[str, dict[str, str | None]] = {}
+        for att in event.get("attachments") or []:
+            if not isinstance(att, dict):
+                continue
+            att_url = att.get("from_url") or att.get("original_url")
+            if att_url and (att.get("title") or att.get("text")):
+                unfurls[att_url] = {
+                    "title": att.get("title"),
+                    "description": att.get("text"),
+                    "image_url": att.get("image_url") or att.get("thumb_url"),
+                    "site_name": att.get("service_name"),
+                }
+                urls.add(att_url)
+
+        previews: list[LinkPreview] = []
+        for url in urls:
+            preview = self._create_link_preview(url)
+            # TS uses ``url.replace(TRAILING_SLASH_PATTERN, "")`` (no ``g``
+            # flag) which strips a single trailing ``/``. Python's
+            # ``re.sub`` defaults to replacing all occurrences, so we
+            # pin ``count=1`` for parity. (Practically the regex anchors
+            # at end-of-string so only one match exists, but locking
+            # this in prevents drift if the pattern ever loosens.)
+            unfurl = (
+                unfurls.get(url) or unfurls.get(_TRAILING_SLASH_PATTERN.sub("", url, count=1)) or unfurls.get(f"{url}/")
+            )
+            if unfurl:
+                preview = self._merge_unfurl_into_preview(preview, unfurl)
+            previews.append(preview)
+        return previews
+
+    @staticmethod
+    def _merge_unfurl_into_preview(preview: LinkPreview, unfurl: dict[str, str | None]) -> LinkPreview:
+        """Return a new LinkPreview with unfurl metadata merged in.
+
+        Mirrors the TS spread ``{ ...preview, ...unfurl }``: the unfurl
+        values OVERRIDE the preview's ``description`` / ``image_url`` /
+        ``site_name`` (the unfurled attachment is the authoritative
+        source). ``title`` is short-circuited by callers (``_enrich_links``
+        skips merging when the preview already has a title), but for the
+        same-event ``_extract_links`` path the unfurl's title also wins
+        when present. ``fetch_message`` is never present on the unfurl
+        and is preserved from the preview.
+        """
+        return LinkPreview(
+            url=preview.url,
+            title=unfurl.get("title") if unfurl.get("title") is not None else preview.title,
+            description=unfurl.get("description") if unfurl.get("description") is not None else preview.description,
+            image_url=unfurl.get("image_url") if unfurl.get("image_url") is not None else preview.image_url,
+            site_name=unfurl.get("site_name") if unfurl.get("site_name") is not None else preview.site_name,
+            fetch_message=preview.fetch_message,
+        )
+
+    def _handle_message_changed(self, event: dict[str, Any], _options: WebhookOptions | None = None) -> None:
+        """Cache unfurl metadata from ``message_changed`` events.
+
+        Slack delivers link unfurls asynchronously by editing the original
+        message and dispatching ``message_changed``. We extract any unfurl
+        attachments and store them keyed by the inner message ``ts`` so
+        :meth:`_enrich_links` can pick them up for the original event.
+        """
+        inner = event.get("message")
+        channel = event.get("channel")
+        if not (inner and channel and isinstance(inner, dict)):
+            return
+
+        attachments = inner.get("attachments") or []
+        has_unfurls = any(
+            isinstance(att, dict) and (att.get("from_url") or att.get("original_url")) for att in attachments
+        )
+        if not has_unfurls:
+            self._logger.debug("Ignoring message_changed without unfurl data")
+            return
+
+        ts = inner.get("ts")
+        if not (self._chat and ts):
+            return
+
+        self._logger.debug(
+            "Processing message_changed for link unfurls",
+            {"channel": channel, "ts": ts, "attachmentCount": len(attachments)},
+        )
+
+        unfurls: dict[str, dict[str, str | None]] = {}
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            att_url = att.get("from_url") or att.get("original_url")
+            if att_url and (att.get("title") or att.get("text")):
+                unfurls[att_url] = {
+                    "title": att.get("title"),
+                    "description": att.get("text"),
+                    "image_url": att.get("image_url") or att.get("thumb_url"),
+                    "site_name": att.get("service_name"),
+                }
+
+        if not unfurls:
+            return
+
+        async def _store() -> None:
+            try:
+                await self._chat.get_state().set(  # type: ignore[union-attr]
+                    f"slack:unfurls:{ts}",
+                    unfurls,
+                    _UNFURL_CACHE_TTL_MS,
+                )
+            except Exception as exc:
+                self._logger.error("Failed to cache unfurl metadata", {"error": exc})
+
+        try:
+            task = asyncio.get_running_loop().create_task(_store())
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error("Unfurl cache task failed", {"error": t.exception()}) if t.exception() else None
+                )
+            )
+        except RuntimeError:
+            # No running loop (sync test context) — skip silently.
+            self._logger.debug("No running loop; skipping unfurl cache write")
+
+    async def _enrich_links(self, links: list[LinkPreview], message_ts: str | None) -> list[LinkPreview]:
+        """Enrich ``links`` with unfurl metadata from a ``message_changed`` cache.
+
+        Polls the state cache for up to ``_UNFURL_WAIT_MS`` to give Slack
+        time to deliver the cross-event ``message_changed`` payload.
+        Returns the original list (untouched) when there is nothing to wait
+        for.
+        """
+        if not (self._chat and message_ts) or not links:
+            return links
+
+        all_have_metadata = all((link.title is not None) or (link.fetch_message is not None) for link in links)
+        if all_have_metadata:
+            return links
+
+        deadline = time.monotonic() + (_UNFURL_WAIT_MS / 1000.0)
+        state = self._chat.get_state()
+        stored: dict[str, dict[str, str | None]] | None = None
+        while True:
+            try:
+                stored = await state.get(f"slack:unfurls:{message_ts}")
+            except Exception as exc:
+                self._logger.warn(
+                    "Failed to read unfurl data from state",
+                    {"error": str(exc), "message_ts": message_ts},
+                )
+                return links
+            if stored or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_UNFURL_POLL_MS / 1000.0)
+
+        if not stored:
+            return links
+
+        out: list[LinkPreview] = []
+        for link in links:
+            if link.title is not None:
+                out.append(link)
+                continue
+            unfurl = (
+                stored.get(link.url)
+                or stored.get(_TRAILING_SLASH_PATTERN.sub("", link.url, count=1))
+                or stored.get(f"{link.url}/")
+            )
+            if unfurl:
+                out.append(self._merge_unfurl_into_preview(link, unfurl))
+            else:
+                out.append(link)
+        return out
 
     def _create_link_preview(self, url: str) -> LinkPreview:
         """Create a LinkPreview for a URL.
@@ -1844,7 +3130,13 @@ class SlackAdapter:
                 self._create_attachment(f, team_id=event.get("team") or event.get("team_id"))
                 for f in event.get("files", [])
             ],
-            links=self._extract_links(event),
+            # ``_enrich_links`` polls the unfurl cache for up to
+            # ``_UNFURL_WAIT_MS`` (2000 ms) before giving up, so every
+            # message containing a not-yet-unfurled link adds up to
+            # ~2s of latency to message handling worst-case (it returns
+            # immediately when the cache is already populated or when
+            # there are no links to enrich).
+            links=await self._enrich_links(self._extract_links(event), event.get("ts")),
         )
 
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
@@ -1901,8 +3193,13 @@ class SlackAdapter:
         the queue/debounce path JSON-serializes the message.
         """
         url = file.get("url_private")
-        # Capture token at creation time (during webhook processing)
-        bot_token = self._get_token()
+        # Capture per-request token from the active webhook context so
+        # ``fetch_data`` can run later without being inside the ContextVar
+        # frame (e.g. after the message has been queued + rehydrated).
+        # For single-workspace mode the default provider is re-resolved at
+        # fetch time so dynamic ``bot_token`` resolvers honor rotation.
+        ctx = self._request_context.get()
+        ctx_token: str | None = ctx.token if ctx and ctx.token else None
 
         mimetype = file.get("mimetype", "")
         att_type: str = "file"
@@ -1914,7 +3211,8 @@ class SlackAdapter:
             att_type = "audio"
 
         async def fetch_data() -> bytes:
-            return await self._fetch_slack_file(url, bot_token)  # type: ignore[arg-type]
+            token = ctx_token if ctx_token is not None else await self._resolve_token_async()
+            return await self._fetch_slack_file(url, token)  # type: ignore[arg-type]
 
         fetch_meta: dict[str, str] = {}
         if url:
@@ -2021,7 +3319,9 @@ class SlackAdapter:
                     )
                 token = installation.bot_token
             else:
-                token = adapter._get_token()
+                # Use the async resolver so a dynamic ``bot_token`` provider
+                # is invoked at fetch time (rotation-safe).
+                token = await adapter._resolve_token_async()
             return await adapter._fetch_slack_file(url, token)
 
         return Attachment(
@@ -2348,7 +3648,24 @@ class SlackAdapter:
 
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
-        thread_ts = decoded.thread_ts
+        # Normalize empty thread_ts to None to avoid Slack API "invalid_thread_ts" errors.
+        # ``chat.startStream`` rejects an empty thread_ts (top-level DMs have no
+        # parent thread to attach to), but ``chat.postMessage`` accepts it.
+        # Degrade DMs to a single accumulated post_message call so streaming
+        # replies aren't silently dropped (chat-sdk-python#94).
+        thread_ts = decoded.thread_ts or None
+        if not thread_ts:
+            self._logger.debug(
+                "Slack: stream degraded to post_message - no thread context",
+                {"channel": channel},
+            )
+            accumulated = ""
+            async for chunk in text_stream:
+                if isinstance(chunk, str):
+                    accumulated += chunk
+                elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
+                    accumulated += chunk.text  # type: ignore[union-attr]
+            return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
         self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
         token = self._get_token()
@@ -2565,7 +3882,16 @@ class SlackAdapter:
         if files:
             raise ValidationError("slack", "File uploads are not supported in scheduled messages")
 
-        token = self._get_token()
+        # For multi-workspace mode, snapshot the per-team token from the
+        # active request context — ``cancel()`` may run outside the
+        # ContextVar frame. For single-workspace mode, defer resolution to
+        # ``cancel()`` so dynamic resolvers honor token rotation between
+        # ``schedule_message()`` and ``cancel()`` (Slack rotated tokens have
+        # a 12h TTL and scheduled messages can outlive their schedule-time
+        # token).
+        ctx = self._request_context.get()
+        ctx_token: str | None = ctx.token if ctx and ctx.token else None
+        token = ctx_token if ctx_token is not None else await self._resolve_token_async()
 
         try:
             client = self._get_client(token)
@@ -2598,7 +3924,11 @@ class SlackAdapter:
             adapter = self
 
             async def cancel() -> None:
-                c = adapter._get_client(token)
+                # Multi-workspace: use the snapshotted ctx_token (resolver
+                # runs outside the request frame). Single-workspace: re-
+                # resolve so token rotation between schedule + cancel works.
+                cancel_token = ctx_token if ctx_token is not None else await adapter._resolve_token_async()
+                c = adapter._get_client(cancel_token)
                 await c.chat_deleteScheduledMessage(channel=channel, scheduled_message_id=scheduled_message_id)
 
             return ScheduledMessage(
@@ -3230,5 +4560,16 @@ class SlackAdapter:
 
 
 def create_slack_adapter(config: SlackAdapterConfig | None = None) -> SlackAdapter:
-    """Create a new SlackAdapter instance."""
+    """Create a new SlackAdapter instance.
+
+    For socket mode, the factory rejects multi-workspace setups upfront —
+    Socket Mode is a single-workspace transport (the WebSocket carries one
+    app's events for one workspace) and silently mixing the two would mask
+    a config mistake.
+    """
+    if config is not None and (config.mode or "webhook") == "socket" and (config.client_id or config.client_secret):
+        raise ValidationError(
+            "slack",
+            "Multi-workspace (clientId/clientSecret) is not supported in socket mode.",
+        )
     return SlackAdapter(config)

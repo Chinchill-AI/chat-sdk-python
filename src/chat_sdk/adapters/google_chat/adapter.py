@@ -81,6 +81,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    UserInfo,
     WebhookOptions,
     _parse_iso,
 )
@@ -729,6 +730,36 @@ class GoogleChatAdapter:
             return False
 
     # =========================================================================
+    # Public user lookup (chat.get_user)
+    # =========================================================================
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up a Google Chat user from the cached webhook sender info.
+
+        Google Chat does not expose a direct ``users.get`` API for chat
+        bots — display names, avatars, and emails are only available on
+        inbound message ``sender`` payloads. We surface what we've cached
+        from previous webhooks; callers see ``None`` until the user has
+        interacted with the bot at least once.
+
+        Mirrors upstream ``GoogleChatAdapter.getUser`` (vercel/chat#391).
+        """
+        try:
+            cached = await self._user_info_cache.get(user_id)
+        except Exception:
+            return None
+        if not cached:
+            return None
+        return UserInfo(
+            user_id=user_id,
+            user_name=cached.display_name,
+            full_name=cached.display_name,
+            is_bot=bool(cached.is_bot) if cached.is_bot is not None else False,
+            email=cached.email,
+            avatar_url=cached.avatar_url,
+        )
+
+    # =========================================================================
     # Webhook handling
     # =========================================================================
 
@@ -1302,12 +1333,15 @@ class GoogleChatAdapter:
 
             try:
                 loop = asyncio.get_running_loop()
+                sender = message.get("sender") or {}
                 _pin_task(
                     loop.create_task(
                         self._user_info_cache.set(
                             user_id,
                             display_name,
-                            (message.get("sender") or {}).get("email"),
+                            sender.get("email"),
+                            sender.get("type") == "BOT",
+                            sender.get("avatarUrl"),
                         )
                     )
                 )

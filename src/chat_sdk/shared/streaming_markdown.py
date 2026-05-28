@@ -54,6 +54,29 @@ def _strip_fenced_code(text: str) -> str:
     return "\n".join(result_lines)
 
 
+def _is_excluded_asterisk(stripped: str, run_start: int, run_len: int, ch: str) -> bool:
+    """Whether a single-``*`` run at *run_start* should be excluded from the
+    emphasis tally per CommonMark's flanking rules.
+
+    A ``*`` flanked by whitespace (space, tab, newline, or text boundary)
+    on both sides is not a valid emphasis delimiter, and this same check
+    covers line-leading bullet list markers (``* item``). Mirrors
+    ``shouldSkipAsterisk`` in upstream remend's ``emphasis-handlers.ts``.
+
+    Only single-``*`` runs are subject to this check -- ``**`` / ``***``
+    runs are evaluated by the bold pairing logic and have their own
+    word-boundary semantics. ``_``-emphasis isn't ambiguous with list
+    markers, so it's not affected here either.
+    """
+    if ch != "*" or run_len != 1:
+        return False
+    prev_char = stripped[run_start - 1] if run_start > 0 else None
+    next_char = stripped[run_start + run_len] if run_start + run_len < len(stripped) else None
+    prev_ws = prev_char is None or prev_char in (" ", "\t", "\n")
+    next_ws = next_char is None or next_char in (" ", "\t", "\n")
+    return prev_ws and next_ws
+
+
 def _close_emphasis(result: str, stripped: str, ch: str) -> str:
     """Close unclosed bold/italic emphasis for a single marker character.
 
@@ -65,6 +88,11 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
     The algorithm mirrors CommonMark's emphasis handling at a simplified
     level: a run of 2+ characters opens/closes bold first, then any
     remaining single character opens/closes italic.
+
+    Whitespace-flanked single ``*`` runs are excluded via
+    :func:`_is_excluded_asterisk` -- this covers line-leading bullets
+    (``* item``) and any other non-delimiter asterisks per CommonMark's
+    flanking rules (issue #69).
 
     To guarantee idempotency the suffix is separated from any trailing
     marker run by a zero-width space so it cannot merge with existing
@@ -78,10 +106,13 @@ def _close_emphasis(result: str, stripped: str, ch: str) -> str:
             i += 2
             continue
         if stripped[i] == ch:
+            run_start = i
             run_len = 0
             while i < len(stripped) and stripped[i] == ch:
                 run_len += 1
                 i += 1
+            if _is_excluded_asterisk(stripped, run_start, run_len, ch):
+                continue
             runs.append(run_len)
         else:
             i += 1
@@ -231,6 +262,7 @@ def _get_committable_prefix(text: str) -> str:
     # Walk backward to find consecutive table-like lines at the end
     held_count = 0
     separator_found = False
+    separator_idx = -1
 
     for i in range(len(lines) - 1, -1, -1):
         trimmed = lines[i].strip()
@@ -241,6 +273,7 @@ def _get_committable_prefix(text: str) -> str:
 
         if TABLE_SEPARATOR_RE.match(trimmed):
             separator_found = True
+            separator_idx = i
             break
 
         if TABLE_ROW_RE.match(trimmed):
@@ -248,10 +281,38 @@ def _get_committable_prefix(text: str) -> str:
         else:
             break
 
-    if separator_found or held_count == 0:
+    if separator_found and held_count == 0:
+        # Separator present but no body row beneath it yet. Append-only
+        # consumers (Slack `chat.appendStream`, etc.) parse each delta
+        # independently; emitting a header+separator without rows produces
+        # broken syntax. Hold the entire pre-separator table block until a
+        # row arrives (issue #69).
+        #
+        # The backward walk must also stop at empty lines (end of the
+        # current block) and at prior separators -- prior separators mean
+        # the candidate "new header" rows above them were already
+        # committed as body rows of a previously confirmed table.
+        # Rolling them back would violate the monotonic append-only
+        # contract; in that case fall through to "commit everything"
+        # instead (PR #99 review finding).
+        table_start = separator_idx
+        rolled_back = False
+        for i in range(separator_idx - 1, -1, -1):
+            trimmed = lines[i].strip()
+            if trimmed == "" or TABLE_ROW_RE.match(trimmed) is None:
+                break
+            if TABLE_SEPARATOR_RE.match(trimmed):
+                rolled_back = True
+                break
+            table_start = i
+        if rolled_back:
+            return text
+        commit_line_count = table_start
+    elif separator_found or held_count == 0:
         return text
+    else:
+        commit_line_count = len(lines) - held_count
 
-    commit_line_count = len(lines) - held_count
     committed_lines = lines[:commit_line_count]
 
     result = "\n".join(committed_lines)
