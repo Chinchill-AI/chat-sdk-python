@@ -3701,7 +3701,7 @@ class SlackAdapter:
             else:
                 await streamer.append(markdown_text=delta)
 
-        async def send_structured_chunk(chunk: StreamChunk) -> None:
+        async def send_structured_chunk(chunk: StreamChunk | dict[str, Any]) -> None:
             nonlocal first, last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return
@@ -3710,18 +3710,25 @@ class SlackAdapter:
             await flush_markdown_delta(delta)
             last_appended = committable
 
+            def _read(name: str) -> Any:
+                if isinstance(chunk, dict):
+                    return chunk.get(name)
+                return getattr(chunk, name, None)
+
+            chunk_type = _read("type")
+            if not chunk_type:
+                self._logger.warn(
+                    "Slack stream: ignoring chunk with no `type` field",
+                    {"chunkRepr": repr(chunk)[:200]},
+                )
+                return
+
             try:
-                chunk_data = {"type": chunk.type}  # type: ignore[union-attr]
-                if hasattr(chunk, "id"):
-                    chunk_data["id"] = chunk.id  # type: ignore[union-attr]
-                if hasattr(chunk, "title"):
-                    chunk_data["title"] = chunk.title  # type: ignore[union-attr]
-                if hasattr(chunk, "status"):
-                    chunk_data["status"] = chunk.status  # type: ignore[union-attr]
-                if hasattr(chunk, "output") and chunk.output is not None:  # type: ignore[union-attr]
-                    chunk_data["output"] = chunk.output  # type: ignore[union-attr]
-                if hasattr(chunk, "text"):
-                    chunk_data["text"] = chunk.text  # type: ignore[union-attr]
+                chunk_data: dict[str, Any] = {"type": chunk_type}
+                for field_name in ("id", "title", "status", "output", "text"):
+                    value = _read(field_name)
+                    if value is not None:
+                        chunk_data[field_name] = value
 
                 if first:
                     await streamer.append(chunks=[chunk_data], token=token)
@@ -3731,9 +3738,11 @@ class SlackAdapter:
             except Exception as exc:
                 structured_chunks_supported = False
                 self._logger.warn(
-                    "Structured streaming chunk failed, falling back to text-only streaming. "
-                    "Ensure your Slack app manifest includes assistant_view, assistant:write scope.",
-                    {"chunkType": getattr(chunk, "type", "unknown"), "error": exc},
+                    "Slack stream: structured-chunk append failed, falling back to "
+                    "text-only for the rest of this stream. Likely causes: missing "
+                    "`assistant_view` / `assistant:write` scope on the app manifest, "
+                    "malformed chunk payload, or a transient Slack API error.",
+                    {"chunkType": chunk_type, "error": exc},
                 )
 
         async def push_text_and_flush(text: str) -> None:
@@ -3747,6 +3756,14 @@ class SlackAdapter:
         async for chunk in text_stream:
             if isinstance(chunk, str):
                 await push_text_and_flush(chunk)
+            elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                # Dict-shaped StreamChunks are part of the contract: the
+                # `_from_full_stream` normalizer in thread.py forwards dict
+                # `{type: "markdown_text", ...}` items unchanged, so adapters
+                # must handle them the same as the dataclass form.
+                text_value = chunk.get("text")
+                if isinstance(text_value, str) and text_value:
+                    await push_text_and_flush(text_value)
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
                 await push_text_and_flush(chunk.text)  # type: ignore[union-attr]
             else:

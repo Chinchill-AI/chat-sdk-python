@@ -965,6 +965,80 @@ class TestStream:
         assert result.id == "777.777"
 
     @pytest.mark.asyncio
+    async def test_stream_accepts_dict_markdown_text_chunks(self):
+        """Dict-shaped markdown_text chunks must flow into the renderer the
+        same as the dataclass form — `_from_full_stream` in thread.py
+        forwards them unchanged, so adapters must accept both shapes.
+        """
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "666.666"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        async def chunk_gen() -> AsyncIterator[Any]:
+            yield {"type": "markdown_text", "text": "Hello "}
+            yield {"type": "markdown_text", "text": "world"}
+
+        result = await adapter.stream(
+            "slack:C123:1234567890.000000",
+            chunk_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert result.id == "666.666"
+        appended_text = "".join(call.kwargs.get("markdown_text", "") for call in mock_streamer.append.call_args_list)
+        assert "Hello world" in appended_text, (
+            "dict markdown_text chunks were not routed through the "
+            f"markdown renderer; streamer.append received {appended_text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_accepts_dict_task_update_chunks(self):
+        """Dict-shaped task_update chunks must be forwarded as structured
+        chunks to `streamer.append(chunks=...)`, matching the dataclass form.
+        """
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "555.555"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        async def chunk_gen() -> AsyncIterator[Any]:
+            yield "Starting "
+            yield {
+                "type": "task_update",
+                "id": "task1",
+                "title": "Search",
+                "status": "in_progress",
+            }
+            yield {
+                "type": "task_update",
+                "id": "task1",
+                "title": "Search",
+                "status": "complete",
+                "output": "Found 5",
+            }
+
+        result = await adapter.stream(
+            "slack:C123:1234567890.000000",
+            chunk_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert result.id == "555.555"
+        structured_calls = [call for call in mock_streamer.append.call_args_list if "chunks" in call.kwargs]
+        assert structured_calls, (
+            "dict-shaped task_update chunks were not forwarded as structured chunks to streamer.append(chunks=...)"
+        )
+        all_forwarded_chunks = [chunk for call in structured_calls for chunk in call.kwargs["chunks"]]
+        assert any(c.get("type") == "task_update" for c in all_forwarded_chunks), (
+            f"no forwarded chunk had type=task_update; got: {all_forwarded_chunks!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_awaits_chat_stream_coroutine(self):
         """Regression test for issue #44: ``AsyncWebClient.chat_stream`` is a
         coroutine function. Without ``await``, ``streamer`` is a coroutine
