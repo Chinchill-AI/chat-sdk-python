@@ -104,9 +104,16 @@ def make_list(children: list[Content], *, ordered: bool = False, start: int = 1)
     return node
 
 
-def make_list_item(children: list[Content]) -> Content:
-    """Create a list item node."""
-    return {"type": "listItem", "children": children}
+def make_list_item(children: list[Content], *, checked: bool | None = None) -> Content:
+    """Create a list item node.
+
+    *checked* follows the mdast GFM task-list extension: ``True`` for
+    ``- [x]``, ``False`` for ``- [ ]``, ``None`` for a regular list item.
+    """
+    node: Content = {"type": "listItem", "children": children}
+    if checked is not None:
+        node["checked"] = checked
+    return node
 
 
 def make_thematic_break() -> Content:
@@ -162,50 +169,286 @@ def get_node_value(node: Content) -> str:
 # Inline parser
 # ---------------------------------------------------------------------------
 
-# Regex patterns for inline elements, ordered by priority.
-# Each pattern captures a full inline construct.
+# ASCII-punctuation characters that may be backslash-escaped per
+# CommonMark. A preceding `\` makes the next character literal -- not a
+# delimiter -- which `_protect_escapes` consumes into a sentinel-prefixed
+# pair before the inline regexes run.
+_ESCAPABLE_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+# Sentinel character used by `_protect_escapes` to mark every ``\X``
+# escape sequence as ``<SENTINEL>X``. U+FDD0 is one of the 32 BMP
+# "noncharacters" permanently reserved by the Unicode standard for
+# process-internal application use -- by definition, no real text
+# interchange uses these codepoints. `_protect_escapes` also strips
+# any pre-existing occurrence from the input as a defense-in-depth
+# measure, so the sentinel-based round trip is robust even when an
+# adversarial caller smuggles the codepoint in.
+_ESCAPE_SENTINEL = "﷐"
+
+
+def _protect_escapes(text: str) -> str:
+    """Replace every ``\\X`` escape pair with ``<SENTINEL>X`` in *text*.
+
+    Used as a pre-pass before the inline regex matching. Each escaped
+    delimiter character is marked so the regex lookbehinds can skip it
+    via ``(?<!<SENTINEL>)``. Unlike the previous ``(?<!\\\\)`` approach,
+    this correctly handles any number of preceding backslashes because
+    the pre-pass consumes the backslash itself -- a ``*`` preceded by a
+    literal backslash (i.e. an *escaped* backslash followed by a real
+    emphasis opener) has no sentinel before it and matches normally.
+
+    Strips any pre-existing occurrence of the sentinel codepoint from
+    *text* before the escape walk so that adversarial / malformed input
+    can't smuggle in a fake escape sequence. The sentinel is a Unicode
+    noncharacter (U+FDD0) which should never appear in real text; this
+    is belt-and-suspenders for the rare case that it does.
+    """
+    if _ESCAPE_SENTINEL in text:
+        text = text.replace(_ESCAPE_SENTINEL, "")
+    if "\\" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in _ESCAPABLE_PUNCT:
+            out.append(_ESCAPE_SENTINEL)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _restore_escapes(text: str) -> str:
+    """Inverse of :func:`_protect_escapes` for text-leaf emission.
+
+    Replaces each ``<SENTINEL>X`` pair with literal ``X``. The
+    backslash is dropped because the escape sequence resolved to a
+    literal character at the AST text leaf.
+
+    A *dangling* sentinel (one with no following char, which arises when
+    the escaped character was consumed as a delimiter -- e.g. a code
+    span ending in ``\\``, where the backtick that followed the sentinel
+    became the closing delimiter) resolves to a literal backslash. This
+    must never emit the raw sentinel codepoint, which would leak U+FDD0
+    into user-visible output.
+    """
+    if _ESCAPE_SENTINEL not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == _ESCAPE_SENTINEL:
+            if i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 2
+            else:
+                # Dangling sentinel: the escaped char was consumed
+                # elsewhere; keep the backslash, never the sentinel.
+                out.append("\\")
+                i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _restore_escapes_as_literal_pair(text: str) -> str:
+    """Inverse for inline-code emission: ``<SENTINEL>X`` -> ``\\X``.
+
+    Per CommonMark, backslashes inside inline code spans are preserved
+    literally -- ``\\*`` inside a code span stays as ``\\*``, not ``*``.
+
+    A dangling sentinel (e.g. from a code span ending in ``\\`` where the
+    closing backtick was the sentinel's paired char) resolves to a bare
+    backslash, matching CommonMark's "backslash is literal in code"
+    rule. Never emits the raw sentinel codepoint.
+    """
+    if _ESCAPE_SENTINEL not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == _ESCAPE_SENTINEL:
+            out.append("\\")
+            if i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 2
+            else:
+                # Dangling sentinel (e.g. code span ending in `\`): the
+                # paired char became a delimiter; keep the backslash only.
+                i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+# Regex patterns for inline elements, ordered by priority. Each pattern
+# captures a full inline construct.
+#
+# The patterns operate on text that has already been through
+# `_protect_escapes`, so escaped delimiters appear as ``<SENTINEL>X``
+# (where SENTINEL = U+FDD0 -- the f-string ``﷐`` below). The
+# ``(?<!﷐)`` lookbehind on each opener rejects those, while real
+# backslash characters in the protected text -- which can only come
+# from escaped backslashes (``\\\\`` -> ``<SENTINEL>\\``) -- are left
+# as literal ``\`` and don't trigger the lookbehind, so the following
+# delimiter is correctly recognised as a real opener (closing the
+# doubled-backslash gap).
+#
+# Bracket content groups still need ``(?:[^\]﷐]|﷐.)+?`` so
+# that escaped ``\]`` / ``\[`` inside link text don't prematurely
+# terminate the match -- the alternation consumes a ``<SENTINEL>X``
+# pair as a single unit.
+#
+# Performance note: the alternation makes the link / image content
+# match O(n^2) on adversarial inputs with many unclosed ``[`` (e.g.
+# 5000 unclosed brackets -> ~1-2s parse). Typical chat content has a
+# handful of brackets so this is sub-millisecond in practice. If a
+# future surface ever feeds untrusted markdown with adversarial
+# bracket counts, switch to a character-level walker for link/image
+# content (the rest of `_parse_inline` is bounded by message size).
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
-    ("image", re.compile(r'!\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    ("link", re.compile(r'(?<!﷐)\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Inline code: `code`
-    ("inlineCode", re.compile(r"`([^`]+)`")),
+    ("inlineCode", re.compile(r"(?<!﷐)`([^`]+)`")),
     # Bold: **text**
-    ("strong_star", re.compile(r"\*\*(.+?)\*\*")),
+    ("strong_star", re.compile(r"(?<!﷐)\*\*(.+?)\*\*")),
     # Bold: __text__
-    ("strong_under", re.compile(r"__(.+?)__")),
+    ("strong_under", re.compile(r"(?<!﷐)__(.+?)__")),
     # Strikethrough: ~~text~~
-    ("delete", re.compile(r"~~(.+?)~~")),
-    # Emphasis: *text*  (not preceded/followed by *)
-    ("emphasis_star", re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")),
-    # Emphasis: _text_  (not preceded/followed by _)
-    ("emphasis_under", re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")),
+    ("delete", re.compile(r"(?<!﷐)~~(.+?)~~")),
+    # Emphasis: *text*  (not preceded/followed by * or sentinel)
+    ("emphasis_star", re.compile(r"(?<![*﷐])\*(?!\*)(.+?)(?<![*﷐])\*(?!\*)")),
+    # Emphasis: _text_  (not preceded/followed by _ or sentinel)
+    ("emphasis_under", re.compile(r"(?<![_﷐])_(?!_)(.+?)(?<![_﷐])_(?!_)")),
 ]
+
+
+# Note: `_unescape_punct` was removed in favour of the sentinel-based
+# `_protect_escapes` / `_restore_escapes` pair above, which correctly
+# handles any number of preceding backslashes (the previous fixed-width
+# lookbehind couldn't distinguish ``\\*foo*`` from ``\*foo\*``).
+
+
+# Characters that, if present literally in a text leaf, would be parsed
+# as the start of a markdown construct on the next ``parse_markdown``
+# call. Re-escape these at stringify time so the AST round-trips.
+# Over-escaping ordinary punctuation produces noisy output without
+# improving correctness -- only delimiters need it.
+_TEXT_DELIMITERS = frozenset("*_~`[]\\")
+
+
+def _escape_text_leaf(value: str) -> str:
+    """Re-escape delimiter characters so a text leaf round-trips through
+    parse_markdown unchanged.
+
+    Counterpart of :func:`_restore_escapes` -- a text node carrying the
+    value ``"*literal*"`` came from input ``\\*literal\\*``; stringify
+    must emit the backslashes or re-parse will form an emphasis node.
+    """
+    if not any(c in _TEXT_DELIMITERS for c in value):
+        return value
+    out: list[str] = []
+    for c in value:
+        if c in _TEXT_DELIMITERS:
+            out.append("\\")
+        out.append(c)
+    return "".join(out)
+
+
+# Block-level constructs only fire at line start. When a paragraph's
+# joined text begins with one of these patterns -- typically after
+# `_restore_escapes` resolved a ``\#`` or ``\>`` to its literal char --
+# naive stringify would re-form the construct on the next parse. These
+# regexes match the minimal opener pattern; `_escape_paragraph_block_markers`
+# inserts the backslash at the right position.
+_BLOCK_HEADING_RE = re.compile(r"^#{1,6}(?=\s|$)")
+_BLOCK_BLOCKQUOTE_RE = re.compile(r"^>")
+_BLOCK_UNORDERED_RE = re.compile(r"^[-+](?=\s)")
+_BLOCK_ORDERED_RE = re.compile(r"^(\d+)([.)])(?=\s)")
+_BLOCK_THEMATIC_DASH_RE = re.compile(r"^(-\s*){3,}\s*$")
+
+
+def _escape_block_marker_line(line: str) -> str:
+    """Re-escape a block-level marker at the start of a single line."""
+    if not line:
+        return line
+    if _BLOCK_HEADING_RE.match(line):
+        return "\\" + line
+    if _BLOCK_BLOCKQUOTE_RE.match(line):
+        return "\\" + line
+    if _BLOCK_UNORDERED_RE.match(line):
+        return "\\" + line
+    m = _BLOCK_ORDERED_RE.match(line)
+    if m:
+        # Escape the . or ) marker, not the digits -- `\1` isn't a
+        # CommonMark escape (digits aren't in escapable punct), so a
+        # leading-backslash placement wouldn't survive `_restore_escapes`.
+        return f"{m.group(1)}\\{m.group(2)}{line[m.end() :]}"
+    if _BLOCK_THEMATIC_DASH_RE.match(line):
+        return "\\" + line
+    return line
+
+
+def _escape_paragraph_block_markers(text: str) -> str:
+    """Re-escape block-level markers at the start of every line in a
+    paragraph's joined output.
+
+    Applied to the joined output of a `paragraph` node. Block-level
+    constructs (heading, blockquote, list, thematic break) only fire at
+    line start, so mid-line occurrences of ``#`` / ``>`` / ``-`` / ``+``
+    are safe. But a paragraph text leaf may contain ``\\n`` (from
+    `_restore_escapes` resolving an escaped marker after a soft line
+    break, or from joining text leaves around a hard break); each line
+    of the joined output needs the same escape treatment as line 1, or
+    re-parse will split the paragraph at the embedded marker.
+
+    ``*``-based and ``_``-based thematic breaks are already handled by
+    :func:`_escape_text_leaf` since both characters are in
+    `_TEXT_DELIMITERS`.
+    """
+    if not text:
+        return text
+    if "\n" not in text:
+        return _escape_block_marker_line(text)
+    return "\n".join(_escape_block_marker_line(line) for line in text.split("\n"))
 
 
 def _parse_inline_plain(text: str) -> list[Content]:
     """Parse plain text that contains no inline formatting.
 
-    Handles hard line breaks (two trailing spaces + newline).
+    Handles hard line breaks (two trailing spaces + newline) and
+    restores escape-sentinel pairs to their literal character.  The
+    caller is expected to have run ``_protect_escapes`` on the input.
     """
     if "  \n" in text:
         parts: list[Content] = []
         segments = text.split("  \n")
         for i, seg in enumerate(segments):
             if seg:
-                parts.append(make_text(seg))
+                parts.append(make_text(_restore_escapes(seg)))
             if i < len(segments) - 1:
                 parts.append(make_break())
-        return parts if parts else [make_text(text)]
-    return [make_text(text)]
+        return parts if parts else [make_text(_restore_escapes(text))]
+    return [make_text(_restore_escapes(text))]
 
 
-def _parse_inline(text: str) -> list[Content]:
+def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Content]:
     """Parse inline markdown elements into AST nodes.
 
     Handles: strong, emphasis, delete, inlineCode, link, image.
     Returns a list of inline Content nodes.
+
+    Runs ``_protect_escapes`` on entry so the inline regex patterns can
+    use sentinel-based lookbehinds. Recursive calls (e.g. into link
+    text or emphasis content) pass ``_already_protected=True`` because
+    the captured group is already in the protected form.
 
     The suffix (text after a match) is processed iteratively to avoid
     unbounded recursion on long strings.  Content *inside* a match
@@ -214,6 +457,8 @@ def _parse_inline(text: str) -> list[Content]:
     """
     if not text:
         return []
+    if not _already_protected:
+        text = _protect_escapes(text)
 
     nodes: list[Content] = []
     remaining = text
@@ -242,23 +487,30 @@ def _parse_inline(text: str) -> list[Content]:
 
         # The matched construct (content recursion is bounded by match length)
         if best_kind == "image":
-            alt = best_match.group(1)
-            url = best_match.group(2)
+            alt = _restore_escapes(best_match.group(1))
+            url = _restore_escapes(best_match.group(2))
             title = best_match.group(3)
+            if title is not None:
+                title = _restore_escapes(title)
             nodes.append(make_image(url, alt, title))
         elif best_kind == "link":
             link_text = best_match.group(1)
-            url = best_match.group(2)
+            url = _restore_escapes(best_match.group(2))
             title = best_match.group(3)
-            nodes.append(make_link(url, _parse_inline(link_text), title))
+            if title is not None:
+                title = _restore_escapes(title)
+            nodes.append(make_link(url, _parse_inline(link_text, _already_protected=True), title))
         elif best_kind == "inlineCode":
-            nodes.append(make_inline_code(best_match.group(1)))
+            # CommonMark: backslashes inside inline code are literal,
+            # so restore sentinel pairs as `\X` rather than dropping the
+            # backslash.
+            nodes.append(make_inline_code(_restore_escapes_as_literal_pair(best_match.group(1))))
         elif best_kind in ("strong_star", "strong_under"):
-            nodes.append(make_strong(_parse_inline(best_match.group(1))))
+            nodes.append(make_strong(_parse_inline(best_match.group(1), _already_protected=True)))
         elif best_kind == "delete":
-            nodes.append(make_delete(_parse_inline(best_match.group(1))))
+            nodes.append(make_delete(_parse_inline(best_match.group(1), _already_protected=True)))
         elif best_kind in ("emphasis_star", "emphasis_under"):
-            nodes.append(make_emphasis(_parse_inline(best_match.group(1))))
+            nodes.append(make_emphasis(_parse_inline(best_match.group(1), _already_protected=True)))
 
         # Advance past the match (iterative, not recursive)
         remaining = remaining[best_match.end() :]
@@ -319,12 +571,26 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
     items: list[Content] = []
     i = start
     item_re = re.compile(r"^(\d+)[.)]\s+(.*)") if ordered else re.compile(r"^[-*+]\s+(.*)")
+    # GFM task list extension: `- [ ]` or `- [x]` at the start of an
+    # unordered item maps to `listItem.checked = False` / `True`. The
+    # trailing whitespace + content group is optional so an empty task
+    # item (``- [ ]`` with nothing after) still produces ``checked``.
+    task_re = re.compile(r"^\[([ xX])\](?:\s+(.*))?$")
 
     while i < len(lines):
         line = lines[i]
         m = item_re.match(line)
         if m:
             item_text = m.group(2) if ordered else m.group(1)
+
+            checked: bool | None = None
+            if not ordered:
+                task_m = task_re.match(item_text)
+                if task_m:
+                    checked = task_m.group(1) in ("x", "X")
+                    # group(2) is None for an empty task item (`- [ ]`)
+                    # with no trailing whitespace/content.
+                    item_text = task_m.group(2) or ""
 
             item_children_lines = [item_text]
             i += 1
@@ -350,7 +616,7 @@ def _collect_list_items(lines: list[str], start: int, ordered: bool) -> tuple[li
 
             # Parse nested content in the item
             nested_children = _parse_list_item_content(item_children_lines)
-            items.append(make_list_item(nested_children))
+            items.append(make_list_item(nested_children, checked=checked))
         else:
             break
 
@@ -579,14 +845,17 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
     node_type = node.get("type")
 
     if node_type == "text":
-        return node.get("value", "")
+        return _escape_text_leaf(node.get("value", ""))
 
     if node_type == "break":
-        return "\n"
+        # Hard line break in CommonMark is two trailing spaces + newline.
+        # Emitting just `\n` would degrade to a soft break on re-parse.
+        return "  \n"
 
     if node_type == "paragraph":
         children = node.get("children", [])
-        return "".join(_stringify_node(c, emphasis=emphasis, bullet=bullet) or "" for c in children)
+        joined = "".join(_stringify_node(c, emphasis=emphasis, bullet=bullet) or "" for c in children)
+        return _escape_paragraph_block_markers(joined)
 
     if node_type == "heading":
         depth = node.get("depth", 1)
@@ -627,7 +896,7 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
         return f"[{text}]({url})"
 
     if node_type == "image":
-        alt = node.get("alt", "")
+        alt = _escape_text_leaf(node.get("alt", ""))
         url = node.get("url", "")
         title = node.get("title")
         if title:
@@ -641,21 +910,52 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
         lines: list[str] = []
         for idx, item in enumerate(items):
             prefix = f"{start + idx}." if ordered else bullet
+            # GFM task-list marker, only on unordered items with `checked` set.
+            checked = item.get("checked") if not ordered else None
+            task_marker = ""
+            if checked is True:
+                task_marker = "[x] "
+            elif checked is False:
+                task_marker = "[ ] "
             item_children = item.get("children", [])
-            for ci, child in enumerate(item_children):
+            if not item_children:
+                # Empty item -- still emit the prefix (and any task marker)
+                # so the round-trip preserves an empty `- [ ]` task.
+                lines.append(f"{prefix} {task_marker}".rstrip())
+                continue
+            # Track whether the parent prefix has been written so a
+            # listItem whose only children are nested lists still gets
+            # its own line (PR #101 review finding).
+            prefix_emitted = False
+            for child in item_children:
                 child_type = child.get("type")
                 if child_type == "list":
+                    if not prefix_emitted:
+                        # No text child before this nested list -- emit
+                        # the parent prefix on its own line so the
+                        # listItem and any checkbox state survive.
+                        lines.append(f"{prefix} {task_marker}".rstrip())
+                        prefix_emitted = True
                     nested = _stringify_node(child, emphasis=emphasis, bullet=bullet)
                     if nested:
-                        # Indent nested list
                         for nl in nested.split("\n"):
                             lines.append(f"  {nl}")
                 else:
                     text = _stringify_node(child, emphasis=emphasis, bullet=bullet) or ""
-                    if ci == 0:
-                        lines.append(f"{prefix} {text}")
+                    # A paragraph's stringified text may contain `\n` from
+                    # soft breaks or hard breaks. Continuation lines must
+                    # be indented by 2 spaces so the round-trip stays
+                    # inside the list item rather than splitting back out
+                    # to a sibling paragraph.
+                    text_lines = text.split("\n")
+                    if not prefix_emitted:
+                        lines.append(f"{prefix} {task_marker}{text_lines[0]}")
+                        for cont in text_lines[1:]:
+                            lines.append(f"  {cont}" if cont else "")
+                        prefix_emitted = True
                     else:
-                        lines.append(f"  {text}")
+                        for cont in text_lines:
+                            lines.append(f"  {cont}" if cont else "")
         return "\n".join(lines)
 
     if node_type == "listItem":

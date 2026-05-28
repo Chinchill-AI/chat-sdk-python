@@ -100,7 +100,11 @@ class BaseFormatConverter(ABC):
     ) -> str:
         """Render a list node with proper indentation.
 
-        Handles ordered and unordered lists and recurses into nested lists.
+        Handles ordered and unordered lists, recurses into nested lists,
+        and emits GFM task-list checkbox markers (``[ ]`` / ``[x]``) for
+        items carrying a ``checked`` attribute. Most chat platforms
+        either render the marker natively (GitHub, Linear) or display it
+        as literal text -- either way, dropping it would lose user data.
         """
         indent = "  " * depth
         start = node.get("start", 1)
@@ -109,19 +113,37 @@ class BaseFormatConverter(ABC):
 
         for i, item in enumerate(get_node_children(node)):
             prefix = f"{start + i}." if ordered else unordered_bullet
+            # GFM task-list marker, only on unordered items.
+            checked = item.get("checked") if not ordered else None
+            task_marker = ""
+            if checked is True:
+                task_marker = "[x] "
+            elif checked is False:
+                task_marker = "[ ] "
             is_first_content = True
             for child in get_node_children(item):
                 if child.get("type") == "list":
+                    if is_first_content:
+                        # No text child before this nested list -- emit
+                        # the parent prefix on its own line BEFORE the
+                        # nested list, or the checkbox/parent ordering
+                        # ends up reversed (PR #101 review finding).
+                        lines.append(f"{indent}{prefix} {task_marker}".rstrip())
+                        is_first_content = False
                     lines.append(self._render_list(child, depth + 1, node_converter, unordered_bullet))
                     continue
                 text = node_converter(child)
                 if not text.strip():
                     continue
                 if is_first_content:
-                    lines.append(f"{indent}{prefix} {text}")
+                    lines.append(f"{indent}{prefix} {task_marker}{text}")
                     is_first_content = False
                 else:
                     lines.append(f"{indent}  {text}")
+            # Item with zero rendered children -- still emit a line so the
+            # listItem (and any task marker) isn't lost.
+            if is_first_content:
+                lines.append(f"{indent}{prefix} {task_marker}".rstrip())
 
         return "\n".join(lines)
 

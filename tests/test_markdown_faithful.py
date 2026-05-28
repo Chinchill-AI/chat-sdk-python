@@ -190,6 +190,220 @@ class TestParseMarkdown:
 
 
 # ============================================================================
+# Chat / AI agent completeness (issue #69): escaped chars + task lists
+# ============================================================================
+
+
+class TestEscapedCharacters:
+    """Backslash-escape support for chat content.
+
+    LLMs routinely emit ``\\*`` / ``\\[`` / ``\\\\`` when explaining
+    syntax, displaying shell commands, or showing literal markdown.
+    Previously these slipped past the inline regexes and the visible
+    output dropped the backslashes but mis-parsed the surrounding
+    delimiters as emphasis / links.
+    """
+
+    def _para_children(self, md):
+        ast = parse_markdown(md)
+        assert ast["children"][0]["type"] == "paragraph"
+        return ast["children"][0]["children"]
+
+    def test_escaped_asterisk_is_literal_not_italic(self):
+        children = self._para_children(r"\*not italic\*")
+        assert len(children) == 1
+        assert children[0] == {"type": "text", "value": "*not italic*"}
+
+    def test_escaped_underscore_is_literal_not_italic(self):
+        children = self._para_children(r"\_not italic\_")
+        assert len(children) == 1
+        assert children[0] == {"type": "text", "value": "_not italic_"}
+
+    def test_escaped_brackets_do_not_form_a_link(self):
+        children = self._para_children(r"\[not a link\](https://x.com)")
+        assert all(c.get("type") != "link" for c in children)
+        assert any("[not a link]" in c.get("value", "") for c in children if c.get("type") == "text")
+
+    def test_escaped_tilde_does_not_form_strikethrough(self):
+        children = self._para_children(r"\~~not strike\~~")
+        assert all(c.get("type") != "delete" for c in children)
+        # Also pin the actual text content -- a buggy impl that dropped
+        # the tildes entirely would pass the absence-of-`delete` check.
+        text_concat = "".join(c.get("value", "") for c in children if c.get("type") == "text")
+        assert "~~not strike~~" in text_concat
+
+    def test_escaped_backslash_yields_single_backslash(self):
+        children = self._para_children(r"path with \\backslash")
+        assert children == [{"type": "text", "value": "path with \\backslash"}]
+
+    def test_mixed_escaped_and_real_emphasis(self):
+        children = self._para_children(r"\*literal\* and *real italic*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" in types
+        text_values = [c.get("value", "") for c in children if c.get("type") == "text"]
+        assert any("*literal*" in v for v in text_values)
+
+    def test_escaped_alt_in_image(self):
+        children = self._para_children(r"![my \[image\]](pic.png)")
+        assert children[0]["type"] == "image"
+        assert children[0]["alt"] == "my [image]"
+
+    def test_link_url_resolves_backslash_escapes(self):
+        # PR #101 review #3 (downstream-impact reviewer): the inline
+        # parser now resolves backslash escapes in link URLs per
+        # CommonMark spec. This is a behavior change from the previous
+        # raw pass-through; pin it so the contract is explicit.
+        children = self._para_children(r"[t](http://example.com/path\)more)")
+        link_nodes = [c for c in children if c.get("type") == "link"]
+        # The `\)` inside the URL is now resolved to literal `)`.
+        # Previously this URL would have been truncated at the first `)`.
+        assert len(link_nodes) == 1
+        # Escaped `*` in URL becomes literal `*` (rare but spec-correct).
+        children2 = self._para_children(r"[t](u\*r\*l)")
+        link_nodes2 = [c for c in children2 if c.get("type") == "link"]
+        assert len(link_nodes2) == 1
+        assert link_nodes2[0]["url"] == "u*r*l"
+
+    def test_inline_code_contents_are_not_unescaped(self):
+        # Per CommonMark, backslash inside `code` is literal.
+        children = self._para_children(r"a `\*literal\*` b")
+        code_nodes = [c for c in children if c.get("type") == "inlineCode"]
+        assert len(code_nodes) == 1
+        assert code_nodes[0]["value"] == r"\*literal\*"
+
+    def test_code_span_ending_in_backslash_does_not_leak_sentinel(self):
+        # PR #101 re-review (holistic): a code span ending in `\` (e.g.
+        # `` `C:\` ``) used to leave the escape sentinel (U+FDD0)
+        # dangling in the captured content, leaking the noncharacter
+        # into output. The dangling sentinel now resolves to a literal
+        # backslash (CommonMark: backslash is literal inside code spans).
+        for src, expected_code in [
+            ("Use `C:\\` as root", "C:\\"),
+            ("regex `\\d+\\` here", "\\d+\\"),
+            ("a `b\\` c", "b\\"),
+        ]:
+            children = self._para_children(src)
+            code_nodes = [c for c in children if c.get("type") == "inlineCode"]
+            assert len(code_nodes) == 1, f"expected 1 code span in {src!r}"
+            assert code_nodes[0]["value"] == expected_code
+            # The sentinel codepoint must never reach output.
+            assert "﷐" not in code_nodes[0]["value"]
+
+    def test_escaped_backslash_followed_by_real_emphasis(self):
+        # PR #101 review #4 (chatgpt-codex P2): ``\\*foo*`` is literal
+        # backslash + italic. The fixed-width ``(?<!\\)`` lookbehind
+        # couldn't distinguish odd vs even backslash runs; the
+        # ``_protect_escapes`` pre-pass consumes the escape and lets the
+        # regex see a clean ``*foo*`` delimiter pair.
+        children = self._para_children("\\\\*real italic*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" in types, f"expected emphasis, got {types}"
+        # Literal backslash precedes the emphasis as a text node.
+        text_values = [c.get("value", "") for c in children if c.get("type") == "text"]
+        assert "\\" in text_values
+
+    def test_triple_backslash_before_star_is_fully_escaped(self):
+        # ``\\\*foo*`` = escaped backslash + escaped asterisk + ``foo*``.
+        # The leading two-char ``\\`` resolves to literal ``\`` and the
+        # next ``\*`` resolves to literal ``*``. The trailing ``*`` has
+        # no opener so there's no emphasis -- the result is the literal
+        # string `\*foo*` (1 backslash + asterisk + foo + asterisk).
+        children = self._para_children("\\\\\\*foo*")
+        assert children == [{"type": "text", "value": "\\*foo*"}]
+
+    def test_sentinel_codepoint_in_input_is_stripped(self):
+        # The escape sentinel is U+FDD0 (a Unicode noncharacter that
+        # should never appear in real text). Defense-in-depth: if an
+        # adversarial or malformed caller smuggles it in, it's stripped
+        # at the parser entry rather than being mistakenly paired with
+        # the following char as a fake escape sequence.
+        children = self._para_children("hello﷐world")
+        assert children == [{"type": "text", "value": "helloworld"}]
+        # And it doesn't break neighbouring real emphasis.
+        children = self._para_children("before﷐*real italic*")
+        types = [c.get("type") for c in children]
+        assert "emphasis" in types
+
+
+class TestTaskListItems:
+    """GFM task list checkbox extraction.
+
+    Maps ``- [ ] item`` / ``- [x] item`` to mdast ``listItem`` with a
+    ``checked`` attribute. Plain list items stay as before (no attr).
+    """
+
+    def _list(self, md):
+        ast = parse_markdown(md)
+        lists = [c for c in ast["children"] if c.get("type") == "list"]
+        assert len(lists) == 1
+        return lists[0]
+
+    def test_unchecked_task_item_sets_checked_false(self):
+        lst = self._list("- [ ] todo")
+        assert lst["children"][0]["checked"] is False
+
+    def test_checked_task_item_sets_checked_true(self):
+        lst = self._list("- [x] done")
+        assert lst["children"][0]["checked"] is True
+
+    def test_uppercase_x_also_counts_as_checked(self):
+        lst = self._list("- [X] done")
+        assert lst["children"][0]["checked"] is True
+
+    def test_plain_item_has_no_checked_attr(self):
+        lst = self._list("- regular item")
+        assert "checked" not in lst["children"][0]
+
+    def test_mixed_list_preserves_per_item_state(self):
+        lst = self._list("- [x] done\n- [ ] pending\n- regular")
+        items = lst["children"]
+        assert items[0]["checked"] is True
+        assert items[1]["checked"] is False
+        assert "checked" not in items[2]
+
+    def test_task_marker_strips_from_content(self):
+        lst = self._list("- [x] do the thing")
+        para = lst["children"][0]["children"][0]
+        # Content should be "do the thing", not "[x] do the thing".
+        text_concat = "".join(c.get("value", "") for c in para["children"])
+        assert text_concat == "do the thing"
+
+    def test_ordered_list_with_bracket_content_is_not_a_task(self):
+        # `1. [x] foo` should NOT be treated as a task -- task lists are
+        # a bullet-only convention in GFM.
+        ast = parse_markdown("1. [x] foo")
+        lst = ast["children"][0]
+        assert lst["type"] == "list" and lst["ordered"] is True
+        assert "checked" not in lst["children"][0]
+
+    def test_empty_unchecked_task_item_no_content(self):
+        # `- [ ]` with no trailing whitespace or content should still
+        # produce a checked listItem (PR #101 review finding).
+        lst = self._list("- [ ]")
+        assert lst["children"][0]["checked"] is False
+        assert lst["children"][0]["children"] == []
+
+    def test_empty_checked_task_item_no_content(self):
+        lst = self._list("- [x]")
+        assert lst["children"][0]["checked"] is True
+        assert lst["children"][0]["children"] == []
+
+    def test_task_item_with_only_nested_list_keeps_parent_prefix(self):
+        # PR #101 review #2: when a task item's only children are a
+        # nested list, stringify must still emit the parent prefix line
+        # (with task marker) before recursing -- otherwise the parent
+        # disappears entirely and re-parse loses the list structure.
+        src = "- [ ]\n  - child"
+        ast = parse_markdown(src)
+        out = stringify_markdown(ast)
+        # The parent task item must appear with its checkbox marker.
+        assert "[ ]" in out
+        # And the round-trip must preserve the structure.
+        ast2 = parse_markdown(out)
+        assert ast == ast2
+
+
+# ============================================================================
 # stringifyMarkdown Tests
 # ============================================================================
 
@@ -228,6 +442,123 @@ class TestStringifyMarkdown:
         result = stringify_markdown(ast)
         reparsed = parse_markdown(result)
         assert len(reparsed["children"]) == len(ast["children"])
+
+    def test_roundtrip_preserves_escaped_punctuation_in_text(self):
+        # PR #101 downstream review: text leaves carrying delimiter chars
+        # (post-unescape) must be re-escaped on stringify so re-parse
+        # doesn't form a new emphasis / link / strike node.
+        for src in [
+            r"Use \*literal\*",
+            r"see \[brackets\] here",
+            r"backtick \` literal",
+            r"\~\~not strike\~\~",
+            r"path with \\backslash",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"AST diverged after roundtrip on {src!r}"
+
+    def test_roundtrip_preserves_task_list_state(self):
+        # PR #101 downstream review: listItem.checked must be re-emitted
+        # so the checkbox isn't silently dropped on stringify.
+        for src in ["- [x] done", "- [ ] todo", "- [x] a\n- [ ] b\n- regular"]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"task-list AST diverged after roundtrip on {src!r}"
+
+    def test_roundtrip_preserves_empty_task_item(self):
+        ast = parse_markdown("- [ ]")
+        out = stringify_markdown(ast)
+        # The "[ ]" marker must survive the roundtrip
+        assert "[ ]" in out
+        ast2 = parse_markdown(out)
+        assert ast == ast2
+
+    def test_stringify_does_not_over_escape_ordinary_text(self):
+        # Only delimiter characters get backslash-prefixed; ordinary
+        # punctuation (periods, commas, !) stays clean.
+        ast = parse_markdown("Hello, world! It is fine.")
+        out = stringify_markdown(ast)
+        assert "\\" not in out
+
+    def test_roundtrip_preserves_escaped_block_markers_at_paragraph_start(self):
+        # Block-level constructs (heading, blockquote, list, thematic
+        # break, ordered list) only fire at line start. When the user
+        # writes `\#`, `\>`, `\-`, etc. at paragraph start, stringify
+        # must re-emit the backslash or re-parse promotes the paragraph
+        # into the corresponding block construct.
+        for src in [
+            r"\# not heading",
+            r"\> not quote",
+            r"\- not list",
+            r"\+ also not list",
+            r"1\. not ordered",
+            r"2\) other ordered",
+            r"\* not bullet",
+            r"\---",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"paragraph-start drift on {src!r}"
+
+    def test_stringify_does_not_over_escape_mid_text_block_markers(self):
+        # `#` / `>` / `-` / digits-with-dot are only block markers at
+        # line start. Mid-text they're literal -- shouldn't be escaped.
+        for src in [
+            "see > arrow operator",
+            "Step 1. Then 2. Then 3.",
+            "use - dash here",
+            "ordinary # hash inline",
+        ]:
+            out = stringify_markdown(parse_markdown(src))
+            assert "\\" not in out, f"over-escape on {src!r}: {out!r}"
+
+    def test_roundtrip_preserves_escaped_block_markers_after_soft_break(self):
+        # A paragraph text leaf can contain `\n` (from a soft break + a
+        # following line that doesn't qualify as a block construct
+        # because the marker was originally escaped). The line-2 marker
+        # also needs re-escaping or stringify drops it.
+        for src in [
+            "Here is a paragraph\n\\# 1 is not a heading",
+            "first line\n\\> not quote",
+            "line one\n\\- not list",
+            "alpha\n1\\. not ordered",
+            "alpha\n\\---",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"soft-break drift on {src!r}"
+
+    def test_roundtrip_preserves_list_item_continuation_indent(self):
+        # PR #101 adversarial review: a multi-line list item like
+        # `- item1\n  para2` (LLMs frequently emit wrapped bullets)
+        # parses to one list with one item containing one paragraph
+        # `item1\npara2`. The stringifier must indent the continuation
+        # line by 2 spaces or re-parse drops out of the list and
+        # produces `[list, paragraph]`.
+        for src in [
+            "- item1\n  para2",
+            "- a\n  b\n  c",
+            "- first wrapped\n  second line\n- second item",
+            "1. ordered\n   continuation",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"list-item continuation drift on {src!r}"
+
+    def test_roundtrip_preserves_hard_break_in_paragraph(self):
+        # PR #101 adversarial review: a `break` node (hard line break)
+        # previously stringified to a bare `\n`, which re-parses as a
+        # soft break -- collapsing `[text, break, text]` into a single
+        # text leaf with embedded `\n`. Must emit `"  \n"` per CommonMark.
+        ast = parse_markdown("Step  \nline2")
+        ast2 = parse_markdown(stringify_markdown(ast))
+        assert ast == ast2
+        # And the children should still include a `break` node, not
+        # just a single merged text leaf.
+        para = ast2["children"][0]
+        types = [c.get("type") for c in para["children"]]
+        assert "break" in types
 
 
 # ============================================================================
