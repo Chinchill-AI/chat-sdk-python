@@ -1569,8 +1569,7 @@ class Chat:
         if adapter is None:
             registered = sorted(self._adapters.keys())
             raise ChatError(
-                f'Adapter "{adapter_name}" not found for channel ID "{channel_id}" '
-                f"(registered adapters: {registered})"
+                f'Adapter "{adapter_name}" not found for channel ID "{channel_id}" (registered adapters: {registered})'
             )
         return ChannelImpl(
             _ChannelImplConfigWithAdapter(
@@ -1631,8 +1630,7 @@ class Chat:
         if adapter is None:
             registered = sorted(self._adapters.keys())
             raise ChatError(
-                f'Adapter "{adapter_name}" not found for thread ID "{thread_id}" '
-                f"(registered adapters: {registered})"
+                f'Adapter "{adapter_name}" not found for thread ID "{thread_id}" (registered adapters: {registered})'
             )
 
         # Defer to the adapter to derive channel_id as a secondary sanity
