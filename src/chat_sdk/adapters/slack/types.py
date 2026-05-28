@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, TypeAlias, TypedDict
+from typing import Any, Literal, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -44,6 +44,11 @@ SlackBotToken: TypeAlias = str | SlackBotTokenResolver
 #     injection — downstream parsing trusts the substituted body unconditionally.
 SlackWebhookVerifier = Callable[[Any, str], "bool | str | None | Awaitable[bool | str | None]"]
 
+# Connection mode for the Slack adapter. ``"webhook"`` (default) consumes
+# events via signed HTTP POSTs from Slack. ``"socket"`` opens a long-lived
+# WebSocket via Slack's Socket Mode and ACKs each event over the socket.
+SlackAdapterMode = Literal["webhook", "socket"]
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -53,6 +58,8 @@ SlackWebhookVerifier = Callable[[Any, str], "bool | str | None | Awaitable[bool 
 class SlackAdapterConfig:
     """Configuration for the Slack adapter."""
 
+    # App-level token (xapp-...). Required when ``mode == "socket"``.
+    app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.
     # May be a string, or a zero-arg callable returning ``str`` or ``Awaitable[str]``
     # (called on each use to support rotation or deferred resolution from a
@@ -72,10 +79,15 @@ class SlackAdapterConfig:
     installation_key_prefix: str = "slack:installation"
     # Logger instance for error reporting. Defaults to ConsoleLogger.
     logger: Logger | None = None
+    # Connection mode: ``"webhook"`` (default) or ``"socket"``. When set to
+    # ``"socket"`` the adapter opens a Slack Socket Mode WebSocket on
+    # ``initialize()`` and dispatches events over it. ``signing_secret`` is
+    # not required in socket mode (Slack does not sign socket events).
+    mode: SlackAdapterMode = "webhook"
     # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var,
     # *unless* ``webhook_verifier`` is provided — passing an explicit verifier opts
     # out of the env fallback so a deployment-set ``SLACK_SIGNING_SECRET`` can't
-    # silently shadow the verifier.
+    # silently shadow the verifier. Required in webhook mode; optional in socket mode.
     signing_secret: str | None = None
     # Custom webhook verifier. When provided, replaces the built-in HMAC + timestamp
     # check. See :data:`SlackWebhookVerifier` for the SECURITY contract — the
@@ -83,9 +95,20 @@ class SlackAdapterConfig:
     # When both ``signing_secret`` and ``webhook_verifier`` are set, ``signing_secret``
     # takes precedence.
     webhook_verifier: SlackWebhookVerifier | None = None
+    # Shared secret for authenticating events forwarded from a separate
+    # socket-mode listener via HTTP POST. Auto-detected from
+    # SLACK_SOCKET_FORWARDING_SECRET. Falls back to ``app_token`` if not set
+    # (matches upstream behavior; prefer setting this explicitly so the
+    # long-lived xapp- token isn't used as a bearer credential).
+    socket_forwarding_secret: str | None = None
     # Maximum number of cached AsyncWebClient instances (LRU-bounded).
     # Defaults to 100. Increase for large multi-workspace deployments.
     client_cache_max: int | None = None
+    # Maximum number of seconds to wait for the initial Socket Mode WebSocket
+    # handshake. If the slack_sdk ``connect()`` call hangs (e.g. Slack edge
+    # is degraded), ``start_socket_mode`` raises after this many seconds so
+    # ``initialize()`` doesn't block forever (hazard #11).
+    connect_timeout_s: float = 30.0
     # Override bot username (optional)
     user_name: str | None = None
 
