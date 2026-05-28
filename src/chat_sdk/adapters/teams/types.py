@@ -72,6 +72,17 @@ class TeamsAdapterConfig:
     logger: Logger | None = None
     # Override bot username (optional).
     user_name: str | None = None
+    # Minimum interval between native DM streaming activities, in
+    # milliseconds. Bot Framework's streaming endpoint is throttled to
+    # roughly 1 request/second; Microsoft recommends buffering tokens
+    # for 1.5-2 seconds to avoid 429s mid-response. We default to 1500ms
+    # per https://learn.microsoft.com/microsoftteams/platform/bots/streaming-ux.
+    # Chunks that arrive within this window after the previous emit are
+    # accumulated locally and shipped together on the next emit (or in
+    # the final ``message`` activity if the stream ends inside the
+    # window). A caller-supplied ``StreamOptions.update_interval_ms``
+    # overrides this default for a single stream.
+    native_stream_min_emit_interval_ms: int = 1500
 
 
 # =============================================================================
@@ -99,11 +110,37 @@ class TeamsThreadId:
 # =============================================================================
 
 
-class TeamsChannelContext(TypedDict):
-    """Teams channel context extracted from activity.channelData."""
+class TeamsChannelContext(TypedDict, total=False):
+    """Teams channel context extracted from activity.channelData.
+
+    The ``type`` discriminator is optional for backwards-compatibility:
+    cached entries written before vercel/chat#403 omit it, and downstream
+    code treats a missing ``type`` as ``"channel"``.
+    """
 
     channel_id: str
     team_id: str
+    type: str  # Literal["channel"] when present
+
+
+class TeamsDmContext(TypedDict):
+    """Teams DM context with the resolved Microsoft Graph chat ID.
+
+    Bot Framework hands out opaque DM conversation IDs (e.g.
+    ``a:1xWhatever``) which are *not* accepted by Graph's
+    ``/chats/{chat-id}/messages`` endpoint. The canonical Graph chat ID
+    for a 1:1 DM is ``19:{userAadId}_{botId}@unq.gbl.spaces`` — derive
+    and cache it from the incoming activity's ``from.aadObjectId``.
+    """
+
+    graph_chat_id: str
+    type: str  # Literal["dm"]
+
+
+# Discriminated union for Microsoft Graph API resolution context.
+# Group chats are not represented — their conversation ID works as-is
+# with Graph's chat endpoints.
+TeamsGraphContext = TeamsChannelContext | TeamsDmContext
 
 
 # =============================================================================
