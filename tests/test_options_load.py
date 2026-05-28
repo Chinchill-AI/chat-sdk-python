@@ -270,6 +270,222 @@ class TestSlackBlockSuggestion:
     # serverless runtime that rejects registration), the timeout branch
     # must still return the empty-options HTTP 200 fallback rather than
     # surfacing the exception to the webhook.
+    # TS: "handles block_suggestion with option_groups response"
+    # (vercel/chat#410, packages/adapter-slack/src/index.test.ts)
+    @pytest.mark.asyncio
+    async def test_handles_block_suggestion_with_option_groups_response(self):
+        chat = _make_mock_chat()
+        chat.process_options_load = AsyncMock(
+            return_value=[
+                {
+                    "label": "Recent",
+                    "options": [{"label": "Alice", "value": "u1"}],
+                },
+                {
+                    "label": "All",
+                    "options": [{"label": "Bob", "value": "u2"}],
+                },
+            ]
+        )
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+
+        assert response["status"] == 200
+        parsed = json.loads(response["body"])
+        assert parsed == {
+            "option_groups": [
+                {
+                    "label": {"type": "plain_text", "text": "Recent"},
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Alice"}, "value": "u1"},
+                    ],
+                },
+                {
+                    "label": {"type": "plain_text", "text": "All"},
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Bob"}, "value": "u2"},
+                    ],
+                },
+            ]
+        }
+
+    # Slack spec: option_groups and options are mutually exclusive in the
+    # response body. Verify the adapter never emits both.
+    @pytest.mark.asyncio
+    async def test_option_groups_and_options_are_mutually_exclusive(self):
+        chat = _make_mock_chat()
+        chat.process_options_load = AsyncMock(
+            return_value=[
+                {
+                    "label": "Recent",
+                    "options": [{"label": "Alice", "value": "u1"}],
+                },
+            ]
+        )
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+
+        parsed = json.loads(response["body"])
+        # Slack rejects payloads that include both. The adapter must pick one.
+        assert "option_groups" in parsed
+        assert "options" not in parsed
+
+    # Slack spec: group label is plain_text, max 75 chars.
+    @pytest.mark.asyncio
+    async def test_option_groups_label_truncated_to_75_chars(self):
+        chat = _make_mock_chat()
+        long_label = "x" * 200
+        chat.process_options_load = AsyncMock(
+            return_value=[
+                {
+                    "label": long_label,
+                    "options": [{"label": "A", "value": "a"}],
+                }
+            ]
+        )
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+
+        parsed = json.loads(response["body"])
+        assert parsed["option_groups"][0]["label"]["text"] == "x" * 75
+
+    # Slack spec: max 100 groups, max 100 options per group.
+    @pytest.mark.asyncio
+    async def test_option_groups_limits_to_100_groups_and_100_options(self):
+        chat = _make_mock_chat()
+        # 150 groups, each with 150 options — both should be capped to 100.
+        chat.process_options_load = AsyncMock(
+            return_value=[
+                {
+                    "label": f"Group {i}",
+                    "options": [{"label": f"opt-{i}-{j}", "value": f"v{i}-{j}"} for j in range(150)],
+                }
+                for i in range(150)
+            ]
+        )
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+        parsed = json.loads(response["body"])
+        assert len(parsed["option_groups"]) == 100
+        for group in parsed["option_groups"]:
+            assert len(group["options"]) == 100
+
+    # An empty list — common when a handler returns "no results" — must
+    # render as ``{"options": []}``, not ``{"option_groups": []}``. Detection
+    # must read the first element's shape, not just the outer container.
+    @pytest.mark.asyncio
+    async def test_empty_result_renders_as_options_not_groups(self):
+        chat = _make_mock_chat()
+        chat.process_options_load = AsyncMock(return_value=[])
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+
+        parsed = json.loads(response["body"])
+        assert parsed == {"options": []}
+
+    # Per-option ``description`` should round-trip through both flat and
+    # grouped result shapes (covers the shared selectOptionToSlackOption
+    # helper extracted in vercel/chat#410).
+    @pytest.mark.asyncio
+    async def test_grouped_options_include_description(self):
+        chat = _make_mock_chat()
+        chat.process_options_load = AsyncMock(
+            return_value=[
+                {
+                    "label": "Recent",
+                    "options": [
+                        {"label": "Alice", "value": "u1", "description": "Engineering"},
+                    ],
+                },
+            ]
+        )
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret", bot_token="xoxb-test"))
+        await adapter.initialize(chat)
+
+        payload = {
+            "type": "block_suggestion",
+            "team": {"id": "T123"},
+            "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+            "action_id": "user_select",
+            "block_id": "user_block",
+            "value": "",
+        }
+        req = _make_interactive_request(payload)
+
+        response = await adapter.handle_webhook(req)
+        parsed = json.loads(response["body"])
+        assert parsed["option_groups"][0]["options"][0] == {
+            "text": {"type": "plain_text", "text": "Alice"},
+            "value": "u1",
+            "description": {"type": "plain_text", "text": "Engineering"},
+        }
+
     @pytest.mark.asyncio
     async def test_timeout_falls_back_when_wait_until_raises(self):
         from chat_sdk.types import WebhookOptions

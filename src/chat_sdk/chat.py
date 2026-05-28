@@ -21,7 +21,6 @@ from typing import Any
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.modals import SelectOptionElement
 from chat_sdk.thread import (
     ThreadImpl,
     _active_chat,
@@ -56,6 +55,7 @@ from chat_sdk.types import (
     ModalSubmitEvent,
     OnLockConflict,
     OptionsLoadEvent,
+    OptionsLoadResult,
     QueueEntry,
     ReactionEvent,
     SlashCommandEvent,
@@ -87,7 +87,7 @@ ReactionHandler = Callable[[ReactionEvent], Any]
 ActionHandler = Callable[[ActionEvent], Any]
 OptionsLoadHandler = Callable[
     [OptionsLoadEvent],
-    Awaitable[list[SelectOptionElement] | None] | list[SelectOptionElement] | None,
+    Awaitable[OptionsLoadResult | None] | OptionsLoadResult | None,
 ]
 ModalSubmitHandler = Callable[[ModalSubmitEvent], Any]
 ModalCloseHandler = Callable[[ModalCloseEvent], Any]
@@ -953,7 +953,7 @@ class Chat:
         self,
         event: OptionsLoadEvent,
         options: WebhookOptions | None = None,  # noqa: ARG002 (match upstream signature)
-    ) -> list[SelectOptionElement] | None:
+    ) -> OptionsLoadResult | None:
         """Process an options-load event (external-select suggestion lookup).
 
         Runs specific-action-ID handlers before catch-all handlers and returns

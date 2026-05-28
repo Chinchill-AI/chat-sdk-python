@@ -52,8 +52,35 @@ class RadioSelectElement(TypedDict, total=False):
     optional: bool
 
 
+class OptionsLoadGroup(TypedDict):
+    """A labeled group of options returned by an ``onOptionsLoad`` handler.
+
+    Maps to upstream TS ``OptionsLoadGroup``. Slack ``external_select`` renders
+    grouped results as ``option_groups`` (mutually exclusive with top-level
+    ``options`` per Slack's spec).
+    """
+
+    label: str
+    options: list[SelectOptionElement]
+
+
+class ExternalSelectElement(TypedDict, total=False):
+    """External select form element (loads options dynamically from a handler)."""
+
+    type: str  # "external_select"
+    id: str
+    label: str
+    placeholder: str
+    min_query_length: int
+    optional: bool
+    # Pre-selected option when the modal opens (must match an option returned
+    # by the loader). Unlike static :class:`SelectElement`, the initial value
+    # is the full ``{label, value}`` object since the loader has not run yet.
+    initial_option: SelectOptionElement
+
+
 # Union of all modal child types
-ModalChild = TextInputElement | SelectElement | RadioSelectElement | TextElement | FieldsElement
+ModalChild = TextInputElement | SelectElement | ExternalSelectElement | RadioSelectElement | TextElement | FieldsElement
 
 
 class ModalElement(TypedDict, total=False):
@@ -69,7 +96,7 @@ class ModalElement(TypedDict, total=False):
     children: list[ModalChild]
 
 
-VALID_MODAL_CHILD_TYPES = {"text_input", "select", "radio_select", "text", "fields"}
+VALID_MODAL_CHILD_TYPES = {"text_input", "select", "external_select", "radio_select", "text", "fields"}
 
 
 def is_modal_element(value: Any) -> bool:
@@ -180,6 +207,38 @@ def Select(
     return result
 
 
+def ExternalSelect(
+    *,
+    id: str,
+    label: str,
+    placeholder: str | None = None,
+    min_query_length: int | None = None,
+    optional: bool | None = None,
+    initial_option: SelectOptionElement | None = None,
+) -> ExternalSelectElement:
+    """Build an :class:`ExternalSelectElement` dict.
+
+    Slack-only: renders to a Block Kit ``external_select`` element whose
+    options are populated by an :func:`Chat.on_options_load` handler at
+    runtime. ``initial_option`` is the full ``{label, value}`` object (the
+    loader hasn't run yet so just a value string would be ambiguous).
+    """
+    result: ExternalSelectElement = {
+        "type": "external_select",
+        "id": id,
+        "label": label,
+    }
+    if placeholder is not None:
+        result["placeholder"] = placeholder
+    if min_query_length is not None:
+        result["min_query_length"] = min_query_length
+    if optional is not None:
+        result["optional"] = optional
+    if initial_option is not None:
+        result["initial_option"] = initial_option
+    return result
+
+
 def SelectOption(
     *,
     label: str,
@@ -227,5 +286,6 @@ def RadioSelect(
 modal = Modal
 text_input = TextInput
 select = Select
+external_select = ExternalSelect
 select_option = SelectOption
 radio_select = RadioSelect
