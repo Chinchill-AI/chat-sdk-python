@@ -302,6 +302,14 @@ def _restore_escapes_as_literal_pair(text: str) -> str:
 # that escaped ``\]`` / ``\[`` inside link text don't prematurely
 # terminate the match -- the alternation consumes a ``<SENTINEL>X``
 # pair as a single unit.
+#
+# Performance note: the alternation makes the link / image content
+# match O(n^2) on adversarial inputs with many unclosed ``[`` (e.g.
+# 5000 unclosed brackets -> ~1-2s parse). Typical chat content has a
+# handful of brackets so this is sub-millisecond in practice. If a
+# future surface ever feeds untrusted markdown with adversarial
+# bracket counts, switch to a character-level walker for link/image
+# content (the rest of `_parse_inline` is bounded by message size).
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
     ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
@@ -840,7 +848,9 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
         return _escape_text_leaf(node.get("value", ""))
 
     if node_type == "break":
-        return "\n"
+        # Hard line break in CommonMark is two trailing spaces + newline.
+        # Emitting just `\n` would degrade to a soft break on re-parse.
+        return "  \n"
 
     if node_type == "paragraph":
         children = node.get("children", [])
@@ -932,11 +942,20 @@ def _stringify_node(node: Content, *, emphasis: str = "*", bullet: str = "*") ->
                             lines.append(f"  {nl}")
                 else:
                     text = _stringify_node(child, emphasis=emphasis, bullet=bullet) or ""
+                    # A paragraph's stringified text may contain `\n` from
+                    # soft breaks or hard breaks. Continuation lines must
+                    # be indented by 2 spaces so the round-trip stays
+                    # inside the list item rather than splitting back out
+                    # to a sibling paragraph.
+                    text_lines = text.split("\n")
                     if not prefix_emitted:
-                        lines.append(f"{prefix} {task_marker}{text}")
+                        lines.append(f"{prefix} {task_marker}{text_lines[0]}")
+                        for cont in text_lines[1:]:
+                            lines.append(f"  {cont}" if cont else "")
                         prefix_emitted = True
                     else:
-                        lines.append(f"  {text}")
+                        for cont in text_lines:
+                            lines.append(f"  {cont}" if cont else "")
         return "\n".join(lines)
 
     if node_type == "listItem":

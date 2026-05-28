@@ -529,6 +529,37 @@ class TestStringifyMarkdown:
             ast2 = parse_markdown(stringify_markdown(ast))
             assert ast == ast2, f"soft-break drift on {src!r}"
 
+    def test_roundtrip_preserves_list_item_continuation_indent(self):
+        # PR #101 adversarial review: a multi-line list item like
+        # `- item1\n  para2` (LLMs frequently emit wrapped bullets)
+        # parses to one list with one item containing one paragraph
+        # `item1\npara2`. The stringifier must indent the continuation
+        # line by 2 spaces or re-parse drops out of the list and
+        # produces `[list, paragraph]`.
+        for src in [
+            "- item1\n  para2",
+            "- a\n  b\n  c",
+            "- first wrapped\n  second line\n- second item",
+            "1. ordered\n   continuation",
+        ]:
+            ast = parse_markdown(src)
+            ast2 = parse_markdown(stringify_markdown(ast))
+            assert ast == ast2, f"list-item continuation drift on {src!r}"
+
+    def test_roundtrip_preserves_hard_break_in_paragraph(self):
+        # PR #101 adversarial review: a `break` node (hard line break)
+        # previously stringified to a bare `\n`, which re-parses as a
+        # soft break -- collapsing `[text, break, text]` into a single
+        # text leaf with embedded `\n`. Must emit `"  \n"` per CommonMark.
+        ast = parse_markdown("Step  \nline2")
+        ast2 = parse_markdown(stringify_markdown(ast))
+        assert ast == ast2
+        # And the children should still include a `break` node, not
+        # just a single merged text leaf.
+        para = ast2["children"][0]
+        types = [c.get("type") for c in para["children"]]
+        assert "break" in types
+
 
 # ============================================================================
 # toPlainText Tests
