@@ -988,10 +988,7 @@ class TestStream:
         )
 
         assert result.id == "666.666"
-        appended_text = "".join(
-            call.kwargs.get("markdown_text", "")
-            for call in mock_streamer.append.call_args_list
-        )
+        appended_text = "".join(call.kwargs.get("markdown_text", "") for call in mock_streamer.append.call_args_list)
         assert "Hello world" in appended_text, (
             "dict markdown_text chunks were not routed through the "
             f"markdown renderer; streamer.append received {appended_text!r}"
@@ -1032,22 +1029,13 @@ class TestStream:
         )
 
         assert result.id == "555.555"
-        structured_calls = [
-            call for call in mock_streamer.append.call_args_list
-            if "chunks" in call.kwargs
-        ]
+        structured_calls = [call for call in mock_streamer.append.call_args_list if "chunks" in call.kwargs]
         assert structured_calls, (
-            "dict-shaped task_update chunks were not forwarded as "
-            "structured chunks to streamer.append(chunks=...)"
+            "dict-shaped task_update chunks were not forwarded as structured chunks to streamer.append(chunks=...)"
         )
-        all_forwarded_chunks = [
-            chunk
-            for call in structured_calls
-            for chunk in call.kwargs["chunks"]
-        ]
+        all_forwarded_chunks = [chunk for call in structured_calls for chunk in call.kwargs["chunks"]]
         assert any(c.get("type") == "task_update" for c in all_forwarded_chunks), (
-            "no forwarded chunk had type=task_update; got: "
-            f"{all_forwarded_chunks!r}"
+            f"no forwarded chunk had type=task_update; got: {all_forwarded_chunks!r}"
         )
 
     @pytest.mark.asyncio
