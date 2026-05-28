@@ -67,9 +67,12 @@ from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import ConsoleLogger, Logger, LogLevel
 from chat_sdk.message_history import MessageHistoryCache, MessageHistoryConfig
 from chat_sdk.modals import (
+    ExternalSelect,
+    ExternalSelectElement,
     Modal,
     ModalChild,
     ModalElement,
+    OptionsLoadGroup,
     RadioSelect,
     RadioSelectElement,
     Select,
@@ -78,6 +81,7 @@ from chat_sdk.modals import (
     SelectOptionElement,
     TextInput,
     TextInputElement,
+    external_select,
     filter_modal_children,
     is_modal_element,
     modal,
@@ -158,6 +162,7 @@ from chat_sdk.types import (
     ModalResponse,
     ModalSubmitEvent,
     OptionsLoadEvent,
+    OptionsLoadResult,
     PlanUpdateChunk,
     Postable,
     PostableAst,
@@ -186,7 +191,7 @@ from chat_sdk.types import (
 )
 
 # The upstream Vercel Chat version this release is synced to.
-UPSTREAM_PARITY = "4.26.0"
+UPSTREAM_PARITY = "4.27.0"
 
 __all__ = [
     "UPSTREAM_PARITY",
@@ -297,6 +302,7 @@ __all__ = [
     "MessageHistoryCache",
     "MessageHistoryConfig",
     # Modal builders (PascalCase primary — matches source TS SDK)
+    "ExternalSelect",
     "Modal",
     "RadioSelect",
     "Select",
@@ -306,11 +312,14 @@ __all__ = [
     "modal",
     "text_input",
     "select",
+    "external_select",
     "select_option",
     "radio_select",
     # Modal types
+    "ExternalSelectElement",
     "ModalChild",
     "ModalElement",
+    "OptionsLoadGroup",
     "RadioSelectElement",
     "SelectElement",
     "SelectOptionElement",
@@ -364,6 +373,7 @@ __all__ = [
     "ModalSubmitEvent",
     "OptionsLoadEvent",
     "OptionsLoadHandler",
+    "OptionsLoadResult",
     "PlanUpdateChunk",
     "Postable",
     "PostableAst",

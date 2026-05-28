@@ -10,6 +10,7 @@ import warnings
 import pytest
 
 from chat_sdk.modals import (
+    ExternalSelect,
     Modal,
     RadioSelect,
     Select,
@@ -182,6 +183,58 @@ class TestSelectBuilder:
 
 
 # ---------------------------------------------------------------------------
+# ExternalSelect builder
+# ---------------------------------------------------------------------------
+
+
+class TestExternalSelectBuilder:
+    # TS: "should create with required fields"
+    def test_create_with_required_fields(self):
+        es = ExternalSelect(id="person", label="Person")
+        assert es["type"] == "external_select"
+        assert es["id"] == "person"
+        assert es["label"] == "Person"
+
+    # TS: "should include optional fields"
+    def test_include_optional_fields(self):
+        es = ExternalSelect(
+            id="person",
+            label="Person",
+            placeholder="Search people",
+            min_query_length=1,
+            optional=True,
+        )
+        assert es["placeholder"] == "Search people"
+        assert es["min_query_length"] == 1
+        assert es["optional"] is True
+
+    def test_external_select_with_initial_option(self):
+        # Port of vercel/chat#410: ExternalSelect supports initialOption.
+        es = ExternalSelect(
+            id="person",
+            label="Person",
+            initial_option={"label": "Alice", "value": "u1"},
+        )
+        assert es["initial_option"] == {"label": "Alice", "value": "u1"}
+
+    def test_external_select_omits_unset_fields(self):
+        # Hazard #7: omitted vs None — unset optional fields must not be
+        # serialized as ``"key": None``. When initial_option is None it
+        # must be absent from the dict.
+        es = ExternalSelect(id="person", label="Person")
+        assert "placeholder" not in es
+        assert "min_query_length" not in es
+        assert "optional" not in es
+        assert "initial_option" not in es
+
+    def test_min_query_length_zero_preserved(self):
+        # Hazard #1: 0 is a meaningful Slack value ("fire on every keystroke")
+        # and must not be silently dropped by an ``or`` truthiness fallback.
+        es = ExternalSelect(id="person", label="Person", min_query_length=0)
+        assert es["min_query_length"] == 0
+
+
+# ---------------------------------------------------------------------------
 # RadioSelect builder
 # ---------------------------------------------------------------------------
 
@@ -252,12 +305,13 @@ class TestFilterModalChildren:
         children = [
             {"type": "text_input", "id": "a", "label": "A"},
             {"type": "select", "id": "b", "label": "B", "options": []},
+            {"type": "external_select", "id": "x", "label": "X"},
             {"type": "radio_select", "id": "c", "label": "C", "options": []},
             {"type": "text", "content": "hello"},
             {"type": "fields", "items": []},
         ]
         result = filter_modal_children(children)
-        assert len(result) == 5
+        assert len(result) == 6
 
     def test_filters_out_invalid_types(self):
         children = [
