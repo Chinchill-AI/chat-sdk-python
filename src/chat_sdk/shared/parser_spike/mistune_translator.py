@@ -53,8 +53,20 @@ _MD = mistune.create_markdown(
 def parse_markdown(text: str) -> Root:
     """Parse *text* and return an mdast-compatible root node."""
     tokens, _state = _MD.parse(text)
-    children = [_translate_block(tok) for tok in tokens]
-    return make_root([c for c in children if c is not None])
+    # mistune's parse() return-type is `list[dict | str]` -- a bare str
+    # token is the rare lazy-text node that the public API stringifies
+    # directly. Narrow to dicts for the structural walker; lift any
+    # bare-string tokens into paragraph(text(...)) so they're not lost.
+    children: list[Content] = []
+    for tok in tokens:
+        if isinstance(tok, str):
+            if tok:
+                children.append(make_paragraph([make_text(tok)]))
+            continue
+        translated = _translate_block(tok)
+        if translated is not None:
+            children.append(translated)
+    return make_root(children)
 
 
 def _translate_block(tok: dict[str, Any]) -> Content | None:

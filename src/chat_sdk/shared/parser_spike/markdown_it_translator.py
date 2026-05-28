@@ -220,7 +220,8 @@ def _translate_inline(tokens: list[Token]) -> list[Content]:
         elif t == "link_open":
             attrs = tok.attrs or {}
             href = str(attrs.get("href", ""))
-            title = attrs.get("title")
+            raw_title = attrs.get("title")
+            title: str | None = str(raw_title) if raw_title is not None else None
             link_children: list[Content] = []
             stack.append((current, (href, title)))
             current = link_children
@@ -233,7 +234,8 @@ def _translate_inline(tokens: list[Token]) -> list[Content]:
         elif t == "image":
             attrs = tok.attrs or {}
             url = attrs.get("src", "")
-            title = attrs.get("title")
+            raw_title = attrs.get("title")
+            title = str(raw_title) if raw_title is not None else None
             alt = tok.content  # markdown-it precomputes alt text
             current.append(make_image(str(url), alt=alt, title=title))
         elif t == "html_inline":
