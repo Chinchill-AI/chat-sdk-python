@@ -197,7 +197,12 @@ class TestSocketModeConfig:
         # satisfied by SLACK_SIGNING_SECRET in the dev shell.
         prev = os.environ.pop("SLACK_SIGNING_SECRET", None)
         try:
-            with pytest.raises(ValidationError, match="signingSecret is required"):
+            # PR #87 widened the message to "signingSecret or webhookVerifier
+            # is required" once a custom verifier became a valid alternative
+            # to the env-configured signing secret. The spirit of the check
+            # — webhook mode without any verification mechanism is rejected —
+            # is unchanged.
+            with pytest.raises(ValidationError, match="signingSecret"):
                 SlackAdapter(SlackAdapterConfig(bot_token="xoxb-test"))
         finally:
             if prev is not None:
