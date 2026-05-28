@@ -4,9 +4,27 @@ Automated reviewers (Codex, CodeRabbit, CI linters) catch bugs not because
 they're smarter than humans or agents, but because they apply adversarial
 checks consistently on every diff. Self-review tends to verify happy paths
 and ship. This doc is the set of adversarial checks to run against your own
-code *before* declaring a change ready.
+code *before opening the PR* — so that what bots would flag in rounds 2–5
+is caught in commit 1 instead.
 
 ## When to apply
+
+### Timing
+
+**Run self-review BEFORE opening the PR, not after bots converge.**
+
+Self-review is cheap (~5 minutes per PR). Bot review is expensive
+(~1–2 hours per round, often 3–5 rounds before convergence). Running
+self-review first catches what the bots would eventually flag, in the
+original commit — eliminating most of the review-loop cost.
+
+If the temptation is "let bots find issues so I don't have to," re-read
+the [Review-Loop Discipline](UPSTREAM_SYNC.md#review-loop-discipline)
+section. The economics never favor that approach: one round of bot wait +
+triage + fix + push costs more than the self-review that would have
+pre-empted it.
+
+### Triggers
 
 Any change that introduces novel logic — especially:
 

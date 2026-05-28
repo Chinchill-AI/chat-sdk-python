@@ -188,14 +188,27 @@ class TestGitHubAdapterConstructor:
         assert a.is_multi_tenant is False
 
     def test_throws_when_no_auth(self):
-        with pytest.raises(ValidationError, match="Authentication"):
-            GitHubAdapter(
-                {
-                    "webhook_secret": "secret",
-                    "user_name": "bot",
-                    "logger": ConsoleLogger("error"),
-                }
-            )
+        # Clear env vars so the constructor's env-fallback path can't
+        # silently satisfy auth from a GITHUB_TOKEN injected by CI / dev shell.
+        old_token = os.environ.pop("GITHUB_TOKEN", None)
+        old_app = os.environ.pop("GITHUB_APP_ID", None)
+        old_key = os.environ.pop("GITHUB_PRIVATE_KEY", None)
+        try:
+            with pytest.raises(ValidationError, match="Authentication"):
+                GitHubAdapter(
+                    {
+                        "webhook_secret": "secret",
+                        "user_name": "bot",
+                        "logger": ConsoleLogger("error"),
+                    }
+                )
+        finally:
+            if old_token is not None:
+                os.environ["GITHUB_TOKEN"] = old_token
+            if old_app is not None:
+                os.environ["GITHUB_APP_ID"] = old_app
+            if old_key is not None:
+                os.environ["GITHUB_PRIVATE_KEY"] = old_key
 
     def test_bot_user_id_when_set(self):
         a = _make_adapter(bot_user_id=42)
