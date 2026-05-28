@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from chat_sdk.adapters.google_chat.format_converter import GoogleChatFormatConverter
 from chat_sdk.cards import (
     CardChild,
     CardElement,
@@ -18,9 +19,17 @@ from chat_sdk.cards import (
 )
 from chat_sdk.shared import card_to_fallback_text as shared_card_to_fallback_text
 from chat_sdk.shared import create_emoji_converter
+from chat_sdk.shared.base_format_converter import parse_markdown
 
 # Convert emoji placeholders in text to GChat format (Unicode).
 convert_emoji = create_emoji_converter("gchat")
+
+_gchat_converter = GoogleChatFormatConverter()
+
+
+def _render_markdown_as_gchat(text: str) -> str:
+    """Parse standard markdown and render as Google Chat formatted text."""
+    return _gchat_converter.from_ast(parse_markdown(text))
 
 
 def card_to_google_card(
@@ -148,25 +157,13 @@ def _convert_child_to_widgets(
         return []
 
 
-def _markdown_to_gchat(text: str) -> str:
-    """Convert standard Markdown formatting to Google Chat formatting.
-
-    **bold** -> *bold*
-    """
-    import re
-
-    return re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
-
-
 def _convert_text_to_widget(element: dict[str, Any]) -> dict[str, Any]:
     """Convert a text element to a widget."""
-    text = _markdown_to_gchat(convert_emoji(element.get("content", "")))
+    text = _render_markdown_as_gchat(convert_emoji(element.get("content", "")))
 
-    style = element.get("style")
-    if style == "bold":
+    if element.get("style") == "bold":
         text = f"*{text}*"
-    elif style == "muted":
-        # GChat doesn't have muted, use regular text
+    elif element.get("style") == "muted":
         text = convert_emoji(element.get("content", ""))
 
     return {"textParagraph": {"text": text}}
@@ -302,8 +299,8 @@ def _convert_fields_to_widgets(
     return [
         {
             "decoratedText": {
-                "topLabel": _markdown_to_gchat(convert_emoji(field.get("label", ""))),
-                "text": _markdown_to_gchat(convert_emoji(field.get("value", ""))),
+                "topLabel": _render_markdown_as_gchat(convert_emoji(field.get("label", ""))),
+                "text": _render_markdown_as_gchat(convert_emoji(field.get("value", ""))),
             },
         }
         for field in element.get("children", [])

@@ -14,6 +14,7 @@ from chat_sdk.adapters.slack.modals import (
     modal_to_slack_view,
 )
 from chat_sdk.modals import (
+    ExternalSelectElement,
     ModalElement,
     RadioSelectElement,
     SelectElement,
@@ -115,6 +116,27 @@ def _option(*, label: str, value: str, description: str | None = None) -> Select
     if description:
         opt["description"] = description
     return opt
+
+
+def _external_select(
+    *,
+    id: str,
+    label: str,
+    placeholder: str | None = None,
+    min_query_length: int | None = None,
+    optional: bool = False,
+    initial_option: SelectOptionElement | None = None,
+) -> ExternalSelectElement:
+    el: ExternalSelectElement = {"type": "external_select", "id": id, "label": label}
+    if placeholder:
+        el["placeholder"] = placeholder
+    if min_query_length is not None:
+        el["min_query_length"] = min_query_length
+    if optional:
+        el["optional"] = True
+    if initial_option is not None:
+        el["initial_option"] = initial_option
+    return el
 
 
 # ---------------------------------------------------------------------------
@@ -479,3 +501,142 @@ class TestModalSelectDescriptions:
         el = view["blocks"][0]["element"]
         assert el["options"][0]["description"] == {"type": "mrkdwn", "text": "For *individuals*"}
         assert el["options"][1]["description"] == {"type": "mrkdwn", "text": "For _teams_"}
+
+
+# ---------------------------------------------------------------------------
+# ExternalSelect in modals
+#
+# Ports the two upstream tests in
+# packages/adapter-slack/src/modals.test.ts (vercel/chat#397, #410):
+#   - "converts external select with placeholder and min query length"
+#   - "converts external select with initialOption"
+# Plus Python-specific coverage for the omit-None hazard (#7) and the
+# 0-as-min-query-length truthiness hazard (#1).
+# ---------------------------------------------------------------------------
+
+
+class TestModalExternalSelect:
+    # TS: "converts external select with placeholder and min query length"
+    def test_converts_external_select_with_placeholder_and_min_query_length(self):
+        modal = _modal(
+            children=[
+                _external_select(
+                    id="person",
+                    label="Person",
+                    placeholder="Search people",
+                    min_query_length=1,
+                ),
+            ]
+        )
+        view = modal_to_slack_view(modal)
+        block = view["blocks"][0]
+        assert block["type"] == "input"
+        assert block["block_id"] == "person"
+        assert block["label"] == {"type": "plain_text", "text": "Person"}
+        el = block["element"]
+        assert el["type"] == "external_select"
+        assert el["action_id"] == "person"
+        assert el["placeholder"] == {"type": "plain_text", "text": "Search people"}
+        assert el["min_query_length"] == 1
+
+    # TS: "converts external select with initialOption"
+    def test_converts_external_select_with_initial_option(self):
+        modal = _modal(
+            children=[
+                _external_select(
+                    id="person",
+                    label="Person",
+                    initial_option={"label": "Alice", "value": "u1"},
+                ),
+            ]
+        )
+        view = modal_to_slack_view(modal)
+        block = view["blocks"][0]
+        assert block["type"] == "input"
+        assert block["block_id"] == "person"
+        el = block["element"]
+        assert el["type"] == "external_select"
+        assert el["action_id"] == "person"
+        assert el["initial_option"] == {
+            "text": {"type": "plain_text", "text": "Alice"},
+            "value": "u1",
+        }
+
+    def test_external_select_omits_initial_option_when_unset(self):
+        # Hazard #7: when initial_option is unset, the rendered Block Kit
+        # element must not contain the key at all (Slack treats null
+        # differently than missing).
+        modal = _modal(children=[_external_select(id="person", label="Person")])
+        view = modal_to_slack_view(modal)
+        el = view["blocks"][0]["element"]
+        assert "initial_option" not in el
+        assert "placeholder" not in el
+        assert "min_query_length" not in el
+
+    def test_external_select_initial_option_empty_dict_renders(self):
+        """A hand-built ``initial_option={}`` must round-trip, not silently drop.
+
+        What to fix if this fails: in
+        ``src/chat_sdk/adapters/slack/modals.py``,
+        ``_external_select_to_block`` must guard with ``initial_option is not None``,
+        not the truthiness check ``if initial_option:``. The TS expression
+        ``if (select.initialOption)`` only filters null/undefined; an empty
+        object literal is truthy in JS but ``{}`` is falsy in Python.
+        Without ``is not None``, hand-constructed empty dicts disappear from
+        the rendered Block Kit.
+        """
+        external_select_dict = {
+            "type": "external_select",
+            "id": "person",
+            "label": "Person",
+            "initial_option": {},  # hand-built empty dict
+        }
+        modal = _modal(children=[external_select_dict])
+        view = modal_to_slack_view(modal)
+        el = view["blocks"][0]["element"]
+        assert "initial_option" in el, (
+            "_external_select_to_block dropped initial_option={}; use 'is not None' instead of truthiness in modals.py"
+        )
+        # Renders with empty label/value (since the input is empty), but
+        # the element is present — that's the parity guarantee we want.
+        assert el["initial_option"] == {
+            "text": {"type": "plain_text", "text": ""},
+            "value": "",
+        }
+
+    def test_external_select_min_query_length_zero_preserved(self):
+        # Hazard #1: a min_query_length of 0 is meaningful (fire on every
+        # keystroke). It must not be silently omitted by a truthiness check.
+        modal = _modal(children=[_external_select(id="person", label="Person", min_query_length=0)])
+        view = modal_to_slack_view(modal)
+        el = view["blocks"][0]["element"]
+        assert el["min_query_length"] == 0
+
+    def test_external_select_initial_option_with_description(self):
+        # The full SelectOptionElement shape (including description) should
+        # round-trip into the rendered initial_option.
+        modal = _modal(
+            children=[
+                _external_select(
+                    id="person",
+                    label="Person",
+                    initial_option={
+                        "label": "Alice",
+                        "value": "u1",
+                        "description": "Engineering",
+                    },
+                ),
+            ]
+        )
+        view = modal_to_slack_view(modal)
+        el = view["blocks"][0]["element"]
+        assert el["initial_option"] == {
+            "text": {"type": "plain_text", "text": "Alice"},
+            "value": "u1",
+            "description": {"type": "plain_text", "text": "Engineering"},
+        }
+
+    def test_external_select_optional(self):
+        modal = _modal(children=[_external_select(id="person", label="Person", optional=True)])
+        view = modal_to_slack_view(modal)
+        assert view["blocks"][0]["optional"] is True
