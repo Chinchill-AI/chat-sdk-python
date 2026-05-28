@@ -59,6 +59,7 @@ from chat_sdk.types import (
     StreamChunk,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -152,6 +153,21 @@ class WhatsAppAdapter:
         self._chat = chat
         self._bot_user_id = self._phone_number_id
         self._logger.info("WhatsApp adapter initialized", {"phoneNumberId": self._phone_number_id})
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Not implemented — see docs/UPSTREAM_SYNC.md non-parity table.
+
+        WhatsApp Cloud API has no user lookup endpoint; the only stable
+        identifier is the phone number, and there's no equivalent of
+        ``users.info`` exposed to business apps. Raising
+        :class:`~chat_sdk.errors.ChatNotImplementedError` lets
+        :meth:`Chat.get_user` translate this into a ``"does not support
+        get_user"`` error rather than returning ``None`` (which would
+        falsely imply "user not found").
+        """
+        from chat_sdk.errors import ChatNotImplementedError
+
+        raise ChatNotImplementedError("whatsapp", "getUser")
 
     async def _get_http_session(self) -> Any:
         """Return the shared aiohttp session, creating it lazily if needed."""

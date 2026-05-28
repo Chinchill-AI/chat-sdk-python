@@ -26,6 +26,8 @@ class CachedUserInfo:
 
     display_name: str
     email: str | None = None
+    is_bot: bool | None = None
+    avatar_url: str | None = None
 
 
 class UserInfoCache:
@@ -50,12 +52,19 @@ class UserInfoCache:
         user_id: str,
         display_name: str,
         email: str | None = None,
+        is_bot: bool | None = None,
+        avatar_url: str | None = None,
     ) -> None:
         """Cache user info for later lookup."""
         if not display_name or display_name == "unknown":
             return
 
-        user_info = CachedUserInfo(display_name=display_name, email=email)
+        user_info = CachedUserInfo(
+            display_name=display_name,
+            email=email,
+            is_bot=is_bot,
+            avatar_url=avatar_url,
+        )
 
         # Always update in-memory cache
         self._in_memory_cache[user_id] = user_info
@@ -73,7 +82,12 @@ class UserInfoCache:
             cache_key = f"{USER_INFO_KEY_PREFIX}{user_id}"
             await self._state.set(
                 cache_key,
-                {"display_name": display_name, "email": email},
+                {
+                    "display_name": display_name,
+                    "email": email,
+                    "is_bot": is_bot,
+                    "avatar_url": avatar_url,
+                },
                 USER_INFO_CACHE_TTL_MS,
             )
 
@@ -96,12 +110,20 @@ class UserInfoCache:
 
         # Populate in-memory cache if found in state
         if from_state:
-            info = CachedUserInfo(
-                display_name=from_state.get("display_name", "unknown")
-                if isinstance(from_state, dict)
-                else getattr(from_state, "display_name", "unknown"),
-                email=from_state.get("email") if isinstance(from_state, dict) else getattr(from_state, "email", None),
-            )
+            if isinstance(from_state, dict):
+                info = CachedUserInfo(
+                    display_name=from_state.get("display_name", "unknown"),
+                    email=from_state.get("email"),
+                    is_bot=from_state.get("is_bot"),
+                    avatar_url=from_state.get("avatar_url"),
+                )
+            else:
+                info = CachedUserInfo(
+                    display_name=getattr(from_state, "display_name", "unknown"),
+                    email=getattr(from_state, "email", None),
+                    is_bot=getattr(from_state, "is_bot", None),
+                    avatar_url=getattr(from_state, "avatar_url", None),
+                )
             self._in_memory_cache[user_id] = info
             return info
 

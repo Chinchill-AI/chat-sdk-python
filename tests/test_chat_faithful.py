@@ -1473,6 +1473,331 @@ class TestOpenDM:
 
 
 # ============================================================================
+# 13b. getUser (vercel/chat#391)
+# ============================================================================
+
+
+class TestGetUser:
+    """describe("getUser") — chat.get_user(user_id) cross-platform user lookup."""
+
+    # TS: "should return user info from adapter"
+    async def test_should_return_user_info_from_adapter(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        chat, adapter, state = await _init_chat()
+        adapter.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="U123456",
+                user_name="alice",
+                full_name="Alice Smith",
+                email="alice@example.com",
+                avatar_url="https://example.com/alice.png",
+                is_bot=False,
+            )
+        )
+
+        user = await chat.get_user("U123456")
+        assert user is not None
+        assert user.email == "alice@example.com"
+        assert user.full_name == "Alice Smith"
+        adapter.get_user.assert_awaited_once_with("U123456")
+
+    # TS: "should accept Author object"
+    async def test_should_accept_author_object(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        chat, adapter, state = await _init_chat()
+        adapter.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="U789",
+                user_name="bob",
+                full_name="Bob Jones",
+                is_bot=False,
+            )
+        )
+
+        author = _make_author(user_id="U789", user_name="bob", full_name="Bob Jones")
+        user = await chat.get_user(author)
+        adapter.get_user.assert_awaited_once_with("U789")
+        assert user is not None
+        assert user.full_name == "Bob Jones"
+
+    # TS: "should throw when adapter does not support getUser"
+    async def test_should_throw_when_adapter_does_not_support_get_user(self):
+        chat, adapter, state = await _init_chat()
+        # MockAdapter.get_user raises ChatNotImplementedError by default
+        with pytest.raises(ChatError, match="does not support get_user"):
+            await chat.get_user("U123456")
+
+    # TS: "should return null when user is not found"
+    async def test_should_return_none_when_user_is_not_found(self):
+        from unittest.mock import AsyncMock
+
+        chat, adapter, state = await _init_chat()
+        adapter.get_user = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        user = await chat.get_user("U999999")
+        assert user is None
+
+    # TS: "should throw error for unknown userId format"
+    async def test_should_throw_error_for_unknown_userid_format(self):
+        chat, adapter, state = await _init_chat()
+        with pytest.raises(ChatError, match='Cannot infer adapter from userId "invalid-user-id"'):
+            await chat.get_user("invalid-user-id")
+
+    # TS: "should infer linear adapter from a UUID"
+    async def test_should_infer_linear_adapter_from_a_uuid(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        slack = create_mock_adapter("slack")
+        linear = create_mock_adapter("linear")
+        linear.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="8f1f3c7e-d4e1-4f9a-bf2b-1c3d4e5f6a7b",
+                user_name="ben",
+                full_name="Ben Sabic",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"slack": slack, "linear": linear})
+
+        user = await chat.get_user("8f1f3c7e-d4e1-4f9a-bf2b-1c3d4e5f6a7b")
+        assert user is not None
+        assert user.full_name == "Ben Sabic"
+        linear.get_user.assert_awaited_once_with("8f1f3c7e-d4e1-4f9a-bf2b-1c3d4e5f6a7b")
+
+    # TS: "should infer telegram from numeric id when only telegram is registered"
+    async def test_should_infer_telegram_from_numeric_id_when_only_telegram_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="987654321",
+                user_name="alice",
+                full_name="Alice",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"telegram": telegram})
+
+        user = await chat.get_user("987654321")
+        assert user is not None
+        assert user.user_name == "alice"
+        telegram.get_user.assert_awaited_once_with("987654321")
+
+    # TS: "should infer github from numeric id when only github is registered"
+    async def test_should_infer_github_from_numeric_id_when_only_github_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        github = create_mock_adapter("github")
+        github.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="12345",
+                user_name="octocat",
+                full_name="The Octocat",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"github": github})
+
+        user = await chat.get_user("12345")
+        assert user is not None
+        assert user.user_name == "octocat"
+
+    # TS: "should infer discord for 17-19 digit snowflake when only discord is registered"
+    async def test_should_infer_discord_for_snowflake_when_only_discord_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="discordbot",
+                full_name="Discord User",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"discord": discord})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.full_name == "Discord User"
+
+    # TS: "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"
+    # Python divergence: Discord snowflakes (17-19 digits) deterministically
+    # route to Discord when registered, so the remaining ambiguous case is
+    # Telegram + GitHub with a short numeric id outside the snowflake range.
+    async def test_should_throw_ambiguous_when_short_numeric_matches_telegram_and_github(self):
+        telegram = create_mock_adapter("telegram")
+        github = create_mock_adapter("github")
+        chat, _ = await _init_multi_chat({"telegram": telegram, "github": github})
+
+        # 10 digits — well below the 17-digit Discord snowflake floor.
+        with pytest.raises(ChatError, match="ambiguous"):
+            await chat.get_user("1234567890")
+
+    # Regression for PR #90 Codex P1 finding (discussion_r3284323050): a
+    # Discord snowflake must route to Discord even when Telegram is also
+    # registered. Before the fix, _infer_adapter_from_user_id treated every
+    # numeric id as a candidate for Telegram/GitHub regardless of length,
+    # which broke `get_user` and `open_dm` in Discord+Telegram deployments.
+    async def test_discord_snowflake_routes_to_discord_when_telegram_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="discordbot",
+                full_name="Discord User",
+                is_bot=False,
+            )
+        )
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(side_effect=AssertionError("Telegram should not be called"))  # type: ignore[method-assign]
+        chat, _ = await _init_multi_chat({"discord": discord, "telegram": telegram})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.full_name == "Discord User"
+        discord.get_user.assert_awaited_once_with("175928847299117063")
+        telegram.get_user.assert_not_called()
+
+    # Companion regression: when the numeric id is OUTSIDE the Discord
+    # snowflake range (e.g. 10 digits), Discord must not be a candidate;
+    # routing should fall through to Telegram unambiguously.
+    async def test_short_numeric_id_routes_to_telegram_when_discord_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(side_effect=AssertionError("Discord should not be called"))  # type: ignore[method-assign]
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="1234567890",
+                user_name="alice",
+                full_name="Alice",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"discord": discord, "telegram": telegram})
+
+        user = await chat.get_user("1234567890")
+        assert user is not None
+        assert user.user_name == "alice"
+        telegram.get_user.assert_awaited_once_with("1234567890")
+        discord.get_user.assert_not_called()
+
+    # Same Codex P1 case for the Discord + GitHub pairing — a snowflake
+    # must not be misrouted as a GitHub numeric account_id.
+    async def test_discord_snowflake_routes_to_discord_when_github_also_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        discord = create_mock_adapter("discord")
+        discord.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="discordbot",
+                full_name="Discord User",
+                is_bot=False,
+            )
+        )
+        github = create_mock_adapter("github")
+        github.get_user = AsyncMock(side_effect=AssertionError("GitHub should not be called"))  # type: ignore[method-assign]
+        chat, _ = await _init_multi_chat({"discord": discord, "github": github})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.full_name == "Discord User"
+        discord.get_user.assert_awaited_once_with("175928847299117063")
+        github.get_user.assert_not_called()
+
+    # Pin the reverse: when only Telegram is registered, an 18-digit id
+    # (within the Discord snowflake range) must still route to Telegram —
+    # the snowflake guard only kicks in when Discord is actually registered,
+    # so we don't accidentally over-restrict single-adapter deployments.
+    async def test_snowflake_length_id_routes_to_telegram_when_discord_not_registered(self):
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.types import UserInfo
+
+        telegram = create_mock_adapter("telegram")
+        telegram.get_user = AsyncMock(  # type: ignore[method-assign]
+            return_value=UserInfo(
+                user_id="175928847299117063",
+                user_name="alice",
+                full_name="Alice",
+                is_bot=False,
+            )
+        )
+        chat, _ = await _init_multi_chat({"telegram": telegram})
+
+        user = await chat.get_user("175928847299117063")
+        assert user is not None
+        assert user.user_name == "alice"
+        telegram.get_user.assert_awaited_once_with("175928847299117063")
+
+    # TS: "should not match GitHub-style logins as Slack ids (case sensitivity)"
+    async def test_should_not_match_github_style_logins_as_slack_ids(self):
+        slack = create_mock_adapter("slack")
+        github = create_mock_adapter("github")
+        chat, _ = await _init_multi_chat({"slack": slack, "github": github})
+
+        with pytest.raises(ChatError, match='Cannot infer adapter from userId "user123"'):
+            await chat.get_user("user123")
+
+    # Codex P2 (discussion_r3285678546): legacy adapters built before the
+    # ``Adapter.get_user`` Protocol method was added don't define
+    # ``get_user`` at all. Calling ``chat.get_user`` previously raised a
+    # raw ``AttributeError`` for these adapters, breaking the SDK's
+    # error contract. The fix translates the missing-method case to the
+    # same ``ChatError`` used for adapters that explicitly raise
+    # ``ChatNotImplementedError``.
+    async def test_legacy_adapter_without_get_user_raises_chat_error(self):
+        # Minimal legacy adapter — name "slack" so the existing
+        # ``SLACK_USER_ID_REGEX`` routes ``U123456`` to it. Crucially, no
+        # ``get_user`` attribute is defined anywhere on the instance or
+        # class chain, mirroring third-party adapters that predate the
+        # port. Without the fix, ``chat.get_user`` would surface a raw
+        # ``AttributeError`` rather than a translated ``ChatError``.
+        class _LegacyAdapter:
+            name = "slack"
+
+            async def initialize(self, chat: Any) -> None:
+                return None
+
+            async def handle_webhook(self, request: Any, options: Any = None) -> Any:
+                return None
+
+        legacy = _LegacyAdapter()
+        assert getattr(legacy, "get_user", None) is None
+
+        chat, _ = await _init_multi_chat({"slack": legacy})  # type: ignore[dict-item]
+
+        # AttributeError must NOT escape — callers depend on ChatError.
+        with pytest.raises(ChatError, match='Adapter "slack" does not support get_user'):
+            await chat.get_user("U123456")
+
+
+# ============================================================================
 # thread() factory
 # ============================================================================
 
