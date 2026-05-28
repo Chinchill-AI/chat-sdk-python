@@ -215,6 +215,8 @@ class GitHubAdapter:
             except Exception as error:
                 self._logger.warn("Could not fetch bot user ID", {"error": str(error)})
 
+        self._logger.info("GitHub adapter initialized")
+
     async def get_user(self, user_id: str) -> UserInfo | None:
         """Look up a GitHub user by numeric account ID.
 

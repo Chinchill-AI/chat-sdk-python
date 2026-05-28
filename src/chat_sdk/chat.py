@@ -1567,7 +1567,10 @@ class Chat:
             raise ChatError(f"Invalid channel ID: {channel_id}")
         adapter = self._adapters.get(adapter_name)
         if adapter is None:
-            raise ChatError(f'Adapter "{adapter_name}" not found for channel ID "{channel_id}"')
+            registered = sorted(self._adapters.keys())
+            raise ChatError(
+                f'Adapter "{adapter_name}" not found for channel ID "{channel_id}" (registered adapters: {registered})'
+            )
         return ChannelImpl(
             _ChannelImplConfigWithAdapter(
                 id=channel_id,
@@ -1625,7 +1628,10 @@ class Chat:
 
         adapter = self._adapters.get(adapter_name)
         if adapter is None:
-            raise ChatError(f'Adapter "{adapter_name}" not found for thread ID "{thread_id}"')
+            registered = sorted(self._adapters.keys())
+            raise ChatError(
+                f'Adapter "{adapter_name}" not found for thread ID "{thread_id}" (registered adapters: {registered})'
+            )
 
         # Defer to the adapter to derive channel_id as a secondary sanity
         # check — some platform-specific patterns can pass the structural
