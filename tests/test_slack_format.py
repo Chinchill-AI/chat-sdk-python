@@ -199,6 +199,23 @@ class TestMentions:
         result = self.converter.from_markdown("Hey <@U12345>")
         assert result == "Hey <@U12345>"
 
+    def test_does_not_wrap_at_in_email_localpart(self):
+        """`@` preceded by a word char is part of an email address, not a mention.
+
+        Without the lookbehind tightening, `alice@example.com` was rewritten to
+        `alice<@example>.com`, surfacing a broken-looking mention in messages
+        that quote email addresses from upstream APIs.
+        """
+        result = self.converter.render_postable("Contact alice@example.com or bob@example.org")
+        assert "<@example>" not in result
+        assert "alice@example.com" in result
+        assert "bob@example.org" in result
+
+    def test_does_not_wrap_at_in_email_localpart_from_markdown_ast(self):
+        result = self.converter.render_postable({"markdown": "Contact alice@example.com"})
+        assert "<@example>" not in result
+        assert "alice@example.com" in result
+
 
 # ---------------------------------------------------------------------------
 # toPlainText

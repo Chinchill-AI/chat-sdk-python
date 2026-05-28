@@ -1385,6 +1385,52 @@ class TestOptionsLoad:
             for call in error_calls
         )
 
+    # TS: "should support returning option groups" (vercel/chat#410)
+    async def test_should_support_returning_option_groups(self):
+        from chat_sdk.types import OptionsLoadEvent
+
+        chat, adapter, state = await _init_chat()
+
+        captured: list[OptionsLoadEvent] = []
+
+        async def _handler(event: OptionsLoadEvent):
+            captured.append(event)
+            return [
+                {
+                    "label": "Recent",
+                    "options": [{"label": "Alice", "value": "u1"}],
+                },
+                {
+                    "label": "All",
+                    "options": [
+                        {"label": "Bob", "value": "u2"},
+                        {"label": "Carol", "value": "u3"},
+                    ],
+                },
+            ]
+
+        chat.on_options_load("user_select", _handler)
+
+        event = OptionsLoadEvent(
+            action_id="user_select",
+            query="",
+            user=_make_author(),
+            adapter=adapter,
+            raw={},
+        )
+        result = await chat.process_options_load(event)
+
+        assert result is not None
+        assert len(result) == 2
+        # First entry is the "Recent" group; mirrors the upstream assertion.
+        assert result[0]["label"] == "Recent"
+        # Round-trip: the handler-provided shape is returned verbatim — the
+        # adapter is responsible for translating to Slack's option_groups.
+        assert result[1]["options"] == [
+            {"label": "Bob", "value": "u2"},
+            {"label": "Carol", "value": "u3"},
+        ]
+
 
 # ============================================================================
 # 13. openDM (tests 51-54)
