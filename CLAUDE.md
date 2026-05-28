@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (porting v4.27.0; last fully-synced release `0.4.26.3` at upstream `4.26.0`). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to v4.27.0; last fully-synced release `0.4.27`). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -23,8 +23,8 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.25` = synced to upstream `4.25.0`
 - `0.4.25.1` = Python-only fix on top of `4.25.0`
 - `0.4.26` = synced to upstream `4.26.0`
-- `0.4.26.3` = last fully-synced release (Python-only fixes on top of `4.26.0`)
-- `0.4.27a1` = alpha while porting upstream `4.27.0` (current branch)
+- `0.4.26.3` = Python-only fixes on top of `4.26.0`
+- `0.4.27` = synced to upstream `4.27.0` (current release)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture

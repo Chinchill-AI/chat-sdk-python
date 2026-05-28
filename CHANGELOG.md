@@ -1,75 +1,61 @@
 # Changelog
 
-## 0.4.27a1 (2026-05-07)
+## 0.4.27 (2026-05-28)
 
-Alpha sync starter for upstream `4.27.0` (`vercel/chat` release commit
-`f55378a`, Apr 30 2026). **No feature ports in this release** — this is a
-parity-bookkeeping bump that establishes the sync branch, sets
-`UPSTREAM_PARITY = "4.27.0"`, and lays out the porting plan below. Each
-substantive commit lands as its own PR (matching the cadence used during
-the `4.26.0` sync: #64, #66, #67, #74, etc.).
+Synced to upstream `vercel/chat@4.27.0` (release commit `f55378a`, Apr 30 2026). Highlights: Slack Socket Mode + dynamic bot-token resolver, Teams native DM streaming, `chat.get_user()` across all 8 adapters, Telegram MarkdownV2 rendering, and a sweep of adapter bug fixes. Sets `UPSTREAM_PARITY = "4.27.0"`.
+
+### Upstream parity ports
+
+#### Core (`packages/chat`)
+
+- **`Chat.get_user(adapter, user_id)`** for cross-platform user lookups (#90, vercel/chat#391). Returns `User | None` with `email`, `display_name`, `avatar_url`, `is_bot` populated from each platform's user-lookup API. Every adapter exposes `async def get_user(user_id)`; Telegram is best-effort (`getChat` only), WhatsApp returns minimal user info (Cloud API has no separate lookup).
+- **`ExternalSelect.initial_option` + `option_groups`** (#84, vercel/chat#410, #397). Type extensions on `ExternalSelect`; Slack adapter serializes `option_groups` to Block Kit.
+- **`concurrency.max_concurrent` honored in `concurrent` strategy** (vercel/chat#419) — already enforced in the Python port via `asyncio.Semaphore`; upstream has caught up. Divergence row in `docs/UPSTREAM_SYNC.md` downgrades from "silent correctness bug upstream" to "behavior parity restored".
+
+#### Slack (`packages/adapter-slack`)
+
+- **Socket Mode transport** (#86, vercel/chat#162). New `SlackAdapterConfig(mode="socket", app_token="xapp-...")` opens a persistent WebSocket via `slack_sdk.socket_mode.aiohttp.SocketModeClient`. Outer reconnect loop (1s → 30s exp backoff, 250ms shutdown poll) layered on top of the SDK's auto-reconnect. Forwarded-events receiver in `handle_webhook` for the serverless variant (`x-slack-socket-token`, `hmac.compare_digest`). `ModalResponse(action="clear")` lands too. New optional extra: `chat-sdk-python[slack-socket]`. Closes #68.
+- **Dynamic `bot_token` resolver + custom `webhook_verifier`** (#87, vercel/chat#421). `bot_token` now accepts `str | Callable[[], str | Awaitable[str]]`; resolver is invoked per request and cached in a per-instance ContextVar so concurrent webhooks don't share tokens. `webhook_verifier` replaces built-in HMAC + timestamp verification (returning a `str` substitutes the canonical body). `signing_secret` precedence over `webhook_verifier` preserved. `schedule_message().cancel()` and `Attachment.fetch_data` are rotation-safe. New `SlackAdapter.current_token_async()` for cron-style callers outside `handle_webhook`.
+- **Slack streaming team_id fix for interactive payloads** (#85, vercel/chat#330). `recipient_team_id` extraction now walks `team_id` → `team` (string) → `team.id` (object) → `user.team_id` in order, returning `None` only when no string ID is found. Previously the entire `team` dict was forwarded for `block_actions`, breaking streaming routing.
+- **Link-preview unfurl enrichment** (#89, vercel/chat#395). `message_changed` events are routed through a new `_handle_message_changed` handler with a 2s poll window and per-event link cache (1h TTL), so the message handler sees enriched links.
+- **`@mention` regex preserves email addresses** (#91, vercel/chat#394). The `@user` matcher now skips `@` characters inside email localparts.
+- **Empty `thread_ts` guard** (#89, vercel/chat#292). `stream()` now degrades to a single `post_message` for empty `thread_ts` instead of raising — top-level Slack DMs encode thread IDs with an empty `thread_ts` by design, and the old `ValidationError` silently dropped the reply.
+
+#### Teams (`packages/adapter-teams`)
+
+- **Native streaming for DMs via emit** (#88, vercel/chat#416). DM threads use the Bot Framework streaming protocol (`channelData.streamType=streaming` + `streamSequence`, then a final `streamType=final` message); group chats accumulate and post once (matches upstream's flicker-free behavior). New `TeamsAdapterConfig.native_stream_min_emit_interval_ms` (default 1500ms) honors Teams' ~1 req/sec quota; `StreamOptions.update_interval_ms` overrides. Send-failure mid-stream cancels the session and re-raises so `Thread.stream` history matches user-visible text. Migration to `microsoft-teams-apps` (Python SDK, GA 2026-05-01) tracked as #93 for 0.4.28.
+- **DM conversation ID resolution for Graph API** (#85, vercel/chat#403). Bot Framework opaque DM IDs are rejected by Graph's `/chats/{chat-id}/messages` endpoint; the adapter now caches the user's `aadObjectId` from inbound activities into a `TeamsDmContext` keyed by base conversation ID and resolves to the canonical `19:{userAadId}_{botId}@unq.gbl.spaces` form on Graph calls.
+
+#### Telegram (`packages/adapter-telegram`)
+
+- **MarkdownV2 rendering** (#89, vercel/chat#407). Replaces the legacy `Markdown` parse_mode with `MarkdownV2`. Three escape contexts (normal text, code blocks, inline-link URLs) handle the spec's 18-char escape set per region.
+
+#### Discord (`packages/adapter-discord`)
+
+- **Card text deduplication** (#89, vercel/chat#256). Card posts omit `content` on create (Discord renders both `content` and the embed otherwise); edits explicitly send `content: ""` so leftover text from a previous edit is cleared.
+
+### Python-only improvements
+
+- **Markdown parser completeness** (#101). GFM task lists (`- [ ]` / `- [x]` → `checked: bool`), backslash-escaped delimiters (lookbehind `(?<!\\)` on inline regexes), inline math (`$x$`) preserved by `_remend` and the format converter. Sentinel-based escape protection prevents pathological backslash sequences from being eaten by emphasis/strikethrough regexes.
+- **Streaming markdown list-marker awareness + table chunk-boundary** (#99, issue #69). `_get_committable_prefix` knows about list-marker positions so a chunk boundary lands cleanly; tables that span chunk boundaries are wrapped so the first chunk doesn't ship a half-table.
+- **`SlackAdapter._upload_files`** uses `channel=` not `channel_id=` for `files_upload_v2` (#103, issue #102). The underlying `files_completeUploadExternal` forwards `channel_id=channel` internally, so caller-supplied `channel_id=` collided and raised `TypeError` on every Slack file upload.
+- **Adapter dict-StreamChunk support** (#105). `slack`, `github`, and `google_chat` stream loops now honor the dict-shaped `{"type": "markdown_text", ...}` chunks that `thread.py`'s `_from_full_stream` has always forwarded (Teams already honored). Slack `send_structured_chunk` rewritten with a `_read()` helper for dict/dataclass uniformity; fallback warning message rewritten to name the actual possible causes.
+- **Google Chat card text rendering** (#92). `GoogleChatFormatConverter` now uses the full markdown parser for card text (was a regex stub that dropped formatting).
+- **Adapter init logs + adapter-list in not-found errors** (#104). `GoogleChatAdapter.initialize()` and `GitHubAdapter.initialize()` now log on init (matching Slack/Teams). `Chat.channel()` / `Chat.thread()` "adapter not found" errors append `(registered adapters: [...])` so operators can disambiguate "never constructed" from "wrong lookup name".
+
+### Sync-process documentation
+
+- **Review-loop discipline** (`docs/UPSTREAM_SYNC.md`, `docs/SELF_REVIEW.md`). Codifies the lessons learned from this wave: self-review before opening the PR (cheaper than bot rounds), trace fix cascades across overlapping PRs, prefer official SDKs over hand-rolled implementations, cap drafts to 3–4 in flight, divergence budget of ≤2 per sync PR. `docs/SELF_REVIEW.md` adds adversarial check categories (input sweeps, emit/parse symmetry, pass-interaction, unforgeable sentinels, rebind/state coherence).
+
+### Upstream items not ported
+
+- **`@chat-adapter/web`** (Vue + Svelte browser UI, vercel/chat#444) — no browser runtime in chat-sdk-python.
+- **Teams SDK 2.0.8 + `User-Agent` header** (vercel/chat#415) — JS-only. The Python Teams adapter uses raw `aiohttp`, not `botbuilder`; tracked in `docs/UPSTREAM_SYNC.md` non-parity table as a deferred enhancement.
+- **Bundled guide markdown + templates manifest** (vercel/chat#423) — TS-monorepo authoring resources, not runtime behavior.
 
 ### Upstream tagging note
 
-Upstream cut versions for the entire monorepo on Apr 30 2026 (commit
-`f55378a`), bumping `packages/chat/package.json` from `4.26.0` to
-`4.27.0`. As of this writing only `@chat-adapter/shared@4.27.0` got a
-git tag — no `chat@4.27.0` tag was published. The fidelity workflow
-(`scripts/verify_test_fidelity.py`, `.github/workflows/lint.yml`)
-therefore stays pinned to `chat@4.26.0` until either the tag is
-published upstream or the first feature port lands and we move the pin
-to commit `f55378a` directly. Local devs running fidelity in baseline
-mode will see a `chat@4.26.0` vs `chat@4.27.0` mismatch — that's the
-intended in-flight signal.
-
-### Sync scope (22 substantive upstream commits between `chat@4.26.0..f55378a`)
-
-#### Core (`packages/chat/` → `src/chat_sdk/`)
-
-- [x] (PR #90) **`chat.getUser(adapter, userId)`** for cross-platform user lookups (vercel/chat#391, upstream commit `a520797`). Adapter-side: each adapter exposes `getUser`. Touches `chat.py`, `types.py` (`User` type extension), and every adapter (`slack`, `teams`, `gchat`, `telegram`, `discord`, `whatsapp`, `github`, `linear`).
-- [x] (PR #84) **`ExternalSelect.initial_option` + `option_groups`** (vercel/chat#410, `70281dc`). Type extension in `types.py`; Slack adapter must serialize `option_groups` to Block Kit.
-- [x] (already merged via PR #74) **`thread.post()` streaming options** (vercel/chat#388, `9093292`). New params plumb through `Thread.post` → `chat.py` orchestrator.
-- [x] (PR #85) **Slack streaming team ID fix for interactive payloads** (vercel/chat#330, `8a0c7b3`). Bug fix in the Slack streaming path; check `adapters/slack/adapter.py` request-context plumbing.
-- [⏭️] (out of scope) **Bundled guide markdown + templates manifest** (vercel/chat#423, `b0ab804`). Decision: skip or copy `packages/chat/resources/guides/*.md` and `templates.json` verbatim. Probably skip — these are TS-monorepo authoring resources, not runtime behavior.
-- [x] **`concurrency.maxConcurrent` honored in `concurrent` strategy** (vercel/chat#419, `d630e6c`). Already addressed in the Python port — see the existing `ConcurrencyConfig.max_concurrent` row in `docs/UPSTREAM_SYNC.md` (we enforce via `asyncio.Semaphore` and reject misconfiguration). Upstream has now caught up; on this sync the divergence row downgrades from "silent correctness bug upstream" to "behavior parity restored".
-
-#### Slack (`packages/adapter-slack/` → `src/chat_sdk/adapters/slack/`)
-
-- [x] (PR #86) **Slack Socket Mode support** (vercel/chat#162, `7e9d0fc`). Big — adds a persistent WebSocket transport alongside HTTP webhooks. Decision: in scope or follow-up? Mirrors the Discord Gateway gap already documented in non-parity ("HTTP interactions only").
-- [x] (PR #87) **Dynamic `bot_token` resolver + custom `webhookVerifier`** (vercel/chat#421, `2531e9c`). Multi-workspace pattern; touches `SlackAdapter.__init__` and request handling.
-- [x] (PR #84) **External-select Block Kit support** (vercel/chat#397, `a179b29`). Pairs with the core `option_groups` change above.
-- [ ] **Native `markdown_text` for outgoing messages** (vercel/chat#440, post-release — Apr 17). NOTE: this commit is post-`f55378a` so technically out of `4.27.0` scope, but listed here because the team often picks up post-release fixes.
-- [x] (PR #89) **Link-preview unfurl metadata enrichment** (vercel/chat#395, `ded6f78`).
-- [x] (PR #89) **`@mention` regex preserves email addresses** (vercel/chat#394, `c26ee6c`).
-- [x] (PR #89) **Guard against empty `threadTs` (`invalid_thread_ts` fix)** (vercel/chat#292, `53c6b68`).
-
-#### Teams (`packages/adapter-teams/` → `src/chat_sdk/adapters/teams/`)
-
-- [x] (PR #88) **Native streaming for DMs via `emit`** (vercel/chat#416, `ed46bae`). Currently the Python port falls back to `_fallback_stream` for Teams; native streaming would lift that.
-- [x] (PR #85) **DM conversation ID resolution for Graph API** (vercel/chat#403, `4c24c94`). Bug fix.
-- [x] **Teams SDK 2.0.8 + `User-Agent` header** (vercel/chat#415, `885a471`). **N/A — JS-only.** Upstream's change bumps the `botbuilder` dependency and flips the bot client header from `X-User-Agent` to `User-Agent: Vercel.ChatSDK`. The Python Teams adapter does not depend on `botbuilder` (uses raw `aiohttp`), so there is no equivalent dependency to bump. The optional `User-Agent` header propagation is a defense-in-depth nice-to-have; documented as a deferred enhancement in `docs/UPSTREAM_SYNC.md` rather than landed in this sync.
-
-#### Telegram
-
-- [x] (PR #89) **MarkdownV2 rendering fixes** (vercel/chat#407, `b9a1961`). Pairs with the streaming-chunk safety trim in vercel/chat#446 (post-`f55378a`).
-
-#### Discord
-
-- [x] (PR #89) **Don't duplicate text when posting card messages** (vercel/chat#256, `7e5b447`). Confirm Python port's `discord/cards.py` doesn't have the same bug.
-
-#### Out of scope for this Python port
-
-- **`@chat-adapter/web`** — new package adding a browser chat UI for chat-sdk bots (vercel/chat#444). No browser runtime in chat-sdk-python.
-- **Documentation site changes** — `apps/docs/`, README/changelog tweaks, dependency bumps.
-
-### Workflow
-
-1. This alpha PR establishes the sync. CI on this draft is intentionally not invoked (lint.yml is gated on `!github.event.pull_request.draft`).
-2. Each item above lands as its own PR, following the same pattern as the `4.26.0` cycle. Each port PR:
-   - Updates the relevant `MAPPING` / fidelity coverage and removes its entries from `scripts/fidelity_baseline.json` if previously baselined.
-   - Bumps lint.yml's pinned upstream ref to commit `f55378a` (or a later SHA if upstream cuts a `chat@4.27.0` tag in the meantime).
-   - Adds an entry under the next `CHANGELOG` heading (`0.4.27a2`, `0.4.27a3`, …).
-3. Once all 22 items are ported (or explicitly documented as divergence in `docs/UPSTREAM_SYNC.md`), the final PR cuts `0.4.27` and switches CI back to strict fidelity at the upstream tag.
+Upstream cut versions for the entire monorepo on Apr 30 2026 (commit `f55378a`), but only `@chat-adapter/shared@4.27.0` got a git tag — no `chat@4.27.0` tag was published. The fidelity workflow (`scripts/verify_test_fidelity.py`, `.github/workflows/lint.yml`) stays pinned to `chat@4.26.0` for this release; it'll move to a 4.27 SHA pin (or a real tag if upstream publishes one) in the next sync.
 
 ## 0.4.26.3 (2026-05-07)
 
