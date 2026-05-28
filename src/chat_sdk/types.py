@@ -244,6 +244,23 @@ class Author:
 
 
 @dataclass
+class UserInfo:
+    """User information returned by :meth:`Adapter.get_user`.
+
+    Mirrors upstream ``UserInfo`` (``packages/chat/src/types.ts``).  Fields
+    that aren't universally available across platforms (``email``,
+    ``avatar_url``) are optional.
+    """
+
+    full_name: str
+    is_bot: bool
+    user_id: str
+    user_name: str
+    avatar_url: str | None = None
+    email: str | None = None
+
+
+@dataclass
 class MessageMetadata:
     """Message metadata."""
 
@@ -654,6 +671,26 @@ class RawMessage:
     id: str
     thread_id: str
     raw: Any
+    # Optional adapter-authoritative text snapshot. When set, callers
+    # like ``Thread.stream`` MUST prefer this over their own local
+    # accumulator when constructing the recorded ``SentMessage`` body /
+    # message-history entry. Used by adapters whose internal state
+    # (cancellation, throttling, partial commits) makes the local
+    # accumulator diverge from what the platform actually accepted —
+    # the Teams native streaming path sets this when a session is
+    # canceled mid-flight so ``Thread.stream`` records only the text
+    # Teams shipped, not the buffered suffix the user canceled out of.
+    # ``None`` means "use the caller's existing logic" — backward
+    # compatible for adapters that don't need this override.
+    #
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's
+    # ``RawMessage`` interface (packages/chat/src/types.ts) has only
+    # ``id``, ``raw``, ``threadId``; the override is Python-only because
+    # we hand-roll Teams native streaming (upstream uses
+    # ``@microsoft/teams.apps``'s ``IStreamer.emit`` which owns the
+    # cancellation-text reconciliation internally). Will simplify or
+    # disappear once we migrate to ``microsoft-teams-apps`` (Python).
+    text: str | None = None
 
 
 @dataclass
@@ -1079,9 +1116,18 @@ class ModalCloseEvent:
 
 @dataclass
 class ModalResponse:
-    """Response to a modal submit event."""
+    """Response to a modal submit event.
 
-    action: Literal["close", "update", "push", "errors"]
+    The ``action`` field selects which Slack ``response_action`` is sent:
+
+    * ``"close"``     — close the current view (no body)
+    * ``"clear"``     — close the entire view stack
+    * ``"update"``    — replace the current view with ``modal``
+    * ``"push"``      — push ``modal`` onto the view stack
+    * ``"errors"``    — show field-level errors (``errors`` dict)
+    """
+
+    action: Literal["close", "clear", "update", "push", "errors"]
     modal: Any = None
     errors: dict[str, str] | None = None
 
@@ -1200,6 +1246,14 @@ class Adapter(Protocol):
 
     async def handle_webhook(self, request: Any, options: WebhookOptions | None = None) -> Any: ...
     async def initialize(self, chat: ChatInstance) -> None: ...
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up user information by user ID.
+
+        Optional — not all platforms support this.  Returns ``None`` when the
+        user is not found or the lookup fails.
+        """
+        return None
 
 
 class BaseAdapter:
@@ -1347,6 +1401,17 @@ class BaseAdapter:
     async def disconnect(self) -> None:
         """Cleanup hook called when the Chat instance is shut down."""
         raise ChatNotImplementedError(self.name, "disconnect")
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Look up user information by user ID.
+
+        Optional — not all platforms support this.  Concrete adapters that
+        can resolve users via a platform API should override this.  The
+        default raises :class:`~chat_sdk.errors.ChatNotImplementedError`,
+        which :meth:`~chat_sdk.chat.Chat.get_user` translates into a
+        ``"does not support get_user"`` :class:`~chat_sdk.errors.ChatError`.
+        """
+        raise ChatNotImplementedError(self.name, "getUser")
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on an attachment after deserialization.

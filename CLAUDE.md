@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (v4.26.0). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (porting v4.27.0; last fully-synced release `0.4.26.3` at upstream `4.26.0`). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -23,7 +23,8 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.25` = synced to upstream `4.25.0`
 - `0.4.25.1` = Python-only fix on top of `4.25.0`
 - `0.4.26` = synced to upstream `4.26.0`
-- `0.4.26a1` = alpha while porting upstream `4.26.0`
+- `0.4.26.3` = last fully-synced release (Python-only fixes on top of `4.26.0`)
+- `0.4.27a1` = alpha while porting upstream `4.27.0` (current branch)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
@@ -106,16 +107,20 @@ will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` in the mapped core files has a matching Python `def test_*()`,
-pinned to `chat@4.26.0`. The `MAPPING` dict in that script is the
-authoritative scope list — it currently covers 8 of 17
-`packages/chat/src/*.test.ts` files (extending it is tracked as a
+pinned to `chat@4.26.0` (the last fully-synced upstream tag — `chat@4.27.0`
+is in flight; pin moves as ports land in this sync cycle). The `MAPPING`
+dict in that script is the authoritative scope list — it currently covers 8
+of 17 `packages/chat/src/*.test.ts` files (extending it is tracked as a
 follow-up). **CI runs `--strict`** (see `.github/workflows/lint.yml`):
 any missing translation in a mapped file fails the build, and a missing
 upstream checkout also fails (the script exits non-zero when any mapped
 TS file isn't found). Baseline mode (the default without `--strict`) is
 retained for local workflows where a few ports land in flight —
 regenerate via `--update-baseline` after documenting intentional
-divergence in `docs/UPSTREAM_SYNC.md`.
+divergence in `docs/UPSTREAM_SYNC.md`. During this sync cycle baseline
+mode reports a parity mismatch (baseline pinned at `chat@4.26.0`,
+`UPSTREAM_PARITY` says `4.27.0`); that's the intended signal until the
+sync lands.
 
 Before the fidelity check can run locally, clone the pinned upstream
 checkout (same command CI uses in `lint.yml`):
