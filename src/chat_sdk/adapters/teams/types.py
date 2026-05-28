@@ -72,6 +72,17 @@ class TeamsAdapterConfig:
     logger: Logger | None = None
     # Override bot username (optional).
     user_name: str | None = None
+    # Minimum interval between native DM streaming activities, in
+    # milliseconds. Bot Framework's streaming endpoint is throttled to
+    # roughly 1 request/second; Microsoft recommends buffering tokens
+    # for 1.5-2 seconds to avoid 429s mid-response. We default to 1500ms
+    # per https://learn.microsoft.com/microsoftteams/platform/bots/streaming-ux.
+    # Chunks that arrive within this window after the previous emit are
+    # accumulated locally and shipped together on the next emit (or in
+    # the final ``message`` activity if the stream ends inside the
+    # window). A caller-supplied ``StreamOptions.update_interval_ms``
+    # overrides this default for a single stream.
+    native_stream_min_emit_interval_ms: int = 1500
 
 
 # =============================================================================

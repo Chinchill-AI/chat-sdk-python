@@ -1047,8 +1047,10 @@ class TestStream:
             yield {"type": "markdown_text", "text": "World"}
 
         result = await adapter.stream(tid, text_stream())
+        # Group chat: accumulate → single send.
         assert result.id == "msg-1"
         assert result.raw["text"] == "Hello World"
+        assert send_call_count == 1
 
     async def test_stream_string_chunks(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -1068,6 +1070,9 @@ class TestStream:
 
         result = await adapter.stream(tid, text_stream())
         assert "Hello World" in result.raw["text"]
+        # Group chat: single accumulate-and-post send, no edits.
+        assert adapter._teams_send.call_count == 1
+        assert adapter._teams_update.call_count == 0
 
     async def test_stream_empty_chunks_skipped(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -1087,6 +1092,7 @@ class TestStream:
 
         result = await adapter.stream(tid, text_stream())
         assert result.id == ""  # nothing sent
+        assert adapter._teams_send.call_count == 0
 
 
 # ---------------------------------------------------------------------------
