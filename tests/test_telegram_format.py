@@ -32,19 +32,24 @@ class TestTelegramFromAst:
         assert "Hello world" in result
 
     def test_bold(self):
+        # MarkdownV2 uses single-asterisk for bold (vs standard's `**`).
         ast = converter.to_ast("**bold text**")
         result = converter.from_ast(ast)
-        assert "**bold text**" in result
+        assert "*bold text*" in result
+        assert "**" not in result
 
     def test_italic(self):
+        # MarkdownV2 uses single-underscore for italic (vs standard's `*`).
         ast = converter.to_ast("*italic text*")
         result = converter.from_ast(ast)
-        assert "*italic text*" in result
+        assert "_italic text_" in result
 
     def test_strikethrough(self):
+        # MarkdownV2 uses single-tilde for strikethrough (vs standard's `~~`).
         ast = converter.to_ast("~~strikethrough~~")
         result = converter.from_ast(ast)
-        assert "~~strikethrough~~" in result
+        assert "~strikethrough~" in result
+        assert "~~" not in result
 
     def test_links(self):
         ast = converter.to_ast("[link text](https://example.com)")
@@ -131,9 +136,12 @@ class TestTelegramRenderPostable:
         assert "Hello from AST" in result
 
     def test_bold_and_italic(self):
+        # MarkdownV2: single-asterisk bold, single-underscore italic, and
+        # the literal " and " keeps spaces unescaped.
         result = converter.render_postable({"markdown": "**bold** and *italic*"})
-        assert "**bold**" in result
-        assert "*italic*" in result
+        assert "*bold*" in result
+        assert "_italic_" in result
+        assert "**" not in result
 
     def test_markdown_table_as_code_block(self):
         result = converter.render_postable({"markdown": "| A | B |\n| --- | --- |\n| 1 | 2 |"})
@@ -198,8 +206,10 @@ class TestTelegramRoundtrip:
         assert "Hello world" in result
 
     def test_bold(self):
+        # Roundtrip into MarkdownV2 produces the single-asterisk form.
         result = converter.from_ast(converter.to_ast("**bold text**"))
-        assert "**bold text**" in result
+        assert "*bold text*" in result
+        assert "**" not in result
 
     def test_links(self):
         result = converter.from_ast(converter.to_ast("[click here](https://example.com)"))
@@ -214,3 +224,185 @@ class TestTelegramRoundtrip:
         assert "```" in result
         assert "Col1" in result
         assert "A" in result
+
+
+# ---------------------------------------------------------------------------
+# MarkdownV2 escape matrix (port of vercel/chat#407 / chat@4.27.0)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownV2Escaping:
+    """Telegram's MarkdownV2 parser rejects every unescaped occurrence of
+    ``_*[]()~`>#+-=|{}.!\\`` outside of entities. The previous adapter
+    used legacy ``"Markdown"`` parse mode + standard markdown stringify,
+    which produced ``can't parse entities`` 400s on any LLM response that
+    happened to contain a bare ``.`` or ``!``.
+
+    What to fix if this fails: the renderer in
+    ``src/chat_sdk/adapters/telegram/format_converter.py`` must escape
+    every special char in plain text via the 20-char matrix, but only
+    ``` ` ``` and ``\\`` inside code blocks, and only ``)`` and ``\\``
+    inside link URLs.
+    """
+
+    def test_full_escape_matrix_in_plain_text(self):
+        # All 20 reserved chars must be backslash-escaped.
+        raw_text = "hello _world_ * [link] ( ) ~ ` > # + - = | { } . ! \\"
+        ast = converter.to_ast(raw_text)
+        result = converter.from_ast(ast)
+        # Each special char must appear escaped (preceded by `\`).
+        # Use a sample of representative characters — testing all 20
+        # individually would be redundant noise.
+        for char in [".", "!", "(", ")", "-", "+", "=", "|", "{", "}"]:
+            # The char appears in the text — confirm there's no bare
+            # unescaped occurrence anywhere in the rendered output.
+            pos = result.find(char)
+            assert pos > 0, f"char {char!r} should appear in output"
+            assert result[pos - 1] == "\\", (
+                f"char {char!r} at position {pos} is not preceded by `\\` — "
+                f"context: {result[max(0, pos - 5) : pos + 3]!r}"
+            )
+
+    def test_dot_in_text_is_escaped(self):
+        # The classic LLM-output failure: any sentence with a period.
+        result = converter.from_ast(converter.to_ast("Hello world. This is a test."))
+        # `.` must be escaped — `\.`
+        assert "\\." in result
+        # No bare `.` anywhere outside the escape sequence.
+        # (Strip every escape pair, then assert no `.` remains.)
+        stripped = result.replace("\\.", "")
+        assert "." not in stripped
+
+    def test_inline_code_only_escapes_backtick_and_backslash(self):
+        # Inside `code`, a `.` is a literal `.` and must NOT be escaped.
+        result = converter.from_ast(converter.to_ast("Use `obj.method()` here"))
+        assert "obj.method()" in result, "code-block content should be unescaped"
+
+    def test_link_url_only_escapes_paren_and_backslash(self):
+        # Inside link URL, `.` is literal (not escaped). `)` IS escaped.
+        result = converter.from_ast(converter.to_ast("[wiki](https://en.wikipedia.org/wiki/Foo_(bar))"))
+        # The inner `)` from `(bar)` must be escaped to `\)`.
+        assert "\\)" in result
+        # The `.` in the host should NOT be escaped inside the URL — assert
+        # via a long anchored fragment so CodeQL's URL-substring heuristic
+        # isn't tripped (this is a render check, not a security boundary).
+        assert "https://en.wikipedia.org/wiki/Foo_" in result
+
+    def test_render_postable_string_passes_through_unchanged(self):
+        # Plain string messages ship verbatim — no escaping (parse_mode
+        # will be None at the API layer).
+        s = "hello.world! free-form text with (parens) and dots."
+        assert converter.render_postable(s) == s
+
+    def test_empty_input(self):
+        assert converter.from_ast({"type": "root", "children": []}) == ""
+
+    def test_whitespace_only_input(self):
+        result = converter.render_postable({"markdown": "   \n   "})
+        # Should be empty or whitespace — not a parse error.
+        assert result.strip() == ""
+
+    def test_heading_renders_as_bold(self):
+        # MarkdownV2 has no heading syntax; we render `# H1` as `*H1*`.
+        result = converter.from_ast(converter.to_ast("# Heading"))
+        assert "*Heading*" in result
+
+    def test_blockquote_per_line_prefix(self):
+        result = converter.from_ast(converter.to_ast("> first\n> second"))
+        # MarkdownV2 blockquote uses `>` per line.
+        assert ">" in result
+
+    def test_list_dash_is_escaped(self):
+        # Bullet list items must use escaped `\-` (since `-` is reserved).
+        result = converter.from_ast(converter.to_ast("- one\n- two"))
+        assert "\\-" in result
+        # No bare leading `- ` should remain (would be unescaped).
+        for line in result.split("\n"):
+            assert not line.startswith("- "), f"bare `- ` in line: {line!r}"
+
+    def test_ordered_list_period_is_escaped(self):
+        result = converter.from_ast(converter.to_ast("1. first\n2. second"))
+        # The period after each number must be escaped: `1\.`
+        assert "1\\." in result
+        assert "2\\." in result
+
+    def test_ordered_list_preserves_start_value(self):
+        """Ordered lists must honour the source's ``start`` value rather
+        than silently renumbering from 1. Markdown like ``5. five`` and
+        HTML like ``<ol start="5">`` parse to an mdast ``list`` node with
+        ``start: 5`` -- if the renderer ignores that, the user sees
+        ``1. five`` and meaning changes.
+        """
+        result = converter.from_ast(converter.to_ast("5. five\n6. six\n7. seven"))
+        # Source numbering must be preserved.
+        assert "5\\. five" in result
+        assert "6\\. six" in result
+        assert "7\\. seven" in result
+        # And the renderer must NOT renumber to 1./2./3.
+        assert "1\\." not in result
+        assert "2\\." not in result
+        assert "3\\." not in result
+
+    def test_ordered_list_with_explicit_start_attribute(self):
+        """Direct AST input with ``start=5`` and N items renders 5./6./.../N+4."""
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "list",
+                    "ordered": True,
+                    "start": 5,
+                    "children": [
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": f"item {n}"}],
+                                }
+                            ],
+                        }
+                        for n in range(3)
+                    ],
+                }
+            ],
+        }
+        result = converter.from_ast(ast)
+        assert "5\\. item 0" in result
+        assert "6\\. item 1" in result
+        assert "7\\. item 2" in result
+
+    def test_ordered_list_default_start_is_one(self):
+        """Sanity: without an explicit ``start``, lists still begin at 1."""
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "list",
+                    "ordered": True,
+                    "children": [
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": "a"}],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "listItem",
+                            "children": [
+                                {
+                                    "type": "paragraph",
+                                    "children": [{"type": "text", "value": "b"}],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+        result = converter.from_ast(ast)
+        assert "1\\. a" in result
+        assert "2\\. b" in result
