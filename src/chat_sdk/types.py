@@ -61,7 +61,7 @@ FormattedContent = dict[str, Any]
 # =============================================================================
 
 LockScope = Literal["thread", "channel"]
-ConcurrencyStrategy = Literal["drop", "queue", "debounce", "concurrent"]
+ConcurrencyStrategy = Literal["drop", "queue", "debounce", "burst", "concurrent"]
 OnLockConflict = (
     Literal["drop", "force"]
     | Callable[..., Awaitable[Literal["force", "drop"] | bool] | Literal["force", "drop"] | bool]
@@ -220,8 +220,10 @@ class ConcurrencyConfig:
     """Fine-grained concurrency configuration."""
 
     strategy: ConcurrencyStrategy
+    # Debounce window in milliseconds (debounce/burst strategies). Default: 1500.
     debounce_ms: int = 1500
     max_concurrent: int | None = None  # None = Infinity
+    # Max queued messages per thread (queue/burst strategies). Default: 10.
     max_queue_size: int = 10
     on_queue_full: Literal["drop-oldest", "drop-newest"] = "drop-oldest"
     queue_entry_ttl_ms: int = 90000
@@ -1447,7 +1449,7 @@ class ChatConfig:
     state: StateAdapter
     user_name: str
     # How to handle concurrent messages to the same thread/channel.
-    # Pass a strategy name ("drop", "queue", "debounce", "concurrent")
+    # Pass a strategy name ("drop", "queue", "debounce", "burst", "concurrent")
     # or a full ConcurrencyConfig for fine-grained control.
     concurrency: ConcurrencyStrategy | ConcurrencyConfig | None = None
     # Milliseconds to remember a message ID for deduplication (default 5 min).
