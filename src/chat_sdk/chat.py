@@ -2483,7 +2483,13 @@ class _MessageHistoryCache:
 
     async def append(self, thread_id: str, message: Message) -> None:
         key = f"msg-history:{thread_id}"
+        # Serialize with raw nulled out to save storage (matches
+        # MessageHistoryCache.append in message_history.py). Without this,
+        # SentMessage.raw — now populated post-#117 with platform payloads
+        # like Slack team_id/user_id, Discord guild IDs — would persist to
+        # the state adapter on every reply, inflating storage and PII surface.
         data = message.to_json()
+        data["raw"] = None
         await self._state.append_to_list(key, data, max_length=self._max_messages, ttl_ms=self._ttl_ms)
 
     async def get_messages(self, thread_id: str, limit: int | None = None) -> list[Message]:

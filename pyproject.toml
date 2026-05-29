@@ -1,6 +1,6 @@
 [project]
 name = "chat-sdk"
-version = "0.4.29a1"
+version = "0.4.29a2"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
 keywords = [
     "chat",

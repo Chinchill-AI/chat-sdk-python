@@ -260,6 +260,29 @@ class TestPostWithDifferentMessageFormats:
         result = await thread.post("Hello")
         assert result.thread_id == "slack:C123:new-thread-id"
 
+    # it("should propagate adapter RawMessage.raw onto SentMessage.raw")
+    @pytest.mark.asyncio
+    async def test_should_propagate_adapter_raw_onto_sent_message(self):
+        """post() must carry the adapter's RawMessage.raw through to
+        SentMessage.raw so consumers can read platform confirmation data
+        (e.g. Slack's ``uploaded_file_ids``)."""
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        async def custom_post(thread_id: str, message: Any) -> RawMessage:
+            return RawMessage(
+                id="msg-3",
+                thread_id=thread_id,
+                raw={"ok": True, "uploaded_file_ids": ["F1", "F2"]},
+            )
+
+        adapter.post_message = custom_post  # type: ignore[assignment]
+        thread = _make_thread(adapter, state)
+        result = await thread.post(PostableMarkdown(markdown="report", files=[]))
+
+        assert isinstance(result.raw, dict)
+        assert result.raw["uploaded_file_ids"] == ["F1", "F2"]
+
 
 # ===========================================================================
 # Streaming
