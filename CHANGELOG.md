@@ -7,6 +7,7 @@ Python-only patch on the 0.4.27 line. No upstream version change; does NOT inclu
 ### Fixes
 
 - **Slack now surfaces `files_upload_v2` confirmation through `post()`** — `SlackAdapter._upload_files` already computed the list of Slack-confirmed file IDs but `post_message` discarded the return, and `ThreadImpl._create_sent_message` hardcoded `raw=None`, so the confirmation never reached `SentMessage.raw`. Slack was the only file-capable adapter to drop this; discord/telegram upload inline and expose the platform response naturally. `post_message` now augments `RawMessage.raw` with `"uploaded_file_ids"` on every return path that can carry files (file-only, card, table, text), and `ThreadImpl._create_sent_message` accepts and propagates the adapter's `raw` into `SentMessage.raw`. `None` means no upload occurred; an empty list signals Slack confirmed zero attachments. The `raw` payload is augmented, not replaced, so existing consumers are unaffected. Backported from #117 (which targets the 0.4.29 line). Unblocks chinchill gating UX on actual delivery success. Upstream convergence tracked in vercel/chat#564.
+- **`chat._MessageHistoryCache` now nulls `raw` before persisting to history** — mirror of the existing null-out in `message_history.MessageHistoryCache.append`. Without this, the platform payload that the above fix populates on `SentMessage.raw` (Slack `team_id`/`user_id`, Discord `guildId`, etc.) would persist on every reply to Redis/Postgres-backed state, inflating storage and PII surface. Caught by post-merge review of #117.
 
 ### Test quality
 
