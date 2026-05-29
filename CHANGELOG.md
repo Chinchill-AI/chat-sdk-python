@@ -1,12 +1,150 @@
 # Changelog
 
-## Unreleased
+## 0.4.29a1 (2026-05-28)
 
-Part of the 0.4.29 sync wave (tracking issue #98).
+Alpha sync starter for upstream `4.29.0` (`vercel/chat` release commit
+`6581d31`, May 18 2026). Upstream skipped tagging `chat@4.27.0` and
+`chat@4.28.0` (only `@chat-adapter/shared@4.27.0` and `@chat-adapter/shared@4.28.0`
+got tags); `chat@4.29.0` is the next real tag and the target of this
+wave. **No feature ports in this release** — parity-bookkeeping bump
+that sets `UPSTREAM_PARITY = "4.29.0"` and lays out the porting plan
+below.
+
+Each substantive commit lands as its own PR (matching the cadence used
+during the 4.27 sync: #83, #85, #86, #87, #88, #89, #90, #91, #92, #99,
+#101, #103, #104, #105). Tracking issue: #98.
 
 ### Behavior changes (Slack)
 
-- **`webhook_verifier` now takes precedence over `signing_secret`** (#108, vercel/chat#468, commit `0f0c203`). When a Slack adapter is constructed with both `webhook_verifier` and `signing_secret` (or with `webhook_verifier` while `SLACK_SIGNING_SECRET` is set in the env), the verifier wins and the signing-secret path is dropped entirely. This **reverses** the precedence the Python port shipped in 0.4.27 (PR #87), which preferred `signing_secret` to match upstream's intent at that time. Upstream reversed itself in vercel/chat#468 (`chat@4.29.0`) so an env-configured `SLACK_SIGNING_SECRET` could not silently shadow a verifier the caller wired up; this port now follows. **Migration:** if you relied on a configured `signing_secret` overriding `webhook_verifier`, drop the `webhook_verifier` from your `SlackAdapterConfig` (or, if you wired the verifier in deliberately, your signing-secret path is now correctly inert and you can remove it). The built-in HMAC + 5-minute timestamp tolerance only applies on the signing-secret path; verifier implementers remain responsible for replay protection (`slack/types.py` SECURITY contract).
+- **`webhook_verifier` now takes precedence over `signing_secret`** (vercel/chat#468, commit `0f0c203`). When a Slack adapter is constructed with both `webhook_verifier` and `signing_secret` (or with `webhook_verifier` while `SLACK_SIGNING_SECRET` is set in the env), the verifier wins and the signing-secret path is dropped entirely. This **reverses** the precedence the Python port shipped in 0.4.27 (PR #87), which preferred `signing_secret` to match upstream's intent at that time. Upstream reversed itself in vercel/chat#468 (`chat@4.29.0`) so an env-configured `SLACK_SIGNING_SECRET` could not silently shadow a verifier the caller wired up; this port now follows. **Migration:** if you relied on a configured `signing_secret` overriding `webhook_verifier`, drop the `webhook_verifier` from your `SlackAdapterConfig` (or, if you wired the verifier in deliberately, your signing-secret path is now correctly inert and you can remove it). The built-in HMAC + 5-minute timestamp tolerance only applies on the signing-secret path; verifier implementers remain responsible for replay protection (`slack/types.py` SECURITY contract).
+
+### Sync scope (37 substantive upstream commits between `f55378a..chat@4.29.0`)
+
+#### Core (`packages/chat`)
+
+- [ ] **`chat/ai` subpath for AI SDK utilities** (vercel/chat#492). New
+  public API surface: `createChatTools`, `toAiMessages` for LLM/agent
+  integration. Vercel AI SDK is TS-only; the Python equivalent needs a
+  design call (see open question). Likely the biggest single PR in the
+  wave.
+- [ ] **`queue-debounce` concurrency strategy** (vercel/chat#495). New
+  strategy beyond the existing `drop` / `queue` / `debounce` /
+  `concurrent`.
+- [ ] **Transcripts API + per-thread cache rename to `threadHistory`**
+  (vercel/chat#448). New API surface; the cache rename has chinchill-api
+  blast radius.
+- [ ] **`callbackUrl` on buttons and modals** (vercel/chat#454).
+- [ ] **`message.subject` + adapter client access** (vercel/chat#459).
+
+#### All adapters
+
+- [ ] **`adapter.client` rename → `adapter.octokit` / `adapter.linearClient`
+  / `adapter.webClient`** (vercel/chat#478). Public API rename across
+  all adapters; deprecation shims advisable for one release.
+- [x] **`private` → `protected` for subclassing** (vercel/chat#475).
+  Already addressed — Python convention uses `_underscore` (de-facto
+  protected); audit confirmed no `__name_mangled` internals across all
+  8 adapters. No work needed.
+
+#### Slack (`packages/adapter-slack`)
+
+- [ ] **Native `markdown_text` for outgoing messages** (vercel/chat#440).
+  Was listed as "deferred" in 0.4.27.
+- [ ] **External installation provider for bot token management**
+  (vercel/chat#467). Multi-workspace token mgmt extension.
+- [ ] **Flip `webhook_verifier > signing_secret` precedence**
+  (vercel/chat#468). Our 0.4.27 explicitly went the other direction
+  ("match upstream" intent, with comment). Upstream has since reversed
+  itself in #468. The comment on `adapter.py:385` is now stale; flip
+  precedence + refresh comment + update tests.
+- [ ] **Expose direct `WebClient` via `adapter.client`** (vercel/chat#471,
+  reverted in #472, reapplied in #476). Pairs with the #478 rename.
+
+#### Discord (`packages/adapter-discord`)
+
+- [ ] **Handle interactions in gateway-only mode** (vercel/chat#490).
+  Related to issue #57 (Discord native Gateway). Decide if Gateway
+  support lands in this wave or stays on a separate track.
+
+#### Telegram (`packages/adapter-telegram`)
+
+- [ ] **Typed attachment uploads** (vercel/chat#485). Bundled with
+  related Telegram polish.
+- [ ] **`video_note` (round video messages) in `extractAttachments`**
+  (vercel/chat#457).
+- [x] **MarkdownV2 entity safety trim to streaming chunks**
+  (vercel/chat#446). Already addressed in our 0.4.27 — the
+  `_trim_to_markdown_v2_safe_boundary` / `_find_unclosed_link_dest_open_bracket`
+  / `_slice_to_utf16_units` helpers from PR #89 cover this. No work
+  needed.
+
+#### Teams (`packages/adapter-teams`)
+
+- [ ] **Migrate to `microsoft-teams-apps` SDK** (issue #93). Replaces our
+  hand-rolled Bot Framework REST streaming with `ctx.stream.emit()`.
+  Requires Python 3.12 floor bump. Headline Teams change for this wave
+  (or 0.4.29.1 if the migration slips).
+
+#### New packages
+
+- [ ] **`@chat-adapter/messenger`** (vercel/chat#461). Brand-new Meta
+  Messenger Platform adapter. Similar scope to porting WhatsApp or
+  Telegram from scratch — own file tree under `src/chat_sdk/adapters/messenger/`,
+  full webhook / message / attachment surface, ~1,500 LOC estimate.
+- [⏭️] **`@chat-adapter/web`** (vercel/chat#444). Vue + Svelte browser
+  UI for chat-sdk bots. **Out of scope** — no browser runtime in
+  chat-sdk-python.
+- [ ] **`@chat-adapter/tests` test kit** (vercel/chat#470). Test
+  utilities for adapter authors. We already have an adapter-test
+  pattern; evaluate whether to mirror.
+
+#### Out of scope for this Python port
+
+- **`@chat-adapter/web`** as above.
+- **Documentation site changes** — `apps/docs/`, MDX refreshes, etc.
+- **Vercel-specific release/CI automation** (#465, #466, #511, #512,
+  #520).
+
+### Open questions (resolve before implementation)
+
+1. **`chat/ai` subpath — Python design.** Detailed scoping in design
+   issue (see below). Recommended shape: shared SDK-agnostic core in
+   `chat_sdk/ai/tools.py` + thin per-SDK adapters (Anthropic, OpenAI)
+   via optional extras (`chat-sdk-python[ai-anthropic]`,
+   `chat-sdk-python[ai-openai]`). 17 tool factories + the existing
+   `to_ai_messages` (already in `chat_sdk/ai.py`). ~7 engineer-days.
+   Three sub-questions: approval-flow contract, hand-written JSON
+   Schema vs Pydantic v2, ship OpenAI extras in first cut?
+2. **Messenger adapter (vercel/chat#461) — Python port.** Detailed
+   scoping in design issue (see below). Mirrors WhatsApp adapter
+   conventions; ~1,500 LOC prod + ~2,500 LOC tests; 2 PRs (scaffolding
+   then adapter); ~5–6 days. Three sub-questions: init-failure
+   semantics, postback `value` passthrough, signature-failure HTTP
+   status code (upstream returns 403, our other adapters return 401).
+3. **Cadence**: ship as one wave (4.27 → 4.29) or split into 0.4.28
+   then 0.4.29?
+4. **Python floor bump to 3.12** (required for Teams SDK migration —
+   issue #93). Confirm chinchill-api compatibility before committing.
+5. **Discord Gateway scope**: ship Gateway support in this wave
+   (issue #57) or keep gateway-only mode fix (vercel/chat#490)
+   isolated?
+6. **`adapter.client` rename**: ship deprecation shim for one release,
+   or hard cutover?
+
+### Workflow
+
+1. This alpha PR establishes the sync. CI on this draft is intentionally
+   not invoked (lint.yml is gated on `!github.event.pull_request.draft`).
+2. Each item above lands as its own PR. Each port PR:
+   - Updates the relevant `MAPPING` / fidelity coverage and removes its
+     entries from `scripts/fidelity_baseline.json` if previously baselined.
+   - Bumps lint.yml's pinned upstream ref to `chat@4.29.0` (the new tag)
+     once the first feature port lands.
+   - Adds an entry under the next CHANGELOG heading (`0.4.29a2`,
+     `0.4.29a3`, …).
+3. Once all items are ported (or explicitly documented as divergence in
+   `docs/UPSTREAM_SYNC.md`), the final PR cuts `0.4.29` and switches CI
+   back to strict fidelity at the upstream tag.
 
 ## 0.4.27 (2026-05-28)
 
