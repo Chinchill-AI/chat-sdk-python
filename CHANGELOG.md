@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.27.1 (2026-05-29)
+
+Python-only patch on the 0.4.27 line. No upstream version change; does NOT include the 0.4.29 alpha sync work.
+
+### Fixes
+
+- **Slack now surfaces `files_upload_v2` confirmation through `post()`** — `SlackAdapter._upload_files` already computed the list of Slack-confirmed file IDs but `post_message` discarded the return, and `ThreadImpl._create_sent_message` hardcoded `raw=None`, so the confirmation never reached `SentMessage.raw`. Slack was the only file-capable adapter to drop this; discord/telegram upload inline and expose the platform response naturally. `post_message` now augments `RawMessage.raw` with `"uploaded_file_ids"` on every return path that can carry files (file-only, card, table, text), and `ThreadImpl._create_sent_message` accepts and propagates the adapter's `raw` into `SentMessage.raw`. `None` means no upload occurred; an empty list signals Slack confirmed zero attachments. The `raw` payload is augmented, not replaced, so existing consumers are unaffected. Backported from #117 (which targets the 0.4.29 line). Unblocks chinchill gating UX on actual delivery success. Upstream convergence tracked in vercel/chat#564.
+
+### Test quality
+
+- Added 4 tests: three in `tests/test_slack_api.py` (file-only, text+files, text-only-no-augment paths) and one end-to-end `tests/test_thread_faithful.py` test verifying `post()` propagates `RawMessage.raw` to `SentMessage.raw`.
+
 ## 0.4.27 (2026-05-28)
 
 Synced to upstream `vercel/chat@4.27.0` (release commit `f55378a`, Apr 30 2026). Highlights: Slack Socket Mode + dynamic bot-token resolver, Teams native DM streaming, `chat.get_user()` across all 8 adapters, Telegram MarkdownV2 rendering, and a sweep of adapter bug fixes. Sets `UPSTREAM_PARITY = "4.27.0"`.

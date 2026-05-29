@@ -566,7 +566,7 @@ class ThreadImpl:
 
         postable: AdapterPostableMessage = message  # type: ignore[assignment]
         raw_msg = await self.adapter.post_message(self._id, postable)
-        result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id)
+        result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id, raw=raw_msg.raw)
 
         if self._message_history is not None:
             await self._message_history.append(self._id, _to_message(result))
@@ -1122,6 +1122,7 @@ class ThreadImpl:
         message_id: str,
         postable: AdapterPostableMessage,
         thread_id_override: str | None = None,
+        raw: Any = None,
     ) -> SentMessage:
         adapter = self.adapter
         thread_id = thread_id_override or self._id
@@ -1160,7 +1161,7 @@ class ThreadImpl:
             ),
             attachments=attachments,
             links=[],
-            raw=None,
+            raw=raw,
             _edit=_edit,
             _delete=_delete,
             _add_reaction=_add_reaction,

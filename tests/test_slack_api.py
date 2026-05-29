@@ -237,6 +237,63 @@ class TestPostMessage:
         assert len(client.get_calls("chat_postMessage")) == chat_post_calls_before
 
     @pytest.mark.asyncio
+    async def test_file_only_post_surfaces_confirmed_upload_ids(self):
+        """File-only post exposes Slack-confirmed file IDs on ``RawMessage.raw``."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "files_upload_v2",
+            {"ok": True, "files": [{"files": [{"id": "F1"}, {"id": "F2"}]}]},
+        )
+
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        msg = PostableMarkdown(
+            markdown="",
+            files=[FileUpload(data=b"hello", filename="test.txt")],
+        )
+        result = await adapter.post_message("slack:C123:1234567890.000000", msg)
+
+        assert isinstance(result.raw, dict)
+        assert result.raw["uploaded_file_ids"] == ["F1", "F2"]
+        # The original raw payload is preserved (augment, don't replace).
+        assert "files" in result.raw
+
+    @pytest.mark.asyncio
+    async def test_text_with_files_surfaces_confirmed_upload_ids(self):
+        """Text + files post augments the chat_postMessage raw with confirmed IDs."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.222222"})
+        client.set_response(
+            "files_upload_v2",
+            {"ok": True, "files": [{"files": [{"id": "F9"}]}]},
+        )
+
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        msg = PostableMarkdown(
+            markdown="here is the report",
+            files=[FileUpload(data=b"hello", filename="report.txt")],
+        )
+        result = await adapter.post_message("slack:C123:1234567890.000000", msg)
+
+        assert result.id == "1234567890.222222"
+        assert isinstance(result.raw, dict)
+        assert result.raw["uploaded_file_ids"] == ["F9"]
+        # The Slack chat_postMessage response is preserved alongside the IDs.
+        assert result.raw["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_text_only_post_does_not_add_uploaded_file_ids(self):
+        """Posts without files leave ``raw`` unaugmented (no ``uploaded_file_ids`` key)."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.333333"})
+
+        result = await adapter.post_message("slack:C123:1234567890.000000", "plain text")
+
+        assert isinstance(result.raw, dict)
+        assert "uploaded_file_ids" not in result.raw
+
+    @pytest.mark.asyncio
     async def test_file_upload_uses_channel_kwarg_not_channel_id(self):
         """Regression: slack-sdk's files_upload_v2 takes ``channel=``, not ``channel_id=``.
 
