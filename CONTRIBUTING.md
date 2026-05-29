@@ -5,7 +5,7 @@ Thanks for your interest in contributing! This guide covers the essentials.
 ## Dev Environment Setup
 
 ```bash
-# Clone and install (requires Python 3.10+ and uv)
+# Clone and install (requires Python 3.12+ and uv)
 git clone https://github.com/Chinchill-AI/chat-sdk-python.git
 cd chat-sdk-python
 uv sync --group dev
@@ -120,7 +120,7 @@ Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mappin
 
 ### What NOT to do
 
-- Don't publish without CI green on all 4 Python versions (3.10-3.13)
+- Don't publish without CI green on both Python versions (3.12, 3.13)
 - Don't skip the fidelity check for test changes
 - Don't use alpha tags for *final* sync releases — alpha tags (`0.4.26a1`) are
   only for work-in-progress ports while syncing a new upstream version
