@@ -507,8 +507,8 @@ class ThreadImpl:
         """Subscribe to future messages in this thread.
 
         Once subscribed, messages in non-DM threads trigger
-        :py:meth:`Chat.on_subscribed_message` handlers. DM threads route to
-        :py:meth:`Chat.on_direct_message` first when a direct message handler
+        :py:meth:`~chat_sdk.chat.Chat.on_subscribed_message` handlers. DM threads route to
+        :py:meth:`~chat_sdk.chat.Chat.on_direct_message` first when a direct message handler
         is registered. The initial message that triggered subscription will
         NOT fire the handler.
         """
