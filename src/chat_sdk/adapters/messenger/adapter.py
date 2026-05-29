@@ -287,7 +287,7 @@ class MessengerAdapter:
     def _handle_verification(self, request: Any) -> Any:
         """Handle the GET subscription challenge."""
         url = getattr(request, "url", "")
-        parsed = urlparse(url)
+        parsed = urlparse(str(url))
         params = parse_qs(parsed.query)
 
         mode = (params.get("hub.mode") or [None])[0]
@@ -301,7 +301,7 @@ class MessengerAdapter:
         self._logger.warn("Messenger webhook verification failed")
         return self._make_response("Forbidden", 403)
 
-    def _verify_signature(self, body: str, signature: str | None) -> bool:
+    def _verify_signature(self, body: bytes, signature: str | None) -> bool:
         """Verify the ``X-Hub-Signature-256`` header (HMAC-SHA256, App Secret).
 
         Format: ``sha256=<hex>``. Returns ``False`` on any malformed input.
@@ -325,7 +325,7 @@ class MessengerAdapter:
         try:
             computed_hex = hmac.new(
                 self._app_secret.encode("utf-8"),
-                body.encode("utf-8"),
+                body,
                 hashlib.sha256,
             ).hexdigest()
             # Compare hex strings directly. The signature is presented as a
@@ -854,6 +854,8 @@ class MessengerAdapter:
                 method="GET",
                 query_params={"fields": "first_name,last_name,profile_pic"},
             )
+            if not isinstance(profile, dict):
+                return {"id": user_id}
             self._user_profile_cache[user_id] = profile
             return cast(MessengerUserProfile, profile)
         except Exception:
@@ -1033,23 +1035,32 @@ class MessengerAdapter:
     # =========================================================================
 
     @staticmethod
-    async def _get_request_body(request: Any) -> str:
-        """Extract body text from a request object (sync or async)."""
-        text_attr = getattr(request, "text", None)
-        if text_attr is not None:
-            if callable(text_attr):
-                result = text_attr()
-                text_attr = await result if inspect.isawaitable(result) else result
-            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
+    async def _get_request_body(request: Any) -> bytes:
+        """Extract the raw request body as bytes (sync or async).
+
+        Returned as raw bytes so signature verification operates on the exact
+        wire bytes Meta signed. Any encode/decode round-trip risks replacement
+        characters or altered code points and breaks HMAC parity.
+        """
         body = getattr(request, "body", None)
         if body is not None:
             if callable(body):
                 result = body()
                 body = await result if inspect.isawaitable(result) else result
             if isinstance(body, (bytes, bytearray)):
-                return body.decode("utf-8")
-            return str(body)
-        return ""
+                return bytes(body)
+            if isinstance(body, str):
+                return body.encode("utf-8")
+        text_attr = getattr(request, "text", None)
+        if text_attr is not None:
+            if callable(text_attr):
+                result = text_attr()
+                text_attr = await result if inspect.isawaitable(result) else result
+            if isinstance(text_attr, (bytes, bytearray)):
+                return bytes(text_attr)
+            if isinstance(text_attr, str):
+                return text_attr.encode("utf-8")
+        return b""
 
     @staticmethod
     def _get_header(request: Any, name: str) -> str | None:

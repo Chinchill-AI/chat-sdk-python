@@ -451,6 +451,30 @@ class TestFetchThreadAndChannel:
         # Second call hits the cache — no extra API call.
         assert adapter._graph_api_fetch.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_non_dict_profile_response_falls_back(self) -> None:
+        """A successful Graph API call that returns a non-mapping must not poison the cache.
+
+        ``_graph_api_fetch`` is typed loosely and could in principle yield
+        ``None`` or a list (e.g. an API shape change, a stubbed test, a
+        proxy returning an array). Without the ``isinstance(profile, dict)``
+        guard, ``_profile_display_name`` then calls ``.get`` on whatever
+        came back and raises ``AttributeError``, and the next call hits the
+        same poisoned cache entry. Verify (a) the minimal ``{"id": uid}``
+        fallback is returned, and (b) the cache stays empty.
+        """
+        adapter = _make_adapter()
+        adapter._graph_api_fetch = AsyncMock(return_value=None)
+        info = await adapter.fetch_thread(THREAD_ID)
+        assert info.channel_name == RECIPIENT_ID
+        assert RECIPIENT_ID not in adapter._user_profile_cache
+
+        # Same again for a list, to pin the dict-only contract.
+        adapter._graph_api_fetch = AsyncMock(return_value=[{"id": RECIPIENT_ID}])
+        info = await adapter.fetch_thread(THREAD_ID)
+        assert info.channel_name == RECIPIENT_ID
+        assert RECIPIENT_ID not in adapter._user_profile_cache
+
 
 # ---------------------------------------------------------------------------
 # Message fetching / pagination

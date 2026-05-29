@@ -84,9 +84,10 @@ class _FakeRequest:
         return self._body
 
 
-def _sign(body: str, secret: str = APP_SECRET) -> str:
+def _sign(body: bytes | str, secret: str = APP_SECRET) -> str:
     """Compute the X-Hub-Signature-256 header value for ``body``."""
-    return "sha256=" + hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
+    return "sha256=" + hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
 
 
 def _sample_event(**overrides: Any) -> dict[str, Any]:
@@ -333,34 +334,34 @@ class TestVerifySignature:
 
     def test_valid_signature_accepted(self) -> None:
         adapter = _make_adapter(app_secret="my-secret")
-        body = '{"test": true}'
-        sig = "sha256=" + hmac.new(b"my-secret", body.encode("utf-8"), hashlib.sha256).hexdigest()
+        body = b'{"test": true}'
+        sig = "sha256=" + hmac.new(b"my-secret", body, hashlib.sha256).hexdigest()
         assert adapter._verify_signature(body, sig) is True
 
     def test_invalid_signature_rejected(self) -> None:
         adapter = _make_adapter(app_secret="my-secret")
-        assert adapter._verify_signature('{"a":1}', "sha256=deadbeef") is False
+        assert adapter._verify_signature(b'{"a":1}', "sha256=deadbeef") is False
 
     def test_missing_signature_rejected(self) -> None:
         adapter = _make_adapter()
-        assert adapter._verify_signature("body", None) is False
+        assert adapter._verify_signature(b"body", None) is False
 
     def test_empty_signature_rejected(self) -> None:
         adapter = _make_adapter()
-        assert adapter._verify_signature("body", "") is False
+        assert adapter._verify_signature(b"body", "") is False
 
     def test_wrong_algo_rejected(self) -> None:
         adapter = _make_adapter()
-        assert adapter._verify_signature("body", "sha1=abcdef") is False
+        assert adapter._verify_signature(b"body", "sha1=abcdef") is False
 
     def test_missing_hash_after_algo_rejected(self) -> None:
         adapter = _make_adapter()
-        assert adapter._verify_signature("body", "sha256=") is False
+        assert adapter._verify_signature(b"body", "sha256=") is False
 
     def test_signature_without_equals_rejected(self) -> None:
         adapter = _make_adapter()
         # No "=" separator at all is malformed.
-        assert adapter._verify_signature("body", "abc123") is False
+        assert adapter._verify_signature(b"body", "abc123") is False
 
     def test_signature_with_wrong_secret_rejected(self) -> None:
         """A signature computed with the wrong key must not validate.
@@ -369,8 +370,8 @@ class TestVerifySignature:
         even with a valid-looking sha256 hex shape, mismatching HMAC fails.
         """
         adapter = _make_adapter(app_secret="real-secret")
-        body = '{"x":1}'
-        forged = "sha256=" + hmac.new(b"other-secret", body.encode("utf-8"), hashlib.sha256).hexdigest()
+        body = b'{"x":1}'
+        forged = "sha256=" + hmac.new(b"other-secret", body, hashlib.sha256).hexdigest()
         assert adapter._verify_signature(body, forged) is False
 
     def test_replay_with_modified_body_rejected(self) -> None:
@@ -381,11 +382,111 @@ class TestVerifySignature:
         signed, so any change to the body invalidates the signature.
         """
         adapter = _make_adapter()
-        original_body = json.dumps(_webhook_payload([_sample_event()]))
+        original_body = json.dumps(_webhook_payload([_sample_event()])).encode("utf-8")
         sig = _sign(original_body)
         # Same signature, body mutated (e.g. attacker injects another event).
-        mutated_body = json.dumps(_webhook_payload([_sample_event(), _sample_event()]))
+        mutated_body = json.dumps(_webhook_payload([_sample_event(), _sample_event()])).encode("utf-8")
         assert adapter._verify_signature(mutated_body, sig) is False
+
+    def test_verifies_raw_bytes_without_encoding_roundtrip(self) -> None:
+        """Signature must be checked against the exact wire bytes.
+
+        Meta signs the raw HTTP request body. If the adapter re-encodes the
+        body (decode-to-str then encode-back-to-bytes) before HMAC, any byte
+        sequence that's not valid UTF-8 gets replaced with U+FFFD and the
+        computed HMAC diverges from Meta's — legitimate webhooks would fail
+        verification. This regression pins the contract: feed a body whose
+        bytes don't round-trip through UTF-8 cleanly, and verification still
+        succeeds when the signature was computed over the original bytes.
+        """
+        adapter = _make_adapter(app_secret="my-secret")
+        # Lone continuation byte (0x80) — invalid UTF-8. A decode+re-encode
+        # round-trip via "utf-8" with errors="replace" would mutate this to
+        # the 3-byte U+FFFD sequence, breaking HMAC parity.
+        body = b'{"data":"\x80\xff"}'
+        assert body.decode("utf-8", errors="replace").encode("utf-8") != body
+        sig = "sha256=" + hmac.new(b"my-secret", body, hashlib.sha256).hexdigest()
+        assert adapter._verify_signature(body, sig) is True
+
+
+class TestGetRequestBody:
+    """Pin that ``_get_request_body`` returns raw bytes.
+
+    The function feeds ``_verify_signature``; switching its return type
+    would silently re-introduce the decode/re-encode hazard. These tests
+    cover the four frameworks-shaped inputs the helper supports
+    (bytes/str ``body`` attribute, bytes/str ``text`` attribute, async or
+    sync callables) and pin the bytes contract on each path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bytes_body_attribute_returned_unchanged(self) -> None:
+        adapter = _make_adapter()
+        raw = b'{"x":"\x80\xff"}'
+
+        class Req:
+            body = raw
+
+        result = await adapter._get_request_body(Req())
+        assert result == raw
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_str_body_attribute_encoded_utf8(self) -> None:
+        adapter = _make_adapter()
+
+        class Req:
+            body = '{"hello": "world"}'
+
+        result = await adapter._get_request_body(Req())
+        assert result == b'{"hello": "world"}'
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_async_callable_body_returns_bytes(self) -> None:
+        """Mirrors Starlette/FastAPI: ``await request.body()`` returns bytes."""
+        adapter = _make_adapter()
+        raw = b'{"async": true}'
+
+        async def body() -> bytes:
+            return raw
+
+        class Req:
+            pass
+
+        req = Req()
+        req.body = body  # type: ignore[attr-defined]
+        result = await adapter._get_request_body(req)
+        assert result == raw
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_text_attribute_fallback_returns_bytes(self) -> None:
+        """aiohttp-style: ``await request.text()`` returns str — encode it."""
+        adapter = _make_adapter()
+
+        async def text() -> str:
+            return '{"text": "ok"}'
+
+        class Req:
+            pass
+
+        req = Req()
+        req.text = text  # type: ignore[attr-defined]
+        result = await adapter._get_request_body(req)
+        assert result == b'{"text": "ok"}'
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_missing_body_returns_empty_bytes(self) -> None:
+        adapter = _make_adapter()
+
+        class Req:
+            pass
+
+        result = await adapter._get_request_body(Req())
+        assert result == b""
+        assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------
