@@ -32,6 +32,7 @@ from chat_sdk.shared.errors import (
     AuthenticationError,
     ValidationError,
 )
+from chat_sdk.types import Attachment, FileUpload, PostableMarkdown, PostableRaw
 
 # =============================================================================
 # Helpers
@@ -162,6 +163,239 @@ class TestPostMessageParseMode:
 
         payload = adapter.telegram_fetch.call_args[0][1]
         assert payload.get("parse_mode") == "MarkdownV2"
+
+
+# =============================================================================
+# Tests -- typed attachment uploads (vercel/chat#485)
+# =============================================================================
+
+
+def _form_fields(form_data: Any) -> dict[str, Any]:
+    """Map a non-binary aiohttp.FormData field name -> string value."""
+    fields: dict[str, Any] = {}
+    for type_options, _headers, value in form_data._fields:
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            fields[type_options["name"]] = value
+    return fields
+
+
+def _form_binary_field(form_data: Any, name: str) -> tuple[Any, str | None, str | None]:
+    """Return (value, filename, content_type) for a binary FormData field."""
+    for type_options, headers, value in form_data._fields:
+        if type_options["name"] == name:
+            return value, type_options.get("filename"), headers.get("Content-Type")
+    raise AssertionError(f"FormData field {name!r} not found")
+
+
+class TestPostMessageTypedAttachmentUploads:
+    """post_message routes typed attachments to the per-type Telegram method."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("attachment_type", "field", "method", "mime_type", "name"),
+        [
+            ("image", "photo", "sendPhoto", "image/png", "image.png"),
+            ("audio", "audio", "sendAudio", "audio/mpeg", "track.mp3"),
+            ("video", "video", "sendVideo", "video/mp4", "clip.mp4"),
+            ("file", "document", "sendDocument", "application/pdf", "report.pdf"),
+        ],
+    )
+    async def test_typed_attachment_selects_method(
+        self,
+        attachment_type: str,
+        field: str,
+        method: str,
+        mime_type: str,
+        name: str,
+    ):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableMarkdown(
+                markdown="attached **media**",
+                attachments=[
+                    Attachment(
+                        type=attachment_type,  # type: ignore[arg-type]
+                        data=b"payload",
+                        mime_type=mime_type,
+                        name=name,
+                        width=1280 if attachment_type == "video" else None,
+                        height=720 if attachment_type == "video" else None,
+                    )
+                ],
+            ),
+        )
+
+        called_method = adapter.telegram_fetch.call_args[0][0]
+        form_data = adapter.telegram_fetch.call_args[0][1]
+        assert called_method == method
+
+        fields = _form_fields(form_data)
+        assert fields["chat_id"] == CHAT_ID
+        assert fields["caption"] == "attached *media*"
+        assert fields["parse_mode"] == "MarkdownV2"
+
+        value, filename, content_type = _form_binary_field(form_data, field)
+        assert value == b"payload"
+        assert filename == name
+        assert content_type == mime_type
+
+        if attachment_type == "video":
+            assert fields["width"] == "1280"
+            assert fields["height"] == "720"
+        else:
+            assert "width" not in fields
+            assert "height" not in fields
+
+    @pytest.mark.asyncio
+    async def test_attachment_loaded_through_fetch_data(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        fetch_data = AsyncMock(return_value=b"payload")
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableRaw(
+                raw="",
+                attachments=[
+                    Attachment(
+                        type="file",
+                        mime_type="application/pdf",
+                        name="report.pdf",
+                        fetch_data=fetch_data,
+                    )
+                ],
+            ),
+        )
+
+        fetch_data.assert_awaited_once()
+        method = adapter.telegram_fetch.call_args[0][0]
+        form_data = adapter.telegram_fetch.call_args[0][1]
+        assert method == "sendDocument"
+        fields = _form_fields(form_data)
+        # ``raw=""`` ships verbatim with no caption / parse_mode.
+        assert "caption" not in fields
+        assert "parse_mode" not in fields
+        value, _filename, _content_type = _form_binary_field(form_data, "document")
+        assert value == b"payload"
+
+    @pytest.mark.asyncio
+    async def test_url_only_attachment_uses_url_field(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableMarkdown(
+                markdown="public **image**",
+                attachments=[
+                    Attachment(
+                        type="image",
+                        mime_type="image/png",
+                        name="image.png",
+                        url="https://cdn.example.com/image.png",
+                    )
+                ],
+            ),
+        )
+
+        method = adapter.telegram_fetch.call_args[0][0]
+        payload = adapter.telegram_fetch.call_args[0][1]
+        assert method == "sendPhoto"
+        # URL-only attachments ship as a JSON dict, not multipart FormData.
+        assert isinstance(payload, dict)
+        assert payload["chat_id"] == CHAT_ID
+        assert payload["photo"] == "https://cdn.example.com/image.png"
+        assert payload["caption"] == "public *image*"
+        assert payload["parse_mode"] == "MarkdownV2"
+
+    @pytest.mark.asyncio
+    async def test_url_only_video_attachment_includes_dimensions(self):
+        # Edge case beyond the upstream URL test: video width/height ride
+        # along on the JSON URL path too.
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableMarkdown(
+                markdown="clip",
+                attachments=[
+                    Attachment(
+                        type="video",
+                        url="https://cdn.example.com/clip.mp4",
+                        width=1280,
+                        height=720,
+                    )
+                ],
+            ),
+        )
+
+        method = adapter.telegram_fetch.call_args[0][0]
+        payload = adapter.telegram_fetch.call_args[0][1]
+        assert method == "sendVideo"
+        assert payload["video"] == "https://cdn.example.com/clip.mp4"
+        assert payload["width"] == 1280
+        assert payload["height"] == 720
+
+    @pytest.mark.asyncio
+    async def test_rejects_multiple_attachments(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        with pytest.raises(ValidationError, match="single attachment upload"):
+            await adapter.post_message(
+                THREAD_ID,
+                PostableRaw(
+                    raw="attachments",
+                    attachments=[
+                        Attachment(type="image", data=b"one"),
+                        Attachment(type="image", data=b"two"),
+                    ],
+                ),
+            )
+
+        adapter.telegram_fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_mixed_files_and_attachments(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        with pytest.raises(ValidationError, match="mixing file uploads and attachments"):
+            await adapter.post_message(
+                THREAD_ID,
+                PostableRaw(
+                    raw="mixed",
+                    attachments=[Attachment(type="image", data=b"one")],
+                    files=[FileUpload(data=b"two", filename="two.txt")],
+                ),
+            )
+
+        adapter.telegram_fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_attachment_without_data_or_url(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        with pytest.raises(ValidationError, match="Attachment data or URL required for image"):
+            await adapter.post_message(
+                THREAD_ID,
+                PostableRaw(raw="", attachments=[Attachment(type="image")]),
+            )
+
+        adapter.telegram_fetch.assert_not_called()
 
 
 # =============================================================================

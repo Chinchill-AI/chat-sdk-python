@@ -319,6 +319,71 @@ class TestTelegramParseMessageAttachments:
         assert parsed.attachments[0].height == 1080
         assert parsed.attachments[0].mime_type == "video/mp4"
 
+    def test_video_note_attachment(self):
+        # Port of vercel/chat#457: round video messages (video_note) extract
+        # as a "video" attachment with width/height set to the clip's length.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            video_note={
+                "file_id": "vn1",
+                "file_unique_id": "uvn1",
+                "length": 240,
+                "duration": 10,
+                "file_size": 512000,
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.type == "video"
+        assert attachment.width == 240
+        assert attachment.height == 240
+        assert attachment.size == 512000
+
+    def test_video_note_attachment_stores_file_id(self):
+        # video_note must round-trip its file_id into fetch_metadata so the
+        # lazy download closure can be rebuilt after serialization.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            video_note={"file_id": "vn2", "file_unique_id": "uvn2", "length": 120},
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "vn2"}
+
+    def test_video_note_attachment_without_optional_fields(self):
+        # Edge case not covered upstream: video_note with no length and no
+        # file_size must still extract a video attachment without raising,
+        # leaving width/height/size as None.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            video_note={"file_id": "vn3", "file_unique_id": "uvn3"},
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.type == "video"
+        assert attachment.width is None
+        assert attachment.height is None
+        assert attachment.size is None
+
+    def test_video_note_attachment_zero_length(self):
+        # Edge case not covered upstream: a zero length must propagate as
+        # width/height == 0 (not be dropped by a truthiness check).
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            video_note={"file_id": "vn4", "file_unique_id": "uvn4", "length": 0},
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.width == 0
+        assert attachment.height == 0
+
 
 # ---------------------------------------------------------------------------
 # applyTelegramEntities (complementary to existing tests)

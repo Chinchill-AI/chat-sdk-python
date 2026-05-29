@@ -1,6 +1,10 @@
 """Shared utilities for chat SDK adapters."""
 
-from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.adapter_utils import (
+    extract_card,
+    extract_files,
+    extract_postable_attachments,
+)
 from chat_sdk.shared.base_format_converter import BaseFormatConverter
 from chat_sdk.shared.buffer_utils import (
     buffer_to_data_uri,
@@ -67,6 +71,7 @@ __all__ = [
     "escape_table_cell",
     "extract_card",
     "extract_files",
+    "extract_postable_attachments",
     "map_button_style",
     "mock_logger",
     "parse_markdown",

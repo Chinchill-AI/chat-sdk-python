@@ -48,7 +48,11 @@ from chat_sdk.adapters.telegram.types import (
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.adapter_utils import (
+    extract_card,
+    extract_files,
+    extract_postable_attachments,
+)
 from chat_sdk.shared.card_utils import card_to_fallback_text
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
@@ -90,6 +94,14 @@ TELEGRAM_SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"  # pragma: allo
 MESSAGE_ID_PATTERN = re.compile(r"^([^:]+):(\d+)$")
 TELEGRAM_MARKDOWN_PARSE_MODE = "MarkdownV2"
 MESSAGE_SEQUENCE_PATTERN = re.compile(r":(\d+)$")
+# Map a normalized Attachment.type to the Telegram Bot API media method and
+# its multipart form field. Port of upstream ATTACHMENT_UPLOADS (vercel/chat#485).
+ATTACHMENT_UPLOADS: dict[str, dict[str, str]] = {
+    "audio": {"field": "audio", "method": "sendAudio"},
+    "file": {"field": "document", "method": "sendDocument"},
+    "image": {"field": "photo", "method": "sendPhoto"},
+    "video": {"field": "video", "method": "sendVideo"},
+}
 LEADING_AT_PATTERN = re.compile(r"^@+")
 EMOJI_PLACEHOLDER_PATTERN = re.compile(r"^\{\{emoji:([a-z0-9_]+)\}\}$", re.IGNORECASE)
 EMOJI_NAME_PATTERN = re.compile(r"^[a-z0-9_+-]+$", re.IGNORECASE)
@@ -1208,6 +1220,19 @@ class TelegramAdapter:
                 "Telegram adapter supports a single file upload per message",
             )
 
+        attachments = extract_postable_attachments(message)
+        if len(attachments) > 1:
+            raise ValidationError(
+                "telegram",
+                "Telegram adapter supports a single attachment upload per message",
+            )
+
+        if files and attachments:
+            raise ValidationError(
+                "telegram",
+                "Telegram adapter does not support mixing file uploads and attachments in one message",
+            )
+
         raw_message: TelegramMessage
 
         if len(files) == 1:
@@ -1215,6 +1240,17 @@ class TelegramAdapter:
             if not file:
                 raise ValidationError("telegram", "File upload payload is empty")
             raw_message = await self.send_document(parsed_thread, file, text, reply_markup, parse_mode)
+        elif len(attachments) == 1:
+            attachment = attachments[0]
+            if not attachment:
+                raise ValidationError("telegram", "Attachment upload payload is empty")
+            raw_message = await self.send_attachment(
+                parsed_thread,
+                attachment,
+                text,
+                reply_markup,
+                parse_mode,
+            )
         else:
             if not text.strip():
                 raise ValidationError("telegram", "Message text cannot be empty")
@@ -1711,6 +1747,22 @@ class TelegramAdapter:
                 )
             )
 
+        # Round video messages (video_note) are a distinct Telegram field
+        # from `video`. Port of vercel/chat#457: extract them as a "video"
+        # attachment with width/height set to the clip's `length`.
+        video_note = raw.get("video_note")
+        if video_note:
+            length = video_note.get("length")
+            attachments.append(
+                self.create_attachment(
+                    "video",
+                    video_note["file_id"],
+                    size=video_note.get("file_size"),
+                    width=length,
+                    height=length,
+                )
+            )
+
         return attachments
 
     def create_attachment(
@@ -1831,6 +1883,93 @@ class TelegramAdapter:
             form_data.add_field("reply_markup", json.dumps(reply_markup))
 
         return await self.telegram_fetch("sendDocument", form_data)
+
+    async def send_attachment(
+        self,
+        thread: TelegramThreadId,
+        attachment: Attachment,
+        text: str,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+    ) -> TelegramMessage:
+        """Send a typed attachment using the Telegram media method for its type.
+
+        Port of upstream ``sendAttachment`` (vercel/chat#485). Selects
+        ``sendPhoto``/``sendAudio``/``sendVideo``/``sendDocument`` based on
+        :data:`ATTACHMENT_UPLOADS`. Binary payloads (``data`` or ``fetch_data``)
+        are sent as multipart uploads; URL-only attachments are passed through
+        as a Telegram URL field (must be a public URL Telegram can fetch).
+        """
+        import aiohttp
+
+        upload = ATTACHMENT_UPLOADS[attachment.type]
+
+        data = attachment.data
+        if data is None and attachment.fetch_data is not None:
+            data = await attachment.fetch_data()
+
+        if data is None and not attachment.url:
+            raise ValidationError(
+                "telegram",
+                f"Attachment data or URL required for {attachment.type}",
+            )
+
+        if data is None:
+            payload: dict[str, Any] = {
+                "chat_id": thread.chat_id,
+                upload["field"]: attachment.url,
+            }
+
+            if isinstance(thread.message_thread_id, int):
+                payload["message_thread_id"] = thread.message_thread_id
+
+            if text.strip():
+                payload["caption"] = self.truncate_caption(text, parse_mode)
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
+
+            if attachment.type == "video":
+                if isinstance(attachment.width, int):
+                    payload["width"] = attachment.width
+                if isinstance(attachment.height, int):
+                    payload["height"] = attachment.height
+
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+
+            return await self.telegram_fetch(upload["method"], payload)
+
+        if isinstance(data, memoryview) or not isinstance(data, bytes):
+            data = bytes(data)
+
+        form_data = aiohttp.FormData()
+        form_data.add_field("chat_id", thread.chat_id)
+
+        if isinstance(thread.message_thread_id, int):
+            form_data.add_field("message_thread_id", str(thread.message_thread_id))
+
+        if text.strip():
+            form_data.add_field("caption", self.truncate_caption(text, parse_mode))
+            if parse_mode:
+                form_data.add_field("parse_mode", parse_mode)
+
+        if attachment.type == "video":
+            if isinstance(attachment.width, int):
+                form_data.add_field("width", str(attachment.width))
+            if isinstance(attachment.height, int):
+                form_data.add_field("height", str(attachment.height))
+
+        form_data.add_field(
+            upload["field"],
+            data,
+            filename=attachment.name or "attachment",
+            content_type=attachment.mime_type or "application/octet-stream",
+        )
+
+        if reply_markup:
+            form_data.add_field("reply_markup", json.dumps(reply_markup))
+
+        return await self.telegram_fetch(upload["method"], form_data)
 
     # -- Message caching -----------------------------------------------------
 
