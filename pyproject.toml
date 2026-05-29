@@ -18,7 +18,7 @@ keywords = [
 ]
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -26,8 +26,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Communications",
@@ -99,11 +97,19 @@ include = [
 asyncio_mode = "auto"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "SIM", "UP"]
+# Modernization of pre-3.12 patterns is deferred to follow-up PRs; the 3.12
+# floor bump itself doesn't rewrite call sites. Re-enable these as the
+# codebase is migrated.
+ignore = [
+    "UP017",  # datetime.timezone.utc → datetime.UTC (3.11+)
+    "UP040",  # TypeAlias → PEP 695 `type` keyword (3.12+)
+    "UP041",  # asyncio.TimeoutError → builtins TimeoutError (3.11+)
+]
 
 [dependency-groups]
 dev = [
@@ -132,7 +138,7 @@ project-excludes = ["**/__pycache__", "**/.pytest_cache"]
 disable-project-excludes-heuristics = true
 use-ignore-files = false
 
-python-version = "3.10"
+python-version = "3.12"
 python-platform = "linux"
 
 # Optional adapter deps that aren't in the default install. Treating them as
