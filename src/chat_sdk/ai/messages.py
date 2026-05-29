@@ -1,6 +1,6 @@
 """Convert chat Messages to AI SDK format.
 
-Python port of ai.ts.
+Python port of ``ai/messages.ts``.
 """
 
 from __future__ import annotations
