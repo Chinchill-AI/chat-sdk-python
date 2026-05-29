@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.29a3 (unreleased)
+
+### Documentation alignment
+
+- **DM routing precedence docstrings** (vercel/chat#491, commit `67c1794`). The Python runtime already routed direct messages to `on_direct_message` handlers before subscribed-message, mention, and pattern handlers (`Chat._handle_incoming_message`, `chat.py:2154`), but `on_direct_message` and `Thread.subscribe` lacked docstrings clarifying that contract. Refreshed both to match upstream's #491 docstring rewrite, plus a new `tests/integration/test_dm_flow.py::TestDMRoutingDocs` group and a `test_dm_handler_runs_before_pattern_handler` regression test that pin the documented precedence (DM > pattern) the previous suite did not explicitly cover. No runtime behavior change.
+
+> Version bump from `0.4.29a2` to `0.4.29a3` will be cut by a coordinating PR once the parallel 4.29 ports land; this entry intentionally leaves `pyproject.toml` unchanged.
+
 ## 0.4.29a2 (2026-05-28)
 
 Python-only fix. No upstream version change.
