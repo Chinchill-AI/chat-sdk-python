@@ -191,7 +191,7 @@ from chat_sdk.types import (
 )
 
 # The upstream Vercel Chat version this release is synced to.
-UPSTREAM_PARITY = "4.27.0"
+UPSTREAM_PARITY = "4.29.0"
 
 __all__ = [
     "UPSTREAM_PARITY",
