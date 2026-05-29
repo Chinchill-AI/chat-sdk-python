@@ -200,7 +200,7 @@ The Python module layout mirrors the TS package layout:
 These must stay structurally identical to the TS SDK:
 
 - **Type definitions** (`types.py`): All dataclass shapes, protocol methods, and event types must match TS. This is the interop contract.
-- **Concurrency strategies** (`chat.py`): The drop/queue/debounce/concurrent logic, lock TTLs, and dedup keys must produce identical behavior.
+- **Concurrency strategies** (`chat.py`): The drop/queue/debounce/burst/concurrent logic, lock TTLs, and dedup keys must produce identical behavior.
 - **Card element types** (`cards.py`): The TypedDict shapes must match TS so that platform card renderers produce the same output.
 - **Thread ID encoding/decoding**: Each adapter's `encode_thread_id` / `decode_thread_id` must produce the same strings as TS for cross-language state sharing.
 - **State key prefixes**: `thread-state:`, `channel-state:`, `dedupe:`, `modal-context:` must match.

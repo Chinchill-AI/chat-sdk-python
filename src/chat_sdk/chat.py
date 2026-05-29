@@ -1821,7 +1821,7 @@ class Chat:
             await self._handle_concurrent(adapter, thread_id, message)
             return
 
-        if strategy in ("queue", "debounce"):
+        if strategy in ("queue", "debounce", "burst"):
             await self._handle_queue_or_debounce(adapter, thread_id, lock_key, message, strategy)
             return
 
@@ -1963,6 +1963,35 @@ class Chat:
                     },
                 )
                 await self._debounce_loop(lock, adapter, thread_id, lock_key)
+            elif strategy == "burst":
+                # Burst: enqueue the first message, sleep `debounce_ms` so any
+                # messages arriving during the window are queued alongside it,
+                # then drain like ``queue`` -- the latest message is dispatched
+                # with the earlier ones in ``context.skipped``.
+                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                await self._state_adapter.enqueue(
+                    lock_key,
+                    QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
+                    max_queue_size,
+                )
+                self._logger.info(
+                    "message-debouncing",
+                    {
+                        "thread_id": thread_id,
+                        "lock_key": lock_key,
+                        "message_id": message.id,
+                        "debounce_ms": debounce_ms,
+                    },
+                )
+                await _sleep(debounce_ms)
+                extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
+                if not extended:
+                    self._logger.warn(
+                        "Lock lost during burst window, aborting",
+                        {"thread_id": thread_id, "lock_key": lock_key},
+                    )
+                    return
+                await self._drain_queue(lock, adapter, thread_id, lock_key)
             else:
                 await self._dispatch_to_handlers(adapter, thread_id, message)
                 await self._drain_queue(lock, adapter, thread_id, lock_key)

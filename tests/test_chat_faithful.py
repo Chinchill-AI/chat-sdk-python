@@ -3128,6 +3128,318 @@ class TestConcurrencyDebounce:
 
 
 # ============================================================================
+# 20b. concurrency: burst (vercel/chat#495)
+# ============================================================================
+
+
+class TestConcurrencyBurst:
+    """Faithful port of TS ``describe("concurrency: burst")`` (vercel/chat#495).
+
+    ``burst`` waits ``debounce_ms`` before the first handler so messages that
+    arrive during the window coalesce into a single dispatch (with the earlier
+    messages in ``context.skipped``). Subsequent bursts that arrive while the
+    handler is running drain like ``queue``.
+
+    TS uses ``vi.useFakeTimers()``; the Python port uses a short real
+    ``debounce_ms`` and ``asyncio.sleep`` because we have no fake-timer
+    framework wired into chat-sdk tests yet (matches the style used by the
+    existing ``TestConcurrencyDebounce`` tests above).
+    """
+
+    # TS: "should collapse an idle burst into the latest message with skipped context"
+    async def test_should_collapse_an_idle_burst_into_the_latest_message_with_skipped_context(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=80),
+        )
+
+        received_messages: list[str] = []
+        received_contexts: list[MessageContext | None] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_messages.append(message.text)
+            received_contexts.append(context)
+
+        # First message acquires lock and enters the burst window.
+        msg1 = create_test_message("msg-burst-1", "Hey @slack-bot first")
+        task = asyncio.create_task(chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg1))
+
+        # Let the event loop hand control to the burst window
+        await asyncio.sleep(0.005)
+
+        # Two more messages arrive during the window -- they should be enqueued
+        # behind the first and end up in ``context.skipped`` while the latest
+        # (msg3) becomes the message dispatched to the handler.
+        msg2 = create_test_message("msg-burst-2", "Hey @slack-bot second")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg2)
+        msg3 = create_test_message("msg-burst-3", "Hey @slack-bot third")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg3)
+
+        # No handler call yet -- still inside the burst window
+        assert received_messages == []
+
+        await task
+
+        assert received_messages == ["Hey @slack-bot third"]
+        assert received_contexts[0] is not None
+        assert [m.text for m in received_contexts[0].skipped] == [
+            "Hey @slack-bot first",
+            "Hey @slack-bot second",
+        ]
+        assert received_contexts[0].total_since_last_handler == 3
+
+    # TS: "should process a lone idle message after the debounce window"
+    async def test_should_process_a_lone_idle_message_after_the_debounce_window(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=50),
+        )
+
+        received_messages: list[str] = []
+        received_contexts: list[MessageContext | None] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_messages.append(message.text)
+            received_contexts.append(context)
+
+        msg = create_test_message("msg-burst-solo", "Hey @slack-bot solo")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        assert received_messages == ["Hey @slack-bot solo"]
+        # The lone message is itself drained as the "latest", with an empty
+        # skipped list and total_since_last_handler == 1.
+        assert received_contexts[0] is not None
+        assert received_contexts[0].skipped == []
+        assert received_contexts[0].total_since_last_handler == 1
+
+    # TS: "should drain messages that arrive while the debounced handler is running"
+    async def test_should_drain_messages_that_arrive_while_the_debounced_handler_is_running(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=40),
+        )
+
+        received_messages: list[str] = []
+        received_contexts: list[MessageContext | None] = []
+        release_second_handler: asyncio.Event = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_messages.append(message.text)
+            received_contexts.append(context)
+            if message.id == "msg-burst-drain-2":
+                # Hold the handler open so msgs 3 and 4 land while we're busy
+                await release_second_handler.wait()
+
+        first_task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-burst-drain-1", "Hey @slack-bot first"),
+            )
+        )
+        await asyncio.sleep(0.005)
+
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-drain-2", "Hey @slack-bot second"),
+        )
+
+        # Wait until the burst window has elapsed and the handler has been
+        # invoked with msg2 (it parks on ``release_second_handler``).
+        for _ in range(200):
+            if received_messages == ["Hey @slack-bot second"]:
+                break
+            await asyncio.sleep(0.005)
+
+        assert received_messages == ["Hey @slack-bot second"]
+
+        # While the handler is parked, msg3 and msg4 enqueue
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-drain-3", "Hey @slack-bot third"),
+        )
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-drain-4", "Hey @slack-bot fourth"),
+        )
+
+        release_second_handler.set()
+        await first_task
+
+        # After the first handler returns, drain processes the latest (msg4)
+        # with msg3 in skipped.
+        assert received_messages == ["Hey @slack-bot second", "Hey @slack-bot fourth"]
+        assert received_contexts[0] is not None
+        assert [m.text for m in received_contexts[0].skipped] == ["Hey @slack-bot first"]
+        assert received_contexts[0].total_since_last_handler == 2
+        assert received_contexts[1] is not None
+        assert [m.text for m in received_contexts[1].skipped] == ["Hey @slack-bot third"]
+        assert received_contexts[1].total_since_last_handler == 2
+
+    # TS: "should respect drop-newest when the queue fills during debounce"
+    async def test_should_respect_dropnewest_when_the_queue_fills_during_debounce(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(
+                strategy="burst",
+                debounce_ms=60,
+                max_queue_size=2,
+                on_queue_full="drop-newest",
+            ),
+        )
+
+        received_messages: list[str] = []
+        received_contexts: list[MessageContext | None] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_messages.append(message.text)
+            received_contexts.append(context)
+
+        first_task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-burst-drop-1", "Hey @slack-bot one"),
+            )
+        )
+        await asyncio.sleep(0.005)
+
+        # msg2 fills the queue to capacity (max_queue_size=2 -- first message
+        # already counts as 1 of 2). msg3 should be silently dropped under
+        # drop-newest.
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-drop-2", "Hey @slack-bot two"),
+        )
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-drop-3", "Hey @slack-bot three"),
+        )
+
+        assert await state.queue_depth("slack:C123:1234.5678") == 2
+
+        await first_task
+
+        assert received_messages == ["Hey @slack-bot two"]
+        assert received_contexts[0] is not None
+        assert [m.text for m in received_contexts[0].skipped] == ["Hey @slack-bot one"]
+        assert received_contexts[0].total_since_last_handler == 2
+
+    # Distinct semantics: burst vs queue.
+    # ``queue`` would process all 3 messages (first immediately, then drain the
+    # rest); ``burst`` collapses the entire idle burst into a single handler
+    # invocation with the earlier messages in ``context.skipped``.
+    async def test_burst_collapses_idle_burst_unlike_queue(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=60),
+        )
+
+        invocations: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            invocations.append(message.id)
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("burst-vs-queue-1", "Hey @slack-bot a"),
+            )
+        )
+        await asyncio.sleep(0.005)
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("burst-vs-queue-2", "Hey @slack-bot b"),
+        )
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("burst-vs-queue-3", "Hey @slack-bot c"),
+        )
+
+        await task
+
+        # Exactly one handler invocation (with msg3 as the latest) -- ``queue``
+        # would produce 2 (msg1 immediately, then drain msg2+msg3).
+        assert invocations == ["burst-vs-queue-3"]
+
+    # Distinct semantics: burst vs debounce.
+    # ``debounce`` would silently drop earlier messages in the burst (no
+    # ``skipped`` context). ``burst`` preserves them via ``context.skipped`` so
+    # the handler can still see what was coalesced.
+    async def test_burst_preserves_skipped_unlike_debounce(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=60),
+        )
+
+        received_contexts: list[MessageContext | None] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received_contexts.append(context)
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("burst-vs-deb-1", "Hey @slack-bot a"),
+            )
+        )
+        await asyncio.sleep(0.005)
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("burst-vs-deb-2", "Hey @slack-bot b"),
+        )
+
+        await task
+
+        assert len(received_contexts) == 1
+        # ``debounce`` would pass ``context=None`` here (it just drops earlier
+        # messages). ``burst`` exposes them via ``skipped``.
+        assert received_contexts[0] is not None
+        assert [m.id for m in received_contexts[0].skipped] == ["burst-vs-deb-1"]
+        assert received_contexts[0].total_since_last_handler == 2
+
+
+# ============================================================================
 # 21. concurrency: concurrent (test 86)
 # ============================================================================
 
