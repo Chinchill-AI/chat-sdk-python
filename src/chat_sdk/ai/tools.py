@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from chat_sdk.chat import Chat
-from chat_sdk.errors import ChatError
+from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.types import Author, FetchOptions, ListThreadsOptions, Message
 
 # ---------------------------------------------------------------------------
@@ -690,10 +690,13 @@ def fetch_channel_messages(chat: ChatBinding) -> ChatTool:
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         direction = args.get("direction", "backward")
-        result = await fetch_method(
-            channel_id,
-            FetchOptions(limit=limit, cursor=cursor, direction=direction),
-        )
+        try:
+            result = await fetch_method(
+                channel_id,
+                FetchOptions(limit=limit, cursor=cursor, direction=direction),
+            )
+        except ChatNotImplementedError as exc:
+            raise ChatError(f'Adapter "{adapter_name}" does not support fetching channel messages') from exc
         return {
             "messages": [_project_message(m) for m in result.messages],
             "nextCursor": result.next_cursor,
@@ -765,7 +768,10 @@ def list_threads(chat: ChatBinding) -> ChatTool:
 
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
-        result = await list_method(channel_id, ListThreadsOptions(limit=limit, cursor=cursor))
+        try:
+            result = await list_method(channel_id, ListThreadsOptions(limit=limit, cursor=cursor))
+        except ChatNotImplementedError as exc:
+            raise ChatError(f'Adapter "{adapter_name}" does not support listing threads') from exc
         return {
             "threads": [
                 {
@@ -967,7 +973,7 @@ def _resolve_approval(tool_name: str, config: ApprovalConfig) -> bool:
 
 
 def _resolve_preset_tools(preset: ChatToolPreset | list[ChatToolPreset]) -> set[str]:
-    presets: list[str] = list(preset) if isinstance(preset, list) else [preset]
+    presets: list[str] = [preset] if isinstance(preset, str) else list(preset)
     tools: set[str] = set()
     for p in presets:
         if p not in _PRESET_TOOLS:

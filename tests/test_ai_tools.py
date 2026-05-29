@@ -20,7 +20,7 @@ from chat_sdk.ai import (
     ChatTool,
     create_chat_tools,
 )
-from chat_sdk.errors import ChatError
+from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.shared.mock_adapter import (
     MockAdapter,
     MockStateAdapter,
@@ -479,6 +479,18 @@ class TestExecutePaths:
         with pytest.raises(ChatError, match="does not support fetching channel messages"):
             await tools["fetchChannelMessages"].execute({"channelId": "slack:C123"})
 
+    async def test_fetch_channel_messages_wraps_not_implemented(self, harness: _Harness):
+        # BaseAdapter's default stub for optional methods raises
+        # ChatNotImplementedError. The tool must wrap that into ChatError so
+        # callers see one consistent failure mode, preserving the cause chain.
+        harness.adapter.fetch_channel_messages = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ChatNotImplementedError("slack", "fetch_channel_messages"),
+        )
+        tools = create_chat_tools(chat=harness.chat)
+        with pytest.raises(ChatError, match="does not support fetching channel messages") as exc_info:
+            await tools["fetchChannelMessages"].execute({"channelId": "slack:C123"})
+        assert isinstance(exc_info.value.__cause__, ChatNotImplementedError)
+
     async def test_fetch_thread_returns_flattened_thread_info(self, harness: _Harness):
         harness.adapter.fetch_thread = AsyncMock(  # type: ignore[method-assign]
             return_value=ThreadInfo(
@@ -535,6 +547,15 @@ class TestExecutePaths:
         tools = create_chat_tools(chat=harness.chat)
         with pytest.raises(ChatError, match="does not support listing threads"):
             await tools["listThreads"].execute({"channelId": "slack:C123"})
+
+    async def test_list_threads_wraps_not_implemented(self, harness: _Harness):
+        harness.adapter.list_threads = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ChatNotImplementedError("slack", "list_threads"),
+        )
+        tools = create_chat_tools(chat=harness.chat)
+        with pytest.raises(ChatError, match="does not support listing threads") as exc_info:
+            await tools["listThreads"].execute({"channelId": "slack:C123"})
+        assert isinstance(exc_info.value.__cause__, ChatNotImplementedError)
 
     async def test_get_thread_participants_delegates_to_thread(self, harness: _Harness):
         # Stub `chat.thread(...)` directly so we don't drag in the cursor
