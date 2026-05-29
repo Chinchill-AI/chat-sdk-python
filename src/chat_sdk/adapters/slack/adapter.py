@@ -3389,10 +3389,16 @@ class SlackAdapter:
         try:
             client = self._get_client()
 
-            # Check for files to upload
+            # Check for files to upload. ``files_upload_v2`` returns the
+            # Slack-confirmed file IDs; we surface them on ``RawMessage.raw``
+            # so consumers can gate on actual delivery (parity with
+            # discord/telegram, which upload inline and expose the platform
+            # response naturally). ``None`` means no upload happened; an empty
+            # list means Slack confirmed zero attachments (a real signal).
+            uploaded_file_ids: list[str] | None = None
             files = extract_files(message)
             if files:
-                await self._upload_files(files, channel, thread_ts or None)
+                uploaded_file_ids = await self._upload_files(files, channel, thread_ts or None)
                 has_text = (
                     isinstance(message, str)
                     or (hasattr(message, "raw") and getattr(message, "raw", None))
@@ -3404,7 +3410,7 @@ class SlackAdapter:
                     return RawMessage(
                         id=f"file-{int(time.time() * 1000)}",
                         thread_id=thread_id,
-                        raw={"files": files},
+                        raw=self._augment_raw_with_uploads({"files": files}, uploaded_file_ids),
                     )
 
             card = extract_card(message)
@@ -3426,7 +3432,10 @@ class SlackAdapter:
                 return RawMessage(
                     id=result.get("ts", ""),
                     thread_id=thread_id,
-                    raw=result.data if hasattr(result, "data") else result,
+                    raw=self._augment_raw_with_uploads(
+                        result.data if hasattr(result, "data") else result,
+                        uploaded_file_ids,
+                    ),
                 )
 
             # Table blocks
@@ -3443,7 +3452,10 @@ class SlackAdapter:
                 return RawMessage(
                     id=result.get("ts", ""),
                     thread_id=thread_id,
-                    raw=result.data if hasattr(result, "data") else result,
+                    raw=self._augment_raw_with_uploads(
+                        result.data if hasattr(result, "data") else result,
+                        uploaded_file_ids,
+                    ),
                 )
 
             # Regular text
@@ -3462,10 +3474,28 @@ class SlackAdapter:
             return RawMessage(
                 id=result.get("ts", ""),
                 thread_id=thread_id,
-                raw=result.data if hasattr(result, "data") else result,
+                raw=self._augment_raw_with_uploads(
+                    result.data if hasattr(result, "data") else result,
+                    uploaded_file_ids,
+                ),
             )
         except Exception as error:
             self._handle_slack_error(error)
+
+    @staticmethod
+    def _augment_raw_with_uploads(raw: Any, uploaded_file_ids: list[str] | None) -> Any:
+        """Add Slack-confirmed file IDs to a ``RawMessage.raw`` payload.
+
+        Returns ``raw`` unchanged when no upload occurred (``uploaded_file_ids``
+        is ``None``). Otherwise returns a NEW dict that merges the existing raw
+        (Slack never returns an ``uploaded_file_ids`` key, so this is additive
+        and non-breaking) with the confirmed IDs. An empty list is preserved —
+        it signals that Slack confirmed zero attachments.
+        """
+        if uploaded_file_ids is None:
+            return raw
+        base = raw if isinstance(raw, dict) else {}
+        return {**base, "uploaded_file_ids": uploaded_file_ids}
 
     async def edit_message(
         self,

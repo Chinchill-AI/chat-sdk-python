@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.29a2 (2026-05-28)
+
+Python-only fix. No upstream version change.
+
+### Fixes
+
+- **Slack now surfaces `files_upload_v2` confirmation through `post()`** — `SlackAdapter._upload_files` already computed the list of Slack-confirmed file IDs but `post_message` discarded the return, and `ThreadImpl._create_sent_message` hardcoded `raw=None`, so the confirmation never reached `SentMessage.raw`. Slack was the only file-capable adapter to drop this; discord/telegram upload inline and expose the platform response naturally. `post_message` now augments `RawMessage.raw` with `"uploaded_file_ids"` on every return path that can carry files (file-only, card, table, text), and `ThreadImpl._create_sent_message` accepts and propagates the adapter's `raw` into `SentMessage.raw`. `None` means no upload occurred; an empty list signals Slack confirmed zero attachments. The `raw` payload is augmented, not replaced, so existing consumers are unaffected. Unblocks chinchill gating UX on actual delivery success. An upstream `vercel/chat` issue is filed in parallel for convergence.
+
+### Test quality
+
+- Added 4 tests: three in `tests/test_slack_api.py` (file-only, text+files, and text-only-no-augment paths) and one end-to-end `tests/test_thread_faithful.py` test verifying `post()` propagates `RawMessage.raw` to `SentMessage.raw`.
+
 ## 0.4.29a1 (2026-05-28)
 
 Alpha sync starter for upstream `4.29.0` (`vercel/chat` release commit
