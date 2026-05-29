@@ -276,9 +276,11 @@ class SlackAdapter:
 
         mode = config.mode or "webhook"
 
-        # An explicit ``webhook_verifier`` opts out of the SLACK_SIGNING_SECRET
-        # env fallback — otherwise an env-configured deployment would silently
-        # shadow the verifier the caller intended to use.
+        # ``webhook_verifier`` takes precedence over ``signing_secret`` (config)
+        # and the ``SLACK_SIGNING_SECRET`` env var. When the caller wires up a
+        # verifier we ignore both so an env-configured deployment can't silently
+        # shadow it (mirrors upstream vercel/chat#468, which reversed the
+        # original direction the Python port shipped in PR #87).
         #
         # Use explicit ``is not None`` checks rather than truthiness fallbacks
         # (per docs/UPSTREAM_SYNC.md hazard #1): an explicit empty string for
@@ -317,13 +319,17 @@ class SlackAdapter:
                 "slack",
                 "webhook_verifier must be callable.",
             )
-        signing_secret = (
-            config.signing_secret
-            if config.signing_secret is not None
-            else (None if webhook_verifier is not None else os.environ.get("SLACK_SIGNING_SECRET"))
-        )
-        if signing_secret == "":
-            signing_secret = None
+        if webhook_verifier is not None:
+            # Verifier wins: drop both the config ``signing_secret`` and the
+            # ``SLACK_SIGNING_SECRET`` env fallback. Mirrors upstream
+            # vercel/chat#468 (``webhookVerifier`` ?? undefined : (...)).
+            signing_secret: str | None = None
+        else:
+            signing_secret = (
+                config.signing_secret if config.signing_secret is not None else os.environ.get("SLACK_SIGNING_SECRET")
+            )
+            if signing_secret == "":
+                signing_secret = None
         # ``signing_secret`` is required in webhook mode (unless a
         # ``webhook_verifier`` replaces the built-in HMAC check). Socket mode
         # legitimately runs without a signing secret because Slack does not
@@ -381,9 +387,9 @@ class SlackAdapter:
 
         self._name = "slack"
         self._signing_secret: str | None = signing_secret
-        # ``webhook_verifier`` is honored only when ``signing_secret`` is not set —
-        # signing_secret takes precedence when both are provided (matches upstream).
-        self._webhook_verifier: SlackWebhookVerifier | None = None if signing_secret else webhook_verifier
+        # ``webhook_verifier`` takes precedence; ``signing_secret`` is only used
+        # when no verifier is configured (matches upstream vercel/chat#468).
+        self._webhook_verifier: SlackWebhookVerifier | None = webhook_verifier
         # Resolver returning the default (single-workspace) bot token. ``None`` in
         # multi-workspace mode where the token is resolved per-team from the
         # InstallationStore. Single-workspace mode with a static string still
@@ -1276,9 +1282,11 @@ class SlackAdapter:
         if self._mode == "socket":
             return {"body": "Webhooks are disabled in socket mode", "status": 405}
 
-        # Verify the request — custom verifier takes priority when configured
-        # without a signing_secret. The verifier may also return a string that
-        # replaces the body for downstream parsing (e.g. canonicalization).
+        # Verify the request — when a custom ``webhook_verifier`` is configured
+        # it takes precedence over ``signing_secret`` / ``SLACK_SIGNING_SECRET``
+        # (matches upstream vercel/chat#468). The verifier may also return a
+        # string that replaces the body for downstream parsing (e.g.
+        # canonicalization).
         if self._webhook_verifier is not None:
             try:
                 verifier_result = self._webhook_verifier(request, body)
