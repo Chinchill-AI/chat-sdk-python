@@ -385,7 +385,16 @@ class TestWebhookVerifierConstruction:
             if old is not None:
                 os.environ["SLACK_SIGNING_SECRET"] = old
 
-    def test_signing_secret_takes_precedence_over_verifier(self):
+    def test_webhook_verifier_takes_precedence_over_signing_secret(self):
+        """When both are set, ``webhook_verifier`` wins.
+
+        Port of upstream vercel/chat#468 (commit ``0f0c203``): the original
+        Python port (PR #87) and upstream both used to prefer
+        ``signing_secret``; upstream has since reversed itself and this port
+        follows. Callers wiring up a verifier no longer have it silently
+        shadowed by a present ``signing_secret`` (or ``SLACK_SIGNING_SECRET``
+        env var; see :meth:`test_verifier_opts_out_of_env_signing_secret`).
+        """
         verifier_called: list[int] = []
 
         def verifier(req: Any, body: str) -> bool:
@@ -399,8 +408,10 @@ class TestWebhookVerifierConstruction:
                 webhook_verifier=verifier,
             )
         )
-        # Internal: webhook_verifier was suppressed because signing_secret won.
-        assert adapter._webhook_verifier is None
+        # The verifier wins; the explicit signing_secret is dropped so the
+        # built-in HMAC path is never taken.
+        assert adapter._webhook_verifier is verifier
+        assert adapter._signing_secret is None
 
     def test_verifier_opts_out_of_env_signing_secret(self):
         """An explicit verifier suppresses the SLACK_SIGNING_SECRET env fallback.
@@ -790,6 +801,37 @@ class TestHandleWebhookCustomVerifier:
         response = await adapter.handle_webhook(_unsigned_request(original_body))
         assert response["status"] == 200
         assert json.loads(response["body"]) == {"challenge": "canonical"}
+
+    @pytest.mark.asyncio
+    async def test_verifier_runs_even_when_signing_secret_is_configured(self):
+        """``webhook_verifier`` wins over a configured ``signing_secret``.
+
+        Port of upstream vercel/chat#468 — the upstream test was previously
+        titled "prefers signingSecret over webhookVerifier" and asserted
+        ``verifier`` was *not* called when both were set. Upstream reversed
+        that behavior; this Python port mirrors the new direction: with no
+        signing headers (which would fail the built-in HMAC check), the
+        verifier still runs and the request succeeds.
+        """
+        verifier_calls: list[tuple[Any, str]] = []
+
+        def verifier(req: Any, body: str) -> bool:
+            verifier_calls.append((req, body))
+            return True
+
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                signing_secret="test-signing-secret",
+                bot_token="xoxb-x",
+                webhook_verifier=verifier,
+            )
+        )
+        body = json.dumps({"type": "url_verification", "challenge": "test-challenge"})
+        # No signing headers — only the verifier should run.
+        response = await adapter.handle_webhook(_FakeRequest(body, {"content-type": "application/json"}))
+        assert response["status"] == 200
+        assert json.loads(response["body"]) == {"challenge": "test-challenge"}
+        assert len(verifier_calls) == 1
 
     @pytest.mark.asyncio
     async def test_verifier_path_does_not_invoke_default_signature_check(self):

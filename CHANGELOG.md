@@ -14,6 +14,10 @@ Each substantive commit lands as its own PR (matching the cadence used
 during the 4.27 sync: #83, #85, #86, #87, #88, #89, #90, #91, #92, #99,
 #101, #103, #104, #105). Tracking issue: #98.
 
+### Behavior changes (Slack)
+
+- **`webhook_verifier` now takes precedence over `signing_secret`** (vercel/chat#468, commit `0f0c203`). When a Slack adapter is constructed with both `webhook_verifier` and `signing_secret` (or with `webhook_verifier` while `SLACK_SIGNING_SECRET` is set in the env), the verifier wins and the signing-secret path is dropped entirely. This **reverses** the precedence the Python port shipped in 0.4.27 (PR #87), which preferred `signing_secret` to match upstream's intent at that time. Upstream reversed itself in vercel/chat#468 (`chat@4.29.0`) so an env-configured `SLACK_SIGNING_SECRET` could not silently shadow a verifier the caller wired up; this port now follows. **Migration:** if you relied on a configured `signing_secret` overriding `webhook_verifier`, drop the `webhook_verifier` from your `SlackAdapterConfig` (or, if you wired the verifier in deliberately, your signing-secret path is now correctly inert and you can remove it). The built-in HMAC + 5-minute timestamp tolerance only applies on the signing-secret path; verifier implementers remain responsible for replay protection (`slack/types.py` SECURITY contract).
+
 ### Sync scope (37 substantive upstream commits between `f55378a..chat@4.29.0`)
 
 #### Core (`packages/chat`)

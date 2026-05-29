@@ -85,15 +85,16 @@ class SlackAdapterConfig:
     # not required in socket mode (Slack does not sign socket events).
     mode: SlackAdapterMode = "webhook"
     # Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var,
-    # *unless* ``webhook_verifier`` is provided — passing an explicit verifier opts
-    # out of the env fallback so a deployment-set ``SLACK_SIGNING_SECRET`` can't
-    # silently shadow the verifier. Required in webhook mode; optional in socket mode.
+    # *unless* ``webhook_verifier`` is provided — an explicit verifier takes
+    # precedence over both this field and the ``SLACK_SIGNING_SECRET`` env var,
+    # so an env-configured deployment can't silently shadow the verifier the
+    # caller wired up. Required in webhook mode; optional in socket mode.
     signing_secret: str | None = None
     # Custom webhook verifier. When provided, replaces the built-in HMAC + timestamp
     # check. See :data:`SlackWebhookVerifier` for the SECURITY contract — the
     # implementer is responsible for constant-time comparison and replay protection.
-    # When both ``signing_secret`` and ``webhook_verifier`` are set, ``signing_secret``
-    # takes precedence.
+    # ``webhook_verifier`` takes precedence over ``signing_secret`` and the
+    # ``SLACK_SIGNING_SECRET`` env var; when it is set, those are ignored.
     webhook_verifier: SlackWebhookVerifier | None = None
     # Shared secret for authenticating events forwarded from a separate
     # socket-mode listener via HTTP POST. Auto-detected from
