@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to v4.27.0; last fully-synced release `0.4.27`). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (porting v4.29.0; last fully-synced release `0.4.27` at upstream `4.27.0`). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -24,7 +24,8 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.25.1` = Python-only fix on top of `4.25.0`
 - `0.4.26` = synced to upstream `4.26.0`
 - `0.4.26.3` = Python-only fixes on top of `4.26.0`
-- `0.4.27` = synced to upstream `4.27.0` (current release)
+- `0.4.27` = synced to upstream `4.27.0`
+- `0.4.29a1` = alpha while porting upstream `4.29.0` (current branch; upstream skipped 4.28 tag)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
@@ -107,8 +108,9 @@ will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` in the mapped core files has a matching Python `def test_*()`,
-pinned to `chat@4.26.0` (the last fully-synced upstream tag — `chat@4.27.0`
-is in flight; pin moves as ports land in this sync cycle). The `MAPPING`
+pinned to `chat@4.26.0` (upstream skipped tagging `chat@4.27.0` and
+`chat@4.28.0`, then resumed at `chat@4.29.0`; pin moves to `chat@4.29.0`
+once the in-flight 4.29 sync lands). The `MAPPING`
 dict in that script is the authoritative scope list — it currently covers 8
 of 17 `packages/chat/src/*.test.ts` files (extending it is tracked as a
 follow-up). **CI runs `--strict`** (see `.github/workflows/lint.yml`):
@@ -119,7 +121,7 @@ retained for local workflows where a few ports land in flight —
 regenerate via `--update-baseline` after documenting intentional
 divergence in `docs/UPSTREAM_SYNC.md`. During this sync cycle baseline
 mode reports a parity mismatch (baseline pinned at `chat@4.26.0`,
-`UPSTREAM_PARITY` says `4.27.0`); that's the intended signal until the
+`UPSTREAM_PARITY` says `4.29.0`); that's the intended signal until the
 sync lands.
 
 Before the fidelity check can run locally, clone the pinned upstream
