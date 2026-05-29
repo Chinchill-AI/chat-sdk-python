@@ -282,15 +282,9 @@ class SlackAdapter:
         # shadow it (mirrors upstream vercel/chat#468, which reversed the
         # original direction the Python port shipped in PR #87).
         #
-        # Use explicit ``is not None`` checks rather than truthiness fallbacks
-        # (per docs/UPSTREAM_SYNC.md hazard #1): an explicit empty string for
-        # ``signing_secret`` should fail validation, not silently fall through
-        # to ``SLACK_SIGNING_SECRET`` from the environment. *But* an empty
-        # string is itself unusable downstream (``_verify_signature`` would
-        # short-circuit with ``if not self._signing_secret`` and reject every
-        # webhook with 401), so after the cascade we normalize ``""`` to
-        # ``None`` to surface the misconfiguration here at init rather than
-        # silently failing on every request.
+        # Empty-string ``signing_secret`` is rejected outright below;
+        # empty ``SLACK_SIGNING_SECRET`` env values are normalized to ``None``
+        # so they can't masquerade as a configured secret.
         webhook_verifier = config.webhook_verifier
         # Reject an explicit empty-string ``signing_secret`` at construction —
         # even when a ``webhook_verifier`` is set. An explicit ``""`` is a
