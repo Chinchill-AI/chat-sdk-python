@@ -25,7 +25,7 @@ from chat_sdk.adapters.messenger.adapter import (
     MESSENGER_MESSAGE_LIMIT,
     MessengerAdapter,
 )
-from chat_sdk.adapters.messenger.types import MessengerAdapterConfig
+from chat_sdk.adapters.messenger.types import MessengerAdapterConfig, MessengerThreadId
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import (
     AdapterRateLimitError,
@@ -732,6 +732,43 @@ class TestParseMessage:
         parsed = adapter.parse_message(event)
         assert parsed.author.is_me is True
         assert parsed.author.is_bot is True
+
+    def test_echo_threads_by_recipient_psid(self) -> None:
+        """Echo events flip sender/recipient: ``sender.id`` is the Page ID and
+        ``recipient.id`` is the user's PSID. ``parse_message`` must thread the
+        echo off the user PSID so it lands in the same conversation as the
+        inbound user messages (matching ``_handle_echo``), not the page id.
+        """
+        adapter = _make_adapter()
+        adapter._bot_user_id = "PAGE_456"
+        event = {
+            "sender": {"id": "PAGE_456"},
+            "recipient": {"id": "USER_123"},
+            "timestamp": 1735689600000,
+            "message": {"mid": "mid.echo", "text": "bot says", "is_echo": True},
+        }
+        parsed = adapter.parse_message(event)
+        # Threaded under the user's PSID, NOT the page id.
+        assert parsed.thread_id == "messenger:USER_123"
+        assert parsed.thread_id != "messenger:PAGE_456"
+        # Must match what _handle_echo derives for the same event.
+        expected = adapter.encode_thread_id(MessengerThreadId(recipient_id="USER_123"))
+        assert parsed.thread_id == expected
+
+    def test_non_echo_threads_by_sender_psid(self) -> None:
+        """Non-echo inbound messages have ``sender.id`` == user PSID and must
+        keep threading off the sender — guards against over-applying the echo
+        fix to normal inbound events.
+        """
+        adapter = _make_adapter()
+        event = {
+            "sender": {"id": "USER_123"},
+            "recipient": {"id": "PAGE_456"},
+            "timestamp": 1735689600000,
+            "message": {"mid": "mid.abc", "text": "hi"},
+        }
+        parsed = adapter.parse_message(event)
+        assert parsed.thread_id == "messenger:USER_123"
 
     def test_postback_uses_title_as_text(self) -> None:
         adapter = _make_adapter()

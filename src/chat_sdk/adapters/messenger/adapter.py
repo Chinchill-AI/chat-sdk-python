@@ -735,7 +735,16 @@ class MessengerAdapter:
     def parse_message(self, raw: MessengerRawMessage) -> Message:
         """Parse a raw messaging event into a normalized ``Message``."""
         sender = raw.get("sender") or {}
-        thread_id = self.encode_thread_id(MessengerThreadId(recipient_id=sender.get("id", "")))
+        message_data = raw.get("message") or {}
+        # For echoes (bot-sent messages echoed back) ``sender.id`` is the Page
+        # ID and ``recipient.id`` is the user's PSID — the reverse of a normal
+        # inbound event. Thread off the user PSID so the message threads under
+        # the same conversation ``_handle_echo`` uses.
+        if message_data.get("is_echo"):
+            recipient = raw.get("recipient") or {}
+            thread_id = self.encode_thread_id(MessengerThreadId(recipient_id=recipient.get("id", "")))
+        else:
+            thread_id = self.encode_thread_id(MessengerThreadId(recipient_id=sender.get("id", "")))
         message = self._parse_messenger_message(raw, thread_id)
         self._cache_message(message)
         return message
