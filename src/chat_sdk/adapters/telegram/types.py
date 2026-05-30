@@ -208,6 +208,17 @@ class TelegramVideoFile(TypedDict, total=False):
     file_name: str
 
 
+class TelegramVideoNoteFile(TypedDict, total=False):
+    """Telegram video note (round video message) with extra metadata."""
+
+    file_id: str  # required
+    file_path: str
+    file_size: int
+    file_unique_id: str
+    length: int
+    duration: int
+
+
 class TelegramVoiceFile(TypedDict, total=False):
     """Telegram voice file with extra metadata."""
 
@@ -249,6 +260,7 @@ class TelegramMessage(TypedDict, total=False):
     sticker: TelegramStickerFile
     text: str
     video: TelegramVideoFile
+    video_note: TelegramVideoNoteFile
     voice: TelegramVoiceFile
 
 
