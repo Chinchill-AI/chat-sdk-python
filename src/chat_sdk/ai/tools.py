@@ -770,7 +770,7 @@ def list_threads(chat: ChatBinding) -> ChatTool:
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         try:
-            result = await list_method(channel_id, ListThreadsOptions(limit=limit, cursor=cursor))
+            result = await list_method(channel_id, options=ListThreadsOptions(limit=limit, cursor=cursor))
         except ChatNotImplementedError as exc:
             raise ChatError(f'Adapter "{adapter_name}" does not support listing threads') from exc
         return {

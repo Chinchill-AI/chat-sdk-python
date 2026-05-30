@@ -542,6 +542,20 @@ class TestExecutePaths:
         assert summary["rootMessage"]["id"] == "m1"
         assert summary["rootMessage"]["text"] == "root"
 
+    async def test_list_threads_uses_keyword_options(self, harness: _Harness):
+        """Pin that the tool passes ``options`` as a keyword to ``list_threads``.
+
+        ``MockAdapter.list_threads`` (and any adapter using a ``**kwargs``
+        signature) rejects a second positional arg with ``TypeError`` — the
+        tool must use the keyword form. This exercises the **real**
+        ``MockAdapter.list_threads`` (no ``AsyncMock`` override) so a
+        regression to positional args trips immediately at runtime, not just
+        in the mock-adapter ergonomics.
+        """
+        tools = create_chat_tools(chat=harness.chat)
+        result = await tools["listThreads"].execute({"channelId": "slack:C123"})
+        assert result == {"threads": [], "nextCursor": None}
+
     async def test_list_threads_raises_when_adapter_unsupported(self, harness: _Harness):
         harness.adapter.list_threads = None  # type: ignore[method-assign,assignment]
         tools = create_chat_tools(chat=harness.chat)
