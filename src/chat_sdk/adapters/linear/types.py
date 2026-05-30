@@ -28,6 +28,17 @@ class LinearAdapterBaseConfig:
     # Webhook signing secret for HMAC-SHA256 verification.
     # Defaults to LINEAR_WEBHOOK_SECRET env var.
     webhook_secret: str | None = None
+    # Optional 32-byte AES-256-GCM key used to encrypt OAuth ``access_token``
+    # and ``refresh_token`` values at rest in the state store. Accepts either a
+    # 64-char hex string or a 44-char base64 string. Defaults to the
+    # ``LINEAR_ENCRYPTION_KEY`` env var. Strongly recommended for multi-tenant
+    # deployments -- without it, a state-store compromise yields plaintext
+    # per-tenant Linear API tokens. When unset, installations are stored as
+    # plaintext (legacy behavior).
+    encryption_key: str | None = None
+    # Prefix for the state key used to store per-organization installations.
+    # Defaults to ``linear:installation``. The full key is ``{prefix}:{org_id}``.
+    installation_key_prefix: str = "linear:installation"
 
 
 @dataclass
@@ -69,6 +80,28 @@ class LinearAdapterAppConfig(LinearAdapterBaseConfig):
 LinearAdapterConfig = (
     LinearAdapterBaseConfig | LinearAdapterAPIKeyConfig | LinearAdapterOAuthConfig | LinearAdapterAppConfig
 )
+
+
+# =============================================================================
+# Installation
+# =============================================================================
+
+
+@dataclass
+class LinearInstallation:
+    """Per-organization OAuth installation persisted to the state store.
+
+    Used in multi-tenant mode after a successful OAuth exchange. When an
+    ``encryption_key`` is configured on the adapter, ``access_token`` and
+    ``refresh_token`` are AES-256-GCM-encrypted at rest; the in-memory form
+    always holds plaintext.
+    """
+
+    access_token: str
+    organization_id: str
+    bot_user_id: str | None = None
+    expires_at: int | None = None
+    refresh_token: str | None = None
 
 
 # =============================================================================

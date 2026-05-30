@@ -26,10 +26,24 @@ from chat_sdk.adapters.linear.types import (
     LinearAdapterBaseConfig,
     LinearAdapterConfig,
     LinearCommentData,
+    LinearInstallation,
     LinearRawMessage,
     LinearThreadId,
     LinearWebhookActor,
     ReactionWebhookPayload,
+)
+
+# AES-256-GCM token-at-rest encryption helpers. These live under the Slack
+# adapter package but are platform-agnostic (a faithful port of upstream's
+# shared ``adapter-shared/crypto.ts``); reuse them rather than duplicating the
+# crypto primitives. ``cryptography`` is imported lazily inside encrypt/decrypt
+# so adapters that don't configure a key don't require the dependency.
+from chat_sdk.adapters.slack.crypto import (
+    EncryptedTokenData,
+    decode_key,
+    decrypt_token,
+    encrypt_token,
+    is_encrypted_token_data,
 )
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -160,6 +174,25 @@ class LinearAdapter:
                             "or LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET, or provide auth in config.",
                         )
 
+        # State-key prefix for per-organization installations.
+        self._installation_key_prefix = getattr(config, "installation_key_prefix", None) or "linear:installation"
+
+        # Optional AES-256-GCM key for encrypting OAuth tokens at rest. Use
+        # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``
+        # is treated as "user explicitly opted out" and is NOT silently
+        # shadowed by ``LINEAR_ENCRYPTION_KEY`` from the env (CLAUDE.md
+        # truthiness-trap hazard). An empty user value still short-circuits
+        # ``decode_key`` via the ``if encryption_key_raw`` guard, so no broken
+        # key is ever built.
+        config_encryption_key = getattr(config, "encryption_key", None)
+        if config_encryption_key is not None:
+            encryption_key_raw: str | None = config_encryption_key
+        else:
+            encryption_key_raw = os.environ.get("LINEAR_ENCRYPTION_KEY")
+        self._encryption_key: bytes | None = None
+        if encryption_key_raw:
+            self._encryption_key = decode_key(encryption_key_raw)
+
     @property
     def name(self) -> str:
         return self._name
@@ -258,6 +291,137 @@ class LinearAdapter:
             if self._access_token_expiry and time.time() > self._access_token_expiry:
                 self._logger.info("Linear access token expired, refreshing...")
                 await self._refresh_client_credentials_token()
+
+    # ------------------------------------------------------------------
+    # Multi-tenant installation persistence (with optional encryption)
+    # ------------------------------------------------------------------
+
+    def _installation_key(self, organization_id: str) -> str:
+        return f"{self._installation_key_prefix}:{organization_id}"
+
+    async def set_installation(self, organization_id: str, installation: LinearInstallation) -> None:
+        """Persist a Linear installation for an organization.
+
+        Used in multi-tenant mode after a successful OAuth exchange. When an
+        ``encryption_key`` is configured, ``access_token`` / ``refresh_token``
+        are AES-256-GCM-encrypted before being written to the state store.
+        """
+        if not self._chat:
+            raise ValidationError(
+                "linear",
+                "Adapter not initialized. Ensure chat.initialize() has been called first.",
+            )
+
+        state = self._chat.get_state()
+        key = self._installation_key(organization_id)
+        await state.set(key, self._encrypt_installation(installation))
+        self._logger.info("Linear installation saved", {"organizationId": organization_id})
+
+    async def get_installation(self, organization_id: str) -> LinearInstallation | None:
+        """Retrieve a Linear installation for an organization.
+
+        Decrypts ``access_token`` / ``refresh_token`` when they were stored as
+        encrypted envelopes. Tolerates plaintext records written before
+        encryption was enabled, so a key can be rotated in with zero downtime.
+        """
+        if not self._chat:
+            raise ValidationError(
+                "linear",
+                "Adapter not initialized. Ensure chat.initialize() has been called first.",
+            )
+
+        state = self._chat.get_state()
+        stored = await state.get(self._installation_key(organization_id))
+        if not stored or not isinstance(stored, dict):
+            return None
+
+        return self._decrypt_installation(stored)
+
+    async def delete_installation(self, organization_id: str) -> None:
+        """Remove a Linear installation. Used for uninstall handling."""
+        if not self._chat:
+            raise ValidationError(
+                "linear",
+                "Adapter not initialized. Ensure chat.initialize() has been called first.",
+            )
+
+        state = self._chat.get_state()
+        await state.delete(self._installation_key(organization_id))
+        self._logger.info("Linear installation deleted", {"organizationId": organization_id})
+
+    def _encrypt_installation(self, installation: LinearInstallation) -> dict[str, Any]:
+        """Serialize an installation for storage, encrypting tokens if a key is set.
+
+        Without a key, tokens are stored as plaintext (legacy behavior).
+        Field names use camelCase to match the persisted-JSON boundary
+        convention (CLAUDE.md) and upstream's ``StoredLinearInstallation``.
+        """
+        data: dict[str, Any] = {
+            "botUserId": installation.bot_user_id,
+            "expiresAt": installation.expires_at,
+            "organizationId": installation.organization_id,
+        }
+
+        if self._encryption_key:
+            access = encrypt_token(installation.access_token, self._encryption_key)
+            data["accessToken"] = {"iv": access.iv, "data": access.data, "tag": access.tag}
+            if installation.refresh_token is not None:
+                refresh = encrypt_token(installation.refresh_token, self._encryption_key)
+                data["refreshToken"] = {"iv": refresh.iv, "data": refresh.data, "tag": refresh.tag}
+        else:
+            data["accessToken"] = installation.access_token
+            if installation.refresh_token is not None:
+                data["refreshToken"] = installation.refresh_token
+
+        return data
+
+    def _decrypt_installation(self, stored: dict[str, Any]) -> LinearInstallation:
+        """Reconstruct an installation from storage, decrypting tokens as needed."""
+        # Tolerate both camelCase (this port / upstream) and snake_case keys.
+        raw_access = stored.get("accessToken")
+        if raw_access is None:
+            raw_access = stored.get("access_token")
+        raw_refresh = stored.get("refreshToken")
+        if raw_refresh is None:
+            raw_refresh = stored.get("refresh_token")
+
+        access_token = self._maybe_decrypt(raw_access)
+        refresh_token = None if raw_refresh is None else self._maybe_decrypt(raw_refresh)
+
+        return LinearInstallation(
+            access_token=access_token if access_token is not None else "",
+            organization_id=stored.get("organizationId") or stored.get("organization_id") or "",
+            bot_user_id=stored.get("botUserId") or stored.get("bot_user_id"),
+            expires_at=stored.get("expiresAt") if stored.get("expiresAt") is not None else stored.get("expires_at"),
+            refresh_token=refresh_token,
+        )
+
+    def _maybe_decrypt(self, value: Any) -> str | None:
+        """Decrypt an encrypted-token envelope, or pass through a plaintext value.
+
+        Plaintext tolerance: a value that is not an encrypted envelope (e.g. a
+        record written before encryption was enabled) is returned unchanged.
+
+        Raises:
+            ValidationError: if an encrypted envelope is read but no key is
+                configured -- a clear error instead of returning ciphertext.
+        """
+        if value is None:
+            return None
+        if is_encrypted_token_data(value):
+            if not self._encryption_key:
+                raise ValidationError(
+                    "linear",
+                    "Stored Linear installation token is encrypted but no encryption_key is "
+                    "configured. Set LINEAR_ENCRYPTION_KEY (or config.encryption_key) to the key "
+                    "used when the installation was saved.",
+                )
+            return decrypt_token(
+                EncryptedTokenData(iv=value["iv"], data=value["data"], tag=value["tag"]),
+                self._encryption_key,
+            )
+        # Plaintext value (legacy / no encryption configured at write time).
+        return value if isinstance(value, str) else str(value)
 
     async def get_user(self, user_id: str) -> UserInfo | None:
         """Look up a Linear user by UUID via the GraphQL ``user`` query.
