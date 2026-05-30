@@ -3930,3 +3930,62 @@ class TestSubjectBinding:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
         assert resolved == [None]
+
+    # Codex P2: skipped messages were dispatched to handlers via
+    # ``context.skipped`` without ever being bound to their owning adapter,
+    # so ``await context.skipped[i].subject`` silently returned ``None`` even
+    # when ``adapter.fetch_subject`` was implemented. Fix binds skipped
+    # messages alongside the primary message in ``_dispatch_to_handlers``.
+    async def test_skipped_messages_subject_resolves_via_adapter_hook(self):
+        """Burst-drained skipped messages must also support ``.subject``.
+
+        Load-bearing: reverting the bind-skipped fix in
+        ``_dispatch_to_handlers`` makes ``context.skipped[i].subject``
+        return ``None`` instead of the adapter-fetched value.
+        """
+        adapter = create_mock_adapter("slack")
+        # ``_resolve_subject`` invokes ``fetch_subject(self.raw)`` — the raw
+        # webhook payload, not the Message object — so we key on raw["id"].
+        fetched: dict[str, MessageSubject] = {
+            "msg-burst-1": MessageSubject(id="A", type="issue", title="first", raw={}),
+            "msg-burst-2": MessageSubject(id="B", type="issue", title="second", raw={}),
+            "msg-burst-3": MessageSubject(id="C", type="issue", title="third", raw={}),
+        }
+
+        async def _fetch_subject(raw):  # noqa: ANN001, ANN202
+            return fetched[raw["id"]]
+
+        adapter.fetch_subject = _fetch_subject  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=60),
+        )
+
+        all_subjects: list[MessageSubject | None] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):  # noqa: ANN001
+            all_subjects.append(await message.subject)
+            if context is not None:
+                for skipped in context.skipped:
+                    all_subjects.append(await skipped.subject)
+
+        def _mk(mid: str, text: str):  # noqa: ANN202
+            return create_test_message(mid, text, raw={"id": mid})
+
+        msg1 = _mk("msg-burst-1", "Hey @slack-bot first")
+        task = asyncio.create_task(chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg1))
+        await asyncio.sleep(0.005)
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", _mk("msg-burst-2", "Hey @slack-bot second")
+        )
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", _mk("msg-burst-3", "Hey @slack-bot third")
+        )
+        await task
+
+        # latest (msg-burst-3) dispatched as ``message``, the two earlier
+        # arrivals folded into ``context.skipped`` in order. All three must
+        # resolve to their adapter-fetched subjects.
+        assert all_subjects == [fetched["msg-burst-3"], fetched["msg-burst-1"], fetched["msg-burst-2"]]

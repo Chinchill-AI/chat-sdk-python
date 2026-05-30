@@ -2142,6 +2142,13 @@ class Chat:
         # site (packages/chat/src/chat.ts). Every dispatched message flows
         # through here, so this is the single registration point.
         set_message_adapter(message, adapter)
+        # Skipped messages (queue drain / burst collapse) are surfaced to
+        # handlers via ``context.skipped`` but never themselves dispatched,
+        # so they also need their adapter bound for ``await msg.subject`` to
+        # work inside the handler.
+        if context is not None:
+            for skipped_msg in context.skipped:
+                set_message_adapter(skipped_msg, adapter)
 
         # Detect mention
         message.is_mention = message.is_mention or self._detect_mention(adapter, message)
