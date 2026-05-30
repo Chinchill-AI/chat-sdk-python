@@ -397,6 +397,32 @@ class TestPostMessageTypedAttachmentUploads:
 
         adapter.telegram_fetch.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_rejects_unsupported_attachment_type(self):
+        """An attachment.type not in ATTACHMENT_UPLOADS raises a clear ValidationError.
+
+        ``Attachment.type`` is a ``Literal``, but Python does not enforce it at
+        runtime, so an untyped/dynamic caller can supply an out-of-set value.
+        Without the guard the per-type dict lookup raises a bare ``KeyError``;
+        we surface a ``ValidationError`` naming the bad type and the supported
+        set instead. Load-bearing: reverting the guard makes this raise
+        ``KeyError`` (not ``ValidationError``) and the test fails.
+        """
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        with pytest.raises(ValidationError, match="Unsupported attachment type: sticker"):
+            await adapter.post_message(
+                THREAD_ID,
+                PostableRaw(
+                    raw="",
+                    attachments=[Attachment(type="sticker", data=b"x")],  # type: ignore[arg-type]
+                ),
+            )
+
+        adapter.telegram_fetch.assert_not_called()
+
 
 # =============================================================================
 # Tests -- edit_message

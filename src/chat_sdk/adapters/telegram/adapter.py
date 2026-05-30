@@ -1902,6 +1902,11 @@ class TelegramAdapter:
         """
         import aiohttp
 
+        if attachment.type not in ATTACHMENT_UPLOADS:
+            raise ValidationError(
+                "telegram",
+                f"Unsupported attachment type: {attachment.type}. Supported types: {', '.join(ATTACHMENT_UPLOADS)}",
+            )
         upload = ATTACHMENT_UPLOADS[attachment.type]
 
         data = attachment.data
