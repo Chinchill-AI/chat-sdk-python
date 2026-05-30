@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.27.2 (2026-05-29)
+
+Python-only feature port on the 0.4.27 line (does NOT include 0.4.29 alpha sync work). Backport of the Teams file-delivery port from the 0.4.29 line (chat-sdk-python PR #125) so chinchill can consume it on the stable line it pins.
+
+### Features
+
+- **Teams now delivers outbound files via base64 data-URI activity attachments** — the Teams adapter previously dropped a `Postable`'s `.files`: `post_message` never called `extract_files`, so execution artifacts (charts, CSVs) silently vanished. Ports upstream `vercel/chat`'s `filesToAttachments` (`packages/adapter-teams/src/index.ts` ~1006-1035). A new `TeamsAdapter._files_to_attachments` resolves each `FileUpload`'s bytes via `to_buffer(..., throw_on_unsupported=False)`, base64-encodes them, and builds a Bot Framework attachment `{"contentType", "contentUrl": "data:<mime>;base64,<b64>", "name"}` (mime defaults to `application/octet-stream`; unresolvable bytes skipped with a debug log, mirroring upstream's `if (!buffer) continue`). Wired into `post_message` only — `edit_message` is intentionally left file-free (upstream wires files into `postMessage`/`postChannelMessage`, not `editMessage`; chinchill delivers via a fresh `post`). **Caveats (inherited from upstream's data-URI design — verify in a real Teams tenant before relying on either):** (1) Bot Framework documents data-URI `contentUrl` as **image-only** — `image/*` (charts) render inline, but `text/csv`/`application/pdf` may NOT surface on Teams, which uses a file-consent / hosted-URL flow for arbitrary files. So this delivers reliable Teams parity for **images**; non-image artifact delivery on Teams may need the file-consent path as a follow-up. (2) data-URI inlines the base64 payload — keep files under ~256KB encoded.
+
+### Test quality
+
+- Added 7 tests in `tests/test_teams_adapter.py` (`TestFileAttachments`): text+file, adaptive-card+file, multiple-files-in-order, partial-skip-preserves-surviving-files, mime default, the skip-unresolvable-bytes branch (asserting the specific debug log), and a fidelity guard that `edit_message` carries NO file attachments.
+
 ## 0.4.27.1 (2026-05-29)
 
 Python-only patch on the 0.4.27 line. No upstream version change; does NOT include the 0.4.29 alpha sync work.

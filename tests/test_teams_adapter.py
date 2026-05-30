@@ -694,6 +694,202 @@ class TestEditMessage:
         adapter._teams_update.assert_called_once()
 
 
+class TestFileAttachments:
+    """Outbound file delivery via base64 data-URI activity attachments.
+
+    Ports ``filesToAttachments`` from
+    ``packages/adapter-teams/src/index.ts`` (lines ~1006-1035) and its use in
+    ``postMessage``/``editMessage``.
+    """
+
+    @staticmethod
+    def _thread_id(adapter: TeamsAdapter) -> str:
+        return adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_message_with_file(self):
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "sent-1", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="here is your report",
+            files=[FileUpload(data=b"a,b,c\n1,2,3\n", filename="report.csv", mime_type="text/csv")],
+        )
+        result = await adapter.post_message(self._thread_id(adapter), message)
+
+        payload = adapter._teams_send.call_args.args[1]
+        attachments = payload["attachments"]
+        assert len(attachments) == 1
+        att = attachments[0]
+        assert att["contentType"] == "text/csv"
+        assert att["name"] == "report.csv"
+        assert att["contentUrl"].startswith("data:text/csv;base64,")
+        # round-trip the base64 payload back to the original bytes
+        import base64
+
+        b64 = att["contentUrl"].split("base64,", 1)[1]
+        assert base64.b64decode(b64) == b"a,b,c\n1,2,3\n"
+        # the data-URI attachment is also recorded on the returned raw activity
+        assert result.raw["attachments"][0]["name"] == "report.csv"
+
+    @pytest.mark.asyncio
+    async def test_card_message_with_file(self):
+        from chat_sdk.cards import Card
+        from chat_sdk.types import FileUpload, PostableCard
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "sent-2", "type": "message"})
+
+        message = PostableCard(
+            card=Card(title="Results"),
+            files=[FileUpload(data=b"\x89PNG\r\n", filename="chart.png", mime_type="image/png")],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        payload = adapter._teams_send.call_args.args[1]
+        attachments = payload["attachments"]
+        # adaptive card attachment AND the file attachment both present
+        assert len(attachments) == 2
+        assert attachments[0]["contentType"] == "application/vnd.microsoft.card.adaptive"
+        file_att = attachments[1]
+        assert file_att["contentType"] == "image/png"
+        assert file_att["name"] == "chart.png"
+        assert file_att["contentUrl"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_edit_message_does_not_carry_files(self):
+        """Upstream fidelity: ``editMessage`` never delivers files (upstream wires
+        ``filesToAttachments`` into ``postMessage``/``postChannelMessage`` only), and
+        chinchill delivers execution artifacts via a fresh ``post`` — never by editing
+        files into an existing message. A ``PostableMarkdown`` carrying files must edit
+        the text only, with no file attachments on the activity.
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_update = AsyncMock()
+
+        message = PostableMarkdown(
+            markdown="updated",
+            files=[FileUpload(data=b"hello", filename="note.txt", mime_type="text/plain")],
+        )
+        result = await adapter.edit_message(self._thread_id(adapter), "edit-1", message)
+
+        payload = adapter._teams_update.call_args.args[2]
+        assert "attachments" not in payload, (
+            "edit_message must not carry file attachments — outbound file delivery is "
+            f"post_message-only (upstream fidelity); got attachments={payload.get('attachments')!r}"
+        )
+        assert payload["text"] == "updated"
+        assert result.id == "edit-1"
+
+    @pytest.mark.asyncio
+    async def test_file_without_mime_type_defaults_to_octet_stream(self):
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "sent-3", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="bin",
+            files=[FileUpload(data=b"\x00\x01\x02", filename="blob.bin")],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        att = adapter._teams_send.call_args.args[1]["attachments"][0]
+        assert att["contentType"] == "application/octet-stream"
+        assert att["contentUrl"].startswith("data:application/octet-stream;base64,")
+
+    @pytest.mark.asyncio
+    async def test_file_with_unresolvable_data_is_skipped(self):
+        """A FileUpload whose data is not bytes is skipped with a debug log.
+
+        Mirrors upstream's ``throwOnUnsupported: false`` followed by
+        ``if (!buffer) continue``. (The Python ``FileUpload`` has no
+        ``fetch_data`` field — it carries only inline ``data`` bytes — so the
+        lazy-fetch case from the upstream interface collapses to this
+        skip-unresolvable-bytes branch.)
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        logger = _make_logger()
+        adapter = _make_adapter(app_id="test-app-id", logger=logger)
+        adapter._teams_send = AsyncMock(return_value={"id": "sent-4", "type": "message"})
+
+        # data is a str, not bytes -> to_buffer returns None -> file skipped
+        bad = FileUpload(data="not-bytes", filename="bad.txt", mime_type="text/plain")  # type: ignore[arg-type]
+        message = PostableMarkdown(markdown="text only", files=[bad])
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        payload = adapter._teams_send.call_args.args[1]
+        # no attachments key added when every file was skipped
+        assert "attachments" not in payload
+        # assert the SPECIFIC skip log fired — not just that some debug log happened
+        # (post_message emits an unconditional "send (message)" debug, so a bare
+        # logger.debug.called check would pass even if the skip branch logged nothing).
+        skip_logged = any(
+            call.args and "skipping file with unsupported data" in str(call.args[0])
+            for call in logger.debug.call_args_list
+        )
+        assert skip_logged, "a skipped file must emit the 'unsupported data' debug log"
+
+    @pytest.mark.asyncio
+    async def test_multiple_files_attached_in_order(self):
+        """N files -> N attachments, in input order. Closes the gap where
+        ``return attachments[:1]`` (drop all but first) or a reorder would
+        otherwise merge green — both directly defeat multi-artifact parity.
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="three files",
+            files=[
+                FileUpload(data=b"aaa", filename="a.csv", mime_type="text/csv"),
+                FileUpload(data=b"\x89PNG", filename="b.png", mime_type="image/png"),
+                FileUpload(data=b"%PDF", filename="c.pdf", mime_type="application/pdf"),
+            ],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        assert [a["name"] for a in attachments] == ["a.csv", "b.png", "c.pdf"]
+        assert [a["contentType"] for a in attachments] == ["text/csv", "image/png", "application/pdf"]
+        assert all(a["contentUrl"].startswith("data:") for a in attachments)
+
+    @pytest.mark.asyncio
+    async def test_partial_skip_preserves_surviving_files_in_order(self):
+        """A good/bad/good batch drops only the unresolvable file; survivors keep
+        input order. No single-file test covers partial-skip-with-survivors.
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="good bad good",
+            files=[
+                FileUpload(data=b"first", filename="first.csv", mime_type="text/csv"),
+                FileUpload(data="not-bytes", filename="bad.bin", mime_type="application/octet-stream"),  # type: ignore[arg-type]
+                FileUpload(data=b"third", filename="third.csv", mime_type="text/csv"),
+            ],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        assert [a["name"] for a in attachments] == ["first.csv", "third.csv"]
+
+
 class TestDeleteMessage:
     @pytest.mark.asyncio
     async def test_deletes_without_error(self):
