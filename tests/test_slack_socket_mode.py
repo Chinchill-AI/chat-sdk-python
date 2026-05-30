@@ -343,6 +343,85 @@ class TestForwardedSocketEvents:
         result = await adapter.handle_webhook(request)
         assert result["status"] == 401
 
+    async def test_webhook_socket_token_uses_timing_safe_compare(self, monkeypatch):
+        """The socket-token check MUST route through ``hmac.compare_digest``.
+
+        Upstream switched this comparison to a constant-time check
+        (timingSafeStringEqual, 9824d33 / PR #441). This is the load-bearing
+        guard against a regression to a plain ``==`` / ``!=`` comparison:
+        we spy on ``hmac.compare_digest`` as referenced by the adapter module
+        and assert it is invoked for the socket token, with both operands
+        encoded to bytes (mirroring upstream's ``Buffer.from(x, "utf8")``).
+        """
+        import time as _time
+
+        from chat_sdk.adapters.slack import adapter as adapter_mod
+
+        calls: list[tuple[Any, Any]] = []
+        real_compare = adapter_mod.hmac.compare_digest
+
+        def _spy_compare(a, b):
+            calls.append((a, b))
+            return real_compare(a, b)
+
+        monkeypatch.setattr(adapter_mod.hmac, "compare_digest", _spy_compare)
+
+        adapter = _make_socket_adapter(socket_forwarding_secret="fwd-secret")
+        chat = _make_mock_chat()
+        adapter._chat = chat
+        forwarded = {
+            "type": "socket_event",
+            "eventType": "events_api",
+            "body": {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "1.0",
+                    "user": "U1",
+                    "text": "hi",
+                    "team": "T1",
+                },
+                "team_id": "T1",
+            },
+            "timestamp": int(_time.time()),
+        }
+        request = _FakeRequest(
+            json.dumps(forwarded),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "fwd-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+
+        # Valid token => accepted, AND the timing-safe path was exercised
+        # with byte-encoded operands.
+        assert result["status"] == 200
+        assert (b"fwd-secret", b"fwd-secret") in calls, (
+            f"socket token must be compared via hmac.compare_digest on bytes, not == ; recorded calls: {calls!r}"
+        )
+
+    async def test_webhook_socket_token_non_ascii_rejected_not_crash(self):
+        """A non-ASCII socket token must be rejected (401), never crash.
+
+        ``hmac.compare_digest`` raises ``TypeError`` on non-ASCII ``str``
+        operands; encoding to bytes (the upstream behavior) avoids that. This
+        pins the ``.encode()`` so a regression to str comparison surfaces as a
+        crash here rather than silently in production.
+        """
+        adapter = _make_socket_adapter(socket_forwarding_secret="fwd-secret")
+        adapter._chat = _make_mock_chat()
+        request = _FakeRequest(
+            json.dumps({"type": "socket_event", "eventType": "events_api", "body": {}}),
+            headers={
+                "content-type": "application/json",
+                "x-slack-socket-token": "café-not-the-secret",
+            },
+        )
+        result = await adapter.handle_webhook(request)
+        assert result["status"] == 401
+
 
 # ---------------------------------------------------------------------------
 # _route_socket_event dispatch
