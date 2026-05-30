@@ -7,7 +7,6 @@ import gc
 import weakref
 from datetime import datetime, timezone
 
-import chat_sdk.types as types_module
 from chat_sdk.types import (
     Attachment,
     Author,
@@ -18,6 +17,8 @@ from chat_sdk.types import (
     MessageSubject,
     MessageSubjectParty,
     RawMessage,
+    _get_message_adapter,
+    _message_adapter_map,
     set_message_adapter,
 )
 
@@ -534,10 +535,10 @@ class TestSetMessageAdapterWeakref:
         msg = _make_message()
         set_message_adapter(msg, object())
         key = id(msg)
-        assert key in types_module._message_adapter_map
+        assert key in _message_adapter_map
         del msg
         gc.collect()
-        assert key not in types_module._message_adapter_map
+        assert key not in _message_adapter_map
 
     def test_distinct_messages_get_distinct_adapters(self):
         m1 = _make_message()
@@ -545,8 +546,8 @@ class TestSetMessageAdapterWeakref:
         a1, a2 = object(), object()
         set_message_adapter(m1, a1)
         set_message_adapter(m2, a2)
-        assert types_module._get_message_adapter(m1) is a1
-        assert types_module._get_message_adapter(m2) is a2
+        assert _get_message_adapter(m1) is a1
+        assert _get_message_adapter(m2) is a2
 
     @staticmethod
     def _live_finalizer_count(message: Message) -> int:
@@ -580,9 +581,9 @@ class TestSetMessageAdapterWeakref:
         msg = _make_message()
         adapter_a, adapter_b = object(), object()
         set_message_adapter(msg, adapter_a)
-        assert types_module._get_message_adapter(msg) is adapter_a
+        assert _get_message_adapter(msg) is adapter_a
         set_message_adapter(msg, adapter_b)
-        assert types_module._get_message_adapter(msg) is adapter_b
+        assert _get_message_adapter(msg) is adapter_b
 
     def test_re_registered_message_cleans_up_exactly_once(self):
         # After re-registration, GC must remove the single entry without a
@@ -591,7 +592,7 @@ class TestSetMessageAdapterWeakref:
         set_message_adapter(msg, object())
         set_message_adapter(msg, object())
         key = id(msg)
-        assert key in types_module._message_adapter_map
+        assert key in _message_adapter_map
         del msg
         gc.collect()
-        assert key not in types_module._message_adapter_map
+        assert key not in _message_adapter_map
