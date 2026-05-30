@@ -3977,8 +3977,12 @@ class TestSubjectBinding:
         msg1 = _mk("msg-burst-1", "Hey @slack-bot first")
         task = asyncio.create_task(chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg1))
         await asyncio.sleep(0.005)
-        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", _mk("msg-burst-2", "Hey @slack-bot second"))
-        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", _mk("msg-burst-3", "Hey @slack-bot third"))
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", _mk("msg-burst-2", "Hey @slack-bot second")
+        )
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", _mk("msg-burst-3", "Hey @slack-bot third")
+        )
         await task
 
         # latest (msg-burst-3) dispatched as ``message``, the two earlier
