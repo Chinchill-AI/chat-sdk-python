@@ -793,6 +793,13 @@ class MessengerAdapter:
                     type=self._map_attachment_type(attachment.get("type", "")),
                     url=url,
                     fetch_data=self._make_attachment_downloader(url),
+                    # Persist the download URL so the closure can be rebuilt
+                    # by ``rehydrate_attachment`` after the message survives
+                    # a queue/debounce/burst JSON roundtrip (which drops the
+                    # ``fetch_data`` closure).  Messenger payload URLs are
+                    # signature-gated by Meta and require no auth header, so
+                    # the URL alone is sufficient to rebuild the closure.
+                    fetch_metadata={"url": url},
                 )
             )
         return result
@@ -809,6 +816,41 @@ class MessengerAdapter:
             return await self._download_attachment(url)
 
         return _download
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Reconstruct ``fetch_data`` on a deserialized Messenger attachment.
+
+        Called by :class:`~chat_sdk.chat.Chat` during message rehydration in
+        the queue/debounce/burst concurrency paths, where the original
+        ``fetch_data`` closure was dropped during JSON serialization.  Reads
+        the download URL from ``attachment.fetch_metadata`` (populated by
+        :meth:`_extract_attachments`) and rebuilds the lazy downloader that
+        reuses the shared aiohttp session.  Returns the attachment unchanged
+        when no URL is present — matching the upstream documented "leave
+        unchanged when no hook" degraded-mode behavior.
+
+        Mirrors :meth:`WhatsAppAdapter.rehydrate_attachment` exactly (both
+        platforms are Meta-family and share the same queue-mode failure
+        shape).  Like the original ``_download_attachment``, the rebuilt
+        closure attaches no auth headers — Messenger payload URLs are
+        signature-gated by Meta and do not require Bearer tokens.
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        url = meta.get("url")
+        if not url:
+            return attachment
+        return Attachment(
+            type=attachment.type,
+            url=attachment.url,
+            name=attachment.name,
+            mime_type=attachment.mime_type,
+            size=attachment.size,
+            width=attachment.width,
+            height=attachment.height,
+            data=attachment.data,
+            fetch_data=self._make_attachment_downloader(url),
+            fetch_metadata=attachment.fetch_metadata,
+        )
 
     @staticmethod
     def _map_attachment_type(fb_type: str) -> str:

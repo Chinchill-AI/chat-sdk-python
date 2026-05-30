@@ -964,3 +964,117 @@ class TestAttachmentParsing:
 
         result = await parsed.attachments[0].fetch_data()
         assert result == b"image-bytes"
+
+
+# ---------------------------------------------------------------------------
+# Attachment rehydration (queue/debounce/burst concurrency)
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateAttachment:
+    """``MessengerAdapter.rehydrate_attachment`` rebuilds dropped closures.
+
+    Ports the WhatsApp adapter's ``rehydrate_attachment`` hook to Messenger
+    so that messages bearing attachments survive the queue/debounce/burst
+    concurrency paths (Codex P2 finding).  Without the hook, ``fetch_data``
+    is ``None`` after dequeue and downstream handlers cannot download bytes.
+    """
+
+    def test_extraction_populates_fetch_metadata_with_url(self) -> None:
+        """``_extract_attachments`` stores the download URL on ``fetch_metadata``."""
+        adapter = _make_adapter()
+        event = _sample_event(
+            message={
+                "mid": "mid.meta",
+                "text": "x",
+                "attachments": [
+                    {"type": "image", "payload": {"url": "https://scontent.example.com/img.jpg"}},
+                ],
+            }
+        )
+        parsed = adapter.parse_message(event)
+        assert parsed.attachments[0].fetch_metadata == {"url": "https://scontent.example.com/img.jpg"}
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_rebuilds_fetch_data_after_queue_roundtrip(self) -> None:
+        """Simulate the queue/serialize cycle and confirm rehydration restores downloads.
+
+        This is the load-bearing test: it would FAIL if ``rehydrate_attachment``
+        is left as the protocol default (no-op) because ``fetch_data`` would
+        stay ``None`` and the ``await`` would raise ``TypeError``.
+        """
+        adapter = _make_adapter()
+        event = _sample_event(
+            message={
+                "mid": "mid.rehy",
+                "text": "x",
+                "attachments": [
+                    {"type": "image", "payload": {"url": "https://scontent.example.com/img.jpg"}},
+                ],
+            }
+        )
+        parsed = adapter.parse_message(event)
+        original = parsed.attachments[0]
+
+        # Simulate the JSON roundtrip: ``fetch_data`` closure is dropped,
+        # ``fetch_metadata`` survives (it serializes as a plain dict).
+        original.fetch_data = None
+
+        rehydrated = adapter.rehydrate_attachment(original)
+        assert rehydrated.fetch_data is not None
+        assert callable(rehydrated.fetch_data)
+        # Preserves the metadata so a second roundtrip would still work.
+        assert rehydrated.fetch_metadata == {"url": "https://scontent.example.com/img.jpg"}
+
+        # Wire a fake session to capture the URL the rebuilt closure hits.
+        captured_urls: list[str] = []
+
+        class _Resp:
+            status = 200
+
+            async def read(self) -> bytes:
+                return b"rehydrated-bytes"
+
+            async def __aenter__(self) -> _Resp:
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                pass
+
+        def _session_get(url: str, **_kw: object) -> _Resp:
+            captured_urls.append(url)
+            return _Resp()
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get.side_effect = _session_get
+        adapter._http_session = mock_session
+
+        data = await rehydrated.fetch_data()
+        assert data == b"rehydrated-bytes"
+        assert captured_urls == ["https://scontent.example.com/img.jpg"]
+
+    def test_rehydrate_no_metadata_returns_unchanged(self) -> None:
+        """Degraded mode: attachment without ``fetch_metadata`` is returned as-is."""
+        adapter = _make_adapter()
+        from chat_sdk.types import Attachment
+
+        bare = Attachment(type="image", url="https://example.com/x.jpg")
+        # fetch_metadata is None by default — adapter cannot rebuild the closure.
+        result = adapter.rehydrate_attachment(bare)
+        assert result is bare
+        assert result.fetch_data is None
+
+    def test_rehydrate_metadata_missing_url_returns_unchanged(self) -> None:
+        """Degraded mode: ``fetch_metadata`` without the ``url`` key is a no-op."""
+        adapter = _make_adapter()
+        from chat_sdk.types import Attachment
+
+        bare = Attachment(
+            type="image",
+            url="https://example.com/x.jpg",
+            fetch_metadata={"unrelated": "value"},
+        )
+        result = adapter.rehydrate_attachment(bare)
+        assert result is bare
+        assert result.fetch_data is None
