@@ -466,16 +466,27 @@ def set_message_adapter(message: Message, adapter: Adapter) -> None:
     is garbage-collected, its entry is removed automatically.
     """
     key = id(message)
+    already_registered = key in _message_adapter_map
     _message_adapter_map[key] = adapter
 
-    # Drop the entry when the message is GC'd. A zero-arg closure (rather than
-    # ``weakref.finalize(message, dict.pop, key, None)``) captures ``key`` and
-    # keeps the finalizer callable's type unambiguous for the type-checker.
-    # ``pop(key, None)`` is a no-op if the entry was already removed.
-    def _cleanup() -> None:
-        _message_adapter_map.pop(key, None)
+    # Register the GC finalizer only on first registration for a given message
+    # identity; re-registering the same live message just overwrites the adapter
+    # value above. This prevents an accumulation of redundant finalizers when a
+    # message is registered more than once (re-dispatch, rehydrate, multiple
+    # handler passes). The ``id()``-reuse hole stays closed: if a prior message
+    # with the same id was GC'd, its finalizer already popped the entry, so
+    # ``key not in _message_adapter_map`` is true again and a fresh finalizer is
+    # registered for the new object.
+    if not already_registered:
+        # Drop the entry when the message is GC'd. A zero-arg closure (rather
+        # than ``weakref.finalize(message, dict.pop, key, None)``) captures
+        # ``key`` and keeps the finalizer callable's type unambiguous for the
+        # type-checker. ``pop(key, None)`` is a no-op if the entry was already
+        # removed.
+        def _cleanup() -> None:
+            _message_adapter_map.pop(key, None)
 
-    weakref.finalize(message, _cleanup)
+        weakref.finalize(message, _cleanup)
 
 
 def _get_message_adapter(message: Message) -> Adapter | None:
@@ -524,8 +535,10 @@ class Message:
         (failures are swallowed, mirroring upstream's ``.catch(() => null)``).
         """
         adapter = _get_message_adapter(self)
+        if adapter is None:
+            return None
         fetch_subject = getattr(adapter, "fetch_subject", None)
-        if adapter is None or fetch_subject is None:
+        if fetch_subject is None:
             return None
         try:
             return await fetch_subject(self.raw)

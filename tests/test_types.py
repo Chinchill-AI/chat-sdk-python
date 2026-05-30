@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import weakref
 from datetime import datetime, timezone
 
 import chat_sdk.types as types_module
@@ -546,3 +547,51 @@ class TestSetMessageAdapterWeakref:
         set_message_adapter(m2, a2)
         assert types_module._get_message_adapter(m1) is a1
         assert types_module._get_message_adapter(m2) is a2
+
+    @staticmethod
+    def _live_finalizer_count(message: Message) -> int:
+        """Count live ``weakref.finalize`` callbacks attached to ``message``.
+
+        ``weakref.finalize`` keeps a class-level registry whose keys are the
+        ``finalize`` instances; ``peek()`` returns ``(obj, func, args, kwargs)``
+        while the finalizer is still alive. We count entries whose tracked
+        object is ``message`` to assert exactly one cleanup is registered.
+        """
+        count = 0
+        for finalizer in list(weakref.finalize._registry):
+            peeked = finalizer.peek()
+            if peeked is not None and peeked[0] is message:
+                count += 1
+        return count
+
+    def test_re_registration_does_not_add_duplicate_finalizer(self):
+        # Registering the same live message more than once (re-dispatch,
+        # rehydrate, multiple handler passes) must not accumulate finalizers.
+        msg = _make_message()
+        set_message_adapter(msg, object())
+        assert self._live_finalizer_count(msg) == 1
+        set_message_adapter(msg, object())
+        set_message_adapter(msg, object())
+        assert self._live_finalizer_count(msg) == 1
+
+    def test_re_registration_updates_adapter_value(self):
+        # The adapter VALUE is still overwritten on re-registration even though
+        # no second finalizer is added.
+        msg = _make_message()
+        adapter_a, adapter_b = object(), object()
+        set_message_adapter(msg, adapter_a)
+        assert types_module._get_message_adapter(msg) is adapter_a
+        set_message_adapter(msg, adapter_b)
+        assert types_module._get_message_adapter(msg) is adapter_b
+
+    def test_re_registered_message_cleans_up_exactly_once(self):
+        # After re-registration, GC must remove the single entry without a
+        # double-pop and without leaving a stale finalizer behind.
+        msg = _make_message()
+        set_message_adapter(msg, object())
+        set_message_adapter(msg, object())
+        key = id(msg)
+        assert key in types_module._message_adapter_map
+        del msg
+        gc.collect()
+        assert key not in types_module._message_adapter_map
