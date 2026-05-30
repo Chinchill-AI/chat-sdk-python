@@ -281,3 +281,188 @@ class TestInReplyToIdRoutesToRootThread:
         assert decoded.review_comment_id == root_comment_id
         # The thread_id format should contain :rc:3000
         assert f":rc:{root_comment_id}" in thread_id
+
+
+# =============================================================================
+# Tests -- eager bot-user-ID auto-detection (github slice of upstream 9824d33)
+# =============================================================================
+
+
+def _make_multi_tenant_adapter(**overrides: Any) -> GitHubAdapter:
+    """Create a multi-tenant GitHub App adapter (no installation_id)."""
+    defaults: dict[str, Any] = {
+        "webhook_secret": WEBHOOK_SECRET,
+        "app_id": "12345",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        "logger": ConsoleLogger("error"),
+    }
+    defaults.update(overrides)
+    return GitHubAdapter(defaults)
+
+
+def _make_install_payload(*, sender_id: int = 100, installation_id: int = 54321) -> dict[str, Any]:
+    """An issue_comment payload carrying an installation id (multi-tenant)."""
+    payload = _make_issue_comment_payload(sender_id=sender_id, owner="acme", repo="app", pr_number=42)
+    payload["installation"] = {"id": installation_id, "node_id": "MDIzOk"}
+    return payload
+
+
+class TestEagerBotUserIdDetection:
+    """Eager bot-user-ID detection so is_me works and self-reply loops are prevented.
+
+    Mirrors the github slice of upstream commit 9824d33: detection runs on the
+    first webhook for an installation (so the very first reply has a populated
+    bot id), is cached so subsequent webhooks don't re-fetch, and falls back
+    from users.getAuthenticated (GET /user) to apps.getAuthenticated (GET /app)
+    + users.getByUsername (GET /users/{slug}[bot]) for installation tokens.
+    """
+
+    @pytest.mark.asyncio
+    async def test_webhook_populates_bot_user_id_before_dispatch(self):
+        """First webhook for a new installation populates _bot_user_id before message handling."""
+        adapter = _make_multi_tenant_adapter()
+        chat = MagicMock()
+        chat.process_message = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        adapter._chat = chat
+
+        # Installation tokens: /user is unavailable, so detection falls back to
+        # /app then /users/{slug}[bot].
+        async def fake_api(method: str, path: str, body: Any = None, *, installation_id: int | None = None) -> Any:
+            if path == "/user":
+                raise RuntimeError("404 /user not available for installation token")
+            if path == "/app":
+                return {"slug": "my-bot", "id": 1}
+            if path == "/users/my-bot[bot]":
+                return {"id": 7777, "login": "my-bot[bot]"}
+            raise AssertionError(f"unexpected path {path}")
+
+        api = AsyncMock(side_effect=fake_api)
+        adapter._github_api_request = api
+
+        # process_message must observe a populated bot id. Capture it at call time.
+        observed: dict[str, Any] = {}
+        chat.process_message.side_effect = lambda *a, **kw: observed.update({"bot_id": adapter._bot_user_id})
+
+        payload = _make_install_payload(sender_id=100, installation_id=54321)
+        body = json.dumps(payload)
+        headers = {
+            "x-hub-signature-256": _sign(body),
+            "x-github-event": "issue_comment",
+            "content-type": "application/json",
+        }
+
+        result = await adapter.handle_webhook(FakeRequest(body, headers))
+
+        assert result["status"] == 200
+        assert adapter._bot_user_id == 7777
+        # Detection used the webhook's installation id for the API calls.
+        assert api.await_args_list[0].kwargs["installation_id"] == 54321
+        # process_message ran, and the bot id was already set when it did.
+        chat.process_message.assert_called_once()
+        assert observed["bot_id"] == 7777
+
+    @pytest.mark.asyncio
+    async def test_message_from_bot_filtered_as_is_me(self):
+        """A message authored by the bot itself is filtered (self-reply loop prevented)."""
+        adapter = _make_multi_tenant_adapter()
+        chat = MagicMock()
+        chat.process_message = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        adapter._chat = chat
+
+        async def fake_api(method: str, path: str, body: Any = None, *, installation_id: int | None = None) -> Any:
+            if path == "/user":
+                raise RuntimeError("404")
+            if path == "/app":
+                return {"slug": "my-bot"}
+            if path == "/users/my-bot[bot]":
+                return {"id": 8888, "login": "my-bot[bot]"}
+            raise AssertionError(f"unexpected path {path}")
+
+        adapter._github_api_request = AsyncMock(side_effect=fake_api)
+
+        # Sender is the bot itself (id 8888) -> must be ignored.
+        payload = _make_install_payload(sender_id=8888, installation_id=54321)
+        body = json.dumps(payload)
+        headers = {
+            "x-hub-signature-256": _sign(body),
+            "x-github-event": "issue_comment",
+            "content-type": "application/json",
+        }
+
+        result = await adapter.handle_webhook(FakeRequest(body, headers))
+
+        assert result["status"] == 200
+        assert adapter._bot_user_id == 8888
+        # Self-message: process_message NOT called -> no self-reply loop.
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pat_path_uses_users_get_authenticated(self):
+        """PAT path resolves the bot via GET /user (users.getAuthenticated), no /app fallback."""
+        adapter = _make_adapter()  # token-based (PAT) adapter
+        chat = MagicMock()
+        chat.process_message = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        adapter._chat = chat
+
+        api = AsyncMock(return_value={"id": 4242, "login": "pat-bot"})
+        adapter._github_api_request = api
+
+        payload = _make_issue_comment_payload(sender_id=100)
+        body = json.dumps(payload)
+        headers = {
+            "x-hub-signature-256": _sign(body),
+            "x-github-event": "issue_comment",
+            "content-type": "application/json",
+        }
+
+        result = await adapter.handle_webhook(FakeRequest(body, headers))
+
+        assert result["status"] == 200
+        assert adapter._bot_user_id == 4242
+        # Only GET /user was used; no apps.getAuthenticated fallback.
+        called_paths = [c.args[1] for c in api.await_args_list]
+        assert called_paths == ["/user"]
+        chat.process_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_second_webhook_does_not_refetch(self):
+        """A second webhook for the same installation does NOT re-fetch (cache hit)."""
+        adapter = _make_multi_tenant_adapter()
+        chat = MagicMock()
+        chat.process_message = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        adapter._chat = chat
+
+        async def fake_api(method: str, path: str, body: Any = None, *, installation_id: int | None = None) -> Any:
+            if path == "/user":
+                raise RuntimeError("404")
+            if path == "/app":
+                return {"slug": "my-bot"}
+            if path == "/users/my-bot[bot]":
+                return {"id": 9999, "login": "my-bot[bot]"}
+            raise AssertionError(f"unexpected path {path}")
+
+        api = AsyncMock(side_effect=fake_api)
+        adapter._github_api_request = api
+
+        headers_for = lambda b: {  # noqa: E731
+            "x-hub-signature-256": _sign(b),
+            "x-github-event": "issue_comment",
+            "content-type": "application/json",
+        }
+
+        body1 = json.dumps(_make_install_payload(sender_id=100, installation_id=54321))
+        await adapter.handle_webhook(FakeRequest(body1, headers_for(body1)))
+        assert adapter._bot_user_id == 9999
+
+        detection_calls_after_first = len(api.await_args_list)
+
+        body2 = json.dumps(_make_install_payload(sender_id=101, installation_id=54321))
+        await adapter.handle_webhook(FakeRequest(body2, headers_for(body2)))
+
+        # No additional detection API calls on the second webhook (cache hit).
+        assert len(api.await_args_list) == detection_calls_after_first
+        assert chat.process_message.call_count == 2
