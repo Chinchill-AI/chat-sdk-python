@@ -24,6 +24,7 @@ from chat_sdk.plan import (
     Plan,
     PostableObjectContext,
     StartPlanOptions,
+    StreamingPlanOptions,
     UpdateTaskInput,
     is_postable_object,
     post_postable_object,
@@ -576,3 +577,37 @@ class TestEditErrorPath:
         assert task is not None
         assert task.title == "Step 3"
         assert len(plan.tasks) == 3
+
+
+class TestStreamingPlanOptionsDocs:
+    """Pin the StreamingPlanOptions docstring to upstream's #463 refresh.
+
+    vercel/chat#463 (commit `0cc3d06`) dropped the stale "fallback mode (post
+    + edit on adapters without native streaming)" wording in favor of "Used
+    by post+edit streaming paths" — the same string is used regardless of
+    whether the adapter has a ``stream`` method (the adapter's stream method
+    may also internally rate-limit using this value). Without this lock,
+    Python could drift back to the old wording on the next sync.
+    """
+
+    def test_update_interval_ms_docstring_matches_upstream(self) -> None:
+        doc = StreamingPlanOptions.__doc__ or ""
+        # New (post-#463) wording
+        assert "post + edit streaming paths" in doc or "post+edit streaming paths" in doc
+        # Old wording must be gone
+        assert "fallback mode" not in doc
+        assert "without native streaming" not in doc
+
+    def test_thread_handle_stream_docstring_matches_upstream(self) -> None:
+        """ThreadImpl._handle_stream docstring uses the post-#463 wording.
+
+        Upstream rewrote the comment from "uses adapter's native streaming
+        if available" to "uses the adapter's stream implementation if
+        available" so the docs no longer imply a binary native/fallback
+        split (some adapters' ``stream`` method does its own post+edit).
+        """
+        doc = ThreadImpl._handle_stream.__doc__ or ""
+        # New (post-#463) wording
+        assert "stream implementation" in doc
+        # Old wording must be gone
+        assert "native streaming" not in doc

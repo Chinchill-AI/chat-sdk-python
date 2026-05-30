@@ -648,7 +648,8 @@ class ThreadImpl:
     ) -> SentMessage:
         """Handle streaming from an AsyncIterable.
 
-        Uses adapter's native streaming if available, otherwise falls back to post+edit.
+        Uses the adapter's stream implementation if available, otherwise
+        falls back to post+edit.
 
         ``extra_options`` carries caller-supplied fields (e.g. from a
         :class:`StreamingPlan`: ``task_display_mode``, ``stop_blocks``,
@@ -682,7 +683,7 @@ class ThreadImpl:
             if extra_options.update_interval_ms is not None:
                 options.update_interval_ms = extra_options.update_interval_ms
 
-        # Use native streaming if adapter supports it
+        # Use adapter-provided streaming if available.
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
