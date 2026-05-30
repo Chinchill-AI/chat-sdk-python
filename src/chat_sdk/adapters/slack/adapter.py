@@ -704,6 +704,13 @@ class SlackAdapter:
                 # ``_default_bot_token_cache`` would be a latent bug, so detect
                 # and raise instead.
                 if inspect.isawaitable(resolved):
+                    # Close to suppress "coroutine was never awaited"
+                    # RuntimeWarning before raising. ``isawaitable`` matches
+                    # both coroutines and awaitable objects; both implement
+                    # ``close`` via their ``__await__`` / Coroutine protocol.
+                    close = getattr(resolved, "close", None)
+                    if callable(close):
+                        close()
                     raise AuthenticationError(
                         "slack",
                         "Bot token resolver returned an awaitable in a sync "

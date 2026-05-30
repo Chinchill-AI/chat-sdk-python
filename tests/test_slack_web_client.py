@@ -306,36 +306,44 @@ class TestWebClientSyncResolver:
         assert "async" in message
 
     def test_sync_callable_returning_coroutine_raises(self):
-        """Defensive: a sync callable that returns a coroutine must not be cached."""
+        """Defensive: a sync callable that returns a coroutine must not be cached.
+
+        The production code is responsible for closing the orphaned coroutine
+        before raising — otherwise callers see a noisy ``coroutine was never
+        awaited`` RuntimeWarning. We pin that behavior by capturing warnings
+        and asserting none were emitted.
+        """
+        import warnings
 
         async def _coro() -> str:
             return "xoxb-would-be-resolved"
 
-        produced: list = []
-
         def resolver():
             # ``iscoroutinefunction`` returns False for this — the awaitable
             # only appears at call time. Caching the coroutine would be a
-            # latent bug; the defensive check must raise instead.
-            c = _coro()
-            produced.append(c)
-            return c
+            # latent bug; the defensive check must raise AND close the
+            # coroutine to silence the warning.
+            return _coro()
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
 
-        try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
             with pytest.raises(AuthenticationError) as excinfo:
                 _ = adapter.web_client
 
-            message = str(excinfo.value).lower()
-            assert "awaitable" in message or "async" in message
-            # And the cache must not have been poisoned with the coroutine object.
-            assert adapter._default_bot_token_cache is None
-        finally:
-            # Close the coroutine we created but intentionally did not await,
-            # so the test does not leave an un-awaited-coroutine warning behind.
-            for c in produced:
-                c.close()
+        message = str(excinfo.value).lower()
+        assert "awaitable" in message or "async" in message
+        # Cache must not have been poisoned with the coroutine object.
+        assert adapter._default_bot_token_cache is None
+        # No "coroutine was never awaited" RuntimeWarning leaked — production
+        # code closed the coroutine before raising.
+        unawaited = [
+            str(w.message)
+            for w in captured
+            if issubclass(w.category, RuntimeWarning) and "never awaited" in str(w.message)
+        ]
+        assert unawaited == [], f"unexpected un-awaited coroutine warnings: {unawaited}"
 
     def test_sync_callable_returning_empty_string_raises(self):
         """An empty/invalid resolver result raises rather than caching it."""
