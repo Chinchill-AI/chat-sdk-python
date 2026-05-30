@@ -40,7 +40,14 @@ from typing import Any, Literal
 
 from chat_sdk.chat import Chat
 from chat_sdk.errors import ChatError, ChatNotImplementedError
-from chat_sdk.types import Author, FetchOptions, ListThreadsOptions, Message
+from chat_sdk.types import (
+    Author,
+    FetchOptions,
+    ListThreadsOptions,
+    Message,
+    PostableMarkdown,
+    PostableRaw,
+)
 
 # ---------------------------------------------------------------------------
 # Tool dataclass
@@ -258,7 +265,7 @@ def _project_message(message: Message) -> dict[str, Any]:
                 "mimeType": att.mime_type,
                 "url": att.url,
             }
-            for att in (message.attachments or [])
+            for att in (message.attachments if message.attachments is not None else [])
         ],
     }
 
@@ -305,11 +312,6 @@ def _to_postable(message: Any) -> Any:
     in a :class:`~chat_sdk.types.PostableMarkdown` so the SDK's markdown
     rendering path runs.
     """
-    # Lazy import to keep tools.py importable without triggering the full
-    # types module on cold start of consumers that only want the factory
-    # for static introspection.
-    from chat_sdk.types import PostableMarkdown, PostableRaw
-
     if isinstance(message, str):
         return message
     if isinstance(message, dict):
@@ -368,7 +370,7 @@ def get_channel_info(chat: ChatBinding) -> ChatTool:
 
 def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Post a message inside an existing thread."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -400,7 +402,7 @@ def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 
 def post_channel_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Post a top-level channel message (not threaded under another message)."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         channel = chat.channel(args["channelId"])
@@ -431,7 +433,7 @@ def post_channel_message(chat: ChatBinding, options: ToolOptions | None = None) 
 
 def send_direct_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Open (or reuse) a 1:1 DM with a user and post in it."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         dm = await chat.open_dm(args["userId"])
@@ -463,7 +465,7 @@ def send_direct_message(chat: ChatBinding, options: ToolOptions | None = None) -
 
 def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Edit a previously posted message in a thread."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -500,7 +502,7 @@ def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 
 def delete_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Delete a message from a thread."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -539,7 +541,7 @@ def delete_message(chat: ChatBinding, options: ToolOptions | None = None) -> Cha
 
 def add_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Add an emoji reaction to a specific message."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -579,7 +581,7 @@ def add_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 
 def remove_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Remove an emoji reaction the bot previously added."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -836,7 +838,7 @@ def get_thread_participants(chat: ChatBinding) -> ChatTool:
 
 def subscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Subscribe to all future messages in a thread."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -866,7 +868,7 @@ def subscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> C
 
 def unsubscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Unsubscribe from a thread."""
-    opts = options or ToolOptions()
+    opts = options if options is not None else ToolOptions()
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         thread = chat.thread(args["threadId"])
@@ -1084,7 +1086,7 @@ def create_chat_tools(
     }
 
     result: dict[str, ChatTool] = {}
-    overrides_map = overrides or {}
+    overrides_map = overrides if overrides is not None else {}
     for name, build in factories.items():
         if allowed is not None and name not in allowed:
             continue
