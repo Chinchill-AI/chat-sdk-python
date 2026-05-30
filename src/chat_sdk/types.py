@@ -552,10 +552,17 @@ class Message:
         ``ensure_future`` and stores the shared future on the instance; every
         later/concurrent await reuses it, so ``fetch_subject`` runs at most
         once. Mirrors upstream's cached ``_subjectPromise``.
+
+        The cached future is awaited through :func:`asyncio.shield` so that a
+        caller cancellation (e.g. ``asyncio.wait_for(msg.subject, timeout=...)``
+        firing) propagates ``CancelledError`` to the caller but does *not*
+        cancel the shared inner task. Without shielding, the first cancelled
+        awaiter would poison the cache and every subsequent ``await
+        msg.subject`` would raise ``CancelledError``.
         """
         if self._subject_future is None:
             self._subject_future = asyncio.ensure_future(self._resolve_subject())
-        return await self._subject_future
+        return await asyncio.shield(self._subject_future)
 
     @property
     def subject(self) -> Awaitable[MessageSubject | None]:

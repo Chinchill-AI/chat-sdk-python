@@ -7,6 +7,8 @@ import gc
 import weakref
 from datetime import datetime, timezone
 
+import pytest
+
 from chat_sdk.types import (
     Attachment,
     Author,
@@ -518,6 +520,40 @@ class TestMessageSubject:
         set_message_adapter(msg, Capturing())
         await msg.subject
         assert seen["raw"] == {"native": "payload"}
+
+    async def test_subject_survives_caller_cancellation(self):
+        """Cancellation in one awaiter must not poison the cached future for other awaiters.
+
+        Cancelling ``await msg.subject`` (via wait_for/timeout) used to propagate into
+        the shared ``_subject_future``, cancelling the inner task and causing every
+        subsequent ``await msg.subject`` to raise CancelledError. ``asyncio.shield()``
+        prevents that.
+        """
+        # Set up: an adapter whose fetch_subject takes longer than a tight timeout.
+        started = asyncio.Event()
+        proceed = asyncio.Event()
+
+        class SlowAdapter:
+            name = "slow"
+
+            async def fetch_subject(self, raw):  # noqa: ANN001, ANN201
+                started.set()
+                await proceed.wait()
+                return MessageSubject(id="s1", type="issue", raw={}, title="Done")
+
+        msg = _make_message()
+        set_message_adapter(msg, SlowAdapter())
+
+        # First caller times out — must NOT poison the cache.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(msg.subject, timeout=0.05)
+        await started.wait()  # confirm the inner task started
+
+        # Now let the inner task finish. A second caller must see the result.
+        proceed.set()
+        result = await msg.subject
+        assert result is not None
+        assert result.title == "Done"
 
 
 class TestSetMessageAdapterWeakref:
