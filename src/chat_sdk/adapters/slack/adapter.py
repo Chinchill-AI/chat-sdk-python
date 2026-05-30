@@ -19,6 +19,7 @@ import json
 import os
 import re
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
@@ -466,6 +467,16 @@ class SlackAdapter:
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
         self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
 
+        # Cache of synchronous slack_sdk.WebClient instances keyed by bot
+        # token, backing the public ``web_client`` property (the direct port
+        # of upstream's ``getClientForToken``). Kept separate from
+        # ``_client_cache`` because that one holds async ``AsyncWebClient``
+        # instances used by the adapter's own API calls; the two client types
+        # are not interchangeable. Mirrors upstream's plain (unbounded) Map —
+        # one entry per distinct token — since callers reach for this escape
+        # hatch rarely and tokens are low-cardinality.
+        self._web_client_cache: dict[str, Any] = {}
+
         # Multi-workspace OAuth fields.
         # ``is not None`` (not truthiness) so an explicit empty-string user
         # config does not silently fall back to env (hazard #1). Empty env
@@ -589,6 +600,61 @@ class SlackAdapter:
         :class:`AuthenticationError` when no token is available.
         """
         return self._get_client()
+
+    @property
+    def web_client(self) -> Any:
+        """Direct access to a synchronous ``slack_sdk.WebClient``.
+
+        Bound to the bot token for the current request context
+        (multi-workspace) or the configured default token
+        (single-workspace). Use for any Slack Web API call not covered by
+        the adapter's high-level methods — e.g.
+        ``adapter.web_client.pins_add(...)`` or
+        ``adapter.web_client.usergroups_list(...)``.
+
+        Resolution order (the standard 3-level resolver):
+
+        1. Token from the current request context (set during webhook
+           handling, or by :meth:`with_bot_token` / :meth:`with_bot_token_async`).
+        2. The default bot token, when configured as a static string or
+           already-resolved value.
+        3. Otherwise raise :class:`AuthenticationError`.
+
+        Raises :class:`AuthenticationError` if neither is available —
+        typical causes are accessing ``web_client`` outside any
+        webhook / :meth:`with_bot_token` context in multi-workspace mode,
+        or having configured ``bot_token`` as an async resolver that has
+        not run yet. In the latter case await
+        :meth:`current_token_async` (or process the work inside the
+        webhook flow) so the resolver primes the token first.
+
+        Return type is ``Any`` (rather than the concrete ``WebClient``)
+        because ``slack_sdk`` is an optional dependency — consumers who do
+        not install the ``slack`` extra should not pay an import cost.
+
+        This is the direct port of upstream's ``adapter.webClient`` getter
+        (vercel/chat ``2f108bd``). Unlike :attr:`current_client` it returns
+        the *synchronous* ``WebClient`` (the analog of the single TS
+        ``WebClient``), so its methods are not awaitables.
+        """
+        return self._get_web_client_for_token(self._get_token())
+
+    @property
+    def client(self) -> Any:
+        """Deprecated alias for :attr:`web_client`.
+
+        .. deprecated::
+            Use :attr:`web_client` instead. This alias mirrors upstream's
+            pre-rename ``adapter.client`` (vercel/chat ``8366b8b``) and is
+            kept for one release for backwards compatibility; it will be
+            removed in a future version. Emits :class:`DeprecationWarning`.
+        """
+        warnings.warn(
+            "SlackAdapter.client is deprecated; use SlackAdapter.web_client instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.web_client
 
     # ------------------------------------------------------------------
     # Token management
@@ -742,6 +808,25 @@ class SlackAdapter:
     def _invalidate_client(self, token: str) -> None:
         """Remove a cached client (e.g., on token revocation)."""
         self._client_cache.pop(token, None)
+
+    def _get_web_client_for_token(self, token: str) -> Any:
+        """Return a synchronous ``slack_sdk.WebClient`` for *token*, cached.
+
+        Backs the public :attr:`web_client` property and is the direct port
+        of upstream's ``getClientForToken`` (vercel/chat ``2f108bd``): one
+        cached ``WebClient`` instance per distinct token. The import is
+        deferred so ``slack_sdk`` stays an optional dependency (hazard #10).
+
+        Distinct from :meth:`_get_client`, which caches the *async*
+        ``AsyncWebClient`` used by the adapter's own API calls.
+        """
+        client = self._web_client_cache.get(token)
+        if client is None:
+            from slack_sdk import WebClient
+
+            client = WebClient(token=token)
+            self._web_client_cache[token] = client
+        return client
 
     # ------------------------------------------------------------------
     # Initialization
