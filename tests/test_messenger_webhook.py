@@ -338,6 +338,20 @@ class TestVerifySignature:
         sig = "sha256=" + hmac.new(b"my-secret", body, hashlib.sha256).hexdigest()
         assert adapter._verify_signature(body, sig) is True
 
+    def test_uppercase_hex_signature_accepted(self) -> None:
+        """An uppercase-hex signature must still verify.
+
+        ``hexdigest()`` is lowercase, but Node's ``Buffer.from(hex)`` is
+        case-insensitive, so upstream accepts an uppercase-hex signature.
+        We normalize the header hash to lowercase before the constant-time
+        compare; without that, this exact-but-uppercased signature would be
+        rejected. Pins parity with upstream's behavior.
+        """
+        adapter = _make_adapter(app_secret="my-secret")
+        body = b'{"test": true}'
+        sig = "sha256=" + hmac.new(b"my-secret", body, hashlib.sha256).hexdigest().upper()
+        assert adapter._verify_signature(body, sig) is True
+
     def test_invalid_signature_rejected(self) -> None:
         adapter = _make_adapter(app_secret="my-secret")
         assert adapter._verify_signature(b'{"a":1}', "sha256=deadbeef") is False

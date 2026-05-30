@@ -328,9 +328,11 @@ class MessengerAdapter:
                 body,
                 hashlib.sha256,
             ).hexdigest()
-            # Compare hex strings directly. The signature is presented as a
-            # lowercase hex string by Meta; ``hexdigest()`` is lowercase.
-            return hmac.compare_digest(hash_hex, computed_hex)
+            # Compare hex strings. ``hexdigest()`` is lowercase; Node's
+            # ``Buffer.from(hex)`` is case-insensitive, so upstream accepts an
+            # uppercase-hex signature. Normalize the header hash to lowercase
+            # before the constant-time compare to match that behavior.
+            return hmac.compare_digest(hash_hex.lower(), computed_hex)
         except Exception:
             self._logger.warn("Failed to verify Messenger webhook signature")
             return False
@@ -1097,11 +1099,13 @@ def create_messenger_adapter(
 ) -> MessengerAdapter:
     """Factory for ``MessengerAdapter`` with env-var fallbacks.
 
-    Q1 (see #110): init-failure behavior.  We match the upstream contract and
-    the sibling ``WhatsAppAdapter`` by raising ``ValidationError`` at
-    construction time for each missing required credential.  This keeps the
-    Meta-family adapters consistent and surfaces config errors loudly during
-    startup rather than at first webhook call.
+    Q1 (see #110): init-failure behavior.  We match the upstream contract by
+    raising ``ValidationError`` at construction time for each missing required
+    credential.  This improves on the sibling ``WhatsAppAdapter``, whose
+    constructor does no validation (direct misconstruction raises ``TypeError``,
+    not ``ValidationError``) -- Messenger raises a descriptive ``ValidationError``
+    from both the factory and the constructor.  It surfaces config errors loudly
+    during startup rather than at first webhook call.
     """
     _logger = logger or ConsoleLogger("info").child("messenger")
 
