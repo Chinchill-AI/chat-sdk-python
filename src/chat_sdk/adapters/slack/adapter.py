@@ -689,13 +689,42 @@ class SlackAdapter:
         if self._default_bot_token_cache is not None:
             return self._default_bot_token_cache
         if self._default_bot_token_provider is not None:
-            # Resolver-based default token configured but never resolved. This
-            # is a programming error: the async entry path should have awaited
-            # ``_resolve_default_token()`` before reaching here.
+            provider = self._default_bot_token_provider
+            # Sync callable resolver: invoke it directly and prime the
+            # process-wide cache so subsequent sync access stays fast. Mirrors
+            # the cache-update semantics in ``_resolve_default_token`` (the
+            # async path). Async resolvers cannot be awaited from a sync
+            # context, so those still raise below — call ``current_token_async``
+            # or enter via ``handle_webhook`` to prime the cache first.
+            if not inspect.iscoroutinefunction(provider):
+                resolved = provider()
+                # Defensive: a "sync" callable may still *return* a coroutine
+                # (e.g. ``lambda: some_async_fn()``) and ``iscoroutinefunction``
+                # would not catch that. Caching a coroutine in
+                # ``_default_bot_token_cache`` would be a latent bug, so detect
+                # and raise instead.
+                if inspect.isawaitable(resolved):
+                    raise AuthenticationError(
+                        "slack",
+                        "Bot token resolver returned an awaitable in a sync "
+                        "context. Use the async API (handle_webhook / "
+                        "current_token_async) so the resolver can be awaited.",
+                    )
+                if not isinstance(resolved, str) or not resolved:
+                    raise AuthenticationError(
+                        "slack",
+                        "Bot token resolver returned an empty or non-string value.",
+                    )
+                self._default_bot_token_cache = resolved
+                return resolved
+            # Async resolver-based default token configured but never resolved.
+            # Cannot be awaited from a sync context — the async entry path must
+            # have awaited ``_resolve_default_token()`` before reaching here.
             raise AuthenticationError(
                 "slack",
-                "Bot token resolver has not been invoked yet. Use the async API "
-                "(handle_webhook / current_token_async) so the resolver runs first.",
+                "Async bot token resolver has not been invoked yet. Use the "
+                "async API (handle_webhook / current_token_async) so the "
+                "resolver runs first.",
             )
         raise AuthenticationError(
             "slack",

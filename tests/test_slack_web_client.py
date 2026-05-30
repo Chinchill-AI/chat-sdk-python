@@ -242,3 +242,109 @@ class TestWebClientAsyncResolver:
 
         with pytest.raises(AuthenticationError):
             _ = adapter.web_client
+
+
+# ---------------------------------------------------------------------------
+# Sync resolver: invoked directly from ``web_client`` (Codex P2 fix)
+# ---------------------------------------------------------------------------
+
+
+class TestWebClientSyncResolver:
+    """Cover the sync-callable ``bot_token`` branch in ``_get_token``.
+
+    Before the fix, ``_get_token`` only handled the static-string and primed
+    cache cases — sync callables (used e.g. for lazy secret-manager loads or
+    rotation) raised ``AuthenticationError`` from ``web_client`` outside any
+    webhook / ContextVar scope, so proactive sends were impossible until an
+    async path had primed the cache. The new sync-callable branch invokes
+    the resolver and primes ``_default_bot_token_cache`` in the same way
+    ``_resolve_default_token`` does on the async path.
+    """
+
+    def test_sync_callable_resolves_and_caches(self):
+        """A sync ``bot_token`` callable is invoked on first access and cached.
+
+        Load-bearing: with the fix reverted the first access raises
+        ``AuthenticationError`` instead of returning the resolved token.
+        """
+        calls = {"n": 0}
+
+        def resolver() -> str:
+            calls["n"] += 1
+            return "xoxb-sync-resolved"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+
+        first = adapter.web_client
+        assert first.token == "xoxb-sync-resolved"
+        assert calls["n"] == 1
+
+        # Second access must hit the cache and not re-invoke the resolver —
+        # matches the cache semantics of the async ``_resolve_default_token``
+        # path (which writes ``_default_bot_token_cache``).
+        second = adapter.web_client
+        assert second is first
+        assert calls["n"] == 1
+        assert adapter._default_bot_token_cache == "xoxb-sync-resolved"
+
+    def test_async_callable_in_sync_context_raises(self):
+        """``async def`` resolvers cannot be awaited from the sync property."""
+
+        async def resolver() -> str:
+            return "xoxb-async-resolved"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+
+        with pytest.raises(AuthenticationError) as excinfo:
+            _ = adapter.web_client
+
+        # Not brittle about exact wording — just confirm the message points at
+        # the sync/async resolver mismatch rather than the generic
+        # "no bot token" path.
+        message = str(excinfo.value).lower()
+        assert "resolver" in message
+        assert "async" in message
+
+    def test_sync_callable_returning_coroutine_raises(self):
+        """Defensive: a sync callable that returns a coroutine must not be cached."""
+
+        async def _coro() -> str:
+            return "xoxb-would-be-resolved"
+
+        produced: list = []
+
+        def resolver():
+            # ``iscoroutinefunction`` returns False for this — the awaitable
+            # only appears at call time. Caching the coroutine would be a
+            # latent bug; the defensive check must raise instead.
+            c = _coro()
+            produced.append(c)
+            return c
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+
+        try:
+            with pytest.raises(AuthenticationError) as excinfo:
+                _ = adapter.web_client
+
+            message = str(excinfo.value).lower()
+            assert "awaitable" in message or "async" in message
+            # And the cache must not have been poisoned with the coroutine object.
+            assert adapter._default_bot_token_cache is None
+        finally:
+            # Close the coroutine we created but intentionally did not await,
+            # so the test does not leave an un-awaited-coroutine warning behind.
+            for c in produced:
+                c.close()
+
+    def test_sync_callable_returning_empty_string_raises(self):
+        """An empty/invalid resolver result raises rather than caching it."""
+
+        def resolver() -> str:
+            return ""
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+
+        with pytest.raises(AuthenticationError):
+            _ = adapter.web_client
+        assert adapter._default_bot_token_cache is None
