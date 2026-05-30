@@ -1962,8 +1962,8 @@ class TelegramAdapter:
         form_data.add_field(
             upload["field"],
             data,
-            filename=attachment.name or "attachment",
-            content_type=attachment.mime_type or "application/octet-stream",
+            filename=attachment.name if attachment.name is not None else "attachment",
+            content_type=attachment.mime_type if attachment.mime_type is not None else "application/octet-stream",
         )
 
         if reply_markup:
