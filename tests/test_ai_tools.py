@@ -739,3 +739,63 @@ class TestChannelInfoEdgeCases:
         result = await tools["getChannelInfo"].execute({"channelId": "slack:C999"})
         assert result["isDM"] is False
         assert result["name"] is None
+
+
+# ---------------------------------------------------------------------------
+# Schema isolation (review): tools must not share mutable nested schema dicts
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaIsolation:
+    """Each tool must own a fully independent ``input_schema``.
+
+    The factories build several tools from the same shared schema source
+    (the postable-message body, the fetch ``direction`` enum). If two tools
+    embedded the *same* nested dict object, a downstream consumer mutating
+    one tool's schema in place would silently corrupt its siblings. These
+    tests deep-mutate one tool's schema and assert the sibling is untouched,
+    pinning the per-tool deep-copy guarantee.
+    """
+
+    async def test_postable_message_schema_not_shared_between_tools(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+        post_msg = tools["postMessage"]
+        post_channel = tools["postChannelMessage"]
+
+        a = post_msg.input_schema["properties"]["message"]
+        b = post_channel.input_schema["properties"]["message"]
+        # Distinct top-level objects and distinct nested objects.
+        assert a is not b
+        assert a["oneOf"] is not b["oneOf"]
+        assert a["oneOf"][1] is not b["oneOf"][1]
+
+        # Deep-mutate one tool's nested schema; the sibling must be unaffected.
+        a["oneOf"][1]["properties"]["markdown"]["description"] = "MUTATED"
+        a["oneOf"].append({"type": "null"})
+        assert "description" not in b["oneOf"][1]["properties"]["markdown"]
+        assert len(b["oneOf"]) == 3
+
+        # A freshly built toolset must also be pristine (no module-level bleed).
+        fresh = create_chat_tools(chat=harness.chat)
+        fresh_msg = fresh["postMessage"].input_schema["properties"]["message"]
+        assert "description" not in fresh_msg["oneOf"][1]["properties"]["markdown"]
+        assert len(fresh_msg["oneOf"]) == 3
+
+    async def test_fetch_direction_schema_not_shared_between_tools(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+        fetch_msgs = tools["fetchMessages"]
+        fetch_channel = tools["fetchChannelMessages"]
+
+        a = fetch_msgs.input_schema["properties"]["direction"]
+        b = fetch_channel.input_schema["properties"]["direction"]
+        assert a is not b
+        # The enum list is a nested mutable object that must not be shared.
+        assert a["enum"] is not b["enum"]
+
+        # Deep-mutate one tool's direction enum; sibling must be unaffected.
+        a["enum"].append("sideways")
+        assert b["enum"] == ["forward", "backward"]
+
+        fresh = create_chat_tools(chat=harness.chat)
+        fresh_dir = fresh["fetchMessages"].input_schema["properties"]["direction"]
+        assert fresh_dir["enum"] == ["forward", "backward"]

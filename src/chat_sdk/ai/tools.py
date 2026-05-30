@@ -33,6 +33,7 @@ core fields that overrides cannot replace.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -387,7 +388,7 @@ def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
                     "type": "string",
                     "description": "Full thread id including adapter prefix",
                 },
-                "message": _POSTABLE_INPUT_SCHEMA,
+                "message": copy.deepcopy(_POSTABLE_INPUT_SCHEMA),
             },
             "required": ["threadId", "message"],
             "additionalProperties": False,
@@ -418,7 +419,7 @@ def post_channel_message(chat: ChatBinding, options: ToolOptions | None = None) 
                     "type": "string",
                     "description": "Full channel id including adapter prefix",
                 },
-                "message": _POSTABLE_INPUT_SCHEMA,
+                "message": copy.deepcopy(_POSTABLE_INPUT_SCHEMA),
             },
             "required": ["channelId", "message"],
             "additionalProperties": False,
@@ -450,7 +451,7 @@ def send_direct_message(chat: ChatBinding, options: ToolOptions | None = None) -
                     "type": "string",
                     "description": "Platform-specific user id; the adapter is auto-detected",
                 },
-                "message": _POSTABLE_INPUT_SCHEMA,
+                "message": copy.deepcopy(_POSTABLE_INPUT_SCHEMA),
             },
             "required": ["userId", "message"],
             "additionalProperties": False,
@@ -487,7 +488,7 @@ def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
                     "type": "string",
                     "description": "Platform-specific message id of the message to edit",
                 },
-                "message": _POSTABLE_INPUT_SCHEMA,
+                "message": copy.deepcopy(_POSTABLE_INPUT_SCHEMA),
             },
             "required": ["threadId", "messageId", "message"],
             "additionalProperties": False,
@@ -663,7 +664,7 @@ def fetch_messages(chat: ChatBinding) -> ChatTool:
                     "description": "Pagination cursor from a previous fetchMessages call",
                 },
                 "direction": {
-                    **_FETCH_DIRECTION_SCHEMA,
+                    **copy.deepcopy(_FETCH_DIRECTION_SCHEMA),
                     "description": (
                         "'backward' (default) returns the most recent messages; 'forward' iterates from the oldest"
                     ),
@@ -718,7 +719,7 @@ def fetch_channel_messages(chat: ChatBinding) -> ChatTool:
                     "default": 20,
                 },
                 "cursor": {"type": "string"},
-                "direction": _FETCH_DIRECTION_SCHEMA,
+                "direction": copy.deepcopy(_FETCH_DIRECTION_SCHEMA),
             },
             "required": ["channelId"],
             "additionalProperties": False,
