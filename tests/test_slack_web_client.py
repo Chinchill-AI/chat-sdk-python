@@ -256,36 +256,53 @@ class TestWebClientSyncResolver:
     cache cases — sync callables (used e.g. for lazy secret-manager loads or
     rotation) raised ``AuthenticationError`` from ``web_client`` outside any
     webhook / ContextVar scope, so proactive sends were impossible until an
-    async path had primed the cache. The new sync-callable branch invokes
-    the resolver and primes ``_default_bot_token_cache`` in the same way
-    ``_resolve_default_token`` does on the async path.
+    async path had primed the cache. The sync-callable branch invokes the
+    resolver fresh on every access to honor the rotation contract documented
+    on :attr:`SlackAdapterConfig.bot_token`.
     """
 
-    def test_sync_callable_resolves_and_caches(self):
-        """A sync ``bot_token`` callable is invoked on first access and cached.
+    def test_sync_callable_invoked_fresh_each_access(self):
+        """Sync ``bot_token`` callables are invoked on *every* sync read.
 
-        Load-bearing: with the fix reverted the first access raises
-        ``AuthenticationError`` instead of returning the resolved token.
+        Load-bearing for two contracts:
+
+        1. The bot_token contract in ``types.py`` ("called on each use to
+           support rotation").
+        2. The audit fix that made sync resolvers reachable from
+           ``web_client`` at all (reverting it makes the first access raise).
+
+        If the resolver were cached after the first call, a rotating
+        secret-manager-backed resolver would silently freeze on the
+        original value.
         """
+        tokens = iter(["xoxb-sync-1", "xoxb-sync-2", "xoxb-sync-3"])
         calls = {"n": 0}
 
         def resolver() -> str:
             calls["n"] += 1
-            return "xoxb-sync-resolved"
+            return next(tokens)
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
 
         first = adapter.web_client
-        assert first.token == "xoxb-sync-resolved"
+        assert first.token == "xoxb-sync-1"
         assert calls["n"] == 1
 
-        # Second access must hit the cache and not re-invoke the resolver —
-        # matches the cache semantics of the async ``_resolve_default_token``
-        # path (which writes ``_default_bot_token_cache``).
+        # Second access must re-invoke the resolver and see the rotated
+        # token — caching would break rotation.
         second = adapter.web_client
-        assert second is first
-        assert calls["n"] == 1
-        assert adapter._default_bot_token_cache == "xoxb-sync-resolved"
+        assert second.token == "xoxb-sync-2"
+        assert calls["n"] == 2
+        # WebClient cache is keyed by token; a new token yields a new client.
+        assert second is not first
+
+        third = adapter.current_token
+        assert third == "xoxb-sync-3"
+        assert calls["n"] == 3
+
+        # Crucially, the dynamic-resolver path must NOT prime the
+        # process-wide cache — that would suppress future resolver calls.
+        assert adapter._default_bot_token_cache is None
 
     def test_async_callable_in_sync_context_raises(self):
         """``async def`` resolvers cannot be awaited from the sync property."""
@@ -356,3 +373,75 @@ class TestWebClientSyncResolver:
         with pytest.raises(AuthenticationError):
             _ = adapter.web_client
         assert adapter._default_bot_token_cache is None
+
+
+class TestInvalidateClientClearsTokenCaches:
+    """Pin that ``_invalidate_client`` clears the resolved-token caches for
+    dynamic-resolver configs.
+
+    Before the fix, ``_invalidate_client`` only evicted the WebClient and
+    AsyncWebClient caches — the next ``_get_token`` would still return the
+    revoked token from ``_default_bot_token_cache`` (or the per-request
+    ContextVar), so a 401-driven invalidation just rebuilt clients around the
+    same revoked credential.
+    """
+
+    def test_invalidate_clears_default_cache_for_dynamic_resolver(self):
+        """Async-resolver path: after invalidation the cache is cleared.
+
+        Load-bearing: with the fix reverted, ``_default_bot_token_cache``
+        still equals the revoked token after invalidation.
+        """
+
+        async def resolver() -> str:
+            return "xoxb-revoked"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+        # Simulate the async path having already primed the cache.
+        adapter._default_bot_token_cache = "xoxb-revoked"
+
+        adapter._invalidate_client("xoxb-revoked")
+
+        assert adapter._default_bot_token_cache is None
+
+    def test_invalidate_clears_per_request_token_for_dynamic_resolver(self):
+        """ContextVar-primed per-request token is cleared on invalidation."""
+
+        async def resolver() -> str:
+            return "xoxb-revoked"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+        adapter._resolved_default_token.set("xoxb-revoked")
+
+        adapter._invalidate_client("xoxb-revoked")
+
+        assert adapter._resolved_default_token.get() is None
+
+    def test_invalidate_static_string_does_not_clear_token_cache(self):
+        """Static-string ``bot_token`` configs have no refresh path.
+
+        Clearing the cache for a static-string config would just make every
+        subsequent sync access raise, with no way to recover. The fix
+        intentionally guards on ``_is_dynamic_bot_token`` to preserve the
+        static-string fast path.
+        """
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token="xoxb-static"))
+        assert adapter._default_bot_token_cache == "xoxb-static"
+
+        adapter._invalidate_client("xoxb-static")
+
+        # Client caches evicted but token cache retained.
+        assert adapter._default_bot_token_cache == "xoxb-static"
+
+    def test_invalidate_different_token_does_not_clear_cache(self):
+        """Only invalidation of the *currently cached* token clears it."""
+
+        async def resolver() -> str:
+            return "xoxb-current"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
+        adapter._default_bot_token_cache = "xoxb-current"
+
+        adapter._invalidate_client("xoxb-some-other-token")
+
+        assert adapter._default_bot_token_cache == "xoxb-current"

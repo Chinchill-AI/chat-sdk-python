@@ -396,6 +396,12 @@ class SlackAdapter:
         # on each subsequent webhook entry. Static-string configs prime this at
         # construction time so sync access works before any webhook fires.
         self._default_bot_token_cache: str | None = bot_token_config if isinstance(bot_token_config, str) else None
+        # True when the user passed a callable ``bot_token`` (sync or async).
+        # The config contract says callable resolvers are invoked on each use
+        # to support rotation, so sync access goes through a fresh-invoke
+        # branch instead of reading ``_default_bot_token_cache``. Static
+        # strings have nothing to rotate and stay on the cached fast path.
+        self._is_dynamic_bot_token: bool = callable(bot_token_config)
 
         # ------------------------------------------------------------------
         # Socket mode wiring (PR #86). Resolved AFTER the bot-token resolver
@@ -668,17 +674,19 @@ class SlackAdapter:
         1. Multi-workspace request context (``_request_context``)
         2. Per-request resolved default token (``_resolved_default_token``)
            — primed by ``handle_webhook`` after invoking the resolver
-        3. Static default token cache (set by the constructor for
-           string-typed ``bot_token`` configs)
-        4. Raises :class:`AuthenticationError`
+        3. Sync dynamic resolver — invoked **fresh on every call** to honor
+           the rotation contract in :attr:`SlackAdapterConfig.bot_token`
+           ("called on each use to support rotation")
+        4. Static default token cache (set by the constructor for
+           string-typed ``bot_token`` configs, or by the async path after
+           ``_resolve_default_token`` runs)
+        5. Raises :class:`AuthenticationError`
 
-        Synchronous: the token resolver is *not* invoked here. Webhook entry
-        paths call :meth:`_resolve_default_token` first so the per-request
-        cache is primed; static-string ``bot_token`` configs prime the
-        process-wide cache at construction time so this is a no-op for the
-        common case. Use :meth:`_resolve_token_async` from new async call
-        sites that need to invoke a resolver outside webhook flow (e.g.
-        cron jobs).
+        Async resolvers cannot be awaited from a sync context — sync access
+        outside a webhook scope falls back to the process-wide cache, or
+        raises if the async path has not run yet. Use
+        :meth:`current_token_async` or enter via :meth:`handle_webhook` so
+        the resolver runs first.
         """
         ctx = self._request_context.get()
         if ctx and ctx.token:
@@ -686,47 +694,40 @@ class SlackAdapter:
         per_request = self._resolved_default_token.get()
         if per_request is not None:
             return per_request
+        # Sync dynamic resolver: invoke fresh every call to honor rotation.
+        # Static strings (no rotation possible) and async resolvers (which
+        # need a webhook entry to be awaited) fall through to the cache.
+        provider = self._default_bot_token_provider
+        if self._is_dynamic_bot_token and provider is not None and not inspect.iscoroutinefunction(provider):
+            resolved = provider()
+            # Defensive: a "sync" callable may still *return* a coroutine
+            # (e.g. ``lambda: some_async_fn()``) and ``iscoroutinefunction``
+            # would not catch that. Refuse to use such a value in a sync
+            # context — and close the awaitable to suppress the
+            # ``coroutine was never awaited`` RuntimeWarning before raising.
+            if inspect.isawaitable(resolved):
+                close = getattr(resolved, "close", None)
+                if callable(close):
+                    close()
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an awaitable in a sync "
+                    "context. Use the async API (handle_webhook / "
+                    "current_token_async) so the resolver can be awaited.",
+                )
+            if not isinstance(resolved, str) or not resolved:
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an empty or non-string value.",
+                )
+            # Intentionally do NOT write ``_default_bot_token_cache``: caching
+            # would break the rotation contract for the next sync access.
+            return resolved
         if self._default_bot_token_cache is not None:
             return self._default_bot_token_cache
-        if self._default_bot_token_provider is not None:
-            provider = self._default_bot_token_provider
-            # Sync callable resolver: invoke it directly and prime the
-            # process-wide cache so subsequent sync access stays fast. Mirrors
-            # the cache-update semantics in ``_resolve_default_token`` (the
-            # async path). Async resolvers cannot be awaited from a sync
-            # context, so those still raise below — call ``current_token_async``
-            # or enter via ``handle_webhook`` to prime the cache first.
-            if not inspect.iscoroutinefunction(provider):
-                resolved = provider()
-                # Defensive: a "sync" callable may still *return* a coroutine
-                # (e.g. ``lambda: some_async_fn()``) and ``iscoroutinefunction``
-                # would not catch that. Caching a coroutine in
-                # ``_default_bot_token_cache`` would be a latent bug, so detect
-                # and raise instead.
-                if inspect.isawaitable(resolved):
-                    # Close to suppress "coroutine was never awaited"
-                    # RuntimeWarning before raising. ``isawaitable`` matches
-                    # both coroutines and awaitable objects; both implement
-                    # ``close`` via their ``__await__`` / Coroutine protocol.
-                    close = getattr(resolved, "close", None)
-                    if callable(close):
-                        close()
-                    raise AuthenticationError(
-                        "slack",
-                        "Bot token resolver returned an awaitable in a sync "
-                        "context. Use the async API (handle_webhook / "
-                        "current_token_async) so the resolver can be awaited.",
-                    )
-                if not isinstance(resolved, str) or not resolved:
-                    raise AuthenticationError(
-                        "slack",
-                        "Bot token resolver returned an empty or non-string value.",
-                    )
-                self._default_bot_token_cache = resolved
-                return resolved
-            # Async resolver-based default token configured but never resolved.
-            # Cannot be awaited from a sync context — the async entry path must
-            # have awaited ``_resolve_default_token()`` before reaching here.
+        if provider is not None:
+            # Async resolver configured but never awaited. ``handle_webhook``
+            # or ``current_token_async`` must run first to prime the cache.
             raise AuthenticationError(
                 "slack",
                 "Async bot token resolver has not been invoked yet. Use the "
@@ -842,9 +843,21 @@ class SlackAdapter:
         return client
 
     def _invalidate_client(self, token: str) -> None:
-        """Remove a cached client (e.g., on token revocation)."""
+        """Remove a cached client (e.g., on token revocation).
+
+        For dynamic-resolver configs also clears the resolved-token caches
+        so the next access re-invokes the resolver instead of serving the
+        revoked token. Static-string configs intentionally retain their
+        cache: there is no refresh path, so clearing would just make every
+        subsequent sync access raise.
+        """
         self._client_cache.pop(token, None)
         self._web_client_cache.pop(token, None)
+        if self._is_dynamic_bot_token:
+            if self._default_bot_token_cache == token:
+                self._default_bot_token_cache = None
+            if self._resolved_default_token.get() == token:
+                self._resolved_default_token.set(None)
 
     def _get_web_client_for_token(self, token: str) -> Any:
         """Return a synchronous ``slack_sdk.WebClient`` for *token*, cached.

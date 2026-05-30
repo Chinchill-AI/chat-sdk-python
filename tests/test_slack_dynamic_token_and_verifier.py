@@ -188,9 +188,10 @@ class TestBotTokenResolverConstruction:
         resolvers too — single-workspace apps using a sync resolver for
         secret rotation could not read ``current_token`` / ``web_client``
         outside a webhook context until an async path had primed the cache.
-        ``_get_token`` now invokes the sync resolver directly and primes
-        ``_default_bot_token_cache``; the async-resolver-in-sync-context
-        case still raises (see
+        ``_get_token`` now invokes the sync resolver directly — fresh on
+        every call, to honor the rotation contract on
+        :attr:`SlackAdapterConfig.bot_token`. The
+        async-resolver-in-sync-context case still raises (see
         ``test_sync_current_token_with_async_resolver_raises`` below).
         """
 
@@ -199,9 +200,12 @@ class TestBotTokenResolverConstruction:
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
         assert adapter.current_token == "xoxb-resolved"
-        # And the resolved token must be cached in the same slot the async
-        # path writes, so subsequent sync reads don't re-invoke.
-        assert adapter._default_bot_token_cache == "xoxb-resolved"
+        # Dynamic resolvers must NOT prime ``_default_bot_token_cache``;
+        # caching would suppress subsequent resolver calls and break the
+        # rotation contract. Rotation behavior is pinned by
+        # ``test_sync_callable_invoked_fresh_each_access`` in
+        # tests/test_slack_web_client.py.
+        assert adapter._default_bot_token_cache is None
 
     def test_sync_current_token_with_async_resolver_raises(self):
         """Async resolvers still cannot be awaited from the sync property."""
