@@ -37,8 +37,10 @@ def extract_postable_attachments(message: AdapterPostableMessage) -> list[Attach
     """
     if isinstance(message, str):
         return []
-    if hasattr(message, "attachments") and message.attachments:  # type: ignore[union-attr]
-        return message.attachments  # type: ignore[union-attr]
+    if hasattr(message, "attachments"):
+        attachments = message.attachments  # type: ignore[union-attr]
+        return attachments if attachments is not None else []
     if isinstance(message, dict) and "attachments" in message:
-        return message.get("attachments") or []
+        attachments = message.get("attachments")
+        return attachments if attachments is not None else []
     return []
