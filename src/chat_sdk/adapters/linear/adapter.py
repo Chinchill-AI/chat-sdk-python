@@ -174,8 +174,12 @@ class LinearAdapter:
                             "or LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET, or provide auth in config.",
                         )
 
-        # State-key prefix for per-organization installations.
-        self._installation_key_prefix = getattr(config, "installation_key_prefix", None) or "linear:installation"
+        # State-key prefix for per-organization installations. Use ``is not
+        # None`` (not truthiness) so an explicit ``installation_key_prefix=""``
+        # is honored verbatim and NOT silently overridden by the default
+        # (CLAUDE.md truthiness-trap hazard).
+        prefix = getattr(config, "installation_key_prefix", None)
+        self._installation_key_prefix = prefix if prefix is not None else "linear:installation"
 
         # Optional AES-256-GCM key for encrypting OAuth tokens at rest. Use
         # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``

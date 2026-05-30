@@ -89,6 +89,21 @@ class TestEncryptionKeyResolution:
         )
         assert adapter._encryption_key is None
 
+    def test_explicit_empty_installation_key_prefix_is_honored(self):
+        # An explicit empty prefix ("") is a valid caller choice and must NOT
+        # be silently overridden by the default. A truthiness fallback
+        # (``... or "linear:installation"``) would discard "" and yield the
+        # default; an explicit ``is not None`` check preserves it.
+        adapter = LinearAdapter(
+            LinearAdapterAppConfig(
+                client_id="c",
+                client_secret="s",
+                webhook_secret=WEBHOOK_SECRET,
+                installation_key_prefix="",
+            )
+        )
+        assert adapter._installation_key_prefix == ""
+
 
 # ---------------------------------------------------------------------------
 # Round-trip and storage shape
