@@ -132,9 +132,11 @@ class MessengerAdapter:
 
         # If a user_name is provided we treat it as explicit and never
         # overwrite it from ``/me`` / ``chat.get_user_name()`` — matches the
-        # upstream ``hasExplicitUserName`` gate.
-        self._has_explicit_user_name = bool(config.user_name)
-        self._user_name = config.user_name or "bot"
+        # upstream ``hasExplicitUserName`` gate. ``is not None`` (not truthy)
+        # so an explicit ``user_name=""`` is respected rather than silently
+        # replaced by the ``"bot"`` fallback.
+        self._has_explicit_user_name = config.user_name is not None
+        self._user_name = config.user_name if config.user_name is not None else "bot"
 
         self._chat: ChatInstance | None = None
         self._bot_user_id: str | None = None
@@ -889,7 +891,9 @@ class MessengerAdapter:
 
     async def _fetch_user_profile(self, user_id: str) -> MessengerUserProfile:
         cached = self._user_profile_cache.get(user_id)
-        if cached:
+        # ``is not None`` (not truthy): an empty-dict ``{}`` cache entry is
+        # falsy and would otherwise trigger a re-fetch on every call.
+        if cached is not None:
             return cached
 
         try:
@@ -946,7 +950,7 @@ class MessengerAdapter:
 
     @staticmethod
     def _paginate_messages(messages: list[Message], options: FetchOptions) -> FetchResult:
-        limit = max(1, min(options.limit or 50, 100))
+        limit = max(1, min(options.limit if options.limit is not None else 50, 100))
         direction = options.direction or "backward"
 
         if not messages:

@@ -452,6 +452,25 @@ class TestFetchThreadAndChannel:
         assert adapter._graph_api_fetch.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_empty_dict_cache_entry_is_a_hit_not_a_miss(self) -> None:
+        """Regression: a cached ``{}`` profile must NOT trigger a re-fetch.
+
+        The old ``if cached:`` treated ``{}`` (falsy) as a miss and called the
+        Graph API every time. The fix ``if cached is not None`` honors the
+        cache entry regardless of dict contents. Without the fix this test
+        would observe ``call_count == 1`` (the re-fetch).
+        """
+        adapter = _make_adapter()
+        adapter._user_profile_cache[RECIPIENT_ID] = {}  # pre-populated empty hit
+        adapter._graph_api_fetch = AsyncMock(return_value={"id": RECIPIENT_ID, "first_name": "Should-Not-Be-Called"})
+
+        profile = await adapter._fetch_user_profile(RECIPIENT_ID)
+
+        # Cache hit returns the empty dict as-is, no Graph API roundtrip.
+        assert profile == {}
+        assert adapter._graph_api_fetch.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_non_dict_profile_response_falls_back(self) -> None:
         """A successful Graph API call that returns a non-mapping must not poison the cache.
 
@@ -576,6 +595,25 @@ class TestFetchMessages:
         _seed_messages(adapter, 5)
         result = await adapter.fetch_messages(THREAD_ID, FetchOptions(limit=500))
         assert len(result.messages) == 5
+
+    @pytest.mark.asyncio
+    async def test_explicit_zero_limit_is_not_swallowed_to_default(self) -> None:
+        """Regression: ``FetchOptions(limit=0)`` must not silently become 50.
+
+        The old ``limit = options.limit or 50`` treated ``0`` as falsy and
+        substituted the default page size — a caller asking for zero messages
+        got fifty. Switching to ``is not None`` preserves the explicit value
+        (then ``max(1, ...)`` clamps to 1, matching ``limit=-N`` behavior).
+        Without the fix, with 5 messages seeded, this test would observe
+        ``len(result.messages) == 5`` (all of them, since 50 > 5).
+        """
+        from chat_sdk.types import FetchOptions
+
+        adapter = _make_adapter()
+        _seed_messages(adapter, 5)
+        result = await adapter.fetch_messages(THREAD_ID, FetchOptions(limit=0))
+        # New behavior: clamped to 1 via ``max(1, min(0, 100))``, NOT 50.
+        assert len(result.messages) == 1
 
     @pytest.mark.asyncio
     async def test_unknown_cursor_backward(self) -> None:

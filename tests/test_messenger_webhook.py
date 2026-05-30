@@ -199,6 +199,31 @@ class TestFactory:
                 )
             )
 
+    def test_explicit_empty_user_name_is_respected(self, _clear_messenger_env: Any) -> None:
+        """Regression: ``user_name=""`` must be treated as an explicit choice.
+
+        The old ``config.user_name or "bot"`` (paired with
+        ``bool(config.user_name)``) silently replaced an explicit empty
+        string with the ``"bot"`` default and left ``_has_explicit_user_name``
+        ``False`` — so ``initialize()`` would then overwrite it from
+        ``chat.get_user_name()`` / ``/me``. Switching both sites to
+        ``is not None`` honors the explicit empty string.
+
+        Without the fix this test would observe ``_user_name == "bot"`` and
+        ``_has_explicit_user_name is False``.
+        """
+        adapter = MessengerAdapter(
+            MessengerAdapterConfig(
+                app_secret=APP_SECRET,
+                page_access_token=PAGE_TOKEN,
+                verify_token=VERIFY_TOKEN,
+                user_name="",
+                logger=ConsoleLogger("error"),
+            )
+        )
+        assert adapter._user_name == ""
+        assert adapter._has_explicit_user_name is True
+
 
 # ---------------------------------------------------------------------------
 # Thread ID encoding
