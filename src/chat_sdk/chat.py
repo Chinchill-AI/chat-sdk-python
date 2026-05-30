@@ -570,7 +570,21 @@ class Chat:
         return handler
 
     def on_direct_message(self, handler: DirectMessageHandler) -> DirectMessageHandler:
-        """Register a handler for direct messages."""
+        """Register a handler for direct messages.
+
+        Called for every message received in a DM thread when at least one
+        direct message handler is registered. Direct message handlers run
+        before :py:meth:`on_subscribed_message`, :py:meth:`on_mention`, and
+        pattern handlers.
+
+        If no ``on_direct_message`` handlers are registered, DMs continue
+        through normal routing. Unsubscribed DMs fall through to
+        :py:meth:`on_mention` for backward compatibility.
+
+        Args:
+            handler: Handler called for DM messages. Receives
+                ``(thread, message, channel, context)``.
+        """
         self._direct_message_handlers.append(handler)
         self._logger.debug("Registered direct message handler")
         return handler

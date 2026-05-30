@@ -504,6 +504,14 @@ class ThreadImpl:
         return await self._state_adapter.is_subscribed(self._id)
 
     async def subscribe(self) -> None:
+        """Subscribe to future messages in this thread.
+
+        Once subscribed, messages in non-DM threads trigger
+        :py:meth:`~chat_sdk.chat.Chat.on_subscribed_message` handlers. DM threads route to
+        :py:meth:`~chat_sdk.chat.Chat.on_direct_message` first when a direct message handler
+        is registered. The initial message that triggered subscription will
+        NOT fire the handler.
+        """
         await self._state_adapter.subscribe(self._id)
         if hasattr(self.adapter, "on_thread_subscribe") and self.adapter.on_thread_subscribe:  # type: ignore[union-attr]
             await self.adapter.on_thread_subscribe(self._id)  # type: ignore[union-attr]
