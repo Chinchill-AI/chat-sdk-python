@@ -11,6 +11,7 @@ imports such as ``from chat_sdk.ai import to_ai_messages`` keep working.
 from __future__ import annotations
 
 from chat_sdk.ai.messages import (
+    TEXT_MIME_PREFIXES,
     AiAssistantMessage,
     AiFilePart,
     AiImagePart,
@@ -23,6 +24,7 @@ from chat_sdk.ai.messages import (
 )
 
 __all__ = [
+    "TEXT_MIME_PREFIXES",
     "AiAssistantMessage",
     "AiFilePart",
     "AiImagePart",
