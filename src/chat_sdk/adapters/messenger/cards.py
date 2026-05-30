@@ -54,9 +54,6 @@ MAX_BUTTON_TEMPLATE_TEXT_LENGTH = 640
 # Maximum character length for title in Generic Template
 MAX_TITLE_LENGTH = 80
 
-# Maximum character length for a plain text message
-MAX_TEXT_LENGTH = 2000
-
 
 class _MessengerCardActionPayload(TypedDict, total=False):
     a: str
