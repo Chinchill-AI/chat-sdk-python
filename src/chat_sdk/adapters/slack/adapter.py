@@ -808,6 +808,7 @@ class SlackAdapter:
     def _invalidate_client(self, token: str) -> None:
         """Remove a cached client (e.g., on token revocation)."""
         self._client_cache.pop(token, None)
+        self._web_client_cache.pop(token, None)
 
     def _get_web_client_for_token(self, token: str) -> Any:
         """Return a synchronous ``slack_sdk.WebClient`` for *token*, cached.

@@ -109,7 +109,13 @@ class TestWebClientSingleWorkspace:
         """Repeated access returns the exact same cached object (identity)."""
         adapter = _single_workspace_adapter()
 
-        assert adapter.web_client is adapter.web_client
+        # Bind each property access to a name so the identity check reads as a
+        # caching assertion (two calls → same object), not a tautological
+        # ``x is x`` self-comparison.
+        first = adapter.web_client
+        second = adapter.web_client
+
+        assert first is second
 
     def test_caches_under_the_resolved_token(self):
         """The cached client is keyed by the resolved token."""
@@ -118,6 +124,21 @@ class TestWebClientSingleWorkspace:
         client = adapter.web_client
 
         assert adapter._web_client_cache["xoxb-cache-key"] is client
+
+    def test_invalidate_client_clears_web_client_cache(self):
+        """``_invalidate_client`` evicts the sync WebClient too (token revocation).
+
+        Load-bearing: without the ``_web_client_cache.pop`` in
+        ``_invalidate_client`` a revoked token's stale ``WebClient`` would
+        survive eviction and this assertion fails.
+        """
+        adapter = _single_workspace_adapter("xoxb-revoke")
+        client = adapter.web_client
+        assert adapter._web_client_cache["xoxb-revoke"] is client
+
+        adapter._invalidate_client("xoxb-revoke")
+
+        assert "xoxb-revoke" not in adapter._web_client_cache
 
 
 # ---------------------------------------------------------------------------
