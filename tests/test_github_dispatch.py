@@ -7,6 +7,7 @@ and in_reply_to_id routing to root thread.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -466,3 +467,133 @@ class TestEagerBotUserIdDetection:
         # No additional detection API calls on the second webhook (cache hit).
         assert len(api.await_args_list) == detection_calls_after_first
         assert chat.process_message.call_count == 2
+
+
+# =============================================================================
+# Fake aiohttp session (exercises the real auth-selection logic in
+# _github_api_request: PAT vs App-JWT vs installation-token)
+# =============================================================================
+
+
+class _FakeResponse:
+    """Minimal aiohttp-style response usable as an async context manager."""
+
+    def __init__(self, status: int, payload: Any) -> None:
+        self.status = status
+        self._payload = payload
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def json(self) -> Any:
+        return self._payload
+
+    async def text(self) -> str:
+        return json.dumps(self._payload)
+
+
+class _FakeSession:
+    """Routes requests by path, recording the Authorization header used.
+
+    Lets a test assert *which* credential (app JWT vs installation token) was
+    sent to each GitHub endpoint, which is the load-bearing behaviour for the
+    /app-needs-JWT fix.
+    """
+
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        self.closed = False
+        # path -> Authorization header value used for that path
+        self.auth_by_path: dict[str, str] = {}
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        path = url.replace("https://api.github.com", "")
+        headers = kwargs.get("headers", {})
+        self.auth_by_path[path] = headers.get("Authorization", "")
+        status, payload = self._handler(method, path)
+        return _FakeResponse(status, payload)
+
+
+class TestAppEndpointAuthSelection:
+    """GET /app must authenticate with the App JWT, not an installation token.
+
+    GitHub's apps.getAuthenticated (GET /app) endpoint rejects installation
+    tokens (401/403). For the GitHub-App/installation case the /user path also
+    fails on installation tokens, so the /app fallback is what must work --
+    and it only works when authenticated with the App JWT directly.
+
+    This test exercises the real auth-selection branch in _github_api_request
+    (the HTTP layer is faked, not _github_api_request itself).
+    """
+
+    @pytest.mark.asyncio
+    async def test_app_endpoint_uses_jwt_not_installation_token(self):
+        adapter = _make_multi_tenant_adapter()
+        adapter._installation_id = 54321  # single resolvable installation
+
+        # Spy the credential minting so we can assert which path used which.
+        adapter._generate_app_jwt = MagicMock(return_value="APP_JWT")  # type: ignore[method-assign]
+        adapter._get_installation_token = AsyncMock(return_value="INSTALL_TOKEN")  # type: ignore[method-assign]
+
+        def handler(method: str, path: str) -> tuple[int, Any]:
+            if path == "/user":
+                # Installation token cannot use /user -> 403.
+                return 403, {"message": "Resource not accessible by integration"}
+            if path == "/app":
+                return 200, {"slug": "my-app", "id": 1}
+            if path == "/users/my-app[bot]":
+                return 200, {"id": 12345, "login": "my-app[bot]"}
+            raise AssertionError(f"unexpected path {path}")
+
+        session = _FakeSession(handler)
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        await adapter._detect_bot_user_id(installation_id=54321)
+
+        # Detection resolved the bot id via /app -> /users/{slug}[bot].
+        assert adapter._bot_user_id == 12345
+
+        # The /app call was authenticated with the App JWT (not an install token).
+        assert session.auth_by_path["/app"] == "Bearer APP_JWT"
+        assert adapter._generate_app_jwt.called
+        # And /app was NOT sent the installation token.
+        assert session.auth_by_path["/app"] != "Bearer INSTALL_TOKEN"
+
+        # The /user attempt (which 403s) and the public /users/{slug}[bot] lookup
+        # both go through the installation-token exchange, as expected.
+        assert session.auth_by_path["/user"] == "Bearer INSTALL_TOKEN"
+        assert session.auth_by_path["/users/my-app[bot]"] == "Bearer INSTALL_TOKEN"
+
+
+class TestConcurrentDetectionFetchesOnce:
+    """Concurrent detection must fetch the bot identity only once (lock works)."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_detect_fetches_once(self):
+        adapter = _make_multi_tenant_adapter()
+
+        call_counts: dict[str, int] = {"/user": 0}
+        started = asyncio.Event()
+
+        async def fake_api(method: str, path: str, body: Any = None, *, installation_id: int | None = None) -> Any:
+            if path == "/user":
+                call_counts["/user"] += 1
+                started.set()
+                # Slow PAT-style success so concurrent callers pile up behind
+                # the first one if locking is absent.
+                await asyncio.sleep(0.05)
+                return {"id": 4242, "login": "the-bot"}
+            raise AssertionError(f"unexpected path {path}")
+
+        adapter._github_api_request = AsyncMock(side_effect=fake_api)
+
+        # Fire N concurrent detections; only the first should hit the API.
+        await asyncio.gather(*[adapter._detect_bot_user_id(installation_id=54321) for _ in range(8)])
+
+        assert adapter._bot_user_id == 4242
+        # The lock + double-checked cache means /user is fetched exactly once.
+        assert call_counts["/user"] == 1
+        assert adapter._github_api_request.await_count == 1

@@ -120,6 +120,10 @@ class GitHubAdapter:
         self._installation_id: int | None = None
         self._installation_token_cache: dict[int, tuple[str, float]] = {}
         self._token_lock = asyncio.Lock()
+        # Serializes concurrent bot-user-ID detection so concurrent webhooks
+        # don't all race to fetch the (identical) bot identity (see
+        # ``_detect_bot_user_id``).
+        self._detect_lock = asyncio.Lock()
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -224,45 +228,54 @@ class GitHubAdapter:
         failure, fall back to ``apps.getAuthenticated`` (``GET /app``) and
         resolve the bot user via ``users.getByUsername`` (``GET /users/{slug}[bot]``).
         """
-        # Cache hit: already detected once, don't re-fetch per webhook.
+        # Cache hit: already detected once, don't re-fetch per webhook. This is
+        # the fast path that avoids taking the lock once detection has succeeded.
         if self._bot_user_id is not None:
             return
 
-        try:
-            user = await self._github_api_request("GET", "/user", installation_id=installation_id)
-            self._bot_user_id = user.get("id")
-            self._logger.info(
-                "GitHub bot user ID auto-detected",
-                {
-                    "botUserId": self._bot_user_id,
-                    "login": user.get("login"),
-                },
-            )
-            return
-        except Exception as error:
-            self._logger.debug(
-                "users.getAuthenticated failed; falling back to apps.getAuthenticated",
-                {"error": str(error)},
-            )
+        # Double-checked locking: concurrent webhooks must not all race to fetch
+        # the (identical) bot identity. Serialize detection and re-check the
+        # cache inside the lock so only the first caller hits the API.
+        async with self._detect_lock:
+            if self._bot_user_id is not None:
+                return
 
-        try:
-            # For App-authenticated installation tokens, /user is not available;
-            # use apps.getAuthenticated and resolve the bot user via
-            # /users/{login}[bot].
-            app = await self._github_api_request("GET", "/app", installation_id=installation_id)
-            if app:
-                login = f"{app['slug']}[bot]"
-                bot_user = await self._github_api_request("GET", f"/users/{login}", installation_id=installation_id)
-                self._bot_user_id = bot_user.get("id")
+            try:
+                user = await self._github_api_request("GET", "/user", installation_id=installation_id)
+                self._bot_user_id = user.get("id")
                 self._logger.info(
-                    "GitHub bot user ID auto-detected via app slug",
+                    "GitHub bot user ID auto-detected",
                     {
                         "botUserId": self._bot_user_id,
-                        "login": login,
+                        "login": user.get("login"),
                     },
                 )
-        except Exception as error:
-            self._logger.warn("Could not auto-detect GitHub bot user ID", {"error": str(error)})
+                return
+            except Exception as error:
+                self._logger.debug(
+                    "users.getAuthenticated failed; falling back to apps.getAuthenticated",
+                    {"error": str(error)},
+                )
+
+            try:
+                # For App-authenticated installation tokens, /user is not
+                # available; use apps.getAuthenticated (GET /app, authenticated
+                # with the App JWT) and resolve the bot user via
+                # /users/{login}[bot].
+                app = await self._github_api_request("GET", "/app", installation_id=installation_id)
+                if app:
+                    login = f"{app['slug']}[bot]"
+                    bot_user = await self._github_api_request("GET", f"/users/{login}", installation_id=installation_id)
+                    self._bot_user_id = bot_user.get("id")
+                    self._logger.info(
+                        "GitHub bot user ID auto-detected via app slug",
+                        {
+                            "botUserId": self._bot_user_id,
+                            "login": login,
+                        },
+                    )
+            except Exception as error:
+                self._logger.warn("Could not auto-detect GitHub bot user ID", {"error": str(error)})
 
     async def get_user(self, user_id: str) -> UserInfo | None:
         """Look up a GitHub user by numeric account ID.
@@ -1126,16 +1139,27 @@ class GitHubAdapter:
         """
         auth_token = self._auth_token
 
-        # GitHub App auth: exchange JWT for installation token
+        # GitHub App auth.
         if not auth_token and self._app_credentials:
-            resolved_installation_id = installation_id if installation_id is not None else self._installation_id
-            if not resolved_installation_id:
-                raise RuntimeError(
-                    "Installation ID required for GitHub App authentication. "
-                    "This usually means you're trying to make an API call outside of a webhook context. "
-                    "For proactive messages, use thread IDs from previous webhook interactions."
-                )
-            auth_token = await self._get_installation_token(resolved_installation_id)
+            if path == "/app":
+                # App-level endpoints (apps.getAuthenticated) REQUIRE app-JWT
+                # auth; installation tokens get 401/403 here. Authenticate with
+                # the App JWT directly instead of exchanging for an installation
+                # token. This is what makes bot-user-ID detection work in the
+                # GitHub-App/installation case (the /user path 403s on
+                # installation tokens, so this fallback must succeed).
+                auth_token = self._generate_app_jwt()
+            else:
+                # Installation-scoped endpoints: exchange the JWT for an
+                # installation token.
+                resolved_installation_id = installation_id if installation_id is not None else self._installation_id
+                if not resolved_installation_id:
+                    raise RuntimeError(
+                        "Installation ID required for GitHub App authentication. "
+                        "This usually means you're trying to make an API call outside of a webhook context. "
+                        "For proactive messages, use thread IDs from previous webhook interactions."
+                    )
+                auth_token = await self._get_installation_token(resolved_installation_id)
 
         headers: dict[str, str] = {
             "Accept": "application/vnd.github+json",
