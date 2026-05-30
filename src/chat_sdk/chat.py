@@ -63,6 +63,7 @@ from chat_sdk.types import (
     UserInfo,
     WebhookOptions,
     _parse_iso,
+    set_message_adapter,
 )
 
 # ---------------------------------------------------------------------------
@@ -2135,6 +2136,13 @@ class Chat:
         context: MessageContext | None = None,
     ) -> None:
         """Route a message to the correct handler chain."""
+        # Register the owning adapter so handlers can lazily resolve
+        # ``message.subject`` via the adapter's optional ``fetch_subject`` hook.
+        # Mirrors upstream's ``setMessageAdapter`` call at the dispatch bind
+        # site (packages/chat/src/chat.ts). Every dispatched message flows
+        # through here, so this is the single registration point.
+        set_message_adapter(message, adapter)
+
         # Detect mention
         message.is_mention = message.is_mention or self._detect_mention(adapter, message)
 

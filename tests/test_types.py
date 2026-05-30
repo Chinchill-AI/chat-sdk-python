@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 from datetime import datetime, timezone
 
+import chat_sdk.types as types_module
 from chat_sdk.types import (
     Attachment,
     Author,
@@ -11,7 +14,10 @@ from chat_sdk.types import (
     EmojiValue,
     Message,
     MessageMetadata,
+    MessageSubject,
+    MessageSubjectParty,
     RawMessage,
+    set_message_adapter,
 )
 
 
@@ -366,3 +372,177 @@ class TestRawMessage:
         assert raw.id == "raw-001"
         assert raw.thread_id == "thread-001"
         assert raw.raw["platform"] == "test"
+
+
+def _make_message(**overrides) -> Message:
+    """Build a Message for subject tests (mirrors upstream ``makeMessage``)."""
+    defaults = {
+        "id": "msg-1",
+        "thread_id": "slack:C123:1234.5678",
+        "text": "Hello world",
+        "formatted": {"type": "root", "children": []},
+        "author": Author(
+            user_id="U123",
+            user_name="testuser",
+            full_name="Test User",
+            is_bot=False,
+            is_me=False,
+        ),
+        "metadata": MessageMetadata(
+            date_sent=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+            edited=False,
+        ),
+        "raw": {"platform": "test"},
+    }
+    defaults.update(overrides)
+    return Message(**defaults)
+
+
+class _AdapterWithSubject:
+    """Minimal adapter stub exposing ``fetch_subject`` that records call count."""
+
+    def __init__(self, result: MessageSubject | None) -> None:
+        self._result = result
+        self.calls = 0
+
+    async def fetch_subject(self, raw):  # noqa: ANN001, ANN201
+        self.calls += 1
+        return self._result
+
+
+class TestMessageSubjectDataclass:
+    """Tests for the MessageSubject / MessageSubjectParty dataclasses."""
+
+    def test_minimal_required_fields(self):
+        subject = MessageSubject(id="ENG-1", type="issue")
+        assert subject.id == "ENG-1"
+        assert subject.type == "issue"
+        assert subject.raw is None
+        assert subject.assignee is None
+        assert subject.labels is None
+
+    def test_all_fields(self):
+        subject = MessageSubject(
+            id="ENG-123",
+            type="issue",
+            raw={"k": "v"},
+            assignee=MessageSubjectParty(id="u1", name="Alice"),
+            author=MessageSubjectParty(id="u2", name="Bob"),
+            description="A bug",
+            labels=["bug", "p0"],
+            status="In Progress",
+            title="Fix bug",
+            url="https://linear.app/team/ENG-123",
+        )
+        assert subject.assignee == MessageSubjectParty(id="u1", name="Alice")
+        assert subject.author.name == "Bob"
+        assert subject.labels == ["bug", "p0"]
+        assert subject.status == "In Progress"
+        assert subject.title == "Fix bug"
+        assert subject.url == "https://linear.app/team/ENG-123"
+        assert subject.description == "A bug"
+
+
+class TestMessageSubject:
+    """Tests for the Message.subject accessor (mirrors upstream message.test.ts)."""
+
+    async def test_returns_none_when_no_adapter_is_set(self):
+        msg = _make_message()
+        assert await msg.subject is None
+
+    async def test_returns_none_when_adapter_has_no_fetch_subject(self):
+        msg = _make_message()
+        set_message_adapter(msg, object())
+        assert await msg.subject is None
+
+    async def test_returns_subject_from_adapter(self):
+        msg = _make_message()
+        expected = MessageSubject(
+            type="issue",
+            id="ENG-123",
+            title="Fix bug",
+            status="In Progress",
+            url="https://linear.app/team/ENG-123",
+            raw={},
+        )
+        set_message_adapter(msg, _AdapterWithSubject(expected))
+        result = await msg.subject
+        assert result == expected
+
+    async def test_should_cache_the_result(self):
+        msg = _make_message()
+        adapter = _AdapterWithSubject(MessageSubject(type="issue", id="1", raw={}))
+        set_message_adapter(msg, adapter)
+        await msg.subject
+        await msg.subject
+        assert adapter.calls == 1
+
+    async def test_should_cache_null_result(self):
+        msg = _make_message()
+        adapter = _AdapterWithSubject(None)
+        set_message_adapter(msg, adapter)
+        await msg.subject
+        await msg.subject
+        assert adapter.calls == 1
+
+    async def test_should_handle_concurrent_access(self):
+        msg = _make_message()
+        adapter = _AdapterWithSubject(MessageSubject(type="issue", id="1", raw={}))
+        set_message_adapter(msg, adapter)
+        a, b = await asyncio.gather(msg.subject, msg.subject)
+        assert a == b
+        assert adapter.calls == 1
+
+    async def test_swallows_fetch_subject_errors(self):
+        """A raising hook resolves to None (mirrors upstream .catch(() => null))."""
+        msg = _make_message()
+
+        class Boom:
+            async def fetch_subject(self, raw):  # noqa: ANN001, ANN201
+                raise RuntimeError("boom")
+
+        set_message_adapter(msg, Boom())
+        assert await msg.subject is None
+
+    async def test_passes_raw_payload_to_fetch_subject(self):
+        msg = _make_message(raw={"native": "payload"})
+        seen = {}
+
+        class Capturing:
+            async def fetch_subject(self, raw):  # noqa: ANN001, ANN201
+                seen["raw"] = raw
+                return None
+
+        set_message_adapter(msg, Capturing())
+        await msg.subject
+        assert seen["raw"] == {"native": "payload"}
+
+
+class TestSetMessageAdapterWeakref:
+    """Tests for the identity-keyed, weakly-scoped adapter registry."""
+
+    def test_registration_does_not_crash_on_unhashable_message(self):
+        # Message is a plain dataclass (eq=True) -> unhashable. The registry
+        # must not rely on hashing the Message itself.
+        msg = _make_message()
+        with __import__("pytest").raises(TypeError):
+            hash(msg)
+        set_message_adapter(msg, object())  # must not raise
+
+    def test_entry_removed_when_message_is_garbage_collected(self):
+        msg = _make_message()
+        set_message_adapter(msg, object())
+        key = id(msg)
+        assert key in types_module._message_adapter_map
+        del msg
+        gc.collect()
+        assert key not in types_module._message_adapter_map
+
+    def test_distinct_messages_get_distinct_adapters(self):
+        m1 = _make_message()
+        m2 = _make_message()
+        a1, a2 = object(), object()
+        set_message_adapter(m1, a1)
+        set_message_adapter(m2, a2)
+        assert types_module._get_message_adapter(m1) is a1
+        assert types_module._get_message_adapter(m2) is a2

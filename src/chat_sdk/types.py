@@ -5,6 +5,8 @@ Python port of Vercel Chat SDK types.ts.
 
 from __future__ import annotations
 
+import asyncio
+import weakref
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -387,6 +389,100 @@ class SerializedMessage(_SerializedMessageRequired, total=False):
     links: list[SerializedLinkPreview]
 
 
+@dataclass
+class MessageSubjectParty:
+    """A person referenced by a :class:`MessageSubject` (assignee/author).
+
+    Mirrors the inline ``{ id: string; name: string }`` shape used by
+    upstream's ``MessageSubject.assignee`` / ``MessageSubject.author``.
+    """
+
+    id: str
+    name: str
+
+
+@dataclass
+class MessageSubject:
+    """The external subject a message refers to (e.g. a Linear issue or GitHub PR).
+
+    Python port of the TS ``MessageSubject`` interface
+    (``packages/chat/src/types.ts``). Resolved lazily via
+    :attr:`Message.subject`, which delegates to the owning adapter's
+    optional :meth:`Adapter.fetch_subject` hook.
+
+    Field names are snake_case per the Python port convention; ``raw`` is
+    the platform-specific escape hatch.
+    """
+
+    # ``id`` and ``type`` are the only required fields upstream; everything
+    # else is optional. ``raw`` is required upstream but defaults to ``None``
+    # here so partially-populated subjects (e.g. in tests) construct cleanly.
+    id: str
+    type: str
+    raw: Any = None
+    assignee: MessageSubjectParty | None = None
+    author: MessageSubjectParty | None = None
+    description: str | None = None
+    labels: list[str] | None = None
+    status: str | None = None
+    title: str | None = None
+    url: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Message -> Adapter registry (powers ``Message.subject``)
+# --------------------------------------------------------------------------
+#
+# Upstream (``packages/chat/src/message.ts``) uses
+# ``const adapterMap = new WeakMap<Message, Adapter>()`` so a dispatched
+# message can lazily ask its owning adapter to resolve its subject, without
+# the message holding a hard reference to the adapter and without leaking
+# messages after they fall out of scope.
+#
+# Python port hazard — hashability/weakref:
+#   ``Message`` is a plain ``@dataclass`` (``eq=True``), which makes instances
+#   *unhashable*. A ``weakref.WeakKeyDictionary[Message, Adapter]`` therefore
+#   raises ``TypeError: unhashable type: 'Message'``. We deliberately do NOT
+#   change ``Message`` to ``eq=False``/``frozen=True`` (that would alter its
+#   public equality contract). Instead we key a plain ``dict`` by
+#   ``id(message)`` (object identity, matching ``WeakMap`` semantics) and
+#   register a ``weakref.finalize`` callback per message that pops the entry
+#   when the message is garbage-collected. ``weakref.ref(message)`` works on a
+#   plain dataclass even though ``hash()`` does not, so this is safe. The
+#   finalizer also closes the ``id()`` reuse hole: the entry is removed before
+#   CPython can recycle the id for a new object.
+_message_adapter_map: dict[int, Adapter] = {}
+
+
+def set_message_adapter(message: Message, adapter: Adapter) -> None:
+    """Register the adapter that owns ``message`` (powers ``message.subject``).
+
+    Called by :class:`~chat_sdk.chat.Chat` at the dispatch bind site so every
+    message handed to a handler can resolve its subject via the adapter's
+    optional :meth:`Adapter.fetch_subject` hook.
+
+    Mirrors upstream ``setMessageAdapter`` (``packages/chat/src/message.ts``).
+    The mapping is keyed by object identity and weakly scoped: when ``message``
+    is garbage-collected, its entry is removed automatically.
+    """
+    key = id(message)
+    _message_adapter_map[key] = adapter
+
+    # Drop the entry when the message is GC'd. A zero-arg closure (rather than
+    # ``weakref.finalize(message, dict.pop, key, None)``) captures ``key`` and
+    # keeps the finalizer callable's type unambiguous for the type-checker.
+    # ``pop(key, None)`` is a no-op if the entry was already removed.
+    def _cleanup() -> None:
+        _message_adapter_map.pop(key, None)
+
+    weakref.finalize(message, _cleanup)
+
+
+def _get_message_adapter(message: Message) -> Adapter | None:
+    """Return the adapter registered for ``message``, or ``None``."""
+    return _message_adapter_map.get(id(message))
+
+
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     """Remove keys whose value is ``None`` from a dict.
 
@@ -411,6 +507,63 @@ class Message:
     is_mention: bool | None = None
     links: list[LinkPreview] | None = None
     raw: Any = None
+
+    # Cached awaitable for ``subject``. Mirrors upstream's ``_subjectPromise``:
+    # the first ``await message.subject`` stores the in-flight future here so a
+    # second access reuses it instead of re-calling ``fetch_subject``.
+    # ``init=False``/``compare=False``/``repr=False`` keep it out of the
+    # dataclass ``__init__``, equality, and ``repr`` — it is purely internal
+    # resolution state, not message data.
+    _subject_future: Any = field(default=None, init=False, compare=False, repr=False)
+
+    async def _resolve_subject(self) -> MessageSubject | None:
+        """Resolve the subject via the owning adapter's ``fetch_subject`` hook.
+
+        Returns ``None`` when no adapter is registered, the adapter has no
+        ``fetch_subject`` hook, the hook returns ``None``, or the hook raises
+        (failures are swallowed, mirroring upstream's ``.catch(() => null)``).
+        """
+        adapter = _get_message_adapter(self)
+        fetch_subject = getattr(adapter, "fetch_subject", None)
+        if adapter is None or fetch_subject is None:
+            return None
+        try:
+            return await fetch_subject(self.raw)
+        except Exception:
+            return None
+
+    async def _subject(self) -> MessageSubject | None:
+        """Coroutine backing the :attr:`subject` accessor (caches the result).
+
+        The first await schedules ``_resolve_subject`` once via
+        ``ensure_future`` and stores the shared future on the instance; every
+        later/concurrent await reuses it, so ``fetch_subject`` runs at most
+        once. Mirrors upstream's cached ``_subjectPromise``.
+        """
+        if self._subject_future is None:
+            self._subject_future = asyncio.ensure_future(self._resolve_subject())
+        return await self._subject_future
+
+    @property
+    def subject(self) -> Awaitable[MessageSubject | None]:
+        """The external subject this message refers to (issue, PR, etc.), or ``None``.
+
+        Lazily resolved via the owning adapter's optional
+        :meth:`Adapter.fetch_subject` hook. The adapter is registered at
+        dispatch time by :func:`set_message_adapter`.
+
+        Mirrors upstream ``Message.subject`` (``packages/chat/src/message.ts``):
+        it is an awaitable, the result is cached after the first access, and a
+        second ``await message.subject`` does NOT re-call ``fetch_subject``.
+        Concurrent awaits share a single in-flight resolution.
+
+        Usage::
+
+            subject = await message.subject
+            if subject is not None:
+                ...
+        """
+        return self._subject()
 
     def to_json(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -1257,6 +1410,17 @@ class Adapter(Protocol):
         """
         return None
 
+    # NOTE: ``fetch_subject`` is intentionally NOT declared here. Upstream's
+    # ``Adapter.fetchSubject`` is an *optional* member (``fetchSubject?(...)``),
+    # and in this Python port the established convention for optional adapter
+    # hooks (``stream``, ``open_dm``, ``rehydrate_attachment``,
+    # ``get_channel_visibility``, ...) is to declare them on :class:`BaseAdapter`
+    # only — NOT on this structural ``Protocol`` — so that adapters which don't
+    # implement them still satisfy ``Adapter`` for type-checking. Declaring it
+    # on the Protocol would make it a *required* attribute and break every
+    # adapter that doesn't define it. :attr:`Message.subject` reads the hook via
+    # ``getattr(adapter, "fetch_subject", None)``, so presence is fully optional.
+
 
 class BaseAdapter:
     """Base adapter with default implementations for optional methods.
@@ -1414,6 +1578,22 @@ class BaseAdapter:
         ``"does not support get_user"`` :class:`~chat_sdk.errors.ChatError`.
         """
         raise ChatNotImplementedError(self.name, "getUser")
+
+    async def fetch_subject(self, raw: Any) -> MessageSubject | None:
+        """Resolve the external subject a message refers to (issue, PR, etc.).
+
+        Optional — the default returns ``None`` (no subject).  Adapters that
+        can resolve a backing entity (a Linear issue, a GitHub PR, etc.) from a
+        message's raw payload should override this.  Unlike most optional
+        :class:`BaseAdapter` hooks it does *not* raise
+        :class:`~chat_sdk.errors.ChatNotImplementedError`, because
+        :attr:`Message.subject` is best-effort: "this adapter has no subject
+        concept" is a normal, non-error outcome that maps to ``None``.
+
+        Mirrors upstream's optional ``Adapter.fetchSubject``
+        (``packages/chat/src/types.ts``).
+        """
+        return None
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on an attachment after deserialization.

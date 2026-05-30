@@ -34,6 +34,7 @@ from chat_sdk.types import (
     ConcurrencyConfig,
     EmojiValue,
     MessageContext,
+    MessageSubject,
     ModalSubmitEvent,
     QueueEntry,
     ReactionEvent,
@@ -3889,3 +3890,43 @@ class TestPersistMessageHistory:
 
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
+
+
+class TestSubjectBinding:
+    """Dispatch registers the owning adapter so handlers can resolve message.subject."""
+
+    async def test_handler_can_resolve_subject_via_adapter_hook(self):
+        adapter = create_mock_adapter("slack")
+        expected = MessageSubject(id="ENG-1", type="issue", title="Fix it", raw={})
+
+        async def _fetch_subject(raw):  # noqa: ANN001, ANN202
+            return expected
+
+        adapter.fetch_subject = _fetch_subject  # type: ignore[attr-defined]
+        chat, adapter, state = await _init_chat(adapter=adapter)
+
+        resolved: list[MessageSubject | None] = []
+
+        @chat.on_subscribed_message
+        async def handler(thread, message, context=None):
+            resolved.append(await message.subject)
+
+        await state.subscribe("slack:C123:1234.5678")
+        msg = create_test_message("msg-1", "Follow up")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        assert resolved == [expected]
+
+    async def test_subject_is_none_when_adapter_has_no_fetch_subject_hook(self):
+        chat, adapter, state = await _init_chat()
+        resolved: list[MessageSubject | None] = []
+
+        @chat.on_subscribed_message
+        async def handler(thread, message, context=None):
+            resolved.append(await message.subject)
+
+        await state.subscribe("slack:C123:1234.5678")
+        msg = create_test_message("msg-1", "Follow up")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        assert resolved == [None]
