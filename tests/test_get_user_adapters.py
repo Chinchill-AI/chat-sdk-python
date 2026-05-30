@@ -287,6 +287,7 @@ class TestGoogleChatGetUser:
                     private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
                     project_id="test-project",
                 ),
+                disable_signature_verification=True,
             )
         )
 

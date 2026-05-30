@@ -1,6 +1,8 @@
 """Tests for Google Chat webhook verification behaviour.
 
-Covers: rejecting webhooks without auth header, rejecting invalid tokens,
+Covers: the constructor fail-closed verification gate (google_chat_project_number,
+pubsub_audience, or the disable_signature_verification escape hatch, with env
+fallback), rejecting webhooks without auth header, rejecting invalid tokens,
 warning when no project number is configured, and allowing webhooks
 when verification is unconfigured.
 """
@@ -8,6 +10,7 @@ when verification is unconfigured.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,6 +21,7 @@ from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
+from chat_sdk.shared.errors import ValidationError
 
 # =============================================================================
 # Helpers
@@ -33,6 +37,12 @@ def _make_credentials() -> ServiceAccountCredentials:
 
 
 def _make_adapter(**overrides: Any) -> GoogleChatAdapter:
+    # The adapter now fails closed at construction unless one of
+    # google_chat_project_number, pubsub_audience, or
+    # disable_signature_verification is set. Tests that want the unconfigured
+    # runtime path default to the explicit opt-out; verification-gated tests
+    # pass google_chat_project_number / pubsub_audience to override it.
+    overrides.setdefault("disable_signature_verification", True)
     config = GoogleChatAdapterConfig(
         credentials=overrides.pop("credentials", _make_credentials()),
         **overrides,
@@ -174,6 +184,10 @@ class TestWarnsWhenNoProjectNumber:
         logger.child = MagicMock(return_value=logger)
 
         adapter = _make_adapter(logger=logger)
+        # The constructor emits a dev-only warning when the escape hatch is the
+        # sole gate; reset the mock so this test asserts only the *runtime*
+        # warn path on the first unconfigured webhook.
+        logger.warn.reset_mock()
         # Explicitly clear project number
         adapter._google_chat_project_number = None
         adapter._warned_no_webhook_verification = False
@@ -225,3 +239,150 @@ class TestAllowsWithoutVerificationWhenUnconfigured:
         assert result["status"] == 200
         # process_message should have been called since the event was valid
         chat.process_message.assert_called_once()
+
+
+# =============================================================================
+# Tests -- constructor fail-closed verification gate
+#
+# Ports the gchat slice of upstream 9824d33 (PR #441): the constructor refuses
+# to start unless webhook signature verification can be performed for at least
+# one transport, or the operator explicitly opts out.
+# =============================================================================
+
+
+def _clear_verification_env() -> dict[str, str]:
+    """Remove the three gating env vars and return the saved values."""
+    keys = (
+        "GOOGLE_CHAT_PROJECT_NUMBER",
+        "GOOGLE_CHAT_PUBSUB_AUDIENCE",
+        "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION",
+    )
+    saved = {k: os.environ[k] for k in keys if k in os.environ}
+    for k in keys:
+        os.environ.pop(k, None)
+    return saved
+
+
+def _config(**overrides: Any) -> GoogleChatAdapterConfig:
+    """Build a config with valid auth but no gating field unless overridden."""
+    return GoogleChatAdapterConfig(credentials=_make_credentials(), **overrides)
+
+
+class TestConstructorFailsClosed:
+    """The constructor must fail closed when no verifier is configured."""
+
+    def test_raises_when_no_gating_field_set(self):
+        saved = _clear_verification_env()
+        try:
+            with pytest.raises(ValidationError, match="signature verification is required"):
+                GoogleChatAdapter(_config())
+        finally:
+            os.environ.update(saved)
+
+    def test_explicit_disable_false_still_fails_closed(self):
+        # An explicit False must be treated as "verification required", NOT as
+        # unset -- otherwise the env fallback / fail-closed logic would be wrong.
+        saved = _clear_verification_env()
+        try:
+            with pytest.raises(ValidationError, match="signature verification is required"):
+                GoogleChatAdapter(_config(disable_signature_verification=False))
+        finally:
+            os.environ.update(saved)
+
+
+class TestConstructorEachGatingFieldSatisfiesIndividually:
+    """Any one of the three gating fields must allow construction."""
+
+    def test_google_chat_project_number_satisfies(self):
+        saved = _clear_verification_env()
+        try:
+            adapter = GoogleChatAdapter(_config(google_chat_project_number="123456789"))
+            assert adapter.name == "gchat"
+            assert adapter._google_chat_project_number == "123456789"
+        finally:
+            os.environ.update(saved)
+
+    def test_pubsub_audience_satisfies(self):
+        saved = _clear_verification_env()
+        try:
+            adapter = GoogleChatAdapter(_config(pubsub_audience="https://example.com/webhook"))
+            assert adapter.name == "gchat"
+            assert adapter._pubsub_audience == "https://example.com/webhook"
+        finally:
+            os.environ.update(saved)
+
+    def test_disable_signature_verification_satisfies(self):
+        saved = _clear_verification_env()
+        try:
+            adapter = GoogleChatAdapter(_config(disable_signature_verification=True))
+            assert adapter.name == "gchat"
+            assert adapter._disable_signature_verification is True
+        finally:
+            os.environ.update(saved)
+
+
+class TestEscapeHatchEmitsWarning:
+    """The dev-only escape hatch must construct AND log a warning."""
+
+    def test_escape_hatch_logs_warning(self):
+        saved = _clear_verification_env()
+        try:
+            logger = MagicMock()
+            logger.child = MagicMock(return_value=logger)
+            adapter = GoogleChatAdapter(_config(disable_signature_verification=True, logger=logger))
+            assert adapter._disable_signature_verification is True
+            warn_messages = [str(call) for call in logger.warn.call_args_list]
+            assert any("disabled" in m.lower() for m in warn_messages), (
+                f"Expected a dev-only warning when the escape hatch is used, got: {warn_messages}"
+            )
+        finally:
+            os.environ.update(saved)
+
+    def test_no_warning_when_real_verifier_configured(self):
+        # The warning is specific to the escape hatch; a real verifier must not
+        # trigger it even if disable_signature_verification is also set.
+        saved = _clear_verification_env()
+        try:
+            logger = MagicMock()
+            logger.child = MagicMock(return_value=logger)
+            GoogleChatAdapter(_config(google_chat_project_number="123456789", logger=logger))
+            warn_messages = [str(call) for call in logger.warn.call_args_list]
+            assert not any("disabled" in m.lower() for m in warn_messages), (
+                f"Did not expect an escape-hatch warning with a real verifier, got: {warn_messages}"
+            )
+        finally:
+            os.environ.update(saved)
+
+
+class TestDisableSignatureVerificationEnvFallback:
+    """The GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION env var must gate."""
+
+    def test_env_true_satisfies_construction(self):
+        saved = _clear_verification_env()
+        try:
+            os.environ["GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION"] = "true"
+            adapter = GoogleChatAdapter(_config())
+            assert adapter._disable_signature_verification is True
+        finally:
+            os.environ.update(saved)
+
+    def test_env_non_true_value_does_not_satisfy(self):
+        # Only the literal "true" enables the opt-out; anything else fails closed.
+        saved = _clear_verification_env()
+        try:
+            os.environ["GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION"] = "false"
+            with pytest.raises(ValidationError, match="signature verification is required"):
+                GoogleChatAdapter(_config())
+        finally:
+            os.environ.update(saved)
+
+    def test_explicit_config_false_overrides_env_true(self):
+        # An explicit config value wins over the env var, so a config False must
+        # fail closed even when the env var says "true".
+        saved = _clear_verification_env()
+        try:
+            os.environ["GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION"] = "true"
+            with pytest.raises(ValidationError, match="signature verification is required"):
+                GoogleChatAdapter(_config(disable_signature_verification=False))
+        finally:
+            os.environ.update(saved)

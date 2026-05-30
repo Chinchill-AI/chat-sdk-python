@@ -155,6 +155,45 @@ class GoogleChatAdapter:
             "GOOGLE_CHAT_PROJECT_NUMBER"
         )
         self._pubsub_audience = config.pubsub_audience or os.environ.get("GOOGLE_CHAT_PUBSUB_AUDIENCE")
+        # Explicit opt-out of signature verification. An explicit
+        # config.disable_signature_verification value (True OR False) wins over
+        # the env var; only fall back to the env var when the config field is
+        # unset (None). Note: ``x if x is not None else default`` -- a plain
+        # ``or`` would silently discard an explicit ``False``.
+        self._disable_signature_verification = (
+            config.disable_signature_verification
+            if config.disable_signature_verification is not None
+            else os.environ.get("GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION") == "true"
+        )
+
+        # Fail-closed: refuse to construct unless webhook signature verification
+        # can be performed for at least one transport, or the operator has
+        # explicitly opted into the unverified path. Previously the adapter
+        # accepted any webhook in this state, allowing forged payloads to
+        # impersonate users / trigger handlers. Mirrors the gchat slice of
+        # upstream 9824d33 (PR #441).
+        if not (self._google_chat_project_number or self._pubsub_audience or self._disable_signature_verification):
+            raise ValidationError(
+                "gchat",
+                "Webhook signature verification is required. Set "
+                "google_chat_project_number (or GOOGLE_CHAT_PROJECT_NUMBER) for "
+                "direct webhooks and/or pubsub_audience (or "
+                "GOOGLE_CHAT_PUBSUB_AUDIENCE) for Pub/Sub. To accept unverified "
+                "webhooks (NOT recommended in production), set "
+                "disable_signature_verification=True.",
+            )
+
+        # The escape hatch is dev-only -- warn loudly whenever it is the only
+        # reason the adapter was allowed to construct without a verifier.
+        if self._disable_signature_verification and not (self._google_chat_project_number or self._pubsub_audience):
+            self._logger.warn(
+                "Google Chat webhook signature verification is disabled "
+                "(disable_signature_verification / "
+                "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION). Incoming webhooks "
+                "will be accepted without JWT verification. Do not use this in "
+                "production -- set google_chat_project_number and/or "
+                "pubsub_audience instead.",
+            )
 
         # In-progress subscription creations to prevent duplicate requests
         self._pending_subscriptions: dict[str, Any] = {}

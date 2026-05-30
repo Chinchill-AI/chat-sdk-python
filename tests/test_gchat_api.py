@@ -133,6 +133,9 @@ def _make_credentials() -> ServiceAccountCredentials:
 
 
 def _make_adapter(**overrides: Any) -> GoogleChatAdapter:
+    # Adapter fails closed without a verification gating field; default these
+    # non-verification tests to the explicit opt-out.
+    overrides.setdefault("disable_signature_verification", True)
     config = GoogleChatAdapterConfig(
         credentials=overrides.pop("credentials", _make_credentials()),
         **overrides,
@@ -1088,6 +1091,7 @@ class TestErrorHandling:
             GoogleChatAdapterConfig(
                 credentials=_make_credentials(),
                 logger=mock_logger,
+                disable_signature_verification=True,
             )
         )
 
