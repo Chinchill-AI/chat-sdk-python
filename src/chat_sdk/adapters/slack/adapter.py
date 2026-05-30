@@ -1235,8 +1235,14 @@ class SlackAdapter:
         # success.
         socket_token = headers.get("x-slack-socket-token") or headers.get("X-Slack-Socket-Token")
         if socket_token:
+            # Constant-time bearer comparison (upstream timingSafeStringEqual,
+            # 9824d33 / PR #441). Encode both operands to UTF-8 bytes so
+            # ``compare_digest`` mirrors upstream's ``Buffer.from(x, "utf8")``
+            # comparison: it returns False on length mismatch (the secret's
+            # length is fixed at config time, so that is not a leak) and never
+            # raises on non-ASCII tokens the way str comparison would.
             if not self._socket_forwarding_secret or not hmac.compare_digest(
-                socket_token, self._socket_forwarding_secret
+                socket_token.encode(), self._socket_forwarding_secret.encode()
             ):
                 self._logger.warn("Invalid socket forwarding token")
                 return {"body": "Invalid socket token", "status": 401}
