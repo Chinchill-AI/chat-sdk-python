@@ -227,25 +227,9 @@ class TestWebClientMultiWorkspace:
 
 
 # ---------------------------------------------------------------------------
-# Async resolver: not-yet-resolved default token raises (sync property)
-# ---------------------------------------------------------------------------
-
-
-class TestWebClientAsyncResolver:
-    def test_unresolved_async_resolver_raises(self):
-        """A callable ``bot_token`` that has not run yet cannot resolve sync."""
-
-        async def resolver() -> str:
-            return "xoxb-async-resolved"
-
-        adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
-
-        with pytest.raises(AuthenticationError):
-            _ = adapter.web_client
-
-
-# ---------------------------------------------------------------------------
 # Sync resolver: invoked directly from ``web_client`` (Codex P2 fix)
+# Async resolver raising from the sync property is covered by
+# ``TestWebClientSyncResolver.test_async_callable_in_sync_context_raises``.
 # ---------------------------------------------------------------------------
 
 
@@ -275,12 +259,14 @@ class TestWebClientSyncResolver:
         secret-manager-backed resolver would silently freeze on the
         original value.
         """
-        tokens = iter(["xoxb-sync-1", "xoxb-sync-2", "xoxb-sync-3"])
         calls = {"n": 0}
 
         def resolver() -> str:
+            # ``f"xoxb-sync-{n}"`` rather than ``next(iter([...]))`` so the
+            # test is robust if assertions evolve to add a 4th+ access — a
+            # plain iterator would StopIteration instead of failing cleanly.
             calls["n"] += 1
-            return next(tokens)
+            return f"xoxb-sync-{calls['n']}"
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret=_SECRET, bot_token=resolver))
 
