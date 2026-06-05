@@ -338,6 +338,42 @@ class TestInteractivePayloads:
         assert response["status"] == 200
 
     @pytest.mark.asyncio
+    async def test_dm_block_action_does_not_thread(self):
+        """A click on a top-level DM message must resolve to a DM-root thread_id.
+
+        Regression: _handle_block_actions fell back to message_ts for thread_ts
+        in DMs, so HITL approval result cards posted via event.thread.post became
+        phantom "1 reply" threads in the DM. DMs have no threads — the ActionEvent
+        must carry an empty thread_ts, mirroring _handle_message_event.
+        """
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "block_actions",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "container": {"type": "message", "message_ts": "1234567890.123456", "channel_id": "D456"},
+                "channel": {"id": "D456", "name": "directmessage"},
+                "message": {"ts": "1234567890.123456"},  # top-level DM message: no thread_ts
+                "actions": [{"type": "button", "action_id": "approve_btn", "value": "approved"}],
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+        chat.process_action.assert_called_once()
+        action_event = chat.process_action.call_args[0][0]
+        decoded = adapter.decode_thread_id(action_event.thread_id)
+        assert decoded.channel == "D456"
+        assert decoded.thread_ts == "", (
+            f"DM block action threaded under {decoded.thread_ts!r}; a top-level DM click "
+            "must resolve to a DM-root thread_id (empty thread_ts), else the approval "
+            "result card posts as a phantom reply thread."
+        )
+
+    @pytest.mark.asyncio
     async def test_returns_400_for_missing_payload(self):
         adapter = _make_adapter()
         req = _make_signed_request("foo=bar", content_type="application/x-www-form-urlencoded")
