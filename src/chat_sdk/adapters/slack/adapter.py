@@ -3869,7 +3869,6 @@ class SlackAdapter:
 
         streamer = await client.chat_stream(**stream_kwargs)
 
-        first = True
         last_appended = ""
 
         # Use StreamingMarkdownRenderer for safe incremental rendering
@@ -3878,18 +3877,20 @@ class SlackAdapter:
         renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
         structured_chunks_supported = True
 
+        # The resolved bot token is passed on EVERY append and on stop
+        # (vercel/chat#573). Passing it only on the first append left
+        # chat.startStream/chat.stopStream unauthenticated ("not_authed")
+        # whenever the stream reached stop() before a token-bearing append
+        # had flushed (e.g. fully buffered markdown). In multi-workspace
+        # mode `token` is the per-request installation token resolved by
+        # _get_token() at stream entry.
         async def flush_markdown_delta(delta: str) -> None:
-            nonlocal first
             if not delta:
                 return
-            if first:
-                await streamer.append(markdown_text=delta, token=token)
-                first = False
-            else:
-                await streamer.append(markdown_text=delta)
+            await streamer.append(markdown_text=delta, token=token)
 
         async def send_structured_chunk(chunk: StreamChunk | dict[str, Any]) -> None:
-            nonlocal first, last_appended, structured_chunks_supported
+            nonlocal last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return
             committable = renderer.get_committable_text()
@@ -3917,11 +3918,7 @@ class SlackAdapter:
                     if value is not None:
                         chunk_data[field_name] = value
 
-                if first:
-                    await streamer.append(chunks=[chunk_data], token=token)
-                    first = False
-                else:
-                    await streamer.append(chunks=[chunk_data])
+                await streamer.append(chunks=[chunk_data], token=token)
             except Exception as exc:
                 structured_chunks_supported = False
                 self._logger.warn(
@@ -3961,10 +3958,10 @@ class SlackAdapter:
         final_delta = final_committable[len(last_appended) :]
         await flush_markdown_delta(final_delta)
 
-        stop_kwargs: dict[str, Any] = {}
+        stop_kwargs: dict[str, Any] = {"token": token}
         if options.stop_blocks:
             stop_kwargs["blocks"] = options.stop_blocks
-        result = await streamer.stop(**stop_kwargs) if stop_kwargs else await streamer.stop()
+        result = await streamer.stop(**stop_kwargs)
 
         message_ts = ""
         if isinstance(result, dict):
