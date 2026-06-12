@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias, TypedDict
+from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -75,8 +75,21 @@ class SlackAdapterConfig:
     # If provided, bot tokens stored via set_installation() will be encrypted at rest.
     encryption_key: str | None = None
     # Prefix for the state key used to store workspace installations.
-    # Defaults to ``slack:installation``. The full key will be ``{prefix}:{team_id}``.
+    # Defaults to ``slack:installation``. The full key will be ``{prefix}:{team_id}``
+    # (or ``{prefix}:{enterprise_id}`` for Enterprise Grid org-wide installs).
     installation_key_prefix: str = "slack:installation"
+    # External installation provider for multi-workspace apps using external
+    # token management (e.g. Vercel Connect). When set, the adapter bypasses
+    # internal StateAdapter storage for token lookups on incoming webhooks.
+    #
+    # For Enterprise Grid org-wide installs, ``installation_id`` will be the
+    # enterprise ID; otherwise it will be the team ID.
+    #
+    # Precedence: a configured default ``bot_token`` (single-workspace mode,
+    # static or resolver) still wins — per-installation resolution (and thus
+    # this provider) only runs in multi-workspace mode. See the resolver rows
+    # in docs/UPSTREAM_SYNC.md.
+    installation_provider: SlackInstallationProvider | None = None
     # Logger instance for error reporting. Defaults to ConsoleLogger.
     logger: Logger | None = None
     # Connection mode: ``"webhook"`` (default) or ``"socket"``. When set to
@@ -126,6 +139,26 @@ class SlackInstallation:
     bot_token: str
     bot_user_id: str | None = None
     team_name: str | None = None
+
+
+class SlackInstallationProvider(Protocol):
+    """External installation provider for multi-workspace token management.
+
+    Implementations resolve a :class:`SlackInstallation` from an external
+    system (e.g. Vercel Connect) instead of the adapter's internal
+    StateAdapter storage. ``installation_id`` is the ``enterprise_id`` for
+    Enterprise Grid org-wide installs (``is_enterprise_install=True``),
+    otherwise the ``team_id``. Return ``None`` when no installation exists.
+
+    The provider is read-only: ``set_installation`` / ``delete_installation``
+    / ``handle_oauth_callback`` continue to write to the internal state
+    adapter, so callers using a provider should manage their own writes
+    through their external system.
+    """
+
+    def get_installation(
+        self, installation_id: str, is_enterprise_install: bool
+    ) -> Awaitable[SlackInstallation | None]: ...
 
 
 # =============================================================================
@@ -321,9 +354,13 @@ class SlackWebhookPayload(TypedDict, total=False):
     """Slack webhook payload envelope."""
 
     challenge: str
+    # Enterprise ID for Enterprise Grid org-wide installs
+    enterprise_id: str
     event: Any  # SlackEventUnion
     event_id: str
     event_time: int
+    # Whether this is an Enterprise Grid org-wide install
+    is_enterprise_install: bool
     # Whether this event occurred in an externally shared channel (Slack Connect)
     is_ext_shared_channel: bool
     team_id: str
@@ -465,3 +502,7 @@ class RequestContext:
     token: str
     bot_user_id: str | None = None
     is_ext_shared_channel: bool | None = None
+    # Enterprise ID for Enterprise Grid org-wide installs
+    enterprise_id: str | None = None
+    # Whether this request came from an Enterprise Grid org-wide install
+    is_enterprise_install: bool | None = None

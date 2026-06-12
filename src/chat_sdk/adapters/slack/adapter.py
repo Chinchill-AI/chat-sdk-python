@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
@@ -52,6 +53,7 @@ from chat_sdk.adapters.slack.types import (
     SlackBotToken,
     SlackBotTokenResolver,
     SlackInstallation,
+    SlackInstallationProvider,
     SlackThreadId,
     SlackWebhookVerifier,
 )
@@ -205,6 +207,19 @@ _UNFURL_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _InstallationInfo:
+    """Installation identity extracted from an interactive payload.
+
+    ``installation_id`` is the team ID -- or the enterprise ID for
+    Enterprise Grid org-wide installs (``is_enterprise_install``).
+    """
+
+    installation_id: str
+    is_enterprise_install: bool
+    enterprise_id: str | None = None
 
 
 def _find_next_mention(text: str) -> int:
@@ -487,6 +502,9 @@ class SlackAdapter:
         else:
             self._client_secret = None
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
+        # External installation provider (e.g. Vercel Connect). When set,
+        # per-installation token lookups bypass internal StateAdapter storage.
+        self._installation_provider: SlackInstallationProvider | None = config.installation_provider
 
         # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``
         # is treated as "user explicitly opted out" and is NOT silently
@@ -973,30 +991,79 @@ class SlackAdapter:
     # Private helpers - token resolution
     # ==================================================================
 
-    async def _resolve_token_for_team(self, team_id: str) -> RequestContext | None:
-        """Resolve the bot token for a team from the state adapter."""
+    async def _resolve_token_for_team(
+        self, installation_id: str, is_enterprise_install: bool = False
+    ) -> RequestContext | None:
+        """Resolve the bot token for an installation.
+
+        Checks the external installation provider first (e.g. Vercel
+        Connect); when no provider is configured, falls back to the
+        internal state adapter.
+
+        ``installation_id`` is the ``team_id`` -- or the ``enterprise_id``
+        for Enterprise Grid org-wide installs (``is_enterprise_install``).
+        """
         try:
-            installation = await self.get_installation(team_id)
+            # Check external installation provider first (e.g. Vercel Connect)
+            if self._installation_provider is not None:
+                installation = await self._installation_provider.get_installation(
+                    installation_id, is_enterprise_install
+                )
+                if installation:
+                    return RequestContext(
+                        token=installation.bot_token,
+                        bot_user_id=installation.bot_user_id,
+                    )
+                self._logger.warn(
+                    "No installation found from provider",
+                    {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                )
+                return None
+            # Fall back to internal state adapter
+            installation = await self.get_installation(installation_id)
             if installation:
                 return RequestContext(
                     token=installation.bot_token,
                     bot_user_id=installation.bot_user_id,
                 )
-            self._logger.warn("No installation found for team", {"teamId": team_id})
+            self._logger.warn(
+                "No installation found for team",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+            )
             return None
         except Exception as exc:
-            self._logger.error("Failed to resolve token for team", {"teamId": team_id, "error": exc})
+            self._logger.error(
+                "Failed to resolve token for team",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install, "error": exc},
+            )
             return None
 
-    def _extract_team_id_from_interactive(self, body: str) -> str | None:
-        """Extract team_id from an interactive payload (form-urlencoded)."""
+    def _extract_installation_from_interactive(self, body: str) -> _InstallationInfo | None:
+        """Extract installation info from an interactive payload (form-urlencoded).
+
+        For Enterprise Grid org-wide installs, the installation ID is the
+        enterprise ID; otherwise it is the team ID.
+        """
         try:
             params = parse_qs(body)
             payload_str = params.get("payload", [None])[0]
             if not payload_str:
                 return None
             payload = json.loads(payload_str)
-            return payload.get("team", {}).get("id") or payload.get("team_id")
+            is_enterprise_install = bool(payload.get("is_enterprise_install"))
+            enterprise = payload.get("enterprise") or {}
+            enterprise_id = enterprise.get("id") or payload.get("enterprise_id") or None
+            team = payload.get("team") or {}
+            team_id = team.get("id") or payload.get("team_id") or None
+            installation_id = enterprise_id if is_enterprise_install else team_id
+
+            if not installation_id:
+                return None
+            return _InstallationInfo(
+                installation_id=installation_id,
+                is_enterprise_install=is_enterprise_install,
+                enterprise_id=enterprise_id,
+            )
         except Exception:
             return None
 
@@ -1359,24 +1426,47 @@ class SlackAdapter:
 
             # Slash command
             if "command" in params and "payload" not in params:
-                team_id = (params.get("team_id") or [None])[0]
-                if not self._is_single_workspace and team_id:
-                    ctx = await self._resolve_token_for_team(team_id)
-                    if ctx:
-                        tok = self._request_context.set(ctx)
-                        try:
-                            return await self._handle_slash_command(params, options)
-                        finally:
-                            self._request_context.reset(tok)
-                    self._logger.warn("Could not resolve token for slash command")
+                if not self._is_single_workspace:
+                    # For Enterprise Grid org-wide installs, use enterprise_id;
+                    # otherwise use team_id.
+                    is_enterprise_install = (params.get("is_enterprise_install") or [None])[0] == "true"
+                    enterprise_id = (params.get("enterprise_id") or [None])[0]
+                    team_id = (params.get("team_id") or [None])[0]
+                    installation_id = enterprise_id if is_enterprise_install else team_id
+
+                    if installation_id:
+                        ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
+                        if ctx:
+                            ctx = replace(
+                                ctx,
+                                enterprise_id=enterprise_id,
+                                is_enterprise_install=is_enterprise_install,
+                            )
+                            tok = self._request_context.set(ctx)
+                            try:
+                                return await self._handle_slash_command(params, options)
+                            finally:
+                                self._request_context.reset(tok)
+                        self._logger.warn(
+                            "Could not resolve token for slash command",
+                            {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                        )
                 return await self._handle_slash_command(params, options)
 
             # Interactive payload
             if not self._is_single_workspace:
-                team_id_interactive = self._extract_team_id_from_interactive(body)
-                if team_id_interactive:
-                    ctx = await self._resolve_token_for_team(team_id_interactive)
+                installation_info = self._extract_installation_from_interactive(body)
+                if installation_info:
+                    ctx = await self._resolve_token_for_team(
+                        installation_info.installation_id,
+                        installation_info.is_enterprise_install,
+                    )
                     if ctx:
+                        ctx = replace(
+                            ctx,
+                            enterprise_id=installation_info.enterprise_id,
+                            is_enterprise_install=installation_info.is_enterprise_install,
+                        )
                         tok = self._request_context.set(ctx)
                         try:
                             return await self._handle_interactive_payload(body, options)
@@ -1406,15 +1496,27 @@ class SlackAdapter:
         # isolated -- the ContextVar change does not leak back to the caller
         # and does not need an explicit reset.
         if not self._is_single_workspace and payload.get("type") == "event_callback":
-            team_id_event = payload.get("team_id")
-            if team_id_event:
-                ctx = await self._resolve_token_for_team(team_id_event)
+            # For Enterprise Grid org-wide installs, use enterprise_id;
+            # otherwise use team_id.
+            is_enterprise_install = bool(payload.get("is_enterprise_install"))
+            installation_id = payload.get("enterprise_id") if is_enterprise_install else payload.get("team_id")
+
+            if installation_id:
+                ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
                 if ctx:
+                    ctx = replace(
+                        ctx,
+                        enterprise_id=payload.get("enterprise_id"),
+                        is_enterprise_install=is_enterprise_install,
+                    )
                     isolated = contextvars.copy_context()
                     isolated.run(self._request_context.set, ctx)
                     isolated.run(self._process_event_payload, payload, options)
                     return {"body": "ok", "status": 200}
-                self._logger.warn("Could not resolve token for team", {"teamId": team_id_event})
+                self._logger.warn(
+                    "Could not resolve token for installation",
+                    {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                )
                 return {"body": "ok", "status": 200}
 
         # Single-workspace mode or fallback
@@ -3201,13 +3303,17 @@ class SlackAdapter:
         the queue/debounce path JSON-serializes the message.
         """
         url = file.get("url_private")
-        # Capture per-request token from the active webhook context so
-        # ``fetch_data`` can run later without being inside the ContextVar
-        # frame (e.g. after the message has been queued + rehydrated).
+        # Capture per-request context (token + Enterprise Grid info) from the
+        # active webhook context so ``fetch_data`` can run later without being
+        # inside the ContextVar frame (e.g. after the message has been queued
+        # + rehydrated), and ``rehydrate_attachment`` can resolve tokens
+        # through the same lookup logic on a different process invocation.
         # For single-workspace mode the default provider is re-resolved at
         # fetch time so dynamic ``bot_token`` resolvers honor rotation.
         ctx = self._request_context.get()
         ctx_token: str | None = ctx.token if ctx and ctx.token else None
+        ctx_enterprise_id: str | None = ctx.enterprise_id if ctx else None
+        ctx_is_enterprise_install: bool = bool(ctx.is_enterprise_install) if ctx else False
 
         mimetype = file.get("mimetype", "")
         att_type: str = "file"
@@ -3227,6 +3333,12 @@ class SlackAdapter:
             fetch_meta["url"] = url
         if team_id:
             fetch_meta["teamId"] = team_id
+        # Omit the Enterprise Grid keys entirely when absent (hazard #7:
+        # omitted keys, not serialized ``None``/false values).
+        if ctx_enterprise_id:
+            fetch_meta["enterpriseId"] = ctx_enterprise_id
+        if ctx_is_enterprise_install:
+            fetch_meta["isEnterpriseInstall"] = "true"
 
         return Attachment(
             type=att_type,  # type: ignore[arg-type]
@@ -3312,20 +3424,28 @@ class SlackAdapter:
         meta_url = meta.get("url")
         url = meta_url if meta_url is not None else attachment.url
         team_id = meta.get("teamId")
+        enterprise_id = meta.get("enterpriseId")
+        is_enterprise_install = meta.get("isEnterpriseInstall") == "true"
         if not url:
             return attachment
 
         adapter = self
 
         async def fetch_data() -> bytes:
-            if team_id:
-                installation = await adapter.get_installation(team_id)
-                if installation is None:
+            installation_id = enterprise_id if is_enterprise_install else team_id
+            if installation_id:
+                # Route through ``_resolve_token_for_team`` so
+                # ``installation_provider`` (when configured) is honored --
+                # otherwise this falls back to internal state via
+                # ``get_installation``, matching the prior behavior.
+                ctx = await adapter._resolve_token_for_team(installation_id, is_enterprise_install)
+                if ctx is None:
                     raise AuthenticationError(
                         "slack",
-                        f"Installation not found for team {team_id}",
+                        f"Installation not found for "
+                        f"{'enterprise' if is_enterprise_install else 'team'} {installation_id}",
                     )
-                token = installation.bot_token
+                token = ctx.token
             else:
                 # Use the async resolver so a dynamic ``bot_token`` provider
                 # is invoked at fetch time (rotation-safe).
