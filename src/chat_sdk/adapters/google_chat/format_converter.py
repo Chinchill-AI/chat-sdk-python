@@ -298,6 +298,17 @@ class GoogleChatFormatConverter(BaseFormatConverter):
             url = node.get("url", "")
             if link_text == url:
                 return url
+            # Collapse redundant mailto:/tel: autolink formatting
+            # (vercel/chat#553): when the visible label already equals the
+            # URL minus its scheme (e.g. an autolinked email address), emit
+            # the bare value as plain text instead of the verbose
+            # `<url|text>` form.
+            for scheme in ("mailto:", "tel:"):
+                if not url.startswith(scheme):
+                    continue
+                bare_value = url[len(scheme) :]
+                if bare_value == link_text:
+                    return bare_value
             # An empty label can't round-trip in either `<url|text>` or
             # `text (url)` form (the parser regex requires ≥1 char in the
             # label, and "(url)" alone reads as a parenthetical). Emit the
