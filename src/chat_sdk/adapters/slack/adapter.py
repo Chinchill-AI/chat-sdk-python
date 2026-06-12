@@ -2571,15 +2571,25 @@ class SlackAdapter:
 
             thread_id = self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=parent_ts))
 
+            # Resolve display names from the cached users.info lookup so
+            # reaction handlers see real names instead of raw user IDs
+            # (vercel/chat#523). Falls back to the user ID on lookup failure.
+            user_info = await self._lookup_user(user_id)
+            display_name = user_info.get("display_name")
+            user_name = display_name if display_name is not None else user_id
+            real_name = user_info.get("real_name")
+            full_name = real_name if real_name is not None else user_name
+            is_bot = user_info.get("is_bot")
+
             reaction_event = ReactionEvent(
                 emoji=normalized_emoji,
                 raw_emoji=raw_emoji,
                 added=event.get("type") == "reaction_added",
                 user=Author(
                     user_id=user_id,
-                    user_name=user_id,
-                    full_name=user_id,
-                    is_bot=False,
+                    user_name=user_name,
+                    full_name=full_name,
+                    is_bot=is_bot if is_bot is not None else False,
                     is_me=is_me,
                 ),
                 message_id=message_id,
