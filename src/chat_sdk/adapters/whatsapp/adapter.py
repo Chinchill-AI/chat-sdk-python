@@ -39,7 +39,8 @@ from chat_sdk.adapters.whatsapp.types import (
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.errors import AdapterError, ValidationError
+from chat_sdk.thread_history import ThreadHistoryCache
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -64,7 +65,7 @@ from chat_sdk.types import (
 )
 
 # Default Graph API version
-DEFAULT_API_VERSION = "v21.0"
+DEFAULT_API_VERSION = "v25.0"
 
 # Maximum message length for WhatsApp Cloud API
 WHATSAPP_MESSAGE_LIMIT = 4096
@@ -944,8 +945,48 @@ class WhatsAppAdapter:
         )
 
     async def start_typing(self, thread_id: str, status: str | None = None) -> None:
-        """Start typing indicator. Not supported by WhatsApp Cloud API."""
-        pass
+        """Start typing indicator.
+
+        WhatsApp typing indicators require the most recent inbound message ID.
+        They also implicitly mark the referenced message as read.
+
+        See: https://developers.facebook.com/documentation/business-messaging/whatsapp/typing-indicators
+        """
+        message_id = await self._resolve_typing_target_message_id(thread_id)
+        self._logger.debug(
+            "WhatsApp typing indicator requested",
+            {"messageId": message_id, "threadId": thread_id},
+        )
+
+        if not message_id:
+            self._logger.warn(
+                "WhatsApp typing indicator skipped - no inbound message context",
+                {"threadId": thread_id},
+            )
+            return
+
+        if status:
+            self._logger.warn(
+                "WhatsApp typing indicator ignores custom status text",
+                {"status": status, "threadId": thread_id, "messageId": message_id},
+            )
+
+        response = await self._graph_api_request(
+            f"/{self._phone_number_id}/messages",
+            {
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": message_id,
+                "typing_indicator": {"type": "text"},
+            },
+        )
+
+        if not response.get("success"):
+            self._logger.error(
+                "WhatsApp typing indicator failed: API returned success=false",
+                {"messageId": message_id, "threadId": thread_id},
+            )
+            raise AdapterError("WhatsApp typing indicator failed", "whatsapp")
 
     async def fetch_messages(
         self,
@@ -1064,6 +1105,20 @@ class WhatsAppAdapter:
     # Private helpers
     # =========================================================================
 
+    async def _resolve_typing_target_message_id(self, thread_id: str) -> str | None:
+        """Resolve the latest inbound message ID for a thread."""
+        if not self._chat:
+            return None
+
+        state = self._chat.get_state()
+        history = await ThreadHistoryCache(state).get_messages(thread_id)
+
+        for message in reversed(history):
+            if not message.author.is_me:
+                return message.id
+
+        return None
+
     async def _graph_api_request(self, path: str, body: Any) -> Any:
         """Make a request to the Meta Graph API."""
         session = await self._get_http_session()
@@ -1085,7 +1140,10 @@ class WhatsAppAdapter:
                         "path": path,
                     },
                 )
-                raise RuntimeError(f"WhatsApp API error: {response.status} {error_body}")
+                raise AdapterError(
+                    f"WhatsApp API error: {response.status} {error_body}",
+                    "whatsapp",
+                )
 
             return await response.json()
 

@@ -363,3 +363,27 @@ class TestCreateWhatsAppAdapter:
         assert adapter.lock_scope == "channel"
         assert adapter.persist_thread_history is True
         assert adapter.bot_user_id is None  # not yet initialized
+
+    def test_default_api_version_is_v25(self):
+        """vercel/chat#320 bumped the default Graph API version to v25.0.
+
+        Upstream pins this through its custom-apiUrl factory tests; our
+        config has no apiUrl override, so assert the default URL directly
+        (an explicit api_version must still win).
+        """
+        adapter = create_whatsapp_adapter(
+            access_token="tok",
+            app_secret="sec",
+            phone_number_id="123",
+            verify_token="vt",
+        )
+        assert adapter._graph_api_url == "https://graph.facebook.com/v25.0"
+
+        pinned = create_whatsapp_adapter(
+            access_token="tok",
+            app_secret="sec",
+            phone_number_id="123",
+            verify_token="vt",
+            api_version="v21.0",
+        )
+        assert pinned._graph_api_url == "https://graph.facebook.com/v21.0"

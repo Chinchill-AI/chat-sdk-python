@@ -13,7 +13,7 @@ import hmac
 import json
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -652,12 +652,6 @@ class TestAdapterMiscMethods:
         tid = await adapter.open_dm("15551234567")
         assert tid == "whatsapp:123456789:15551234567"
 
-    @pytest.mark.asyncio
-    async def test_start_typing_noop(self):
-        adapter = _make_adapter()
-        result = await adapter.start_typing("whatsapp:123456789:15551234567")
-        assert result is None
-
     def test_is_dm_always_true(self):
         adapter = _make_adapter()
         assert adapter.is_dm("whatsapp:123456789:15551234567") is True
@@ -666,6 +660,102 @@ class TestAdapterMiscMethods:
         adapter = _make_adapter()
         result = adapter.channel_id_from_thread_id("whatsapp:123456789:15551234567")
         assert result == "whatsapp:123456789:15551234567"
+
+
+# ---------------------------------------------------------------------------
+# startTyping (vercel/chat#320 — typing indicator via the Cloud API)
+# ---------------------------------------------------------------------------
+
+
+def _serialized_history_message(message_id: str, *, is_me: bool) -> dict[str, Any]:
+    """Build a serialized Message dict as stored by ThreadHistoryCache."""
+    user_id = "123456789" if is_me else "15551234567"
+    name = "bot" if is_me else "User"
+    return {
+        "_type": "chat:Message",
+        "id": message_id,
+        "threadId": "whatsapp:123456789:15551234567",
+        "text": "Hello" if is_me else "Hi",
+        "author": {
+            "userId": user_id,
+            "userName": name,
+            "fullName": name,
+            "isMe": is_me,
+            "isBot": is_me,
+        },
+        "formatted": {"type": "root", "children": []},
+        "attachments": [],
+        "metadata": {"dateSent": "2026-06-01T00:00:00Z", "edited": False},
+    }
+
+
+def _make_chat_with_history(history: list[dict[str, Any]]) -> MagicMock:
+    """Mock ChatInstance whose state returns the given thread history."""
+    state = MagicMock()
+    state.get_list = AsyncMock(return_value=history)
+    chat = MagicMock()
+    chat.get_state = MagicMock(return_value=state)
+    chat._state = state
+    return chat
+
+
+class TestStartTyping:
+    """Port of upstream describe("startTyping") (vercel/chat#320)."""
+
+    THREAD_ID = "whatsapp:123456789:15551234567"
+
+    @pytest.mark.asyncio
+    async def test_resolves_latest_inbound_message_id_and_sends_typing_indicator(self):
+        adapter = _make_adapter()
+        # History: 1 inbound message, then 1 outbound (bot) message. The
+        # typing indicator must target the latest *inbound* message, skipping
+        # the bot's own newer reply.
+        chat = _make_chat_with_history(
+            [
+                _serialized_history_message("wamid.inbound123", is_me=False),
+                _serialized_history_message("wamid.outbound456", is_me=True),
+            ]
+        )
+        await adapter.initialize(chat)
+        adapter._graph_api_request = AsyncMock(return_value={"success": True})
+
+        await adapter.start_typing(self.THREAD_ID)
+
+        # History is read through the ThreadHistoryCache key contract.
+        chat._state.get_list.assert_awaited_once_with(f"msg-history:{self.THREAD_ID}")
+
+        adapter._graph_api_request.assert_awaited_once()
+        path, body = adapter._graph_api_request.call_args[0]
+        assert path == "/123456789/messages"
+        assert body["status"] == "read"
+        assert body["message_id"] == "wamid.inbound123"
+        assert body["typing_indicator"]["type"] == "text"
+
+    @pytest.mark.asyncio
+    async def test_does_nothing_if_no_inbound_message_is_found_in_history(self):
+        adapter = _make_adapter()
+        chat = _make_chat_with_history([])
+        await adapter.initialize(chat)
+        adapter._graph_api_request = AsyncMock(return_value={"success": True})
+
+        await adapter.start_typing(self.THREAD_ID)
+
+        adapter._graph_api_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_typing_raises_adapter_error_when_api_reports_failure(self):
+        """Python-only branch coverage: success=false from the Cloud API must
+        surface as an AdapterError (upstream throws AdapterError too but has
+        no test for it)."""
+        from chat_sdk.shared.errors import AdapterError
+
+        adapter = _make_adapter()
+        chat = _make_chat_with_history([_serialized_history_message("wamid.inbound123", is_me=False)])
+        await adapter.initialize(chat)
+        adapter._graph_api_request = AsyncMock(return_value={"success": False})
+
+        with pytest.raises(AdapterError, match="typing indicator failed"):
+            await adapter.start_typing(self.THREAD_ID)
 
 
 # ---------------------------------------------------------------------------
