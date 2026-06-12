@@ -99,9 +99,14 @@ def _make_mock_chat() -> MagicMock:
     mock.process_assistant_context_changed = MagicMock()
     mock.process_app_home_opened = MagicMock()
     mock.process_member_joined_channel = MagicMock()
-    # get_state needed by some adapters
+    # get_state needed by some adapters. All StateAdapter methods are
+    # async — configure them explicitly so adapter code paths that cache
+    # lookups (e.g. Slack `_lookup_user`) don't await MagicMock results.
     mock_state = MagicMock()
     mock_state.get = AsyncMock(return_value=None)
+    mock_state.set = AsyncMock()
+    mock_state.get_list = AsyncMock(return_value=[])
+    mock_state.append_to_list = AsyncMock()
     mock.get_state = MagicMock(return_value=mock_state)
     mock.get_logger = MagicMock(return_value=MagicMock())
     mock.get_user_name = MagicMock(return_value="bot")
@@ -175,14 +180,23 @@ class TestSlackDispatchKeys:
         }
 
         # The Slack reaction handler is async (it launches a task to resolve
-        # the parent thread_ts).  We need to mock the Slack client so the
-        # async resolution succeeds.
+        # the parent thread_ts and the reacting user's display name).  We
+        # need to mock the Slack client so the async resolution succeeds.
+        # The users.info mock mirrors the upstream test update for
+        # vercel/chat#523 — auto-children of a bare AsyncMock are async, so
+        # `result.get(...)` would otherwise return an orphaned coroutine.
         mock_client = AsyncMock()
         mock_client.conversations_replies = AsyncMock(
             return_value={
                 "messages": [
                     {"ts": "1234567890.123456", "thread_ts": "1234567890.000001"},
                 ],
+            }
+        )
+        mock_client.users_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "user": {"name": "user", "profile": {"display_name": "User"}},
             }
         )
         adapter._get_client = MagicMock(return_value=mock_client)
