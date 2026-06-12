@@ -1236,19 +1236,12 @@ class Adapter(Protocol):
     @property
     def lock_scope(self) -> LockScope | None: ...
 
-    # Deprecated: renamed to ``persist_thread_history``.  Both flags are read
-    # for backwards compatibility; either being truthy enables persistence.
-    # Like the upstream TS interface members, both flags are *optional* —
-    # the SDK reads them via ``getattr(..., None)``, so adapters may omit
-    # either attribute entirely.
-    @property
-    def persist_message_history(self) -> bool | None: ...
-
-    # When true, the SDK persists per-thread message history in the state
-    # adapter for this platform.  Use for platforms that lack server-side
-    # message history APIs (e.g. WhatsApp, Telegram).
-    @property
-    def persist_thread_history(self) -> bool | None: ...
+    # NOTE: the optional history-persistence flags (``persist_thread_history``
+    # and its deprecated alias ``persist_message_history``) are declared on
+    # ``BaseAdapter``, NOT here. Adding optional hooks to this structural
+    # Protocol makes them *required* members and breaks adapters that don't
+    # define them (several adapters satisfy the Protocol without extending
+    # BaseAdapter). The SDK reads both flags via ``getattr(..., None)``.
 
     def encode_thread_id(self, platform_data: Any) -> str: ...
     def decode_thread_id(self, thread_id: str) -> Any: ...

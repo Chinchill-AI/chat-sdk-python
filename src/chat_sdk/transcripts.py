@@ -96,7 +96,9 @@ class TranscriptsApiImpl:
     def __init__(self, state: StateAdapter, config: TranscriptsConfig) -> None:
         self._state = state
         self._max_per_user = config.max_per_user if config.max_per_user is not None else DEFAULT_MAX_PER_USER
-        self._retention_ms = _parse_duration(config.retention)
+        parsed_retention = _parse_duration(config.retention)
+        # append_to_list takes ttl_ms: int | None; fractional ms are meaningless
+        self._retention_ms = int(parsed_retention) if parsed_retention is not None else None
         self._store_formatted = config.store_formatted
 
     async def append(

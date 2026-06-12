@@ -19,7 +19,7 @@ import os
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.messenger.cards import (
@@ -43,6 +43,7 @@ from chat_sdk.adapters.messenger.types import (
     MessengerWebhookPayload,
 )
 from chat_sdk.emoji import convert_emoji_placeholders, default_emoji_resolver
+from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
 from chat_sdk.shared.errors import (
@@ -72,6 +73,7 @@ from chat_sdk.types import (
     StreamChunk,
     StreamOptions,
     ThreadInfo,
+    UserInfo,
     WebhookOptions,
 )
 
@@ -864,7 +866,7 @@ class MessengerAdapter:
         )
 
     @staticmethod
-    def _map_attachment_type(fb_type: str) -> str:
+    def _map_attachment_type(fb_type: str) -> Literal["audio", "file", "image", "video"]:
         """Map a Messenger attachment type to the SDK ``Attachment.type`` enum."""
         if fb_type == "image":
             return "image"
@@ -873,6 +875,17 @@ class MessengerAdapter:
         if fb_type == "audio":
             return "audio"
         return "file"
+
+    async def get_user(self, user_id: str) -> UserInfo | None:
+        """Messenger has no user-lookup parity with the other adapters yet.
+
+        Mirrors :meth:`BaseAdapter.get_user`: raises
+        :class:`~chat_sdk.errors.ChatNotImplementedError`, which
+        ``Chat.get_user`` translates into a "does not support get_user"
+        ``ChatError``. A real Graph-API-backed implementation is tracked as
+        issue #132.
+        """
+        raise ChatNotImplementedError(self.name, "getUser")
 
     async def _download_attachment(self, url: str) -> bytes:
         """Download an attachment payload URL. Wraps errors in ``NetworkError``."""
@@ -913,8 +926,9 @@ class MessengerAdapter:
             )
             if not isinstance(profile, dict):
                 return {"id": user_id}
-            self._user_profile_cache[user_id] = profile
-            return cast(MessengerUserProfile, profile)
+            typed_profile = cast(MessengerUserProfile, profile)
+            self._user_profile_cache[user_id] = typed_profile
+            return typed_profile
         except Exception:
             # On any error, fall back to a minimal profile carrying just the
             # user ID. Matches upstream's silent fallback.
