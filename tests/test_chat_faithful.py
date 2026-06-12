@@ -4014,6 +4014,7 @@ class TestPersistThreadHistory:
         assert stored is not None
         assert stored[0]["id"] == "msg-1"
 
+
 # ============================================================================
 # 21. processMessage return value (core slice of vercel/chat#444)
 # ============================================================================
@@ -4178,6 +4179,7 @@ class TestConcurrencyBurstRehydration:
         assert received_subject == mock_subject
         assert received_skipped_subject == mock_subject
         assert adapter.fetch_subject.await_count == 2  # type: ignore[attr-defined]
+
 
 # ============================================================================
 # 24. Action callbackUrl handling (vercel/chat#454)
@@ -4565,3 +4567,69 @@ class TestActionCallbackUrlErrorLogging:
             await _process_action_and_wait(chat, event)
 
         assert any(call_args[0] == "Button callbackUrl POST failed" for call_args in logger.error.calls)
+
+
+# ============================================================================
+# 25. Slash-command openModal without adapter support + subject wiring
+# ============================================================================
+
+
+class TestSlashCommandOpenModalUnsupported:
+    """[Slash Commands] flavor of the openModal-unsupported test.
+
+    Upstream chat.test.ts has two tests with this exact title (one under
+    the actions describe, one under slash commands); the fidelity matcher
+    counts Python names as a multiset, so each needs its own def.
+    """
+
+    # TS: "should return undefined from openModal when adapter does not support modals"
+    async def test_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(
+        self,
+    ):
+        adapter = create_mock_adapter("slack")
+        adapter.open_modal = None  # type: ignore[assignment]
+
+        chat, _, _ = await _init_chat(adapter=adapter)
+        captured_event: list[SlashCommandEvent] = []
+
+        async def _handler(event):
+            captured_event.append(event)
+
+        chat.on_slash_command("/feedback", _handler)
+
+        event = _make_slash_event(adapter, command="/feedback", text="", trigger_id="trigger-123")
+        chat.process_slash_command(event)
+        await asyncio.sleep(0.02)
+
+        assert len(captured_event) == 1
+
+        modal = {
+            "type": "modal",
+            "callback_id": "test_modal",
+            "title": "Test Modal",
+            "children": [],
+        }
+        result = await captured_event[0].open_modal(modal)
+        assert result is None
+
+
+class TestSubjectAdapterWiring:
+    # TS: "should wire adapter on message for subject access"
+    @requires_fetch_subject
+    async def test_should_wire_adapter_on_message_for_subject_access(self):
+        chat, adapter, _state = await _init_chat()
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-subject", "Hey @slack-bot test"),
+        )
+
+        assert len(received) == 1
+        # The mock adapter exposes no fetch_subject hook -> resolves None
+        assert await received[0].subject is None
