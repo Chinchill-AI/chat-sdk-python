@@ -1107,18 +1107,27 @@ class TestSecurityProperties:
         """Spot-check: the default verifier path uses ``hmac.compare_digest``.
 
         A regression to ``==`` would leak signature bytes via timing. This
-        test inspects the source of ``_verify_signature`` to assert the
-        primitive has not been swapped out. The regex requires an actual
-        ``hmac.compare_digest(`` call — a passing mention in a comment or
-        docstring (e.g. ``# use hmac.compare_digest, never ==``) does not
+        test inspects the source of the shared ``verify_slack_signature``
+        primitive (``chat_sdk.adapters.slack.webhook.verify`` — the single
+        implementation behind the adapter since the vercel/chat#538 port) to
+        assert the primitive has not been swapped out. The regex requires an
+        actual ``hmac.compare_digest(`` call — a passing mention in a comment
+        or docstring (e.g. ``# use hmac.compare_digest, never ==``) does not
         satisfy the assertion.
         """
         import inspect as _inspect
         import re as _re
 
-        src = _inspect.getsource(SlackAdapter._verify_signature)
+        from chat_sdk.adapters.slack.webhook import verify as _verify_module
+
+        src = _inspect.getsource(_verify_module._verify_slack_signature_value)
         assert _re.search(r"\bhmac\.compare_digest\s*\(", src), (
             "default signature verifier must call hmac.compare_digest(...) for constant-time comparison"
+        )
+        # And the adapter must still route through the shared primitive.
+        adapter_src = _inspect.getsource(SlackAdapter.handle_webhook)
+        assert _re.search(r"\bverify_slack_request\s*\(", adapter_src), (
+            "SlackAdapter.handle_webhook must verify via the shared verify_slack_request primitive"
         )
 
     @pytest.mark.asyncio

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
-import time
 
 import pytest
 
@@ -116,62 +113,6 @@ class TestSlackThreadId:
         adapter = _make_adapter()
         vis = adapter.get_channel_visibility("slack:X123:ts")
         assert vis == "unknown"
-
-
-# ---------------------------------------------------------------------------
-# verify_signature
-# ---------------------------------------------------------------------------
-
-
-class TestSlackVerifySignature:
-    """Tests for _verify_signature."""
-
-    def test_valid_signature(self):
-        adapter = _make_adapter(signing_secret="my-signing-secret")
-        body = "request body content"
-        timestamp = str(int(time.time()))
-        sig_basestring = f"v0:{timestamp}:{body}"
-        expected_sig = (
-            "v0="
-            + hmac.new(
-                b"my-signing-secret",
-                sig_basestring.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-        )
-        assert adapter._verify_signature(body, timestamp, expected_sig) is True
-
-    def test_invalid_signature(self):
-        adapter = _make_adapter(signing_secret="my-signing-secret")
-        timestamp = str(int(time.time()))
-        assert adapter._verify_signature("body", timestamp, "v0=invalid") is False
-
-    def test_none_timestamp(self):
-        adapter = _make_adapter()
-        assert adapter._verify_signature("body", None, "v0=sig") is False
-
-    def test_none_signature(self):
-        adapter = _make_adapter()
-        assert adapter._verify_signature("body", str(int(time.time())), None) is False
-
-    def test_old_timestamp_rejected(self):
-        adapter = _make_adapter(signing_secret="secret")
-        body = "test"
-        old_timestamp = str(int(time.time()) - 600)  # 10 minutes ago
-        sig_basestring = f"v0:{old_timestamp}:{body}"
-        sig = (
-            "v0="
-            + hmac.new(
-                b"secret",
-                sig_basestring.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-        )
-        assert adapter._verify_signature(body, old_timestamp, sig) is False
-
-    def test_non_numeric_timestamp(self):
-        adapter = _make_adapter()
-        assert adapter._verify_signature("body", "not-a-number", "v0=sig") is False
 
 
 # ---------------------------------------------------------------------------
