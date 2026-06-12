@@ -18,6 +18,11 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from chat_sdk.callback_url import (
+    decode_callback_value,
+    post_to_callback_url,
+    resolve_callback_url,
+)
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -176,17 +181,19 @@ class _SlashCommandPattern:
 
 
 class _StoredModalContext:
-    __slots__ = ("thread", "message", "channel")
+    __slots__ = ("thread", "message", "channel", "callback_url")
 
     def __init__(
         self,
         thread: dict[str, Any] | None = None,
         message: dict[str, Any] | None = None,
         channel: dict[str, Any] | None = None,
+        callback_url: str | None = None,
     ) -> None:
         self.thread = thread
         self.message = message
         self.channel = channel
+        self.callback_url = callback_url
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1061,7 @@ class Chat:
     ) -> ModalResponse | None:
         """Process a modal form submission. Returns optional response."""
         related = await self._retrieve_modal_context(event.adapter.name, context_id)
+        callback_url = related.get("callback_url")
 
         full_event = ModalSubmitEvent(
             adapter=event.adapter,
@@ -1068,18 +1076,50 @@ class Chat:
             raw=event.raw,
         )
 
+        result: ModalResponse | None = None
         for pat in self._modal_submit_handlers:
             if not pat.callback_ids or event.callback_id in pat.callback_ids:
                 try:
                     response = await self._invoke_handler(pat.handler, full_event)
                     if response is not None:
-                        return response
+                        result = response
+                        break
                 except Exception as exc:
                     self._logger.error(
                         "Modal submit handler error",
                         {"callback_id": event.callback_id, "error": str(exc)},
                     )
-        return None
+
+        if callback_url and getattr(result, "action", None) != "errors":
+            # POST the form values to the modal's callback URL. The response
+            # is returned to the platform without waiting for the POST; the
+            # task is handed to options.wait_until for serverless callers.
+            payload = {
+                "type": "modal_submit",
+                "callbackId": event.callback_id,
+                "values": event.values,
+                "user": {"id": event.user.user_id, "name": event.user.user_name},
+            }
+
+            async def _post_modal_callback() -> None:
+                try:
+                    post_result = await post_to_callback_url(callback_url, payload)
+                    if post_result.error is not None:
+                        self._logger.error(
+                            "Modal callbackUrl POST failed",
+                            {"callback_url": callback_url, "error": str(post_result.error)},
+                        )
+                except Exception as error:  # mirrors upstream's trailing .catch
+                    self._logger.error(
+                        "Modal callbackUrl POST failed",
+                        {"callback_url": callback_url, "error": str(error)},
+                    )
+
+            task = _create_task(_post_modal_callback(), self._active_tasks)
+            if task is not None and options and options.wait_until:
+                options.wait_until(task)
+
+        return result
 
     def process_modal_close(
         self,
@@ -1261,7 +1301,12 @@ class Chat:
                 self._logger.warn(f"Cannot open modal: {event.adapter.name} does not support modals")
                 return None
             context_id = str(uuid.uuid4())
-            self._store_modal_context(event.adapter.name, context_id, channel=channel)
+            self._store_modal_context(
+                event.adapter.name,
+                context_id,
+                channel=channel,
+                callback_url=modal.get("callback_url") if isinstance(modal, dict) else None,
+            )
             return await event.adapter.open_modal(trigger_id, modal, context_id)  # type: ignore[union-attr]
 
         full_event = SlashCommandEvent(
@@ -1295,12 +1340,16 @@ class Chat:
         thread: ThreadImpl | None = None,
         message: Message | None = None,
         channel: Channel | None = None,
+        callback_url: str | None = None,
     ) -> None:
         key = f"modal-context:{adapter_name}:{context_id}"
         context = {
             "thread": thread.to_json() if thread else None,
             "message": message.to_json() if message else None,
             "channel": channel.to_json() if channel else None,
+            # camelCase: stored state is a serialization boundary shared
+            # with the TS SDK (matches the serialized thread/message keys).
+            "callbackUrl": callback_url,
         }
         task = _create_task(self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS), self._active_tasks)
         if task is not None:
@@ -1319,6 +1368,7 @@ class Chat:
     ) -> dict[str, Any]:
         if not context_id:
             return {
+                "callback_url": None,
                 "related_thread": None,
                 "related_message": None,
                 "related_channel": None,
@@ -1329,6 +1379,7 @@ class Chat:
 
         if not stored:
             return {
+                "callback_url": None,
                 "related_thread": None,
                 "related_message": None,
                 "related_channel": None,
@@ -1349,7 +1400,12 @@ class Chat:
         if stored.get("channel"):
             related_channel = ChannelImpl.from_json(stored["channel"], adapter)
 
+        # Accept both camelCase (written by this SDK and the TS SDK) and
+        # snake_case (hand-written state) — same tolerance as from_json.
+        callback_url = stored["callbackUrl"] if "callbackUrl" in stored else stored.get("callback_url")
+
         return {
+            "callback_url": callback_url,
             "related_thread": related_thread,
             "related_message": related_message,
             "related_channel": related_channel,
@@ -1373,6 +1429,46 @@ class Chat:
         if event.user.is_me:
             self._logger.debug("Skipping action from self")
             return
+
+        # Decode a callback token (`__cb:<token>`) planted at post time by
+        # process_card_callback_urls. When one resolves, handlers see the
+        # button's original value and the action payload is POSTed to the
+        # stored callback URL concurrently with the handlers.
+        callback_token = decode_callback_value(event.value).callback_token
+
+        resolved = None
+        if callback_token:
+            resolved = await resolve_callback_url(callback_token, self._state_adapter)
+
+        action_value = resolved.original_value if resolved is not None else event.value
+
+        callback_url_task: asyncio.Task[Any] | None = None
+        if resolved is not None:
+            callback_url = resolved.url
+            # Wire payload: camelCase keys, optional keys omitted (not None)
+            # to mirror upstream's JSON.stringify semantics — hazard #7.
+            payload: dict[str, Any] = {"type": "action", "actionId": event.action_id}
+            if resolved.original_value is not None:
+                payload["value"] = resolved.original_value
+            payload["user"] = {"id": event.user.user_id, "name": event.user.user_name}
+            if event.thread_id is not None:
+                payload["threadId"] = event.thread_id
+            if event.message_id is not None:
+                payload["messageId"] = event.message_id
+
+            async def _post_action_callback() -> None:
+                post_result = await post_to_callback_url(callback_url, payload)
+                if post_result.error is not None:
+                    self._logger.error(
+                        "Button callbackUrl POST failed",
+                        {
+                            "callback_url": callback_url,
+                            "action_id": event.action_id,
+                            "error": str(post_result.error),
+                        },
+                    )
+
+            callback_url_task = _create_task(_post_action_callback(), self._active_tasks)
 
         thread: ThreadImpl | None = None
         if event.thread_id:
@@ -1434,6 +1530,7 @@ class Chat:
                 thread=thread,
                 message=fetched_message,
                 channel=channel_impl,
+                callback_url=modal.get("callback_url") if isinstance(modal, dict) else None,
             )
             return await event.adapter.open_modal(trigger_id, modal, context_id)  # type: ignore[union-attr]
 
@@ -1444,7 +1541,7 @@ class Chat:
             message_id=event.message_id,
             user=event.user,
             action_id=event.action_id,
-            value=event.value,
+            value=action_value,
             trigger_id=event.trigger_id,
             raw=event.raw,
             _open_modal=_open_modal,
@@ -1458,6 +1555,9 @@ class Chat:
             if event.action_id in pat.action_ids:
                 self._logger.debug("Running matched action handler", {"action_id": event.action_id})
                 await self._invoke_handler(pat.handler, full_event)
+
+        if callback_url_task is not None:
+            await callback_url_task
 
     # ========================================================================
     # Reaction handling

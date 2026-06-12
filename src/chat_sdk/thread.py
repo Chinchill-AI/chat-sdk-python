@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from chat_sdk.callback_url import process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
@@ -573,6 +574,7 @@ class ThreadImpl:
             return await self._handle_stream(message)
 
         postable: AdapterPostableMessage = message  # type: ignore[assignment]
+        postable = await self._process_callback_urls(postable)
         raw_msg = await self.adapter.post_message(self._id, postable)
         result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id, raw=raw_msg.raw)
 
@@ -604,6 +606,8 @@ class ThreadImpl:
         """
         user_id = user if isinstance(user, str) else user.user_id
 
+        message = await self._process_callback_urls(message)  # type: ignore[assignment]
+
         # Try native ephemeral
         if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
             return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
@@ -624,6 +628,28 @@ class ThreadImpl:
 
         return None
 
+    async def _process_callback_urls(
+        self,
+        postable: str | AdapterPostableMessage,
+    ) -> str | AdapterPostableMessage:
+        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454)."""
+        if isinstance(postable, str):
+            return postable
+
+        if isinstance(postable, dict) and postable.get("type") == "card":
+            return await process_card_callback_urls(postable, self._state_adapter)
+
+        if (
+            isinstance(postable, PostableCard)
+            and isinstance(postable.card, dict)
+            and postable.card.get("type") == "card"
+        ):
+            processed = await process_card_callback_urls(postable.card, self._state_adapter)
+            if processed is not postable.card:
+                return replace(postable, card=processed)
+
+        return postable
+
     async def schedule(
         self,
         message: AdapterPostableMessage,
@@ -631,6 +657,8 @@ class ThreadImpl:
         post_at: datetime,
     ) -> ScheduledMessage:
         """Schedule a message for future delivery."""
+        message = await self._process_callback_urls(message)  # type: ignore[assignment]
+
         if not hasattr(self.adapter, "schedule_message") or not self.adapter.schedule_message:  # type: ignore[union-attr]
             raise ChatNotImplementedError(
                 self.adapter.name,
@@ -1140,6 +1168,7 @@ class ThreadImpl:
         plain_text, formatted, attachments = _extract_message_content(postable)
 
         async def _edit(new_content: Any) -> SentMessage:
+            new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
             return thread_impl._create_sent_message(message_id, new_content)
 
@@ -1185,6 +1214,7 @@ class ThreadImpl:
         thread_impl = self
 
         async def _edit(new_content: Any) -> SentMessage:
+            new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
             return thread_impl._create_sent_message(message_id, new_content, thread_id)
 

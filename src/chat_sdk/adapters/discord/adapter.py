@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
     card_to_discord_payload,
+    decode_discord_custom_id,
 )
 from chat_sdk.adapters.discord.format_converter import DiscordFormatConverter
 from chat_sdk.adapters.discord.types import (
@@ -385,10 +386,11 @@ class DiscordAdapter:
             },
         )
 
+        decoded = decode_discord_custom_id(custom_id)
         self._chat.process_action(
             ActionEvent(
-                action_id=custom_id,
-                value=custom_id,
+                action_id=decoded.action_id,
+                value=decoded.value if decoded.value is not None else decoded.action_id,
                 user=Author(
                     user_id=user.get("id", ""),
                     user_name=user.get("username", ""),
