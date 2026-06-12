@@ -38,7 +38,7 @@ class WhatsAppAdapterConfig:
     user_name: str
     # Verify token for webhook challenge-response verification
     verify_token: str
-    # Meta Graph API version (default: "v21.0")
+    # Meta Graph API version (default: "v25.0")
     api_version: str | None = None
 
 
@@ -207,6 +207,12 @@ class WhatsAppSendResponse(TypedDict):
     contacts: list[dict[str, str]]
     messages: list[dict[str, str]]
     messaging_product: str  # "whatsapp"
+
+
+class WhatsAppTypingIndicatorResponse(TypedDict):
+    """Response from sending a typing indicator via the Cloud API."""
+
+    success: bool
 
 
 class WhatsAppInteractiveButtonReply(TypedDict):
