@@ -269,7 +269,7 @@ class _ThreadImplConfig:
     # Direct adapter mode
     adapter: Adapter | None = None
     state_adapter: StateAdapter | None = None
-    message_history: Any = None  # MessageHistoryCache
+    thread_history: Any = None  # ThreadHistoryCache
 
     # Lazy resolution mode
     adapter_name: str | None = None
@@ -303,7 +303,7 @@ class ThreadImpl:
         self._adapter: Adapter | None = config.adapter
         self._adapter_name: str | None = config.adapter_name
         self._state_adapter_instance: StateAdapter | None = config.state_adapter
-        self._message_history: Any = config.message_history
+        self._thread_history: Any = config.thread_history
 
         # Lazy channel cache
         self._channel_cache: ChannelImpl | None = None
@@ -405,7 +405,7 @@ class ThreadImpl:
                     state_adapter=self._state_adapter,
                     is_dm=self._is_dm,
                     channel_visibility=self._channel_visibility,
-                    message_history=self._message_history,
+                    thread_history=self._thread_history,
                 )
             )
         return self._channel_cache
@@ -419,7 +419,7 @@ class ThreadImpl:
         """
         adapter = self.adapter
         thread_id = self._id
-        message_history = self._message_history
+        thread_history = self._thread_history
         cursor: str | None = None
         yielded_any = False
 
@@ -438,8 +438,8 @@ class ThreadImpl:
             cursor = result.next_cursor
 
         # Fallback to cached history
-        if not yielded_any and message_history is not None:
-            cached: list[Message] = await message_history.get_messages(thread_id)
+        if not yielded_any and thread_history is not None:
+            cached: list[Message] = await thread_history.get_messages(thread_id)
             for msg in reversed(cached):
                 yield msg
 
@@ -450,7 +450,7 @@ class ThreadImpl:
         """
         adapter = self.adapter
         thread_id = self._id
-        message_history = self._message_history
+        thread_history = self._thread_history
         cursor: str | None = None
         yielded_any = False
 
@@ -467,8 +467,8 @@ class ThreadImpl:
                 break
             cursor = result.next_cursor
 
-        if not yielded_any and message_history is not None:
-            cached: list[Message] = await message_history.get_messages(thread_id)
+        if not yielded_any and thread_history is not None:
+            cached: list[Message] = await thread_history.get_messages(thread_id)
             for msg in cached:
                 yield msg
 
@@ -562,10 +562,10 @@ class ThreadImpl:
             raw = await self._handle_postable_object(message)
             # Cache in history with the real message ID (upstream skips this,
             # but that's a gap — posted messages should appear in history).
-            if self._message_history is not None and raw is not None:
+            if self._thread_history is not None and raw is not None:
                 fallback = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
                 sent = self._create_sent_message(raw.id, PostableMarkdown(markdown=fallback), raw.thread_id)
-                await self._message_history.append(self._id, _to_message(sent))
+                await self._thread_history.append(self._id, _to_message(sent))
             return message
 
         # Handle AsyncIterable (streaming)
@@ -576,8 +576,8 @@ class ThreadImpl:
         raw_msg = await self.adapter.post_message(self._id, postable)
         result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id, raw=raw_msg.raw)
 
-        if self._message_history is not None:
-            await self._message_history.append(self._id, _to_message(result))
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(result))
 
         return result
 
@@ -716,8 +716,8 @@ class ThreadImpl:
                 PostableMarkdown(markdown=recorded_text),
                 raw_result.thread_id,
             )
-            if self._message_history is not None:
-                await self._message_history.append(self._id, _to_message(sent))
+            if self._thread_history is not None:
+                await self._thread_history.append(self._id, _to_message(sent))
             return sent
 
         # Fallback: post + edit with throttling (text-only)
@@ -930,8 +930,8 @@ class ThreadImpl:
             PostableMarkdown(markdown=last_edit_content),
             thread_id_for_edits,
         )
-        if self._message_history is not None:
-            await self._message_history.append(self._id, _to_message(sent))
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(sent))
 
         # If the stream raised mid-way, we've now flushed whatever partial
         # content was rendered (so the user sees real content instead of a
@@ -954,8 +954,8 @@ class ThreadImpl:
         result = await self.adapter.fetch_messages(self._id, FetchOptions(limit=50))
         if result.messages:
             self._recent_messages = result.messages
-        elif self._message_history is not None:
-            self._recent_messages = await self._message_history.get_messages(self._id, 50)
+        elif self._thread_history is not None:
+            self._recent_messages = await self._thread_history.get_messages(self._id, 50)
         else:
             self._recent_messages = []
 
@@ -1036,7 +1036,7 @@ class ThreadImpl:
             # Every attribute that embeds a reference to the old context
             # gets cleared here: `_state_adapter_instance` (old chat's
             # state backend), `_channel_cache` (old adapter's channel),
-            # `_message_history` (old chat's history cache),
+            # `_thread_history` (old chat's history cache),
             # `_recent_messages` (old adapter's fetched content), and
             # `_is_subscribed_context` (handler-context flag from the
             # old chat — a thread rebound to a new context shouldn't
@@ -1045,7 +1045,7 @@ class ThreadImpl:
             if adapter is not None or chat is not None:
                 thread._state_adapter_instance = None
                 thread._channel_cache = None
-                thread._message_history = None
+                thread._thread_history = None
                 thread._recent_messages = []
                 thread._is_subscribed_context = False
         else:
@@ -1323,4 +1323,4 @@ class _ChannelImplConfigForThread:
     state_adapter: StateAdapter
     is_dm: bool = False
     channel_visibility: ChannelVisibility = "unknown"
-    message_history: Any = None
+    thread_history: Any = None

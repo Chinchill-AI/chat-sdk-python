@@ -29,6 +29,7 @@ from chat_sdk.thread import (
     has_chat_singleton,
     set_chat_singleton,
 )
+from chat_sdk.transcripts import TranscriptsApiImpl
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
@@ -43,6 +44,8 @@ from chat_sdk.types import (
     ConcurrencyConfig,
     ConcurrencyStrategy,
     EmojiValue,
+    IdentityContext,
+    IdentityResolver,
     Lock,
     LockScope,
     LockScopeContext,
@@ -60,6 +63,7 @@ from chat_sdk.types import (
     ReactionEvent,
     SlashCommandEvent,
     StateAdapter,
+    TranscriptsApi,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -361,8 +365,25 @@ class Chat:
             else None
         )
 
-        # -- Message history (placeholder -- real impl would use MessageHistoryCache)
-        self._message_history = _MessageHistoryCache(self._state_adapter, config.message_history)
+        # -- Thread history (placeholder -- real impl would use ThreadHistoryCache)
+        # `config.message_history` is the deprecated alias; `thread_history`
+        # takes precedence when both are set (mirrors upstream
+        # `config.threadHistory ?? config.messageHistory`).
+        self._thread_history = _ThreadHistoryCache(
+            self._state_adapter,
+            config.thread_history if config.thread_history is not None else config.message_history,
+        )
+
+        # -- Transcripts API (cross-platform per-user persistence) -------------
+        self._identity: IdentityResolver | None = config.identity
+        self._transcripts: TranscriptsApiImpl | None = None
+        if config.transcripts is not None:
+            if config.identity is None:
+                raise ValueError(
+                    "ChatConfig.transcripts requires ChatConfig.identity to be set "
+                    "— the cross-platform user key must be resolvable"
+                )
+            self._transcripts = TranscriptsApiImpl(self._state_adapter, config.transcripts)
 
         # -- Logger -----------------------------------------------------------
         if isinstance(config.logger, str):
@@ -407,6 +428,24 @@ class Chat:
             self.webhooks[name] = self._make_webhook_handler(name)
 
         self._logger.debug("Chat instance created", {"adapters": list(config.adapters.keys())})
+
+    # ========================================================================
+    # Transcripts API
+    # ========================================================================
+
+    @property
+    def transcripts(self) -> TranscriptsApi:
+        """Cross-platform per-user transcript store.
+
+        Available only when ``transcripts`` is configured on the Chat
+        instance (and an ``identity`` resolver is set).  Raises on access
+        otherwise so callers fail loudly rather than silently no-op'ing.
+        """
+        if self._transcripts is None:
+            raise ChatError(
+                "chat.transcripts is not configured — pass `transcripts` and `identity` to ChatConfig to enable it"
+            )
+        return self._transcripts
 
     # ========================================================================
     # Singleton management
@@ -1825,12 +1864,16 @@ class Chat:
             self._logger.debug("Skipping duplicate message", {"message_id": message.id})
             return
 
-        # Persist incoming message before acquiring lock
-        if adapter.persist_message_history:
+        # Persist incoming message before acquiring lock.
+        # `persist_message_history` is the deprecated adapter flag; either
+        # being truthy enables persistence (mirrors upstream
+        # `adapter.persistThreadHistory || adapter.persistMessageHistory`).
+        # Both flags are optional on the adapter, hence getattr.
+        if getattr(adapter, "persist_thread_history", None) or getattr(adapter, "persist_message_history", None):
             channel_id = adapter.channel_id_from_thread_id(thread_id)
-            appends = [self._message_history.append(thread_id, message)]
+            appends = [self._thread_history.append(thread_id, message)]
             if channel_id != thread_id:
-                appends.append(self._message_history.append(channel_id, message))
+                appends.append(self._thread_history.append(channel_id, message))
             await asyncio.gather(*appends)
 
         # Resolve lock key
@@ -2165,6 +2208,27 @@ class Chat:
 
         thread = self._create_thread(adapter, thread_id, message, is_subscribed)
 
+        # Resolve cross-platform user key (Transcripts API). Cached on the
+        # Message instance so handlers and the Transcripts API see the same
+        # value without re-invoking the resolver.
+        if self._identity is not None and message.user_key is None:
+            try:
+                resolved = self._identity(IdentityContext(adapter=adapter.name, author=message.author, message=message))
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+                if resolved:
+                    message.user_key = resolved
+            except Exception as err:
+                self._logger.warn(
+                    "Identity resolver threw; skipping userKey",
+                    {
+                        "error": err,
+                        "adapter": adapter.name,
+                        "thread_id": thread_id,
+                        "author_user_id": message.author.user_id,
+                    },
+                )
+
         # DM routing
         is_dm = (
             adapter.is_dm(thread_id)  # type: ignore[union-attr]
@@ -2247,7 +2311,14 @@ class Chat:
                 logger=self._logger,
                 streaming_update_interval_ms=self._streaming_update_interval_ms,
                 fallback_streaming_placeholder_text=self._fallback_streaming_placeholder_text,
-                message_history=(self._message_history if adapter.persist_message_history else None),
+                thread_history=(
+                    self._thread_history
+                    if (
+                        getattr(adapter, "persist_thread_history", None)
+                        or getattr(adapter, "persist_message_history", None)
+                    )
+                    else None
+                ),
             )
         )
 
@@ -2490,12 +2561,19 @@ def _message_from_json(data: dict[str, Any]) -> Message:
 
 
 # ---------------------------------------------------------------------------
-# Minimal MessageHistoryCache (placeholder -- real impl uses StateAdapter lists)
+# Minimal ThreadHistoryCache (placeholder -- real impl uses StateAdapter lists)
 # ---------------------------------------------------------------------------
 
+# Key prefix for thread history entries.
+#
+# Kept as ``msg-history:`` for backwards compatibility — renaming would
+# silently orphan every existing user's stored data. The user-facing names
+# changed; the storage shape didn't. (Matches KEY_PREFIX in thread_history.py.)
+_THREAD_HISTORY_KEY_PREFIX = "msg-history:"
 
-class _MessageHistoryCache:
-    """Lightweight in-SDK message history cache backed by the state adapter."""
+
+class _ThreadHistoryCache:
+    """Lightweight in-SDK per-thread history cache backed by the state adapter."""
 
     def __init__(self, state: StateAdapter, config: dict[str, Any] | None = None) -> None:
         self._state = state
@@ -2503,9 +2581,9 @@ class _MessageHistoryCache:
         self._ttl_ms = (config or {}).get("ttl_ms", 30 * 24 * 60 * 60 * 1000)
 
     async def append(self, thread_id: str, message: Message) -> None:
-        key = f"msg-history:{thread_id}"
+        key = f"{_THREAD_HISTORY_KEY_PREFIX}{thread_id}"
         # Serialize with raw nulled out to save storage (matches
-        # MessageHistoryCache.append in message_history.py). Without this,
+        # ThreadHistoryCache.append in thread_history.py). Without this,
         # SentMessage.raw — now populated post-#117 with platform payloads
         # like Slack team_id/user_id, Discord guild IDs — would persist to
         # the state adapter on every reply, inflating storage and PII surface.
@@ -2514,7 +2592,7 @@ class _MessageHistoryCache:
         await self._state.append_to_list(key, data, max_length=self._max_messages, ttl_ms=self._ttl_ms)
 
     async def get_messages(self, thread_id: str, limit: int | None = None) -> list[Message]:
-        key = f"msg-history:{thread_id}"
+        key = f"{_THREAD_HISTORY_KEY_PREFIX}{thread_id}"
         raw_list = await self._state.get_list(key)
         messages = [_message_from_json(r) if isinstance(r, dict) else r for r in raw_list]
         if limit is not None:

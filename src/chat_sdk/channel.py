@@ -83,7 +83,7 @@ class _ChannelImplConfigWithAdapter:
     state_adapter: StateAdapter
     channel_visibility: ChannelVisibility = "unknown"
     is_dm: bool = False
-    message_history: Any = None
+    thread_history: Any = None
 
 
 @dataclass
@@ -122,15 +122,15 @@ class ChannelImpl:
             self._adapter: Adapter | None = None
             self._adapter_name: str | None = config.adapter_name
             self._state_adapter_instance: StateAdapter | None = None
-            self._message_history: Any = None
+            self._thread_history: Any = None
         else:
             # _ChannelImplConfigWithAdapter, _ChannelImplConfigForThread,
             # or _ChannelImplConfigForChat (from chat.py) -- all have
-            # adapter, state_adapter, and optional message_history attrs.
+            # adapter, state_adapter, and optional thread_history attrs.
             self._adapter = config.adapter  # type: ignore[union-attr]
             self._adapter_name = None
             self._state_adapter_instance = config.state_adapter  # type: ignore[union-attr]
-            self._message_history = getattr(config, "message_history", None)
+            self._thread_history = getattr(config, "thread_history", None)
 
     # -- Properties ----------------------------------------------------------
 
@@ -206,7 +206,7 @@ class ChannelImpl:
         """
         adapter = self.adapter
         channel_id = self._id
-        message_history = self._message_history
+        thread_history = self._thread_history
         cursor: str | None = None
         yielded_any = False
 
@@ -227,8 +227,8 @@ class ChannelImpl:
             cursor = result.next_cursor
 
         # Fallback to cached history
-        if not yielded_any and message_history is not None:
-            cached: list[Message] = await message_history.get_messages(channel_id)
+        if not yielded_any and thread_history is not None:
+            cached: list[Message] = await thread_history.get_messages(channel_id)
             for msg in reversed(cached):
                 yield msg
 
@@ -285,10 +285,10 @@ class ChannelImpl:
         # Handle PostableObject (e.g. Plan)
         if is_postable_object(message):
             raw = await self._handle_postable_object(message)
-            if self._message_history is not None and raw is not None:
+            if self._thread_history is not None and raw is not None:
                 fallback = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
                 sent = self._create_sent_message(raw.id, PostableMarkdown(markdown=fallback), raw.thread_id)
-                await self._message_history.append(self._id, _to_message(sent))
+                await self._thread_history.append(self._id, _to_message(sent))
             return message
 
         if _is_async_iterable(message):
@@ -312,8 +312,8 @@ class ChannelImpl:
 
         sent = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id)
 
-        if self._message_history is not None:
-            await self._message_history.append(self._id, _to_message(sent))
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(sent))
 
         return sent
 
@@ -439,11 +439,11 @@ class ChannelImpl:
 
             # Validation passed — safe to invalidate.
             # Both `_state_adapter_instance` (old chat's state backend)
-            # and `_message_history` (old chat's cache) would route to
+            # and `_thread_history` (old chat's cache) would route to
             # the previous context otherwise.
             if adapter is not None or chat is not None:
                 channel._state_adapter_instance = None
-                channel._message_history = None
+                channel._thread_history = None
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall

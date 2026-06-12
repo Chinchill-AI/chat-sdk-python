@@ -3852,13 +3852,55 @@ class TestLockScope:
 
 
 # ============================================================================
-# 23. persistMessageHistory (tests 92-93)
+# 23. persistThreadHistory (tests 92-97)
 # ============================================================================
 
 
-class TestPersistMessageHistory:
-    # TS: "should cache incoming messages when adapter has persistMessageHistory"
-    async def test_should_cache_incoming_messages_when_adapter_has_persistmessagehistory(self):
+def _record_append_to_list_calls(state: MockStateAdapter) -> list[tuple[str, Any, int | None, int | None]]:
+    """Wrap ``state.append_to_list`` to record ``(key, value, max_length, ttl_ms)``.
+
+    Python stand-in for the TS mock state's ``vi.fn()``-wrapped
+    ``appendToList`` that the upstream config-precedence tests assert on.
+    """
+    calls: list[tuple[str, Any, int | None, int | None]] = []
+    real_append = state.append_to_list
+
+    async def _recording_append(
+        key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None
+    ) -> None:
+        calls.append((key, value, max_length, ttl_ms))
+        await real_append(key, value, max_length=max_length, ttl_ms=ttl_ms)
+
+    state.append_to_list = _recording_append
+    return calls
+
+
+class TestPersistThreadHistory:
+    # TS: "caches incoming messages when adapter sets persistThreadHistory"
+    async def test_caches_incoming_messages_when_adapter_sets_persistthreadhistory(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello from WhatsApp")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        stored = state.cache.get("msg-history:whatsapp:phone:user1")
+        assert stored is not None
+        assert isinstance(stored, list)
+        assert stored[0]["id"] == "msg-1"
+
+    # TS: "caches incoming messages when adapter sets the deprecated persistMessageHistory flag"
+    async def test_caches_incoming_messages_when_adapter_sets_the_deprecated_persistmessagehistory_flag(self):
         adapter = create_mock_adapter("whatsapp")
         adapter.persist_message_history = True
         state = create_mock_state()
@@ -3880,8 +3922,8 @@ class TestPersistMessageHistory:
         assert isinstance(stored, list)
         assert stored[0]["id"] == "msg-1"
 
-    # TS: "should NOT cache incoming messages when adapter does not set persistMessageHistory"
-    async def test_should_not_cache_incoming_messages_when_adapter_does_not_set_persistmessagehistory(self):
+    # TS: "does not cache when adapter sets neither flag"
+    async def test_does_not_cache_when_adapter_sets_neither_flag(self):
         chat, adapter, state = await _init_chat()
 
         msg = create_test_message("msg-2", "Hello from Slack")
@@ -3890,6 +3932,83 @@ class TestPersistMessageHistory:
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
 
+    # TS: "honors top-level config.messageHistory (deprecated alias) when threadHistory is not set"
+    async def test_honors_top_level_config_messagehistory_deprecated_alias_when_threadhistory_is_not_set(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+        append_calls = _record_append_to_list_calls(state)
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+            message_history={"max_messages": 5, "ttl_ms": 12_345},
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        matching = [call for call in append_calls if call[0] == "msg-history:whatsapp:phone:user1"]
+        assert len(matching) == 1
+        _key, value, max_length, ttl_ms = matching[0]
+        assert value["id"] == "msg-1"
+        assert max_length == 5
+        assert ttl_ms == 12_345
+
+    # TS: "threadHistory takes precedence when both threadHistory and messageHistory are set"
+    async def test_threadhistory_takes_precedence_when_both_threadhistory_and_messagehistory_are_set(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+        append_calls = _record_append_to_list_calls(state)
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+            thread_history={"max_messages": 5, "ttl_ms": 1_000},
+            message_history={"max_messages": 999, "ttl_ms": 999_999},
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        matching = [call for call in append_calls if call[0] == "msg-history:whatsapp:phone:user1"]
+        assert len(matching) == 1
+        _key, value, max_length, ttl_ms = matching[0]
+        assert value["id"] == "msg-1"
+        assert max_length == 5
+        assert ttl_ms == 1_000
+
+    # TS: "persists when both persistThreadHistory and persistMessageHistory are set on the adapter"
+    async def test_persists_when_both_persistthreadhistory_and_persistmessagehistory_are_set_on_the_adapter(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        adapter.persist_message_history = True
+        state = create_mock_state()
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        stored = state.cache.get("msg-history:whatsapp:phone:user1")
+        assert stored is not None
+        assert stored[0]["id"] == "msg-1"
 
 # ============================================================================
 # 21. processMessage return value (core slice of vercel/chat#444)

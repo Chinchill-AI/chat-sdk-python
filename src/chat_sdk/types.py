@@ -411,6 +411,15 @@ class Message:
     is_mention: bool | None = None
     links: list[LinkPreview] | None = None
     raw: Any = None
+    # Cross-platform user key for this message's author.
+    #
+    # Set by the Chat SDK before passing the message to handlers, when
+    # ``ChatConfig.identity`` is configured.  ``None`` if no resolver is
+    # configured or when the resolver returned ``None``.
+    #
+    # Used by the Transcripts API to look up / append per-user transcripts.
+    # Not part of the serialized ``SerializedMessage`` shape.
+    user_key: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -1226,8 +1235,20 @@ class Adapter(Protocol):
     def bot_user_id(self) -> str | None: ...
     @property
     def lock_scope(self) -> LockScope | None: ...
+
+    # Deprecated: renamed to ``persist_thread_history``.  Both flags are read
+    # for backwards compatibility; either being truthy enables persistence.
+    # Like the upstream TS interface members, both flags are *optional* —
+    # the SDK reads them via ``getattr(..., None)``, so adapters may omit
+    # either attribute entirely.
     @property
     def persist_message_history(self) -> bool | None: ...
+
+    # When true, the SDK persists per-thread message history in the state
+    # adapter for this platform.  Use for platforms that lack server-side
+    # message history APIs (e.g. WhatsApp, Telegram).
+    @property
+    def persist_thread_history(self) -> bool | None: ...
 
     def encode_thread_id(self, platform_data: Any) -> str: ...
     def decode_thread_id(self, thread_id: str) -> Any: ...
@@ -1285,8 +1306,14 @@ class BaseAdapter:
     def lock_scope(self) -> LockScope | None:
         return None
 
+    # Deprecated: renamed to ``persist_thread_history``.  Kept for
+    # backwards compatibility; either flag being truthy enables persistence.
     @property
     def persist_message_history(self) -> bool | None:
+        return None
+
+    @property
+    def persist_thread_history(self) -> bool | None:
         return None
 
     # -- Optional methods with default (not-implemented) --------------------
@@ -1455,17 +1482,38 @@ class ChatConfig:
     # Milliseconds to remember a message ID for deduplication (default 5 min).
     dedupe_ttl_ms: int = 300000
     fallback_streaming_placeholder_text: str | None = "..."
+    # Resolves a stable cross-platform user key from inbound messages.
+    #
+    # Required when ``transcripts`` is configured.  Called once per inbound
+    # message during dispatch; the result is attached to the Message
+    # instance as ``message.user_key`` for handlers to use.
+    identity: IdentityResolver | None = None
     # Whether locks are scoped per-thread or per-channel.
     # Can also be a callable that inspects context and returns the scope.
     lock_scope: LockScope | Callable[..., LockScope | Awaitable[LockScope]] | None = None
     logger: Logger | LogLevel | None = None
-    # Configuration dict forwarded to MessageHistoryCache
-    # (e.g. {"max_messages": 50, "persist": True}).
+    # Deprecated: renamed to ``thread_history``.  Both fields are read for
+    # backwards compatibility; ``thread_history`` takes precedence when both
+    # are set.
     message_history: dict[str, Any] | None = None
     # What to do when a lock is already held: "drop" the new message,
     # "force" acquire, or a callable that decides at runtime.
     on_lock_conflict: OnLockConflict | None = None
     streaming_update_interval_ms: int = 500
+    # Configuration dict for persistent per-thread message history backfill
+    # (e.g. {"max_messages": 50, "ttl_ms": 86_400_000}).
+    #
+    # Only used by adapters that set ``persist_thread_history`` (e.g.
+    # Telegram, WhatsApp).  Distinct from ``transcripts`` (the cross-platform
+    # per-user Transcripts API).
+    thread_history: dict[str, Any] | None = None
+    # Cross-platform per-user message persistence.
+    #
+    # When set, ``chat.transcripts`` is available for append/list/count/delete
+    # keyed by a resolved cross-platform user key.
+    #
+    # Requires ``identity`` to also be set; the constructor raises otherwise.
+    transcripts: TranscriptsConfig | None = None
 
 
 # =============================================================================
@@ -1510,6 +1558,12 @@ class ChatInstance(Protocol):
     def process_member_joined_channel(
         self, event: MemberJoinedChannelEvent, options: WebhookOptions | None = None
     ) -> None: ...
+
+    # Cross-platform per-user transcript store.  Raises on access when
+    # ``transcripts`` is not configured on the Chat instance — callers should
+    # check ``ChatConfig.transcripts`` if they need a no-raise guard.
+    @property
+    def transcripts(self) -> TranscriptsApi: ...
 
 
 # =============================================================================
@@ -1678,4 +1732,222 @@ class Thread(Postable, Protocol):
 
     def to_json(self) -> dict[str, Any]:
         """Serialize the thread to a plain JSON object."""
+        ...
+
+
+# =============================================================================
+# Transcripts API (cross-platform per-user message persistence)
+# =============================================================================
+
+
+@dataclass
+class IdentityContext:
+    """Context passed to an :data:`IdentityResolver`."""
+
+    # Adapter name (e.g. "slack", "discord").
+    adapter: str
+    author: Author
+    message: Message
+
+
+# Resolves a stable, cross-platform user key from an inbound message context.
+#
+# Return ``None`` to skip persistence for this event (unknown user, system
+# message, or the bot itself).  The SDK fails loudly rather than silently
+# falling back to a platform-specific ID.  May be sync or async.
+IdentityResolver = Callable[[IdentityContext], "str | None | Awaitable[str | None]"]
+
+# Role tag on a stored message.
+#
+# - ``user``: produced by the resolved end-user
+# - ``assistant``: produced by this bot
+# - ``system``: SDK-injected marker (handoff, summary). Adapters never produce it.
+TranscriptRole = Literal["user", "assistant", "system"]
+
+# Duration shorthand: e.g. ``"7d"``, ``"30m"``, ``"2h"``, ``"45s"``.
+# (TS models this as a template-literal type; Python uses a plain ``str``.)
+DurationString = str
+
+
+@dataclass
+class TranscriptEntry:
+    """A stored transcript entry.
+
+    Serialized at the storage boundary via :meth:`to_json` using the same
+    camelCase shape the upstream TS SDK writes, so stores are interoperable.
+    """
+
+    # UUID assigned by the SDK at append time. Opaque — not lexicographically
+    # sortable. Entries are returned by ``list()`` in append order (the
+    # underlying list semantics of ``state.append_to_list``); use
+    # ``timestamp`` to reason about ordering across stores.
+    id: str
+    # Cross-platform user key from the IdentityResolver.
+    user_key: str
+    role: TranscriptRole
+    # Plain-text body — canonical field for prompt building.
+    text: str
+    # Originating adapter name.
+    platform: str
+    # Originating thread ID.
+    thread_id: str
+    # ms-since-epoch, set at append time on the SDK side.
+    timestamp: int
+    # mdast AST. Only present when ``transcripts.store_formatted`` is true.
+    formatted: FormattedContent | None = None
+    # Platform-native message ID, when known.
+    platform_message_id: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        """Serialize to the camelCase storage shape (optional keys omitted)."""
+        result: dict[str, Any] = {
+            "id": self.id,
+            "userKey": self.user_key,
+            "role": self.role,
+            "text": self.text,
+            "platform": self.platform,
+            "threadId": self.thread_id,
+            "timestamp": self.timestamp,
+        }
+        if self.formatted is not None:
+            result["formatted"] = self.formatted
+        if self.platform_message_id is not None:
+            result["platformMessageId"] = self.platform_message_id
+        return result
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> TranscriptEntry:
+        """Reconstruct an entry from its camelCase storage shape."""
+        return cls(
+            id=data.get("id", ""),
+            user_key=data.get("userKey", ""),
+            role=data.get("role", "user"),
+            text=data.get("text", ""),
+            platform=data.get("platform", ""),
+            thread_id=data.get("threadId", ""),
+            timestamp=data.get("timestamp", 0),
+            formatted=data.get("formatted"),
+            platform_message_id=data.get("platformMessageId"),
+        )
+
+
+@dataclass
+class TranscriptsConfig:
+    """Configuration for the cross-platform per-user Transcripts API."""
+
+    # Hard cap; older messages evicted on append. Default 200.
+    max_per_user: int | None = None
+    # Default retention applied as the list TTL (ms, or a DurationString such
+    # as "7d"). Refreshed on every append (matches ``append_to_list``
+    # semantics). Omit for no expiry.
+    retention: int | DurationString | None = None
+    # Persist ``formatted`` (mdast). Default False to keep storage small.
+    store_formatted: bool = False
+
+
+@dataclass
+class AppendInput:
+    """Input shape for appending a non-Message (e.g. an assistant reply you
+    just posted via ``thread.post()``)."""
+
+    role: TranscriptRole
+    text: str
+    formatted: FormattedContent | None = None
+    platform_message_id: str | None = None
+
+
+@dataclass
+class AppendOptions:
+    """Options for :meth:`TranscriptsApi.append`."""
+
+    # Required when appending an ``AppendInput`` (assistant/system role) — the
+    # SDK has no Message instance from which to read the resolved key.
+    #
+    # Ignored when appending a Message; the Message's own ``user_key`` is used.
+    user_key: str | None = None
+
+
+@dataclass
+class ListQuery:
+    """Query for :meth:`TranscriptsApi.list`."""
+
+    user_key: str
+    # Newest N kept (still returned in chronological order). Default 50.
+    limit: int | None = None
+    # Filter to a subset of adapter names.
+    platforms: list[str] | None = None
+    # Filter to specific roles. Default: all.
+    roles: list[TranscriptRole] | None = None
+    # Filter to a single thread.
+    thread_id: str | None = None
+
+
+@dataclass
+class DeleteTarget:
+    """Target for :meth:`TranscriptsApi.delete`.  Wipes every stored message
+    under the given user key."""
+
+    user_key: str
+
+
+@dataclass
+class CountQuery:
+    """Query shape for :meth:`TranscriptsApi.count`."""
+
+    user_key: str
+
+
+@dataclass
+class DeleteResult:
+    """Result of :meth:`TranscriptsApi.delete`.
+
+    Python-side named type for the upstream inline ``{ deleted: number }``
+    return shape.
+    """
+
+    deleted: int
+
+
+class TranscriptsApi(Protocol):
+    """Cross-platform per-user message store.
+
+    Distinct from the existing per-thread ``thread_history`` config (which
+    exists to backfill thread context for adapters that lack server-side
+    history APIs).  The Transcripts API is keyed by a resolved cross-platform
+    user key and is intended for transcript-style use cases (LLM context
+    building, audit).
+    """
+
+    async def append(
+        self,
+        thread: Postable,
+        message: Message | AppendInput,
+        options: AppendOptions | None = None,
+    ) -> TranscriptEntry | None:
+        """Persist a Message (or AppendInput) under the user key.
+
+        - For Message: ``user_key`` is read from the Message instance (set by
+          the SDK during inbound dispatch via the configured IdentityResolver).
+          No-op if the Message has no ``user_key`` (resolver returned None).
+        - For AppendInput: ``options.user_key`` is required.
+        """
+        ...
+
+    async def count(self, query: CountQuery) -> int:
+        """Total stored count for a user key."""
+        ...
+
+    async def delete(self, target: DeleteTarget) -> DeleteResult:
+        """GDPR / DSR delete — wipes every stored message under the user key."""
+        ...
+
+    async def list(self, query: ListQuery) -> list[TranscriptEntry]:
+        """Return the most recent entries in chronological order (oldest
+        first), capped at ``query.limit`` (default 50).
+
+        Pagination is intentionally not supported — the store keeps at most
+        ``transcripts.max_per_user`` entries per user.  To widen the window,
+        raise ``max_per_user``; to fetch a different slice, narrow with
+        ``thread_id`` / ``platforms`` / ``roles``.
+        """
         ...

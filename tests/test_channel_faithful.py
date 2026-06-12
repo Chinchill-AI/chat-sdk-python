@@ -752,7 +752,7 @@ class TestSerialization:
             "_adapter": original._adapter,
             "_adapter_name": original._adapter_name,
             "_state_adapter_instance": original._state_adapter_instance,
-            "_message_history": original._message_history,
+            "_thread_history": original._thread_history,
         }
 
         with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
