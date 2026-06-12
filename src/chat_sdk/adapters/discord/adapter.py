@@ -505,10 +505,20 @@ class DiscordAdapter:
         command_parts: list[str] = [name if name.startswith("/") else f"/{name}"]
         value_parts: list[str] = []
 
+        def stringify(value: Any) -> str:
+            # Match TS `String(value)` for boolean options: JSON booleans
+            # arrive as Python bools, and `str(True)` would emit "True"
+            # where upstream emits "true" (e.g. a `verbose: true` option).
+            if value is True:
+                return "true"
+            if value is False:
+                return "false"
+            return str(value)
+
         def collect(items: list[DiscordCommandOption]) -> None:
             for option in items:
                 if option.get("value") is not None:
-                    value_parts.append(str(option["value"]))
+                    value_parts.append(stringify(option["value"]))
                     continue
                 sub_options = option.get("options", [])
                 if sub_options:
@@ -541,10 +551,109 @@ class DiscordAdapter:
             await self._handle_forwarded_reaction(event.get("data", {}), True, options)
         elif event_type == "GATEWAY_MESSAGE_REACTION_REMOVE":
             await self._handle_forwarded_reaction(event.get("data", {}), False, options)
+        elif event_type == "GATEWAY_INTERACTION_CREATE":
+            await self._handle_forwarded_interaction(event.get("data", {}), options)
         else:
             self._logger.debug("Forwarded Gateway event (no handler)", {"type": event_type})
 
         return self._make_json_response(json.dumps({"ok": True}), 200)
+
+    async def _handle_forwarded_interaction(
+        self,
+        interaction: DiscordInteraction,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Handle a forwarded INTERACTION_CREATE event (gateway-only mode).
+
+        Discord sends interactions through either the Gateway or an
+        Interactions Endpoint URL, not both (vercel/chat#490). Deployments
+        that leave the endpoint URL unset receive interactions over the
+        Gateway; the forwarder relays the raw INTERACTION_CREATE dispatch
+        payload here, which is already in wire format, so the existing HTTP
+        interaction handlers consume it unchanged.
+
+        Unlike HTTP interactions -- where the deferral rides the HTTP
+        response body -- a gateway interaction is acknowledged with an
+        explicit REST call to the interaction callback endpoint. That is
+        the same wire call upstream's gateway-only handler makes via
+        discord.js ``deferReply()`` (slash commands) and ``deferUpdate()``
+        (components). Slash commands then route through the existing slash
+        command handler path (the deferred response is later resolved by
+        ``post_message`` PATCHing the ``@original`` interaction webhook
+        message), and component interactions route through the existing
+        action handler path.
+        """
+        interaction_id = interaction.get("id")
+        interaction_token = interaction.get("token")
+        interaction_type = interaction.get("type", 0)
+
+        self._logger.info(
+            "Discord Gateway interaction received",
+            {"id": interaction_id, "type": interaction_type},
+        )
+
+        if interaction_type not in (
+            INTERACTION_TYPE_APPLICATION_COMMAND,
+            INTERACTION_TYPE_MESSAGE_COMPONENT,
+        ):
+            self._logger.debug(
+                "Forwarded Gateway interaction (no handler)",
+                {"type": interaction_type},
+            )
+            return
+
+        if not (interaction_id and interaction_token):
+            # A gateway INTERACTION_CREATE always carries id + token; a
+            # malformed forward must not produce a garbage callback URL.
+            self._logger.warn(
+                "Forwarded Gateway interaction missing id or token",
+                {"id": interaction_id, "type": interaction_type},
+            )
+            return
+
+        try:
+            if interaction_type == INTERACTION_TYPE_APPLICATION_COMMAND:
+                # deferReply: ACK now, respond via the interaction webhook later.
+                await self._defer_gateway_interaction(
+                    interaction_id,
+                    interaction_token,
+                    InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                )
+                self._handle_application_command_interaction(interaction, options)
+                return
+
+            # deferUpdate: ACK the component, update the message later.
+            await self._defer_gateway_interaction(
+                interaction_id,
+                interaction_token,
+                InteractionResponseType.DEFERRED_UPDATE_MESSAGE,
+            )
+            self._handle_component_interaction(interaction, options)
+        except Exception as error:
+            self._logger.error(
+                "Error handling Gateway interaction",
+                {"error": str(error), "interactionId": interaction_id},
+            )
+
+    async def _defer_gateway_interaction(
+        self,
+        interaction_id: str,
+        interaction_token: str,
+        response_type: int,
+    ) -> None:
+        """ACK a gateway-received interaction via the callback endpoint.
+
+        ``POST /interactions/{id}/{token}/callback`` is the REST equivalent
+        of returning the deferral as the HTTP response body on the
+        Interactions Endpoint path. Path segments are URL-quoted so a
+        crafted id/token in a forwarded payload cannot pivot the request
+        (hazard #12, same guard as :meth:`get_user`).
+        """
+        await self._discord_fetch(
+            f"/interactions/{quote(interaction_id, safe='')}/{quote(interaction_token, safe='')}/callback",
+            "POST",
+            {"type": response_type},
+        )
 
     async def _handle_forwarded_message(
         self,
