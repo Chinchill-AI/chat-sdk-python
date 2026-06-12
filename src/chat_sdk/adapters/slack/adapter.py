@@ -55,7 +55,7 @@ from chat_sdk.adapters.slack.types import (
     SlackThreadId,
     SlackWebhookVerifier,
 )
-from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
+from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
@@ -3355,35 +3355,6 @@ class SlackAdapter:
         return bool(self._bot_id and event.get("bot_id") == self._bot_id)
 
     # ==================================================================
-    # Table block rendering
-    # ==================================================================
-
-    def _render_with_table_blocks(self, message: AdapterPostableMessage) -> dict[str, Any] | None:
-        """Try to render a message with native Slack table blocks.
-
-        Returns ``{"text": ..., "blocks": ...}`` if the message contains tables,
-        ``None`` otherwise.
-        """
-        ast: dict[str, Any] | None = None
-        if isinstance(message, dict):
-            ast = message.get("ast")  # type: ignore[union-attr]
-        elif hasattr(message, "ast"):
-            ast = getattr(message, "ast", None)
-        elif hasattr(message, "markdown"):
-            # We don't have a full markdown->AST parser in Python; skip table blocks
-            return None
-
-        if not ast:
-            return None
-
-        blocks = self._format_converter.to_blocks_with_table(ast)
-        if not blocks:
-            return None
-
-        fallback_text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
-        return {"text": fallback_text, "blocks": blocks}
-
-    # ==================================================================
     # Post / Edit / Delete messages
     # ==================================================================
 
@@ -3446,38 +3417,21 @@ class SlackAdapter:
                     ),
                 )
 
-            # Table blocks
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
-                return RawMessage(
-                    id=result.get("ts", ""),
-                    thread_id=thread_id,
-                    raw=self._augment_raw_with_uploads(
-                        result.data if hasattr(result, "data") else result,
-                        uploaded_file_ids,
-                    ),
-                )
-
-            # Regular text
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+            payload = self._format_converter.to_slack_payload(message)
             self._logger.debug(
                 "Slack API: chat.postMessage",
-                {"channel": channel, "threadTs": thread_ts, "textLength": len(text)},
+                {
+                    "channel": channel,
+                    "threadTs": thread_ts,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
             )
             result = await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts or None,
-                text=text,
                 unfurl_links=False,
                 unfurl_media=False,
+                **payload,
             )
             return RawMessage(
                 id=result.get("ts", ""),
@@ -3547,22 +3501,16 @@ class SlackAdapter:
                     raw=result.data if hasattr(result, "data") else result,
                 )
 
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_update(
-                    channel=channel,
-                    ts=message_id,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                )
-                return RawMessage(
-                    id=result.get("ts", ""),
-                    thread_id=thread_id,
-                    raw=result.data if hasattr(result, "data") else result,
-                )
-
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
-            result = await client.chat_update(channel=channel, ts=message_id, text=text)
+            payload = self._format_converter.to_slack_payload(message)
+            self._logger.debug(
+                "Slack API: chat.update",
+                {
+                    "channel": channel,
+                    "messageId": message_id,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
+            )
+            result = await client.chat_update(channel=channel, ts=message_id, **payload)
             return RawMessage(
                 id=result.get("ts", ""),
                 thread_id=thread_id,
@@ -3864,28 +3812,21 @@ class SlackAdapter:
                     raw=result.data if hasattr(result, "data") else result,
                 )
 
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_postEphemeral(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    user=user_id,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                )
-                return EphemeralMessage(
-                    id=result.get("message_ts", ""),
-                    thread_id=thread_id,
-                    used_fallback=False,
-                    raw=result.data if hasattr(result, "data") else result,
-                )
-
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+            payload = self._format_converter.to_slack_payload(message)
+            self._logger.debug(
+                "Slack API: chat.postEphemeral",
+                {
+                    "channel": channel,
+                    "threadTs": thread_ts,
+                    "userId": user_id,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
+            )
             result = await client.chat_postEphemeral(
                 channel=channel,
                 thread_ts=thread_ts or None,
                 user=user_id,
-                text=text,
+                **payload,
             )
             return EphemeralMessage(
                 id=result.get("message_ts", ""),
@@ -3948,14 +3889,23 @@ class SlackAdapter:
                     unfurl_media=False,
                 )
             else:
-                text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+                payload = self._format_converter.to_slack_payload(message)
+                self._logger.debug(
+                    "Slack API: chat.scheduleMessage",
+                    {
+                        "channel": channel,
+                        "threadTs": thread_ts,
+                        "postAt": post_at_unix,
+                        "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                    },
+                )
                 result = await client.chat_scheduleMessage(
                     channel=channel,
                     thread_ts=thread_ts or None,
                     post_at=post_at_unix,
-                    text=text,
                     unfurl_links=False,
                     unfurl_media=False,
+                    **payload,
                 )
 
             scheduled_message_id = result.get("scheduled_message_id", "")
@@ -4425,7 +4375,10 @@ class SlackAdapter:
         return self._parse_slack_message_sync(event, thread_id)
 
     def render_formatted(self, content: FormattedContent) -> str:
-        """Render formatted content (AST) to Slack mrkdwn."""
+        """Render formatted content (AST) to standard markdown.
+
+        Slack now accepts markdown natively via ``markdown_text``.
+        """
         return self._format_converter.from_ast(content)
 
     # ==================================================================
@@ -4547,18 +4500,13 @@ class SlackAdapter:
                     "blocks": card_to_block_kit(card),
                 }
             else:
-                table_result = self._render_with_table_blocks(message)
-                if table_result:
-                    payload = {
-                        "replace_original": True,
-                        "text": table_result["text"],
-                        "blocks": table_result["blocks"],
-                    }
-                else:
-                    payload = {
-                        "replace_original": True,
-                        "text": convert_emoji_placeholders(self._format_converter.render_postable(message), "slack"),
-                    }
+                # Slack rejects `markdown_text` on response_url payloads
+                # (`no_text`), so markdown/AST messages are rendered to
+                # Slack's legacy mrkdwn format for this surface.
+                payload = {
+                    "replace_original": True,
+                    "text": self._format_converter.to_response_url_text(message),
+                }
 
             if thread_ts:
                 payload["thread_ts"] = thread_ts

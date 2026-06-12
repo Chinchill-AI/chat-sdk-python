@@ -331,6 +331,58 @@ class TestPostMessage:
         calls = client.get_calls("chat_postMessage")
         assert calls[0]["kwargs"]["thread_ts"] == "1234567890.000000"
 
+    @pytest.mark.asyncio
+    async def test_markdown_message_posts_via_native_markdown_text(self):
+        """Markdown is passed through to Slack's markdown_text field for
+        native rendering -- not converted to mrkdwn ``text``."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.444444"})
+
+        from chat_sdk.types import PostableMarkdown
+
+        await adapter.post_message(
+            "slack:C123:1234567890.000000",
+            PostableMarkdown(markdown="**Bold** and _italic_ and `code`"),
+        )
+
+        calls = client.get_calls("chat_postMessage")
+        assert len(calls) == 1
+        kwargs = calls[0]["kwargs"]
+        assert kwargs["markdown_text"] == "**Bold** and _italic_ and `code`"
+        # markdown_text is mutually exclusive with text.
+        assert "text" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_plain_string_posts_via_text_not_markdown_text(self):
+        """Plain strings keep going to ``text`` so literal ``*`` survives."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.555555"})
+
+        await adapter.post_message("slack:C123:1234567890.000000", "Use *foo* literally")
+
+        kwargs = client.get_calls("chat_postMessage")[0]["kwargs"]
+        assert kwargs["text"] == "Use *foo* literally"
+        assert "markdown_text" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_markdown_table_posts_as_markdown_text_without_blocks(self):
+        """Tables ride along in markdown_text (Slack renders them natively);
+        the legacy native-table-block conversion is gone."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.666666"})
+
+        from chat_sdk.types import PostableMarkdown
+
+        await adapter.post_message(
+            "slack:C123:1234567890.000000",
+            PostableMarkdown(markdown="| A | B |\n|---|---|\n| 1 | 2 |"),
+        )
+
+        kwargs = client.get_calls("chat_postMessage")[0]["kwargs"]
+        assert kwargs["markdown_text"] == "| A | B |\n|---|---|\n| 1 | 2 |"
+        assert "blocks" not in kwargs
+        assert "text" not in kwargs
+
 
 # =============================================================================
 # editMessage Tests
@@ -368,6 +420,83 @@ class TestEditMessage:
         )
 
         assert result.thread_id == "slack:CABC:1111.2222"
+
+    @pytest.mark.asyncio
+    async def test_edit_with_markdown_uses_markdown_text(self):
+        """chat.update sends markdown via markdown_text, like postMessage."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_update", {"ok": True, "ts": "1234567890.123456"})
+
+        from chat_sdk.types import PostableMarkdown
+
+        await adapter.edit_message(
+            "slack:C123:1234567890.000000",
+            "1234567890.123456",
+            PostableMarkdown(markdown="**Updated** body"),
+        )
+
+        kwargs = client.get_calls("chat_update")[0]["kwargs"]
+        assert kwargs["markdown_text"] == "**Updated** body"
+        assert "text" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_edit_ephemeral_via_response_url_uses_mrkdwn_fallback(self):
+        """response_url payloads reject markdown_text (`no_text`), so
+        markdown/AST edits are rendered to legacy mrkdwn ``text``."""
+        adapter, _, _ = await _init_adapter()
+        ephemeral_id = adapter._encode_ephemeral_message_id(
+            "1234567890.123456", "https://hooks.slack.com/respond", "U1"
+        )
+
+        recorded: dict[str, Any] = {}
+
+        class FakeResponse:
+            is_success = True
+            status_code = 200
+            text = "ok"
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+            async def post(self, url: str, *, json: Any = None, headers: Any = None) -> FakeResponse:
+                recorded["url"] = url
+                recorded["json"] = json
+                return FakeResponse()
+
+        # ``_send_to_response_url`` lazily imports httpx (optional dep, not
+        # installed in the test env) -- inject a stand-in module.
+        import sys
+        import types
+
+        fake_httpx = types.ModuleType("httpx")
+        fake_httpx.AsyncClient = FakeAsyncClient  # type: ignore[attr-defined]
+        original_module = sys.modules.get("httpx")
+        sys.modules["httpx"] = fake_httpx
+        try:
+            from chat_sdk.types import PostableMarkdown
+
+            await adapter.edit_message(
+                "slack:C123:1234567890.000000",
+                ephemeral_id,
+                PostableMarkdown(markdown="**Updated** [text](https://example.com)\n\n| A | B |\n|---|---|\n| 1 | 2 |"),
+            )
+        finally:
+            if original_module is not None:
+                sys.modules["httpx"] = original_module
+            else:
+                sys.modules.pop("httpx", None)
+
+        assert recorded["url"] == "https://hooks.slack.com/respond"
+        body = recorded["json"]
+        assert body["replace_original"] is True
+        assert "*Updated* <https://example.com|text>" in body["text"]
+        # Tables fall back to ASCII code blocks on this surface.
+        assert "```" in body["text"]
+        assert "markdown_text" not in body
 
 
 # =============================================================================
@@ -670,6 +799,24 @@ class TestPostEphemeral:
 
         assert result.id == ""
 
+    @pytest.mark.asyncio
+    async def test_ephemeral_markdown_uses_markdown_text(self):
+        """chat.postEphemeral sends markdown via markdown_text too."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postEphemeral", {"ok": True, "message_ts": "1234567890.777777"})
+
+        from chat_sdk.types import PostableMarkdown
+
+        await adapter.post_ephemeral(
+            "slack:C123:1234567890.000000",
+            "U_USER_1",
+            PostableMarkdown(markdown="## Only for you"),
+        )
+
+        kwargs = client.get_calls("chat_postEphemeral")[0]["kwargs"]
+        assert kwargs["markdown_text"] == "## Only for you"
+        assert "text" not in kwargs
+
 
 # =============================================================================
 # scheduleMessage Tests
@@ -721,6 +868,25 @@ class TestScheduleMessage:
         calls = client.get_calls("chat_deleteScheduledMessage")
         assert len(calls) == 1
         assert calls[0]["kwargs"]["scheduled_message_id"] == "Q5678"
+
+    @pytest.mark.asyncio
+    async def test_schedule_markdown_uses_markdown_text(self):
+        """chat.scheduleMessage sends markdown via markdown_text too."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response("chat_scheduleMessage", {"ok": True, "scheduled_message_id": "Q9999"})
+
+        from chat_sdk.types import PostableMarkdown
+
+        future_time = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc)
+        await adapter.schedule_message(
+            "slack:C123:1234567890.000000",
+            PostableMarkdown(markdown="**Reminder** tomorrow"),
+            future_time,
+        )
+
+        kwargs = client.get_calls("chat_scheduleMessage")[0]["kwargs"]
+        assert kwargs["markdown_text"] == "**Reminder** tomorrow"
+        assert "text" not in kwargs
 
     @pytest.mark.asyncio
     async def test_rejects_past_time(self):
@@ -1316,6 +1482,23 @@ class TestRenderFormatted:
         )
         assert "Hello world" in result
 
+    def test_renders_ast_to_standard_markdown(self):
+        """Slack now accepts markdown natively, so renderFormatted emits
+        standard markdown (``**bold**``), not legacy mrkdwn (``*bold*``)."""
+        adapter = _make_adapter()
+        result = adapter.render_formatted(
+            {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [{"type": "strong", "children": [{"type": "text", "value": "bold"}]}],
+                    }
+                ],
+            }
+        )
+        assert result.strip() == "**bold**"
+
 
 # =============================================================================
 # Link extraction edge cases
@@ -1586,7 +1769,9 @@ class TestEmptyThreadTsGuards:
         assert len(post_calls) == 1
         assert post_calls[0]["kwargs"]["channel"] == "C123"
         assert post_calls[0]["kwargs"]["thread_ts"] is None
-        assert post_calls[0]["kwargs"]["text"] == "Hello from DM"
+        # Accumulated markdown goes out via Slack's native markdown_text field.
+        assert post_calls[0]["kwargs"]["markdown_text"] == "Hello from DM"
+        assert "text" not in post_calls[0]["kwargs"]
         assert result.id == "5555.5555"
 
     @pytest.mark.asyncio
