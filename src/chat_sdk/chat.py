@@ -909,10 +909,16 @@ class Chat:
         thread_id: str,
         message_or_factory: Message | Callable[[], Awaitable[Message]],
         options: WebhookOptions | None = None,
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Process an incoming message from an adapter.
 
-        Handles waitUntil registration and error catching.
+        Handles waitUntil registration and error catching. Returns the
+        handler task (``None`` only when no event loop is running) so
+        streaming callers can await full handler completion and observe
+        handler exceptions; fire-and-forget webhook callers may ignore it.
+        ``wait_until`` keeps the existing swallowed-error semantics —
+        platforms shouldn't retry on handler bugs. (Core slice of
+        vercel/chat#444; the @chat-adapter/web package itself is not ported.)
         """
 
         async def _task() -> None:
@@ -932,6 +938,7 @@ class Chat:
             )
             if options and options.wait_until:
                 options.wait_until(task)
+        return task
 
     def process_reaction(
         self,

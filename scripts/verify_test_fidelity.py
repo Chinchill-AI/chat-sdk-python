@@ -45,7 +45,9 @@ MAPPING = {
     "packages/chat/src/markdown.test.ts": "tests/test_markdown_faithful.py",
     "packages/chat/src/streaming-markdown.test.ts": "tests/test_streaming_markdown.py",
     "packages/chat/src/serialization.test.ts": "tests/test_serialization.py",
-    "packages/chat/src/ai.test.ts": "tests/test_ai_messages.py",
+    # chat@4.29.0 moved ai.test.ts into ai/ and split it (vercel/chat#492)
+    "packages/chat/src/ai/messages.test.ts": "tests/test_ai_messages.py",
+    "packages/chat/src/ai/index.test.ts": "tests/test_ai_tools.py",
     "packages/chat/src/from-full-stream.test.ts": "tests/test_from_full_stream.py",
 }
 

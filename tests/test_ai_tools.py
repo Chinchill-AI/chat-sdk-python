@@ -174,7 +174,7 @@ class TestRequireApproval:
         for name in read_tools:
             assert tools[name].needs_approval is None, name
 
-    async def test_require_approval_false_disables_all(self, harness: _Harness):
+    async def test_disables_approval_on_every_write_tool_when_requireapproval_is_false(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         write_tools = [
             "postMessage",
@@ -292,7 +292,7 @@ class TestOverrides:
 class TestExecutePaths:
     """Each tool's ``execute()`` dispatches through to the right adapter call."""
 
-    async def test_post_message_dispatches_via_post_message(self, harness: _Harness):
+    async def test_postmessage_dispatches_via_the_adapters_postmessage(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["postMessage"].execute(
             {"threadId": "slack:C123:1234.5678", "message": "hello"},
@@ -315,7 +315,7 @@ class TestExecutePaths:
         assert isinstance(sent, PostableRaw)
         assert sent.raw == "<blocks>...</blocks>"
 
-    async def test_post_channel_message_dispatches_with_markdown(self, harness: _Harness):
+    async def test_postchannelmessage_dispatches_via_the_adapters_postchannelmessage(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["postChannelMessage"].execute(
             {"channelId": "slack:C123", "message": {"markdown": "**hi**"}},
@@ -333,7 +333,7 @@ class TestExecutePaths:
         # MockAdapter.open_dm produces `slack:DU123456:` — the DM thread id.
         assert harness.adapter._post_calls == [("slack:DU123456:", "ping")]
 
-    async def test_add_reaction_dispatches_via_adapter(self, harness: _Harness):
+    async def test_addreaction_dispatches_via_the_adapters_addreaction(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["addReaction"].execute(
             {
@@ -348,7 +348,7 @@ class TestExecutePaths:
         assert result["added"] is True
         assert result["emoji"] == "thumbs_up"
 
-    async def test_remove_reaction_dispatches_via_adapter(self, harness: _Harness):
+    async def test_removereaction_dispatches_via_the_adapters_removereaction(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["removeReaction"].execute(
             {
@@ -367,7 +367,7 @@ class TestExecutePaths:
             "threadId": "slack:C123:1234.5678",
         }
 
-    async def test_delete_message_dispatches_via_adapter(self, harness: _Harness):
+    async def test_deletemessage_dispatches_via_the_adapters_deletemessage(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["deleteMessage"].execute(
             {"threadId": "slack:C123:1234.5678", "messageId": "msg-1"},
@@ -379,7 +379,7 @@ class TestExecutePaths:
             "threadId": "slack:C123:1234.5678",
         }
 
-    async def test_edit_message_dispatches_with_markdown(self, harness: _Harness):
+    async def test_editmessage_dispatches_via_the_adapters_editmessage(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
         result = await tools["editMessage"].execute(
             {
@@ -413,7 +413,7 @@ class TestExecutePaths:
         assert await harness.state.is_subscribed("slack:C123:1234.5678") is False
         assert result == {"subscribed": False, "threadId": "slack:C123:1234.5678"}
 
-    async def test_start_typing_dispatches_via_adapter(self, harness: _Harness):
+    async def test_starttyping_dispatches_via_the_adapters_starttyping(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat)
         await tools["startTyping"].execute(
             {"threadId": "slack:C123:1234.5678", "status": "Searching..."},
@@ -448,7 +448,7 @@ class TestExecutePaths:
             "channelVisibility": None,
         }
 
-    async def test_fetch_channel_messages_dispatches_and_projects(self, harness: _Harness):
+    async def test_fetchchannelmessages_dispatches_via_the_adapter_and_projects_messages(self, harness: _Harness):
         stub_message = create_test_message("m1", "channel hello")
         harness.adapter.fetch_channel_messages = AsyncMock(  # type: ignore[method-assign]
             return_value=FetchResult(messages=[stub_message], next_cursor="next"),
@@ -471,7 +471,7 @@ class TestExecutePaths:
         assert result["messages"][0]["text"] == "channel hello"
         assert result["nextCursor"] == "next"
 
-    async def test_fetch_channel_messages_raises_when_adapter_unsupported(self, harness: _Harness):
+    async def test_fetchchannelmessages_throws_when_the_adapter_does_not_support_it(self, harness: _Harness):
         # Remove the adapter's fetch_channel_messages so the tool path's
         # "does not support" branch fires.
         harness.adapter.fetch_channel_messages = None  # type: ignore[method-assign,assignment]
@@ -512,7 +512,7 @@ class TestExecutePaths:
             "isDM": False,
         }
 
-    async def test_list_threads_projects_summaries(self, harness: _Harness):
+    async def test_listthreads_projects_threadsummary_entries(self, harness: _Harness):
         root_message = create_test_message("m1", "root")
         from datetime import datetime, timezone
 
@@ -556,7 +556,7 @@ class TestExecutePaths:
         result = await tools["listThreads"].execute({"channelId": "slack:C123"})
         assert result == {"threads": [], "nextCursor": None}
 
-    async def test_list_threads_raises_when_adapter_unsupported(self, harness: _Harness):
+    async def test_listthreads_throws_when_the_adapter_does_not_support_it(self, harness: _Harness):
         harness.adapter.list_threads = None  # type: ignore[method-assign,assignment]
         tools = create_chat_tools(chat=harness.chat)
         with pytest.raises(ChatError, match="does not support listing threads"):
@@ -571,7 +571,9 @@ class TestExecutePaths:
             await tools["listThreads"].execute({"channelId": "slack:C123"})
         assert isinstance(exc_info.value.__cause__, ChatNotImplementedError)
 
-    async def test_get_thread_participants_delegates_to_thread(self, harness: _Harness):
+    async def test_getthreadparticipants_delegates_to_threadgetparticipants_and_projects_authors(
+        self, harness: _Harness
+    ):
         # Stub `chat.thread(...)` directly so we don't drag in the cursor
         # pagination / current-message machinery just to test the projection.
         from chat_sdk.types import Author as AuthorType
@@ -614,7 +616,7 @@ class TestExecutePaths:
             ],
         }
 
-    async def test_get_user_projects_user_info_when_found(self, harness: _Harness):
+    async def test_getuser_projects_userinfo_when_the_adapter_resolves_a_user(self, harness: _Harness):
         harness.adapter.get_user = AsyncMock(  # type: ignore[method-assign]
             return_value=UserInfo(
                 user_id="U123456",

@@ -3889,3 +3889,169 @@ class TestPersistMessageHistory:
 
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
+
+
+# ============================================================================
+# 21. processMessage return value (core slice of vercel/chat#444)
+# ============================================================================
+
+
+class TestProcessMessageAwaitable:
+    """Faithful port of the TS root-describe test added by vercel/chat#444.
+
+    Only the core ``processMessage`` slice of #444 applies to the Python
+    port — the ``@chat-adapter/web`` package itself is browser-only and not
+    ported (see docs/UPSTREAM_SYNC.md).
+    """
+
+    # TS: "should return an awaitable Promise from processMessage"
+    async def test_should_return_an_awaitable_promise_from_processmessage(self):
+        chat, adapter, _state = await _init_chat()
+
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handler_started.set()
+            await release_handler.wait()
+
+        message = create_test_message("msg-await-1", "Hey @slack-bot ping")
+        task = chat.process_message(adapter, "slack:C123:await.1", message)
+
+        assert isinstance(task, asyncio.Task)
+
+        # Yield so the handler kicks off but cannot complete until released.
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        assert not task.done()
+
+        release_handler.set()
+        await asyncio.wait_for(task, timeout=1)
+        assert task.done()
+
+
+# ============================================================================
+# 22. queue/burst subject rehydration after a JSON roundtrip (vercel/chat#459
+#     + #495). Gated on message.subject (PR #131): the skipif below evaluates
+#     BaseAdapter.fetch_subject at collection time, so these activate
+#     automatically once #131 merges — no manual unskip step.
+# ============================================================================
+
+
+def _wrap_enqueue_with_json_roundtrip(state: MockStateAdapter) -> None:
+    """Make ``state.enqueue`` JSON-roundtrip entries like a persistent backend.
+
+    TS does ``JSON.parse(JSON.stringify(entry))``; the Python equivalent of
+    what Redis/Postgres do to a queued message is ``Message.to_json()`` →
+    JSON → plain dict (``Chat._rehydrate_message`` upgrades it on dequeue).
+    """
+    import json
+
+    real_enqueue = state.enqueue
+
+    async def wrapped(thread_id: str, entry: QueueEntry, max_size: int) -> int:
+        plain = json.loads(json.dumps(entry.message.to_json()))
+        roundtripped = QueueEntry(
+            message=plain,  # type: ignore[arg-type]
+            enqueued_at=entry.enqueued_at,
+            expires_at=entry.expires_at,
+        )
+        return await real_enqueue(thread_id, roundtripped, max_size)
+
+    state.enqueue = wrapped  # type: ignore[method-assign]
+
+
+def _base_adapter_has_fetch_subject() -> bool:
+    from chat_sdk.types import BaseAdapter
+
+    return hasattr(BaseAdapter, "fetch_subject")
+
+
+requires_fetch_subject = pytest.mark.skipif(
+    not _base_adapter_has_fetch_subject(),
+    reason="message.subject infrastructure lands with PR #131; this fidelity "
+    "port auto-unskips once BaseAdapter.fetch_subject exists",
+)
+
+
+class TestConcurrencyQueueSubjectRehydration:
+    # TS: "should wire adapter on queued message so fetchSubject works after JSON roundtrip"
+    @requires_fetch_subject
+    async def test_should_wire_adapter_on_queued_message_so_fetchsubject_works_after_json_roundtrip(
+        self,
+    ):
+        from unittest.mock import AsyncMock
+
+        state = create_mock_state()
+        _wrap_enqueue_with_json_roundtrip(state)
+        adapter = create_mock_adapter("slack")
+        mock_subject = {"type": "issue", "id": "ENG-1", "title": "Queue test", "raw": {}}
+        adapter.fetch_subject = AsyncMock(return_value=mock_subject)  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        received_subject: Any = "not-called"
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal received_subject
+            received_subject = await message.subject
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+        msg = create_test_message("msg-sub-q", "Hey @slack-bot test")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        trigger = create_test_message("msg-sub-trigger", "Hey @slack-bot go")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", trigger)
+
+        assert received_subject == mock_subject
+        assert adapter.fetch_subject.await_count == 2  # type: ignore[attr-defined]
+
+
+class TestConcurrencyBurstRehydration:
+    # TS: "should rehydrate queued messages after JSON roundtrip"
+    @requires_fetch_subject
+    async def test_should_rehydrate_queued_messages_after_json_roundtrip(self):
+        from unittest.mock import AsyncMock
+
+        state = create_mock_state()
+        _wrap_enqueue_with_json_roundtrip(state)
+        adapter = create_mock_adapter("slack")
+        mock_subject = {"type": "issue", "id": "ENG-414", "title": "Burst test", "raw": {}}
+        adapter.fetch_subject = AsyncMock(return_value=mock_subject)  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=80),
+        )
+
+        received_subject: Any = "not-called"
+        received_skipped_subject: Any = "not-called"
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal received_subject, received_skipped_subject
+            received_subject = await message.subject
+            if context is not None and context.skipped:
+                received_skipped_subject = await context.skipped[0].subject
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-burst-json-1", "Hey @slack-bot one"),
+            )
+        )
+        await asyncio.sleep(0.005)
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-json-2", "Hey @slack-bot two"),
+        )
+        await task
+
+        assert received_subject == mock_subject
+        assert received_skipped_subject == mock_subject
+        assert adapter.fetch_subject.await_count == 2  # type: ignore[attr-defined]
