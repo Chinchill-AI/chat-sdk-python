@@ -6,6 +6,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 
+# Custom webhook verifier — defined in (and re-exported from) the low-level
+# ``chat_sdk.adapters.slack.webhook`` subpath since vercel/chat#538. See
+# ``webhook/types.py`` for the full SECURITY contract (constant-time
+# comparison, replay protection, body-substitution safety).
+from chat_sdk.adapters.slack.webhook.types import SlackWebhookVerifier
 from chat_sdk.logger import Logger
 
 # ---------------------------------------------------------------------------
@@ -21,28 +26,6 @@ from chat_sdk.logger import Logger
 #   ``type SlackBotToken = string | (() => string | Promise<string>)``
 SlackBotTokenResolver = Callable[[], "str | Awaitable[str]"]
 SlackBotToken: TypeAlias = str | SlackBotTokenResolver
-
-# Custom webhook verifier. Receives the original request object and the raw
-# body string already consumed by the adapter. Return:
-#   - ``True`` (or any truthy non-string value) to accept the request as-is.
-#   - A ``str`` to accept *and* substitute the verified body for downstream
-#     parsing (useful when the verifier canonicalizes the payload).
-#   - ``False``/falsy or raise to reject (adapter responds with 401).
-#
-# May be sync or async.
-#
-# SECURITY: When a custom verifier replaces ``signing_secret``, the adapter's
-# built-in HMAC + timestamp tolerance check is bypassed. The implementer is
-# responsible for:
-#   - constant-time signature comparison (use ``hmac.compare_digest``, never ``==``)
-#   - replay protection (validate ``x-slack-request-timestamp`` freshness)
-#   - any other freshness/origin checks the platform requires
-#   - body-substitution safety: when returning a ``str`` to substitute the body
-#     for downstream parsing, the returned bytes MUST be derived from a
-#     verified payload. Returning attacker-controlled bytes (e.g. echoing the
-#     unverified raw body or splicing in untrusted fields) grants payload
-#     injection — downstream parsing trusts the substituted body unconditionally.
-SlackWebhookVerifier = Callable[[Any, str], "bool | str | None | Awaitable[bool | str | None]"]
 
 # Connection mode for the Slack adapter. ``"webhook"`` (default) consumes
 # events via signed HTTP POSTs from Slack. ``"socket"`` opens a long-lived

@@ -12,7 +12,6 @@ import asyncio
 import base64
 import contextlib
 import contextvars
-import hashlib
 import hmac
 import inspect
 import json
@@ -57,6 +56,10 @@ from chat_sdk.adapters.slack.types import (
     SlackInstallationProvider,
     SlackThreadId,
     SlackWebhookVerifier,
+)
+from chat_sdk.adapters.slack.webhook import (
+    read_slack_request_body,
+    verify_slack_request,
 )
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -1392,33 +1395,11 @@ class SlackAdapter:
 
         Returns a dict with ``body`` and ``status`` keys.
         """
-        # Read the raw body. `hasattr` narrows `Any` → `object` (not
-        # awaitable), so we use `getattr(..., None)` to preserve the
-        # `Any` type across the duck-typed framework branches.
-        # Handle both callable (`async def text(self)`) and non-callable
-        # (`text: str` attribute) forms of `request.text`. Gating entry
-        # on callability would drop populated string attributes.
-        text_attr = getattr(request, "text", None)
-        body: str
-        if text_attr is not None:
-            if callable(text_attr):
-                result = text_attr()
-                text_attr = await result if inspect.isawaitable(result) else result
-            body = text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
-        else:
-            raw = getattr(request, "body", None)
-            if raw is not None:
-                # Some frameworks expose `body` as an async method (e.g.
-                # `async def body(self)`) — call it, then await if the
-                # result is awaitable. Previously we only handled the
-                # coroutine-as-attribute case, not the async-method case.
-                if callable(raw):
-                    raw = raw()
-                if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) or inspect.isawaitable(raw):
-                    raw = await raw
-                body = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            else:
-                body = str(request)
+        # Read the raw body via the shared webhook primitive (the Python
+        # stand-in for the Fetch API's ``await request.text()``) so the
+        # adapter and the low-level ``webhook`` subpath use one
+        # implementation for duck-typed framework requests.
+        body: str = await read_slack_request_body(request)
 
         self._logger.debug("Slack webhook raw body", {"body": body[:500]})
 
@@ -1455,7 +1436,7 @@ class SlackAdapter:
             # Hazard #12 (replay): the shared bearer alone is not enough —
             # without a freshness check, an old captured forwarded event
             # could be replayed indefinitely. Mirror the 5-minute window
-            # ``_verify_signature`` enforces on signed webhook traffic.
+            # ``verify_slack_signature`` enforces on signed webhook traffic.
             #
             # Wire format: upstream's ``forwardSocketEvent`` always emits
             # ``timestamp: Date.now()`` — milliseconds since the Unix epoch
@@ -1484,31 +1465,22 @@ class SlackAdapter:
         if self._mode == "socket":
             return {"body": "Webhooks are disabled in socket mode", "status": 405}
 
-        # Verify the request — when a custom ``webhook_verifier`` is configured
-        # it takes precedence over ``signing_secret`` / ``SLACK_SIGNING_SECRET``
-        # (matches upstream vercel/chat#468). The verifier may also return a
-        # string that replaces the body for downstream parsing (e.g.
-        # canonicalization).
-        if self._webhook_verifier is not None:
-            try:
-                verifier_result = self._webhook_verifier(request, body)
-                if inspect.isawaitable(verifier_result):
-                    verifier_result = await verifier_result
-            except Exception as exc:
-                self._logger.warn("Webhook verifier rejected request", {"error": exc})
-                return {"body": "Invalid signature", "status": 401}
-            if not verifier_result:
-                self._logger.warn("Webhook verifier rejected request")
-                return {"body": "Invalid signature", "status": 401}
-            if isinstance(verifier_result, str):
-                # Substitute the verifier-supplied canonical body before
-                # parsing.  Other truthy returns are pure verification.
-                body = verifier_result
-        else:
-            timestamp = headers.get("x-slack-request-timestamp") or headers.get("X-Slack-Request-Timestamp")
-            signature = headers.get("x-slack-signature") or headers.get("X-Slack-Signature")
-            if not self._verify_signature(body, timestamp, signature):
-                return {"body": "Invalid signature", "status": 401}
+        # Verify the request via the shared webhook primitive (vercel/chat#538
+        # extracted this from the adapter) — when a custom ``webhook_verifier``
+        # is configured it takes precedence over ``signing_secret`` /
+        # ``SLACK_SIGNING_SECRET`` (matches upstream vercel/chat#468). The
+        # verifier may also return a string that replaces the body for
+        # downstream parsing (e.g. canonicalization).
+        try:
+            body = await verify_slack_request(
+                request,
+                body=body,
+                signing_secret=self._signing_secret,
+                webhook_verifier=self._webhook_verifier,
+            )
+        except Exception as exc:
+            self._logger.warn("Webhook verifier rejected request", {"error": exc})
+            return {"body": "Invalid signature", "status": 401}
 
         # URL verification is special: Slack sends a JSON ``url_verification``
         # ping at app-install / event-subscription time and only expects the
@@ -1657,52 +1629,6 @@ class SlackAdapter:
         # Single-workspace mode or fallback
         self._process_event_payload(payload, options)
         return {"body": "ok", "status": 200}
-
-    # ==================================================================
-    # Signature verification
-    # ==================================================================
-
-    def _verify_signature(self, body: str, timestamp: str | None, signature: str | None) -> bool:
-        # Defensive: ``_verify_signature`` should never be reached when only a
-        # ``webhook_verifier`` is configured (handle_webhook gates on that),
-        # but if a subclass calls this directly without a signing_secret,
-        # fail closed. This also covers the socket-mode case where
-        # ``signing_secret`` is legitimately ``None`` — without this guard a
-        # caller could call ``handle_webhook`` while in socket mode and
-        # silently pass verification with an empty secret.
-        if not self._signing_secret:
-            return False
-
-        if not (timestamp and signature):
-            return False
-
-        # Check timestamp is recent (within 5 minutes)
-        now = int(time.time())
-        try:
-            ts_int = int(timestamp)
-        except (ValueError, TypeError):
-            return False
-        if abs(now - ts_int) > 300:
-            return False
-
-        sig_basestring = f"v0:{timestamp}:{body}"
-        expected = (
-            "v0="
-            + hmac.new(
-                self._signing_secret.encode("utf-8"),
-                sig_basestring.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-        )
-
-        try:
-            # ``hmac.compare_digest`` is the canonical constant-time comparison.
-            # Custom verifiers passed via ``webhook_verifier`` MUST do the
-            # same — a regression to ``==`` would leak signature bytes via
-            # timing.
-            return hmac.compare_digest(signature, expected)
-        except Exception:
-            return False
 
     # ==================================================================
     # Event dispatch
