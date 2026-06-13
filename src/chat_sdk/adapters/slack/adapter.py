@@ -3571,10 +3571,12 @@ class SlackAdapter:
 
             # Check for files to upload. ``files_upload_v2`` returns the
             # Slack-confirmed file IDs; we surface them on ``RawMessage.raw``
-            # so consumers can gate on actual delivery (parity with
-            # discord/telegram, which upload inline and expose the platform
-            # response naturally). ``None`` means no upload happened; an empty
-            # list means Slack confirmed zero attachments (a real signal).
+            # under the camelCase ``uploadedFileIds`` key (upstream
+            # chat@4.30.0 adopted this same surface) so consumers can
+            # gate on actual delivery (parity with discord/telegram, which
+            # upload inline and expose the platform response naturally).
+            # ``None`` means no upload happened; an empty list means Slack
+            # confirmed zero attachments (a real signal).
             uploaded_file_ids: list[str] | None = None
             files = extract_files(message)
             if files:
@@ -3651,14 +3653,19 @@ class SlackAdapter:
 
         Returns ``raw`` unchanged when no upload occurred (``uploaded_file_ids``
         is ``None``). Otherwise returns a NEW dict that merges the existing raw
-        (Slack never returns an ``uploaded_file_ids`` key, so this is additive
+        (Slack never returns an ``uploadedFileIds`` key, so this is additive
         and non-breaking) with the confirmed IDs. An empty list is preserved —
         it signals that Slack confirmed zero attachments.
+
+        The key is emitted in camelCase (``uploadedFileIds``) to match the
+        surface upstream adopted in chat@4.30.0; ``uploaded_file_ids`` is the
+        internal (snake_case) variable, camelCase only at this serialization
+        boundary.
         """
         if uploaded_file_ids is None:
             return raw
         base = raw if isinstance(raw, dict) else {}
-        return {**base, "uploaded_file_ids": uploaded_file_ids}
+        return {**base, "uploadedFileIds": uploaded_file_ids}
 
     async def edit_message(
         self,
