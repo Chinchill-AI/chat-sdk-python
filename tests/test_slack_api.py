@@ -254,7 +254,7 @@ class TestPostMessage:
         result = await adapter.post_message("slack:C123:1234567890.000000", msg)
 
         assert isinstance(result.raw, dict)
-        assert result.raw["uploaded_file_ids"] == ["F1", "F2"]
+        assert result.raw["uploadedFileIds"] == ["F1", "F2"]
         # The original raw payload is preserved (augment, don't replace).
         assert "files" in result.raw
 
@@ -278,20 +278,20 @@ class TestPostMessage:
 
         assert result.id == "1234567890.222222"
         assert isinstance(result.raw, dict)
-        assert result.raw["uploaded_file_ids"] == ["F9"]
+        assert result.raw["uploadedFileIds"] == ["F9"]
         # The Slack chat_postMessage response is preserved alongside the IDs.
         assert result.raw["ok"] is True
 
     @pytest.mark.asyncio
     async def test_text_only_post_does_not_add_uploaded_file_ids(self):
-        """Posts without files leave ``raw`` unaugmented (no ``uploaded_file_ids`` key)."""
+        """Posts without files leave ``raw`` unaugmented (no ``uploadedFileIds`` key)."""
         adapter, client, _ = await _init_adapter()
         client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.333333"})
 
         result = await adapter.post_message("slack:C123:1234567890.000000", "plain text")
 
         assert isinstance(result.raw, dict)
-        assert "uploaded_file_ids" not in result.raw
+        assert "uploadedFileIds" not in result.raw
 
     @pytest.mark.asyncio
     async def test_file_upload_uses_channel_kwarg_not_channel_id(self):

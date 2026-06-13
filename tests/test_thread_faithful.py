@@ -269,7 +269,7 @@ class TestPostWithDifferentMessageFormats:
     async def test_should_propagate_adapter_raw_onto_sent_message(self):
         """post() must carry the adapter's RawMessage.raw through to
         SentMessage.raw so consumers can read platform confirmation data
-        (e.g. Slack's ``uploaded_file_ids``)."""
+        (e.g. Slack's ``uploadedFileIds``)."""
         adapter = create_mock_adapter()
         state = create_mock_state()
 
@@ -277,7 +277,7 @@ class TestPostWithDifferentMessageFormats:
             return RawMessage(
                 id="msg-3",
                 thread_id=thread_id,
-                raw={"ok": True, "uploaded_file_ids": ["F1", "F2"]},
+                raw={"ok": True, "uploadedFileIds": ["F1", "F2"]},
             )
 
         adapter.post_message = custom_post  # type: ignore[assignment]
@@ -285,7 +285,7 @@ class TestPostWithDifferentMessageFormats:
         result = await thread.post(PostableMarkdown(markdown="report", files=[]))
 
         assert isinstance(result.raw, dict)
-        assert result.raw["uploaded_file_ids"] == ["F1", "F2"]
+        assert result.raw["uploadedFileIds"] == ["F1", "F2"]
 
 
 # ===========================================================================
