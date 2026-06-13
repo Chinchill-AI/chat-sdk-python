@@ -924,7 +924,13 @@ class TeamsAdapter:
         elif content_type.startswith("audio/"):
             att_type = "audio"
 
-        url = att.get("contentUrl")
+        # Files uploaded in a personal/group chat arrive as a "download info" attachment
+        # whose ``content.downloadUrl`` is a short-lived pre-signed link that fetches with
+        # no auth header. The top-level ``contentUrl`` points at the SharePoint/OneDrive
+        # item and returns 403 to an anonymous GET, so prefer the pre-signed URL.
+        content = att.get("content")
+        download_url = content.get("downloadUrl") if isinstance(content, dict) else None
+        url = download_url or att.get("contentUrl")
         return Attachment(
             type=att_type,
             url=url,

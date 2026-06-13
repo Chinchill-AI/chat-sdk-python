@@ -372,6 +372,34 @@ class TestParseMessage:
         assert msg.attachments[0].fetch_metadata == {"url": "https://x.com/photo.jpg"}
         assert msg.attachments[0].fetch_data is not None
 
+    def test_prefers_pre_signed_download_url_over_sharepoint_content_url(self):
+        """A chat file upload arrives as a download-info attachment: ``content.downloadUrl``
+        is a pre-signed link that fetches anonymously, while the top-level ``contentUrl``
+        points at the auth-required SharePoint item and 403s. The adapter must surface the
+        pre-signed URL so the file is actually readable."""
+        adapter = _make_adapter(app_id="test-app")
+        signed_url = "https://contoso.sharepoint.com/personal/alice/_layouts/download.aspx?UniqueId=abc&tempauth=SIGNED"
+        activity = {
+            "type": "message",
+            "id": "msg-dl",
+            "text": "",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.teams.file.download.info",
+                    "contentUrl": "https://contoso.sharepoint.com/personal/alice/Documents/report.csv",
+                    "name": "report.csv",
+                    "content": {"downloadUrl": signed_url, "uniqueId": "abc", "fileType": "csv"},
+                },
+            ],
+        }
+        msg = adapter.parse_message(activity)
+        assert msg.attachments[0].url == signed_url, (
+            "must surface the pre-signed content.downloadUrl, not the auth-required SharePoint contentUrl"
+        )
+
 
 # ---------------------------------------------------------------------------
 # rehydrate_attachment
