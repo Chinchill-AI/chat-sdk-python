@@ -1316,12 +1316,14 @@ class BaseAdapter:
         thread_id: str,
         text_stream: AsyncIterable[str | StreamChunk],
         options: StreamOptions | None = None,
-    ) -> RawMessage:
+    ) -> RawMessage | None:
         """Stream a message using platform-native streaming APIs.
 
         The adapter consumes the async iterable and handles the entire
-        streaming lifecycle.  Only available on platforms with native
-        streaming support (e.g., Slack).
+        streaming lifecycle.  Available on platforms with native streaming
+        or preview APIs.  Adapters may return ``None`` before consuming any
+        chunks to delegate back to the SDK's built-in post+edit fallback
+        for the current thread (vercel/chat#340).
         """
         raise ChatNotImplementedError(self.name, "stream")
 
