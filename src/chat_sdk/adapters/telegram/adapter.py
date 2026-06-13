@@ -17,9 +17,11 @@ import json
 import math
 import os
 import re
+import time
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from chat_sdk.adapters.telegram.cards import (
     card_to_telegram_inline_keyboard,
@@ -62,6 +64,8 @@ from chat_sdk.shared.errors import (
     ResourceNotFoundError,
     ValidationError,
 )
+from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown
+from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -76,8 +80,11 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
+    StreamChunk,
+    StreamOptions,
     ThreadInfo,
     UserInfo,
     WebhookOptions,
@@ -109,6 +116,12 @@ EMOJI_NAME_PATTERN = re.compile(r"^[a-z0-9_+-]+$", re.IGNORECASE)
 TELEGRAM_DEFAULT_POLLING_TIMEOUT_SECONDS = 30
 TELEGRAM_DEFAULT_POLLING_LIMIT = 100
 TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS = 1000
+TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS = 250
+# Telegram rejects unparseable MarkdownV2 with a 400 whose description reads
+# "Bad Request: can't parse entities: ..." ("caption entities" for media
+# captions). Matched case-insensitively as a substring, like upstream's
+# /can't parse (?:caption )?entities/i test().
+TELEGRAM_MARKDOWN_PARSE_ERROR_PATTERN = re.compile(r"can't parse (?:caption )?entities", re.IGNORECASE)
 TELEGRAM_MAX_POLLING_LIMIT = 100
 TELEGRAM_MIN_POLLING_LIMIT = 1
 TELEGRAM_MIN_POLLING_TIMEOUT_SECONDS = 0
@@ -144,10 +157,24 @@ class ResolvedTelegramLongPollingConfig:
 
 TelegramRuntimeMode = str  # "webhook" | "polling"
 
+_T = TypeVar("_T")
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _markdown_to_plain_text(markdown: str) -> str:
+    """Extract plain text from a markdown string, stripping all formatting.
+
+    Local equivalent of upstream's ``markdownToPlainText`` chat export
+    (``parseMarkdown`` + ``mdast-util-to-string``). Unclosed inline markers
+    (``**broken``) stay literal text in our parser, so they survive into
+    the plain-text rendering — matching remark, which also treats them as
+    literal when no closer exists.
+    """
+    return ast_to_plain_text(parse_markdown(markdown))
 
 
 def _utf16_len(text: str) -> int:
@@ -619,6 +646,12 @@ class TelegramAdapter:
         self._runtime_mode: TelegramRuntimeMode = "webhook"
         self._polling_task: asyncio.Task[None] | None = None
         self._polling_active: bool = False
+
+        # Draft-id counter for native DM draft streaming (vercel/chat#340).
+        # Seeded from wall-clock millis (mod int32 max) so concurrent bot
+        # restarts don't reuse the previous process's draft ids; wraps to 1
+        # at 2_147_483_647 to stay within Telegram's signed-int32 range.
+        self._next_draft_id: int = max(1, int(time.time() * 1000) % 2_147_483_647)
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -1200,6 +1233,12 @@ class TelegramAdapter:
         card = extract_card(message)
         reply_markup = card_to_telegram_inline_keyboard(card) if card else None
         parse_mode = self.resolve_parse_mode(message, card)
+        # Plain-text rendering of the same message, used as the retry body
+        # when Telegram rejects the MarkdownV2 entities (vercel/chat#340).
+        plain_text = self.truncate_message(
+            convert_emoji_placeholders(self.render_plain_text_message(message, card), "gchat"),
+            None,
+        )
         text = self.truncate_message(
             convert_emoji_placeholders(
                 # Route the card's standard-markdown fallback through the
@@ -1239,7 +1278,7 @@ class TelegramAdapter:
             file = files[0]
             if not file:
                 raise ValidationError("telegram", "File upload payload is empty")
-            raw_message = await self.send_document(parsed_thread, file, text, reply_markup, parse_mode)
+            raw_message = await self.send_document(parsed_thread, file, text, plain_text, reply_markup, parse_mode)
         elif len(attachments) == 1:
             attachment = attachments[0]
             if not attachment:
@@ -1248,6 +1287,7 @@ class TelegramAdapter:
                 parsed_thread,
                 attachment,
                 text,
+                plain_text,
                 reply_markup,
                 parse_mode,
             )
@@ -1255,15 +1295,25 @@ class TelegramAdapter:
             if not text.strip():
                 raise ValidationError("telegram", "Message text cannot be empty")
 
-            raw_message = await self.telegram_fetch(
-                "sendMessage",
-                {
-                    "chat_id": parsed_thread.chat_id,
-                    "message_thread_id": parsed_thread.message_thread_id,
-                    "text": text,
-                    "reply_markup": reply_markup,
-                    "parse_mode": parse_mode,
-                },
+            async def _send_message(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
+                return await self.telegram_fetch(
+                    "sendMessage",
+                    {
+                        "chat_id": parsed_thread.chat_id,
+                        "message_thread_id": parsed_thread.message_thread_id,
+                        "text": resolved_text,
+                        "reply_markup": reply_markup,
+                        "parse_mode": resolved_parse_mode,
+                    },
+                )
+
+            raw_message = await self.with_telegram_markdown_fallback(
+                parse_mode,
+                _send_message,
+                initial_text=text,
+                fallback_text=plain_text,
+                method="sendMessage",
+                thread_id=thread_id,
             )
 
         resulting_thread_id = self.encode_thread_id(
@@ -1310,6 +1360,12 @@ class TelegramAdapter:
         card = extract_card(message)
         reply_markup = card_to_telegram_inline_keyboard(card) if card else None
         parse_mode = self.resolve_parse_mode(message, card)
+        # Plain-text rendering of the same message, used as the retry body
+        # when Telegram rejects the MarkdownV2 entities (vercel/chat#340).
+        plain_text = self.truncate_message(
+            convert_emoji_placeholders(self.render_plain_text_message(message, card), "gchat"),
+            None,
+        )
         text = self.truncate_message(
             convert_emoji_placeholders(
                 self._format_converter.from_markdown(card_to_fallback_text(card))
@@ -1323,15 +1379,29 @@ class TelegramAdapter:
         if not text.strip():
             raise ValidationError("telegram", "Message text cannot be empty")
 
-        result = await self.telegram_fetch(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": telegram_message_id,
-                "text": text,
-                "reply_markup": reply_markup or empty_telegram_inline_keyboard(),
-                "parse_mode": parse_mode,
-            },
+        # Returns ``Any`` because Telegram answers ``true`` (not a Message)
+        # when editing inline messages — the ``result is True`` narrowing
+        # below handles that shape, matching the pre-#340 untyped fetch.
+        async def _edit_message_text(resolved_parse_mode: str | None, resolved_text: str) -> Any:
+            return await self.telegram_fetch(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": telegram_message_id,
+                    "text": resolved_text,
+                    "reply_markup": reply_markup or empty_telegram_inline_keyboard(),
+                    "parse_mode": resolved_parse_mode,
+                },
+            )
+
+        result = await self.with_telegram_markdown_fallback(
+            parse_mode,
+            _edit_message_text,
+            initial_text=text,
+            fallback_text=plain_text,
+            message_id=message_id,
+            method="editMessageText",
+            thread_id=thread_id,
         )
 
         # Telegram returns ``true`` when editing inline messages
@@ -1455,6 +1525,171 @@ class TelegramAdapter:
                 "action": "typing",
             },
         )
+
+    # -- Streaming -------------------------------------------------------------
+
+    async def stream(
+        self,
+        thread_id: str,
+        text_stream: AsyncIterable[str | StreamChunk],
+        options: StreamOptions | None = None,
+    ) -> RawMessage | None:
+        """Stream a message to a Telegram private chat via draft updates.
+
+        Port of upstream ``TelegramAdapter.stream`` (vercel/chat#340).
+        Private chats (DMs) get native draft streaming through the
+        ``sendMessageDraft`` Bot API method: the draft bubble updates in
+        place as chunks arrive, throttled to ``options.update_interval_ms``
+        (default :data:`TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS`), and a
+        regular ``sendMessage`` persists the final text when the stream
+        ends. Returns ``None`` for non-DM threads — before consuming any
+        chunks — so the SDK's built-in post+edit fallback handles groups,
+        supergroups, and channels.
+
+        Draft updates render the in-flight markdown through
+        :class:`StreamingMarkdownRenderer` and
+        :func:`truncate_for_telegram`, so transiently unpaired entity
+        markers are trimmed to a MarkdownV2-safe boundary instead of
+        tripping Telegram's ``can't parse entities`` 400. If Telegram still
+        rejects the markdown, the stream downgrades to plain-text drafts
+        (and a plain-text final send); any other draft failure disables
+        draft updates entirely but never fails the stream — the final
+        message is always attempted.
+        """
+        if not self.is_dm(thread_id):
+            return None
+
+        parsed_thread = self._resolve_thread_id(thread_id)
+        update_interval_ms = self.clamp_integer(
+            options.update_interval_ms if options is not None else None,
+            TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS,
+            0,
+            2**53 - 1,
+        )
+
+        renderer = StreamingMarkdownRenderer()
+        draft_id = self.create_draft_id()
+        accumulated = ""
+        last_draft_text: str | None = None
+        last_flush_at = 0.0
+        draft_streaming_enabled = True
+        stream_uses_markdown = True
+
+        def _now_ms() -> float:
+            return time.monotonic() * 1000.0
+
+        def render_markdown_text(text: str) -> str:
+            return self.truncate_message(
+                convert_emoji_placeholders(self._format_converter.from_markdown(text), "gchat"),
+                TELEGRAM_MARKDOWN_PARSE_MODE,
+            )
+
+        def render_plain_text(text: str) -> str:
+            return self.truncate_message(
+                self.resolve_telegram_fallback_text(text, _markdown_to_plain_text(text)),
+                None,
+            )
+
+        def _draft_payload(text: str, *, markdown: bool) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "chat_id": parsed_thread.chat_id,
+                "draft_id": draft_id,
+                "text": text,
+            }
+            # Omit absent optional keys: DMs have no forum-topic thread id,
+            # and plain-text drafts ship without a parse_mode (mirrors
+            # upstream, where JSON.stringify drops the undefined fields).
+            if parsed_thread.message_thread_id is not None:
+                payload["message_thread_id"] = parsed_thread.message_thread_id
+            if markdown:
+                payload["parse_mode"] = TELEGRAM_MARKDOWN_PARSE_MODE
+            return payload
+
+        async def send_draft(text: str, use_markdown: bool) -> None:
+            nonlocal draft_streaming_enabled, last_draft_text, last_flush_at, stream_uses_markdown
+            if not draft_streaming_enabled or text == last_draft_text:
+                return
+
+            try:
+                await self.telegram_fetch("sendMessageDraft", _draft_payload(text, markdown=use_markdown))
+                last_draft_text = text
+                last_flush_at = _now_ms()
+            except Exception as error:
+                if use_markdown and self.is_telegram_markdown_parse_error(error):
+                    # Telegram rejected the MarkdownV2 entities: downgrade
+                    # this stream to plain-text drafts and retry once with
+                    # the plain rendering of everything accumulated so far.
+                    stream_uses_markdown = False
+                    plain_draft_text = render_plain_text(accumulated)
+                    try:
+                        await self.telegram_fetch("sendMessageDraft", _draft_payload(plain_draft_text, markdown=False))
+                        last_draft_text = plain_draft_text
+                        last_flush_at = _now_ms()
+                    except Exception as retry_error:
+                        draft_streaming_enabled = False
+                        self._logger.warn(
+                            "Telegram draft streaming update failed",
+                            {"error": str(retry_error), "thread_id": thread_id},
+                        )
+                    return
+
+                draft_streaming_enabled = False
+                self._logger.warn(
+                    "Telegram draft streaming update failed",
+                    {"error": str(error), "thread_id": thread_id},
+                )
+
+        async def flush_draft() -> None:
+            if not draft_streaming_enabled:
+                return
+            draft_text = (
+                render_markdown_text(renderer.render()) if stream_uses_markdown else render_plain_text(accumulated)
+            )
+            await send_draft(draft_text, stream_uses_markdown)
+
+        # Open the draft bubble immediately so the user sees activity
+        # before the first chunk lands.
+        await send_draft("", False)
+
+        async for chunk in text_stream:
+            text: str | None = None
+            if isinstance(chunk, str):
+                text = chunk
+            elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                text = chunk.get("text", "")
+            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
+                # Runtime-narrowed to a MarkdownTextChunk via the `type`
+                # tag; only that variant has `.text`. Pyrefly doesn't do
+                # tag-based union narrowing, so read via `getattr`.
+                text = getattr(chunk, "text", "")
+
+            if text is None:
+                # Task/plan progress chunks have no draft representation.
+                continue
+
+            accumulated += text
+            renderer.push(text)
+
+            if _now_ms() - last_flush_at >= update_interval_ms:
+                await flush_draft()
+
+        await flush_draft()
+
+        if not accumulated.strip():
+            raise ValidationError("telegram", "Telegram streaming requires text content")
+
+        # Persist the final message through the regular post path (which
+        # carries its own markdown-parse retry). The returned RawMessage
+        # leaves ``text`` unset so ``Thread.stream`` records its local
+        # accumulator — matching upstream, which records
+        # ``{ markdown: accumulated }``.
+        final_postable: AdapterPostableMessage = (
+            PostableMarkdown(markdown=accumulated)
+            if stream_uses_markdown
+            else self.resolve_telegram_fallback_text(accumulated, _markdown_to_plain_text(accumulated))
+        )
+
+        return await self.post_message(thread_id, final_postable)
 
     # -- Fetching messages ---------------------------------------------------
 
@@ -1849,15 +2084,52 @@ class TelegramAdapter:
         thread: TelegramThreadId,
         file: Any,
         text: str,
+        plain_text: str,
         reply_markup: TelegramInlineKeyboardMarkup | None = None,
         parse_mode: str | None = None,
     ) -> TelegramMessage:
         """Send a document (file upload) to Telegram."""
-        import aiohttp
-
         data = getattr(file, "data", b"")
         if isinstance(data, memoryview) or not isinstance(data, bytes):
             data = bytes(data)
+
+        async def _send(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
+            # FormData is rebuilt per attempt: aiohttp marks a FormData
+            # instance processed after one send, so the markdown-parse
+            # retry needs a fresh one (upstream rebuilds for the same
+            # reason — undici FormData bodies are single-use streams).
+            return await self.telegram_fetch(
+                "sendDocument",
+                self._create_telegram_document_form_data(
+                    thread,
+                    file,
+                    data,
+                    resolved_text,
+                    reply_markup,
+                    resolved_parse_mode,
+                ),
+            )
+
+        return await self.with_telegram_markdown_fallback(
+            parse_mode,
+            _send,
+            initial_text=text,
+            fallback_text=plain_text,
+            method="sendDocument",
+            thread_id=self.encode_thread_id(thread),
+        )
+
+    def _create_telegram_document_form_data(
+        self,
+        thread: TelegramThreadId,
+        file: Any,
+        data: bytes,
+        text: str,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+    ) -> Any:
+        """Build the multipart form body for a ``sendDocument`` call."""
+        import aiohttp
 
         form_data = aiohttp.FormData()
         form_data.add_field("chat_id", thread.chat_id)
@@ -1882,13 +2154,14 @@ class TelegramAdapter:
         if reply_markup:
             form_data.add_field("reply_markup", json.dumps(reply_markup))
 
-        return await self.telegram_fetch("sendDocument", form_data)
+        return form_data
 
     async def send_attachment(
         self,
         thread: TelegramThreadId,
         attachment: Attachment,
         text: str,
+        plain_text: str,
         reply_markup: TelegramInlineKeyboardMarkup | None = None,
         parse_mode: str | None = None,
     ) -> TelegramMessage:
@@ -1919,62 +2192,73 @@ class TelegramAdapter:
                 f"Attachment data or URL required for {attachment.type}",
             )
 
-        if data is None:
-            payload: dict[str, Any] = {
-                "chat_id": thread.chat_id,
-                upload["field"]: attachment.url,
-            }
+        if data is not None and (isinstance(data, memoryview) or not isinstance(data, bytes)):
+            data = bytes(data)
+
+        async def _send(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
+            if data is None:
+                payload: dict[str, Any] = {
+                    "chat_id": thread.chat_id,
+                    upload["field"]: attachment.url,
+                }
+
+                if isinstance(thread.message_thread_id, int):
+                    payload["message_thread_id"] = thread.message_thread_id
+
+                if resolved_text.strip():
+                    payload["caption"] = self.truncate_caption(resolved_text, resolved_parse_mode)
+                    if resolved_parse_mode:
+                        payload["parse_mode"] = resolved_parse_mode
+
+                if attachment.type == "video":
+                    if isinstance(attachment.width, int):
+                        payload["width"] = attachment.width
+                    if isinstance(attachment.height, int):
+                        payload["height"] = attachment.height
+
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
+
+                return await self.telegram_fetch(upload["method"], payload)
+
+            # FormData is rebuilt per attempt — see send_document.
+            form_data = aiohttp.FormData()
+            form_data.add_field("chat_id", thread.chat_id)
 
             if isinstance(thread.message_thread_id, int):
-                payload["message_thread_id"] = thread.message_thread_id
+                form_data.add_field("message_thread_id", str(thread.message_thread_id))
 
-            if text.strip():
-                payload["caption"] = self.truncate_caption(text, parse_mode)
-                if parse_mode:
-                    payload["parse_mode"] = parse_mode
+            if resolved_text.strip():
+                form_data.add_field("caption", self.truncate_caption(resolved_text, resolved_parse_mode))
+                if resolved_parse_mode:
+                    form_data.add_field("parse_mode", resolved_parse_mode)
 
             if attachment.type == "video":
                 if isinstance(attachment.width, int):
-                    payload["width"] = attachment.width
+                    form_data.add_field("width", str(attachment.width))
                 if isinstance(attachment.height, int):
-                    payload["height"] = attachment.height
+                    form_data.add_field("height", str(attachment.height))
+
+            form_data.add_field(
+                upload["field"],
+                data,
+                filename=attachment.name if attachment.name is not None else "attachment",
+                content_type=attachment.mime_type if attachment.mime_type is not None else "application/octet-stream",
+            )
 
             if reply_markup:
-                payload["reply_markup"] = reply_markup
+                form_data.add_field("reply_markup", json.dumps(reply_markup))
 
-            return await self.telegram_fetch(upload["method"], payload)
+            return await self.telegram_fetch(upload["method"], form_data)
 
-        if isinstance(data, memoryview) or not isinstance(data, bytes):
-            data = bytes(data)
-
-        form_data = aiohttp.FormData()
-        form_data.add_field("chat_id", thread.chat_id)
-
-        if isinstance(thread.message_thread_id, int):
-            form_data.add_field("message_thread_id", str(thread.message_thread_id))
-
-        if text.strip():
-            form_data.add_field("caption", self.truncate_caption(text, parse_mode))
-            if parse_mode:
-                form_data.add_field("parse_mode", parse_mode)
-
-        if attachment.type == "video":
-            if isinstance(attachment.width, int):
-                form_data.add_field("width", str(attachment.width))
-            if isinstance(attachment.height, int):
-                form_data.add_field("height", str(attachment.height))
-
-        form_data.add_field(
-            upload["field"],
-            data,
-            filename=attachment.name if attachment.name is not None else "attachment",
-            content_type=attachment.mime_type if attachment.mime_type is not None else "application/octet-stream",
+        return await self.with_telegram_markdown_fallback(
+            parse_mode,
+            _send,
+            initial_text=text,
+            fallback_text=plain_text,
+            method=upload["method"],
+            thread_id=self.encode_thread_id(thread),
         )
-
-        if reply_markup:
-            form_data.add_field("reply_markup", json.dumps(reply_markup))
-
-        return await self.telegram_fetch(upload["method"], form_data)
 
     # -- Message caching -----------------------------------------------------
 
@@ -2024,6 +2308,16 @@ class TelegramAdapter:
         """Extract the numeric sequence from a composite message ID."""
         match = MESSAGE_SEQUENCE_PATTERN.search(message_id)
         return int(match.group(1)) if match else 0
+
+    def create_draft_id(self) -> int:
+        """Return the next draft id for native DM draft streaming.
+
+        Monotonically increasing per adapter instance so concurrent streams
+        to the same chat update distinct draft bubbles; wraps to 1 past
+        Telegram's signed-int32 maximum.
+        """
+        self._next_draft_id = 1 if self._next_draft_id >= 2_147_483_647 else self._next_draft_id + 1
+        return self._next_draft_id
 
     # -- Pagination ----------------------------------------------------------
 
@@ -2239,6 +2533,51 @@ class TelegramAdapter:
         # format_converter.render_postable, which emits MarkdownV2.
         return TELEGRAM_MARKDOWN_PARSE_MODE
 
+    def render_plain_text_message(
+        self,
+        message: AdapterPostableMessage,
+        card: Any,
+    ) -> str:
+        """Render a postable message as plain text (no MarkdownV2 markup).
+
+        Port of upstream ``renderPlainTextMessage`` (vercel/chat#340): the
+        retry body used when Telegram rejects the MarkdownV2 entities of
+        the primary rendering. Handles both dict- and dataclass-shaped
+        postables (mirroring ``render_postable``'s branch order: raw →
+        markdown → ast).
+        """
+        if card:
+            return card_to_fallback_text(card)
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict):
+            if "raw" in message:
+                return message["raw"]
+            if "markdown" in message:
+                return self.resolve_telegram_fallback_text(
+                    message["markdown"], _markdown_to_plain_text(message["markdown"])
+                )
+            if "ast" in message:
+                return ast_to_plain_text(message["ast"])
+        else:
+            if hasattr(message, "raw"):
+                return message.raw
+            if hasattr(message, "markdown"):
+                markdown = getattr(message, "markdown", "")
+                return self.resolve_telegram_fallback_text(markdown, _markdown_to_plain_text(markdown))
+            if hasattr(message, "ast"):
+                return ast_to_plain_text(getattr(message, "ast", {}))
+        return self._format_converter.render_postable(message)
+
+    def resolve_telegram_fallback_text(self, original_text: str, fallback_text: str) -> str:
+        """Prefer *fallback_text* unless stripping markup left it empty.
+
+        A whitespace-only plain rendering (e.g. ``**`` — markers with no
+        content) falls back to *original_text* so the retry never sends a
+        body Telegram rejects as empty.
+        """
+        return fallback_text if fallback_text.strip() else original_text
+
     # -- Truncation ----------------------------------------------------------
 
     def truncate_message(self, text: str, parse_mode: str | None = None) -> str:
@@ -2411,6 +2750,67 @@ class TelegramAdapter:
         raise NetworkError(
             "telegram",
             f"{description} (status {status}, error {error_code})",
+        )
+
+    # -- Markdown parse-error fallback (vercel/chat#340) -----------------------
+
+    async def with_telegram_markdown_fallback(
+        self,
+        parse_mode: str | None,
+        operation: Callable[[str | None, str], Awaitable[_T]],
+        *,
+        initial_text: str,
+        fallback_text: str,
+        method: str,
+        message_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> _T:
+        """Run *operation*, retrying without ``parse_mode`` on entity errors.
+
+        ``operation`` receives ``(parse_mode, text)`` and must build its own
+        request body per attempt (multipart bodies are single-use). The
+        first attempt ships ``(parse_mode, initial_text)``; when Telegram
+        rejects MarkdownV2 with a ``can't parse entities`` 400, the retry
+        ships ``(None, fallback)`` — the plain rendering, or the original
+        text when stripping markup left nothing (see
+        :meth:`resolve_telegram_fallback_text`). Every other failure, and
+        any failure for non-MarkdownV2 sends, propagates unchanged.
+        """
+        try:
+            return await operation(parse_mode, initial_text)
+        except Exception as error:
+            if parse_mode != TELEGRAM_MARKDOWN_PARSE_MODE or not self.is_telegram_markdown_parse_error(error):
+                raise
+
+            log_context: dict[str, Any] = {
+                "error": str(error),
+                "initial_text": initial_text,
+                "fallback_text": fallback_text,
+                "method": method,
+            }
+            if message_id is not None:
+                log_context["message_id"] = message_id
+            if thread_id is not None:
+                log_context["thread_id"] = thread_id
+            self._logger.warn(
+                "Telegram markdown parse failed; retrying without parse mode",
+                log_context,
+            )
+
+            return await operation(None, self.resolve_telegram_fallback_text(initial_text, fallback_text))
+
+    def is_telegram_markdown_parse_error(self, error: object) -> bool:
+        """Whether *error* is Telegram rejecting MarkdownV2 entity parsing.
+
+        Matches the ``can't parse entities`` / ``can't parse caption
+        entities`` 400s that :meth:`throw_telegram_api_error` surfaces as
+        :class:`ValidationError`. Other 4xx validation failures (wrong
+        chat, empty text, …) do not qualify and must propagate.
+        """
+        return (
+            isinstance(error, ValidationError)
+            and error.adapter == "telegram"
+            and TELEGRAM_MARKDOWN_PARSE_ERROR_PATTERN.search(str(error)) is not None
         )
 
     # -- Polling config resolution -------------------------------------------
