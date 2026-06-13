@@ -1,10 +1,27 @@
 """Twilio adapter for chat-sdk.
 
 Python port of upstream ``packages/adapter-twilio``. Supports SMS and MMS
-bots over Twilio Messaging webhooks and the Messages REST API, plus
-low-level voice helpers for custom Twilio voice routes.
+bots over Twilio Messaging webhooks (X-Twilio-Signature verification) and
+the Messages REST API, plus low-level ``api`` / ``webhook`` / ``voice``
+helpers for apps that only need Twilio primitives — like upstream, none
+of it depends on the official ``twilio`` SDK.
 """
 
+from chat_sdk.adapters.twilio.adapter import TwilioAdapter, create_twilio_adapter
+from chat_sdk.adapters.twilio.api import (
+    DEFAULT_API_URL,
+    TwilioApiError,
+    TwilioApiResponse,
+    call_twilio_api,
+    delete_twilio_message,
+    encode_twilio_form,
+    fetch_twilio_media,
+    fetch_twilio_message,
+    list_twilio_messages,
+    resolve_twilio_credential,
+    send_twilio_message,
+    update_twilio_call,
+)
 from chat_sdk.adapters.twilio.cards import card_to_twilio_text
 from chat_sdk.adapters.twilio.format_converter import (
     TWILIO_MESSAGE_LIMIT,
@@ -12,6 +29,11 @@ from chat_sdk.adapters.twilio.format_converter import (
     TwilioTextResult,
     truncate_twilio_text,
     twilio_text_or_placeholder,
+)
+from chat_sdk.adapters.twilio.thread import (
+    decode_twilio_thread_id,
+    encode_twilio_thread_id,
+    twilio_channel_id,
 )
 from chat_sdk.adapters.twilio.types import (
     TwilioAdapterConfig,
@@ -37,16 +59,41 @@ from chat_sdk.adapters.twilio.types import (
     TwilioWebhookVerificationError,
     TwilioWebhookVerifier,
 )
+from chat_sdk.adapters.twilio.voice import (
+    TwilioGatherSpeechResponseOptions,
+    TwilioVoiceCallPayload,
+    TwilioVoiceTranscriptionPayload,
+    empty_twilio_response,
+    escape_xml,
+    gather_speech_twilio_response,
+    parse_twilio_voice_call,
+    parse_twilio_voice_transcription,
+    say_twilio_response,
+    twilio_response,
+)
+from chat_sdk.adapters.twilio.webhook import (
+    parse_twilio_webhook_body,
+    read_twilio_webhook,
+    resolve_twilio_webhook_url,
+    sign_twilio_request,
+    twilio_signature_base,
+    verify_twilio_request,
+)
 
 __all__ = [
+    "DEFAULT_API_URL",
     "TWILIO_MESSAGE_LIMIT",
+    "TwilioAdapter",
     "TwilioAdapterConfig",
+    "TwilioApiError",
+    "TwilioApiResponse",
     "TwilioCallResource",
     "TwilioCredential",
     "TwilioCredentials",
     "TwilioFormFields",
     "TwilioFormParams",
     "TwilioFormatConverter",
+    "TwilioGatherSpeechResponseOptions",
     "TwilioHttpRequest",
     "TwilioHttpResponse",
     "TwilioMediaPayload",
@@ -58,13 +105,41 @@ __all__ = [
     "TwilioThreadId",
     "TwilioUnsupportedPayload",
     "TwilioVerifiedRequest",
+    "TwilioVoiceCallPayload",
+    "TwilioVoiceTranscriptionPayload",
     "TwilioWebhookError",
     "TwilioWebhookParseError",
     "TwilioWebhookPayload",
     "TwilioWebhookUrl",
     "TwilioWebhookVerificationError",
     "TwilioWebhookVerifier",
+    "call_twilio_api",
     "card_to_twilio_text",
+    "create_twilio_adapter",
+    "decode_twilio_thread_id",
+    "delete_twilio_message",
+    "empty_twilio_response",
+    "encode_twilio_form",
+    "encode_twilio_thread_id",
+    "escape_xml",
+    "fetch_twilio_media",
+    "fetch_twilio_message",
+    "gather_speech_twilio_response",
+    "list_twilio_messages",
+    "parse_twilio_voice_call",
+    "parse_twilio_voice_transcription",
+    "parse_twilio_webhook_body",
+    "read_twilio_webhook",
+    "resolve_twilio_credential",
+    "resolve_twilio_webhook_url",
+    "say_twilio_response",
+    "send_twilio_message",
+    "sign_twilio_request",
     "truncate_twilio_text",
+    "twilio_channel_id",
+    "twilio_response",
+    "twilio_signature_base",
     "twilio_text_or_placeholder",
+    "update_twilio_call",
+    "verify_twilio_request",
 ]

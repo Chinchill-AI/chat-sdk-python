@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+In flight toward `vercel/chat@4.30.0` (landing incrementally; `UPSTREAM_PARITY`
+stays `4.29.0` until the wave completes).
+
+### New adapter: Twilio (SMS / MMS / Voice)
+
+- **`chat_sdk.adapters.twilio`** (vercel/chat#558). Twilio Programmable Messaging adapter (10th platform): inbound message webhooks with `X-Twilio-Signature` HMAC-SHA1 verification (`hmac.compare_digest`), outbound SMS/MMS through the Messages REST API (hand-rolled over an injectable transport — no official `twilio` SDK, mirroring upstream), 1:1 DM threads keyed `twilio:{sender}:{recipient}`, plus standalone `api` / `webhook` / `voice` helpers (TwiML builders, call + transcription parsing). New extra: `chat-sdk-python[twilio]`. Imports stay lazy so the package loads without `aiohttp` installed.
+
+#### Python-specific (divergence from upstream)
+
+- **Twilio media-download SSRF guard.** `rehydrate_attachment` validates the rehydrated media URL (https + Twilio-owned host) inside the download closure before forwarding the account SID / auth token as HTTP Basic, where upstream `fetchTwilioMedia` GETs the URL blindly. Folded into the existing `rehydrate_attachment` URL allowlist non-parity row (Slack / Teams / Google Chat / **Twilio**); enforces `CLAUDE.md`'s SSRF rule. Regression: `tests/test_twilio_adapter.py::TestRehydrateAttachment::test_media_downloader_refuses_untrusted_hosts`.
+
 ## 0.4.29 (2026-06-12)
 
 Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; upstream never tagged `chat@4.27.0`/`chat@4.28.0`). Headlines: **Meta Messenger adapter** (9th platform), **`chat/ai` tool factories** (`create_chat_tools`), **`callback_url` on buttons and modals**, **Transcripts API + `thread_history` rename**, **`burst` concurrency strategy**, a Slack feature wave (verifier precedence flip, external installation providers, native `markdown_text`, `web_client`), the upstream adapter-hardening security pass, and a Python floor bump to 3.12. Sets `UPSTREAM_PARITY = "4.29.0"`; CI fidelity re-pinned to `chat@4.29.0`.
