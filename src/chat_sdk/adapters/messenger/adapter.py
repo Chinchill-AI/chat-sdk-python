@@ -127,7 +127,7 @@ class MessengerAdapter:
         self._app_secret = app_secret
         self._page_access_token = page_access_token
         self._verify_token = verify_token
-        self._api_version = config.api_version or DEFAULT_API_VERSION
+        self._api_version = config.api_version if config.api_version is not None else DEFAULT_API_VERSION
         self._graph_api_url = f"{GRAPH_API_BASE}/{self._api_version}"
         self._logger: Logger = config.logger
         self._format_converter = MessengerFormatConverter()
