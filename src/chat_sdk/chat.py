@@ -1301,7 +1301,7 @@ class Chat:
                 self._logger.warn(f"Cannot open modal: {event.adapter.name} does not support modals")
                 return None
             context_id = str(uuid.uuid4())
-            self._store_modal_context(
+            await self._store_modal_context(
                 event.adapter.name,
                 context_id,
                 channel=channel,
@@ -1333,7 +1333,7 @@ class Chat:
     # Modal context persistence
     # ========================================================================
 
-    def _store_modal_context(
+    async def _store_modal_context(
         self,
         adapter_name: str,
         context_id: str,
@@ -1342,6 +1342,12 @@ class Chat:
         channel: Channel | None = None,
         callback_url: str | None = None,
     ) -> None:
+        # Upstream ``storeModalContext`` is ``async`` and the ``openModal``
+        # helper *awaits* it before calling ``adapter.openModal`` (chat.ts
+        # :1280/:1342/:1554). We mirror that: the state write must land
+        # before the modal can be submitted, otherwise with a remote
+        # (Redis/Postgres) backend a fast submit can race ahead of a
+        # fire-and-forget write and miss the stored callbackUrl/channel.
         key = f"modal-context:{adapter_name}:{context_id}"
         context = {
             "thread": thread.to_json() if thread else None,
@@ -1351,15 +1357,7 @@ class Chat:
             # with the TS SDK (matches the serialized thread/message keys).
             "callbackUrl": callback_url,
         }
-        task = _create_task(self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS), self._active_tasks)
-        if task is not None:
-            task.add_done_callback(
-                lambda t: (
-                    self._logger.error("Failed to store modal context", {"context_id": context_id})
-                    if not t.cancelled() and t.exception()
-                    else None
-                )
-            )
+        await self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS)
 
     async def _retrieve_modal_context(
         self,
@@ -1524,7 +1522,7 @@ class Chat:
 
             context_id = str(uuid.uuid4())
             channel_impl = thread.channel if thread else None
-            self._store_modal_context(
+            await self._store_modal_context(
                 event.adapter.name,
                 context_id,
                 thread=thread,

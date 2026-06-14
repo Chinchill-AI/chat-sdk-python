@@ -4359,8 +4359,6 @@ class TestModalCallbackUrl:
         }
         assert len(captured_action) == 1
         await captured_action[0].open_modal(modal)
-        # _store_modal_context persists via a background task
-        await asyncio.sleep(0.02)
 
         modal_context_keys = [k for k in state.cache if k.startswith("modal-context:")]
         assert len(modal_context_keys) == 1
