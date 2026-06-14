@@ -764,7 +764,13 @@ class TestFileAttachments:
         assert file_att["contentUrl"].startswith("data:image/png;base64,")
 
     @pytest.mark.asyncio
-    async def test_edit_message_with_file(self):
+    async def test_edit_message_does_not_carry_files(self):
+        """Upstream fidelity: ``editMessage`` never delivers files (upstream wires
+        ``filesToAttachments`` into ``postMessage``/``postChannelMessage`` only), and
+        chinchill delivers execution artifacts via a fresh ``post`` — never by editing
+        files into an existing message. A ``PostableMarkdown`` carrying files must edit
+        the text only, with no file attachments on the activity.
+        """
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
@@ -777,11 +783,11 @@ class TestFileAttachments:
         result = await adapter.edit_message(self._thread_id(adapter), "edit-1", message)
 
         payload = adapter._teams_update.call_args.args[2]
-        attachments = payload["attachments"]
-        assert len(attachments) == 1
-        assert attachments[0]["contentType"] == "text/plain"
-        assert attachments[0]["name"] == "note.txt"
-        assert attachments[0]["contentUrl"].startswith("data:text/plain;base64,")
+        assert "attachments" not in payload, (
+            "edit_message must not carry file attachments — outbound file delivery is "
+            f"post_message-only (upstream fidelity); got attachments={payload.get('attachments')!r}"
+        )
+        assert payload["text"] == "updated"
         assert result.id == "edit-1"
 
     @pytest.mark.asyncio

@@ -1171,14 +1171,18 @@ class TeamsAdapter:
         message_id: str,
         message: AdapterPostableMessage,
     ) -> RawMessage:
-        """Edit an existing Teams message."""
+        """Edit an existing Teams message.
+
+        Note: file delivery is intentionally NOT wired here. Upstream
+        ``vercel/chat`` ports ``filesToAttachments`` into ``postMessage`` and
+        ``postChannelMessage`` only — ``editMessage`` does not carry files — and
+        chinchill delivers execution artifacts via a fresh ``post`` (never by
+        editing files into an existing message). Keeping ``edit_message``
+        file-free preserves upstream fidelity.
+        """
         decoded = self.decode_thread_id(thread_id)
 
-        files = extract_files(message)
-        file_attachments = await self._files_to_attachments(files) if files else []
-
         card = extract_card(message)
-        activity_payload: dict[str, Any]
         if card:
             adaptive_card = card_to_adaptive_card(card)
             activity_payload = {
@@ -1188,7 +1192,6 @@ class TeamsAdapter:
                         "contentType": "application/vnd.microsoft.card.adaptive",
                         "content": adaptive_card,
                     },
-                    *file_attachments,
                 ],
             }
         else:
@@ -1201,8 +1204,6 @@ class TeamsAdapter:
                 "text": text,
                 "textFormat": "markdown",
             }
-            if file_attachments:
-                activity_payload["attachments"] = file_attachments
 
         self._logger.debug(
             "Teams API: updateActivity",
