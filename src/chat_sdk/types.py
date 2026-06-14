@@ -5,6 +5,7 @@ Python port of Vercel Chat SDK types.ts.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1527,7 +1528,7 @@ class ChatInstance(Protocol):
         thread_id: str,
         message: Message | Callable[[], Awaitable[Message]],
         options: WebhookOptions | None = None,
-    ) -> None: ...
+    ) -> asyncio.Task[None] | None: ...
     async def handle_incoming_message(self, adapter: Adapter, thread_id: str, message: Message) -> None: ...
     def process_action(self, event: Any, options: WebhookOptions | None = None) -> None: ...
     def process_reaction(self, event: Any, options: WebhookOptions | None = None) -> None: ...
