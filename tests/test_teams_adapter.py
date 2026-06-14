@@ -831,7 +831,63 @@ class TestFileAttachments:
         payload = adapter._teams_send.call_args.args[1]
         # no attachments key added when every file was skipped
         assert "attachments" not in payload
-        assert logger.debug.called
+        # assert the SPECIFIC skip log fired — not just that some debug log happened
+        # (post_message emits an unconditional "send (message)" debug, so a bare
+        # logger.debug.called check would pass even if the skip branch logged nothing).
+        skip_logged = any(
+            call.args and "skipping file with unsupported data" in str(call.args[0])
+            for call in logger.debug.call_args_list
+        )
+        assert skip_logged, "a skipped file must emit the 'unsupported data' debug log"
+
+    @pytest.mark.asyncio
+    async def test_multiple_files_attached_in_order(self):
+        """N files -> N attachments, in input order. Closes the gap where
+        ``return attachments[:1]`` (drop all but first) or a reorder would
+        otherwise merge green — both directly defeat multi-artifact parity.
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="three files",
+            files=[
+                FileUpload(data=b"aaa", filename="a.csv", mime_type="text/csv"),
+                FileUpload(data=b"\x89PNG", filename="b.png", mime_type="image/png"),
+                FileUpload(data=b"%PDF", filename="c.pdf", mime_type="application/pdf"),
+            ],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        assert [a["name"] for a in attachments] == ["a.csv", "b.png", "c.pdf"]
+        assert [a["contentType"] for a in attachments] == ["text/csv", "image/png", "application/pdf"]
+        assert all(a["contentUrl"].startswith("data:") for a in attachments)
+
+    @pytest.mark.asyncio
+    async def test_partial_skip_preserves_surviving_files_in_order(self):
+        """A good/bad/good batch drops only the unresolvable file; survivors keep
+        input order. No single-file test covers partial-skip-with-survivors.
+        """
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+
+        message = PostableMarkdown(
+            markdown="good bad good",
+            files=[
+                FileUpload(data=b"first", filename="first.csv", mime_type="text/csv"),
+                FileUpload(data="not-bytes", filename="bad.bin", mime_type="application/octet-stream"),  # type: ignore[arg-type]
+                FileUpload(data=b"third", filename="third.csv", mime_type="text/csv"),
+            ],
+        )
+        await adapter.post_message(self._thread_id(adapter), message)
+
+        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        assert [a["name"] for a in attachments] == ["first.csv", "third.csv"]
 
 
 class TestDeleteMessage:
