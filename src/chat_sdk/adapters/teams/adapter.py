@@ -31,7 +31,8 @@ from chat_sdk.adapters.teams.types import (
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.shared.adapter_utils import extract_card
+from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.buffer_utils import buffer_to_data_uri, to_buffer
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
     AdapterRateLimitError,
@@ -49,6 +50,7 @@ from chat_sdk.types import (
     EmojiValue,
     FetchOptions,
     FetchResult,
+    FileUpload,
     FormattedContent,
     LockScope,
     Message,
@@ -1038,6 +1040,40 @@ class TeamsAdapter:
             return True
         return bool(from_id.endswith(f":{self._app_id}"))
 
+    async def _files_to_attachments(self, files: list[FileUpload]) -> list[dict[str, Any]]:
+        """Convert ``FileUpload`` objects to Bot Framework data-URI attachments.
+
+        Python port of ``filesToAttachments`` in
+        ``packages/adapter-teams/src/index.ts`` (lines ~1006-1035). Each file's
+        bytes are base64-encoded into a ``data:`` URI and attached as a
+        Bot Framework activity attachment. Files whose data cannot be resolved
+        to bytes are skipped (mirrors upstream's ``throwOnUnsupported: false``
+        followed by ``if (!buffer) continue``).
+        """
+        attachments: list[dict[str, Any]] = []
+
+        for file in files:
+            buffer = await to_buffer(file.data, "teams", throw_on_unsupported=False)
+            if buffer is None:
+                self._logger.debug(
+                    "Teams API: skipping file with unsupported data",
+                    {"filename": file.filename},
+                )
+                continue
+
+            mime_type = file.mime_type or "application/octet-stream"
+            data_uri = buffer_to_data_uri(buffer, mime_type)
+
+            attachments.append(
+                {
+                    "contentType": mime_type,
+                    "contentUrl": data_uri,
+                    "name": file.filename,
+                }
+            )
+
+        return attachments
+
     async def post_message(
         self,
         thread_id: str,
@@ -1045,6 +1081,9 @@ class TeamsAdapter:
     ) -> RawMessage:
         """Post a message to a Teams conversation."""
         decoded = self.decode_thread_id(thread_id)
+
+        files = extract_files(message)
+        file_attachments = await self._files_to_attachments(files) if files else []
 
         card = extract_card(message)
         if card:
@@ -1055,7 +1094,8 @@ class TeamsAdapter:
                     {
                         "contentType": "application/vnd.microsoft.card.adaptive",
                         "content": adaptive_card,
-                    }
+                    },
+                    *file_attachments,
                 ],
             }
 
@@ -1063,6 +1103,7 @@ class TeamsAdapter:
                 "Teams API: send (adaptive card)",
                 {
                     "conversationId": decoded.conversation_id,
+                    "fileCount": len(file_attachments),
                 },
             )
 
@@ -1089,17 +1130,20 @@ class TeamsAdapter:
             "teams",
         )
 
-        activity_payload = {
+        activity_payload: dict[str, Any] = {
             "type": "message",
             "text": text,
             "textFormat": "markdown",
         }
+        if file_attachments:
+            activity_payload["attachments"] = file_attachments
 
         self._logger.debug(
             "Teams API: send (message)",
             {
                 "conversationId": decoded.conversation_id,
                 "textLength": len(text),
+                "fileCount": len(file_attachments),
             },
         )
 
@@ -1130,7 +1174,11 @@ class TeamsAdapter:
         """Edit an existing Teams message."""
         decoded = self.decode_thread_id(thread_id)
 
+        files = extract_files(message)
+        file_attachments = await self._files_to_attachments(files) if files else []
+
         card = extract_card(message)
+        activity_payload: dict[str, Any]
         if card:
             adaptive_card = card_to_adaptive_card(card)
             activity_payload = {
@@ -1139,7 +1187,8 @@ class TeamsAdapter:
                     {
                         "contentType": "application/vnd.microsoft.card.adaptive",
                         "content": adaptive_card,
-                    }
+                    },
+                    *file_attachments,
                 ],
             }
         else:
@@ -1152,6 +1201,8 @@ class TeamsAdapter:
                 "text": text,
                 "textFormat": "markdown",
             }
+            if file_attachments:
+                activity_payload["attachments"] = file_attachments
 
         self._logger.debug(
             "Teams API: updateActivity",
