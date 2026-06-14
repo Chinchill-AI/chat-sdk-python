@@ -1624,7 +1624,7 @@ class SlackAdapter:
 
         thread_id = ""
         if channel and (thread_ts or message_ts):
-            thread_id = self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=thread_ts))
+            thread_id = self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=thread_ts or ""))
 
         is_ephemeral = (payload.get("container") or {}).get("is_ephemeral") is True
         response_url = payload.get("response_url")

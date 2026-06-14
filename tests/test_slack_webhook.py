@@ -374,6 +374,42 @@ class TestInteractivePayloads:
         )
 
     @pytest.mark.asyncio
+    async def test_channel_block_action_threads_under_clicked_message(self):
+        """A click on a top-level channel message must thread under that message.
+
+        Counterpart to the DM case: channels DO have threads, so a button click on
+        a top-level (no thread_ts) channel message must fall back to the clicked
+        message's own ts so the response card threads under it. The DM-only guard
+        must not leak into channels.
+        """
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "block_actions",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "container": {"type": "message", "message_ts": "1234567890.123456", "channel_id": "C456"},
+                "channel": {"id": "C456", "name": "general"},
+                "message": {"ts": "1234567890.123456"},  # top-level channel message: no thread_ts
+                "actions": [{"type": "button", "action_id": "approve_btn", "value": "approved"}],
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+        chat.process_action.assert_called_once()
+        action_event = chat.process_action.call_args[0][0]
+        decoded = adapter.decode_thread_id(action_event.thread_id)
+        assert decoded.channel == "C456"
+        assert decoded.thread_ts == "1234567890.123456", (
+            f"channel block action resolved to thread_ts {decoded.thread_ts!r}; a top-level "
+            "channel click must thread under the clicked message's own ts, not a DM-root "
+            "empty thread_ts."
+        )
+
+    @pytest.mark.asyncio
     async def test_returns_400_for_missing_payload(self):
         adapter = _make_adapter()
         req = _make_signed_request("foo=bar", content_type="application/x-www-form-urlencoded")
