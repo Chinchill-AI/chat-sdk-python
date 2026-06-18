@@ -1,6 +1,6 @@
 """Behavioral tests for Teams native streaming via the SDK ``IStreamer``.
 
-Port of upstream ``adapter-teams@chat@4.30.0`` ``index.ts``
+Port of upstream ``@chat-adapter/teams@4.30.0`` ``index.ts``
 (``streamViaEmit`` / ``streamWithEmitter``): for DMs, the Teams adapter
 dispatches stream chunks through the Teams SDK ``IStreamer.emit()`` and lets
 the SDK ship the Bot Framework streaming wire format

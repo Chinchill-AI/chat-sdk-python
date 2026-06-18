@@ -2,7 +2,7 @@
 
 ## 0.4.30
 
-Synced to upstream `vercel/chat@4.30.0`. The mapped core (`packages/chat/src`) is byte-for-byte unchanged from `4.29.0`, so this wave is all adapter work: a **new Twilio adapter**, a **Telegram native-streaming** port, a **Slack primitives-subpath** wave, a batch of **WhatsApp / Slack / Google Chat** fixes, and the headline — the **Teams adapter migration to the official `microsoft-teams-apps` SDK** (issue #93, delivered across four PRs). Sets `UPSTREAM_PARITY = "4.30.0"`; CI fidelity re-pinned to `chat@4.30.0` (732/732 mapped-core tests still pass, 0 missing).
+Synced to upstream `vercel/chat@4.30.0`. The mapped core (`packages/chat/src`) is content-identical between the `chat@4.29.0` and `chat@4.30.0` upstream tags, so this wave is all adapter work: a **new Twilio adapter**, a **Telegram native-streaming** port, a **Slack primitives-subpath** wave, a batch of **WhatsApp / Slack / Google Chat** fixes, and the headline — the **Teams adapter migration to the official `microsoft-teams-apps` SDK** (issue #93, delivered across four PRs). Sets `UPSTREAM_PARITY = "4.30.0"`; CI fidelity re-pinned to `chat@4.30.0` (732/732 mapped-core tests still pass, 0 missing).
 
 ### New adapter: Twilio (SMS / MMS / Voice)
 
