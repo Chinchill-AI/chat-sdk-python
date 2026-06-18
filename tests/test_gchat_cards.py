@@ -19,6 +19,7 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
 )
+from chat_sdk.modals import RadioSelect, Select, SelectOption
 from chat_sdk.shared import card_to_fallback_text
 
 # ---------------------------------------------------------------------------
@@ -365,3 +366,173 @@ class TestCardLink:
                 "text": '<a href="https://example.com">Click here</a>',
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Select / RadioSelect -> selectionInput widgets
+# Port of cards.test.ts "converts select actions to selectionInput ..." tests.
+# ---------------------------------------------------------------------------
+
+
+class TestSelectionInputWidgets:
+    def test_converts_select_actions_to_dropdown_selection_input(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Select(
+                            id="priority",
+                            label="Priority",
+                            options=[
+                                SelectOption(label="High", value="high", description="Urgent"),
+                                SelectOption(label="Normal", value="normal"),
+                            ],
+                            initial_option="normal",
+                        ),
+                    ]
+                ),
+            ]
+        )
+
+        gchat_card = card_to_google_card(
+            card,
+            {"endpoint_url": "https://example.com/api/webhooks/gchat"},
+        )
+
+        widgets = gchat_card["card"]["sections"][0]["widgets"]
+        assert len(widgets) == 1
+        assert widgets[0] == {
+            "selectionInput": {
+                "name": "priority",
+                "label": "Priority",
+                "type": "DROPDOWN",
+                "items": [
+                    {"text": "High", "value": "high"},
+                    {"text": "Normal", "value": "normal", "selected": True},
+                ],
+                "onChangeAction": {
+                    "function": "https://example.com/api/webhooks/gchat",
+                    "parameters": [{"key": "actionId", "value": "priority"}],
+                },
+            },
+        }
+
+    def test_converts_radio_select_actions_to_radio_selection_input(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        RadioSelect(
+                            id="status",
+                            label="Status",
+                            options=[
+                                SelectOption(label="Open", value="open"),
+                                SelectOption(label="Closed", value="closed"),
+                            ],
+                            initial_option="open",
+                        ),
+                    ]
+                ),
+            ]
+        )
+
+        gchat_card = card_to_google_card(card)
+        widgets = gchat_card["card"]["sections"][0]["widgets"]
+
+        assert len(widgets) == 1
+        assert widgets[0] == {
+            "selectionInput": {
+                "name": "status",
+                "label": "Status",
+                "type": "RADIO_BUTTON",
+                "items": [
+                    {"text": "Open", "value": "open", "selected": True},
+                    {"text": "Closed", "value": "closed"},
+                ],
+                "onChangeAction": {
+                    # No endpoint URL configured -> function falls back to the id.
+                    "function": "status",
+                    "parameters": [{"key": "actionId", "value": "status"}],
+                },
+            },
+        }
+
+    def test_preserves_action_order_for_mixed_buttons_and_selection_inputs(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Button(id="refresh", label="Refresh"),
+                        Select(
+                            id="category",
+                            label="Category",
+                            options=[
+                                SelectOption(label="Alpha", value="alpha"),
+                                SelectOption(label="Beta", value="beta"),
+                            ],
+                        ),
+                        LinkButton(url="https://example.com/docs", label="Docs"),
+                        RadioSelect(
+                            id="view",
+                            label="View",
+                            options=[
+                                SelectOption(label="Summary", value="summary"),
+                                SelectOption(label="Detailed", value="detailed"),
+                            ],
+                        ),
+                    ]
+                ),
+            ]
+        )
+
+        gchat_card = card_to_google_card(card)
+        widgets = gchat_card["card"]["sections"][0]["widgets"]
+
+        assert len(widgets) == 4
+        assert len(widgets[0]["buttonList"]["buttons"]) == 1
+        assert widgets[0]["buttonList"]["buttons"][0] == {
+            "text": "Refresh",
+            "onClick": {
+                "action": {
+                    "function": "refresh",
+                    "parameters": [{"key": "actionId", "value": "refresh"}],
+                },
+            },
+        }
+        assert widgets[1]["selectionInput"]["name"] == "category"
+        assert widgets[1]["selectionInput"]["type"] == "DROPDOWN"
+        assert widgets[2]["buttonList"]["buttons"] == [
+            {
+                "text": "Docs",
+                "onClick": {
+                    "openLink": {"url": "https://example.com/docs"},
+                },
+            },
+        ]
+        assert widgets[3]["selectionInput"]["name"] == "view"
+        assert widgets[3]["selectionInput"]["type"] == "RADIO_BUTTON"
+
+    def test_selection_input_without_initial_option_marks_none_selected(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Select(
+                            id="color",
+                            label="Color",
+                            options=[
+                                SelectOption(label="Red", value="red"),
+                                SelectOption(label="Blue", value="blue"),
+                            ],
+                        ),
+                    ]
+                ),
+            ]
+        )
+
+        widgets = card_to_google_card(card)["card"]["sections"][0]["widgets"]
+        items = widgets[0]["selectionInput"]["items"]
+        assert items == [
+            {"text": "Red", "value": "red"},
+            {"text": "Blue", "value": "blue"},
+        ]

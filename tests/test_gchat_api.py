@@ -291,7 +291,31 @@ class TestEditMessage:
         calls = api.get_calls("PATCH", msg_id)
         assert len(calls) == 1
         assert calls[0]["body"]["text"] is not None
-        assert calls[0]["params"]["updateMask"] == "text"
+        # Editing to text must also clear any stranded card (see regression
+        # test below): updateMask covers both fields and cardsV2 is emptied.
+        assert calls[0]["params"]["updateMask"] == "text,cardsV2"
+
+    @pytest.mark.asyncio
+    async def test_edit_to_text_clears_cards_v2(self):
+        # Regression: GChat renders BOTH the text and the previous cardsV2 if
+        # the card field is left untouched on an edit. Editing a card message
+        # down to plain text must send updateMask "text,cardsV2" with an empty
+        # cardsV2 list so the old card is removed. Matches upstream index.ts
+        # spaces.messages.update (text branch).
+        adapter, api, _ = await _init_adapter()
+        tid = _encode_tid("spaces/ABC123")
+        msg_id = "spaces/ABC123/messages/msg1"
+        api.set_response("PATCH", msg_id, {"name": msg_id})
+
+        await adapter.edit_message(tid, msg_id, "Now just plain text")
+
+        calls = api.get_calls("PATCH", msg_id)
+        assert len(calls) == 1
+        body = calls[0]["body"]
+        assert body["cardsV2"] == []
+        assert body["text"] == "Now just plain text"
+        mask_fields = set(calls[0]["params"]["updateMask"].split(","))
+        assert mask_fields == {"text", "cardsV2"}
 
     @pytest.mark.asyncio
     async def test_edit_message_api_error(self):

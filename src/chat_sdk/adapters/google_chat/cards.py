@@ -133,7 +133,7 @@ def _convert_child_to_widgets(
     elif child_type == "divider":
         return [_convert_divider_to_widget()]
     elif child_type == "actions":
-        return [_convert_actions_to_widget(cast("dict[str, Any]", child), endpoint_url)]
+        return _convert_actions_to_widgets(cast("dict[str, Any]", child), endpoint_url)
     elif child_type == "section":
         return _convert_section_to_widgets(cast("dict[str, Any]", child), endpoint_url)
     elif child_type == "fields":
@@ -184,20 +184,71 @@ def _convert_divider_to_widget() -> dict[str, Any]:
     return {"divider": {}}
 
 
-def _convert_actions_to_widget(
+def _convert_actions_to_widgets(
+    element: dict[str, Any],
+    endpoint_url: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convert an actions element to widgets.
+
+    Buttons accumulate into a single ``buttonList`` widget; ``select`` and
+    ``radio_select`` children become standalone ``selectionInput`` widgets,
+    interleaved in source order (any pending buttons are flushed first).
+    """
+    widgets: list[dict[str, Any]] = []
+    buttons: list[dict[str, Any]] = []
+
+    def flush_buttons() -> None:
+        if not buttons:
+            return
+        widgets.append({"buttonList": {"buttons": list(buttons)}})
+        buttons.clear()
+
+    for child in element.get("children", []):
+        child_type = child.get("type")
+        if child_type == "button":
+            buttons.append(_convert_button_to_google_button(child, endpoint_url))
+            continue
+        if child_type == "link-button":
+            buttons.append(_convert_link_button_to_google_button(child))
+            continue
+        if child_type in ("select", "radio_select"):
+            flush_buttons()
+            widgets.append(_convert_selection_input_to_widget(child, endpoint_url))
+
+    flush_buttons()
+
+    return widgets
+
+
+def _convert_selection_input_to_widget(
     element: dict[str, Any],
     endpoint_url: str | None = None,
 ) -> dict[str, Any]:
-    """Convert an actions element to a widget."""
-    buttons: list[dict[str, Any]] = []
-    for child in element.get("children", []):
-        child_type = child.get("type")
-        if child_type == "link-button":
-            buttons.append(_convert_link_button_to_google_button(child))
-        elif child_type == "button":
-            buttons.append(_convert_button_to_google_button(child, endpoint_url))
+    """Convert a select/radio_select element to a ``selectionInput`` widget."""
+    initial_option = element.get("initial_option")
+    items: list[dict[str, Any]] = []
+    for option in element.get("options", []):
+        item: dict[str, Any] = {
+            "text": convert_emoji(option.get("label", "")),
+            "value": option.get("value", ""),
+        }
+        if option.get("value") == initial_option:
+            item["selected"] = True
+        items.append(item)
 
-    return {"buttonList": {"buttons": buttons}}
+    element_id = element.get("id", "")
+    return {
+        "selectionInput": {
+            "name": element_id,
+            "label": convert_emoji(element.get("label", "")),
+            "type": "RADIO_BUTTON" if element.get("type") == "radio_select" else "DROPDOWN",
+            "items": items,
+            "onChangeAction": {
+                "function": endpoint_url or element_id,
+                "parameters": [{"key": "actionId", "value": element_id}],
+            },
+        },
+    }
 
 
 def _convert_button_to_google_button(
