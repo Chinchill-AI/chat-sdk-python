@@ -19,6 +19,7 @@ import json
 import os
 import re
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
@@ -410,6 +411,12 @@ class SlackAdapter:
         # on each subsequent webhook entry. Static-string configs prime this at
         # construction time so sync access works before any webhook fires.
         self._default_bot_token_cache: str | None = bot_token_config if isinstance(bot_token_config, str) else None
+        # True when the user passed a callable ``bot_token`` (sync or async).
+        # The config contract says callable resolvers are invoked on each use
+        # to support rotation, so sync access goes through a fresh-invoke
+        # branch instead of reading ``_default_bot_token_cache``. Static
+        # strings have nothing to rotate and stay on the cached fast path.
+        self._is_dynamic_bot_token: bool = callable(bot_token_config)
 
         # ------------------------------------------------------------------
         # Socket mode wiring (PR #86). Resolved AFTER the bot-token resolver
@@ -480,6 +487,16 @@ class SlackAdapter:
         # Cache of AsyncWebClient instances keyed by bot token (LRU-bounded)
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
         self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
+
+        # Cache of synchronous slack_sdk.WebClient instances keyed by bot
+        # token, backing the public ``web_client`` property (the direct port
+        # of upstream's ``getClientForToken``). Kept separate from
+        # ``_client_cache`` because that one holds async ``AsyncWebClient``
+        # instances used by the adapter's own API calls; the two client types
+        # are not interchangeable. Mirrors upstream's plain (unbounded) Map —
+        # one entry per distinct token — since callers reach for this escape
+        # hatch rarely and tokens are low-cardinality.
+        self._web_client_cache: dict[str, Any] = {}
 
         # Multi-workspace OAuth fields.
         # ``is not None`` (not truthiness) so an explicit empty-string user
@@ -608,6 +625,61 @@ class SlackAdapter:
         """
         return self._get_client()
 
+    @property
+    def web_client(self) -> Any:
+        """Direct access to a synchronous ``slack_sdk.WebClient``.
+
+        Bound to the bot token for the current request context
+        (multi-workspace) or the configured default token
+        (single-workspace). Use for any Slack Web API call not covered by
+        the adapter's high-level methods — e.g.
+        ``adapter.web_client.pins_add(...)`` or
+        ``adapter.web_client.usergroups_list(...)``.
+
+        Resolution order (the standard 3-level resolver):
+
+        1. Token from the current request context (set during webhook
+           handling, or by :meth:`with_bot_token` / :meth:`with_bot_token_async`).
+        2. The default bot token, when configured as a static string or
+           already-resolved value.
+        3. Otherwise raise :class:`AuthenticationError`.
+
+        Raises :class:`AuthenticationError` if neither is available —
+        typical causes are accessing ``web_client`` outside any
+        webhook / :meth:`with_bot_token` context in multi-workspace mode,
+        or having configured ``bot_token`` as an async resolver that has
+        not run yet. In the latter case await
+        :meth:`current_token_async` (or process the work inside the
+        webhook flow) so the resolver primes the token first.
+
+        Return type is ``Any`` (rather than the concrete ``WebClient``)
+        because ``slack_sdk`` is an optional dependency — consumers who do
+        not install the ``slack`` extra should not pay an import cost.
+
+        This is the direct port of upstream's ``adapter.webClient`` getter
+        (vercel/chat ``2f108bd``). Unlike :attr:`current_client` it returns
+        the *synchronous* ``WebClient`` (the analog of the single TS
+        ``WebClient``), so its methods are not awaitables.
+        """
+        return self._get_web_client_for_token(self._get_token())
+
+    @property
+    def client(self) -> Any:
+        """Deprecated alias for :attr:`web_client`.
+
+        .. deprecated::
+            Use :attr:`web_client` instead. This alias mirrors upstream's
+            pre-rename ``adapter.client`` (vercel/chat ``8366b8b``) and is
+            kept for one release for backwards compatibility; it will be
+            removed in a future version. Emits :class:`DeprecationWarning`.
+        """
+        warnings.warn(
+            "SlackAdapter.client is deprecated; use SlackAdapter.web_client instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.web_client
+
     # ------------------------------------------------------------------
     # Token management
     # ------------------------------------------------------------------
@@ -620,17 +692,19 @@ class SlackAdapter:
         1. Multi-workspace request context (``_request_context``)
         2. Per-request resolved default token (``_resolved_default_token``)
            — primed by ``handle_webhook`` after invoking the resolver
-        3. Static default token cache (set by the constructor for
-           string-typed ``bot_token`` configs)
-        4. Raises :class:`AuthenticationError`
+        3. Sync dynamic resolver — invoked **fresh on every call** to honor
+           the rotation contract in :attr:`SlackAdapterConfig.bot_token`
+           ("called on each use to support rotation")
+        4. Static default token cache (set by the constructor for
+           string-typed ``bot_token`` configs, or by the async path after
+           ``_resolve_default_token`` runs)
+        5. Raises :class:`AuthenticationError`
 
-        Synchronous: the token resolver is *not* invoked here. Webhook entry
-        paths call :meth:`_resolve_default_token` first so the per-request
-        cache is primed; static-string ``bot_token`` configs prime the
-        process-wide cache at construction time so this is a no-op for the
-        common case. Use :meth:`_resolve_token_async` from new async call
-        sites that need to invoke a resolver outside webhook flow (e.g.
-        cron jobs).
+        Async resolvers cannot be awaited from a sync context — sync access
+        outside a webhook scope falls back to the process-wide cache, or
+        raises if the async path has not run yet. Use
+        :meth:`current_token_async` or enter via :meth:`handle_webhook` so
+        the resolver runs first.
         """
         ctx = self._request_context.get()
         if ctx and ctx.token:
@@ -638,16 +712,45 @@ class SlackAdapter:
         per_request = self._resolved_default_token.get()
         if per_request is not None:
             return per_request
+        # Sync dynamic resolver: invoke fresh every call to honor rotation.
+        # Static strings (no rotation possible) and async resolvers (which
+        # need a webhook entry to be awaited) fall through to the cache.
+        provider = self._default_bot_token_provider
+        if self._is_dynamic_bot_token and provider is not None and not inspect.iscoroutinefunction(provider):
+            resolved = provider()
+            # Defensive: a "sync" callable may still *return* a coroutine
+            # (e.g. ``lambda: some_async_fn()``) and ``iscoroutinefunction``
+            # would not catch that. Refuse to use such a value in a sync
+            # context — and close the awaitable to suppress the
+            # ``coroutine was never awaited`` RuntimeWarning before raising.
+            if inspect.isawaitable(resolved):
+                close = getattr(resolved, "close", None)
+                if callable(close):
+                    close()
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an awaitable in a sync "
+                    "context. Use the async API (handle_webhook / "
+                    "current_token_async) so the resolver can be awaited.",
+                )
+            if not isinstance(resolved, str) or not resolved:
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an empty or non-string value.",
+                )
+            # Intentionally do NOT write ``_default_bot_token_cache``: caching
+            # would break the rotation contract for the next sync access.
+            return resolved
         if self._default_bot_token_cache is not None:
             return self._default_bot_token_cache
-        if self._default_bot_token_provider is not None:
-            # Resolver-based default token configured but never resolved. This
-            # is a programming error: the async entry path should have awaited
-            # ``_resolve_default_token()`` before reaching here.
+        if provider is not None:
+            # Async resolver configured but never awaited. ``handle_webhook``
+            # or ``current_token_async`` must run first to prime the cache.
             raise AuthenticationError(
                 "slack",
-                "Bot token resolver has not been invoked yet. Use the async API "
-                "(handle_webhook / current_token_async) so the resolver runs first.",
+                "Async bot token resolver has not been invoked yet. Use the "
+                "async API (handle_webhook / current_token_async) so the "
+                "resolver runs first.",
             )
         raise AuthenticationError(
             "slack",
@@ -758,8 +861,40 @@ class SlackAdapter:
         return client
 
     def _invalidate_client(self, token: str) -> None:
-        """Remove a cached client (e.g., on token revocation)."""
+        """Remove a cached client (e.g., on token revocation).
+
+        For dynamic-resolver configs also clears the resolved-token caches
+        so the next access re-invokes the resolver instead of serving the
+        revoked token. Static-string configs intentionally retain their
+        cache: there is no refresh path, so clearing would just make every
+        subsequent sync access raise.
+        """
         self._client_cache.pop(token, None)
+        self._web_client_cache.pop(token, None)
+        if self._is_dynamic_bot_token:
+            if self._default_bot_token_cache == token:
+                self._default_bot_token_cache = None
+            if self._resolved_default_token.get() == token:
+                self._resolved_default_token.set(None)
+
+    def _get_web_client_for_token(self, token: str) -> Any:
+        """Return a synchronous ``slack_sdk.WebClient`` for *token*, cached.
+
+        Backs the public :attr:`web_client` property and is the direct port
+        of upstream's ``getClientForToken`` (vercel/chat ``2f108bd``): one
+        cached ``WebClient`` instance per distinct token. The import is
+        deferred so ``slack_sdk`` stays an optional dependency (hazard #10).
+
+        Distinct from :meth:`_get_client`, which caches the *async*
+        ``AsyncWebClient`` used by the adapter's own API calls.
+        """
+        client = self._web_client_cache.get(token)
+        if client is None:
+            from slack_sdk import WebClient
+
+            client = WebClient(token=token)
+            self._web_client_cache[token] = client
+        return client
 
     # ------------------------------------------------------------------
     # Initialization
