@@ -508,6 +508,90 @@ class TestHandleWebhook:
         assert response["status"] == 200
 
     @pytest.mark.asyncio
+    async def test_card_click_reads_selection_value_from_form_inputs(self):
+        # Port of index.test.ts "should read selection values from formInputs
+        # when parameters.value is missing". Selection inputs return the chosen
+        # option through formInputs[actionId].stringInputs.value[0], not via
+        # commonEventObject.parameters.value.
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        event = {
+            "chat": {
+                "buttonClickedPayload": {
+                    "space": {"name": "spaces/ABC123", "type": "ROOM"},
+                    "message": {
+                        "name": "spaces/ABC123/messages/msg1",
+                        "sender": {"name": "users/1", "displayName": "U", "type": "HUMAN"},
+                        "text": "",
+                        "createTime": "2024-01-01T00:00:00Z",
+                    },
+                    "user": {
+                        "name": "users/2",
+                        "displayName": "Clicker",
+                        "type": "HUMAN",
+                        "email": "",
+                    },
+                },
+            },
+            "commonEventObject": {
+                "parameters": {"actionId": "selection"},
+                "formInputs": {
+                    "selection": {"stringInputs": {"value": ["option-1"]}},
+                },
+            },
+        }
+        response = await adapter.handle_webhook(event)
+        assert response["status"] == 200
+        assert chat.process_action.called
+        action_event = chat.process_action.call_args[0][0]
+        assert action_event.action_id == "selection"
+        assert action_event.value == "option-1"
+
+    @pytest.mark.asyncio
+    async def test_card_click_prefers_parameters_value_over_form_inputs(self):
+        # Port of index.test.ts "should prefer parameters.value when both
+        # parameters and formInputs are present" — button value wins.
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        event = {
+            "chat": {
+                "buttonClickedPayload": {
+                    "space": {"name": "spaces/ABC123", "type": "ROOM"},
+                    "message": {
+                        "name": "spaces/ABC123/messages/msg1",
+                        "sender": {"name": "users/1", "displayName": "U", "type": "HUMAN"},
+                        "text": "",
+                        "createTime": "2024-01-01T00:00:00Z",
+                    },
+                    "user": {
+                        "name": "users/2",
+                        "displayName": "Clicker",
+                        "type": "HUMAN",
+                        "email": "",
+                    },
+                },
+            },
+            "commonEventObject": {
+                "parameters": {"actionId": "selection", "value": "button-value"},
+                "formInputs": {
+                    "selection": {"stringInputs": {"value": ["dropdown-value"]}},
+                },
+            },
+        }
+        response = await adapter.handle_webhook(event)
+        assert response["status"] == 200
+        assert chat.process_action.called
+        action_event = chat.process_action.call_args[0][0]
+        assert action_event.action_id == "selection"
+        assert action_event.value == "button-value"
+
+    @pytest.mark.asyncio
     async def test_non_message_event_returns_200(self):
         adapter = _make_adapter()
         state = _make_mock_state()

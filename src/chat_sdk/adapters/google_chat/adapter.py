@@ -1290,8 +1290,11 @@ class GoogleChatAdapter:
             )
             return
 
-        # Get value from parameters
+        # Buttons send value via parameters, while selection inputs return the
+        # chosen option through formInputs under the action ID.
         value = (common_event.get("parameters") or {}).get("value")
+        if value is None:
+            value = self._get_form_input_value(common_event.get("formInputs"), action_id)
 
         # Get space and message info
         space = (button_payload or {}).get("space")
@@ -1338,6 +1341,20 @@ class GoogleChatAdapter:
         )
 
         self._chat.process_action(action_event, options)
+
+    def _get_form_input_value(
+        self,
+        form_inputs: dict[str, Any] | None,
+        action_id: str,
+    ) -> str | None:
+        """Resolve a selection-input value from a card-click ``formInputs`` map.
+
+        Mirrors upstream ``getFormInputValue``: returns
+        ``formInputs[actionId].stringInputs.value[0]`` if present, else ``None``.
+        """
+        entry = (form_inputs or {}).get(action_id) or {}
+        values = (entry.get("stringInputs") or {}).get("value") or []
+        return values[0] if values else None
 
     def _handle_message_event(
         self,
@@ -1678,8 +1695,11 @@ class GoogleChatAdapter:
             response = await self._gchat_api_request(
                 "PATCH",
                 message_id,
-                body={"text": text},
-                params={"updateMask": "text"},
+                # Clear any stranded card when editing a card message down to
+                # plain text. GChat renders both text and cardsV2 if cardsV2 is
+                # left untouched, so send an empty list under the update mask.
+                body={"text": text, "cardsV2": []},
+                params={"updateMask": "text,cardsV2"},
             )
 
             self._logger.debug(
