@@ -877,11 +877,19 @@ class TeamsAdapter:
         finally:
             # Always close the streamer (the SDK sends the ``streamType: 'final'``
             # message here) and drop the registry entry so a subsequent message
-            # can register fresh. We close even on cancellation: the SDK's own
-            # ``HttpStream.close`` no-ops when the stream was canceled or never
-            # received content, so this is safe — it mirrors the SDK App's
-            # ``process_activity``, which calls ``await ctx.stream.close()`` in
-            # both the success and ``StreamCancelledError`` paths.
+            # can register fresh. We close even on cancellation, in two cases:
+            #   • SDK-detected cancel (Teams 403 / ``StreamCancelledError``): the
+            #     SDK's ``HttpStream.close`` no-ops because ``_canceled`` is set —
+            #     matching the SDK App's ``process_activity``, which also closes in
+            #     both its success and ``StreamCancelledError`` branches.
+            #   • Raw ``asyncio.CancelledError`` (the webhook task is cancelled
+            #     mid-stream): ``_canceled`` is NOT set, so ``close`` flushes a
+            #     final activity for whatever was accumulated. This is intentional —
+            #     it finalizes the partial response instead of leaving Teams in a
+            #     dangling "streaming" state. The send below is wrapped in
+            #     ``try/except Exception``, which does NOT catch ``CancelledError``
+            #     (a ``BaseException``), so any network failure is swallowed while
+            #     the original cancellation still propagates after the ``finally``.
             current = self._active_streams.get(thread_id)
             if current is streamer:
                 self._active_streams.pop(thread_id, None)
