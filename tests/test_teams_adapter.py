@@ -601,16 +601,29 @@ class _FakeRequest:
 class TestHandleWebhook:
     @pytest.fixture(autouse=True)
     def _skip_jwt(self, monkeypatch):
-        """Bypass JWT verification in unit tests."""
-        monkeypatch.setattr(
-            TeamsAdapter,
-            "_verify_bot_framework_token",
-            AsyncMock(return_value=None),
-        )
+        """Bypass inbound JWT validation in unit tests.
+
+        Inbound auth now runs inside the Microsoft Teams SDK ``App``
+        (issue #93 PR 1); ``handle_webhook`` dispatches through the
+        ``BridgeHttpAdapter`` into the SDK's ``HttpServer``. We force the SDK's
+        ``skip_auth`` flag so unsigned test requests still reach the bridge's
+        JSON parsing without needing a real Bot Framework token.
+        """
+        from microsoft_teams.apps.http.http_server import HttpServer
+
+        real_initialize = HttpServer.initialize
+
+        def _initialize_skip_auth(self, credentials=None, skip_auth=False, cloud=None):
+            return real_initialize(self, credentials=credentials, skip_auth=True, cloud=cloud)
+
+        monkeypatch.setattr(HttpServer, "initialize", _initialize_skip_auth)
 
     @pytest.mark.asyncio
     async def test_400_for_invalid_json(self):
         adapter = _make_adapter(logger=_make_logger())
+        chat = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        await adapter.initialize(chat)
         request = _FakeRequest("not valid json{{{", {"content-type": "application/json"})
 
         response = await adapter.handle_webhook(request)
@@ -629,6 +642,44 @@ class TestInitialize:
         mock_chat = MagicMock()
         await adapter.initialize(mock_chat)
         assert adapter.name == "teams"
+
+    @pytest.mark.asyncio
+    async def test_initialize_wires_sdk_app_and_bridge(self):
+        adapter = _make_adapter()
+        await adapter.initialize(MagicMock())
+        # The SDK App captured the messaging-endpoint route in our bridge so
+        # handle_webhook can dispatch through it.
+        assert adapter._bridge._handler is not None
+        # JWT/auth + activity routing now flow through our dispatcher.
+        on_request = adapter._app.server.on_request
+        assert on_request is not None
+        assert on_request.__func__ is TeamsAdapter._dispatch_activity
+        assert on_request.__self__ is adapter
+
+    @pytest.mark.asyncio
+    async def test_initialize_is_idempotent(self):
+        adapter = _make_adapter()
+        chat = MagicMock()
+        await adapter.initialize(chat)
+        first_handler = adapter._bridge._handler
+        # Re-initializing (e.g. adapter reused across chats) must not double-init
+        # the SDK App or lose the captured route handler.
+        await adapter.initialize(chat)
+        assert adapter._bridge._handler is first_handler
+
+
+class TestSdkAppConstruction:
+    def test_app_built_with_vercel_user_agent(self):
+        adapter = _make_adapter()
+        # The User-Agent the adapter stamps onto the SDK client must identify
+        # the Chat SDK (parity with upstream App construction). The SDK merges
+        # its own UA on top, so we assert against the client options we passed.
+        client_opts = adapter._app.options.client
+        assert client_opts.headers["User-Agent"] == "Vercel.ChatSDK"
+
+    def test_app_id_mapped_to_sdk_client_id(self):
+        adapter = _make_adapter(app_id="my-bot-id")
+        assert adapter._app.id == "my-bot-id"
 
 
 # ---------------------------------------------------------------------------

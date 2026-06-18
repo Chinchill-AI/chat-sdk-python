@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import os
 import re
@@ -19,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, cast
 from urllib.parse import quote, urlparse
 
+from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
 from chat_sdk.adapters.teams.types import (
@@ -155,8 +155,66 @@ ALLOWED_SERVICE_URL_PATTERNS = [
     re.compile(r"^https://smba\.infra\.(gcc|gov)\.teams\.microsoft\.(com|us)/"),
 ]
 
-# Bot Framework OpenID configuration URL for JWT verification
-BOT_FRAMEWORK_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openid-configuration"
+
+def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
+    """Convert :class:`TeamsAdapterConfig` (public API) to Teams SDK ``AppOptions``.
+
+    Python port of ``packages/adapter-teams/src/config.ts`` ``toAppOptions``
+    (synced to ``adapter-teams@chat@4.30.0``). Maps our public
+    ``app_id``/``app_password``/``app_tenant_id``/``federated``/``app_type``
+    fields onto the SDK's ``client_id``/``client_secret``/``tenant_id``/
+    ``managed_identity_client_id`` keys, reading the same ``TEAMS_*`` env-var
+    fallbacks the legacy adapter used.
+
+    Returns a dict suitable for ``App(**options)`` minus ``http_server_adapter``
+    (the adapter injects the bridge separately). Only keys with a value are
+    included so the SDK applies its own defaults for the rest.
+
+    Certificate auth is rejected here for exact parity with upstream — the
+    adapter constructor also guards it, but mirroring the check keeps the
+    config conversion self-contained.
+    """
+    if config.certificate is not None:
+        raise ValidationError(
+            "teams",
+            "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
+            "Use appPassword (client secret) or federated (workload identity) authentication instead.",
+        )
+
+    client_id = config.app_id if config.app_id is not None else os.environ.get("TEAMS_APP_ID")
+    # Federated (workload identity) auth derives the secret from a managed
+    # identity, so no client secret is supplied in that mode.
+    if config.federated is not None:
+        client_secret = None
+    elif config.app_password is not None:
+        client_secret = config.app_password
+    else:
+        client_secret = os.environ.get("TEAMS_APP_PASSWORD")
+
+    # SingleTenant apps need a tenant_id; MultiTenant apps omit it.
+    if config.app_type == "MultiTenant":
+        tenant_id = None
+    elif config.app_tenant_id is not None:
+        tenant_id = config.app_tenant_id
+    else:
+        tenant_id = os.environ.get("TEAMS_APP_TENANT_ID")
+
+    federated = config.federated
+    if federated is not None and federated.get("client_audience") and config.logger is not None:
+        config.logger.warn("federated.clientAudience is not supported by the Teams SDK and will be ignored.")
+
+    managed_identity_client_id = federated.get("client_id") if federated is not None else None
+
+    options: dict[str, Any] = {}
+    if client_id:
+        options["client_id"] = client_id
+    if client_secret:
+        options["client_secret"] = client_secret
+    if tenant_id:
+        options["tenant_id"] = tenant_id
+    if managed_identity_client_id:
+        options["managed_identity_client_id"] = managed_identity_client_id
+    return options
 
 
 def _validate_service_url(url: str) -> None:
@@ -174,28 +232,64 @@ def _validate_service_url(url: str) -> None:
     )
 
 
-def _handle_teams_error(error: Any, operation: str) -> NoReturn:
-    """Convert Teams SDK errors to adapter errors and raise.
+def _error_field(error: Any, dict_key: str, attr_name: str) -> Any:
+    """Read a field from a Teams error that may be a dict or an SDK exception.
 
-    Raises an appropriate AdapterError subclass based on the error shape.
+    The hand-rolled Graph / outbound aiohttp path raises plain dicts
+    (``{"statusCode": 429, ...}``); the Microsoft Teams SDK raises typed
+    exceptions whose HTTP details live on attributes (``status_code``,
+    ``retry_after``, ``inner_http_error``). This reads ``dict_key`` from a
+    dict error or ``attr_name`` from an object error so :func:`_handle_teams_error`
+    maps both shapes to our taxonomy with one code path.
     """
-    if error and isinstance(error, dict):
-        inner_error = error.get("innerHttpError", {})
+    if isinstance(error, dict):
+        return error.get(dict_key)
+    return getattr(error, attr_name, None)
+
+
+def _handle_teams_error(error: Any, operation: str) -> NoReturn:
+    """Convert Teams SDK / Bot Framework errors to adapter errors and raise.
+
+    Python port of ``packages/adapter-teams/src/errors.ts`` ``handleTeamsError``
+    (synced to ``adapter-teams@chat@4.30.0``). Maps the error onto our taxonomy:
+
+    - ``401`` → :class:`AuthenticationError`
+    - ``403`` (or a "permission" message) → :class:`AdapterPermissionError`
+    - ``404`` → :class:`NetworkError` ("not found")
+    - ``429`` → :class:`AdapterRateLimitError` (with ``retry_after`` when present)
+    - any other message → :class:`NetworkError`
+
+    Handles both the plain-dict errors raised by the still-hand-rolled Graph /
+    outbound path and the typed exceptions raised by the Microsoft Teams SDK
+    (whose HTTP status lives on ``inner_http_error.status_code`` /
+    ``status_code`` / ``status`` / ``code``).
+    """
+    if error is not None and isinstance(error, (dict, Exception)):
+        # SDK ``HttpError`` shape exposes the upstream status on
+        # ``inner_http_error.status_code``; dict errors use ``innerHttpError``.
+        inner = _error_field(error, "innerHttpError", "inner_http_error")
+        inner_status = _error_field(inner, "statusCode", "status_code") if inner is not None else None
         status_code = (
-            inner_error.get("statusCode") or error.get("statusCode") or error.get("status") or error.get("code")
+            inner_status
+            if inner_status is not None
+            else (
+                _error_field(error, "statusCode", "status_code")
+                or _error_field(error, "status", "status")
+                or _error_field(error, "code", "code")
+            )
         )
 
         if isinstance(status_code, str) and status_code.isdigit():
             status_code = int(status_code)
 
+        message = error.get("message") if isinstance(error, dict) else str(error)
+
         if status_code == 401:
             raise AuthenticationError(
                 "teams",
-                f"Authentication failed for {operation}: {error.get('message', 'unauthorized')}",
+                f"Authentication failed for {operation}: {message or 'unauthorized'}",
             )
-        if status_code == 403 or (
-            isinstance(error.get("message"), str) and "permission" in error.get("message", "").lower()
-        ):
+        if status_code == 403 or (isinstance(message, str) and "permission" in message.lower()):
             raise AdapterPermissionError("teams", operation)
         if status_code == 404:
             raise NetworkError(
@@ -203,12 +297,13 @@ def _handle_teams_error(error: Any, operation: str) -> NoReturn:
                 f"Resource not found during {operation}: conversation or message may no longer exist",
             )
         if status_code == 429:
-            retry_after = error.get("retryAfter") if isinstance(error.get("retryAfter"), (int, float)) else None
+            retry_after_raw = _error_field(error, "retryAfter", "retry_after")
+            retry_after = retry_after_raw if isinstance(retry_after_raw, (int, float)) else None
             raise AdapterRateLimitError("teams", retry_after)
-        if isinstance(error.get("message"), str):
+        if isinstance(message, str) and message and isinstance(error, dict):
             raise NetworkError(
                 "teams",
-                f"Teams API error during {operation}: {error['message']}",
+                f"Teams API error during {operation}: {message}",
             )
 
     if isinstance(error, Exception):
@@ -264,7 +359,16 @@ class TeamsAdapter:
         self._access_token: str | None = None
         self._token_expiry: float = 0
         self._token_lock = asyncio.Lock()
-        self._jwks_client: Any | None = None  # Cached PyJWKClient for JWT verification
+
+        # Microsoft Teams SDK ``App`` — owns inbound JWT validation and
+        # activity routing (issue #93 PR 1). The ``BridgeHttpAdapter`` captures
+        # the route handler the App registers during ``app.initialize()`` so
+        # ``handle_webhook`` can dispatch serverless webhooks through it. The
+        # SDK is an optional ([teams] extra) dependency, so it is imported
+        # lazily here rather than at module scope.
+        self._bridge = BridgeHttpAdapter(self._logger)
+        self._app = self._build_app(config)
+        self._app_initialized = False
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -292,6 +396,37 @@ class TeamsAdapter:
         # AsyncMock so they don't actually wait the configured interval.
         self._stream_sleep_ms: Callable[[float], Awaitable[None]] = lambda ms: asyncio.sleep(ms / 1000.0)
 
+    def _build_app(self, config: TeamsAdapterConfig) -> Any:
+        """Construct the Microsoft Teams SDK ``App`` for this adapter.
+
+        Lazy-imports ``microsoft_teams.apps`` (the optional ``[teams]`` extra),
+        maps :class:`TeamsAdapterConfig` onto SDK ``AppOptions`` via
+        :func:`_to_app_options`, injects the :class:`BridgeHttpAdapter`, and
+        stamps the ``User-Agent: Vercel.ChatSDK`` client header — matching
+        upstream ``adapter-teams/src/index.ts`` App construction.
+
+        The SDK's ``App`` enforces inbound JWT validation by default
+        (``skip_auth`` defaults to ``False``); when ``client_id`` is configured
+        it builds a Bot Framework ``TokenValidator`` (RS256, audience =
+        ``app_id`` + ``api://`` variants, Bot Framework issuer + JWKS). We pass
+        no ``skip_auth`` so that default stands — replacing the previously
+        hand-rolled ``_verify_bot_framework_token`` block.
+        """
+        try:
+            from microsoft_teams.apps import App
+            from microsoft_teams.common import ClientOptions
+        except ImportError as exc:  # pragma: no cover - exercised via packaging
+            raise ImportError(
+                "The Teams adapter requires the 'teams' extra. Install it with: pip install 'chat-sdk[teams]'"
+            ) from exc
+
+        options = _to_app_options(config)
+        return App(
+            **options,
+            client=ClientOptions(headers={"User-Agent": "Vercel.ChatSDK"}),
+            http_server_adapter=self._bridge,
+        )
+
     @property
     def name(self) -> str:
         return self._name
@@ -313,9 +448,47 @@ class TeamsAdapter:
         return None
 
     async def initialize(self, chat: ChatInstance) -> None:
-        """Initialize the adapter."""
+        """Initialize the adapter and the underlying Teams SDK ``App``.
+
+        Mirrors upstream ``TeamsAdapter.initialize`` (set ``chat`` → register
+        event handlers → ``await app.initialize()``). ``app.initialize()``
+        registers the messaging-endpoint route with the
+        :class:`BridgeHttpAdapter` (so :meth:`handle_webhook` can dispatch) and
+        configures inbound JWT validation. We then point the SDK's
+        ``server.on_request`` at :meth:`_dispatch_activity` so JWT-validated
+        activities route to our chat-processing handlers.
+        """
         self._chat = chat
+        self._register_event_handlers()
+        if not self._app_initialized:
+            await self._app.initialize()
+            # The SDK's ``HttpServer`` invokes ``on_request`` *after* JWT
+            # validation. The default callback runs the SDK's strict typed
+            # router + a live user-token fetch; we replace it with our own
+            # dispatcher that routes the (already-authenticated) activity to
+            # the registered handlers using the adapter's existing logic.
+            self._app.server.on_request = self._dispatch_activity
+            self._app_initialized = True
         self._logger.info("Teams adapter initialized")
+
+    def _register_event_handlers(self) -> None:
+        """Register inbound handlers on the Teams SDK ``App``.
+
+        Registers the handlers via the SDK decorators so the App is aware of
+        them (parity with upstream ``registerEventHandlers``). The actual
+        dispatch happens through :meth:`_dispatch_activity` (wired in
+        :meth:`initialize`), which routes by activity type to the same handler
+        coroutines — keeping the chat-processing logic identical to the
+        pre-migration adapter while sourcing data from the SDK activity.
+        """
+        self._app.on_message(self._on_sdk_message)
+        self._app.on_message_reaction(self._on_sdk_message_reaction)
+        self._app.on_card_action(self._on_sdk_card_action)
+        self._app.on_dialog_open(self._on_sdk_dialog_open)
+        self._app.on_dialog_submit(self._on_sdk_dialog_submit)
+        self._app.on_conversation_update(self._on_sdk_conversation_update)
+        self._app.on_install_add(self._on_sdk_install)
+        self._app.on_install_remove(self._on_sdk_install)
 
     async def get_user(self, user_id: str) -> UserInfo | None:
         """Look up a Teams user via Microsoft Graph ``GET /users/{id}``.
@@ -392,55 +565,135 @@ class TeamsAdapter:
         request: Any,
         options: WebhookOptions | None = None,
     ) -> Any:
-        """Handle incoming webhook from Teams Bot Framework.
+        """Handle an incoming webhook from Teams Bot Framework.
 
-        Processes message, reaction, and card action activities.
+        Delegates to the :class:`BridgeHttpAdapter`, which feeds the request
+        through the Microsoft Teams SDK route handler: the SDK validates the
+        inbound JWT (RS256 + Bot Framework audience/issuer/JWKS) and routes the
+        activity to our handlers via :meth:`_dispatch_activity`. Returns the
+        framework-agnostic ``{body, status, headers}`` dict our consumers
+        expect.
+
+        Mirrors upstream ``TeamsAdapter.handleWebhook`` (which is a one-line
+        delegate to ``bridgeAdapter.dispatch``).
         """
-        body = await self._get_request_body(request)
-        self._logger.debug("Teams webhook raw body", {"body": body[:500] if body else ""})
+        return await self._bridge.dispatch(request, options)
 
-        # ---- JWT verification (Bot Framework tokens) ----
-        if not self._app_id:
-            self._logger.warn("Rejecting Teams webhook: app_id is not configured, cannot verify JWT")
-            return self._make_response("Unauthorized – Teams app_id not configured", 401)
+    async def _dispatch_activity(self, event: Any) -> Any:
+        """Route a JWT-validated activity to the adapter's chat-processing logic.
 
-        auth_result = await self._verify_bot_framework_token(request)
-        if auth_result is not None:
-            return auth_result
+        Installed as the Teams SDK ``HttpServer.on_request`` callback in
+        :meth:`initialize`. By the time this runs the SDK has already validated
+        the inbound JWT. ``event.body`` is the SDK's lenient ``CoreActivity``;
+        we dump it back to the camelCase activity dict our handlers consume so
+        the routing logic stays identical to the pre-migration adapter while
+        the data now flows from the SDK-parsed activity.
 
-        try:
-            activity: dict[str, Any] = json.loads(body)
-        except (json.JSONDecodeError, ValueError):
-            self._logger.error("Failed to parse request body")
-            return self._make_response("Invalid JSON", 400)
-
+        Returns an ``InvokeResponse``-shaped dict the SDK's HttpServer maps to
+        the HTTP response. Card actions (``invoke``) return the Bot Framework
+        invoke acknowledgement; everything else returns ``200`` with no body.
+        """
+        activity = self._activity_to_dict(event)
         activity_type = activity.get("type", "")
         self._logger.debug("Teams activity received", {"type": activity_type})
 
-        # Cache user context from activity metadata
+        # Cache user context from activity metadata (serviceUrl / tenantId /
+        # aadObjectId / channel + DM context) — unchanged from upstream.
         await self._cache_user_context(activity)
+
+        options = self._bridge.get_webhook_options(activity.get("id"))
 
         if activity_type == "message":
             await self._handle_message_activity(activity, options)
         elif activity_type == "messageReaction":
             self._handle_reaction_activity(activity, options)
         elif activity_type == "invoke":
-            # Adaptive card actions
+            # Adaptive card actions (Action.Execute → invoke).
             action_data = (activity.get("value") or {}).get("action", {}).get("data", {})
-            if action_data.get("actionId"):
+            if isinstance(action_data, dict) and action_data.get("actionId"):
                 await self._handle_adaptive_card_action(activity, action_data, options)
-                return self._make_json_response(
-                    json.dumps(
-                        {
-                            "statusCode": 200,
-                            "type": "application/vnd.microsoft.activity.message",
-                            "value": "",
-                        }
-                    ),
-                    200,
-                )
+                return {
+                    "status": 200,
+                    "body": {
+                        "statusCode": 200,
+                        "type": "application/vnd.microsoft.activity.message",
+                        "value": "",
+                    },
+                }
 
-        return self._make_json_response("{}", 200)
+        return {"status": 200, "body": None}
+
+    @staticmethod
+    def _activity_to_dict(event: Any) -> dict[str, Any]:
+        """Extract the camelCase activity dict from a Teams SDK activity event.
+
+        Handles both the SDK ``ActivityEvent`` (``event.body`` is a
+        ``CoreActivity`` pydantic model) and an ``ActivityContext`` (``ctx``
+        whose ``ctx.activity`` is a typed activity model). In both cases we
+        ``model_dump(by_alias=True, exclude_none=True)`` to recover the exact
+        Bot Framework wire shape (``from``/``serviceUrl``/``channelData``/…)
+        that the adapter's dict-based handlers were written against.
+        """
+        source = getattr(event, "body", None)
+        if source is None:
+            source = getattr(event, "activity", event)
+        model_dump = getattr(source, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(by_alias=True, exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        return source if isinstance(source, dict) else {}
+
+    # ------------------------------------------------------------------
+    # Teams SDK event handlers (registered in _register_event_handlers).
+    # Each sources its activity from the SDK ``ActivityContext`` and routes to
+    # the adapter's existing chat-processing logic. They are wired to the SDK
+    # decorators for parity; dispatch is driven by _dispatch_activity.
+    # ------------------------------------------------------------------
+    async def _on_sdk_message(self, ctx: Any) -> None:
+        activity = self._activity_to_dict(ctx)
+        await self._cache_user_context(activity)
+        await self._handle_message_activity(activity, self._bridge.get_webhook_options(activity.get("id")))
+
+    async def _on_sdk_message_reaction(self, ctx: Any) -> None:
+        activity = self._activity_to_dict(ctx)
+        await self._cache_user_context(activity)
+        self._handle_reaction_activity(activity, self._bridge.get_webhook_options(activity.get("id")))
+
+    async def _on_sdk_card_action(self, ctx: Any) -> Any:
+        activity = self._activity_to_dict(ctx)
+        await self._cache_user_context(activity)
+        action_data = (activity.get("value") or {}).get("action", {}).get("data", {})
+        if isinstance(action_data, dict) and action_data.get("actionId"):
+            await self._handle_adaptive_card_action(
+                activity, action_data, self._bridge.get_webhook_options(activity.get("id"))
+            )
+        return {
+            "status": 200,
+            "body": {
+                "statusCode": 200,
+                "type": "application/vnd.microsoft.activity.message",
+                "value": "",
+            },
+        }
+
+    async def _on_sdk_dialog_open(self, ctx: Any) -> Any:
+        # Modal/dialog support is out of PR-1 scope (tracked for a later wave);
+        # cache context for parity and return no task module response.
+        activity = self._activity_to_dict(ctx)
+        await self._cache_user_context(activity)
+        return None
+
+    async def _on_sdk_dialog_submit(self, ctx: Any) -> Any:
+        activity = self._activity_to_dict(ctx)
+        await self._cache_user_context(activity)
+        return None
+
+    async def _on_sdk_conversation_update(self, ctx: Any) -> None:
+        await self._cache_user_context(self._activity_to_dict(ctx))
+
+    async def _on_sdk_install(self, ctx: Any) -> None:
+        await self._cache_user_context(self._activity_to_dict(ctx))
 
     async def _cache_user_context(self, activity: dict[str, Any]) -> None:
         """Cache serviceUrl, tenantId, and channel context from activity metadata."""
@@ -2660,113 +2913,6 @@ class TeamsAdapter:
                     "teams",
                     f"Teams API error: {response.status} {error_text}",
                 )
-
-    # =========================================================================
-    # JWT verification (Bot Framework)
-    # =========================================================================
-
-    async def _verify_bot_framework_token(self, request: Any) -> Any | None:
-        """Verify the JWT Bearer token from the Bot Framework.
-
-        Returns a 401 response dict if authentication fails, or ``None`` if
-        the token is valid.
-        """
-        auth_header: str | None = self._get_header(request, "authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            self._logger.warn("Missing or invalid Authorization header on Teams webhook")
-            return self._make_response("Unauthorized", 401)
-
-        token = auth_header[7:]
-        try:
-            import jwt as pyjwt
-            from jwt import PyJWKClient
-
-            # Lazily create and cache the JWKS client
-            if self._jwks_client is None:
-                session = await self._get_http_session()
-                async with session.get(BOT_FRAMEWORK_OPENID_CONFIG_URL) as resp:
-                    if resp.status != 200:
-                        self._logger.error("Failed to fetch Bot Framework OpenID config", {"status": resp.status})
-                        return self._make_response("Unauthorized", 401)
-                    openid_config = await resp.json()
-                jwks_uri = openid_config.get("jwks_uri")
-                if not jwks_uri:
-                    self._logger.error("No jwks_uri in Bot Framework OpenID config")
-                    return self._make_response("Unauthorized", 401)
-                self._jwks_client = PyJWKClient(jwks_uri)
-
-            signing_key = await asyncio.to_thread(self._jwks_client.get_signing_key_from_jwt, token)
-            payload = pyjwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["RS256"],
-                audience=self._app_id,
-                issuer="https://api.botframework.com",
-            )
-            self._logger.debug(
-                "Teams JWT verified",
-                {
-                    "iss": payload.get("iss"),
-                    "aud": payload.get("aud"),
-                },
-            )
-            return None  # success
-        except Exception as exc:
-            self._logger.warn(f"Teams JWT verification failed: {exc}")
-            return self._make_response("Unauthorized", 401)
-
-    # =========================================================================
-    # Request/Response helpers (framework-agnostic)
-    # =========================================================================
-
-    @staticmethod
-    async def _get_request_body(request: Any) -> str:
-        """Extract the request body as a string."""
-        # `hasattr` narrows `Any` → `object` (not awaitable); using
-        # `getattr(..., None)` preserves `Any` for framework duck-typing.
-        # Handle both callable and non-callable `request.text`. Gating
-        # entry on callability would drop populated string attributes.
-        text_attr = getattr(request, "text", None)
-        if text_attr is not None:
-            if callable(text_attr):
-                result = text_attr()
-                text_attr = await result if inspect.isawaitable(result) else result
-            return text_attr.decode("utf-8") if isinstance(text_attr, (bytes, bytearray)) else str(text_attr)
-        body = getattr(request, "body", None)
-        if body is not None:
-            if callable(body):
-                body = body()
-            # Some frameworks expose `body` as an async method; if calling it
-            # produced a coroutine, await it before treating as bytes/str.
-            if inspect.isawaitable(body):
-                body = await body
-            if hasattr(body, "read"):
-                raw_result = body.read()
-                raw = await raw_result if inspect.isawaitable(raw_result) else raw_result
-                return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
-        data = getattr(request, "data", None)
-        if data is not None:
-            return data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
-        return ""
-
-    def _get_header(self, request: Any, name: str) -> str | None:
-        """Extract a header value from the request."""
-        if hasattr(request, "headers"):
-            headers = request.headers
-            if isinstance(headers, dict):
-                return headers.get(name) or headers.get(name.title())
-            if hasattr(headers, "get"):
-                return headers.get(name)
-        return None
-
-    def _make_response(self, body: str, status: int) -> Any:
-        """Create a simple text response."""
-        return {"body": body, "status": status, "headers": {"Content-Type": "text/plain"}}
-
-    def _make_json_response(self, body: str, status: int) -> Any:
-        """Create a JSON response."""
-        return {"body": body, "status": status, "headers": {"Content-Type": "application/json"}}
 
 
 def create_teams_adapter(config: TeamsAdapterConfig | None = None) -> TeamsAdapter:

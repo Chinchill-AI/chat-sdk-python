@@ -123,6 +123,26 @@ def _teams_request(body: str) -> _FakeRequest:
     )
 
 
+def _teams_skip_auth():
+    """Force the Microsoft Teams SDK to skip inbound JWT validation.
+
+    Inbound auth moved into the SDK ``App`` (issue #93 PR 1). Fixture replays
+    carry no signed Bot Framework token, so this patches ``HttpServer.initialize``
+    to enable ``skip_auth`` — exercising the real bridge → SDK → handler path
+    without signature checks. Returns a context manager covering both
+    ``adapter.initialize()`` (where the route + validator are set up) and the
+    subsequent ``handle_webhook`` dispatch.
+    """
+    from microsoft_teams.apps.http.http_server import HttpServer
+
+    real_initialize = HttpServer.initialize
+
+    def _initialize_skip_auth(self, credentials=None, skip_auth=False, cloud=None):
+        return real_initialize(self, credentials=credentials, skip_auth=True, cloud=cloud)
+
+    return patch.object(HttpServer, "initialize", _initialize_skip_auth)
+
+
 def _gchat_request(body: str) -> _FakeRequest:
     """Build a Google Chat request (JWT verification skipped when no project number)."""
     return _FakeRequest(body, {"content-type": "application/json"})
@@ -367,12 +387,16 @@ class TestTeamsFixtureReplay:
         """Send a fixture payload and assert process_message was called."""
         adapter = self._make_adapter(fixture)
         mock_chat = _make_mock_chat()
-        await adapter.initialize(mock_chat)
 
         body = json.dumps(fixture[payload_key])
         request = _teams_request(body)
 
-        with patch.object(adapter, "_verify_bot_framework_token", new_callable=AsyncMock, return_value=None):
+        # Inbound JWT validation now runs inside the Microsoft Teams SDK
+        # (issue #93 PR 1). Fixture payloads carry no signed token, so we
+        # force the SDK's own ``skip_auth`` flag while still driving the real
+        # bridge → SDK → handler dispatch path.
+        with _teams_skip_auth():
+            await adapter.initialize(mock_chat)
             result = await adapter.handle_webhook(request)
 
         assert result["status"] == 200

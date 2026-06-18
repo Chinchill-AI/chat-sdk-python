@@ -132,7 +132,7 @@ def _adapters() -> list[tuple[str, Any]]:
     from chat_sdk.adapters.discord.adapter import DiscordAdapter
     from chat_sdk.adapters.github.adapter import GitHubAdapter
     from chat_sdk.adapters.linear.adapter import LinearAdapter
-    from chat_sdk.adapters.teams.adapter import TeamsAdapter
+    from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
     from chat_sdk.adapters.telegram.adapter import TelegramAdapter
     from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
 
@@ -142,7 +142,8 @@ def _adapters() -> list[tuple[str, Any]]:
         ("whatsapp", WhatsAppAdapter._get_request_body),
         ("discord", DiscordAdapter._get_request_body),
         ("linear", LinearAdapter._get_request_body),
-        ("teams", TeamsAdapter._get_request_body),
+        # Teams' body extraction moved into the SDK dispatch bridge (#93 PR 1).
+        ("teams", BridgeHttpAdapter._read_body),
     ]
 
 
