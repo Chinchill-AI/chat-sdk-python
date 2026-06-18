@@ -26,6 +26,11 @@ class DiscordAdapterConfig:
     See: https://discord.com/developers/docs/getting-started
     """
 
+    # Override the Discord API base URL. Defaults to the DISCORD_API_URL env
+    # var, then to "https://discord.com/api/v10". Mirrors upstream
+    # ``config.apiUrl ?? process.env.DISCORD_API_URL ?? DISCORD_API_BASE``
+    # (vercel/chat adapter-discord index.ts:142).
+    api_url: str | None = None
     # Discord application ID. Defaults to DISCORD_APPLICATION_ID env var.
     application_id: str | None = None
     # Discord bot token. Defaults to DISCORD_BOT_TOKEN env var.
