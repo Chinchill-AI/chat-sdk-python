@@ -1,7 +1,7 @@
 """Bridge between framework-agnostic webhooks and the Microsoft Teams SDK.
 
 Python port of ``packages/adapter-teams/src/bridge-adapter.ts`` (synced to
-upstream ``adapter-teams@chat@4.30.0``).
+upstream ``@chat-adapter/teams@4.30.0``).
 
 The :class:`BridgeHttpAdapter` implements the Teams SDK's
 :class:`~microsoft_teams.apps.http.adapter.HttpServerAdapter` protocol. Rather
