@@ -530,6 +530,46 @@ class TestToAppOptions:
                 )
             )
 
+    def test_api_url_sets_service_url(self):
+        """``api_url`` threads into ``service_url`` for sovereign clouds (config.ts:38).
+
+        GCC-High / DoD tenants run the Bot Framework on a different host; upstream
+        feeds ``config.apiUrl`` to the SDK ``AppOptions.serviceUrl`` so all outbound
+        calls target that endpoint instead of the global default.
+        """
+        opts = _to_app_options(
+            TeamsAdapterConfig(
+                app_id="app-1",
+                app_password="secret-1",
+                api_url="https://smba.infra.gov.teams.microsoft.us/",
+            )
+        )
+        assert opts["service_url"] == "https://smba.infra.gov.teams.microsoft.us/"
+
+    def test_no_api_url_omits_service_url(self):
+        """Absent ``api_url``/``TEAMS_API_URL``, ``service_url`` is left unset so the
+        SDK applies its own global default rather than receiving an empty string."""
+        opts = _to_app_options(TeamsAdapterConfig(app_id="app-1", app_password="secret-1"))
+        assert "service_url" not in opts
+
+    def test_api_url_env_fallback(self, monkeypatch):
+        """``TEAMS_API_URL`` env var is the fallback when ``api_url`` is unset."""
+        monkeypatch.setenv("TEAMS_API_URL", "https://smba.gov.teams.microsoft.us/")
+        opts = _to_app_options(TeamsAdapterConfig(app_id="app-1", app_password="secret-1"))
+        assert opts["service_url"] == "https://smba.gov.teams.microsoft.us/"
+
+    def test_api_url_config_overrides_env(self, monkeypatch):
+        """Explicit ``api_url`` wins over ``TEAMS_API_URL`` (config field precedence)."""
+        monkeypatch.setenv("TEAMS_API_URL", "https://env.example.us/")
+        opts = _to_app_options(
+            TeamsAdapterConfig(
+                app_id="app-1",
+                app_password="secret-1",
+                api_url="https://explicit.example.us/",
+            )
+        )
+        assert opts["service_url"] == "https://explicit.example.us/"
+
 
 # ---------------------------------------------------------------------------
 # Message ID patterns
@@ -672,6 +712,138 @@ class TestMessageAction:
         response = await adapter.handle_webhook(request)
         assert response["status"] == 200
         assert chat.process_action.called
+
+
+# ---------------------------------------------------------------------------
+# ChoiceSet auto-submit fan-out (regression for single-dispatch bug)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoSubmitFanOut:
+    """ChoiceSet (Select/RadioSelect) submissions carry the ``__auto_submit``
+    sentinel action ID and a per-input dict, e.g.
+    ``{"actionId": "__auto_submit", "color": "red", "size": "L"}``.
+
+    Upstream (adapter-teams/src/index.ts:404-471 + fanOutAutoSubmit 513-556)
+    fans this out into ONE ``chat.processAction`` per input key so a handler
+    registered as ``on_action("color")`` fires. The pre-fix Python adapter
+    dispatched a SINGLE action with ``action_id="__auto_submit"`` and the full
+    dict as ``value`` — these tests fail on that code.
+    """
+
+    def test_message_action_fans_out_per_input_key(self):
+        adapter = _make_adapter(logger=_make_logger())
+        chat = _make_mock_chat()
+        adapter._chat = chat
+
+        activity = {
+            "type": "message",
+            "id": "msg-1",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        action_value = {"actionId": "__auto_submit", "color": "red", "size": "L"}
+
+        adapter._handle_message_action(activity, action_value)
+
+        # One process_action per input key (regression: pre-fix dispatched once).
+        assert chat.process_action.call_count == 2
+        dispatched = {call.args[0].action_id: call.args[0].value for call in chat.process_action.call_args_list}
+        assert dispatched == {"color": "red", "size": "L"}
+        # The sentinel must never leak through as an action ID.
+        assert "__auto_submit" not in dispatched
+
+    async def test_adaptive_card_action_fans_out_per_input_key(self):
+        adapter = _make_adapter(logger=_make_logger())
+        chat = _make_mock_chat()
+        adapter._chat = chat
+
+        activity = {
+            "type": "invoke",
+            "id": "inv-1",
+            "from": {"id": "user-2", "name": "Bob"},
+            "conversation": {"id": "19:def@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        action_data = {"actionId": "__auto_submit", "priority": "high"}
+
+        await adapter._handle_adaptive_card_action(activity, action_data)
+
+        assert chat.process_action.call_count == 1
+        event = chat.process_action.call_args.args[0]
+        assert event.action_id == "priority"
+        assert event.value == "high"
+
+    def test_fan_out_drops_msteams_transport_key(self):
+        """The ``msteams`` transport key injected by Teams infra is not user input
+        and must be filtered out of the fan-out (upstream filters actionId + msteams)."""
+        adapter = _make_adapter(logger=_make_logger())
+        chat = _make_mock_chat()
+        adapter._chat = chat
+
+        activity = {
+            "id": "msg-1",
+            "from": {"id": "u", "name": "U"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        action_value = {
+            "actionId": "__auto_submit",
+            "msteams": {"type": "messageBack"},
+            "topic": "billing",
+        }
+
+        adapter._handle_message_action(activity, action_value)
+
+        assert chat.process_action.call_count == 1
+        event = chat.process_action.call_args.args[0]
+        assert event.action_id == "topic"
+        assert event.value == "billing"
+
+    def test_fan_out_non_string_value_becomes_none(self):
+        """Non-string input values map to ``None`` per upstream
+        ``typeof val === "string" ? val : undefined`` (index.ts:551)."""
+        adapter = _make_adapter(logger=_make_logger())
+        chat = _make_mock_chat()
+        adapter._chat = chat
+
+        activity = {
+            "id": "msg-1",
+            "from": {"id": "u", "name": "U"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        action_value = {"actionId": "__auto_submit", "flags": ["a", "b"]}
+
+        adapter._handle_message_action(activity, action_value)
+
+        assert chat.process_action.call_count == 1
+        event = chat.process_action.call_args.args[0]
+        assert event.action_id == "flags"
+        assert event.value is None
+
+    def test_plain_button_not_fanned_out(self):
+        """A plain Action.Submit button (no ``__auto_submit`` sentinel) keeps the
+        single-dispatch path with its own action ID — fan-out must not regress it."""
+        adapter = _make_adapter(logger=_make_logger())
+        chat = _make_mock_chat()
+        adapter._chat = chat
+
+        activity = {
+            "id": "msg-1",
+            "from": {"id": "u", "name": "U"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+        action_value = {"actionId": "approve_btn", "value": "yes"}
+
+        adapter._handle_message_action(activity, action_value)
+
+        assert chat.process_action.call_count == 1
+        event = chat.process_action.call_args.args[0]
+        assert event.action_id == "approve_btn"
+        assert event.value == "yes"
 
 
 # ---------------------------------------------------------------------------
