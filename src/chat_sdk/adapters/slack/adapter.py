@@ -541,15 +541,16 @@ class SlackAdapter:
             self._encryption_key = decode_key(encryption_key_raw)
 
         # Custom Slack Web API base URL (e.g. proxy, mock, Enterprise routing).
-        # ``config.apiUrl ?? process.env.SLACK_API_URL`` upstream (index.ts:617).
-        # When ``None`` we omit ``base_url`` from the client constructors
-        # entirely, so slack_sdk keeps its built-in ``https://slack.com/api/``
-        # default (it rejects ``base_url=None``). Threaded into BOTH the async
-        # ``AsyncWebClient`` cache and the synchronous ``web_client`` escape
-        # hatch, mirroring upstream's default + per-token ``slackApiUrl``.
-        self._slack_api_url: str | None = (
-            config.api_url if config.api_url is not None else os.environ.get("SLACK_API_URL")
-        )
+        # ``config.apiUrl ?? process.env.SLACK_API_URL`` upstream (index.ts:617),
+        # consumed via the truthy spread ``...(this.slackApiUrl ? {...} : {})``
+        # at every client construction — so an empty string falls back to the
+        # built-in default. We mirror that here: an empty ``apiUrl`` (or env)
+        # resolves to ``None``. When ``None`` we omit ``base_url`` from the
+        # client constructors entirely, so slack_sdk keeps its built-in
+        # ``https://slack.com/api/`` default (it rejects ``base_url=None``).
+        # Threaded into BOTH the async ``AsyncWebClient`` cache and the
+        # synchronous ``web_client`` escape hatch.
+        self._slack_api_url: str | None = (config.api_url or os.environ.get("SLACK_API_URL")) or None
 
     # ------------------------------------------------------------------
     # Properties (Adapter protocol)
@@ -863,11 +864,12 @@ class SlackAdapter:
 
         from slack_sdk.web.async_client import AsyncWebClient
 
-        # Only pass ``base_url`` when an override is configured — slack_sdk
-        # rejects ``base_url=None`` (it requires a string), so mirroring
-        # upstream's conditional spread keeps the built-in default otherwise.
+        # Only pass ``base_url`` when a truthy override is configured — slack_sdk
+        # rejects ``base_url=None`` (it requires a string), and an empty string
+        # must fall back to the built-in default, so mirroring upstream's truthy
+        # spread keeps the default otherwise.
         client_kwargs: dict[str, Any] = {"token": resolved_token}
-        if self._slack_api_url is not None:
+        if self._slack_api_url:
             client_kwargs["base_url"] = self._slack_api_url
         client = AsyncWebClient(**client_kwargs)
         self._client_cache[resolved_token] = client
@@ -912,10 +914,10 @@ class SlackAdapter:
         if client is None:
             from slack_sdk import WebClient
 
-            # Same conditional-``base_url`` rule as ``_get_client`` — pass the
-            # override only when configured so slack_sdk keeps its default.
+            # Same truthy ``base_url`` rule as ``_get_client`` — pass the
+            # override only when truthy so slack_sdk keeps its default.
             web_client_kwargs: dict[str, Any] = {"token": token}
-            if self._slack_api_url is not None:
+            if self._slack_api_url:
                 web_client_kwargs["base_url"] = self._slack_api_url
             client = WebClient(**web_client_kwargs)
             self._web_client_cache[token] = client

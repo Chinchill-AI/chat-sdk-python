@@ -123,14 +123,15 @@ class GitHubAdapter:
 
         # Custom GitHub API base URL (e.g. GitHub Enterprise Server). Upstream
         # threads ``config.apiUrl ?? process.env.GITHUB_API_URL`` into every
-        # Octokit ``baseUrl`` (index.ts:201). We have no Octokit -- our REST
-        # calls go through ``_github_api_request`` and the installation-token
-        # exchange -- so we normalize the override (strip a trailing slash so
-        # ``f"{base}{path}"`` joins cleanly) and substitute it for the hardcoded
-        # ``https://api.github.com`` at both sites. ``is not None`` honors an
-        # explicit empty string (CLAUDE.md truthiness-trap hazard).
-        config_api_url = config.get("api_url")
-        api_url_raw = config_api_url if config_api_url is not None else os.environ.get("GITHUB_API_URL")
+        # Octokit ``baseUrl`` via the truthy spread ``...(this.apiUrl ? { baseUrl }
+        # : {})`` (index.ts:201/217/...), so an empty string falls back to the
+        # default. We have no Octokit -- our REST calls go through
+        # ``_github_api_request`` and the installation-token exchange -- so we
+        # normalize the override (strip a trailing slash so ``f"{base}{path}"``
+        # joins cleanly) and substitute it for the hardcoded
+        # ``https://api.github.com`` at both sites. The truthy fallback means an
+        # empty ``apiUrl`` (or env) uses the default endpoint.
+        api_url_raw = config.get("api_url") or os.environ.get("GITHUB_API_URL")
         self._api_url = api_url_raw.rstrip("/") if api_url_raw else GITHUB_API_BASE_URL
 
         # Auth configuration

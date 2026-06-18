@@ -13,22 +13,64 @@ Pre-existing parity gaps ported from upstream chat@4.30.0:
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chat_sdk.adapters.discord.adapter import DISCORD_API_BASE, DiscordAdapter
-from chat_sdk.adapters.discord.types import DiscordAdapterConfig
-from chat_sdk.adapters.github.adapter import GITHUB_API_BASE_URL, GitHubAdapter
-from chat_sdk.adapters.linear.adapter import LINEAR_API_URL, LinearAdapter
-from chat_sdk.adapters.linear.types import LinearAdapterAPIKeyConfig
-from chat_sdk.adapters.slack.adapter import SlackAdapter
-from chat_sdk.adapters.slack.types import SlackAdapterConfig
-from chat_sdk.logger import ConsoleLogger
-from chat_sdk.shared.errors import ValidationError
+# ---------------------------------------------------------------------------
+# Stub slack_sdk so the Slack api_url tests run without the real dependency
+# installed. ``slack_sdk`` lives only in the optional ``slack``/``all`` extras
+# (not the dev group CI installs), so a module-level ``importorskip`` here would
+# collect-as-skipped the ENTIRE file -- silently disabling the Discord/GitHub/
+# Linear api_url tests and the get_installation_id regression tests in CI. We
+# install a minimal fake (mirroring ``tests/test_slack_client_cache.py``)
+# *before* importing ``SlackAdapter`` so its deferred ``from slack_sdk ...``
+# imports resolve to the stub. The Slack tests then patch these classes onto the
+# stub via ``_patch_slack_clients``.
+# ---------------------------------------------------------------------------
 
-pytest.importorskip("slack_sdk")
+_fake_slack_sdk = ModuleType("slack_sdk")
+_fake_slack_sdk_web = ModuleType("slack_sdk.web")
+_fake_slack_sdk_web_async = ModuleType("slack_sdk.web.async_client")
+
+
+class _FakeAsyncWebClient:
+    """Minimal stand-in for slack_sdk.web.async_client.AsyncWebClient."""
+
+    def __init__(self, *, token: str = "", base_url: str | None = None) -> None:
+        self.token = token
+        self.base_url = base_url
+
+
+class _FakeWebClient:
+    """Minimal stand-in for slack_sdk.WebClient."""
+
+    def __init__(self, *, token: str = "", base_url: str | None = None) -> None:
+        self.token = token
+        self.base_url = base_url
+
+
+_fake_slack_sdk_web_async.AsyncWebClient = _FakeAsyncWebClient  # type: ignore[attr-defined]
+_fake_slack_sdk_web.async_client = _fake_slack_sdk_web_async  # type: ignore[attr-defined]
+_fake_slack_sdk.web = _fake_slack_sdk_web  # type: ignore[attr-defined]
+_fake_slack_sdk.WebClient = _FakeWebClient  # type: ignore[attr-defined]
+
+sys.modules.setdefault("slack_sdk", _fake_slack_sdk)
+sys.modules.setdefault("slack_sdk.web", _fake_slack_sdk_web)
+sys.modules.setdefault("slack_sdk.web.async_client", _fake_slack_sdk_web_async)
+
+from chat_sdk.adapters.discord.adapter import DISCORD_API_BASE, DiscordAdapter  # noqa: E402
+from chat_sdk.adapters.discord.types import DiscordAdapterConfig  # noqa: E402
+from chat_sdk.adapters.github.adapter import GITHUB_API_BASE_URL, GitHubAdapter  # noqa: E402
+from chat_sdk.adapters.linear.adapter import LINEAR_API_URL, LinearAdapter  # noqa: E402
+from chat_sdk.adapters.linear.types import LinearAdapterAPIKeyConfig  # noqa: E402
+from chat_sdk.adapters.slack.adapter import SlackAdapter  # noqa: E402
+from chat_sdk.adapters.slack.types import SlackAdapterConfig  # noqa: E402
+from chat_sdk.logger import ConsoleLogger  # noqa: E402
+from chat_sdk.shared.errors import ValidationError  # noqa: E402
 
 TEST_PUBLIC_KEY = "a" * 64
 
@@ -141,6 +183,19 @@ class TestSlackApiUrl:
         assert "base_url" not in async_client.kwargs
         assert "base_url" not in sync_client.kwargs
 
+    def test_empty_api_url_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Upstream feeds the WebClients via the truthy spread
+        # ``...(this.slackApiUrl ? {...} : {})`` (index.ts:577/621), so an empty
+        # ``apiUrl`` must fall back to slack_sdk's built-in default -- never pass
+        # ``base_url=""`` (which would point the WebClients at an empty host).
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make(api_url="")
+        assert adapter._slack_api_url is None
+        async_client = adapter._get_client("xoxb-tok")
+        sync_client = adapter._get_web_client_for_token("xoxb-tok")
+        assert "base_url" not in async_client.kwargs
+        assert "base_url" not in sync_client.kwargs
+
     def test_env_fallback_used_when_config_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SLACK_API_URL", "https://slack.env.example/api/")
         _patch_slack_clients(monkeypatch)
@@ -193,6 +248,17 @@ class TestDiscordApiUrl:
         adapter = self._make(api_url="https://discord.proxy.example/api/v10")
         assert adapter._api_base_url == "https://discord.proxy.example/api/v10"
 
+    async def test_empty_api_url_falls_back_to_default(self) -> None:
+        # ``_discord_fetch`` joins ``f"{base}{path}"`` directly, so an empty
+        # ``apiUrl`` must resolve to ``DISCORD_API_BASE`` rather than producing
+        # a relative ``/channels/...`` URL.
+        adapter = self._make(api_url="")
+        assert adapter._api_base_url == DISCORD_API_BASE
+        session = _RecordingSession({"id": "1"})
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        await adapter._discord_fetch("/channels/123/messages", "POST", body={"content": "hi"})
+        assert session.urls == [f"{DISCORD_API_BASE}/channels/123/messages"]
+
     def test_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DISCORD_API_URL", "https://discord.env.example/api/v10")
         adapter = self._make()
@@ -242,6 +308,17 @@ class TestGitHubApiUrl:
         # f"{base}{path}" joins cleanly with leading-slash paths.
         adapter = self._make(api_url="https://github.example.com/api/v3/")
         assert adapter._api_url == "https://github.example.com/api/v3"
+
+    async def test_empty_api_url_falls_back_to_default(self) -> None:
+        # Upstream's truthy spread ``...(this.apiUrl ? { baseUrl } : {})`` means
+        # an empty ``apiUrl`` uses the default api.github.com endpoint, not an
+        # empty base that would yield a relative request URL.
+        adapter = self._make(api_url="")
+        assert adapter._api_url == GITHUB_API_BASE_URL
+        session = _RecordingSession({"id": 1})
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        await adapter._github_api_request("GET", "/repos/acme/app/pulls/1")
+        assert session.urls == ["https://api.github.com/repos/acme/app/pulls/1"]
 
     def test_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GITHUB_API_URL", "https://github.env.example/api/v3")
@@ -307,6 +384,18 @@ class TestLinearApiUrl:
     def test_custom_api_url_stored(self) -> None:
         adapter = self._make(api_url="https://linear.proxy.example/graphql")
         assert adapter._api_url == "https://linear.proxy.example/graphql"
+
+    async def test_empty_api_url_falls_back_to_default(self) -> None:
+        # ``_graphql_query`` POSTs straight to ``self._api_url``; the truthy
+        # fallback (mirroring upstream ``...(this.apiUrl ? { apiUrl } : {})``)
+        # means an empty ``apiUrl`` posts to the real Linear endpoint rather
+        # than an empty/relative URL.
+        adapter = self._make(api_url="")
+        assert adapter._api_url == LINEAR_API_URL
+        session = _RecordingSession({"data": {}})
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        await adapter._graphql_query("query { viewer { id } }")
+        assert session.urls == [LINEAR_API_URL]
 
     def test_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LINEAR_API_URL", "https://linear.env.example/graphql")
