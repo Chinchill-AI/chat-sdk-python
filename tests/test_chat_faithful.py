@@ -10,8 +10,10 @@ TS file: packages/chat/src/chat.test.ts  (3059 lines, 96 tests)
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -35,10 +37,12 @@ from chat_sdk.types import (
     EmojiValue,
     MessageContext,
     MessageSubject,
+    ModalResponse,
     ModalSubmitEvent,
     QueueEntry,
     ReactionEvent,
     SlashCommandEvent,
+    WebhookOptions,
 )
 
 HELP_REGEX = re.compile(r"help", re.IGNORECASE)
@@ -3853,13 +3857,55 @@ class TestLockScope:
 
 
 # ============================================================================
-# 23. persistMessageHistory (tests 92-93)
+# 23. persistThreadHistory (tests 92-97)
 # ============================================================================
 
 
-class TestPersistMessageHistory:
-    # TS: "should cache incoming messages when adapter has persistMessageHistory"
-    async def test_should_cache_incoming_messages_when_adapter_has_persistmessagehistory(self):
+def _record_append_to_list_calls(state: MockStateAdapter) -> list[tuple[str, Any, int | None, int | None]]:
+    """Wrap ``state.append_to_list`` to record ``(key, value, max_length, ttl_ms)``.
+
+    Python stand-in for the TS mock state's ``vi.fn()``-wrapped
+    ``appendToList`` that the upstream config-precedence tests assert on.
+    """
+    calls: list[tuple[str, Any, int | None, int | None]] = []
+    real_append = state.append_to_list
+
+    async def _recording_append(
+        key: str, value: Any, *, max_length: int | None = None, ttl_ms: int | None = None
+    ) -> None:
+        calls.append((key, value, max_length, ttl_ms))
+        await real_append(key, value, max_length=max_length, ttl_ms=ttl_ms)
+
+    state.append_to_list = _recording_append
+    return calls
+
+
+class TestPersistThreadHistory:
+    # TS: "caches incoming messages when adapter sets persistThreadHistory"
+    async def test_caches_incoming_messages_when_adapter_sets_persistthreadhistory(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello from WhatsApp")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        stored = state.cache.get("msg-history:whatsapp:phone:user1")
+        assert stored is not None
+        assert isinstance(stored, list)
+        assert stored[0]["id"] == "msg-1"
+
+    # TS: "caches incoming messages when adapter sets the deprecated persistMessageHistory flag"
+    async def test_caches_incoming_messages_when_adapter_sets_the_deprecated_persistmessagehistory_flag(self):
         adapter = create_mock_adapter("whatsapp")
         adapter.persist_message_history = True
         state = create_mock_state()
@@ -3881,8 +3927,8 @@ class TestPersistMessageHistory:
         assert isinstance(stored, list)
         assert stored[0]["id"] == "msg-1"
 
-    # TS: "should NOT cache incoming messages when adapter does not set persistMessageHistory"
-    async def test_should_not_cache_incoming_messages_when_adapter_does_not_set_persistmessagehistory(self):
+    # TS: "does not cache when adapter sets neither flag"
+    async def test_does_not_cache_when_adapter_sets_neither_flag(self):
         chat, adapter, state = await _init_chat()
 
         msg = create_test_message("msg-2", "Hello from Slack")
@@ -3890,6 +3936,702 @@ class TestPersistMessageHistory:
 
         history_keys = [k for k in state.cache if k.startswith("msg-history:")]
         assert len(history_keys) == 0
+
+    # TS: "honors top-level config.messageHistory (deprecated alias) when threadHistory is not set"
+    async def test_honors_top_level_config_messagehistory_deprecated_alias_when_threadhistory_is_not_set(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+        append_calls = _record_append_to_list_calls(state)
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+            message_history={"max_messages": 5, "ttl_ms": 12_345},
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        matching = [call for call in append_calls if call[0] == "msg-history:whatsapp:phone:user1"]
+        assert len(matching) == 1
+        _key, value, max_length, ttl_ms = matching[0]
+        assert value["id"] == "msg-1"
+        assert max_length == 5
+        assert ttl_ms == 12_345
+
+    # TS: "threadHistory takes precedence when both threadHistory and messageHistory are set"
+    async def test_threadhistory_takes_precedence_when_both_threadhistory_and_messagehistory_are_set(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        state = create_mock_state()
+        append_calls = _record_append_to_list_calls(state)
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+            thread_history={"max_messages": 5, "ttl_ms": 1_000},
+            message_history={"max_messages": 999, "ttl_ms": 999_999},
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        matching = [call for call in append_calls if call[0] == "msg-history:whatsapp:phone:user1"]
+        assert len(matching) == 1
+        _key, value, max_length, ttl_ms = matching[0]
+        assert value["id"] == "msg-1"
+        assert max_length == 5
+        assert ttl_ms == 1_000
+
+    # TS: "persists when both persistThreadHistory and persistMessageHistory are set on the adapter"
+    async def test_persists_when_both_persistthreadhistory_and_persistmessagehistory_are_set_on_the_adapter(self):
+        adapter = create_mock_adapter("whatsapp")
+        adapter.persist_thread_history = True
+        adapter.persist_message_history = True
+        state = create_mock_state()
+
+        config = ChatConfig(
+            user_name="testbot",
+            adapters={"whatsapp": adapter},
+            state=state,
+            logger=MockLogger(),
+        )
+        chat = Chat(config)
+        await chat.webhooks["whatsapp"]("request")
+
+        msg = create_test_message("msg-1", "Hello")
+        await chat.handle_incoming_message(adapter, "whatsapp:phone:user1", msg)
+
+        stored = state.cache.get("msg-history:whatsapp:phone:user1")
+        assert stored is not None
+        assert stored[0]["id"] == "msg-1"
+
+
+# ============================================================================
+# 21. processMessage return value (core slice of vercel/chat#444)
+# ============================================================================
+
+
+class TestProcessMessageAwaitable:
+    """Faithful port of the TS root-describe test added by vercel/chat#444.
+
+    Only the core ``processMessage`` slice of #444 applies to the Python
+    port — the ``@chat-adapter/web`` package itself is browser-only and not
+    ported (see docs/UPSTREAM_SYNC.md).
+    """
+
+    # TS: "should return an awaitable Promise from processMessage"
+    async def test_should_return_an_awaitable_promise_from_processmessage(self):
+        chat, adapter, _state = await _init_chat()
+
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handler_started.set()
+            await release_handler.wait()
+
+        message = create_test_message("msg-await-1", "Hey @slack-bot ping")
+        task = chat.process_message(adapter, "slack:C123:await.1", message)
+
+        assert isinstance(task, asyncio.Task)
+
+        # Yield so the handler kicks off but cannot complete until released.
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        assert not task.done()
+
+        release_handler.set()
+        await asyncio.wait_for(task, timeout=1)
+        assert task.done()
+
+
+# ============================================================================
+# 22. queue/burst subject rehydration after a JSON roundtrip (vercel/chat#459
+#     + #495). Gated on message.subject (PR #131): the skipif below evaluates
+#     BaseAdapter.fetch_subject at collection time, so these activate
+#     automatically once #131 merges — no manual unskip step.
+# ============================================================================
+
+
+def _wrap_enqueue_with_json_roundtrip(state: MockStateAdapter) -> None:
+    """Make ``state.enqueue`` JSON-roundtrip entries like a persistent backend.
+
+    TS does ``JSON.parse(JSON.stringify(entry))``; the Python equivalent of
+    what Redis/Postgres do to a queued message is ``Message.to_json()`` →
+    JSON → plain dict (``Chat._rehydrate_message`` upgrades it on dequeue).
+    """
+    import json
+
+    real_enqueue = state.enqueue
+
+    async def wrapped(thread_id: str, entry: QueueEntry, max_size: int) -> int:
+        plain = json.loads(json.dumps(entry.message.to_json()))
+        roundtripped = QueueEntry(
+            message=plain,  # type: ignore[arg-type]
+            enqueued_at=entry.enqueued_at,
+            expires_at=entry.expires_at,
+        )
+        return await real_enqueue(thread_id, roundtripped, max_size)
+
+    state.enqueue = wrapped  # type: ignore[method-assign]
+
+
+def _base_adapter_has_fetch_subject() -> bool:
+    from chat_sdk.types import BaseAdapter
+
+    return hasattr(BaseAdapter, "fetch_subject")
+
+
+requires_fetch_subject = pytest.mark.skipif(
+    not _base_adapter_has_fetch_subject(),
+    reason="message.subject infrastructure lands with PR #131; this fidelity "
+    "port auto-unskips once BaseAdapter.fetch_subject exists",
+)
+
+
+class TestConcurrencyQueueSubjectRehydration:
+    # TS: "should wire adapter on queued message so fetchSubject works after JSON roundtrip"
+    @requires_fetch_subject
+    async def test_should_wire_adapter_on_queued_message_so_fetchsubject_works_after_json_roundtrip(
+        self,
+    ):
+        from unittest.mock import AsyncMock
+
+        state = create_mock_state()
+        _wrap_enqueue_with_json_roundtrip(state)
+        adapter = create_mock_adapter("slack")
+        mock_subject = {"type": "issue", "id": "ENG-1", "title": "Queue test", "raw": {}}
+        adapter.fetch_subject = AsyncMock(return_value=mock_subject)  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        received_subject: Any = "not-called"
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal received_subject
+            received_subject = await message.subject
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+        msg = create_test_message("msg-sub-q", "Hey @slack-bot test")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        trigger = create_test_message("msg-sub-trigger", "Hey @slack-bot go")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", trigger)
+
+        assert received_subject == mock_subject
+        assert adapter.fetch_subject.await_count == 2  # type: ignore[attr-defined]
+
+
+class TestConcurrencyBurstRehydration:
+    # TS: "should rehydrate queued messages after JSON roundtrip"
+    @requires_fetch_subject
+    async def test_should_rehydrate_queued_messages_after_json_roundtrip(self):
+        from unittest.mock import AsyncMock
+
+        state = create_mock_state()
+        _wrap_enqueue_with_json_roundtrip(state)
+        adapter = create_mock_adapter("slack")
+        mock_subject = {"type": "issue", "id": "ENG-414", "title": "Burst test", "raw": {}}
+        adapter.fetch_subject = AsyncMock(return_value=mock_subject)  # type: ignore[attr-defined]
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=80),
+        )
+
+        received_subject: Any = "not-called"
+        received_skipped_subject: Any = "not-called"
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal received_subject, received_skipped_subject
+            received_subject = await message.subject
+            if context is not None and context.skipped:
+                received_skipped_subject = await context.skipped[0].subject
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-burst-json-1", "Hey @slack-bot one"),
+            )
+        )
+        await asyncio.sleep(0.005)
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-burst-json-2", "Hey @slack-bot two"),
+        )
+        await task
+
+        assert received_subject == mock_subject
+        assert received_skipped_subject == mock_subject
+        assert adapter.fetch_subject.await_count == 2  # type: ignore[attr-defined]
+
+
+# ============================================================================
+# 24. Action callbackUrl handling (vercel/chat#454)
+# ============================================================================
+
+
+def _make_callback_chat() -> tuple[Chat, MockAdapter, MockStateAdapter, MockLogger]:
+    """Like _make_chat but returns the logger so error logs can be asserted."""
+    adapter = create_mock_adapter("slack")
+    state = create_mock_state()
+    logger = MockLogger()
+    config = ChatConfig(
+        user_name="testbot",
+        adapters={"slack": adapter},
+        state=state,
+        logger=logger,
+    )
+    return Chat(config), adapter, state, logger
+
+
+async def _process_action_and_wait(chat: Chat, event: ActionEvent) -> None:
+    """Dispatch an action and deterministically wait for the handler task."""
+    tasks: list[Any] = []
+    chat.process_action(event, WebhookOptions(wait_until=tasks.append))
+    await asyncio.gather(*tasks)
+
+
+class TestActionsCallbackUrl:
+    """TS describe("processAction") — callbackUrl additions."""
+
+    # TS: "should decode callbackUrl token and POST to it"
+    async def test_should_decode_callbackurl_token_and_post_to_it(self):
+        chat, adapter, state = await _init_chat()
+        received: list[ActionEvent] = []
+
+        async def _handler(event):
+            received.append(event)
+
+        chat.on_action("approve", _handler)
+
+        state.cache["chat:callback:testtoken123"] = {
+            "url": "https://example.com/webhook/hook1",
+            "originalValue": "order-789",
+        }
+
+        event = _make_action_event(adapter, action_id="approve", value="__cb:testtoken123")
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(chat, event)
+
+        assert len(received) == 1
+        assert received[0].value == "order-789"
+
+        assert mock_fetch.await_count == 1
+        assert mock_fetch.await_args.args == ("https://example.com/webhook/hook1",)
+        assert mock_fetch.await_args.kwargs["method"] == "POST"
+        assert mock_fetch.await_args.kwargs["headers"] == {"Content-Type": "application/json"}
+
+        body = json.loads(mock_fetch.await_args.kwargs["body"])
+        assert body == {
+            "type": "action",
+            "actionId": "approve",
+            "value": "order-789",
+            "user": {"id": "U123", "name": "user"},
+            "threadId": "slack:C123:1234.5678",
+            "messageId": "msg-1",
+        }
+
+    # TS: "should decode callbackUrl token with no original value"
+    async def test_should_decode_callbackurl_token_with_no_original_value(self):
+        chat, adapter, state = await _init_chat()
+        received: list[ActionEvent] = []
+
+        chat.on_action(lambda event: received.append(event))
+
+        state.cache["chat:callback:tok999"] = {"url": "https://example.com/webhook/hook2"}
+
+        event = _make_action_event(adapter, action_id="deny", value="__cb:tok999")
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(chat, event)
+
+        assert len(received) == 1
+        assert received[0].value is None
+
+        body = json.loads(mock_fetch.await_args.kwargs["body"])
+        assert "value" not in body
+
+    # TS: "should preserve callback-like values when no callbackUrl is stored"
+    async def test_should_preserve_callbacklike_values_when_no_callbackurl_is_stored(self):
+        chat, adapter, state = await _init_chat()
+        received: list[ActionEvent] = []
+
+        async def _handler(event):
+            received.append(event)
+
+        chat.on_action("approve", _handler)
+
+        event = _make_action_event(adapter, action_id="approve", value="__cb:not-a-stored-token")
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(chat, event)
+
+        assert len(received) == 1
+        assert received[0].value == "__cb:not-a-stored-token"
+        assert mock_fetch.await_count == 0
+
+    # TS: "should fire onAction handlers alongside callbackUrl POST"
+    async def test_should_fire_onaction_handlers_alongside_callbackurl_post(self):
+        chat, adapter, state = await _init_chat()
+        catch_all_calls: list[ActionEvent] = []
+        specific_calls: list[ActionEvent] = []
+
+        chat.on_action(lambda event: catch_all_calls.append(event))
+
+        async def _specific(event):
+            specific_calls.append(event)
+
+        chat.on_action("approve", _specific)
+
+        state.cache["chat:callback:tok555"] = {"url": "https://example.com/webhook/hook3"}
+
+        event = _make_action_event(adapter, action_id="approve", value="__cb:tok555")
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(chat, event)
+
+        assert len(catch_all_calls) == 1
+        assert len(specific_calls) == 1
+        assert mock_fetch.await_count == 1
+
+
+# ============================================================================
+# 25. Modal callbackUrl handling (vercel/chat#454)
+# ============================================================================
+
+
+def _make_modal_submit_event(
+    adapter: MockAdapter,
+    *,
+    callback_id: str = "feedback_modal",
+    view_id: str = "V789",
+    values: dict[str, str] | None = None,
+) -> ModalSubmitEvent:
+    return ModalSubmitEvent(
+        callback_id=callback_id,
+        view_id=view_id,
+        values=values if values is not None else {},
+        user=_make_author(),
+        adapter=adapter,
+        raw={},
+    )
+
+
+class TestModalCallbackUrl:
+    """TS describe("processModalSubmit") — callbackUrl additions."""
+
+    # TS: "should POST to modal callbackUrl on submit"
+    async def test_should_post_to_modal_callbackurl_on_submit(self):
+        chat, adapter, state = await _init_chat()
+        captured_action: list[ActionEvent] = []
+
+        async def _action_handler(event):
+            captured_action.append(event)
+
+        chat.on_action("open_form", _action_handler)
+
+        action_event = _make_action_event(adapter, action_id="open_form", trigger_id="trigger-123")
+        await _process_action_and_wait(chat, action_event)
+
+        modal = {
+            "type": "modal",
+            "callback_id": "feedback_modal",
+            "title": "Feedback",
+            "callback_url": "https://example.com/webhook/modal-hook",
+            "children": [],
+        }
+        assert len(captured_action) == 1
+        await captured_action[0].open_modal(modal)
+
+        modal_context_keys = [k for k in state.cache if k.startswith("modal-context:")]
+        assert len(modal_context_keys) == 1
+        context_id = modal_context_keys[0].split(":")[-1]
+
+        modal_handler_calls: list[ModalSubmitEvent] = []
+
+        async def _modal_handler(event):
+            modal_handler_calls.append(event)
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+        tasks: list[Any] = []
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await chat.process_modal_submit(
+                _make_modal_submit_event(adapter, values={"message": "Great!"}),
+                context_id,
+                WebhookOptions(wait_until=tasks.append),
+            )
+            await asyncio.gather(*tasks)
+
+        assert len(modal_handler_calls) == 1
+        assert mock_fetch.await_count == 1
+        assert mock_fetch.await_args.args == ("https://example.com/webhook/modal-hook",)
+        assert mock_fetch.await_args.kwargs["method"] == "POST"
+
+        body = json.loads(mock_fetch.await_args.kwargs["body"])
+        assert body == {
+            "type": "modal_submit",
+            "callbackId": "feedback_modal",
+            "values": {"message": "Great!"},
+            "user": {"id": "U123", "name": "user"},
+        }
+
+    # TS: "should not POST to modal callbackUrl when submit returns errors"
+    async def test_should_not_post_to_modal_callbackurl_when_submit_returns_errors(self):
+        chat, adapter, state = await _init_chat()
+        wait_until_calls: list[Any] = []
+
+        state.cache["modal-context:slack:ctx-errors"] = {
+            "callbackUrl": "https://example.com/webhook/modal-hook",
+        }
+
+        async def _modal_handler(event):
+            return ModalResponse(action="errors", errors={"message": "Required"})
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            response = await chat.process_modal_submit(
+                _make_modal_submit_event(adapter, values={"message": ""}),
+                "ctx-errors",
+                WebhookOptions(wait_until=wait_until_calls.append),
+            )
+
+        assert response == ModalResponse(action="errors", errors={"message": "Required"})
+        assert len(wait_until_calls) == 0
+        assert mock_fetch.await_count == 0
+
+    # TS: "should not wait for modal callbackUrl before returning response"
+    async def test_should_not_wait_for_modal_callbackurl_before_returning_response(self):
+        chat, adapter, state = await _init_chat()
+        wait_until_calls: list[Any] = []
+        fetch_started = asyncio.Event()
+
+        async def _never_resolving_fetch(*args: Any, **kwargs: Any) -> Any:
+            fetch_started.set()
+            await asyncio.Event().wait()  # never resolves
+
+        state.cache["modal-context:slack:ctx-slow"] = {
+            "callbackUrl": "https://example.com/webhook/modal-hook",
+        }
+
+        async def _modal_handler(event):
+            return ModalResponse(action="clear")
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(side_effect=_never_resolving_fetch)) as mock_fetch:
+            response = await chat.process_modal_submit(
+                _make_modal_submit_event(adapter, values={"message": "Great!"}),
+                "ctx-slow",
+                WebhookOptions(wait_until=wait_until_calls.append),
+            )
+
+            # The response came back while the POST is still in flight.
+            assert response == ModalResponse(action="clear")
+            assert len(wait_until_calls) == 1
+
+            await fetch_started.wait()
+            assert mock_fetch.await_count == 1
+            assert mock_fetch.await_args.args == ("https://example.com/webhook/modal-hook",)
+            assert mock_fetch.await_args.kwargs["method"] == "POST"
+
+            # Clean up the in-flight task.
+            wait_until_calls[0].cancel()
+            await asyncio.gather(*wait_until_calls, return_exceptions=True)
+
+    # TS: "should fire-and-forget modal callbackUrl when no waitUntil is provided"
+    async def test_should_fireandforget_modal_callbackurl_when_no_waituntil_is_provided(self):
+        chat, adapter, state = await _init_chat()
+        fetch_started = asyncio.Event()
+        release_fetch = asyncio.Event()
+
+        async def _deferred_fetch(*args: Any, **kwargs: Any) -> tuple[int, str]:
+            fetch_started.set()
+            await release_fetch.wait()
+            return (200, "ok")
+
+        state.cache["modal-context:slack:ctx-noWait"] = {
+            "callbackUrl": "https://example.com/webhook/modal-noWait",
+        }
+
+        async def _modal_handler(event):
+            return ModalResponse(action="clear")
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(side_effect=_deferred_fetch)) as mock_fetch:
+            response = await chat.process_modal_submit(
+                _make_modal_submit_event(adapter, values={"msg": "ok"}),
+                "ctx-noWait",
+            )
+
+            assert response == ModalResponse(action="clear")
+
+            await fetch_started.wait()
+            assert mock_fetch.await_count == 1
+            assert mock_fetch.await_args.args == ("https://example.com/webhook/modal-noWait",)
+            assert mock_fetch.await_args.kwargs["method"] == "POST"
+
+            release_fetch.set()
+            await asyncio.sleep(0)
+
+    # TS: "should not POST when modal context has no callbackUrl"
+    async def test_should_not_post_when_modal_context_has_no_callbackurl(self):
+        chat, adapter, state = await _init_chat()
+
+        state.cache["modal-context:slack:ctx-nocallback"] = {}
+
+        async def _modal_handler(event):
+            return ModalResponse(action="clear")
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await chat.process_modal_submit(
+                _make_modal_submit_event(adapter),
+                "ctx-nocallback",
+            )
+            await asyncio.sleep(0.02)
+
+        assert mock_fetch.await_count == 0
+
+    # TS: "should log error when modal callbackUrl POST returns non-2xx"
+    async def test_should_log_error_when_modal_callbackurl_post_returns_non2xx(self):
+        chat, adapter, state, logger = _make_callback_chat()
+        await chat.webhooks["slack"]("request")
+        tasks: list[Any] = []
+
+        state.cache["modal-context:slack:ctx-fail"] = {
+            "callbackUrl": "https://example.com/webhook/fail",
+        }
+
+        async def _modal_handler(event):
+            return ModalResponse(action="clear")
+
+        chat.on_modal_submit("feedback_modal", _modal_handler)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(500, "nope"))):
+            await chat.process_modal_submit(
+                _make_modal_submit_event(adapter),
+                "ctx-fail",
+                WebhookOptions(wait_until=tasks.append),
+            )
+            await asyncio.gather(*tasks)
+
+        assert any(call_args[0] == "Modal callbackUrl POST failed" for call_args in logger.error.calls)
+
+
+# ============================================================================
+# 26. Action callbackUrl error logging (vercel/chat#454)
+# ============================================================================
+
+
+class TestActionCallbackUrlErrorLogging:
+    """TS describe("action callbackUrl error logging")"""
+
+    # TS: "should log error when action callbackUrl POST returns non-2xx"
+    async def test_should_log_error_when_action_callbackurl_post_returns_non2xx(self):
+        chat, adapter, state, logger = _make_callback_chat()
+        await chat.webhooks["slack"]("request")
+
+        async def _handler(event):
+            return None
+
+        chat.on_action("approve", _handler)
+
+        state.cache["chat:callback:bad-token"] = {"url": "https://example.com/webhook/will-fail"}
+
+        event = _make_action_event(adapter, action_id="approve", value="__cb:bad-token")
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(500, "nope"))):
+            await _process_action_and_wait(chat, event)
+
+        assert any(call_args[0] == "Button callbackUrl POST failed" for call_args in logger.error.calls)
+
+
+# ============================================================================
+# 25. Slash-command openModal without adapter support + subject wiring
+# ============================================================================
+
+
+class TestSlashCommandOpenModalUnsupported:
+    """[Slash Commands] flavor of the openModal-unsupported test.
+
+    Upstream chat.test.ts has two tests with this exact title (one under
+    the actions describe, one under slash commands); the fidelity matcher
+    counts Python names as a multiset, so each needs its own def.
+    """
+
+    # TS: "should return undefined from openModal when adapter does not support modals"
+    async def test_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals(
+        self,
+    ):
+        adapter = create_mock_adapter("slack")
+        adapter.open_modal = None  # type: ignore[assignment]
+
+        chat, _, _ = await _init_chat(adapter=adapter)
+        captured_event: list[SlashCommandEvent] = []
+
+        async def _handler(event):
+            captured_event.append(event)
+
+        chat.on_slash_command("/feedback", _handler)
+
+        event = _make_slash_event(adapter, command="/feedback", text="", trigger_id="trigger-123")
+        chat.process_slash_command(event)
+        await asyncio.sleep(0.02)
+
+        assert len(captured_event) == 1
+
+        modal = {
+            "type": "modal",
+            "callback_id": "test_modal",
+            "title": "Test Modal",
+            "children": [],
+        }
+        result = await captured_event[0].open_modal(modal)
+        assert result is None
+
+
+class TestSubjectAdapterWiring:
+    # TS: "should wire adapter on message for subject access"
+    @requires_fetch_subject
+    async def test_should_wire_adapter_on_message_for_subject_access(self):
+        chat, adapter, _state = await _init_chat()
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-subject", "Hey @slack-bot test"),
+        )
+
+        assert len(received) == 1
+        # The mock adapter exposes no fetch_subject hook -> resolves None
+        assert await received[0].subject is None
 
 
 class TestSubjectBinding:

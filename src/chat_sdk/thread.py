@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from chat_sdk.callback_url import process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
@@ -269,7 +270,7 @@ class _ThreadImplConfig:
     # Direct adapter mode
     adapter: Adapter | None = None
     state_adapter: StateAdapter | None = None
-    message_history: Any = None  # MessageHistoryCache
+    thread_history: Any = None  # ThreadHistoryCache
 
     # Lazy resolution mode
     adapter_name: str | None = None
@@ -303,7 +304,7 @@ class ThreadImpl:
         self._adapter: Adapter | None = config.adapter
         self._adapter_name: str | None = config.adapter_name
         self._state_adapter_instance: StateAdapter | None = config.state_adapter
-        self._message_history: Any = config.message_history
+        self._thread_history: Any = config.thread_history
 
         # Lazy channel cache
         self._channel_cache: ChannelImpl | None = None
@@ -405,7 +406,7 @@ class ThreadImpl:
                     state_adapter=self._state_adapter,
                     is_dm=self._is_dm,
                     channel_visibility=self._channel_visibility,
-                    message_history=self._message_history,
+                    thread_history=self._thread_history,
                 )
             )
         return self._channel_cache
@@ -419,7 +420,7 @@ class ThreadImpl:
         """
         adapter = self.adapter
         thread_id = self._id
-        message_history = self._message_history
+        thread_history = self._thread_history
         cursor: str | None = None
         yielded_any = False
 
@@ -438,8 +439,8 @@ class ThreadImpl:
             cursor = result.next_cursor
 
         # Fallback to cached history
-        if not yielded_any and message_history is not None:
-            cached: list[Message] = await message_history.get_messages(thread_id)
+        if not yielded_any and thread_history is not None:
+            cached: list[Message] = await thread_history.get_messages(thread_id)
             for msg in reversed(cached):
                 yield msg
 
@@ -450,7 +451,7 @@ class ThreadImpl:
         """
         adapter = self.adapter
         thread_id = self._id
-        message_history = self._message_history
+        thread_history = self._thread_history
         cursor: str | None = None
         yielded_any = False
 
@@ -467,8 +468,8 @@ class ThreadImpl:
                 break
             cursor = result.next_cursor
 
-        if not yielded_any and message_history is not None:
-            cached: list[Message] = await message_history.get_messages(thread_id)
+        if not yielded_any and thread_history is not None:
+            cached: list[Message] = await thread_history.get_messages(thread_id)
             for msg in cached:
                 yield msg
 
@@ -504,6 +505,14 @@ class ThreadImpl:
         return await self._state_adapter.is_subscribed(self._id)
 
     async def subscribe(self) -> None:
+        """Subscribe to future messages in this thread.
+
+        Once subscribed, messages in non-DM threads trigger
+        :py:meth:`~chat_sdk.chat.Chat.on_subscribed_message` handlers. DM threads route to
+        :py:meth:`~chat_sdk.chat.Chat.on_direct_message` first when a direct message handler
+        is registered. The initial message that triggered subscription will
+        NOT fire the handler.
+        """
         await self._state_adapter.subscribe(self._id)
         if hasattr(self.adapter, "on_thread_subscribe") and self.adapter.on_thread_subscribe:  # type: ignore[union-attr]
             await self.adapter.on_thread_subscribe(self._id)  # type: ignore[union-attr]
@@ -554,10 +563,10 @@ class ThreadImpl:
             raw = await self._handle_postable_object(message)
             # Cache in history with the real message ID (upstream skips this,
             # but that's a gap — posted messages should appear in history).
-            if self._message_history is not None and raw is not None:
+            if self._thread_history is not None and raw is not None:
                 fallback = message.get_fallback_text() if hasattr(message, "get_fallback_text") else ""
                 sent = self._create_sent_message(raw.id, PostableMarkdown(markdown=fallback), raw.thread_id)
-                await self._message_history.append(self._id, _to_message(sent))
+                await self._thread_history.append(self._id, _to_message(sent))
             return message
 
         # Handle AsyncIterable (streaming)
@@ -565,11 +574,12 @@ class ThreadImpl:
             return await self._handle_stream(message)
 
         postable: AdapterPostableMessage = message  # type: ignore[assignment]
+        postable = await self._process_callback_urls(postable)
         raw_msg = await self.adapter.post_message(self._id, postable)
         result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id, raw=raw_msg.raw)
 
-        if self._message_history is not None:
-            await self._message_history.append(self._id, _to_message(result))
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(result))
 
         return result
 
@@ -596,6 +606,8 @@ class ThreadImpl:
         """
         user_id = user if isinstance(user, str) else user.user_id
 
+        message = await self._process_callback_urls(message)  # type: ignore[assignment]
+
         # Try native ephemeral
         if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
             return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
@@ -616,6 +628,28 @@ class ThreadImpl:
 
         return None
 
+    async def _process_callback_urls(
+        self,
+        postable: str | AdapterPostableMessage,
+    ) -> str | AdapterPostableMessage:
+        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454)."""
+        if isinstance(postable, str):
+            return postable
+
+        if isinstance(postable, dict) and postable.get("type") == "card":
+            return await process_card_callback_urls(postable, self._state_adapter)
+
+        if (
+            isinstance(postable, PostableCard)
+            and isinstance(postable.card, dict)
+            and postable.card.get("type") == "card"
+        ):
+            processed = await process_card_callback_urls(postable.card, self._state_adapter)
+            if processed is not postable.card:
+                return replace(postable, card=processed)
+
+        return postable
+
     async def schedule(
         self,
         message: AdapterPostableMessage,
@@ -623,6 +657,8 @@ class ThreadImpl:
         post_at: datetime,
     ) -> ScheduledMessage:
         """Schedule a message for future delivery."""
+        message = await self._process_callback_urls(message)  # type: ignore[assignment]
+
         if not hasattr(self.adapter, "schedule_message") or not self.adapter.schedule_message:  # type: ignore[union-attr]
             raise ChatNotImplementedError(
                 self.adapter.name,
@@ -640,7 +676,8 @@ class ThreadImpl:
     ) -> SentMessage:
         """Handle streaming from an AsyncIterable.
 
-        Uses adapter's native streaming if available, otherwise falls back to post+edit.
+        Uses the adapter's stream implementation if available, otherwise
+        falls back to post+edit.
 
         ``extra_options`` carries caller-supplied fields (e.g. from a
         :class:`StreamingPlan`: ``task_display_mode``, ``stop_blocks``,
@@ -674,7 +711,7 @@ class ThreadImpl:
             if extra_options.update_interval_ms is not None:
                 options.update_interval_ms = extra_options.update_interval_ms
 
-        # Use native streaming if adapter supports it
+        # Use adapter-provided streaming if available.
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
@@ -707,8 +744,8 @@ class ThreadImpl:
                 PostableMarkdown(markdown=recorded_text),
                 raw_result.thread_id,
             )
-            if self._message_history is not None:
-                await self._message_history.append(self._id, _to_message(sent))
+            if self._thread_history is not None:
+                await self._thread_history.append(self._id, _to_message(sent))
             return sent
 
         # Fallback: post + edit with throttling (text-only)
@@ -921,8 +958,8 @@ class ThreadImpl:
             PostableMarkdown(markdown=last_edit_content),
             thread_id_for_edits,
         )
-        if self._message_history is not None:
-            await self._message_history.append(self._id, _to_message(sent))
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(sent))
 
         # If the stream raised mid-way, we've now flushed whatever partial
         # content was rendered (so the user sees real content instead of a
@@ -945,8 +982,8 @@ class ThreadImpl:
         result = await self.adapter.fetch_messages(self._id, FetchOptions(limit=50))
         if result.messages:
             self._recent_messages = result.messages
-        elif self._message_history is not None:
-            self._recent_messages = await self._message_history.get_messages(self._id, 50)
+        elif self._thread_history is not None:
+            self._recent_messages = await self._thread_history.get_messages(self._id, 50)
         else:
             self._recent_messages = []
 
@@ -1027,7 +1064,7 @@ class ThreadImpl:
             # Every attribute that embeds a reference to the old context
             # gets cleared here: `_state_adapter_instance` (old chat's
             # state backend), `_channel_cache` (old adapter's channel),
-            # `_message_history` (old chat's history cache),
+            # `_thread_history` (old chat's history cache),
             # `_recent_messages` (old adapter's fetched content), and
             # `_is_subscribed_context` (handler-context flag from the
             # old chat — a thread rebound to a new context shouldn't
@@ -1036,7 +1073,7 @@ class ThreadImpl:
             if adapter is not None or chat is not None:
                 thread._state_adapter_instance = None
                 thread._channel_cache = None
-                thread._message_history = None
+                thread._thread_history = None
                 thread._recent_messages = []
                 thread._is_subscribed_context = False
         else:
@@ -1131,6 +1168,7 @@ class ThreadImpl:
         plain_text, formatted, attachments = _extract_message_content(postable)
 
         async def _edit(new_content: Any) -> SentMessage:
+            new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
             return thread_impl._create_sent_message(message_id, new_content)
 
@@ -1176,6 +1214,7 @@ class ThreadImpl:
         thread_impl = self
 
         async def _edit(new_content: Any) -> SentMessage:
+            new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
             return thread_impl._create_sent_message(message_id, new_content, thread_id)
 
@@ -1314,4 +1353,4 @@ class _ChannelImplConfigForThread:
     state_adapter: StateAdapter
     is_dm: bool = False
     channel_visibility: ChannelVisibility = "unknown"
-    message_history: Any = None
+    thread_history: Any = None

@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from chat_sdk.chat import Chat
 from chat_sdk.testing import create_mock_adapter
 from chat_sdk.types import Message
 
@@ -184,3 +185,64 @@ class TestDMFlow:
         await chat.handle_incoming_message(adapter, dm_thread_id, msg)
 
         assert len(calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_dm_handler_runs_before_pattern_handler(self):
+        """DM handler takes precedence over ``on_message`` pattern handlers.
+
+        Mirrors the routing-precedence clarification in vercel/chat#491 — DM
+        handlers run before subscribed/mention/pattern handlers when registered.
+        Without this precedence a DM whose text matches a registered pattern
+        would fire both handlers (or only the pattern handler), silently
+        breaking DM-only flows.
+        """
+        chat, adapters, state = await create_chat()
+        adapter = adapters["slack"]
+        dm_calls: list[Message] = []
+        pattern_calls: list[Message] = []
+
+        @chat.on_direct_message
+        async def dm_handler(thread, message, channel=None, context=None):
+            dm_calls.append(message)
+
+        @chat.on_message(r"^!help")
+        async def pattern_handler(thread, message, context=None):
+            pattern_calls.append(message)
+
+        dm_thread_id = "slack:DDMCHAN:"
+        msg = create_msg("!help me please", thread_id=dm_thread_id)
+        await chat.handle_incoming_message(adapter, dm_thread_id, msg)
+
+        assert len(dm_calls) == 1
+        assert dm_calls[0].text == "!help me please"
+        assert pattern_calls == []
+
+
+class TestDMRoutingDocs:
+    """Lock in the precedence-clarification docstrings ported from vercel/chat#491.
+
+    The runtime routing was already correct in the Python port (see
+    ``Chat._handle_incoming_message``: DM handlers run before
+    subscribed/mention/pattern). These checks fail if a future doc rewrite drops
+    the precedence wording, which would let the docs drift out of sync with
+    upstream's clarified contract again (the original issue closed by #491).
+    """
+
+    def test_on_direct_message_docstring_documents_precedence(self):
+        """``Chat.on_direct_message`` docstring states DM handlers run first."""
+        doc = Chat.on_direct_message.__doc__ or ""
+        assert "before" in doc.lower()
+        assert "on_subscribed_message" in doc
+        assert "on_mention" in doc
+        # Falls-through-when-unregistered carve-out preserved.
+        assert "backward compatibility" in doc
+
+    def test_thread_subscribe_docstring_documents_dm_carveout(self):
+        """``ThreadImpl.subscribe`` docstring covers the DM precedence carve-out."""
+        from chat_sdk.thread import ThreadImpl
+
+        doc = ThreadImpl.subscribe.__doc__ or ""
+        assert "non-DM" in doc
+        assert "on_direct_message" in doc
+        # Pre-existing invariant: initial subscribing message does NOT fire.
+        assert "NOT fire" in doc

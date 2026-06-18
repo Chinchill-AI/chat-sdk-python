@@ -34,6 +34,11 @@ def _make_credentials() -> ServiceAccountCredentials:
 
 def _make_adapter(**overrides) -> GoogleChatAdapter:
     """Create a GoogleChatAdapter with minimal valid config."""
+    # The adapter now fails closed unless a verification gating field is set
+    # (google_chat_project_number, pubsub_audience, or the explicit opt-out).
+    # These tests exercise non-verification mechanics, so default to the
+    # explicit opt-out; individual tests override it via kwargs as needed.
+    overrides.setdefault("disable_signature_verification", True)
     config = GoogleChatAdapterConfig(
         credentials=overrides.pop("credentials", _make_credentials()),
         **overrides,
@@ -176,15 +181,22 @@ class TestCreateGoogleChatAdapter:
         assert adapter.name == "gchat"
 
     def test_with_adc(self):
-        adapter = GoogleChatAdapter(GoogleChatAdapterConfig(use_application_default_credentials=True))
+        adapter = GoogleChatAdapter(
+            GoogleChatAdapterConfig(
+                use_application_default_credentials=True,
+                disable_signature_verification=True,
+            )
+        )
         assert adapter.name == "gchat"
 
     def test_missing_auth(self):
         old_creds = os.environ.pop("GOOGLE_CHAT_CREDENTIALS", None)
         old_adc = os.environ.pop("GOOGLE_CHAT_USE_ADC", None)
         try:
+            # Provide a verification gating field so construction reaches the
+            # auth check rather than failing closed on verification first.
             with pytest.raises(ValidationError, match="Authentication"):
-                GoogleChatAdapter(GoogleChatAdapterConfig())
+                GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
         finally:
             if old_creds is not None:
                 os.environ["GOOGLE_CHAT_CREDENTIALS"] = old_creds

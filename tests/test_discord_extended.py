@@ -924,6 +924,218 @@ class TestForwardedGatewayEvents:
 
 
 # ============================================================================
+# Forwarded gateway interactions (gateway-only mode, vercel/chat#490)
+# ============================================================================
+
+
+class TestForwardedGatewayInteractions:
+    """Port of the "legacy gateway interactions" describe block.
+
+    Discord sends interactions through either the Gateway or an
+    Interactions Endpoint URL, not both. In gateway-only deployments the
+    forwarder relays the raw INTERACTION_CREATE payload; the adapter must
+    defer it via the interaction callback REST endpoint (the wire call
+    discord.js makes for deferReply/deferUpdate) and route through the
+    existing slash-command / action handler paths.
+    """
+
+    def _slash_interaction(self, **overrides):
+        interaction = {
+            "id": "interaction123",
+            "application_id": "test-app-id",
+            "token": "interaction-token",
+            "type": 2,  # APPLICATION_COMMAND
+            "version": 1,
+            "guild_id": "guild123",
+            "channel_id": "channel456",
+            "channel": {"id": "channel456", "type": 0},
+            "user": {
+                "id": "user789",
+                "username": "testuser",
+                "discriminator": "0001",
+                "global_name": "Test User",
+                "bot": False,
+            },
+            "data": {
+                "name": "test",
+                "type": 1,
+                "options": [
+                    {"name": "topic", "type": 3, "value": "status"},
+                    {"name": "verbose", "type": 5, "value": True},
+                ],
+            },
+        }
+        interaction.update(overrides)
+        return interaction
+
+    def _component_interaction(self, **overrides):
+        interaction = {
+            "id": "interaction123",
+            "application_id": "test-app-id",
+            "token": "interaction-token",
+            "type": 3,  # MESSAGE_COMPONENT
+            "version": 1,
+            "guild_id": "guild123",
+            "channel_id": "channel456",
+            "channel": {"id": "channel456", "type": 0},
+            "user": {
+                "id": "user789",
+                "username": "testuser",
+                "discriminator": "0001",
+                "global_name": "Test User",
+                "bot": False,
+            },
+            "data": {"custom_id": "approve_btn", "component_type": 2},
+            "message": {"id": "message123"},
+        }
+        interaction.update(overrides)
+        return interaction
+
+    def _forwarded(self, interaction) -> str:
+        return json.dumps(
+            {
+                "type": "GATEWAY_INTERACTION_CREATE",
+                "timestamp": 1234567890,
+                "data": interaction,
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_handles_slash_command_interactions_from_the_gateway(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.process_slash_command = MagicMock()
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        response = await adapter.handle_webhook(_gateway_request(self._forwarded(self._slash_interaction())))
+
+        assert response["status"] == 200
+        # deferReply: explicit callback REST call (type 5)
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/interactions/interaction123/interaction-token/callback",
+            "POST",
+            {"type": 5},
+        )
+        mock_chat.process_slash_command.assert_called_once()
+        event = mock_chat.process_slash_command.call_args[0][0]
+        assert event.command == "/test"
+        assert event.text == "status true"
+        assert event.channel_id == "discord:guild123:channel456"
+        assert event.user.user_id == "user789"
+        assert event.user.user_name == "testuser"
+        assert event.user.full_name == "Test User"
+
+    @pytest.mark.asyncio
+    async def test_handles_component_interactions_from_the_gateway(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.process_action = MagicMock()
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        response = await adapter.handle_webhook(_gateway_request(self._forwarded(self._component_interaction())))
+
+        assert response["status"] == 200
+        # deferUpdate: explicit callback REST call (type 6)
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/interactions/interaction123/interaction-token/callback",
+            "POST",
+            {"type": 6},
+        )
+        mock_chat.process_action.assert_called_once()
+        event = mock_chat.process_action.call_args[0][0]
+        assert event.action_id == "approve_btn"
+        assert event.value == "approve_btn"
+        assert event.message_id == "message123"
+        assert event.thread_id == "discord:guild123:channel456"
+
+    @pytest.mark.asyncio
+    async def test_slash_command_defer_failure_skips_handler(self):
+        """If the deferral REST call fails the handler must not run --
+        matches upstream where a deferReply rejection is caught and logged
+        before the normalize+handle step."""
+        logger = _make_logger()
+        adapter = _make_adapter(logger=logger)
+        mock_chat = MagicMock()
+        mock_chat.process_slash_command = MagicMock()
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(side_effect=NetworkError("discord", "boom"))
+
+        response = await adapter.handle_webhook(_gateway_request(self._forwarded(self._slash_interaction())))
+
+        # Forwarded-event responses stay 200; the failure is logged.
+        assert response["status"] == 200
+        mock_chat.process_slash_command.assert_not_called()
+        error_messages = [c.args[0] for c in logger.error.call_args_list]
+        assert "Error handling Gateway interaction" in error_messages
+
+    @pytest.mark.asyncio
+    async def test_unhandled_interaction_type_is_ignored_without_defer(self):
+        """PING/autocomplete-style interactions are not deferred or routed."""
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.process_slash_command = MagicMock()
+        mock_chat.process_action = MagicMock()
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        response = await adapter.handle_webhook(_gateway_request(self._forwarded(self._slash_interaction(type=4))))
+
+        assert response["status"] == 200
+        adapter._discord_fetch.assert_not_awaited()
+        mock_chat.process_slash_command.assert_not_called()
+        mock_chat.process_action.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interaction_missing_token_is_not_deferred_or_routed(self):
+        """A malformed forward without id/token must not produce a garbage
+        callback URL or dispatch a handler."""
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.process_action = MagicMock()
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        interaction = self._component_interaction()
+        del interaction["token"]
+        response = await adapter.handle_webhook(_gateway_request(self._forwarded(interaction)))
+
+        assert response["status"] == 200
+        adapter._discord_fetch.assert_not_awaited()
+        mock_chat.process_action.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gateway_slash_command_supports_deferred_response_flow(self):
+        """The gateway-deferred slash interaction resolves like an HTTP one:
+        the handler's first post_message PATCHes the @original webhook
+        message using the interaction token."""
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+
+        def run_handler(event, options=None):
+            # Simulate Chat dispatching a handler that replies immediately.
+            import asyncio as _asyncio
+
+            task = _asyncio.get_running_loop().create_task(adapter.post_message(event.channel_id, "reply from handler"))
+            run_handler.task = task
+
+        mock_chat.process_slash_command = MagicMock(side_effect=run_handler)
+        adapter._chat = mock_chat
+        adapter._discord_fetch = AsyncMock(return_value={"id": "reply-msg-1"})
+
+        await adapter.handle_webhook(_gateway_request(self._forwarded(self._slash_interaction())))
+        await run_handler.task
+
+        paths = [c.args[0] for c in adapter._discord_fetch.await_args_list]
+        # First the deferral, then the @original PATCH (not a channel POST).
+        assert paths[0] == "/interactions/interaction123/interaction-token/callback"
+        assert paths[1] == "/webhooks/test-app-id/interaction-token/messages/@original"
+        patch_call = adapter._discord_fetch.await_args_list[1]
+        assert patch_call.args[1] == "PATCH"
+
+
+# ============================================================================
 # Forwarded message -- thread detection
 # ============================================================================
 

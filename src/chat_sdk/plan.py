@@ -543,8 +543,7 @@ class StreamingPlanOptions:
         Useful for adding feedback buttons after a streamed response.
     update_interval_ms:
         Minimum interval between updates in ms (default: 500).
-        Used for fallback mode (post + edit on adapters without native
-        streaming).
+        Used by post + edit streaming paths.
     """
 
     group_tasks: Literal["plan", "timeline"] | None = None

@@ -90,6 +90,9 @@ def _make_google_chat_adapter() -> GoogleChatAdapter:
             private_key="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
             project_id="test-project",
         ),
+        # Adapter fails closed without a verification gating field; this test
+        # exercises non-verification mechanics, so use the explicit opt-out.
+        disable_signature_verification=True,
     )
     return GoogleChatAdapter(config)
 

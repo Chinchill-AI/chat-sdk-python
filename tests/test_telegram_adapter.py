@@ -364,7 +364,7 @@ class TestCreateTelegramAdapter:
         adapter = _make_adapter()
         assert adapter.name == "telegram"
         assert adapter.lock_scope == "channel"
-        assert adapter.persist_message_history is True
+        assert adapter.persist_thread_history is True
         assert adapter.bot_user_id is None  # not yet initialized
         assert adapter.is_polling is False
         assert adapter.runtime_mode == "webhook"

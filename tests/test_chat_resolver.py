@@ -481,45 +481,47 @@ class TestChatThreadFactory:
 
     def test_reuses_parent_chat_state_and_history(self):
         """The factory must bind the new Thread to the parent Chat's state
-        adapter and message history. This is the core contract of
+        adapter and thread history. This is the core contract of
         `chat.thread()` — worker processes reconstruct a Thread that
         shares state with the original Chat instance, not a fresh
         detached thread. Without this, state writes/reads from the worker
         wouldn't be visible to the Chat in-process.
 
-        For adapters that don't persist message history (persist_message_history
+        For adapters that don't persist thread history (persist_thread_history
         falsy), `_create_thread` intentionally skips the history bind —
         there's no cache to share. This test uses a persisting adapter to
         exercise the positive case.
         """
         chat = _make_chat("slack")
-        # Opt the mock adapter into message history so the factory binds it
+        # Opt the mock adapter into thread history so the factory binds it
         adapter = chat._adapters["slack"]
-        adapter.persist_message_history = True
+        adapter.persist_thread_history = True
 
         thread = chat.thread("slack:C123:1234567890.123456")
         # State adapter must be the exact same instance, not a copy
         assert thread._state_adapter is chat._state_adapter
-        # Message history must be the exact same instance too
-        assert thread._message_history is chat._message_history
+        # Thread history must be the exact same instance too
+        assert thread._thread_history is chat._thread_history
 
     def test_omits_history_when_adapter_does_not_persist(self):
-        """Adapters with `persist_message_history` falsy opt out of the
-        shared history cache. `Chat.thread()` respects that: the Thread
-        gets `None` for history rather than a shared cache the adapter
-        won't populate.
+        """Adapters with `persist_thread_history` falsy (and the deprecated
+        `persist_message_history` alias also falsy) opt out of the shared
+        history cache. `Chat.thread()` respects that: the Thread gets
+        `None` for history rather than a shared cache the adapter won't
+        populate.
 
-        Explicitly set `persist_message_history = None` rather than
-        relying on the mock's default — prevents silent test regression
-        if the mock default ever changes.
+        Explicitly set both flags to `None` rather than relying on the
+        mock's defaults — prevents silent test regression if the mock
+        defaults ever change.
         """
         chat = _make_chat("slack")
         adapter = chat._adapters["slack"]
+        adapter.persist_thread_history = None
         adapter.persist_message_history = None
 
         thread = chat.thread("slack:C123:1234567890.123456")
         assert thread._state_adapter is chat._state_adapter
-        assert thread._message_history is None
+        assert thread._thread_history is None
 
     def test_invalid_thread_id_raises(self):
         from chat_sdk.errors import ChatError

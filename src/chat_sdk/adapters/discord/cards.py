@@ -7,6 +7,7 @@ See: https://discord.com/developers/docs/interactions/message-components
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, cast
 
 from chat_sdk.adapters.discord.types import DiscordActionRow, DiscordButton
@@ -24,6 +25,7 @@ from chat_sdk.cards import (
 )
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.shared.card_utils import render_gfm_table
+from chat_sdk.shared.errors import ValidationError
 
 # Discord button styles (discord-api-types/v10 ButtonStyle)
 BUTTON_STYLE_PRIMARY = 1
@@ -33,6 +35,46 @@ BUTTON_STYLE_LINK = 5
 
 # Discord blurple color
 DISCORD_BLURPLE = 0x5865F2
+
+# Discord packs the button value into custom_id (max 100 chars). The
+# delimiter is a newline -- it can't appear in a Button id and survives
+# Discord's round-trip intact.
+DISCORD_CUSTOM_ID_DELIMITER = "\n"
+DISCORD_CUSTOM_ID_MAX_LENGTH = 100
+
+
+@dataclass(frozen=True)
+class DecodedDiscordCustomId:
+    """Result of :func:`decode_discord_custom_id`."""
+
+    action_id: str
+    value: str | None
+
+
+def _validate_discord_custom_id(custom_id: str) -> None:
+    if len(custom_id) == 0 or len(custom_id) > DISCORD_CUSTOM_ID_MAX_LENGTH:
+        raise ValidationError(
+            "discord",
+            f"Discord custom_id must be 1-{DISCORD_CUSTOM_ID_MAX_LENGTH} characters. Shorten the button id or value.",
+        )
+
+
+def encode_discord_custom_id(action_id: str, value: str | None = None) -> str:
+    """Encode a button's action ID and optional value into a custom_id."""
+    if value is None or value == "":
+        _validate_discord_custom_id(action_id)
+        return action_id
+    encoded = f"{action_id}{DISCORD_CUSTOM_ID_DELIMITER}{value}"
+    _validate_discord_custom_id(encoded)
+    return encoded
+
+
+def decode_discord_custom_id(custom_id: str) -> DecodedDiscordCustomId:
+    """Split a custom_id back into (action_id, value). Splits on the first delimiter only."""
+    idx = custom_id.find(DISCORD_CUSTOM_ID_DELIMITER)
+    if idx == -1:
+        return DecodedDiscordCustomId(action_id=custom_id, value=None)
+    return DecodedDiscordCustomId(action_id=custom_id[:idx], value=custom_id[idx + 1 :])
 
 
 def _convert_emoji(text: str) -> str:
@@ -172,7 +214,7 @@ def _convert_button_element(button: ButtonElement) -> DiscordButton:
         "type": 2,  # Button
         "style": _get_button_style(button.get("style")),
         "label": button.get("label", ""),
-        "custom_id": button.get("id", ""),
+        "custom_id": encode_discord_custom_id(button.get("id", ""), button.get("value")),
     }
 
     if button.get("disabled"):
