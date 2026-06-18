@@ -1842,10 +1842,15 @@ class SlackAdapter:
 
         channel = (payload.get("channel") or {}).get("id") or (payload.get("container") or {}).get("channel_id")
         message_ts = (payload.get("message") or {}).get("ts") or (payload.get("container") or {}).get("message_ts")
+        # DMs have no threads: a button click on a top-level DM message must not
+        # thread the response. Mirror _handle_message_event's DM handling — keep a
+        # real in-DM thread_ts, but never fall back to the clicked message's own
+        # ts, which would spawn a phantom "1 reply" thread in the DM.
+        is_dm = bool(channel) and channel.startswith("D")
         thread_ts = (
             (payload.get("message") or {}).get("thread_ts")
             or (payload.get("container") or {}).get("thread_ts")
-            or message_ts
+            or ("" if is_dm else message_ts)
         )
 
         is_view_action = (payload.get("container") or {}).get("type") == "view"
@@ -1856,7 +1861,12 @@ class SlackAdapter:
 
         thread_id = ""
         if channel and (thread_ts or message_ts):
-            thread_id = self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=thread_ts or message_ts or ""))
+            thread_id = self.encode_thread_id(
+                SlackThreadId(
+                    channel=channel,
+                    thread_ts=thread_ts if thread_ts is not None else "",
+                )
+            )
 
         is_ephemeral = (payload.get("container") or {}).get("is_ephemeral") is True
         response_url = payload.get("response_url")

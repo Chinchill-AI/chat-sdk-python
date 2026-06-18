@@ -20,3 +20,4 @@ uv.lock
 coverage.xml
 htmlcov/
 AGENTS.md
+.DS_Store
