@@ -254,7 +254,7 @@ class TestPostMessage:
         result = await adapter.post_message("slack:C123:1234567890.000000", msg)
 
         assert isinstance(result.raw, dict)
-        assert result.raw["uploaded_file_ids"] == ["F1", "F2"]
+        assert result.raw["uploadedFileIds"] == ["F1", "F2"]
         # The original raw payload is preserved (augment, don't replace).
         assert "files" in result.raw
 
@@ -278,20 +278,20 @@ class TestPostMessage:
 
         assert result.id == "1234567890.222222"
         assert isinstance(result.raw, dict)
-        assert result.raw["uploaded_file_ids"] == ["F9"]
+        assert result.raw["uploadedFileIds"] == ["F9"]
         # The Slack chat_postMessage response is preserved alongside the IDs.
         assert result.raw["ok"] is True
 
     @pytest.mark.asyncio
     async def test_text_only_post_does_not_add_uploaded_file_ids(self):
-        """Posts without files leave ``raw`` unaugmented (no ``uploaded_file_ids`` key)."""
+        """Posts without files leave ``raw`` unaugmented (no ``uploadedFileIds`` key)."""
         adapter, client, _ = await _init_adapter()
         client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.333333"})
 
         result = await adapter.post_message("slack:C123:1234567890.000000", "plain text")
 
         assert isinstance(result.raw, dict)
-        assert "uploaded_file_ids" not in result.raw
+        assert "uploadedFileIds" not in result.raw
 
     @pytest.mark.asyncio
     async def test_file_upload_uses_channel_kwarg_not_channel_id(self):
@@ -1314,6 +1314,90 @@ class TestStream:
         assert result.id == "444.444"
         client.chat_stream.assert_awaited_once()
         assert mock_streamer.append.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_passes_token_on_stream_stop(self):
+        """Port of upstream "passes token on stream stop" (vercel/chat#573):
+        stop() must always carry the resolved bot token so chat.stopStream
+        can't hit not_authed when no token-bearing append flushed first."""
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock(return_value=None)
+        mock_streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.111111"})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        async def short_stream() -> AsyncIterator[str]:
+            yield "hello"
+
+        await adapter.stream(
+            "slack:C123:1234567890.000000",
+            short_stream(),
+            StreamOptions(recipient_user_id="U123", recipient_team_id="T123"),
+        )
+
+        mock_streamer.stop.assert_awaited_once()
+        assert mock_streamer.stop.call_args.kwargs["token"] == "xoxb-test-token"
+        # No stop_blocks were supplied, so the optional key must be omitted.
+        assert "blocks" not in mock_streamer.stop.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_passes_token_on_every_stream_append(self):
+        """Port of upstream "passes token on every stream append"
+        (vercel/chat#573): repeated structured chunk appends each carry the
+        token, not just the first."""
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock(return_value={"ok": True})
+        mock_streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.111111"})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        from chat_sdk.types import TaskUpdateChunk
+
+        async def chunk_stream() -> AsyncIterator[StreamChunk | str]:
+            yield TaskUpdateChunk(id="task-1", title="Task one", status="in_progress", output="first")
+            yield TaskUpdateChunk(id="task-2", title="Task two", status="in_progress", output="second")
+
+        await adapter.stream(
+            "slack:C123:1234567890.000000",
+            chunk_stream(),
+            StreamOptions(recipient_user_id="U123", recipient_team_id="T123"),
+        )
+
+        assert mock_streamer.append.await_count == 2
+        for call in mock_streamer.append.call_args_list:
+            assert call.kwargs["token"] == "xoxb-test-token"
+
+    @pytest.mark.asyncio
+    async def test_stream_uses_request_context_token_for_append_and_stop(self):
+        """Multi-workspace composition: the token resolved from the
+        per-request context (installation token) must flow through every
+        append and the stop — not the default bot token. Python-only
+        regression for the documented bot_token resolver plumbing."""
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock(return_value={"ok": True})
+        mock_streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.222222"})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "workspace-scoped hello"
+
+        await adapter.with_bot_token_async(
+            "xoxb-workspace-token",
+            lambda: adapter.stream(
+                "slack:C123:1234567890.000000",
+                text_gen(),
+                StreamOptions(recipient_user_id="U123", recipient_team_id="T123"),
+            ),
+        )
+
+        assert mock_streamer.append.await_count >= 1
+        for call in mock_streamer.append.call_args_list:
+            assert call.kwargs["token"] == "xoxb-workspace-token"
+        assert mock_streamer.stop.call_args.kwargs["token"] == "xoxb-workspace-token"
 
 
 # =============================================================================

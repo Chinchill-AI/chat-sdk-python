@@ -325,6 +325,78 @@ class TestFromAst:
         result = converter.from_ast(ast)
         assert "<https://example.com|click here>" in result
 
+    def test_collapses_mailto_autolink_for_plain_email_text(self):
+        """Port of upstream "collapses mailto autolink for plain email text"
+        (vercel/chat#553). Upstream's remark parser autolinks the bare input
+        "hello@example.com" into a `mailto:` link node; our subset parser
+        keeps bare emails as plain text (Known Limitations), so the same
+        autolink-shaped node is built through the explicit markdown form to
+        exercise the collapse."""
+        converter = _converter()
+        ast = converter.to_ast("[hello@example.com](mailto:hello@example.com)")
+
+        result = converter.from_ast(ast)
+
+        assert result == "hello@example.com"
+
+    def test_collapses_mailto_autolink_on_gchat_wire_round_trip(self):
+        """Python-only composition with the documented `<url|text>` to_ast
+        divergence: a redundant `<mailto:addr|addr>` read back from the
+        Google Chat wire parses to a link node (upstream leaves it as raw
+        text) and must now collapse to the bare address on re-emit instead
+        of round-tripping the verbose form."""
+        converter = _converter()
+        ast = converter.to_ast("<mailto:hello@example.com|hello@example.com>")
+
+        result = converter.from_ast(ast)
+
+        assert result == "hello@example.com"
+
+    def test_preserves_custom_label_for_mailto_links(self):
+        """Port of upstream "preserves custom label for mailto links"
+        (vercel/chat#553): a label that differs from the address keeps the
+        `<url|text>` form."""
+        converter = _converter()
+        ast = converter.to_ast("[contact](mailto:hello@example.com)")
+
+        result = converter.from_ast(ast)
+
+        assert result == "<mailto:hello@example.com|contact>"
+
+    def test_formats_http_links_correctly(self):
+        """Port of upstream "formats http links correctly" (vercel/chat#553).
+        Upstream autolinks the bare URL to a link node whose text equals its
+        URL and re-emits it bare; our parser keeps bare URLs as plain text —
+        the output contract is identical either way."""
+        converter = _converter()
+        ast = converter.to_ast("https://example.com")
+
+        result = converter.from_ast(ast)
+
+        assert result == "https://example.com"
+
+    def test_keeps_phone_numbers_as_plain_text(self):
+        """Port of upstream "keeps phone numbers as plain text"
+        (vercel/chat#553): plain phone numbers are not autolinked by either
+        parser and must survive unchanged."""
+        converter = _converter()
+        ast = converter.to_ast("+1555123456")
+
+        result = converter.from_ast(ast)
+
+        assert result == "+1555123456"
+
+    def test_collapses_tel_autolink_for_plain_phone_text(self):
+        """Port of upstream "collapses tel autolink for plain phone text"
+        (vercel/chat#553): a tel: link whose label equals the number
+        collapses to the bare number."""
+        converter = _converter()
+        ast = converter.to_ast("[+1555123456](tel:+1555123456)")
+
+        result = converter.from_ast(ast)
+
+        assert result == "+1555123456"
+
     def test_should_preserve_custom_link_labels_in_posted_messages(self):
         # Matches the integration-tests parity case: a posted markdown link
         # with a custom label must render as Google Chat's <url|text> syntax

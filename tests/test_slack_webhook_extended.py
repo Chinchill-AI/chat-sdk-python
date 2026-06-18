@@ -8,6 +8,7 @@ link extraction, formatted text, and edge cases in message parsing.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -641,6 +642,103 @@ class TestReactionEvents:
         req = _make_signed_request(body)
         response = await adapter.handle_webhook(req)
         assert response["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_resolves_reaction_user_display_name(self):
+        """Port of upstream "resolves reaction user display name"
+        (vercel/chat#523): reaction events must carry the resolved
+        users.info display/real names instead of the raw user ID."""
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        mock_client = MagicMock()
+        mock_client.conversations_replies = AsyncMock(
+            return_value={"ok": True, "messages": [{"ts": "1234567890.123456"}]}
+        )
+        mock_client.users_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "user": {
+                    "id": "U123",
+                    "name": "alice",
+                    "real_name": "Alice Example",
+                    "profile": {"display_name": "Alice", "real_name": "Alice Example"},
+                },
+            }
+        )
+        adapter._get_client = MagicMock(return_value=mock_client)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "reaction_added",
+                    "user": "U123",
+                    "reaction": "thumbsup",
+                    "item": {
+                        "type": "message",
+                        "channel": "C456",
+                        "ts": "1234567890.123456",
+                    },
+                },
+            }
+        )
+        req = _make_signed_request(body)
+        await adapter.handle_webhook(req)
+        # The reaction handler resolves names in a background task.
+        await asyncio.sleep(0.05)
+
+        mock_client.users_info.assert_awaited_once_with(user="U123")
+        assert chat.process_reaction.called
+        reaction_event = chat.process_reaction.call_args[0][0]
+        assert reaction_event.user.user_id == "U123"
+        assert reaction_event.user.user_name == "Alice"
+        assert reaction_event.user.full_name == "Alice Example"
+        # users.info returned no is_bot flag -> coalesces to False.
+        assert reaction_event.user.is_bot is False
+
+    @pytest.mark.asyncio
+    async def test_reaction_user_names_fall_back_to_user_id_when_lookup_fails(self):
+        """Upstream falls back to the raw user ID when lookupUser fails;
+        our `_lookup_user` failure path must surface the same fallback."""
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        mock_client = MagicMock()
+        mock_client.conversations_replies = AsyncMock(
+            return_value={"ok": True, "messages": [{"ts": "1234567890.123456"}]}
+        )
+        mock_client.users_info = AsyncMock(side_effect=RuntimeError("users.info unavailable"))
+        adapter._get_client = MagicMock(return_value=mock_client)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "reaction_added",
+                    "user": "U999",
+                    "reaction": "eyes",
+                    "item": {
+                        "type": "message",
+                        "channel": "C456",
+                        "ts": "1234567890.123456",
+                    },
+                },
+            }
+        )
+        req = _make_signed_request(body)
+        await adapter.handle_webhook(req)
+        await asyncio.sleep(0.05)
+
+        assert chat.process_reaction.called
+        reaction_event = chat.process_reaction.call_args[0][0]
+        assert reaction_event.user.user_name == "U999"
+        assert reaction_event.user.full_name == "U999"
+        assert reaction_event.user.is_bot is False
 
 
 # ---------------------------------------------------------------------------

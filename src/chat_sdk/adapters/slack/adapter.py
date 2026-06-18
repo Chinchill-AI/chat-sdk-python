@@ -2642,15 +2642,25 @@ class SlackAdapter:
 
             thread_id = self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=parent_ts))
 
+            # Resolve display names from the cached users.info lookup so
+            # reaction handlers see real names instead of raw user IDs
+            # (vercel/chat#523). Falls back to the user ID on lookup failure.
+            user_info = await self._lookup_user(user_id)
+            display_name = user_info.get("display_name")
+            user_name = display_name if display_name is not None else user_id
+            real_name = user_info.get("real_name")
+            full_name = real_name if real_name is not None else user_name
+            is_bot = user_info.get("is_bot")
+
             reaction_event = ReactionEvent(
                 emoji=normalized_emoji,
                 raw_emoji=raw_emoji,
                 added=event.get("type") == "reaction_added",
                 user=Author(
                     user_id=user_id,
-                    user_name=user_id,
-                    full_name=user_id,
-                    is_bot=False,
+                    user_name=user_name,
+                    full_name=full_name,
+                    is_bot=is_bot if is_bot is not None else False,
                     is_me=is_me,
                 ),
                 message_id=message_id,
@@ -3561,10 +3571,12 @@ class SlackAdapter:
 
             # Check for files to upload. ``files_upload_v2`` returns the
             # Slack-confirmed file IDs; we surface them on ``RawMessage.raw``
-            # so consumers can gate on actual delivery (parity with
-            # discord/telegram, which upload inline and expose the platform
-            # response naturally). ``None`` means no upload happened; an empty
-            # list means Slack confirmed zero attachments (a real signal).
+            # under the camelCase ``uploadedFileIds`` key (upstream
+            # chat@4.30.0 adopted this same surface) so consumers can
+            # gate on actual delivery (parity with discord/telegram, which
+            # upload inline and expose the platform response naturally).
+            # ``None`` means no upload happened; an empty list means Slack
+            # confirmed zero attachments (a real signal).
             uploaded_file_ids: list[str] | None = None
             files = extract_files(message)
             if files:
@@ -3641,14 +3653,19 @@ class SlackAdapter:
 
         Returns ``raw`` unchanged when no upload occurred (``uploaded_file_ids``
         is ``None``). Otherwise returns a NEW dict that merges the existing raw
-        (Slack never returns an ``uploaded_file_ids`` key, so this is additive
+        (Slack never returns an ``uploadedFileIds`` key, so this is additive
         and non-breaking) with the confirmed IDs. An empty list is preserved —
         it signals that Slack confirmed zero attachments.
+
+        The key is emitted in camelCase (``uploadedFileIds``) to match the
+        surface upstream adopted in chat@4.30.0; ``uploaded_file_ids`` is the
+        internal (snake_case) variable, camelCase only at this serialization
+        boundary.
         """
         if uploaded_file_ids is None:
             return raw
         base = raw if isinstance(raw, dict) else {}
-        return {**base, "uploaded_file_ids": uploaded_file_ids}
+        return {**base, "uploadedFileIds": uploaded_file_ids}
 
     async def edit_message(
         self,
@@ -3859,7 +3876,6 @@ class SlackAdapter:
 
         streamer = await client.chat_stream(**stream_kwargs)
 
-        first = True
         last_appended = ""
 
         # Use StreamingMarkdownRenderer for safe incremental rendering
@@ -3868,18 +3884,20 @@ class SlackAdapter:
         renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
         structured_chunks_supported = True
 
+        # The resolved bot token is passed on EVERY append and on stop
+        # (vercel/chat#573). Passing it only on the first append left
+        # chat.startStream/chat.stopStream unauthenticated ("not_authed")
+        # whenever the stream reached stop() before a token-bearing append
+        # had flushed (e.g. fully buffered markdown). In multi-workspace
+        # mode `token` is the per-request installation token resolved by
+        # _get_token() at stream entry.
         async def flush_markdown_delta(delta: str) -> None:
-            nonlocal first
             if not delta:
                 return
-            if first:
-                await streamer.append(markdown_text=delta, token=token)
-                first = False
-            else:
-                await streamer.append(markdown_text=delta)
+            await streamer.append(markdown_text=delta, token=token)
 
         async def send_structured_chunk(chunk: StreamChunk | dict[str, Any]) -> None:
-            nonlocal first, last_appended, structured_chunks_supported
+            nonlocal last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return
             committable = renderer.get_committable_text()
@@ -3907,11 +3925,7 @@ class SlackAdapter:
                     if value is not None:
                         chunk_data[field_name] = value
 
-                if first:
-                    await streamer.append(chunks=[chunk_data], token=token)
-                    first = False
-                else:
-                    await streamer.append(chunks=[chunk_data])
+                await streamer.append(chunks=[chunk_data], token=token)
             except Exception as exc:
                 structured_chunks_supported = False
                 self._logger.warn(
@@ -3951,10 +3965,10 @@ class SlackAdapter:
         final_delta = final_committable[len(last_appended) :]
         await flush_markdown_delta(final_delta)
 
-        stop_kwargs: dict[str, Any] = {}
+        stop_kwargs: dict[str, Any] = {"token": token}
         if options.stop_blocks:
             stop_kwargs["blocks"] = options.stop_blocks
-        result = await streamer.stop(**stop_kwargs) if stop_kwargs else await streamer.stop()
+        result = await streamer.stop(**stop_kwargs)
 
         message_ts = ""
         if isinstance(result, dict):
