@@ -111,7 +111,15 @@ class TestTokenRefreshRaceCondition:
         """Two concurrent _get_access_token calls should only trigger one refresh."""
         from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
 
-        with patch.dict("os.environ", {"GOOGLE_CHAT_CREDENTIALS": '{"client_email":"a@b.iam","private_key":"fake"}'}):
+        # Adapter fails closed without a verification gating field; opt out via
+        # env for this non-verification test.
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOGLE_CHAT_CREDENTIALS": '{"client_email":"a@b.iam","private_key":"fake"}',
+                "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION": "true",
+            },
+        ):
             adapter = GoogleChatAdapter()
 
         call_count = 0

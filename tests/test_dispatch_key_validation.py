@@ -327,7 +327,12 @@ class TestGoogleChatDispatchKeys:
         from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
         from chat_sdk.adapters.google_chat.types import GoogleChatAdapterConfig
 
-        adapter = GoogleChatAdapter(GoogleChatAdapterConfig(use_application_default_credentials=True))
+        adapter = GoogleChatAdapter(
+            GoogleChatAdapterConfig(
+                use_application_default_credentials=True,
+                disable_signature_verification=True,
+            )
+        )
         adapter._chat = _make_mock_chat()
         adapter._bot_user_id = "users/bot123"
         return adapter

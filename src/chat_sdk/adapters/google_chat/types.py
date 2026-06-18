@@ -315,3 +315,16 @@ class GoogleChatAdapterConfig:
 
     # Override bot username
     user_name: str | None = None
+
+    # Explicit opt-in to disable webhook signature verification. Required to
+    # construct the adapter when neither google_chat_project_number nor
+    # pubsub_audience is configured. Without this flag the constructor raises
+    # ValidationError -- fail-closed by default. Only enable in development or
+    # when an upstream layer (e.g. authenticated Cloud Run invocations) provides
+    # equivalent guarantees. Falls back to the
+    # GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION env var when left unset (None).
+    #
+    # Kept at the END of the field list intentionally: GoogleChatAdapterConfig
+    # is a positional-args dataclass, so inserting a new field in the middle
+    # would silently shift every later positional arg for existing callers.
+    disable_signature_verification: bool | None = None

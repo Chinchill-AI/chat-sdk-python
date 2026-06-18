@@ -77,6 +77,9 @@ def _make_credentials() -> ServiceAccountCredentials:
 
 
 def _make_adapter(**overrides: Any) -> GoogleChatAdapter:
+    # Adapter fails closed without a verification gating field; default these
+    # non-verification tests to the explicit opt-out.
+    overrides.setdefault("disable_signature_verification", True)
     config = GoogleChatAdapterConfig(
         credentials=overrides.pop("credentials", _make_credentials()),
         **overrides,
@@ -279,8 +282,10 @@ class TestConstructorEnvVarResolution:
         saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
         try:
             self._clear_gchat_env()
+            # Gating field set so construction reaches the auth check rather
+            # than the fail-closed verification check.
             with pytest.raises(ValidationError, match="Authentication"):
-                GoogleChatAdapter(GoogleChatAdapterConfig())
+                GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
         finally:
             os.environ.update(saved)
 
@@ -294,7 +299,7 @@ class TestConstructorEnvVarResolution:
                     "private_key": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
                 }
             )
-            adapter = GoogleChatAdapter(GoogleChatAdapterConfig())
+            adapter = GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
             assert adapter.name == "gchat"
         finally:
             self._clear_gchat_env()
@@ -305,7 +310,7 @@ class TestConstructorEnvVarResolution:
         try:
             self._clear_gchat_env()
             os.environ["GOOGLE_CHAT_USE_ADC"] = "true"
-            adapter = GoogleChatAdapter(GoogleChatAdapterConfig())
+            adapter = GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
             assert adapter.name == "gchat"
         finally:
             self._clear_gchat_env()
@@ -322,7 +327,7 @@ class TestConstructorEnvVarResolution:
                 }
             )
             os.environ["GOOGLE_CHAT_PUBSUB_TOPIC"] = "projects/test/topics/test"
-            adapter = GoogleChatAdapter(GoogleChatAdapterConfig())
+            adapter = GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
             assert adapter._pubsub_topic == "projects/test/topics/test"
         finally:
             self._clear_gchat_env()
@@ -339,7 +344,7 @@ class TestConstructorEnvVarResolution:
                 }
             )
             os.environ["GOOGLE_CHAT_IMPERSONATE_USER"] = "user@example.com"
-            adapter = GoogleChatAdapter(GoogleChatAdapterConfig())
+            adapter = GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
             assert adapter._impersonate_user == "user@example.com"
         finally:
             self._clear_gchat_env()
@@ -366,7 +371,12 @@ class TestConstructorEnvVarResolution:
 
 class TestConstructorWithADC:
     def test_accepts_adc_config(self):
-        adapter = GoogleChatAdapter(GoogleChatAdapterConfig(use_application_default_credentials=True))
+        adapter = GoogleChatAdapter(
+            GoogleChatAdapterConfig(
+                use_application_default_credentials=True,
+                disable_signature_verification=True,
+            )
+        )
         assert adapter.name == "gchat"
 
     def test_default_user_name_is_bot(self):

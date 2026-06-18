@@ -467,6 +467,9 @@ class TestGChatFixtureReplay:
                 client_email="test@test.iam.gserviceaccount.com",
                 private_key="-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----",
             ),
+            # Replay fixtures carry no JWT; opt out of verification so the
+            # adapter constructs (fail-closed default would otherwise raise).
+            disable_signature_verification=True,
         )
         adapter = GoogleChatAdapter(config)
         # Set bot user ID from fixture so the adapter can detect self-messages
