@@ -52,7 +52,14 @@ redis = ["redis>=5.0"]
 postgres = ["asyncpg>=0.29"]
 crypto = ["cryptography>=42.0"]
 discord = ["pynacl>=1.5", "aiohttp>=3.9"]
-teams = ["aiohttp>=3.9"]
+teams = [
+    "aiohttp>=3.9",
+    # Official Microsoft Teams Apps Python SDK (issue #93 migration; mirrors upstream
+    # adapter-teams@4.30.0's @microsoft/teams.* deps). Graph stays hand-rolled (no [graph] extra).
+    "microsoft-teams-apps>=2.0.13",
+    "microsoft-teams-api>=2.0.13",
+    "microsoft-teams-cards>=2.0.13",
+]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
 messenger = ["aiohttp>=3.9"]
