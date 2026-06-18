@@ -1,10 +1,17 @@
 """Messenger (Meta) adapter for chat-sdk.
 
-PR 1 of 2 (scaffolding): types, format converter, and card conversion.
-The adapter itself (webhook routing, Graph API, signature verification,
-send/stream) is added in PR 2.
+Python port of upstream ``packages/adapter-messenger``. Supports webhook
+routing (with HMAC-SHA256 signature verification), Send API integration via
+the Meta Graph API, and message/card/streaming primitives.
 """
 
+from chat_sdk.adapters.messenger.adapter import (
+    DEFAULT_API_VERSION,
+    GRAPH_API_BASE,
+    MESSENGER_MESSAGE_LIMIT,
+    MessengerAdapter,
+    create_messenger_adapter,
+)
 from chat_sdk.adapters.messenger.cards import (
     MessengerCardResult,
     card_to_messenger,
@@ -30,6 +37,10 @@ from chat_sdk.adapters.messenger.types import (
 )
 
 __all__ = [
+    "DEFAULT_API_VERSION",
+    "GRAPH_API_BASE",
+    "MESSENGER_MESSAGE_LIMIT",
+    "MessengerAdapter",
     "MessengerAdapterConfig",
     "MessengerButton",
     "MessengerButtonTemplatePayload",
@@ -47,6 +58,7 @@ __all__ = [
     "MessengerWebhookPayload",
     "card_to_messenger",
     "card_to_messenger_text",
+    "create_messenger_adapter",
     "decode_messenger_callback_data",
     "encode_messenger_callback_data",
 ]

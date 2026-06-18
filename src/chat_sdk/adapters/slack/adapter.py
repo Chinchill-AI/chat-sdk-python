@@ -19,9 +19,11 @@ import json
 import os
 import re
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
@@ -52,10 +54,11 @@ from chat_sdk.adapters.slack.types import (
     SlackBotToken,
     SlackBotTokenResolver,
     SlackInstallation,
+    SlackInstallationProvider,
     SlackThreadId,
     SlackWebhookVerifier,
 )
-from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_slack, resolve_emoji_from_slack
+from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
 from chat_sdk.shared.adapter_utils import extract_card, extract_files
@@ -205,6 +208,19 @@ _UNFURL_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _InstallationInfo:
+    """Installation identity extracted from an interactive payload.
+
+    ``installation_id`` is the team ID -- or the enterprise ID for
+    Enterprise Grid org-wide installs (``is_enterprise_install``).
+    """
+
+    installation_id: str
+    is_enterprise_install: bool
+    enterprise_id: str | None = None
 
 
 def _find_next_mention(text: str) -> int:
@@ -395,6 +411,12 @@ class SlackAdapter:
         # on each subsequent webhook entry. Static-string configs prime this at
         # construction time so sync access works before any webhook fires.
         self._default_bot_token_cache: str | None = bot_token_config if isinstance(bot_token_config, str) else None
+        # True when the user passed a callable ``bot_token`` (sync or async).
+        # The config contract says callable resolvers are invoked on each use
+        # to support rotation, so sync access goes through a fresh-invoke
+        # branch instead of reading ``_default_bot_token_cache``. Static
+        # strings have nothing to rotate and stay on the cached fast path.
+        self._is_dynamic_bot_token: bool = callable(bot_token_config)
 
         # ------------------------------------------------------------------
         # Socket mode wiring (PR #86). Resolved AFTER the bot-token resolver
@@ -466,6 +488,16 @@ class SlackAdapter:
         self._client_cache: OrderedDict[str, Any] = OrderedDict()
         self._client_cache_max = config.client_cache_max if config.client_cache_max is not None else 100
 
+        # Cache of synchronous slack_sdk.WebClient instances keyed by bot
+        # token, backing the public ``web_client`` property (the direct port
+        # of upstream's ``getClientForToken``). Kept separate from
+        # ``_client_cache`` because that one holds async ``AsyncWebClient``
+        # instances used by the adapter's own API calls; the two client types
+        # are not interchangeable. Mirrors upstream's plain (unbounded) Map —
+        # one entry per distinct token — since callers reach for this escape
+        # hatch rarely and tokens are low-cardinality.
+        self._web_client_cache: dict[str, Any] = {}
+
         # Multi-workspace OAuth fields.
         # ``is not None`` (not truthiness) so an explicit empty-string user
         # config does not silently fall back to env (hazard #1). Empty env
@@ -487,6 +519,9 @@ class SlackAdapter:
         else:
             self._client_secret = None
         self._installation_key_prefix = config.installation_key_prefix or "slack:installation"
+        # External installation provider (e.g. Vercel Connect). When set,
+        # per-installation token lookups bypass internal StateAdapter storage.
+        self._installation_provider: SlackInstallationProvider | None = config.installation_provider
 
         # ``is not None`` (not truthiness) so an explicit ``encryption_key=""``
         # is treated as "user explicitly opted out" and is NOT silently
@@ -590,6 +625,61 @@ class SlackAdapter:
         """
         return self._get_client()
 
+    @property
+    def web_client(self) -> Any:
+        """Direct access to a synchronous ``slack_sdk.WebClient``.
+
+        Bound to the bot token for the current request context
+        (multi-workspace) or the configured default token
+        (single-workspace). Use for any Slack Web API call not covered by
+        the adapter's high-level methods — e.g.
+        ``adapter.web_client.pins_add(...)`` or
+        ``adapter.web_client.usergroups_list(...)``.
+
+        Resolution order (the standard 3-level resolver):
+
+        1. Token from the current request context (set during webhook
+           handling, or by :meth:`with_bot_token` / :meth:`with_bot_token_async`).
+        2. The default bot token, when configured as a static string or
+           already-resolved value.
+        3. Otherwise raise :class:`AuthenticationError`.
+
+        Raises :class:`AuthenticationError` if neither is available —
+        typical causes are accessing ``web_client`` outside any
+        webhook / :meth:`with_bot_token` context in multi-workspace mode,
+        or having configured ``bot_token`` as an async resolver that has
+        not run yet. In the latter case await
+        :meth:`current_token_async` (or process the work inside the
+        webhook flow) so the resolver primes the token first.
+
+        Return type is ``Any`` (rather than the concrete ``WebClient``)
+        because ``slack_sdk`` is an optional dependency — consumers who do
+        not install the ``slack`` extra should not pay an import cost.
+
+        This is the direct port of upstream's ``adapter.webClient`` getter
+        (vercel/chat ``2f108bd``). Unlike :attr:`current_client` it returns
+        the *synchronous* ``WebClient`` (the analog of the single TS
+        ``WebClient``), so its methods are not awaitables.
+        """
+        return self._get_web_client_for_token(self._get_token())
+
+    @property
+    def client(self) -> Any:
+        """Deprecated alias for :attr:`web_client`.
+
+        .. deprecated::
+            Use :attr:`web_client` instead. This alias mirrors upstream's
+            pre-rename ``adapter.client`` (vercel/chat ``8366b8b``) and is
+            kept for one release for backwards compatibility; it will be
+            removed in a future version. Emits :class:`DeprecationWarning`.
+        """
+        warnings.warn(
+            "SlackAdapter.client is deprecated; use SlackAdapter.web_client instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.web_client
+
     # ------------------------------------------------------------------
     # Token management
     # ------------------------------------------------------------------
@@ -602,17 +692,19 @@ class SlackAdapter:
         1. Multi-workspace request context (``_request_context``)
         2. Per-request resolved default token (``_resolved_default_token``)
            — primed by ``handle_webhook`` after invoking the resolver
-        3. Static default token cache (set by the constructor for
-           string-typed ``bot_token`` configs)
-        4. Raises :class:`AuthenticationError`
+        3. Sync dynamic resolver — invoked **fresh on every call** to honor
+           the rotation contract in :attr:`SlackAdapterConfig.bot_token`
+           ("called on each use to support rotation")
+        4. Static default token cache (set by the constructor for
+           string-typed ``bot_token`` configs, or by the async path after
+           ``_resolve_default_token`` runs)
+        5. Raises :class:`AuthenticationError`
 
-        Synchronous: the token resolver is *not* invoked here. Webhook entry
-        paths call :meth:`_resolve_default_token` first so the per-request
-        cache is primed; static-string ``bot_token`` configs prime the
-        process-wide cache at construction time so this is a no-op for the
-        common case. Use :meth:`_resolve_token_async` from new async call
-        sites that need to invoke a resolver outside webhook flow (e.g.
-        cron jobs).
+        Async resolvers cannot be awaited from a sync context — sync access
+        outside a webhook scope falls back to the process-wide cache, or
+        raises if the async path has not run yet. Use
+        :meth:`current_token_async` or enter via :meth:`handle_webhook` so
+        the resolver runs first.
         """
         ctx = self._request_context.get()
         if ctx and ctx.token:
@@ -620,16 +712,45 @@ class SlackAdapter:
         per_request = self._resolved_default_token.get()
         if per_request is not None:
             return per_request
+        # Sync dynamic resolver: invoke fresh every call to honor rotation.
+        # Static strings (no rotation possible) and async resolvers (which
+        # need a webhook entry to be awaited) fall through to the cache.
+        provider = self._default_bot_token_provider
+        if self._is_dynamic_bot_token and provider is not None and not inspect.iscoroutinefunction(provider):
+            resolved = provider()
+            # Defensive: a "sync" callable may still *return* a coroutine
+            # (e.g. ``lambda: some_async_fn()``) and ``iscoroutinefunction``
+            # would not catch that. Refuse to use such a value in a sync
+            # context — and close the awaitable to suppress the
+            # ``coroutine was never awaited`` RuntimeWarning before raising.
+            if inspect.isawaitable(resolved):
+                close = getattr(resolved, "close", None)
+                if callable(close):
+                    close()
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an awaitable in a sync "
+                    "context. Use the async API (handle_webhook / "
+                    "current_token_async) so the resolver can be awaited.",
+                )
+            if not isinstance(resolved, str) or not resolved:
+                raise AuthenticationError(
+                    "slack",
+                    "Bot token resolver returned an empty or non-string value.",
+                )
+            # Intentionally do NOT write ``_default_bot_token_cache``: caching
+            # would break the rotation contract for the next sync access.
+            return resolved
         if self._default_bot_token_cache is not None:
             return self._default_bot_token_cache
-        if self._default_bot_token_provider is not None:
-            # Resolver-based default token configured but never resolved. This
-            # is a programming error: the async entry path should have awaited
-            # ``_resolve_default_token()`` before reaching here.
+        if provider is not None:
+            # Async resolver configured but never awaited. ``handle_webhook``
+            # or ``current_token_async`` must run first to prime the cache.
             raise AuthenticationError(
                 "slack",
-                "Bot token resolver has not been invoked yet. Use the async API "
-                "(handle_webhook / current_token_async) so the resolver runs first.",
+                "Async bot token resolver has not been invoked yet. Use the "
+                "async API (handle_webhook / current_token_async) so the "
+                "resolver runs first.",
             )
         raise AuthenticationError(
             "slack",
@@ -740,8 +861,40 @@ class SlackAdapter:
         return client
 
     def _invalidate_client(self, token: str) -> None:
-        """Remove a cached client (e.g., on token revocation)."""
+        """Remove a cached client (e.g., on token revocation).
+
+        For dynamic-resolver configs also clears the resolved-token caches
+        so the next access re-invokes the resolver instead of serving the
+        revoked token. Static-string configs intentionally retain their
+        cache: there is no refresh path, so clearing would just make every
+        subsequent sync access raise.
+        """
         self._client_cache.pop(token, None)
+        self._web_client_cache.pop(token, None)
+        if self._is_dynamic_bot_token:
+            if self._default_bot_token_cache == token:
+                self._default_bot_token_cache = None
+            if self._resolved_default_token.get() == token:
+                self._resolved_default_token.set(None)
+
+    def _get_web_client_for_token(self, token: str) -> Any:
+        """Return a synchronous ``slack_sdk.WebClient`` for *token*, cached.
+
+        Backs the public :attr:`web_client` property and is the direct port
+        of upstream's ``getClientForToken`` (vercel/chat ``2f108bd``): one
+        cached ``WebClient`` instance per distinct token. The import is
+        deferred so ``slack_sdk`` stays an optional dependency (hazard #10).
+
+        Distinct from :meth:`_get_client`, which caches the *async*
+        ``AsyncWebClient`` used by the adapter's own API calls.
+        """
+        client = self._web_client_cache.get(token)
+        if client is None:
+            from slack_sdk import WebClient
+
+            client = WebClient(token=token)
+            self._web_client_cache[token] = client
+        return client
 
     # ------------------------------------------------------------------
     # Initialization
@@ -973,30 +1126,79 @@ class SlackAdapter:
     # Private helpers - token resolution
     # ==================================================================
 
-    async def _resolve_token_for_team(self, team_id: str) -> RequestContext | None:
-        """Resolve the bot token for a team from the state adapter."""
+    async def _resolve_token_for_team(
+        self, installation_id: str, is_enterprise_install: bool = False
+    ) -> RequestContext | None:
+        """Resolve the bot token for an installation.
+
+        Checks the external installation provider first (e.g. Vercel
+        Connect); when no provider is configured, falls back to the
+        internal state adapter.
+
+        ``installation_id`` is the ``team_id`` -- or the ``enterprise_id``
+        for Enterprise Grid org-wide installs (``is_enterprise_install``).
+        """
         try:
-            installation = await self.get_installation(team_id)
+            # Check external installation provider first (e.g. Vercel Connect)
+            if self._installation_provider is not None:
+                installation = await self._installation_provider.get_installation(
+                    installation_id, is_enterprise_install
+                )
+                if installation:
+                    return RequestContext(
+                        token=installation.bot_token,
+                        bot_user_id=installation.bot_user_id,
+                    )
+                self._logger.warn(
+                    "No installation found from provider",
+                    {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                )
+                return None
+            # Fall back to internal state adapter
+            installation = await self.get_installation(installation_id)
             if installation:
                 return RequestContext(
                     token=installation.bot_token,
                     bot_user_id=installation.bot_user_id,
                 )
-            self._logger.warn("No installation found for team", {"teamId": team_id})
+            self._logger.warn(
+                "No installation found for team",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+            )
             return None
         except Exception as exc:
-            self._logger.error("Failed to resolve token for team", {"teamId": team_id, "error": exc})
+            self._logger.error(
+                "Failed to resolve token for team",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install, "error": exc},
+            )
             return None
 
-    def _extract_team_id_from_interactive(self, body: str) -> str | None:
-        """Extract team_id from an interactive payload (form-urlencoded)."""
+    def _extract_installation_from_interactive(self, body: str) -> _InstallationInfo | None:
+        """Extract installation info from an interactive payload (form-urlencoded).
+
+        For Enterprise Grid org-wide installs, the installation ID is the
+        enterprise ID; otherwise it is the team ID.
+        """
         try:
             params = parse_qs(body)
             payload_str = params.get("payload", [None])[0]
             if not payload_str:
                 return None
             payload = json.loads(payload_str)
-            return payload.get("team", {}).get("id") or payload.get("team_id")
+            is_enterprise_install = bool(payload.get("is_enterprise_install"))
+            enterprise = payload.get("enterprise") or {}
+            enterprise_id = enterprise.get("id") or payload.get("enterprise_id") or None
+            team = payload.get("team") or {}
+            team_id = team.get("id") or payload.get("team_id") or None
+            installation_id = enterprise_id if is_enterprise_install else team_id
+
+            if not installation_id:
+                return None
+            return _InstallationInfo(
+                installation_id=installation_id,
+                is_enterprise_install=is_enterprise_install,
+                enterprise_id=enterprise_id,
+            )
         except Exception:
             return None
 
@@ -1359,24 +1561,47 @@ class SlackAdapter:
 
             # Slash command
             if "command" in params and "payload" not in params:
-                team_id = (params.get("team_id") or [None])[0]
-                if not self._is_single_workspace and team_id:
-                    ctx = await self._resolve_token_for_team(team_id)
-                    if ctx:
-                        tok = self._request_context.set(ctx)
-                        try:
-                            return await self._handle_slash_command(params, options)
-                        finally:
-                            self._request_context.reset(tok)
-                    self._logger.warn("Could not resolve token for slash command")
+                if not self._is_single_workspace:
+                    # For Enterprise Grid org-wide installs, use enterprise_id;
+                    # otherwise use team_id.
+                    is_enterprise_install = (params.get("is_enterprise_install") or [None])[0] == "true"
+                    enterprise_id = (params.get("enterprise_id") or [None])[0]
+                    team_id = (params.get("team_id") or [None])[0]
+                    installation_id = enterprise_id if is_enterprise_install else team_id
+
+                    if installation_id:
+                        ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
+                        if ctx:
+                            ctx = replace(
+                                ctx,
+                                enterprise_id=enterprise_id,
+                                is_enterprise_install=is_enterprise_install,
+                            )
+                            tok = self._request_context.set(ctx)
+                            try:
+                                return await self._handle_slash_command(params, options)
+                            finally:
+                                self._request_context.reset(tok)
+                        self._logger.warn(
+                            "Could not resolve token for slash command",
+                            {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                        )
                 return await self._handle_slash_command(params, options)
 
             # Interactive payload
             if not self._is_single_workspace:
-                team_id_interactive = self._extract_team_id_from_interactive(body)
-                if team_id_interactive:
-                    ctx = await self._resolve_token_for_team(team_id_interactive)
+                installation_info = self._extract_installation_from_interactive(body)
+                if installation_info:
+                    ctx = await self._resolve_token_for_team(
+                        installation_info.installation_id,
+                        installation_info.is_enterprise_install,
+                    )
                     if ctx:
+                        ctx = replace(
+                            ctx,
+                            enterprise_id=installation_info.enterprise_id,
+                            is_enterprise_install=installation_info.is_enterprise_install,
+                        )
                         tok = self._request_context.set(ctx)
                         try:
                             return await self._handle_interactive_payload(body, options)
@@ -1406,15 +1631,27 @@ class SlackAdapter:
         # isolated -- the ContextVar change does not leak back to the caller
         # and does not need an explicit reset.
         if not self._is_single_workspace and payload.get("type") == "event_callback":
-            team_id_event = payload.get("team_id")
-            if team_id_event:
-                ctx = await self._resolve_token_for_team(team_id_event)
+            # For Enterprise Grid org-wide installs, use enterprise_id;
+            # otherwise use team_id.
+            is_enterprise_install = bool(payload.get("is_enterprise_install"))
+            installation_id = payload.get("enterprise_id") if is_enterprise_install else payload.get("team_id")
+
+            if installation_id:
+                ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
                 if ctx:
+                    ctx = replace(
+                        ctx,
+                        enterprise_id=payload.get("enterprise_id"),
+                        is_enterprise_install=is_enterprise_install,
+                    )
                     isolated = contextvars.copy_context()
                     isolated.run(self._request_context.set, ctx)
                     isolated.run(self._process_event_payload, payload, options)
                     return {"body": "ok", "status": 200}
-                self._logger.warn("Could not resolve token for team", {"teamId": team_id_event})
+                self._logger.warn(
+                    "Could not resolve token for installation",
+                    {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+                )
                 return {"body": "ok", "status": 200}
 
         # Single-workspace mode or fallback
@@ -3211,13 +3448,17 @@ class SlackAdapter:
         the queue/debounce path JSON-serializes the message.
         """
         url = file.get("url_private")
-        # Capture per-request token from the active webhook context so
-        # ``fetch_data`` can run later without being inside the ContextVar
-        # frame (e.g. after the message has been queued + rehydrated).
+        # Capture per-request context (token + Enterprise Grid info) from the
+        # active webhook context so ``fetch_data`` can run later without being
+        # inside the ContextVar frame (e.g. after the message has been queued
+        # + rehydrated), and ``rehydrate_attachment`` can resolve tokens
+        # through the same lookup logic on a different process invocation.
         # For single-workspace mode the default provider is re-resolved at
         # fetch time so dynamic ``bot_token`` resolvers honor rotation.
         ctx = self._request_context.get()
         ctx_token: str | None = ctx.token if ctx and ctx.token else None
+        ctx_enterprise_id: str | None = ctx.enterprise_id if ctx else None
+        ctx_is_enterprise_install: bool = bool(ctx.is_enterprise_install) if ctx else False
 
         mimetype = file.get("mimetype", "")
         att_type: str = "file"
@@ -3237,6 +3478,12 @@ class SlackAdapter:
             fetch_meta["url"] = url
         if team_id:
             fetch_meta["teamId"] = team_id
+        # Omit the Enterprise Grid keys entirely when absent (hazard #7:
+        # omitted keys, not serialized ``None``/false values).
+        if ctx_enterprise_id:
+            fetch_meta["enterpriseId"] = ctx_enterprise_id
+        if ctx_is_enterprise_install:
+            fetch_meta["isEnterpriseInstall"] = "true"
 
         return Attachment(
             type=att_type,  # type: ignore[arg-type]
@@ -3322,20 +3569,28 @@ class SlackAdapter:
         meta_url = meta.get("url")
         url = meta_url if meta_url is not None else attachment.url
         team_id = meta.get("teamId")
+        enterprise_id = meta.get("enterpriseId")
+        is_enterprise_install = meta.get("isEnterpriseInstall") == "true"
         if not url:
             return attachment
 
         adapter = self
 
         async def fetch_data() -> bytes:
-            if team_id:
-                installation = await adapter.get_installation(team_id)
-                if installation is None:
+            installation_id = enterprise_id if is_enterprise_install else team_id
+            if installation_id:
+                # Route through ``_resolve_token_for_team`` so
+                # ``installation_provider`` (when configured) is honored --
+                # otherwise this falls back to internal state via
+                # ``get_installation``, matching the prior behavior.
+                ctx = await adapter._resolve_token_for_team(installation_id, is_enterprise_install)
+                if ctx is None:
                     raise AuthenticationError(
                         "slack",
-                        f"Installation not found for team {team_id}",
+                        f"Installation not found for "
+                        f"{'enterprise' if is_enterprise_install else 'team'} {installation_id}",
                     )
-                token = installation.bot_token
+                token = ctx.token
             else:
                 # Use the async resolver so a dynamic ``bot_token`` provider
                 # is invoked at fetch time (rotation-safe).
@@ -3363,35 +3618,6 @@ class SlackAdapter:
         if self._bot_user_id and event.get("user") == self._bot_user_id:
             return True
         return bool(self._bot_id and event.get("bot_id") == self._bot_id)
-
-    # ==================================================================
-    # Table block rendering
-    # ==================================================================
-
-    def _render_with_table_blocks(self, message: AdapterPostableMessage) -> dict[str, Any] | None:
-        """Try to render a message with native Slack table blocks.
-
-        Returns ``{"text": ..., "blocks": ...}`` if the message contains tables,
-        ``None`` otherwise.
-        """
-        ast: dict[str, Any] | None = None
-        if isinstance(message, dict):
-            ast = message.get("ast")  # type: ignore[union-attr]
-        elif hasattr(message, "ast"):
-            ast = getattr(message, "ast", None)
-        elif hasattr(message, "markdown"):
-            # We don't have a full markdown->AST parser in Python; skip table blocks
-            return None
-
-        if not ast:
-            return None
-
-        blocks = self._format_converter.to_blocks_with_table(ast)
-        if not blocks:
-            return None
-
-        fallback_text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
-        return {"text": fallback_text, "blocks": blocks}
 
     # ==================================================================
     # Post / Edit / Delete messages
@@ -3456,38 +3682,21 @@ class SlackAdapter:
                     ),
                 )
 
-            # Table blocks
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
-                return RawMessage(
-                    id=result.get("ts", ""),
-                    thread_id=thread_id,
-                    raw=self._augment_raw_with_uploads(
-                        result.data if hasattr(result, "data") else result,
-                        uploaded_file_ids,
-                    ),
-                )
-
-            # Regular text
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+            payload = self._format_converter.to_slack_payload(message)
             self._logger.debug(
                 "Slack API: chat.postMessage",
-                {"channel": channel, "threadTs": thread_ts, "textLength": len(text)},
+                {
+                    "channel": channel,
+                    "threadTs": thread_ts,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
             )
             result = await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts or None,
-                text=text,
                 unfurl_links=False,
                 unfurl_media=False,
+                **payload,
             )
             return RawMessage(
                 id=result.get("ts", ""),
@@ -3557,22 +3766,16 @@ class SlackAdapter:
                     raw=result.data if hasattr(result, "data") else result,
                 )
 
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_update(
-                    channel=channel,
-                    ts=message_id,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                )
-                return RawMessage(
-                    id=result.get("ts", ""),
-                    thread_id=thread_id,
-                    raw=result.data if hasattr(result, "data") else result,
-                )
-
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
-            result = await client.chat_update(channel=channel, ts=message_id, text=text)
+            payload = self._format_converter.to_slack_payload(message)
+            self._logger.debug(
+                "Slack API: chat.update",
+                {
+                    "channel": channel,
+                    "messageId": message_id,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
+            )
+            result = await client.chat_update(channel=channel, ts=message_id, **payload)
             return RawMessage(
                 id=result.get("ts", ""),
                 thread_id=thread_id,
@@ -3874,28 +4077,21 @@ class SlackAdapter:
                     raw=result.data if hasattr(result, "data") else result,
                 )
 
-            table_result = self._render_with_table_blocks(message)
-            if table_result:
-                result = await client.chat_postEphemeral(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    user=user_id,
-                    text=table_result["text"],
-                    blocks=table_result["blocks"],
-                )
-                return EphemeralMessage(
-                    id=result.get("message_ts", ""),
-                    thread_id=thread_id,
-                    used_fallback=False,
-                    raw=result.data if hasattr(result, "data") else result,
-                )
-
-            text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+            payload = self._format_converter.to_slack_payload(message)
+            self._logger.debug(
+                "Slack API: chat.postEphemeral",
+                {
+                    "channel": channel,
+                    "threadTs": thread_ts,
+                    "userId": user_id,
+                    "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                },
+            )
             result = await client.chat_postEphemeral(
                 channel=channel,
                 thread_ts=thread_ts or None,
                 user=user_id,
-                text=text,
+                **payload,
             )
             return EphemeralMessage(
                 id=result.get("message_ts", ""),
@@ -3958,14 +4154,23 @@ class SlackAdapter:
                     unfurl_media=False,
                 )
             else:
-                text = convert_emoji_placeholders(self._format_converter.render_postable(message), "slack")
+                payload = self._format_converter.to_slack_payload(message)
+                self._logger.debug(
+                    "Slack API: chat.scheduleMessage",
+                    {
+                        "channel": channel,
+                        "threadTs": thread_ts,
+                        "postAt": post_at_unix,
+                        "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
+                    },
+                )
                 result = await client.chat_scheduleMessage(
                     channel=channel,
                     thread_ts=thread_ts or None,
                     post_at=post_at_unix,
-                    text=text,
                     unfurl_links=False,
                     unfurl_media=False,
+                    **payload,
                 )
 
             scheduled_message_id = result.get("scheduled_message_id", "")
@@ -4435,7 +4640,10 @@ class SlackAdapter:
         return self._parse_slack_message_sync(event, thread_id)
 
     def render_formatted(self, content: FormattedContent) -> str:
-        """Render formatted content (AST) to Slack mrkdwn."""
+        """Render formatted content (AST) to standard markdown.
+
+        Slack now accepts markdown natively via ``markdown_text``.
+        """
         return self._format_converter.from_ast(content)
 
     # ==================================================================
@@ -4557,18 +4765,13 @@ class SlackAdapter:
                     "blocks": card_to_block_kit(card),
                 }
             else:
-                table_result = self._render_with_table_blocks(message)
-                if table_result:
-                    payload = {
-                        "replace_original": True,
-                        "text": table_result["text"],
-                        "blocks": table_result["blocks"],
-                    }
-                else:
-                    payload = {
-                        "replace_original": True,
-                        "text": convert_emoji_placeholders(self._format_converter.render_postable(message), "slack"),
-                    }
+                # Slack rejects `markdown_text` on response_url payloads
+                # (`no_text`), so markdown/AST messages are rendered to
+                # Slack's legacy mrkdwn format for this surface.
+                payload = {
+                    "replace_original": True,
+                    "text": self._format_converter.to_response_url_text(message),
+                }
 
             if thread_ts:
                 payload["thread_ts"] = thread_ts

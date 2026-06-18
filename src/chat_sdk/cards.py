@@ -29,6 +29,8 @@ class ButtonElement(_ButtonRequired, total=False):
     value: str
     disabled: bool
     action_type: Literal["action", "modal"] | None
+    # URL to POST action data to when this button is clicked
+    callback_url: str
 
 
 class _LinkButtonRequired(TypedDict):
@@ -256,6 +258,7 @@ def Button(
     value: str | None = None,
     disabled: bool | None = None,
     action_type: Literal["action", "modal"] | None = None,
+    callback_url: str | None = None,
 ) -> ButtonElement:
     """Create a Button element.
 
@@ -264,6 +267,7 @@ def Button(
         Button(id="submit", label="Submit", style="primary")
         Button(id="delete", label="Delete", style="danger", value="item-123")
         Button(id="open", label="Open", action_type="modal")
+        Button(id="approve", label="Approve", callback_url="https://example.com/hook")
     """
     element: ButtonElement = {"type": "button", "id": id, "label": label}
     if style is not None:
@@ -274,6 +278,8 @@ def Button(
         element["disabled"] = disabled
     if action_type is not None:
         element["action_type"] = action_type
+    if callback_url is not None:
+        element["callback_url"] = callback_url
     return element
 
 

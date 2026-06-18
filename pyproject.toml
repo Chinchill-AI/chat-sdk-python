@@ -1,6 +1,6 @@
 [project]
 name = "chat-sdk"
-version = "0.4.29a2"
+version = "0.4.29"
 description = "Multi-platform async chat SDK for Python — port of Vercel Chat"
 keywords = [
     "chat",
@@ -55,6 +55,7 @@ discord = ["pynacl>=1.5", "aiohttp>=3.9"]
 teams = ["aiohttp>=3.9"]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
+messenger = ["aiohttp>=3.9"]
 google-chat = ["aiohttp>=3.9", "pyjwt[crypto]>=2.8", "google-auth>=2.0"]
 linear = ["aiohttp>=3.9"]
 all = [

@@ -406,7 +406,9 @@ class TestHandleWebhookApplicationCommand:
         mock_chat.process_slash_command.assert_called_once()
         call_args = mock_chat.process_slash_command.call_args[0][0]
         assert call_args.command == "/test"
-        assert call_args.text == "status True"
+        # Boolean option values flatten as JSON-style "true"/"false",
+        # matching TS `String(true)` (wire parity, vercel/chat#490 test).
+        assert call_args.text == "status true"
 
     @pytest.mark.asyncio
     async def test_expands_subcommand_path(self):

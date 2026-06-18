@@ -181,18 +181,41 @@ class TestBotTokenResolverConstruction:
         assert await adapter.current_token_async() == "xoxb-token-3"
         assert i[0] == 3
 
-    def test_sync_current_token_with_resolver_before_resolution_raises(self):
-        """Sync ``current_token`` access before the resolver has run raises a clear error."""
+    def test_sync_current_token_with_sync_resolver_invokes_resolver(self):
+        """Sync ``current_token`` invokes a sync resolver directly (Codex P2 fix).
+
+        Previously the sync path raised ``AuthenticationError`` for sync
+        resolvers too — single-workspace apps using a sync resolver for
+        secret rotation could not read ``current_token`` / ``web_client``
+        outside a webhook context until an async path had primed the cache.
+        ``_get_token`` now invokes the sync resolver directly — fresh on
+        every call, to honor the rotation contract on
+        :attr:`SlackAdapterConfig.bot_token`. The
+        async-resolver-in-sync-context case still raises (see
+        ``test_sync_current_token_with_async_resolver_raises`` below).
+        """
 
         def resolver() -> str:
             return "xoxb-resolved"
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
-        # Tightened: error message must mention ``current_token_async`` so
-        # callers know the right async accessor to use, not just that "the
-        # resolver hasn't run". Substring check on "current_token_async"
-        # is escaped via ``re.escape`` so the underscore isn't treated as a
-        # regex token (it isn't, but be explicit).
+        assert adapter.current_token == "xoxb-resolved"
+        # Dynamic resolvers must NOT prime ``_default_bot_token_cache``;
+        # caching would suppress subsequent resolver calls and break the
+        # rotation contract. Rotation behavior is pinned by
+        # ``test_sync_callable_invoked_fresh_each_access`` in
+        # tests/test_slack_web_client.py.
+        assert adapter._default_bot_token_cache is None
+
+    def test_sync_current_token_with_async_resolver_raises(self):
+        """Async resolvers still cannot be awaited from the sync property."""
+
+        async def resolver() -> str:
+            return "xoxb-async-resolved"
+
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
+        # Error message must point at the async entry point so callers know
+        # the right accessor to use.
         with pytest.raises(AuthenticationError, match=r"current_token_async"):
             _ = adapter.current_token
 
@@ -316,6 +339,12 @@ class TestBotTokenResolverConstruction:
         refresh the process-wide ``_default_bot_token_cache`` so the sync
         path returns the freshly resolved value.
 
+        Uses an *async* resolver so the sanity precondition (sync access
+        before any resolution raises) still holds — sync resolvers now
+        resolve directly on the sync path (Codex P2 fix), so the regression
+        scenario this test guards is specifically the async path priming the
+        sync cache.
+
         What to fix if this fails: in ``_resolve_default_token``
         (``adapters/slack/adapter.py``), after the
         ``isinstance(token, str)`` / non-empty validation and before
@@ -323,13 +352,13 @@ class TestBotTokenResolverConstruction:
         ``self._default_bot_token_cache = token``.
         """
 
-        def resolver() -> str:
+        async def resolver() -> str:
             return "xoxb-resolved-token"
 
         adapter = SlackAdapter(SlackAdapterConfig(signing_secret="s", bot_token=resolver))
 
-        # Sanity: before the resolver runs, sync ``current_token`` must raise
-        # (matches ``test_sync_current_token_with_resolver_before_resolution_raises``).
+        # Sanity: before the async resolver runs, sync ``current_token`` must
+        # raise — async resolvers cannot be awaited from the sync property.
         with pytest.raises(AuthenticationError, match=r"current_token_async"):
             _ = adapter.current_token
 

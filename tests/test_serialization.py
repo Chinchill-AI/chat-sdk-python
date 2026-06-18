@@ -702,7 +702,7 @@ class TestThreadFromJsonFaithful:
             "_adapter_name": original._adapter_name,
             "_state_adapter_instance": original._state_adapter_instance,
             "_channel_cache": original._channel_cache,
-            "_message_history": original._message_history,
+            "_thread_history": original._thread_history,
             "_recent_messages": list(original._recent_messages),
             "_is_subscribed_context": original._is_subscribed_context,
         }
@@ -720,10 +720,10 @@ class TestThreadFromJsonFaithful:
         assert original._adapter is snapshot["_adapter"]
         assert original._state_adapter_instance is snapshot["_state_adapter_instance"]
 
-    def test_should_invalidate_recent_messages_and_message_history_on_rebind(self, mock_state):
+    def test_should_invalidate_recent_messages_and_thread_history_on_rebind(self, mock_state):
         """Two additional caches that carry previous-binding references must
         also drop on idempotent rebind: `_recent_messages` (populated from
-        adapter fetches) and `_message_history` (tied to chat's cache).
+        adapter fetches) and `_thread_history` (tied to chat's cache).
         Regression for a self-review-subagent finding."""
         from chat_sdk.testing import create_mock_adapter, create_mock_state, create_test_message
 
@@ -732,7 +732,7 @@ class TestThreadFromJsonFaithful:
         first_state = create_mock_state()
 
         # Prime caches: initial_message populates _recent_messages, and
-        # message_history is a sentinel cache object.
+        # thread_history is a sentinel cache object.
         sentinel_history = object()
         original = ThreadImpl(
             _ThreadImplConfig(
@@ -741,15 +741,15 @@ class TestThreadFromJsonFaithful:
                 state_adapter=first_state,
                 channel_id="C123",
                 initial_message=create_test_message("m1", "hello"),
-                message_history=sentinel_history,
+                thread_history=sentinel_history,
             )
         )
         assert len(original._recent_messages) == 1
-        assert original._message_history is sentinel_history
+        assert original._thread_history is sentinel_history
 
         rebound = ThreadImpl.from_json(original, adapter=second_adapter)
         assert rebound._recent_messages == [], "recent_messages should drop on rebind"
-        assert rebound._message_history is None, "message_history should drop on rebind"
+        assert rebound._thread_history is None, "thread_history should drop on rebind"
 
     def test_should_set_state_from_chat_when_both_adapter_and_chat_passed(self, mock_state):
         """adapter= and chat= are orthogonal. Passing both must apply both:

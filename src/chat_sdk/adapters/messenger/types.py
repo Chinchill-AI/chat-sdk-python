@@ -52,15 +52,17 @@ class MessengerAdapterConfig:
 
     def resolved_app_secret(self) -> str | None:
         """App secret with the ``FACEBOOK_APP_SECRET`` env fallback."""
-        return self.app_secret or os.environ.get(ENV_APP_SECRET)
+        # ``is not None`` (not truthy) mirrors upstream's ``??`` null-coalescing
+        # (index.ts:931) — an explicit config value wins over the env var.
+        return self.app_secret if self.app_secret is not None else os.environ.get(ENV_APP_SECRET)
 
     def resolved_page_access_token(self) -> str | None:
         """Page access token with the ``FACEBOOK_PAGE_ACCESS_TOKEN`` env fallback."""
-        return self.page_access_token or os.environ.get(ENV_PAGE_ACCESS_TOKEN)
+        return self.page_access_token if self.page_access_token is not None else os.environ.get(ENV_PAGE_ACCESS_TOKEN)
 
     def resolved_verify_token(self) -> str | None:
         """Verify token with the ``FACEBOOK_VERIFY_TOKEN`` env fallback."""
-        return self.verify_token or os.environ.get(ENV_VERIFY_TOKEN)
+        return self.verify_token if self.verify_token is not None else os.environ.get(ENV_VERIFY_TOKEN)
 
 
 # =============================================================================

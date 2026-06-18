@@ -43,6 +43,9 @@ def _make_credentials() -> ServiceAccountCredentials:
 
 
 def _make_adapter(**overrides: Any) -> GoogleChatAdapter:
+    # Adapter fails closed without a verification gating field; default these
+    # non-verification tests to the explicit opt-out.
+    overrides.setdefault("disable_signature_verification", True)
     config = GoogleChatAdapterConfig(
         credentials=overrides.pop("credentials", _make_credentials()),
         **overrides,
@@ -195,8 +198,10 @@ class TestConstructor:
         assert adapter.user_name == "mybot"
 
     def test_no_auth_raises(self):
-        with pytest.raises(ValidationError):
-            GoogleChatAdapter(GoogleChatAdapterConfig())
+        # Pass a verification gating field so construction reaches (and fails
+        # on) the auth check rather than the fail-closed verification check.
+        with pytest.raises(ValidationError, match="Authentication"):
+            GoogleChatAdapter(GoogleChatAdapterConfig(disable_signature_verification=True))
 
 
 # ---------------------------------------------------------------------------

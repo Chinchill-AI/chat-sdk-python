@@ -361,5 +361,5 @@ class TestCreateWhatsAppAdapter:
         adapter = _make_adapter()
         assert adapter.name == "whatsapp"
         assert adapter.lock_scope == "channel"
-        assert adapter.persist_message_history is True
+        assert adapter.persist_thread_history is True
         assert adapter.bot_user_id is None  # not yet initialized

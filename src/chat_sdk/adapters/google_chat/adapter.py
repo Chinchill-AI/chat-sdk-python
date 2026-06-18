@@ -155,6 +155,45 @@ class GoogleChatAdapter:
             "GOOGLE_CHAT_PROJECT_NUMBER"
         )
         self._pubsub_audience = config.pubsub_audience or os.environ.get("GOOGLE_CHAT_PUBSUB_AUDIENCE")
+        # Explicit opt-out of signature verification. An explicit
+        # config.disable_signature_verification value (True OR False) wins over
+        # the env var; only fall back to the env var when the config field is
+        # unset (None). Note: ``x if x is not None else default`` -- a plain
+        # ``or`` would silently discard an explicit ``False``.
+        self._disable_signature_verification = (
+            config.disable_signature_verification
+            if config.disable_signature_verification is not None
+            else os.environ.get("GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION") == "true"
+        )
+
+        # Fail-closed: refuse to construct unless webhook signature verification
+        # can be performed for at least one transport, or the operator has
+        # explicitly opted into the unverified path. Previously the adapter
+        # accepted any webhook in this state, allowing forged payloads to
+        # impersonate users / trigger handlers. Mirrors the gchat slice of
+        # upstream 9824d33 (PR #441).
+        if not (self._google_chat_project_number or self._pubsub_audience or self._disable_signature_verification):
+            raise ValidationError(
+                "gchat",
+                "Webhook signature verification is required. Set "
+                "google_chat_project_number (or GOOGLE_CHAT_PROJECT_NUMBER) for "
+                "direct webhooks and/or pubsub_audience (or "
+                "GOOGLE_CHAT_PUBSUB_AUDIENCE) for Pub/Sub. To accept unverified "
+                "webhooks (NOT recommended in production), set "
+                "disable_signature_verification=True.",
+            )
+
+        # The escape hatch is dev-only -- warn loudly whenever it is the only
+        # reason the adapter was allowed to construct without a verifier.
+        if self._disable_signature_verification and not (self._google_chat_project_number or self._pubsub_audience):
+            self._logger.warn(
+                "Google Chat webhook signature verification is disabled "
+                "(disable_signature_verification / "
+                "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION). Incoming webhooks "
+                "will be accepted without JWT verification. Do not use this in "
+                "production -- set google_chat_project_number and/or "
+                "pubsub_audience instead.",
+            )
 
         # In-progress subscription creations to prevent duplicate requests
         self._pending_subscriptions: dict[str, Any] = {}
@@ -839,31 +878,59 @@ class GoogleChatAdapter:
             and parsed["message"].get("data")
             and parsed.get("subscription")
         ):
-            # Verify Pub/Sub JWT if audience is configured
+            # Verify Pub/Sub JWT if audience is configured. The two transports
+            # share a single endpoint, so each shape must be independently
+            # verified -- otherwise an attacker could send the unconfigured
+            # shape to bypass the configured verifier. The constructor's "at
+            # least one verifier OR disable_signature_verification" check is
+            # not sufficient here for that reason. Mirrors upstream
+            # adapter-gchat/src/index.ts.
             if self._pubsub_audience:
                 valid = await self._verify_bearer_token(request, self._pubsub_audience)
                 if not valid:
                     return {"body": "Unauthorized", "status": 401}
-            elif not self._warned_no_pubsub_verification:
-                self._warned_no_pubsub_verification = True
+            elif self._disable_signature_verification:
+                if not self._warned_no_pubsub_verification:
+                    self._warned_no_pubsub_verification = True
+                    self._logger.warn(
+                        "Pub/Sub webhook verification is disabled. "
+                        "Set GOOGLE_CHAT_PUBSUB_AUDIENCE or pubsubAudience to verify incoming requests."
+                    )
+            else:
+                # Direct-webhook verifier may be configured but Pub/Sub
+                # verifier is not -- reject rather than silently process an
+                # unverified payload that a peer transport's config does
+                # nothing to authenticate.
                 self._logger.warn(
-                    "Pub/Sub webhook verification is disabled. "
-                    "Set GOOGLE_CHAT_PUBSUB_AUDIENCE or pubsubAudience to verify incoming requests."
+                    "Rejected Pub/Sub webhook: pubsub_audience is not configured. "
+                    "Set GOOGLE_CHAT_PUBSUB_AUDIENCE, or set "
+                    "disable_signature_verification to accept unverified Pub/Sub payloads."
                 )
+                return {"body": "Unauthorized", "status": 401}
             return self._handle_pub_sub_message(parsed, options)
 
-        # Verify direct Google Chat webhook JWT if project number is configured
+        # Verify direct Google Chat webhook JWT if project number is configured.
+        # Same reasoning as the Pub/Sub branch: each shape requires its own
+        # verifier (or explicit opt-out) to prevent cross-transport bypass.
         if self._google_chat_project_number:
             valid = await self._verify_bearer_token(request, self._google_chat_project_number)
             if not valid:
                 return {"body": "Unauthorized", "status": 401}
-        elif not self._warned_no_webhook_verification:
-            self._warned_no_webhook_verification = True
+        elif self._disable_signature_verification:
+            if not self._warned_no_webhook_verification:
+                self._warned_no_webhook_verification = True
+                self._logger.warn(
+                    "Google Chat webhook verification is disabled. "
+                    "Set GOOGLE_CHAT_PROJECT_NUMBER or googleChatProjectNumber "
+                    "to verify incoming requests."
+                )
+        else:
             self._logger.warn(
-                "Google Chat webhook verification is disabled. "
-                "Set GOOGLE_CHAT_PROJECT_NUMBER or googleChatProjectNumber "
-                "to verify incoming requests."
+                "Rejected direct Google Chat webhook: google_chat_project_number "
+                "is not configured. Set GOOGLE_CHAT_PROJECT_NUMBER, or set "
+                "disable_signature_verification to accept unverified payloads."
             )
+            return {"body": "Unauthorized", "status": 401}
 
         # Treat as a direct Google Chat webhook event
         event: dict[str, Any] = parsed

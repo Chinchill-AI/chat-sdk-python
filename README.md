@@ -7,11 +7,11 @@
 
 Multi-platform async chat SDK for Python. Port of [Vercel Chat](https://github.com/vercel/chat).
 
-> **Status: Alpha (0.4.29a1 — porting [Vercel Chat 4.29.0](https://github.com/vercel/chat))** — API may change. Last fully-synced release: `0.4.27` (parity with upstream `chat@4.27.0`). See [CHANGELOG.md](CHANGELOG.md) for the in-flight sync plan.
+> **Status: 0.4.29 — synced to [Vercel Chat 4.29.0](https://github.com/vercel/chat)** (`UPSTREAM_PARITY = "4.29.0"`). The 4.30 sync wave is tracked in [#135](https://github.com/Chinchill-AI/chat-sdk-python/issues/135). See [CHANGELOG.md](CHANGELOG.md).
 
 ## Why chat-sdk?
 
-- **Write once, deploy to 8 platforms.** One handler runs on Slack, Discord, Teams, Telegram, WhatsApp, Google Chat, GitHub, and Linear.
+- **Write once, deploy to 9 platforms.** One handler runs on Slack, Discord, Teams, Telegram, WhatsApp, Messenger, Google Chat, GitHub, and Linear.
 - **Built-in concurrency primitives.** Deduplication, thread locking, and message queuing are handled for you.
 - **Cross-platform cards.** Author a `Card` once and it renders as Block Kit (Slack), Adaptive Cards (Teams), embeds (Discord), and more.
 - **Not a replacement for platform SDKs.** chat-sdk is built *on top of* them. You can always drop down to the native SDK when you need to.
@@ -54,9 +54,28 @@ async def handle_mention(thread, message):
 | Teams | `chat-sdk[teams]` | Alpha |
 | Telegram | `chat-sdk[telegram]` | Alpha |
 | WhatsApp | `chat-sdk[whatsapp]` | Alpha |
+| Messenger (Meta) | `chat-sdk[messenger]` | Alpha |
 | Google Chat | `chat-sdk[google-chat]` | Alpha |
 | GitHub | `chat-sdk[github]` | Alpha |
 | Linear | `chat-sdk[linear]` | Alpha |
+
+## AI / LLM Integration
+
+Expose chat actions to an LLM agent as tools (`chat/ai` parity, vercel/chat#492):
+
+```python
+from chat_sdk.ai import create_chat_tools, to_ai_messages
+
+tools = create_chat_tools(chat, preset="messenger", require_approval=True)
+# {"postMessage": ChatTool(description=..., input_schema={...}, execute=..., needs_approval=True), ...}
+```
+
+Each `ChatTool` is SDK-agnostic: `input_schema` is a JSON-Schema dict you can
+hand to any agent runtime (Anthropic tool use, OpenAI tools, pydantic-ai, ...),
+`execute` is the async implementation, and `needs_approval` flags write tools
+for human-in-the-loop gating. Presets: `reader`, `messenger`, `moderator`.
+`to_ai_messages(thread)` converts thread history into model-ready messages.
+Runnable demo: [`examples/ai_tools_example.py`](examples/ai_tools_example.py).
 
 ## State Backends
 
@@ -70,7 +89,7 @@ async def handle_mention(thread, message):
 
 | Feature | chat-sdk | Raw platform SDKs | BotFramework SDK |
 |---------|----------|--------------------|------------------|
-| Multi-platform from one codebase | 8 platforms | 1 per SDK | Teams + limited |
+| Multi-platform from one codebase | 9 platforms | 1 per SDK | Teams + limited |
 | Async-native (Python 3.12+) | Yes | Varies | No |
 | Cross-platform cards | Card model | Platform-specific | Adaptive Cards only |
 | Thread locking / dedup | Built-in | DIY | DIY |
