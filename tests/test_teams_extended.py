@@ -736,11 +736,13 @@ class TestStream:
     async def test_group_chat_stream_accumulates_and_posts_single_message(self):
         """Group chats / channels accumulate the stream and post one message.
 
-        Mirrors upstream after vercel/chat#416: ``streamViaEmit`` is reserved
-        for DMs; non-DM threads no longer post+edit (which produced flicker).
+        Mirrors upstream ``stream`` (adapter-teams@chat@4.30.0): native
+        ``streamViaEmit`` is reserved for DMs (where an ``IStreamer`` exists);
+        non-DM threads accumulate and ``postMessage`` a single message via the
+        SDK ``App.send`` (PR 2-backed).
         """
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-1"})
+        send = _mock_app_send(adapter, "stream-msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -755,17 +757,18 @@ class TestStream:
 
         result = await adapter.stream(tid, text_gen())
         assert result.id == "stream-msg-1"
-        # Single send carrying the full accumulated text — no edits.
-        assert adapter._teams_send.call_count == 1
-        sent_payload = adapter._teams_send.await_args.args[1]
-        assert sent_payload["text"] == "Hello world"
-        assert sent_payload["type"] == "message"
+        # Single SDK send carrying the full accumulated text — no edits.
+        send.assert_called_once()
+        conv_id, activity = send.call_args.args
+        assert conv_id == "19:abc@thread.tacv2"
+        assert activity.text == "Hello world"
+        assert activity.text_format == "markdown"
 
     @pytest.mark.asyncio
     async def test_group_chat_stream_empty_returns_empty(self):
         """Empty streams in a group chat skip the post entirely."""
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-2"})
+        send = _mock_app_send(adapter, "stream-msg-2")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -782,4 +785,4 @@ class TestStream:
         # No real text → no send, returned RawMessage carries empty content.
         assert result.id == ""
         assert result.raw["text"] == ""
-        assert adapter._teams_send.call_count == 0
+        send.assert_not_called()

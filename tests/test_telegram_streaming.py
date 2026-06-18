@@ -324,10 +324,10 @@ class TestTelegramDraftStreaming:
         assert final_send["text"] == "**"
 
     # Python-only: direct adapter.stream call with options omitted entirely.
-    # Upstream can't hit this via Thread.post (thread.ts seeds
-    # updateIntervalMs before calling the adapter); our thread.py
-    # intentionally does NOT seed it (see docs/UPSTREAM_SYNC.md divergence),
-    # so options=None / update_interval_ms=None must resolve to
+    # Thread.post never hits this (thread.py seeds updateIntervalMs with the
+    # 500ms thread default before calling the adapter, matching upstream
+    # thread.ts), but a direct adapter.stream(...) call passes options=None,
+    # so update_interval_ms=None must resolve to
     # TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS instead of crashing.
     @pytest.mark.asyncio
     async def test_stream_defaults_update_interval_when_options_omitted(self):

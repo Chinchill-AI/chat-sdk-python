@@ -15,8 +15,11 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from urllib.parse import quote, urlparse
+
+if TYPE_CHECKING:
+    from microsoft_teams.apps import StreamerProtocol
 
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.adapters.teams.cards import card_to_adaptive_card
@@ -55,6 +58,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     StreamOptions,
@@ -63,77 +67,6 @@ from chat_sdk.types import (
     WebhookOptions,
     _parse_iso,
 )
-
-
-class _TeamsStreamSession:
-    """Bookkeeping for a single in-flight native streaming activity.
-
-    Mirrors the upstream Teams SDK ``IStreamer`` surface (``emit``, ``canceled``)
-    that ``streamViaEmit`` uses in ``packages/adapter-teams/src/index.ts``. The
-    Python adapter constructs one of these per DM message-handler invocation,
-    registers it in ``TeamsAdapter._active_streams`` so ``stream()`` can find
-    it, and closes it after the handler completes.
-
-    Carries the running ``stream_id`` (allocated by Teams on the first
-    ``streaming`` activity) and an incrementing ``stream_sequence`` so the
-    Bot Framework streaming protocol's wire shape stays valid.
-    """
-
-    __slots__ = (
-        "stream_id",
-        "sequence",
-        "canceled",
-        "first_chunk_id",
-        "_text",
-        "last_emit_at_ms",
-        "emit_interval_ms",
-    )
-
-    def __init__(self) -> None:
-        self.stream_id: str | None = None
-        # Per Bot Framework streaming protocol: streamSequence starts at 1
-        # for the first informative/streaming activity and increments by 1.
-        self.sequence: int = 0
-        self.canceled: bool = False
-        # Captured from the first activity returned by the Bot Framework REST
-        # API; this becomes the ``streamId`` for subsequent chunks and the
-        # final message.
-        self.first_chunk_id: str = ""
-        self._text: str = ""
-        # Timestamp (ms, same frame as ``TeamsAdapter._stream_clock_ms``) of
-        # the most recent successful emit. Read by ``_close_stream_session``
-        # so the final ``message`` activity honors the same 1-req/sec quota
-        # as the streaming ``typing`` activities — Teams' streaming endpoint
-        # rate-limits ALL activities on a given streamId together, so a close
-        # immediately after a one-chunk emit would 429 without this throttle.
-        # ``-inf`` means "no emit happened" → close path skips the wait.
-        self.last_emit_at_ms: float = float("-inf")
-        # Per-stream emit interval (ms). Cached on the session by
-        # ``_stream_via_emit`` so ``_close_stream_session`` honors caller-
-        # supplied ``StreamOptions.update_interval_ms`` overrides without
-        # the close path needing access to ``options``. ``None`` means
-        # "use the adapter default" (e.g. for sessions constructed outside
-        # the normal stream path, like tests).
-        self.emit_interval_ms: int | None = None
-
-    def cancel(self) -> None:
-        """Mark the session canceled. ``stream()`` checks this each chunk."""
-        self.canceled = True
-
-    @property
-    def text(self) -> str:
-        """Read-only view of the cumulative streamed text.
-
-        External callers (tests, other adapter helpers) should read this
-        instead of poking at the private ``_text`` attribute. Writes go
-        through ``_stream_via_emit`` which owns the buffer.
-        """
-        return self._text
-
-
-# Bot Framework streaming protocol values for ``channelData.streamType``.
-_STREAM_TYPE_STREAMING = "streaming"
-_STREAM_TYPE_FINAL = "final"
 
 MESSAGEID_CAPTURE_PATTERN = re.compile(r"messageid=(\d+)")
 MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
@@ -357,11 +290,11 @@ class TeamsAdapter:
 
         self._bot_user_id: str | None = self._app_id or None
         # Bot Framework token cache (scope ``api.botframework.com``). Owned by
-        # ``_get_access_token`` and consumed only by the still-hand-rolled Bot
-        # Framework paths: native streaming (``_teams_send``, PR 3) and
-        # ``open_dm``. The SDK ``App`` mints its own Bot Framework token for the
-        # migrated outbound send/edit/delete/typing paths, so those no longer
-        # touch this field.
+        # ``_get_access_token`` and consumed only by the still-hand-rolled
+        # ``open_dm`` REST call (the SDK ``App`` does not expose a 1:1
+        # conversation-create helper). The SDK ``App`` mints its own Bot
+        # Framework token for the migrated outbound send/edit/delete/typing
+        # paths and for native streaming, so those no longer touch this field.
         self._access_token: str | None = None
         self._token_expiry: float = 0
         # Microsoft Graph token cache (scope ``graph.microsoft.com``). Kept on
@@ -386,28 +319,13 @@ class TeamsAdapter:
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
 
-        # In-flight native streaming sessions, keyed by thread_id. Populated
-        # by ``_handle_message_activity`` for DMs (which awaits the handler
-        # so the session stays alive); consulted by ``stream()`` to decide
-        # between native streaming via emit and the accumulate-and-post
-        # fallback path.
-        self._active_streams: dict[str, _TeamsStreamSession] = {}
-        # Throttle for native DM streaming — Bot Framework streaming is
-        # ~1 request/second; Microsoft recommends 1.5-2s buffering. See the
-        # field docstring on TeamsAdapterConfig for full context.
-        self._native_stream_min_emit_interval_ms: int = config.native_stream_min_emit_interval_ms
-        # Monotonic-clock callable returning milliseconds since some epoch.
-        # Injectable so tests can drive throttle behavior without real sleeps.
-        # Default reads the running event loop's clock — matches what
-        # ``asyncio.sleep`` would observe. The lazy lambda is intentional:
-        # there is no running loop at ``__init__`` time.
-        self._stream_clock_ms: Callable[[], float] = lambda: asyncio.get_running_loop().time() * 1000.0
-        # Awaitable sleep keyed by milliseconds. Pairs with
-        # ``_stream_clock_ms`` so the end-of-stream flush can honor the
-        # throttle window without forcing real ``asyncio.sleep`` calls in
-        # tests. Default = real ``asyncio.sleep``; tests substitute an
-        # AsyncMock so they don't actually wait the configured interval.
-        self._stream_sleep_ms: Callable[[float], Awaitable[None]] = lambda ms: asyncio.sleep(ms / 1000.0)
+        # In-flight native streaming sessions, keyed by thread_id. Each value
+        # is the Teams SDK ``IStreamer`` (``StreamerProtocol``) captured from
+        # the inbound DM activity context. Populated by
+        # ``_handle_message_activity`` for DMs (which awaits the handler so the
+        # streamer stays alive); consulted by ``stream()`` to decide between
+        # native streaming via ``emit()`` and the accumulate-and-post fallback.
+        self._active_streams: dict[str, StreamerProtocol] = {}
 
     def _build_app(self, config: TeamsAdapterConfig) -> Any:
         """Construct the Microsoft Teams SDK ``App`` for this adapter.
@@ -801,16 +719,16 @@ class TeamsAdapter:
     ) -> None:
         """Handle message activities.
 
-        For DMs we register a :class:`_TeamsStreamSession` and ``await`` the
-        chat-handler task so :meth:`stream` can dispatch through the native
-        Bot Framework streaming protocol while the session is live. Group
-        chats remain fire-and-forget — Teams doesn't support native streaming
-        in channels/group threads, so :meth:`stream` falls through to the
+        For DMs we capture the Teams SDK ``IStreamer`` for this conversation
+        and ``await`` the chat-handler task so :meth:`stream` can dispatch
+        through ``IStreamer.emit()`` while the streamer is live. Group chats
+        remain fire-and-forget — Teams doesn't support native streaming in
+        channels/group threads, so :meth:`stream` falls through to the
         accumulate-and-post path.
 
         Mirrors upstream ``handleMessageActivity`` in
         ``packages/adapter-teams/src/index.ts``: capture ``ctx.stream`` for
-        DMs, block until processing completes, then drop the session.
+        DMs, block until processing completes, then close the streamer.
         """
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring event")
@@ -848,28 +766,42 @@ class TeamsAdapter:
 
         if not self.is_dm(thread_id):
             # Group chat / channel — fire-and-forget. ``stream()`` will see no
-            # active session and accumulate-and-post.
+            # active streamer and accumulate-and-post.
             self._chat.process_message(self, thread_id, message, options)
             return
 
-        # DM path: register a streaming session, then block on the handler so
-        # ``stream()`` can dispatch through the native streaming protocol
-        # while the session stays alive. We chain a ``waitUntil`` shim on
-        # top of the caller-supplied one (if any) so a hosting webhook
-        # framework that respects ``waitUntil`` still gets the underlying
-        # task — the local ``await`` is purely so we know when to reap the
-        # session.
-        session = _TeamsStreamSession()
-        # Keyed by ``thread_id`` to match upstream ``activeStreams.set(threadId, …)``
-        # in ``packages/chat-teams/src/index.ts``. Safe because the default
-        # per-thread concurrency strategy in ``Chat.handle_incoming_message``
-        # serialises DM handlers for the same thread (overlapping webhooks are
-        # deduped or dropped before they reach a handler, so two ``stream()``
-        # calls cannot share a session). A per-handler ``ContextVar`` would
-        # decouple this from the concurrency strategy but would be a Python-only
-        # divergence — tracked as a follow-up rather than landed inside the
-        # parity sync.
-        self._active_streams[thread_id] = session
+        # DM path: capture the Teams SDK ``IStreamer`` for this conversation,
+        # register it, then block on the handler so ``stream()`` can dispatch
+        # through ``IStreamer.emit()`` while the streamer stays alive. We chain
+        # a ``waitUntil`` shim on top of the caller-supplied one (if any) so a
+        # hosting webhook framework that respects ``waitUntil`` still gets the
+        # underlying task — the local ``await`` is purely so we know when the
+        # handler is done and the streamer can be closed.
+        #
+        # Mirrors upstream ``handleMessageActivity`` in
+        # ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``):
+        # ``this.activeStreams.set(threadId, ctx.stream)`` → build
+        # ``processingDone`` + wrapped ``waitUntil`` → ``await processingDone``.
+        # Upstream lets the Teams SDK ``App`` auto-close ``ctx.stream`` after the
+        # handler returns; our bridge owns dispatch (we override
+        # ``server.on_request``), so we play the lifecycle-owner role and call
+        # ``stream.close()`` ourselves in the ``finally`` below — exactly where
+        # the SDK's own ``app_process.process_activity`` calls it. ``stream()``
+        # and ``_stream_via_emit`` never close the streamer.
+        streamer = self._create_streamer(activity, thread_id)
+        if streamer is None:
+            # Could not build a streamer (e.g. the inbound activity lacks the
+            # recipient/conversation fields the SDK ref needs). Fall back to
+            # fire-and-forget; ``stream()`` will accumulate-and-post.
+            self._chat.process_message(self, thread_id, message, options)
+            return
+
+        # Keyed by ``thread_id`` to match upstream ``activeStreams.set(threadId, …)``.
+        # Safe because the default per-thread concurrency strategy in
+        # ``Chat.handle_incoming_message`` serialises DM handlers for the same
+        # thread (overlapping webhooks are deduped or dropped before they reach
+        # a handler, so two ``stream()`` calls cannot share a streamer).
+        self._active_streams[thread_id] = streamer
         loop = asyncio.get_running_loop()
         processing_done: asyncio.Future[None] = loop.create_future()
 
@@ -912,11 +844,11 @@ class TeamsAdapter:
                 # Catch synchronous failures in the caller's hook. If we
                 # let it escape, ``Chat.process_message`` propagates the
                 # exception, the outer ``try`` skips ``await processing_done``,
-                # and the ``finally`` tears down the session while the
-                # underlying chat task is still scheduled — handlers that
-                # later call ``thread.stream()`` would then miss native
-                # streaming and fall back to a normal post. Logging keeps
-                # the failure visible without breaking the streaming path.
+                # and the ``finally`` closes the streamer while the underlying
+                # chat task is still scheduled — handlers that later call
+                # ``thread.stream()`` would then miss native streaming and fall
+                # back to a normal post. Logging keeps the failure visible
+                # without breaking the streaming path.
                 try:
                     upstream_wait_until(task)
                 except Exception as exc:
@@ -941,28 +873,57 @@ class TeamsAdapter:
             # scheduled but has not run yet at this point.
             if not wait_until_invoked and not processing_done.done():
                 processing_done.set_result(None)
-            try:
-                await processing_done
-            except asyncio.CancelledError:
-                # Caller cancelled the webhook handler — propagate cancel
-                # into the streaming session so any in-flight ``stream()``
-                # exits cleanly without sending more chunks.
-                session.cancel()
-                raise
+            await processing_done
         finally:
-            # Always close the session — sending a final activity if any
-            # chunks were emitted — and drop the registry entry so a
-            # subsequent message can register fresh.
+            # Always close the streamer (the SDK sends the ``streamType: 'final'``
+            # message here) and drop the registry entry so a subsequent message
+            # can register fresh. We close even on cancellation: the SDK's own
+            # ``HttpStream.close`` no-ops when the stream was canceled or never
+            # received content, so this is safe — it mirrors the SDK App's
+            # ``process_activity``, which calls ``await ctx.stream.close()`` in
+            # both the success and ``StreamCancelledError`` paths.
             current = self._active_streams.get(thread_id)
-            if current is session:
+            if current is streamer:
                 self._active_streams.pop(thread_id, None)
             try:
-                await self._close_stream_session(thread_id, session)
+                await streamer.close()
             except Exception as exc:  # pragma: no cover — diagnostic-only
                 self._logger.warn(
                     "Teams stream finalization failed",
                     {"threadId": thread_id, "error": str(exc)},
                 )
+
+    def _create_streamer(self, activity: dict[str, Any], thread_id: str) -> StreamerProtocol | None:
+        """Create a Teams SDK ``IStreamer`` for the inbound DM activity.
+
+        Builds the :class:`ConversationReference` the streamer needs from the
+        inbound activity (``recipient`` → bot account, ``conversation``,
+        ``channelId``, ``serviceUrl``) and hands it to the SDK's
+        ``ActivitySender.create_stream`` — the same call the SDK's own
+        ``ActivityContext`` makes to expose ``ctx.stream``. The returned
+        ``HttpStream`` owns the Bot Framework streaming wire format
+        (``streamType``/``streamSequence``/``streamId``), the per-flush
+        throttle, and 429 retry/backoff. We never poke its internals.
+
+        Returns ``None`` when the activity lacks the fields the SDK ref
+        requires (``serviceUrl``), so the caller can fall back to
+        fire-and-forget processing + accumulate-and-post.
+        """
+        from chat_sdk.adapters.teams.streamer import build_conversation_reference
+
+        service_url = activity.get("serviceUrl") or ""
+        if not service_url:
+            return None
+        try:
+            _validate_service_url(service_url)
+            ref = build_conversation_reference(activity, bot_app_id=self._app_id)
+            return self._app.activity_sender.create_stream(ref)
+        except Exception as exc:
+            self._logger.warn(
+                "Failed to create Teams streamer; falling back to buffered post",
+                {"threadId": thread_id, "error": str(exc)},
+            )
+            return None
 
     # Keys injected by the SDK's card renderer or Teams transport — not user input.
     _ACTION_TRANSPORT_KEYS = frozenset({"actionId", "msteams"})
@@ -1640,21 +1601,25 @@ class TeamsAdapter:
     ) -> RawMessage:
         """Stream responses to a Teams conversation.
 
-        DMs use the Bot Framework streaming protocol via :meth:`_stream_via_emit`
-        when an active streaming session exists (set up by
-        :meth:`_handle_message_activity`). Group chats / channels accumulate
-        the stream and post a single message — matching upstream's
-        post-#416 behavior of avoiding the post+edit flicker where Teams
-        doesn't support native streaming. See
-        ``packages/adapter-teams/src/index.ts`` ``stream`` and
-        ``streamViaEmit`` at upstream commit ``ed46bae``.
+        DMs stream natively via the Teams SDK ``IStreamer.emit()`` when an
+        active streamer exists (captured by :meth:`_handle_message_activity`
+        from the inbound activity). Group chats / channels / proactive messages
+        accumulate the stream and post a single message — Teams supports native
+        streaming only in 1:1 chats.
+
+        Mirrors upstream ``stream`` in
+        ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``):
+        delegate to ``streamViaEmit`` when ``activeStream && !activeStream.canceled``,
+        else accumulate and ``postMessage``.
         """
-        session = self._active_streams.get(thread_id)
-        if session is not None and not session.canceled:
-            return await self._stream_via_emit(thread_id, text_stream, session, options)
+        active_stream = self._active_streams.get(thread_id)
+        if active_stream is not None and not active_stream.canceled:
+            return await self._stream_via_emit(thread_id, text_stream, active_stream)
 
         # No native streamer (group chats, proactive messages, or DMs whose
-        # session was already canceled). Accumulate and post once.
+        # streamer was already canceled). Accumulate and post once — matching
+        # upstream's post-#416 behavior of avoiding the post+edit flicker
+        # where Teams doesn't support native streaming.
         accumulated = ""
         async for chunk in text_stream:
             text = ""
@@ -1669,95 +1634,63 @@ class TeamsAdapter:
         if not accumulated:
             return RawMessage(id="", thread_id=thread_id, raw={"text": ""})
 
-        decoded = self.decode_thread_id(thread_id)
-        activity_payload = {
-            "type": "message",
-            "text": accumulated,
-            "textFormat": "markdown",
-        }
-        result = await self._teams_send(decoded, activity_payload)
-        return RawMessage(
-            id=result.get("id", ""),
-            thread_id=thread_id,
-            raw={"text": accumulated},
-        )
+        # SDK-backed buffered send (PR 2): same path as a normal text post.
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
     async def _stream_via_emit(
         self,
         thread_id: str,
         text_stream: Any,
-        session: _TeamsStreamSession,
-        options: StreamOptions | None = None,
+        stream: StreamerProtocol,
     ) -> RawMessage:
-        """Native Bot Framework streaming: typing chunks + final message.
+        """Native streaming via the Teams SDK ``IStreamer.emit()``.
 
-        Wire format (per Bot Framework streaming protocol):
+        Each non-empty chunk is handed to ``stream.emit(text)``; the SDK
+        ``HttpStream`` owns the Bot Framework streaming wire format
+        (``streamType``/``streamSequence``/``streamId``), the per-flush
+        throttle (~500ms between flushes), and 429 retry/backoff. We never
+        touch its internals and we never call ``stream.close()`` — the SDK
+        sends the ``streamType: 'final'`` message after the handler returns
+        (see :meth:`_handle_message_activity`'s ``finally`` block, which plays
+        the lifecycle-owner role the SDK App otherwise would).
 
-        - Each non-empty chunk is a ``typing`` activity with
-          ``channelData = {streamType: "streaming", streamSequence: N,
-          streamId?: <id>}`` and a parallel ``streaminfo`` entity. Per
-          the Bot Framework streaming contract, ``streamId`` MUST appear
-          on the ``streaminfo`` entity (not just ``channelData``) for
-          subsequent and final activities; the first chunk omits it
-          everywhere because the server hasn't assigned an id yet.
-        - On stream completion, a final ``message`` activity is sent by
-          :meth:`_close_stream_session` (it carries ``streamType: "final"``).
+        Cancellation is detected two ways, matching upstream ``streamViaEmit``:
 
-        Throttling: Teams' streaming endpoint enforces ~1 request/second
-        and Microsoft recommends 1.5-2s buffering. We accumulate every
-        non-empty chunk locally but only ship a ``typing`` activity once
-        the emit interval has elapsed since the previous send; in-window
-        chunks are coalesced into the next eligible emit. The interval
-        defaults to ``TeamsAdapterConfig.native_stream_min_emit_interval_ms``
-        (1500ms) and is overridden per-call by
-        ``StreamOptions.update_interval_ms`` when provided.
+        - ``stream.canceled`` is checked before each ``emit`` (the user pressed
+          Stop, or the Teams 2-minute streaming timeout elapsed).
+        - ``StreamCancelledError`` raised by ``emit``/iteration is caught and
+          swallowed (other exceptions re-raise).
 
-        End-of-stream flush: when the iterator ends, any text that was
-        buffered (coalesced into the throttle window) but never emitted
-        as a ``typing`` activity is shipped now via one final forced
-        ``typing`` emit before this method returns. Without that flush,
-        buffered text would only ship in :meth:`_close_stream_session`'s
-        final ``message`` activity — and if THAT send fails (429 / network
-        blip), ``Thread.stream`` would have already built a ``SentMessage``
-        from this method's return value containing text Teams never
-        accepted (the chat handler returns and ``SentMessage`` is created
-        before the close runs from the handler's finally block). With the
-        flush, ``accumulated`` is confirmed-accepted by Teams before we
-        return, so the close-path final ``message`` activity becomes a
-        UI-clearing marker whose failure is a stale-streaming-UI cost
-        rather than a recording inconsistency.
+        We capture the first chunk's server-assigned id via ``on_chunk`` and
+        await it ONLY when text was emitted and the stream was not canceled —
+        awaiting unconditionally would hang forever if no chunk was ever
+        delivered (empty stream, or canceled before the first flush).
 
-        We never emit a chunk after :attr:`_TeamsStreamSession.canceled` is
-        set, and we surface stream-iterator and send exceptions to the
-        caller (after canceling the session) so the close path won't post
-        a final message that doesn't reflect what the user saw.
+        Mirrors upstream ``streamViaEmit`` in
+        ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``).
         """
-        decoded = self.decode_thread_id(thread_id)
-        accumulated = ""
-        # The cumulative-text snapshot last confirmed-accepted by Teams
-        # via a successful ``_teams_send``. After the loop we compare
-        # against ``accumulated`` to decide whether the throttle window
-        # buffered text that needs an end-of-stream flush.
-        last_committed_text = ""
+        from microsoft_teams.apps import StreamCancelledError
 
-        emit_interval_ms: int = (
-            options.update_interval_ms
-            if options is not None and options.update_interval_ms is not None
-            else self._native_stream_min_emit_interval_ms
-        )
-        # Persist the resolved interval on the session so
-        # ``_close_stream_session`` can honor the same caller-supplied
-        # override when throttling the final ``message`` activity.
-        session.emit_interval_ms = emit_interval_ms
-        # Tracks when the most recent successful emit landed, in the same
-        # ms-since-arbitrary-epoch frame as ``self._stream_clock_ms()``.
-        # ``-inf`` so the first chunk always passes the interval gate
-        # regardless of what value the clock returns on its first call.
-        last_emit_at_ms: float = float("-inf")
+        accumulated = ""
+        message_id = ""
+
+        # Capture the first chunk's id. The SDK emits a ``chunk`` event for
+        # every stream activity it ships (``HttpStream._send_activity``); we
+        # only care about the first one, which carries the message id Teams
+        # assigns to the streamed message. A Future resolved by the first
+        # callback mirrors upstream's ``stream.events.once("chunk", …)``.
+        loop = asyncio.get_running_loop()
+        id_captured: asyncio.Future[str] = loop.create_future()
+
+        async def _on_chunk(activity: Any) -> None:
+            if not id_captured.done():
+                id_captured.set_result(getattr(activity, "id", "") or "")
+
+        stream.on_chunk(_on_chunk)
 
         try:
             async for chunk in text_stream:
-                if session.canceled:
+                if stream.canceled:
                     self._logger.debug("Teams stream canceled by user", {"threadId": thread_id})
                     break
 
@@ -1767,327 +1700,32 @@ class TeamsAdapter:
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     text = chunk.get("text", "")
                 elif getattr(chunk, "type", None) == "markdown_text":
-                    # Dataclass form (``MarkdownTextChunk``) — mirror
-                    # ``Thread.stream``'s ``_wrapped_stream`` extraction so
-                    # the adapter's local accumulator stays in sync with
-                    # Thread's. Without this branch, callers that yield
-                    # ``MarkdownTextChunk(text=...)`` would have Thread
-                    # accumulate the text while the adapter dropped it,
-                    # causing the ``RawMessage.text`` happy-path override
-                    # (set unconditionally below) to record empty text in
-                    # the ``SentMessage`` / message history while Teams
-                    # never sees the chunks either. Non-text StreamChunk
-                    # variants (``TaskUpdateChunk``, ``PlanUpdateChunk``)
-                    # fall through with ``text == ""`` and are skipped,
-                    # matching Thread's behavior.
+                    # Dataclass ``MarkdownTextChunk`` form — mirror
+                    # ``Thread.stream``'s ``_wrapped_stream`` extraction so the
+                    # adapter emits exactly the text Thread accumulates. Other
+                    # ``StreamChunk`` variants (task/plan updates) carry no
+                    # ``text`` and are skipped.
                     text = getattr(chunk, "text", "") or ""
                 if not text:
                     continue
 
-                # Always accumulate locally so the close-path final
-                # ``message`` activity carries the full user-visible
-                # text. The decision below only governs whether THIS
-                # chunk triggers an intermediate ``typing`` send.
+                stream.emit(text)
                 accumulated += text
+        except StreamCancelledError:
+            self._logger.debug("Teams stream canceled during iteration", {"threadId": thread_id})
 
-                now_ms = self._stream_clock_ms()
-                if now_ms - last_emit_at_ms < emit_interval_ms:
-                    # Inside the throttle window — coalesce. Buffered text
-                    # ships in the next eligible emit, or in the
-                    # end-of-stream flush below if the iterator ends
-                    # before another window opens.
-                    continue
-
-                result = await self._emit_streaming_activity(
-                    decoded=decoded,
-                    thread_id=thread_id,
-                    session=session,
-                    text=accumulated,
-                )
-                last_committed_text = accumulated
-                last_emit_at_ms = now_ms
-                # Persist for the close-path throttle (see
-                # ``_close_stream_session``). Same value as the local,
-                # mirrored on the session so close has access without
-                # plumbing an extra parameter through.
-                session.last_emit_at_ms = now_ms
-
-                if session.stream_id is None:
-                    chunk_id = result.get("id") or ""
-                    session.first_chunk_id = chunk_id
-                    if chunk_id:
-                        session.stream_id = chunk_id
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
-            # Control-flow exceptions: cancel the session so close() doesn't
-            # post a final message, then re-raise so the caller's cancellation
-            # propagates correctly. Hazard #5 — orphaned tasks here would
-            # leave a half-finished streaming activity visible to the user.
-            session.cancel()
-            raise
-        except Exception:
-            # Iterator raised mid-stream. Cancel so the close path doesn't
-            # ship a final message. The exception surfaces to the caller
-            # (the chat handler), which will propagate to the message
-            # processing task — same shape as the fallback path's
-            # stream-exception capture, sized for native streaming.
-            session.cancel()
-            raise
-
-        # End-of-stream flush — see method docstring for the data-corruption
-        # rationale. Only runs when the iterator ended normally AND the
-        # throttle window buffered text since the last successful emit.
-        # ``session.canceled`` is checked because mid-stream cancellation
-        # via ``session.cancel()`` (e.g. user-initiated abort) breaks the
-        # loop above without an exception, and we shouldn't flush text the
-        # user explicitly canceled out of.
-        if not session.canceled and accumulated != last_committed_text:
-            # Wrap the throttle wait + emit in the same control-flow guard
-            # as the in-loop try/except: ``_stream_sleep_ms`` (and the
-            # clock read above it) can raise — most importantly
-            # ``asyncio.CancelledError`` when the chat task is cancelled by
-            # a supervisor mid-wait. Without this guard the session is
-            # left ``canceled=False`` while the exception propagates,
-            # and the finally-block close path would proceed as if the
-            # stream ran to completion. Mirroring the in-loop pattern
-            # keeps the close path's invariant consistent: any exception
-            # leaving this method implies ``session.canceled`` is True.
+        # Only await the chunk id if we emitted text and the stream wasn't
+        # canceled before any chunk was delivered (which would hang forever).
+        if accumulated and not stream.canceled:
             try:
-                # Honor the throttle even for the end-of-stream flush — a
-                # fast LLM stream that finishes inside the throttle window
-                # after the last successful emit would 429 the Bot Framework
-                # streaming endpoint otherwise (1 req/sec quota), cancelling
-                # the stream mid-flight. Wait for the remaining window
-                # before shipping.
-                elapsed_ms = self._stream_clock_ms() - last_emit_at_ms
-                if elapsed_ms < emit_interval_ms:
-                    await self._stream_sleep_ms(emit_interval_ms - elapsed_ms)
-                # Re-check cancellation after the wait — the chat handler can
-                # call ``session.cancel()`` from another task while we sleep.
-                # If we're canceled, skip the emit entirely; the bottom return
-                # block will surface only ``last_committed_text`` so the
-                # ``SentMessage`` matches what Teams actually shipped to the
-                # user (not the buffered suffix the user explicitly canceled
-                # out of). Same shape as in-loop cancellation.
-                if not session.canceled:
-                    result = await self._emit_streaming_activity(
-                        decoded=decoded,
-                        thread_id=thread_id,
-                        session=session,
-                        text=accumulated,
-                    )
-                    last_committed_text = accumulated
-                    # Update the session timestamp post-emit so the
-                    # close-path throttle sees the FLUSH as the most
-                    # recent activity (not the prior in-loop emit).
-                    # Same frame as ``_stream_clock_ms``.
-                    session.last_emit_at_ms = self._stream_clock_ms()
-                    if session.stream_id is None:
-                        chunk_id = result.get("id") or ""
-                        session.first_chunk_id = chunk_id
-                        if chunk_id:
-                            session.stream_id = chunk_id
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
-                # Control-flow exceptions during the flush wait or emit:
-                # cancel the session so the finally-block close path skips
-                # its final ``message`` activity. ``_emit_streaming_activity``
-                # already calls ``session.cancel()`` on its own failures
-                # before re-raising, so this is a no-op there; the cancel
-                # here is what covers the throttle-wait path.
-                session.cancel()
-                raise
-            except Exception:
-                # Same shape as the in-loop ``except Exception``: cancel
-                # the session before propagating so the close path doesn't
-                # ship a final ``message`` containing text Teams never
-                # accepted via this flush emit.
-                session.cancel()
-                raise
+                message_id = await id_captured
+            except StreamCancelledError:
+                self._logger.debug(
+                    "Teams stream canceled before first chunk delivered",
+                    {"threadId": thread_id},
+                )
 
-        # Pick the cumulative text that Teams actually accepted: when
-        # canceled (in-loop break or during-wait cancellation), some
-        # text may have been buffered locally but never shipped — return
-        # only ``last_committed_text`` so ``Thread.stream``'s outer
-        # accumulator records what the user actually saw. When the stream
-        # ran to completion, ``last_committed_text`` and ``accumulated``
-        # are equal (the flush above committed the final batch), so this
-        # collapses to ``accumulated`` in the happy path.
-        final_text = last_committed_text if session.canceled else accumulated
-        # Persist accumulated text on the session so close() can emit the
-        # final ``message`` activity with the same content the user saw.
-        # Direct ``_text`` write is the canonical mutator (the public
-        # ``text`` property is read-only by design); both classes live in
-        # the same module so this isn't a cross-module SLF001.
-        session._text = final_text  # noqa: SLF001
-        # Set ``text`` (the adapter-authoritative override) so
-        # ``Thread.stream`` records only what Teams actually shipped.
-        # Without this, ``Thread._handle_stream``'s local accumulator
-        # would still include the buffered suffix on cancellation.
-        return RawMessage(
-            id=session.first_chunk_id,
-            thread_id=thread_id,
-            raw={"text": final_text},
-            text=final_text,
-        )
-
-    async def _emit_streaming_activity(
-        self,
-        *,
-        decoded: TeamsThreadId,
-        thread_id: str,
-        session: _TeamsStreamSession,
-        text: str,
-    ) -> dict[str, Any]:
-        """Send one ``typing`` activity carrying the cumulative ``text`` snapshot.
-
-        Increments ``session.sequence`` on success. Raises (after canceling
-        the session and logging) if ``_teams_send`` fails — ``Thread.stream``
-        accumulates each chunk locally BEFORE yielding to the adapter, so
-        swallowing the failure here would let the SDK record a SentMessage
-        / append a message-history entry containing text Teams never
-        accepted. Returns the REST response dict on success so the caller
-        can capture the server-assigned ``streamId`` for the first chunk.
-
-        Hazard #7 — only include ``streamId`` once the server has assigned
-        one. Sending ``"streamId": None`` (or ``""``) on the first chunk
-        would cause Teams to reject the activity. The Bot Framework REST
-        contract requires ``streamId`` on BOTH ``channelData`` and the
-        ``streaminfo`` entity for subsequent activities; setting it only
-        on ``channelData`` may cause Teams to detach the chunk from the
-        initial stream.
-        """
-        next_sequence = session.sequence + 1
-        channel_data: dict[str, Any] = {
-            "streamType": _STREAM_TYPE_STREAMING,
-            "streamSequence": next_sequence,
-        }
-        stream_info_entity: dict[str, Any] = {
-            "type": "streaminfo",
-            "streamType": _STREAM_TYPE_STREAMING,
-            "streamSequence": next_sequence,
-        }
-        if session.stream_id is not None:
-            channel_data["streamId"] = session.stream_id
-            stream_info_entity["streamId"] = session.stream_id
-
-        activity_payload: dict[str, Any] = {
-            "type": "typing",
-            "text": text,
-            "channelData": channel_data,
-            "entities": [stream_info_entity],
-        }
-
-        try:
-            result = await self._teams_send(decoded, activity_payload)
-        except Exception as exc:
-            self._logger.warn(
-                "Teams stream emit failed; canceling stream",
-                {"threadId": thread_id, "error": str(exc)},
-            )
-            session.cancel()
-            raise
-
-        session.sequence = next_sequence
-        return result
-
-    async def _close_stream_session(
-        self,
-        thread_id: str,
-        session: _TeamsStreamSession,
-    ) -> None:
-        """Send the final ``message`` activity to close out a stream.
-
-        No-op if the session was canceled, or if no chunks were ever
-        emitted (empty ``text``). Otherwise we send the final activity —
-        even if the server never returned an ``id`` for the first chunk
-        (i.e. ``stream_id`` is ``None``), in which case we omit
-        ``streamId`` from ``channelData``. Mirrors upstream's looser
-        check: as long as the user saw streamed text, ship the final
-        ``message`` so the Teams streaming UI clears, instead of leaving
-        it spinning until Teams times the session out client-side.
-        """
-        if session.canceled:
-            return
-        # ``text`` is the cumulative buffer; empty means nothing was ever
-        # emitted (empty stream, or stream canceled before first send).
-        if not session.text:
-            return
-
-        # Throttle the final ``message`` activity against the same
-        # ~1 req/sec quota the streaming ``typing`` activities honor.
-        # Teams' streaming endpoint rate-limits ALL activities sharing a
-        # ``streamId`` together — a close immediately after a successful
-        # one-chunk emit would 429 without this wait, and because the
-        # exception is swallowed below (fail-soft) Teams would never
-        # receive the final message while the SDK records the response
-        # as sent. ``last_emit_at_ms == -inf`` means no in-stream emit
-        # happened (shouldn't reach here in that case because
-        # ``session.text`` would be empty, but the guard is cheap).
-        if session.last_emit_at_ms != float("-inf"):
-            interval_ms = (
-                session.emit_interval_ms
-                if session.emit_interval_ms is not None
-                else self._native_stream_min_emit_interval_ms
-            )
-            elapsed_ms = self._stream_clock_ms() - session.last_emit_at_ms
-            if elapsed_ms < interval_ms:
-                try:
-                    await self._stream_sleep_ms(interval_ms - elapsed_ms)
-                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
-                    # Supervisor-initiated cancellation during the wait.
-                    # Mark the session canceled so any subsequent dispatch
-                    # (none in normal flow, but cheap defense) sees the
-                    # right state, then re-raise so the caller's
-                    # cancellation propagates correctly.
-                    session.cancel()
-                    raise
-                # Cancellation may have arrived during the wait via
-                # ``session.cancel()`` from another task — check before
-                # shipping the final.
-                if session.canceled:
-                    return
-
-        decoded = self.decode_thread_id(thread_id)
-        channel_data: dict[str, Any] = {
-            "streamType": _STREAM_TYPE_FINAL,
-        }
-        stream_info_entity: dict[str, Any] = {
-            "type": "streaminfo",
-            "streamType": _STREAM_TYPE_FINAL,
-        }
-        # Hazard #7 — only include ``streamId`` when we actually have one.
-        # The Bot Framework REST response can return ``id=""`` even on a
-        # 200, in which case ``stream_id`` stays ``None`` (see emit guard
-        # in ``_stream_via_emit``); ship the final without a ``streamId``
-        # rather than skipping the send. When present, ``streamId`` must
-        # appear on BOTH ``channelData`` and the ``streaminfo`` entity
-        # per the Bot Framework streaming contract for the final activity.
-        if session.stream_id is not None:
-            channel_data["streamId"] = session.stream_id
-            stream_info_entity["streamId"] = session.stream_id
-
-        final_activity: dict[str, Any] = {
-            "type": "message",
-            "text": session.text,
-            "textFormat": "markdown",
-            "channelData": channel_data,
-            "entities": [stream_info_entity],
-        }
-        try:
-            await self._teams_send(decoded, final_activity)
-        except Exception as exc:
-            # Logged at warn — by the time we get here, ``_stream_via_emit``
-            # has already done an end-of-stream flush so every byte of
-            # ``session.text`` was confirmed-accepted by Teams via a prior
-            # ``typing`` activity. The user has seen the full text. The
-            # final ``message`` activity exists to switch the streaming UI
-            # from typing indicator to message bubble; if that send fails
-            # the streaming UI may stay until Teams times the session out
-            # client-side, but the recorded ``SentMessage`` and
-            # ``_thread_history`` entry still match what the user saw.
-            self._logger.warn(
-                "Teams stream final activity failed",
-                {"threadId": thread_id, "error": str(exc)},
-            )
+        return RawMessage(id=message_id, thread_id=thread_id, raw={"text": accumulated})
 
     def encode_thread_id(self, platform_data: TeamsThreadId) -> str:
         """Encode platform data into a thread ID string.
@@ -2884,8 +2522,7 @@ class TeamsAdapter:
         ``_token_expiry``. The migrated outbound paths
         (post/edit/delete/typing) now mint their Bot Framework token through
         the SDK ``App``, so this hand-rolled token is consumed only by the
-        still-hand-rolled Bot Framework callers: native streaming via
-        :meth:`_teams_send` (PR 3) and :meth:`open_dm`. It must never share a
+        still-hand-rolled :meth:`open_dm` REST call. It must never share a
         cache slot with the Graph token (see :meth:`_get_graph_token`).
         """
         import time
@@ -2932,40 +2569,6 @@ class TeamsAdapter:
                     f"Network error obtaining Bot Framework access token: {exc}",
                     exc,
                 ) from exc
-
-    async def _teams_send(
-        self,
-        decoded: TeamsThreadId,
-        activity: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Send an activity to a Teams conversation via Bot Framework REST API.
-
-        Retained for the still-hand-rolled native streaming path (PR 3), which
-        needs the raw ``channelData``/``entities`` streaming envelope and the
-        server-assigned ``streamId`` from the REST response — neither of which
-        the SDK ``app.send`` surface exposes today. The migrated outbound
-        public methods no longer use this; they delegate to the SDK.
-        """
-        _validate_service_url(decoded.service_url)
-        token = await self._get_access_token()
-        url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities"
-
-        session = await self._get_http_session()
-        async with session.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=activity,
-        ) as response:
-            if not response.ok:
-                error_text = await response.text()
-                raise NetworkError(
-                    "teams",
-                    f"Teams API error: {response.status} {error_text}",
-                )
-            return await response.json()
 
 
 def create_teams_adapter(config: TeamsAdapterConfig | None = None) -> TeamsAdapter:
