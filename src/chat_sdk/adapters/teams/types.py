@@ -54,6 +54,9 @@ class TeamsAdapterConfig:
     See: https://learn.microsoft.com/en-us/microsoftteams/platform/bots/
     """
 
+    # Override the Teams Bot Framework service URL (e.g. for GCC-High /
+    # sovereign-cloud environments). Defaults to TEAMS_API_URL env var.
+    api_url: str | None = None
     # Microsoft App ID. Defaults to TEAMS_APP_ID env var.
     app_id: str | None = None
     # Microsoft App Password. Defaults to TEAMS_APP_PASSWORD env var.

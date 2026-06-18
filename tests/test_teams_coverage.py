@@ -2026,3 +2026,189 @@ class TestFetchMessages403:
 
         with pytest.raises(APE):
             await adapter.fetch_messages(tid)
+
+
+# ---------------------------------------------------------------------------
+# list_threads (Graph API) — channel + chat paths
+# ---------------------------------------------------------------------------
+
+
+class TestListThreads:
+    async def test_channel_path_wraps_each_message_as_thread(self):
+        """Channel context → one ThreadSummary per top-level message, each with a
+        per-message thread ID (``;messageid=`` suffix) and ``last_reply_at``.
+
+        Mirrors upstream GraphReader.listThreads channel branch (graph-api.ts:389-449).
+        """
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:19:chan@thread.tacv2"] = json.dumps(
+            {"type": "channel", "team_id": "team-1", "channel_id": "19:chan@thread.tacv2"}
+        )
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        async def fake_channel_list(team_id: str, channel_id: str, limit: int = 50):
+            assert team_id == "team-1"
+            assert channel_id == "19:chan@thread.tacv2"
+            return [
+                {
+                    "id": "100",
+                    "createdDateTime": "2024-06-01T12:00:00Z",
+                    "lastModifiedDateTime": "2024-06-01T12:05:00Z",
+                    "body": {"contentType": "text", "content": "First"},
+                    "from": {"user": {"id": "u1", "displayName": "Alice"}},
+                },
+                {
+                    "id": "200",
+                    "createdDateTime": "2024-06-01T11:00:00Z",
+                    "body": {"contentType": "text", "content": "Second"},
+                    "from": {"user": {"id": "u2", "displayName": "Bob"}},
+                },
+                {"from": {"user": {"id": "u3"}}},  # no id → skipped
+            ]
+
+        adapter._graph_list_channel_messages = fake_channel_list  # type: ignore[method-assign]
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:chan@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.list_threads(channel_id)
+
+        assert len(result.threads) == 2
+        first = result.threads[0]
+        # Root message text mapped from the Graph body.
+        assert first.root_message.text == "First"
+        # Per-message thread ID embeds messageid=100, distinct from the channel id.
+        decoded = adapter.decode_thread_id(first.id)
+        assert decoded.conversation_id == "19:chan@thread.tacv2;messageid=100"
+        assert first.id != channel_id
+        # last_reply_at from lastModifiedDateTime (channel path only).
+        assert first.last_reply_at is not None
+        assert first.last_reply_at.year == 2024
+        assert result.threads[1].last_reply_at is None  # no lastModifiedDateTime
+
+    async def test_chat_path_lists_chat_messages_without_last_reply(self):
+        """No channel context → chat-messages path; ThreadSummaries carry no
+        ``last_reply_at`` (graph-api.ts:450-505)."""
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        captured_params: list[Any] = []
+
+        async def fake_chat_list(chat_id: str, params: Any):
+            captured_params.append(params)
+            return [
+                {
+                    "id": "300",
+                    "createdDateTime": "2024-06-02T09:00:00Z",
+                    "body": {"contentType": "text", "content": "Chat msg"},
+                    "from": {"user": {"id": "u9", "displayName": "Carol"}},
+                }
+            ]
+
+        adapter._graph_list_chat_messages = fake_chat_list  # type: ignore[method-assign]
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:group@thread.v2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.list_threads(channel_id, {"limit": 10})
+
+        assert len(result.threads) == 1
+        summary = result.threads[0]
+        assert summary.root_message.text == "Chat msg"
+        assert summary.last_reply_at is None
+        decoded = adapter.decode_thread_id(summary.id)
+        assert decoded.conversation_id == "19:group@thread.v2;messageid=300"
+        # Honors the limit + descending order Graph query (graph-api.ts:452-456).
+        assert captured_params[0]["$top"] == 10
+        assert captured_params[0]["$orderby"] == "createdDateTime desc"
+
+    async def test_propagates_graph_errors(self):
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        async def boom(chat_id: str, params: Any):
+            raise NetworkError("teams", "Graph API error: 500")
+
+        adapter._graph_list_chat_messages = boom  # type: ignore[method-assign]
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:group@thread.v2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        with pytest.raises(NetworkError):
+            await adapter.list_threads(channel_id)
+
+
+# ---------------------------------------------------------------------------
+# post_channel_message — text + card to the base conversation
+# ---------------------------------------------------------------------------
+
+
+class TestPostChannelMessage:
+    async def test_text_posts_to_base_conversation(self):
+        """Strips ``;messageid=`` so the activity lands on the base channel
+        conversation, not threaded under a root message (index.ts:1372-1376)."""
+        adapter = _make_adapter(logger=_make_logger())
+        send = _mock_app_send(adapter, "ch-text-1")
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:chan@thread.tacv2;messageid=999",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.post_channel_message(channel_id, {"markdown": "Hello **channel**"})
+
+        assert result.id == "ch-text-1"
+        # threadId echoes the input channel_id (index.ts:1422).
+        assert result.thread_id == channel_id
+        # Sent to the base conversation — the messageid suffix is stripped.
+        assert send.call_args.args[0] == "19:chan@thread.tacv2"
+
+    async def test_card_posts_adaptive_card_to_base_conversation(self):
+        adapter = _make_adapter(logger=_make_logger())
+        send = _mock_app_send(adapter, "ch-card-1")
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:chan@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        result = await adapter.post_channel_message(
+            channel_id,
+            {"card": {"header": {"title": "Notice"}, "body": [{"type": "text", "content": "Body"}]}},
+        )
+
+        assert result.id == "ch-card-1"
+        activity = send.call_args.args[1]
+        dumped = activity.model_dump(by_alias=True, exclude_none=True)
+        assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
+
+    async def test_send_failure_raises(self):
+        adapter = _make_adapter(logger=_make_logger())
+        send = _mock_app_send(adapter)
+        send.side_effect = Exception("connection failed")
+
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:chan@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        with pytest.raises(NetworkError):
+            await adapter.post_channel_message(channel_id, {"markdown": "fail"})

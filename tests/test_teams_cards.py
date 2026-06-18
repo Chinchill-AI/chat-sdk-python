@@ -495,11 +495,15 @@ class TestTeamsCardInputEndToEnd:
         }
         await adapter._handle_message_activity(activity)
 
-        # 3. Verify process_action received the selected values
+        # 3. The __auto_submit sentinel fans out into one process_action per
+        #    input key (adapter-teams/src/index.ts:404-471 + fanOutAutoSubmit),
+        #    so a handler registered as on_action("color_select") fires with the
+        #    selected value — the sentinel itself is never surfaced as an action ID.
         mock_chat.process_action.assert_called_once()
         action_event = mock_chat.process_action.call_args[0][0]
-        assert action_event.action_id == AUTO_SUBMIT_ACTION_ID
-        assert action_event.value == {"color_select": "blue"}
+        assert action_event.action_id == "color_select"
+        assert action_event.action_id != AUTO_SUBMIT_ACTION_ID
+        assert action_event.value == "blue"
         assert action_event.user.user_id == "user-1"
 
     async def test_button_click_still_works(self):

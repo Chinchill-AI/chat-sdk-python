@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from microsoft_teams.apps import StreamerProtocol
 
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
-from chat_sdk.adapters.teams.cards import card_to_adaptive_card
+from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID, card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
@@ -55,6 +55,8 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    ListThreadsOptions,
+    ListThreadsResult,
     LockScope,
     Message,
     MessageMetadata,
@@ -63,6 +65,7 @@ from chat_sdk.types import (
     ReactionEvent,
     StreamOptions,
     ThreadInfo,
+    ThreadSummary,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -94,10 +97,10 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
 
     Python port of ``packages/adapter-teams/src/config.ts`` ``toAppOptions``
     (synced to ``adapter-teams@chat@4.30.0``). Maps our public
-    ``app_id``/``app_password``/``app_tenant_id``/``federated``/``app_type``
-    fields onto the SDK's ``client_id``/``client_secret``/``tenant_id``/
-    ``managed_identity_client_id`` keys, reading the same ``TEAMS_*`` env-var
-    fallbacks the legacy adapter used.
+    ``app_id``/``app_password``/``app_tenant_id``/``federated``/``app_type``/
+    ``api_url`` fields onto the SDK's ``client_id``/``client_secret``/
+    ``tenant_id``/``managed_identity_client_id``/``service_url`` keys, reading
+    the same ``TEAMS_*`` env-var fallbacks the legacy adapter used.
 
     Returns a dict suitable for ``App(**options)`` minus ``http_server_adapter``
     (the adapter injects the bridge separately). Only keys with a value are
@@ -138,6 +141,11 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
 
     managed_identity_client_id = federated.get("client_id") if federated is not None else None
 
+    # Override the Bot Framework service URL for sovereign clouds (GCC-High,
+    # DoD, etc.). Upstream config.ts:38 — ``config.apiUrl ?? TEAMS_API_URL`` —
+    # is fed to the SDK ``AppOptions.serviceUrl``.
+    service_url = config.api_url if config.api_url is not None else os.environ.get("TEAMS_API_URL")
+
     options: dict[str, Any] = {}
     if client_id:
         options["client_id"] = client_id
@@ -147,6 +155,8 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
         options["tenant_id"] = tenant_id
     if managed_identity_client_id:
         options["managed_identity_client_id"] = managed_identity_client_id
+    if service_url:
+        options["service_url"] = service_url
     return options
 
 
@@ -963,9 +973,9 @@ class TeamsAdapter:
 
         For plain buttons, ``action_value`` looks like ``{"actionId": "btn_id", "value": "clicked"}``.
         For ChoiceSet (Select/RadioSelect) submissions, it looks like
-        ``{"actionId": "__auto_submit", "my_select": "option_1"}``.
-        In both cases, we pass the full dict (minus ``actionId``) as ``value``
-        so handlers receive all submitted input values.
+        ``{"actionId": "__auto_submit", "my_select": "option_1"}`` and is
+        fanned out into one :meth:`process_action` per input key (upstream
+        index.ts:404-412 + fanOutAutoSubmit index.ts:513-556).
         """
         if not self._chat:
             return
@@ -979,6 +989,11 @@ class TeamsAdapter:
                 service_url=service_url,
             )
         )
+
+        # Auto-submit fan-out: fire on_action for each input value.
+        if action_value.get("actionId") == AUTO_SUBMIT_ACTION_ID:
+            self._fan_out_auto_submit(action_value, activity, thread_id, options)
+            return
 
         action_id, submitted_values = self._extract_action_values(action_value)
 
@@ -1023,6 +1038,11 @@ class TeamsAdapter:
             )
         )
 
+        # Auto-submit fan-out: fire on_action for each input value.
+        if action_data.get("actionId") == AUTO_SUBMIT_ACTION_ID:
+            self._fan_out_auto_submit(action_data, activity, thread_id, options)
+            return
+
         action_id, submitted_values = self._extract_action_values(action_data)
 
         from_user = activity.get("from", {})
@@ -1045,6 +1065,60 @@ class TeamsAdapter:
             ),
             options,
         )
+
+    def _fan_out_auto_submit(
+        self,
+        payload: dict[str, Any],
+        activity: dict[str, Any],
+        thread_id: str,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Fan out an auto-submit payload into individual ``on_action`` calls.
+
+        Called when the sentinel ``__auto_submit`` action ID is detected on a
+        ChoiceSet (Select / RadioSelect) submission. Each input key/value pair
+        is dispatched as a separate :meth:`process_action` so a handler
+        registered as ``on_action(input_key)`` fires once per submitted input.
+
+        Python port of upstream ``fanOutAutoSubmit`` (adapter-teams/src/index.ts:513-556).
+        Transport keys (``actionId``, ``msteams``) injected by the SDK card
+        renderer / Teams infra are filtered out; non-string values map to
+        ``None`` (upstream ``typeof val === "string" ? val : undefined``).
+        """
+        if not self._chat:
+            return
+
+        entries = [(k, v) for k, v in payload.items() if k not in self._ACTION_TRANSPORT_KEYS]
+
+        self._logger.debug(
+            "Auto-submit fan-out",
+            {"inputCount": len(entries), "keys": [k for k, _ in entries]},
+        )
+
+        from_user = activity.get("from", {})
+        user = Author(
+            user_id=from_user.get("id", "unknown"),
+            user_name=from_user.get("name", "unknown"),
+            full_name=from_user.get("name", "unknown"),
+            is_bot=False,
+            is_me=False,
+        )
+        message_id = activity.get("replyToId") or activity.get("id", "")
+
+        for key, val in entries:
+            self._chat.process_action(
+                ActionEvent(
+                    action_id=key,
+                    value=val if isinstance(val, str) else None,
+                    user=user,
+                    message_id=message_id,
+                    thread_id=thread_id,
+                    thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
+                    adapter=self,
+                    raw=activity,
+                ),
+                options,
+            )
 
     def _handle_reaction_activity(
         self,
@@ -1975,6 +2049,184 @@ class TeamsAdapter:
         except Exception as error:
             self._logger.error("Teams Graph API: fetchChannelMessages error", {"error": str(error)})
             raise
+
+    async def list_threads(
+        self,
+        channel_id: str,
+        options: ListThreadsOptions | dict[str, Any] | None = None,
+    ) -> ListThreadsResult:
+        """List threads in a Teams channel (or chat) via Microsoft Graph API.
+
+        Python port of upstream ``GraphReader.listThreads``
+        (adapter-teams/src/graph-api.ts:367-516, surfaced by index.ts:1357).
+        Each top-level Graph message becomes a :class:`ThreadSummary` whose
+        ``id`` is the per-message thread ID (``{baseConversationId};messageid=
+        {msg.id}``) and whose ``root_message`` is the mapped message. The
+        channel path additionally carries ``last_reply_at`` (the message's
+        ``lastModifiedDateTime``); the chat path does not.
+        """
+        if options is None:
+            options = ListThreadsOptions()
+        elif isinstance(options, dict):
+            options = ListThreadsOptions(**options)
+
+        decoded = self.decode_thread_id(channel_id)
+        conversation_id = decoded.conversation_id
+        service_url = decoded.service_url
+        base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
+        limit = options.limit if options.limit is not None else 50
+
+        try:
+            graph_context = await self._get_graph_context(base_conversation_id)
+            context_type = graph_context.get("type") if graph_context else None
+
+            self._logger.debug(
+                "Teams Graph API: listThreads",
+                {
+                    "conversationId": base_conversation_id,
+                    "contextType": context_type or "none",
+                    "limit": limit,
+                },
+            )
+
+            threads: list[ThreadSummary] = []
+
+            if graph_context and context_type != "dm":
+                channel_context = cast(TeamsChannelContext, graph_context)
+                graph_messages = await self._graph_list_channel_messages(
+                    channel_context["team_id"],
+                    channel_context["channel_id"],
+                    limit=limit,
+                )
+                for msg in graph_messages:
+                    if not msg.get("id"):
+                        continue
+                    thread_id = self.encode_thread_id(
+                        TeamsThreadId(
+                            conversation_id=f"{base_conversation_id};messageid={msg['id']}",
+                            service_url=service_url,
+                        )
+                    )
+                    last_modified = msg.get("lastModifiedDateTime")
+                    threads.append(
+                        ThreadSummary(
+                            id=thread_id,
+                            root_message=self._map_graph_message(msg, thread_id),
+                            last_reply_at=(_parse_iso(last_modified) if last_modified else None),
+                        )
+                    )
+            else:
+                chat_id = self._chat_id_from_context(graph_context, base_conversation_id)
+                graph_messages = await self._graph_list_chat_messages(
+                    chat_id,
+                    {"$top": limit, "$orderby": "createdDateTime desc"},
+                )
+                for msg in graph_messages:
+                    if not msg.get("id"):
+                        continue
+                    thread_id = self.encode_thread_id(
+                        TeamsThreadId(
+                            conversation_id=f"{base_conversation_id};messageid={msg['id']}",
+                            service_url=service_url,
+                        )
+                    )
+                    threads.append(
+                        ThreadSummary(
+                            id=thread_id,
+                            root_message=self._map_graph_message(msg, thread_id),
+                        )
+                    )
+
+            self._logger.debug("Teams Graph API: listThreads result", {"threadCount": len(threads)})
+            return ListThreadsResult(threads=threads)
+
+        except Exception as error:
+            self._logger.error("Teams Graph API: listThreads error", {"error": str(error)})
+            raise
+
+    async def post_channel_message(
+        self,
+        channel_id: str,
+        message: AdapterPostableMessage,
+    ) -> RawMessage:
+        """Post a message to a Teams channel's base conversation (top-level).
+
+        Python port of upstream ``postChannelMessage``
+        (adapter-teams/src/index.ts:1368-1430). The ``;messageid=`` suffix is
+        stripped so the activity lands on the base channel conversation rather
+        than threaded under a specific root message. Supports card, file, and
+        plain-text postable shapes, mirroring :meth:`post_message`.
+        """
+        decoded = self.decode_thread_id(channel_id)
+        base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", decoded.conversation_id)
+
+        files = extract_files(message)
+        file_attachments = await self._files_to_attachments(files) if files else []
+
+        card = extract_card(message)
+        if card:
+            adaptive_card = card_to_adaptive_card(card)
+            activity_payload: dict[str, Any] = {
+                "type": "message",
+                "attachments": [
+                    {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": adaptive_card,
+                    },
+                    *file_attachments,
+                ],
+            }
+
+            try:
+                self._point_app_api_at(decoded.service_url)
+                sent = await self._app.send(
+                    base_conversation_id,
+                    self._message_activity_input(activity_payload),
+                )
+                return RawMessage(
+                    id=getattr(sent, "id", "") or "",
+                    thread_id=channel_id,
+                    raw=activity_payload,
+                )
+            except Exception as error:
+                self._logger.error(
+                    "Teams API: postChannelMessage failed",
+                    {"conversationId": base_conversation_id, "error": str(error)},
+                )
+                _handle_teams_error(error, "postChannelMessage")
+                raise  # unreachable: _handle_teams_error always raises
+
+        text = convert_emoji_placeholders(
+            self._format_converter.render_postable(message),
+            "teams",
+        )
+        activity_payload = {
+            "type": "message",
+            "text": text,
+            "textFormat": "markdown",
+        }
+        if file_attachments:
+            activity_payload["attachments"] = file_attachments
+
+        try:
+            self._point_app_api_at(decoded.service_url)
+            sent = await self._app.send(
+                base_conversation_id,
+                self._message_activity_input(activity_payload),
+            )
+            self._logger.debug("Teams API: postChannelMessage response", {"messageId": getattr(sent, "id", None)})
+            return RawMessage(
+                id=getattr(sent, "id", "") or "",
+                thread_id=channel_id,
+                raw=activity_payload,
+            )
+        except Exception as error:
+            self._logger.error(
+                "Teams API: postChannelMessage failed",
+                {"conversationId": base_conversation_id, "error": str(error)},
+            )
+            _handle_teams_error(error, "postChannelMessage")
+            raise  # unreachable: _handle_teams_error always raises
 
     async def fetch_thread(self, thread_id: str) -> ThreadInfo:
         """Fetch basic thread info for a Teams conversation."""
