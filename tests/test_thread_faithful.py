@@ -314,69 +314,34 @@ class TestStreaming:
         assert len(adapter._post_calls) == 0
 
     @pytest.mark.asyncio
-    async def test_should_prefer_raw_message_text_override_over_local_accumulator(self):
-        """When ``adapter.stream`` returns ``RawMessage`` with ``text`` set, the
-        recorded ``SentMessage`` body MUST come from that override, not from
-        Thread.stream's local accumulator.
+    async def test_should_record_local_accumulator_for_native_streaming(self):
+        """The recorded ``SentMessage`` body comes from Thread.stream's local
+        accumulator (the text collected by the wrapping iterator), NOT from
+        the adapter's ``RawMessage`` return value.
 
-        This is the contract that makes Teams native streaming's
-        cancellation path consistent: ``Thread._handle_stream``
-        accumulates each chunk into a local buffer BEFORE yielding to
-        the adapter, so on cancellation the buffer includes text the
-        adapter never shipped to the platform. The adapter signals the
-        corrected snapshot via ``RawMessage.text``; without honoring it
-        the SDK's recorded ``SentMessage`` would diverge from what the
-        user actually saw.
+        Upstream parity (thread.ts ``handleStream``): the ``SentMessage`` is
+        built from ``accumulated``, which the wrapping iterator collects as it
+        passes chunks through to the adapter. This is the post-unwind contract
+        (issue #93 PR 3): the Teams adapter now emits each chunk through the
+        SDK ``IStreamer`` as it is yielded, so ``accumulated`` and what the
+        platform shipped stay in lockstep — there is no adapter-side text
+        override and ``RawMessage`` no longer carries a ``text`` field.
+
+        Regression guard: if someone reintroduces a ``RawMessage.text``
+        override and makes Thread.stream prefer it, this test still pins the
+        recorded text to the accumulator. The ``id`` / ``thread_id`` still come
+        from the adapter's ``RawMessage``.
         """
         adapter = create_mock_adapter()
         state = create_mock_state()
 
-        # Adapter drains the iterator (matching the real-world contract —
-        # ``_wrapped_stream`` only populates Thread.stream's local
-        # accumulator if the adapter actually iterates it) and reports
-        # back via the override that only "Hello" was shipped even though
-        # "Hello world" was yielded.
+        # Adapter drains the iterator (so Thread.stream's local accumulator
+        # populates) and returns only id/thread_id/raw — the upstream
+        # RawMessage shape with no text field.
         async def mock_stream(thread_id, text_stream, options=None):
             async for _chunk in text_stream:
                 pass
-            return RawMessage(
-                id="msg-1",
-                thread_id="t1",
-                raw={"text": "Hello"},
-                text="Hello",
-            )
-
-        adapter.stream = mock_stream  # type: ignore[attr-defined]
-
-        thread = _make_thread(adapter, state)
-        text_stream = _create_text_stream(["Hello", " world"])
-        result = await thread.post(text_stream)
-
-        assert result.text == "Hello", (
-            "Thread.stream must prefer RawMessage.text over its local "
-            "accumulator. Returning the local 'Hello world' would let "
-            "Thread.stream record text the adapter said was never shipped."
-        )
-
-    @pytest.mark.asyncio
-    async def test_should_fall_back_to_local_accumulator_when_text_override_is_none(self):
-        """Default behavior: when ``RawMessage.text`` is ``None`` (the
-        backward-compatible default for adapters that don't set it),
-        Thread.stream falls back to its local accumulator.
-
-        Critical for adapters like Slack/Discord/GitHub/Linear/etc. that
-        don't need the override — adding the new field must not change
-        their recorded text.
-        """
-        adapter = create_mock_adapter()
-        state = create_mock_state()
-
-        # No ``text`` set — defaults to None. Adapter drains the
-        # iterator so Thread.stream's local accumulator populates.
-        async def mock_stream(thread_id, text_stream, options=None):
-            async for _chunk in text_stream:
-                pass
-            return RawMessage(id="msg-1", thread_id="t1", raw={})
+            return RawMessage(id="msg-1", thread_id="t1", raw={"text": "ignored"})
 
         adapter.stream = mock_stream  # type: ignore[attr-defined]
 
@@ -384,8 +349,12 @@ class TestStreaming:
         text_stream = _create_text_stream(["Hello", " ", "world"])
         result = await thread.post(text_stream)
 
-        # Local accumulator wins because the adapter didn't override.
-        assert result.text == "Hello world"
+        assert result.text == "Hello world", (
+            "Thread.stream must record its local accumulator (upstream "
+            "thread.ts builds the SentMessage from `accumulated`, not from "
+            "the adapter return value)."
+        )
+        assert result.id == "msg-1"
 
     # it("should fall back when adapter.stream returns null")
     @pytest.mark.asyncio
@@ -405,18 +374,16 @@ class TestStreaming:
         call_args = mock_stream.call_args
         assert call_args.args[0] == "slack:C123:1234.5678"
         options = call_args.args[2]
-        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
-        # asserts ``objectContaining({ updateIntervalMs: 500 })`` here
-        # because thread.ts (vercel/chat#340) seeds the thread-level
-        # default into the StreamOptions handed to ``adapter.stream``. We
-        # intentionally leave ``update_interval_ms`` as ``None`` unless
-        # caller-supplied: the hand-rolled Teams native streaming path
-        # treats any non-``None`` value as a caller override of its 1500ms
-        # quota-protecting emit throttle, so the seed would silently drop
-        # Teams DM throttling to the 500ms thread default. If this
-        # assertion fails because seeding was added, reconcile
-        # ``TeamsAdapter._resolve_emit_interval`` first.
-        assert options.update_interval_ms is None
+        # Upstream parity (thread.ts, vercel/chat#340): the StreamOptions handed
+        # to ``adapter.stream`` seed ``update_interval_ms`` with the thread-level
+        # default (500ms) before merging caller options, so the adapter always
+        # sees a concrete interval. Upstream's ``thread.test.ts > should fall
+        # back when adapter.stream returns null`` asserts
+        # ``objectContaining({ updateIntervalMs: 500 })``. The Teams adapter no
+        # longer owns a quota throttle (the SDK ``IStreamer`` does), so this
+        # seed is now harmless for Teams too — issue #93 PR 3 unwound the
+        # previous non-seeding divergence.
+        assert options.update_interval_ms == 500
 
         # ...and returning None delegated to the built-in post+edit
         # fallback: placeholder posted, then edited with the full text.

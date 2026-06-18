@@ -983,47 +983,11 @@ class TestTeamsSDKOperations:
 
 
 # ---------------------------------------------------------------------------
-# _teams_send HTTP helper (retained for the still-hand-rolled streaming path)
+# Adapter lifecycle helpers
 # ---------------------------------------------------------------------------
 
 
 class TestTeamsHTTPHelpers:
-    async def test_teams_send_success(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
-        send_resp = _mock_aiohttp_response({"id": "sent-1"})
-
-        mock_session = _MockSession(default_response=send_resp)
-        original_post = mock_session.post
-
-        def routed_post(url, **kwargs):
-            if "oauth2" in url:
-                return mock_session._make_cm(token_resp)
-            return original_post(url, **kwargs)
-
-        mock_session.post = routed_post
-
-        decoded = TeamsThreadId(
-            conversation_id="19:abc@thread.tacv2",
-            service_url="https://smba.trafficmanager.net/teams/",
-        )
-
-        with patch("aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter._teams_send(decoded, {"type": "message", "text": "hi"})
-            assert result["id"] == "sent-1"
-
-    async def test_teams_send_invalid_service_url_raises(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        decoded = TeamsThreadId(
-            conversation_id="19:abc@thread.tacv2",
-            service_url="https://evil.com/",
-        )
-
-        with pytest.raises(ValidationError):
-            await adapter._teams_send(decoded, {"type": "message"})
-
     async def test_disconnect_is_noop(self):
         adapter = _make_adapter(logger=_make_logger())
         result = await adapter.disconnect()
@@ -1244,16 +1208,11 @@ class TestHandleActivityEarlyReturns:
 
 
 class TestStream:
+    """Group-chat / non-DM fallback: accumulate and post one SDK message."""
+
     async def test_stream_dict_chunks(self):
         adapter = _make_adapter(logger=_make_logger())
-        send_call_count = 0
-
-        async def mock_send(decoded, payload):
-            nonlocal send_call_count
-            send_call_count += 1
-            return {"id": f"msg-{send_call_count}"}
-
-        adapter._teams_send = mock_send
+        send = _mock_app_send(adapter, "msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1267,14 +1226,14 @@ class TestStream:
             yield {"type": "markdown_text", "text": "World"}
 
         result = await adapter.stream(tid, text_stream())
-        # Group chat: accumulate → single send.
+        # Group chat: accumulate → single SDK send.
         assert result.id == "msg-1"
         assert result.raw["text"] == "Hello World"
-        assert send_call_count == 1
+        send.assert_called_once()
 
     async def test_stream_string_chunks(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        send = _mock_app_send(adapter, "s1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1290,11 +1249,11 @@ class TestStream:
         result = await adapter.stream(tid, text_stream())
         assert "Hello World" in result.raw["text"]
         # Group chat: single accumulate-and-post send (no per-chunk edits).
-        assert adapter._teams_send.call_count == 1
+        send.assert_called_once()
 
     async def test_stream_empty_chunks_skipped(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "s1"})
+        send = _mock_app_send(adapter, "s1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1309,7 +1268,7 @@ class TestStream:
 
         result = await adapter.stream(tid, text_stream())
         assert result.id == ""  # nothing sent
-        assert adapter._teams_send.call_count == 0
+        send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1366,37 +1325,6 @@ class TestExtractCardTitle:
 # Request-body / header extraction and response shaping moved to
 # ``BridgeHttpAdapter`` (issue #93 PR 1); those paths are covered by
 # tests/test_teams_bridge.py.
-
-
-# ---------------------------------------------------------------------------
-# _teams_send error path (retained for the still-hand-rolled streaming path)
-# ---------------------------------------------------------------------------
-
-
-class TestTeamsHTTPErrorPaths:
-    async def test_teams_send_non_ok_response(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
-        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
-
-        mock_session = _MockSession(default_response=error_resp)
-        original_post = mock_session.post
-
-        def routed_post(url, **kwargs):
-            if "oauth2" in url:
-                return mock_session._make_cm(token_resp)
-            return original_post(url, **kwargs)
-
-        mock_session.post = routed_post
-
-        decoded = TeamsThreadId(
-            conversation_id="19:abc@thread.tacv2",
-            service_url="https://smba.trafficmanager.net/teams/",
-        )
-
-        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
-            await adapter._teams_send(decoded, {"type": "message"})
 
 
 # ---------------------------------------------------------------------------

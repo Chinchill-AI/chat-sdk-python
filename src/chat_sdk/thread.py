@@ -690,23 +690,15 @@ class ThreadImpl:
         # Build text-only stream from raw_stream
         text_stream = _from_full_stream(raw_stream)
 
-        # Build streaming options from current message context.
-        #
-        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
-        # (vercel/chat#340) seeds ``updateIntervalMs`` with the thread-level
-        # default (``this._streamingUpdateIntervalMs``) before spreading
-        # caller options, so adapters always see a concrete interval. We
-        # deliberately leave ``update_interval_ms`` as ``None`` unless the
-        # caller supplied one: the hand-rolled Teams native streaming path
-        # treats any non-``None`` value as a caller override of its 1500ms
-        # quota-protecting emit throttle (upstream's Teams adapter ignores
-        # the field entirely, so the seed is harmless there). Adapters that
-        # consume the field apply their own default when it is ``None``
-        # (Telegram: ``TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS``), and
-        # ``_fallback_stream`` already falls back to
-        # ``self._streaming_update_interval_ms`` — same observable behavior
-        # as upstream's seed for the fallback path.
-        options = StreamOptions()
+        # Build streaming options from current message context + caller
+        # options. Upstream parity (vercel/chat#340): seed
+        # ``update_interval_ms`` with the thread-level default
+        # (``self._streaming_update_interval_ms``) before merging caller
+        # options, so adapters always see a concrete interval. The Teams
+        # adapter now delegates throttling to the SDK ``IStreamer`` (it no
+        # longer owns a quota throttle), so the seed is harmless there —
+        # matching upstream, whose Teams adapter ignores the field.
+        options = StreamOptions(update_interval_ms=self._streaming_update_interval_ms)
         if self._current_message is not None:
             options.recipient_user_id = self._current_message.author.user_id
             # recipient_team_id is only consumed by the Slack adapter; other
@@ -744,21 +736,16 @@ class ThreadImpl:
             wrapped_stream = _wrapped_stream()
             raw_result = await self.adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
             if raw_result is not None:
-                # Adapters can override the recorded text via the optional
-                # ``text`` field on ``RawMessage`` when their internal state
-                # (cancellation, throttling, partial commits) makes the local
-                # ``accumulated`` buffer diverge from what the platform
-                # actually accepted. Default ``None`` falls back to the local
-                # buffer — backward-compatible for adapters that don't need
-                # the override (Slack, Discord, GitHub, Google Chat,
-                # Telegram, Linear, WhatsApp). The Teams native streaming
-                # path sets it on cancellation to short-circuit the buffered
-                # suffix that was coalesced into the throttle window but
-                # never emitted.
-                recorded_text = raw_result.text if raw_result.text is not None else accumulated
+                # Record the locally-accumulated text. Matches upstream
+                # thread.ts, which builds the ``SentMessage`` from the text
+                # collected by the wrapping iterator (``accumulated``), not
+                # from the adapter's return value. The Teams adapter now
+                # emits each chunk through the SDK ``IStreamer`` as it is
+                # yielded, so ``accumulated`` and what the platform shipped
+                # stay in lockstep — no adapter-side text override needed.
                 sent = self._create_sent_message(
                     raw_result.id,
-                    PostableMarkdown(markdown=recorded_text),
+                    PostableMarkdown(markdown=accumulated),
                     raw_result.thread_id,
                 )
                 if self._thread_history is not None:
