@@ -37,6 +37,50 @@ def _make_logger():
     )
 
 
+class _SentActivity:
+    """Stand-in for the SDK ``SentActivity`` returned by ``app.send`` — only the
+    ``.id`` attribute matters to the adapter, mirroring upstream's
+    ``{ id, type }`` mock return value."""
+
+    def __init__(self, id: str):
+        self.id = id
+
+
+def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
+    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+
+    Mirrors upstream's ``mockApp.send = vi.fn(async () => ({ id, type }))`` —
+    the migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    Returns the mock so tests can assert call count / arguments.
+    """
+    send = AsyncMock(return_value=_SentActivity(sent_id))
+    adapter._app.send = send  # type: ignore[method-assign]
+    return send
+
+
+def _mock_app_activities(
+    adapter: TeamsAdapter,
+    *,
+    update_id: str = "edit-msg-1",
+) -> tuple[AsyncMock, AsyncMock]:
+    """Replace ``adapter._app.api`` so ``conversations.activities(id)`` returns a
+    stub exposing ``update``/``delete`` AsyncMocks.
+
+    Mirrors upstream's editMessage/deleteMessage test mock:
+    ``mockApp.api = { conversations: { activities: () => ({ update, delete }) } }``.
+    Returns ``(update_mock, delete_mock)``.
+    """
+    update = AsyncMock(return_value=_SentActivity(update_id))
+    delete = AsyncMock(return_value=None)
+    ops = MagicMock()
+    ops.update = update
+    ops.delete = delete
+    api = MagicMock()
+    api.conversations.activities = MagicMock(return_value=ops)
+    adapter._app.api = api  # type: ignore[method-assign]
+    return update, delete
+
+
 class _MockAiohttpSession:
     """Stub for ``aiohttp.ClientSession`` that supports the
     ``async with session.get(url) as resp`` pattern.
@@ -713,7 +757,7 @@ class TestPostMessage:
     @pytest.mark.asyncio
     async def test_sends_and_returns_message_id(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "sent-msg-123", "type": "message"})
+        send = _mock_app_send(adapter, "sent-msg-123")
 
         thread_id = adapter.encode_thread_id(
             TeamsThreadId(
@@ -724,14 +768,45 @@ class TestPostMessage:
         result = await adapter.post_message(thread_id, {"markdown": "Hi there"})
         assert result.id == "sent-msg-123"
         assert result.thread_id == thread_id
-        adapter._teams_send.assert_called_once()
+        send.assert_called_once()
+        # delegates to the SDK App.send with the conversation ID and a
+        # MessageActivityInput carrying the rendered text + markdown format
+        conv_id, activity = send.call_args.args
+        assert conv_id == "19:abc@thread.tacv2"
+        assert activity.text == "Hi there"
+        assert activity.text_format == "markdown"
+
+    @pytest.mark.asyncio
+    async def test_send_failure_maps_to_handle_teams_error(self):
+        """Mirrors upstream: a 401 from ``app.send`` flows through
+        ``handleTeamsError`` and surfaces as ``AuthenticationError`` — proving
+        the raw SDK exception (status on ``.status_code``) reaches the mapper."""
+        from chat_sdk.shared.errors import AuthenticationError
+
+        class _SdkError(Exception):
+            def __init__(self):
+                super().__init__("Unauthorized")
+                self.status_code = 401
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter)
+        send.side_effect = _SdkError()
+
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+        with pytest.raises(AuthenticationError):
+            await adapter.post_message(thread_id, {"markdown": "Hi"})
 
 
 class TestEditMessage:
     @pytest.mark.asyncio
     async def test_updates_and_returns(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_update = AsyncMock()
+        update, _delete = _mock_app_activities(adapter, update_id="edit-msg-1")
 
         thread_id = adapter.encode_thread_id(
             TeamsThreadId(
@@ -742,7 +817,64 @@ class TestEditMessage:
         result = await adapter.edit_message(thread_id, "edit-msg-1", {"markdown": "Updated text"})
         assert result.id == "edit-msg-1"
         assert result.thread_id == thread_id
-        adapter._teams_update.assert_called_once()
+        # delegates to app.api.conversations.activities(conversationId).update
+        adapter._app.api.conversations.activities.assert_called_once_with("19:abc@thread.tacv2")
+        update.assert_called_once()
+        update_msg_id, update_activity = update.call_args.args
+        assert update_msg_id == "edit-msg-1"
+        assert update_activity.text == "Updated text"
+        assert update_activity.text_format == "markdown"
+
+
+class TestOutboundServiceUrlRouting:
+    """Each outbound op must retarget the SDK App's Bot Framework client at the
+    thread's decoded service URL before sending — so different regions / sovereign
+    clouds reach the right endpoint. Exercises the REAL ``ApiClient`` (not a mock)
+    to prove ``_point_app_api_at`` actually walks the service-url chain rather than
+    silently no-opping via its mock-tolerant ``AttributeError`` guard.
+    """
+
+    SOVEREIGN_URL = "https://smba.infra.gov.teams.microsoft.us/teams/"
+
+    @pytest.mark.asyncio
+    async def test_post_message_retargets_real_api_client(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        seen: dict[str, str] = {}
+
+        async def fake_send(conversation_id, activity):
+            # captured at call time: the real ApiClient is now on the thread's URL
+            seen["api"] = adapter._app.api.service_url
+            seen["conversations"] = adapter._app.api.conversations.service_url
+            seen["activities"] = adapter._app.api.conversations.activities_client.service_url
+            return _SentActivity("m")
+
+        adapter._app.send = fake_send  # type: ignore[method-assign]
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
+        )
+        await adapter.post_message(tid, {"markdown": "hi"})
+        # the trailing slash is normalized off, matching ApiClient's own rstrip
+        assert seen["api"] == self.SOVEREIGN_URL.rstrip("/")
+        assert seen["conversations"] == self.SOVEREIGN_URL.rstrip("/")
+        assert seen["activities"] == self.SOVEREIGN_URL.rstrip("/")
+
+    @pytest.mark.asyncio
+    async def test_edit_message_retargets_real_activities_client(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        seen: dict[str, str] = {}
+
+        # Patch the real activities_client.update so the routing target is read
+        # off the REAL client chain (not a wholesale api mock).
+        async def fake_update(conversation_id, activity_id, activity):
+            seen["url"] = adapter._app.api.conversations.activities_client.service_url
+            return _SentActivity(activity_id)
+
+        adapter._app.api.conversations.activities_client.update = fake_update  # type: ignore[method-assign]
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
+        )
+        await adapter.edit_message(tid, "edit-1", {"markdown": "x"})
+        assert seen["url"] == self.SOVEREIGN_URL.rstrip("/")
 
 
 class TestFileAttachments:
@@ -762,12 +894,21 @@ class TestFileAttachments:
             )
         )
 
+    @staticmethod
+    def _sent_attachments(send: AsyncMock) -> list[dict]:
+        """Serialize the attachments off the MessageActivityInput handed to the
+        SDK ``app.send``, back to the camelCase wire dicts — proving the file
+        attachments actually reached the SDK boundary (not just the raw echo)."""
+        activity = send.call_args.args[1]
+        dumped = activity.model_dump(by_alias=True, exclude_none=True)
+        return dumped.get("attachments", [])
+
     @pytest.mark.asyncio
     async def test_text_message_with_file(self):
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "sent-1", "type": "message"})
+        send = _mock_app_send(adapter, "sent-1")
 
         message = PostableMarkdown(
             markdown="here is your report",
@@ -775,8 +916,8 @@ class TestFileAttachments:
         )
         result = await adapter.post_message(self._thread_id(adapter), message)
 
-        payload = adapter._teams_send.call_args.args[1]
-        attachments = payload["attachments"]
+        # the data-URI attachment reaches the SDK send AND is echoed on raw
+        attachments = self._sent_attachments(send)
         assert len(attachments) == 1
         att = attachments[0]
         assert att["contentType"] == "text/csv"
@@ -796,7 +937,7 @@ class TestFileAttachments:
         from chat_sdk.types import FileUpload, PostableCard
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "sent-2", "type": "message"})
+        send = _mock_app_send(adapter, "sent-2")
 
         message = PostableCard(
             card=Card(title="Results"),
@@ -804,8 +945,7 @@ class TestFileAttachments:
         )
         await adapter.post_message(self._thread_id(adapter), message)
 
-        payload = adapter._teams_send.call_args.args[1]
-        attachments = payload["attachments"]
+        attachments = self._sent_attachments(send)
         # adaptive card attachment AND the file attachment both present
         assert len(attachments) == 2
         assert attachments[0]["contentType"] == "application/vnd.microsoft.card.adaptive"
@@ -825,7 +965,7 @@ class TestFileAttachments:
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_update = AsyncMock()
+        update, _delete = _mock_app_activities(adapter, update_id="edit-1")
 
         message = PostableMarkdown(
             markdown="updated",
@@ -833,7 +973,8 @@ class TestFileAttachments:
         )
         result = await adapter.edit_message(self._thread_id(adapter), "edit-1", message)
 
-        payload = adapter._teams_update.call_args.args[2]
+        activity = update.call_args.args[1]
+        payload = activity.model_dump(by_alias=True, exclude_none=True)
         assert "attachments" not in payload, (
             "edit_message must not carry file attachments — outbound file delivery is "
             f"post_message-only (upstream fidelity); got attachments={payload.get('attachments')!r}"
@@ -846,7 +987,7 @@ class TestFileAttachments:
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "sent-3", "type": "message"})
+        send = _mock_app_send(adapter, "sent-3")
 
         message = PostableMarkdown(
             markdown="bin",
@@ -854,7 +995,7 @@ class TestFileAttachments:
         )
         await adapter.post_message(self._thread_id(adapter), message)
 
-        att = adapter._teams_send.call_args.args[1]["attachments"][0]
+        att = self._sent_attachments(send)[0]
         assert att["contentType"] == "application/octet-stream"
         assert att["contentUrl"].startswith("data:application/octet-stream;base64,")
 
@@ -872,16 +1013,16 @@ class TestFileAttachments:
 
         logger = _make_logger()
         adapter = _make_adapter(app_id="test-app-id", logger=logger)
-        adapter._teams_send = AsyncMock(return_value={"id": "sent-4", "type": "message"})
+        send = _mock_app_send(adapter, "sent-4")
 
         # data is a str, not bytes -> to_buffer returns None -> file skipped
         bad = FileUpload(data="not-bytes", filename="bad.txt", mime_type="text/plain")  # type: ignore[arg-type]
         message = PostableMarkdown(markdown="text only", files=[bad])
-        await adapter.post_message(self._thread_id(adapter), message)
+        result = await adapter.post_message(self._thread_id(adapter), message)
 
-        payload = adapter._teams_send.call_args.args[1]
-        # no attachments key added when every file was skipped
-        assert "attachments" not in payload
+        # no attachments key added when every file was skipped (raw + sent activity)
+        assert "attachments" not in result.raw
+        assert self._sent_attachments(send) == []
         # assert the SPECIFIC skip log fired — not just that some debug log happened
         # (post_message emits an unconditional "send (message)" debug, so a bare
         # logger.debug.called check would pass even if the skip branch logged nothing).
@@ -900,7 +1041,7 @@ class TestFileAttachments:
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+        send = _mock_app_send(adapter, "m")
 
         message = PostableMarkdown(
             markdown="three files",
@@ -912,7 +1053,7 @@ class TestFileAttachments:
         )
         await adapter.post_message(self._thread_id(adapter), message)
 
-        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        attachments = self._sent_attachments(send)
         assert [a["name"] for a in attachments] == ["a.csv", "b.png", "c.pdf"]
         assert [a["contentType"] for a in attachments] == ["text/csv", "image/png", "application/pdf"]
         assert all(a["contentUrl"].startswith("data:") for a in attachments)
@@ -925,7 +1066,7 @@ class TestFileAttachments:
         from chat_sdk.types import FileUpload, PostableMarkdown
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "m", "type": "message"})
+        send = _mock_app_send(adapter, "m")
 
         message = PostableMarkdown(
             markdown="good bad good",
@@ -937,7 +1078,7 @@ class TestFileAttachments:
         )
         await adapter.post_message(self._thread_id(adapter), message)
 
-        attachments = adapter._teams_send.call_args.args[1]["attachments"]
+        attachments = self._sent_attachments(send)
         assert [a["name"] for a in attachments] == ["first.csv", "third.csv"]
 
 
@@ -945,7 +1086,7 @@ class TestDeleteMessage:
     @pytest.mark.asyncio
     async def test_deletes_without_error(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_delete = AsyncMock()
+        _update, delete = _mock_app_activities(adapter)
 
         thread_id = adapter.encode_thread_id(
             TeamsThreadId(
@@ -954,7 +1095,9 @@ class TestDeleteMessage:
             )
         )
         await adapter.delete_message(thread_id, "del-msg-1")
-        assert adapter._teams_delete.call_count == 1
+        adapter._app.api.conversations.activities.assert_called_once_with("19:abc@thread.tacv2")
+        assert delete.call_count == 1
+        assert delete.call_args.args == ("del-msg-1",)
 
 
 # ---------------------------------------------------------------------------
@@ -965,8 +1108,10 @@ class TestDeleteMessage:
 class TestStartTyping:
     @pytest.mark.asyncio
     async def test_sends_typing_activity(self):
+        from microsoft_teams.api import TypingActivityInput
+
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "typing-1", "type": "typing"})
+        send = _mock_app_send(adapter, "typing-1")
 
         thread_id = adapter.encode_thread_id(
             TeamsThreadId(
@@ -975,7 +1120,12 @@ class TestStartTyping:
             )
         )
         await adapter.start_typing(thread_id)
-        assert adapter._teams_send.call_count == 1
+        assert send.call_count == 1
+        conv_id, activity = send.call_args.args
+        assert conv_id == "19:abc@thread.tacv2"
+        # delegates a TypingActivityInput (type == "typing") to the SDK App.send
+        assert isinstance(activity, TypingActivityInput)
+        assert activity.type == "typing"
 
 
 # ---------------------------------------------------------------------------
