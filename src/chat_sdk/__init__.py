@@ -1,6 +1,22 @@
 """Python port of Vercel Chat SDK."""
 
-from chat_sdk.ai import to_ai_messages
+# Re-exported from `chat_sdk.ai` for backwards compatibility.
+#
+# Prefer importing these from `chat_sdk.ai` in new code — that subpackage is the
+# home for every AI SDK helper (`to_ai_messages`, `create_chat_tools`, etc.).
+# The AI type aliases below are deprecated at the root and mirror upstream's
+# `packages/chat/src/index.ts` deprecated re-export surface (@deprecated → chat/ai).
+from chat_sdk.ai import (
+    AiAssistantMessage,
+    AiFilePart,
+    AiImagePart,
+    AiMessage,
+    AiMessagePart,
+    AiTextPart,
+    AiUserMessage,
+    ToAiMessagesOptions,
+    to_ai_messages,
+)
 from chat_sdk.cards import (
     Actions,
     ActionsElement,
@@ -235,6 +251,15 @@ __all__ = [
     "post_postable_object",
     # AI
     "to_ai_messages",
+    # AI type aliases — deprecated at the root; canonical home is chat_sdk.ai.
+    "AiAssistantMessage",
+    "AiFilePart",
+    "AiImagePart",
+    "AiMessage",
+    "AiMessagePart",
+    "AiTextPart",
+    "AiUserMessage",
+    "ToAiMessagesOptions",
     # Standalone reviver for workflow-safe deserialization
     "reviver",
     # Card builders (PascalCase primary — matches source TS SDK)
