@@ -19,7 +19,10 @@ import pytest
 
 from chat_sdk.adapters.slack.webhook import (
     SlackContinuation,
+    SlackFile,
     SlackRetry,
+    SlackUser,
+    SlackViewStateValue,
     SlackWebhookParseError,
     SlackWebhookVerificationError,
     parse_slack_webhook_body,
@@ -228,6 +231,17 @@ class TestParseSlackWebhookBody:
                     "event": {
                         "channel": "C123",
                         "text": "<@U999> hello",
+                        "files": [
+                            {
+                                "id": "F123",
+                                "mimetype": "image/png",
+                                "name": "chart.png",
+                                "size": 123,
+                                "title": "Chart",
+                                "url_private": "https://files.slack.com/files-pri/chart.png",
+                                "url_private_download": ("https://files.slack.com/files-pri/chart-download.png"),
+                            }
+                        ],
                         "thread_ts": "1710000000.000001",
                         "ts": "1710000000.000002",
                         "type": "app_mention",
@@ -257,6 +271,21 @@ class TestParseSlackWebhookBody:
         )
         assert payload.event_id == "Ev123"
         assert payload.event_time == 1_710_000_000
+        assert payload.files == [
+            SlackFile(
+                download_url="https://files.slack.com/files-pri/chart-download.png",
+                id="F123",
+                mime_type="image/png",
+                name="chart.png",
+                raw=payload.files[0].raw,
+                size=123,
+                title="Chart",
+                type="image",
+                url="https://files.slack.com/files-pri/chart.png",
+            )
+        ]
+        # ``raw`` is the verbatim Slack file object, not dropped.
+        assert payload.files[0].raw["url_private"] == "https://files.slack.com/files-pri/chart.png"
         assert payload.is_ext_shared_channel is True
         assert payload.retry == SlackRetry(num=2, reason="http_timeout")
         assert payload.text == "<@U999> hello"
@@ -351,7 +380,10 @@ class TestParseSlackWebhookBody:
                 {
                     "action_id": "approve",
                     "block_id": "actions",
-                    "selected_option": {"value": "yes"},
+                    "selected_option": {
+                        "text": {"text": "Yes", "type": "plain_text"},
+                        "value": "yes",
+                    },
                     "text": {"text": "Approve", "type": "plain_text"},
                     "type": "button",
                     "value": "approve-value",
@@ -365,6 +397,12 @@ class TestParseSlackWebhookBody:
                 "type": "message",
             },
             "message": {
+                "blocks": [
+                    {
+                        "text": {"text": "Approve deployment?", "type": "mrkdwn"},
+                        "type": "section",
+                    }
+                ],
                 "thread_ts": "1710000000.000001",
                 "ts": "1710000000.000002",
             },
@@ -383,10 +421,15 @@ class TestParseSlackWebhookBody:
         action = payload.actions[0]
         assert action.action_id == "approve"
         assert action.block_id == "actions"
-        assert action.label == "Approve"
+        # Upstream parse.ts:276 — the selected option's text wins over the
+        # element text when both are present.
+        assert action.label == "Yes"
+        assert action.selected_option_label == "Yes"
         assert action.selected_option_value == "yes"
         assert action.type == "button"
         assert action.value == "approve-value"
+        # The acting user is attached to every parsed action (parse.ts:296).
+        assert action.user == SlackUser(id="U123", username="josh")
         assert payload.channel_id == "C123"
         assert payload.continuation == SlackContinuation(
             channel_id="C123",
@@ -394,13 +437,53 @@ class TestParseSlackWebhookBody:
             team_id="T123",
             thread_ts="1710000000.000001",
         )
+        assert payload.message_blocks == [
+            {
+                "text": {"text": "Approve deployment?", "type": "mrkdwn"},
+                "type": "section",
+            }
+        ]
+        assert payload.message_prompt_block == {
+            "text": {"text": "Approve deployment?", "type": "mrkdwn"},
+            "type": "section",
+        }
+        assert payload.message_prompt_text == "Approve deployment?"
         assert payload.message_ts == "1710000000.000002"
         assert payload.response_url == "https://hooks.slack.com/actions/T123/1/abc"
         assert payload.team_id == "T123"
         assert payload.thread_ts == "1710000000.000001"
         assert payload.trigger_id == "123.456.abc"
+        assert payload.user == SlackUser(id="U123", username="josh")
         assert payload.user_id == "U123"
         assert payload.user_name == "josh"
+
+    def test_select_action_label_falls_back_to_element_text(self):
+        """When no option is selected, the label falls back to the element's
+        own text (parse.ts:276 — ``selectedText?.text || text?.text``)."""
+        raw = {
+            "actions": [
+                {
+                    "action_id": "approve",
+                    "text": {"text": "Approve", "type": "plain_text"},
+                    "type": "button",
+                    "value": "approve-value",
+                }
+            ],
+            "channel": {"id": "C123"},
+            "container": {"channel_id": "C123", "thread_ts": "1710000000.000001"},
+            "type": "block_actions",
+            "user": {"id": "U123"},
+        }
+
+        payload = parse_slack_webhook_body(
+            urlencode({"payload": json.dumps(raw)}),
+            content_type="application/x-www-form-urlencoded",
+        )
+
+        action = payload.actions[0]
+        assert action.label == "Approve"
+        assert action.selected_option_label is None
+        assert action.selected_option_value is None
 
     def test_parses_block_suggestion_payloads(self):
         raw = {
@@ -436,6 +519,7 @@ class TestParseSlackWebhookBody:
             "view": {
                 "callback_id": "feedback",
                 "id": "V123",
+                "private_metadata": '{"id":"123"}',
                 "response_urls": [
                     {
                         "action_id": "target",
@@ -443,6 +527,16 @@ class TestParseSlackWebhookBody:
                         "response_url": "https://hooks.slack.com/app/1/2/3",
                     }
                 ],
+                "state": {
+                    "values": {
+                        "feedback": {
+                            "message": {
+                                "type": "plain_text_input",
+                                "value": "looks good",
+                            }
+                        }
+                    }
+                },
             },
         }
 
@@ -452,6 +546,8 @@ class TestParseSlackWebhookBody:
         )
 
         assert payload.kind == "view_submission"
+        assert payload.callback_id == "feedback"
+        assert payload.private_metadata == '{"id":"123"}'
         assert payload.response_urls == [
             {
                 "action_id": "target",
@@ -460,7 +556,18 @@ class TestParseSlackWebhookBody:
             }
         ]
         assert payload.team_id == "T123"
+        assert payload.user == SlackUser(id="U123")
         assert payload.user_id == "U123"
+        # parseViewValues (parse.ts:404) flattens state.values into a list.
+        assert payload.values == [
+            SlackViewStateValue(
+                action_id="message",
+                block_id="feedback",
+                raw={"type": "plain_text_input", "value": "looks good"},
+                type="plain_text_input",
+                value="looks good",
+            )
+        ]
         assert payload.view["callback_id"] == "feedback"
         assert payload.view["id"] == "V123"
 
@@ -481,8 +588,99 @@ class TestParseSlackWebhookBody:
         assert payload.kind == "view_closed"
         assert payload.enterprise_id == "E123"
         assert payload.team_id is None
+        assert payload.user == SlackUser(id="U123")
         assert payload.user_id == "U123"
         assert payload.view == {"id": "V123"}
+
+    def test_infers_file_types_from_mimetype(self):
+        """``inferFileType`` (parse.ts:368) maps the mimetype prefix to a
+        coarse media kind, defaulting to ``file`` when absent/unknown."""
+        event_files = [
+            {"id": "F1", "mimetype": "image/png"},
+            {"id": "F2", "mimetype": "video/mp4"},
+            {"id": "F3", "mimetype": "audio/mpeg"},
+            {"id": "F4", "mimetype": "application/pdf"},
+            {"id": "F5"},
+        ]
+        payload = parse_slack_webhook_body(
+            json.dumps(
+                {
+                    "event": {
+                        "channel": "C123",
+                        "files": event_files,
+                        "text": "see attached",
+                        "ts": "1710000000.000002",
+                        "type": "app_mention",
+                        "user": "U123",
+                    },
+                    "type": "event_callback",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert [f.type for f in payload.files] == ["image", "video", "audio", "file", "file"]
+
+    def test_files_default_to_empty_list_when_absent(self):
+        payload = parse_slack_webhook_body(
+            json.dumps(
+                {
+                    "event": {
+                        "channel": "C123",
+                        "text": "hello",
+                        "ts": "1710000000.000002",
+                        "type": "app_mention",
+                        "user": "U123",
+                    },
+                    "type": "event_callback",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert payload.files == []
+
+    def test_view_values_surface_selected_option_for_select_inputs(self):
+        """parseViewValues (parse.ts:411) extracts the selected option's
+        label/value for static-select inputs."""
+        raw = {
+            "team": {"id": "T123"},
+            "type": "view_submission",
+            "user": {"id": "U123"},
+            "view": {
+                "id": "V123",
+                "state": {
+                    "values": {
+                        "priority_block": {
+                            "priority": {
+                                "type": "static_select",
+                                "selected_option": {
+                                    "text": {"text": "High", "type": "plain_text"},
+                                    "value": "high",
+                                },
+                            }
+                        }
+                    }
+                },
+            },
+        }
+
+        payload = parse_slack_webhook_body(
+            urlencode({"payload": json.dumps(raw)}),
+            content_type="application/x-www-form-urlencoded",
+        )
+
+        assert payload.values == [
+            SlackViewStateValue(
+                action_id="priority",
+                block_id="priority_block",
+                raw=payload.values[0].raw,
+                selected_option_label="High",
+                selected_option_value="high",
+                type="static_select",
+                value=None,
+            )
+        ]
 
     def test_returns_unsupported_for_valid_but_unsupported_payloads(self):
         payload = parse_slack_webhook_body(

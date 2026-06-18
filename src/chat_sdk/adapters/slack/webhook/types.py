@@ -63,6 +63,32 @@ class SlackContinuation:
 
 
 @dataclass
+class SlackUser:
+    """The acting Slack user attached to interactive payloads."""
+
+    id: str
+    name: str | None = None
+    team_id: str | None = None
+    username: str | None = None
+
+
+@dataclass
+class SlackFile:
+    """A file shared on a message-like Events API callback."""
+
+    id: str
+    raw: dict[str, Any]
+    type: Literal["audio", "file", "image", "video"]
+    download_url: str | None = None
+    filetype: str | None = None
+    mime_type: str | None = None
+    name: str | None = None
+    size: float | None = None
+    title: str | None = None
+    url: str | None = None
+
+
+@dataclass
 class SlackUrlVerificationPayload:
     """Slack ``url_verification`` handshake payload."""
 
@@ -86,6 +112,7 @@ class _SlackEventBasePayload:
     enterprise_id: str | None = None
     event_id: str | None = None
     event_time: float | None = None
+    files: list[SlackFile] | None = None
     is_ext_shared_channel: bool | None = None
     retry: SlackRetry | None = None
     team_id: str | None = None
@@ -139,7 +166,9 @@ class SlackAction:
     type: str
     block_id: str | None = None
     label: str | None = None
+    selected_option_label: str | None = None
     selected_option_value: str | None = None
+    user: SlackUser | None = None
     value: str | None = None
 
 
@@ -154,12 +183,16 @@ class SlackBlockActionsPayload:
     continuation: SlackContinuation | None = None
     enterprise_id: str | None = None
     is_enterprise_install: bool | None = None
+    message_blocks: list[Any] | None = None
+    message_prompt_block: Any | None = None
+    message_prompt_text: str | None = None
     message_ts: str | None = None
     response_url: str | None = None
     retry: SlackRetry | None = None
     team_id: str | None = None
     thread_ts: str | None = None
     trigger_id: str | None = None
+    user: SlackUser | None = None
     user_name: str | None = None
     kind: Literal["block_actions"] = "block_actions"
 
@@ -181,16 +214,33 @@ class SlackBlockSuggestionPayload:
 
 
 @dataclass
+class SlackViewStateValue:
+    """A single resolved value inside a view's ``state.values`` map."""
+
+    action_id: str
+    block_id: str
+    raw: dict[str, Any]
+    selected_option_label: str | None = None
+    selected_option_value: str | None = None
+    type: str | None = None
+    value: str | None = None
+
+
+@dataclass
 class SlackViewSubmissionPayload:
     """A ``view_submission`` interactive payload."""
 
     raw: dict[str, Any]
     user_id: str
     view: dict[str, Any]
+    callback_id: str | None = None
     enterprise_id: str | None = None
+    private_metadata: str | None = None
     response_urls: list[Any] | None = None
     retry: SlackRetry | None = None
     team_id: str | None = None
+    user: SlackUser | None = None
+    values: list[SlackViewStateValue] | None = None
     kind: Literal["view_submission"] = "view_submission"
 
 
@@ -204,6 +254,7 @@ class SlackViewClosedPayload:
     enterprise_id: str | None = None
     retry: SlackRetry | None = None
     team_id: str | None = None
+    user: SlackUser | None = None
     kind: Literal["view_closed"] = "view_closed"
 
 
