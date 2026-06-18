@@ -387,6 +387,46 @@ class TestStreaming:
         # Local accumulator wins because the adapter didn't override.
         assert result.text == "Hello world"
 
+    # it("should fall back when adapter.stream returns null")
+    @pytest.mark.asyncio
+    async def test_should_fall_back_when_adapterstream_returns_null(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        mock_stream = AsyncMock(return_value=None)
+        adapter.stream = mock_stream  # type: ignore[attr-defined]
+
+        thread = _make_thread(adapter, state)
+        text_stream = _create_text_stream(["Hello", " ", "World"])
+        await thread.post(text_stream)
+
+        # The adapter was offered the stream first...
+        mock_stream.assert_called_once()
+        call_args = mock_stream.call_args
+        assert call_args.args[0] == "slack:C123:1234.5678"
+        options = call_args.args[2]
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
+        # asserts ``objectContaining({ updateIntervalMs: 500 })`` here
+        # because thread.ts (vercel/chat#340) seeds the thread-level
+        # default into the StreamOptions handed to ``adapter.stream``. We
+        # intentionally leave ``update_interval_ms`` as ``None`` unless
+        # caller-supplied: the hand-rolled Teams native streaming path
+        # treats any non-``None`` value as a caller override of its 1500ms
+        # quota-protecting emit throttle, so the seed would silently drop
+        # Teams DM throttling to the 500ms thread default. If this
+        # assertion fails because seeding was added, reconcile
+        # ``TeamsAdapter._resolve_emit_interval`` first.
+        assert options.update_interval_ms is None
+
+        # ...and returning None delegated to the built-in post+edit
+        # fallback: placeholder posted, then edited with the full text.
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "...")
+        last_edit = adapter._edit_calls[-1]
+        assert last_edit[0] == "slack:C123:1234.5678"
+        assert last_edit[1] == "msg-1"
+        assert isinstance(last_edit[2], PostableMarkdown)
+        assert last_edit[2].markdown == "Hello World"
+
     # it("should fall back to post+edit when adapter has no native streaming")
     @pytest.mark.asyncio
     async def test_should_fall_back_to_postedit_when_adapter_has_no_native_streaming(self):

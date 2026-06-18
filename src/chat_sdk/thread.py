@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -690,7 +690,22 @@ class ThreadImpl:
         # Build text-only stream from raw_stream
         text_stream = _from_full_stream(raw_stream)
 
-        # Build streaming options from current message context
+        # Build streaming options from current message context.
+        #
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
+        # (vercel/chat#340) seeds ``updateIntervalMs`` with the thread-level
+        # default (``this._streamingUpdateIntervalMs``) before spreading
+        # caller options, so adapters always see a concrete interval. We
+        # deliberately leave ``update_interval_ms`` as ``None`` unless the
+        # caller supplied one: the hand-rolled Teams native streaming path
+        # treats any non-``None`` value as a caller override of its 1500ms
+        # quota-protecting emit throttle (upstream's Teams adapter ignores
+        # the field entirely, so the seed is harmless there). Adapters that
+        # consume the field apply their own default when it is ``None``
+        # (Telegram: ``TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS``), and
+        # ``_fallback_stream`` already falls back to
+        # ``self._streaming_update_interval_ms`` — same observable behavior
+        # as upstream's seed for the fallback path.
         options = StreamOptions()
         if self._current_message is not None:
             options.recipient_user_id = self._current_message.author.user_id
@@ -715,7 +730,7 @@ class ThreadImpl:
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
-            async def _wrapped_stream() -> AsyncIterator[str | StreamChunk]:
+            async def _wrapped_stream() -> AsyncGenerator[str | StreamChunk, None]:
                 nonlocal accumulated
                 async for chunk in text_stream:
                     if isinstance(chunk, str):
@@ -726,27 +741,38 @@ class ThreadImpl:
                         accumulated += chunk.text
                     yield chunk
 
-            raw_result = await self.adapter.stream(self._id, _wrapped_stream(), options)  # type: ignore[union-attr]
-            # Adapters can override the recorded text via the optional
-            # ``text`` field on ``RawMessage`` when their internal state
-            # (cancellation, throttling, partial commits) makes the local
-            # ``accumulated`` buffer diverge from what the platform
-            # actually accepted. Default ``None`` falls back to the local
-            # buffer — backward-compatible for adapters that don't need
-            # the override (Slack, Discord, GitHub, Google Chat,
-            # Telegram, Linear, WhatsApp). The Teams native streaming
-            # path sets it on cancellation to short-circuit the buffered
-            # suffix that was coalesced into the throttle window but
-            # never emitted.
-            recorded_text = raw_result.text if raw_result.text is not None else accumulated
-            sent = self._create_sent_message(
-                raw_result.id,
-                PostableMarkdown(markdown=recorded_text),
-                raw_result.thread_id,
-            )
-            if self._thread_history is not None:
-                await self._thread_history.append(self._id, _to_message(sent))
-            return sent
+            wrapped_stream = _wrapped_stream()
+            raw_result = await self.adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
+            if raw_result is not None:
+                # Adapters can override the recorded text via the optional
+                # ``text`` field on ``RawMessage`` when their internal state
+                # (cancellation, throttling, partial commits) makes the local
+                # ``accumulated`` buffer diverge from what the platform
+                # actually accepted. Default ``None`` falls back to the local
+                # buffer — backward-compatible for adapters that don't need
+                # the override (Slack, Discord, GitHub, Google Chat,
+                # Telegram, Linear, WhatsApp). The Teams native streaming
+                # path sets it on cancellation to short-circuit the buffered
+                # suffix that was coalesced into the throttle window but
+                # never emitted.
+                recorded_text = raw_result.text if raw_result.text is not None else accumulated
+                sent = self._create_sent_message(
+                    raw_result.id,
+                    PostableMarkdown(markdown=recorded_text),
+                    raw_result.thread_id,
+                )
+                if self._thread_history is not None:
+                    await self._thread_history.append(self._id, _to_message(sent))
+                return sent
+            # ``None`` means the adapter delegated back to the SDK's built-in
+            # post+edit fallback for this thread (vercel/chat#340 — e.g. the
+            # Telegram adapter only natively streams DMs). The contract
+            # requires adapters to return ``None`` BEFORE consuming any
+            # chunks, so ``text_stream`` is still fully intact for the
+            # fallback below. Close the unused wrapper so a partially
+            # consumed generator (contract violation) is never left
+            # suspended awaiting GC finalization.
+            await wrapped_stream.aclose()
 
         # Fallback: post + edit with throttling (text-only)
         async def _text_only_stream() -> AsyncIterator[str]:
