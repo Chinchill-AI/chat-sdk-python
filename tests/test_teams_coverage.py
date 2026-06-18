@@ -8,7 +8,7 @@ Covers:
 - _get_access_token (token endpoint call)
 - _get_graph_token
 - _validate_service_url (allowed/disallowed patterns)
-- _verify_bot_framework_token (JWT verification with mock JWKS)
+- inbound JWT validation enforced by the Microsoft Teams SDK (TestSdkInboundAuth)
 - postMessage with Adaptive Card
 - editMessage
 - deleteMessage
@@ -44,12 +44,23 @@ from chat_sdk.shared.errors import (
 
 @pytest.fixture(autouse=True)
 def _skip_teams_jwt(monkeypatch):
-    """Bypass JWT verification in unit tests."""
-    monkeypatch.setattr(
-        TeamsAdapter,
-        "_verify_bot_framework_token",
-        AsyncMock(return_value=None),
-    )
+    """Bypass inbound JWT validation in unit tests (no real Bot Framework tokens).
+
+    Inbound auth now lives in the Microsoft Teams SDK ``App`` (issue #93 PR 1):
+    the ``BridgeHttpAdapter`` dispatches webhooks through the SDK's
+    ``HttpServer``, which validates the Bearer token. We force the SDK's own
+    ``skip_auth`` flag on so the bridge → SDK → handler path runs without a
+    signed token. ``TestSdkInboundAuth`` asserts the SDK rejects
+    unauthenticated requests when this bypass is absent.
+    """
+    from microsoft_teams.apps.http.http_server import HttpServer
+
+    real_initialize = HttpServer.initialize
+
+    def _initialize_skip_auth(self, credentials=None, skip_auth=False, cloud=None):
+        return real_initialize(self, credentials=credentials, skip_auth=True, cloud=cloud)
+
+    monkeypatch.setattr(HttpServer, "initialize", _initialize_skip_auth)
 
 
 def _make_adapter(**overrides) -> TeamsAdapter:
@@ -587,19 +598,27 @@ class TestCacheUserContext:
 
 
 # ---------------------------------------------------------------------------
-# _verify_bot_framework_token (without autouse fixture)
+# Inbound JWT validation is now enforced by the Microsoft Teams SDK
+# (issue #93 PR 1). These tests run WITHOUT the skip-auth bypass to assert the
+# SDK actually rejects unauthenticated / unconfigured webhooks.
 # ---------------------------------------------------------------------------
 
 
-class TestVerifyBotFrameworkToken:
+class TestSdkInboundAuth:
+    @pytest.fixture(autouse=True)
+    def _skip_teams_jwt(self):
+        """Override the module-level skip-auth bypass — these tests need the
+        SDK's real JWT enforcement so they can assert it rejects requests."""
+        yield
+
     async def test_webhook_rejects_when_no_app_id(self):
-        """When app_id is empty, webhook should reject."""
+        """No credentials configured: the SDK rejects every inbound request."""
         adapter = TeamsAdapter(TeamsAdapterConfig(app_id="", app_password="test"))
         chat = _make_mock_chat()
         await adapter.initialize(chat)
 
         class FakeReq:
-            headers = {}
+            headers: dict[str, str] = {}
 
             async def text(self):
                 return "{}"
@@ -610,6 +629,68 @@ class TestVerifyBotFrameworkToken:
 
         response = await adapter.handle_webhook(FakeReq())
         assert response["status"] == 401
+
+    async def test_webhook_rejects_missing_bearer_token(self):
+        """Credentials configured but no Bearer token: the SDK responds 401."""
+        adapter = TeamsAdapter(TeamsAdapterConfig(app_id="test-app-id", app_password="secret"))
+        chat = _make_mock_chat()
+        await adapter.initialize(chat)
+
+        activity = {
+            "type": "message",
+            "id": "m1",
+            "from": {"id": "u1"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+
+        class FakeReq:
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self._body = json.dumps(activity)
+
+            async def text(self):
+                return self._body
+
+            @property
+            def data(self):
+                return self._body.encode("utf-8")
+
+        response = await adapter.handle_webhook(FakeReq())
+        assert response["status"] == 401
+        # The SDK validated auth before reaching any chat handler.
+        assert not chat.process_message.called
+
+    async def test_webhook_rejects_invalid_bearer_token(self):
+        """A malformed Bearer token fails SDK signature validation → 401."""
+        adapter = TeamsAdapter(TeamsAdapterConfig(app_id="test-app-id", app_password="secret"))
+        chat = _make_mock_chat()
+        await adapter.initialize(chat)
+
+        activity = {
+            "type": "message",
+            "id": "m1",
+            "from": {"id": "u1"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        }
+
+        class FakeReq:
+            def __init__(self) -> None:
+                self._body = json.dumps(activity)
+                self.headers = {"Authorization": "Bearer not.a.real.jwt"}
+
+            async def text(self):
+                return self._body
+
+            @property
+            def data(self):
+                return self._body.encode("utf-8")
+
+        response = await adapter.handle_webhook(FakeReq())
+        assert response["status"] == 401
+        assert not chat.process_message.called
 
 
 # ---------------------------------------------------------------------------
@@ -1146,126 +1227,9 @@ class TestExtractCardTitle:
         assert adapter._extract_card_title({"body": "not a list"}) is None
 
 
-# ---------------------------------------------------------------------------
-# _get_request_body edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestGetRequestBody:
-    async def test_body_callable_with_read(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            class body:
-                @staticmethod
-                def read():
-                    return b"hello"
-
-            body = body()  # noqa: E731
-            body.read = staticmethod(lambda: b"hello")
-
-        class SimpleReq:
-            body = b"raw bytes"
-
-        result = await adapter._get_request_body(SimpleReq())
-        assert result == "raw bytes"
-
-    async def test_text_callable(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            async def text(self):
-                return "text content"
-
-        result = await adapter._get_request_body(FakeReq())
-        assert result == "text content"
-
-    async def test_text_attribute(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            text = "static text"
-
-        result = await adapter._get_request_body(FakeReq())
-        assert result == "static text"
-
-    async def test_data_attribute(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            data = b"byte data"
-
-        result = await adapter._get_request_body(FakeReq())
-        assert result == "byte data"
-
-    async def test_empty_request(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            pass
-
-        result = await adapter._get_request_body(FakeReq())
-        assert result == ""
-
-
-# ---------------------------------------------------------------------------
-# _get_header edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestGetHeader:
-    def test_dict_headers_title_case(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            headers = {"Authorization": "Bearer token"}
-
-        result = adapter._get_header(FakeReq(), "authorization")
-        # dict.get falls back to title-case key "Authorization"
-        assert result == "Bearer token"
-
-    def test_no_headers_attribute(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeReq:
-            pass
-
-        assert adapter._get_header(FakeReq(), "x-test") is None
-
-    def test_headers_with_get_method(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        class FakeHeaders:
-            def get(self, name):
-                if name == "authorization":
-                    return "Bearer abc"
-                return None
-
-        class FakeReq:
-            headers = FakeHeaders()
-
-        result = adapter._get_header(FakeReq(), "authorization")
-        assert result == "Bearer abc"
-
-
-# ---------------------------------------------------------------------------
-# _make_response / _make_json_response
-# ---------------------------------------------------------------------------
-
-
-class TestMakeResponses:
-    def test_make_response(self):
-        adapter = _make_adapter()
-        r = adapter._make_response("OK", 200)
-        assert r["body"] == "OK"
-        assert r["status"] == 200
-        assert r["headers"]["Content-Type"] == "text/plain"
-
-    def test_make_json_response(self):
-        adapter = _make_adapter()
-        r = adapter._make_json_response('{"ok":true}', 200)
-        assert r["body"] == '{"ok":true}'
-        assert r["headers"]["Content-Type"] == "application/json"
+# Request-body / header extraction and response shaping moved to
+# ``BridgeHttpAdapter`` (issue #93 PR 1); those paths are covered by
+# tests/test_teams_bridge.py.
 
 
 # ---------------------------------------------------------------------------

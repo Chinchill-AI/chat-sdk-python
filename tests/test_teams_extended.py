@@ -27,6 +27,7 @@ from chat_sdk.adapters.teams.adapter import (
     MESSAGEID_STRIP_PATTERN,
     TeamsAdapter,
     _handle_teams_error,
+    _to_app_options,
 )
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
@@ -48,12 +49,24 @@ from chat_sdk.shared.errors import (
 
 @pytest.fixture(autouse=True)
 def _skip_teams_jwt(monkeypatch):
-    """Bypass JWT verification in unit tests (no real Bot Framework tokens)."""
-    monkeypatch.setattr(
-        TeamsAdapter,
-        "_verify_bot_framework_token",
-        AsyncMock(return_value=None),
-    )
+    """Bypass inbound JWT validation in unit tests (no real Bot Framework tokens).
+
+    Inbound auth now lives in the Microsoft Teams SDK ``App`` (issue #93 PR 1):
+    the ``BridgeHttpAdapter`` dispatches webhooks through the SDK's
+    ``HttpServer``, which validates the Bearer token via its ``TokenValidator``.
+    Unit tests don't carry signed tokens, so we force the SDK's own
+    ``skip_auth`` flag on — exercising the real bridge → SDK → handler dispatch
+    path while bypassing signature checks. The dedicated auth tests assert the
+    SDK *does* reject unauthenticated requests when this is not applied.
+    """
+    from microsoft_teams.apps.http.http_server import HttpServer
+
+    real_initialize = HttpServer.initialize
+
+    def _initialize_skip_auth(self, credentials=None, skip_auth=False, cloud=None):
+        return real_initialize(self, credentials=credentials, skip_auth=True, cloud=cloud)
+
+    monkeypatch.setattr(HttpServer, "initialize", _initialize_skip_auth)
 
 
 def _make_adapter(**overrides) -> TeamsAdapter:
@@ -388,6 +401,115 @@ class TestErrorHandling:
             _handle_teams_error(
                 {"innerHttpError": {"statusCode": 401}, "message": "inner auth fail"},
                 "postMessage",
+            )
+
+
+class _FakeSdkHttpError(Exception):
+    """Stand-in for a Microsoft Teams SDK ``HttpError`` (status on attributes)."""
+
+    def __init__(self, message="sdk error", status_code=None, retry_after=None, inner_http_error=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.inner_http_error = inner_http_error
+
+
+class TestHandleTeamsErrorSdkExceptions:
+    """``_handle_teams_error`` must map SDK exception objects (status on
+    attributes), not just the plain dicts the hand-rolled Graph path raises."""
+
+    def test_sdk_exception_401_maps_to_auth_error(self):
+        with pytest.raises(AuthenticationError):
+            _handle_teams_error(_FakeSdkHttpError("nope", status_code=401), "postMessage")
+
+    def test_sdk_exception_403_maps_to_permission_error(self):
+        with pytest.raises(AdapterPermissionError):
+            _handle_teams_error(_FakeSdkHttpError("forbidden", status_code=403), "postMessage")
+
+    def test_sdk_exception_404_maps_to_network_error(self):
+        with pytest.raises(NetworkError, match="not found"):
+            _handle_teams_error(_FakeSdkHttpError("missing", status_code=404), "postMessage")
+
+    def test_sdk_exception_429_carries_retry_after(self):
+        with pytest.raises(AdapterRateLimitError) as exc_info:
+            _handle_teams_error(_FakeSdkHttpError("slow down", status_code=429, retry_after=12), "postMessage")
+        assert exc_info.value.retry_after == 12
+
+    def test_sdk_exception_inner_http_error_status(self):
+        inner = _FakeSdkHttpError("inner", status_code=401)
+        with pytest.raises(AuthenticationError):
+            _handle_teams_error(_FakeSdkHttpError("outer", inner_http_error=inner), "postMessage")
+
+    def test_sdk_exception_permission_keyword_in_message(self):
+        with pytest.raises(AdapterPermissionError):
+            _handle_teams_error(_FakeSdkHttpError("Permission required for resource"), "postMessage")
+
+    def test_sdk_exception_without_status_falls_back_to_network_error(self):
+        with pytest.raises(NetworkError, match="generic sdk failure"):
+            _handle_teams_error(_FakeSdkHttpError("generic sdk failure"), "postMessage")
+
+
+# ---------------------------------------------------------------------------
+# Config conversion (toAppOptions port)
+# ---------------------------------------------------------------------------
+
+
+class TestToAppOptions:
+    def test_client_secret_auth(self):
+        opts = _to_app_options(TeamsAdapterConfig(app_id="app-1", app_password="secret-1", app_tenant_id="tenant-1"))
+        assert opts["client_id"] == "app-1"
+        assert opts["client_secret"] == "secret-1"
+        assert opts["tenant_id"] == "tenant-1"
+        assert "managed_identity_client_id" not in opts
+
+    def test_multitenant_omits_tenant_id(self):
+        opts = _to_app_options(
+            TeamsAdapterConfig(
+                app_id="app-1", app_password="secret-1", app_tenant_id="tenant-1", app_type="MultiTenant"
+            )
+        )
+        assert "tenant_id" not in opts
+
+    def test_federated_omits_secret_and_sets_managed_identity(self):
+        opts = _to_app_options(
+            TeamsAdapterConfig(
+                app_id="app-1",
+                app_password="should-be-ignored",
+                app_tenant_id="tenant-1",
+                federated={"client_id": "mi-client-1"},
+            )
+        )
+        assert "client_secret" not in opts
+        assert opts["managed_identity_client_id"] == "mi-client-1"
+
+    def test_federated_client_audience_logs_warning(self):
+        logger = MagicMock(warn=MagicMock())
+        _to_app_options(
+            TeamsAdapterConfig(
+                app_id="app-1",
+                app_tenant_id="tenant-1",
+                federated={"client_id": "mi-1", "client_audience": "api://AzureADTokenExchange"},
+                logger=logger,
+            )
+        )
+        assert logger.warn.called
+
+    def test_env_var_fallbacks(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_APP_ID", "env-app")
+        monkeypatch.setenv("TEAMS_APP_PASSWORD", "env-secret")
+        monkeypatch.setenv("TEAMS_APP_TENANT_ID", "env-tenant")
+        opts = _to_app_options(TeamsAdapterConfig())
+        assert opts["client_id"] == "env-app"
+        assert opts["client_secret"] == "env-secret"
+        assert opts["tenant_id"] == "env-tenant"
+
+    def test_certificate_rejected(self):
+        with pytest.raises(ValidationError):
+            _to_app_options(
+                TeamsAdapterConfig(
+                    app_id="app-1",
+                    certificate=TeamsAuthCertificate(certificate_private_key="key"),
+                )
             )
 
 

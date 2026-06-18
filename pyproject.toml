@@ -52,7 +52,14 @@ redis = ["redis>=5.0"]
 postgres = ["asyncpg>=0.29"]
 crypto = ["cryptography>=42.0"]
 discord = ["pynacl>=1.5", "aiohttp>=3.9"]
-teams = ["aiohttp>=3.9"]
+teams = [
+    "aiohttp>=3.9",
+    # Official Microsoft Teams Apps Python SDK (issue #93 migration; mirrors upstream
+    # adapter-teams@4.30.0's @microsoft/teams.* deps). Graph stays hand-rolled (no [graph] extra).
+    "microsoft-teams-apps>=2.0.13",
+    "microsoft-teams-api>=2.0.13",
+    "microsoft-teams-cards>=2.0.13",
+]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
 messenger = ["aiohttp>=3.9"]
@@ -68,6 +75,9 @@ all = [
     "pynacl>=1.5",
     "aiohttp>=3.9",
     "google-auth>=2.0",
+    "microsoft-teams-apps>=2.0.13",
+    "microsoft-teams-api>=2.0.13",
+    "microsoft-teams-cards>=2.0.13",
 ]
 
 [build-system]
@@ -123,6 +133,11 @@ dev = [
     "pyjwt[crypto]>=2.8",
     "ruff>=0.4.0",
     "pyrefly==0.61.1",
+    # Teams adapter SDK (issue #93) — in dev so CI (`uv sync --group dev`) installs it
+    # and the Teams test suite runs; matches how the other optional adapter deps are wired.
+    "microsoft-teams-apps>=2.0.13",
+    "microsoft-teams-api>=2.0.13",
+    "microsoft-teams-cards>=2.0.13",
 ]
 
 # ---------------------------------------------------------------------------
@@ -166,6 +181,9 @@ replace-imports-with-any = [
     # GitHub App auth
     "jwt",
     "jwt.*",
+    # Teams — official MS Teams Apps SDK (optional teams extra)
+    "microsoft_teams",
+    "microsoft_teams.*",
 ]
 
 [tool.pyrefly.errors]
