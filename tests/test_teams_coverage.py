@@ -81,6 +81,50 @@ def _make_logger():
     )
 
 
+class _SentActivity:
+    """Stand-in for the SDK ``SentActivity`` returned by ``app.send`` — only the
+    ``.id`` attribute is read by the adapter."""
+
+    def __init__(self, id: str):
+        self.id = id
+
+
+def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
+    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+
+    The migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    """
+    send = AsyncMock(return_value=_SentActivity(sent_id))
+    adapter._app.send = send  # type: ignore[method-assign]
+    return send
+
+
+def _mock_app_activities(
+    adapter: TeamsAdapter,
+    *,
+    update_id: str = "edit-msg-1",
+    update_side_effect: Any = None,
+    delete_side_effect: Any = None,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Replace ``adapter._app.api`` so ``conversations.activities(id)`` returns a
+    stub exposing ``update``/``delete`` AsyncMocks (edit/delete delegation).
+
+    Returns ``(update_mock, delete_mock)``.
+    """
+    update = AsyncMock(
+        return_value=None if update_side_effect else _SentActivity(update_id),
+        side_effect=update_side_effect,
+    )
+    delete = AsyncMock(return_value=None, side_effect=delete_side_effect)
+    ops = MagicMock()
+    ops.update = update
+    ops.delete = delete
+    api = MagicMock()
+    api.conversations.activities = MagicMock(return_value=ops)
+    adapter._app.api = api  # type: ignore[method-assign]
+    return update, delete
+
+
 def _make_mock_state() -> MagicMock:
     cache: dict[str, Any] = {}
     state = MagicMock()
@@ -254,9 +298,9 @@ class TestGetAccessToken:
 class TestGetGraphToken:
     async def test_fetches_graph_token(self):
         adapter = _make_adapter(logger=_make_logger())
-        # Reset any cached token
-        adapter._access_token = None
-        adapter._token_expiry = 0
+        # Reset any cached Graph token (dedicated field — never the BF token)
+        adapter._graph_token = None
+        adapter._graph_token_expiry = 0
 
         mock_session = _MockSession(
             default_response=_mock_aiohttp_response(
@@ -273,13 +317,99 @@ class TestGetGraphToken:
 
     async def test_graph_token_error_raises(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._access_token = None
-        adapter._token_expiry = 0
+        adapter._graph_token = None
+        adapter._graph_token_expiry = 0
 
         mock_session = _MockSession(default_response=_mock_aiohttp_response({"error": "failed"}, status=400))
 
         with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(AuthenticationError):
             await adapter._get_graph_token()
+
+
+# ---------------------------------------------------------------------------
+# Token-cache isolation regression (issue #93)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenCacheIsolation:
+    """The Bot Framework token (``_get_access_token``, scope
+    ``api.botframework.com``) and the Graph token (``_get_graph_token``, scope
+    ``graph.microsoft.com``) must use SEPARATE cache fields.
+
+    Before the untangle they shared ``_access_token`` / ``_token_expiry``, so
+    whichever was fetched last clobbered the other — a Graph read could then
+    ship a Bot Framework token (and vice versa). These tests lock in the fix.
+    """
+
+    @staticmethod
+    def _scope_routed_session() -> _MockSession:
+        """An aiohttp session whose token endpoint returns a DIFFERENT token per
+        requested OAuth scope, so a cross-scope cache hit is observable."""
+        bf_resp = _mock_aiohttp_response({"access_token": "bf-token", "expires_in": 3600})
+        graph_resp = _mock_aiohttp_response({"access_token": "graph-token", "expires_in": 3600})
+        session = _MockSession()
+        original_post = session.post
+
+        def routed_post(url, **kwargs):
+            scope = (kwargs.get("data") or {}).get("scope", "")
+            if "graph.microsoft.com" in scope:
+                return session._make_cm(graph_resp)
+            if "botframework.com" in scope:
+                return session._make_cm(bf_resp)
+            return original_post(url, **kwargs)
+
+        session.post = routed_post
+        return session
+
+    async def test_graph_and_bot_framework_tokens_do_not_collide(self):
+        adapter = _make_adapter(logger=_make_logger())
+        session = self._scope_routed_session()
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            # Fetch Graph first, then Bot Framework, then Graph again. If the two
+            # shared one cache slot, the second/third call would return the
+            # clobbered (wrong-scope) token from cache.
+            graph1 = await adapter._get_graph_token()
+            bf1 = await adapter._get_access_token()
+            graph2 = await adapter._get_graph_token()
+            bf2 = await adapter._get_access_token()
+
+        assert graph1 == "graph-token"
+        assert bf1 == "bf-token"
+        # cache hits return the correct per-scope token, not the other scope's
+        assert graph2 == "graph-token"
+        assert bf2 == "bf-token"
+
+    async def test_tokens_cached_on_separate_fields(self):
+        adapter = _make_adapter(logger=_make_logger())
+        session = self._scope_routed_session()
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            await adapter._get_graph_token()
+            await adapter._get_access_token()
+
+        # each token lives on its OWN field — neither clobbered the other
+        assert adapter._graph_token == "graph-token"
+        assert adapter._access_token == "bf-token"
+        assert adapter._graph_token_expiry > 0
+        assert adapter._token_expiry > 0
+
+    async def test_bot_framework_cache_does_not_satisfy_graph(self):
+        """A warm Bot Framework cache must NOT short-circuit a Graph fetch —
+        the regression that motivated the split. Pre-warm the BF token, then
+        request a Graph token and assert it fetches its own scoped token."""
+        adapter = _make_adapter(logger=_make_logger())
+        session = self._scope_routed_session()
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            bf = await adapter._get_access_token()
+            assert bf == "bf-token"
+            # BF cache is warm; Graph must still fetch its own scoped token
+            graph = await adapter._get_graph_token()
+
+        assert graph == "graph-token"
+        # the warm BF cache was untouched by the Graph fetch
+        assert adapter._access_token == "bf-token"
 
 
 # ---------------------------------------------------------------------------
@@ -694,14 +824,14 @@ class TestSdkInboundAuth:
 
 
 # ---------------------------------------------------------------------------
-# postMessage / editMessage / deleteMessage / startTyping via HTTP
+# postMessage / editMessage / deleteMessage / startTyping via the SDK
 # ---------------------------------------------------------------------------
 
 
-class TestTeamsHTTPOperations:
+class TestTeamsSDKOperations:
     async def test_post_message_with_adaptive_card(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "card-msg-1"})
+        send = _mock_app_send(adapter, "card-msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -719,13 +849,15 @@ class TestTeamsHTTPOperations:
             },
         )
         assert result.id == "card-msg-1"
-        call_args = adapter._teams_send.call_args[0][1]
-        assert call_args["type"] == "message"
-        assert call_args["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
+        # SDK App.send received a MessageActivityInput carrying the adaptive card
+        activity = send.call_args.args[1]
+        dumped = activity.model_dump(by_alias=True, exclude_none=True)
+        assert dumped["type"] == "message"
+        assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
 
     async def test_post_message_text(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "text-msg-1"})
+        send = _mock_app_send(adapter, "text-msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -735,10 +867,12 @@ class TestTeamsHTTPOperations:
         )
         result = await adapter.post_message(tid, {"markdown": "Hello **world**"})
         assert result.id == "text-msg-1"
+        assert send.call_count == 1
 
     async def test_post_message_send_failure(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(side_effect=Exception("connection failed"))
+        send = _mock_app_send(adapter)
+        send.side_effect = Exception("connection failed")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -751,7 +885,7 @@ class TestTeamsHTTPOperations:
 
     async def test_edit_message(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_update = AsyncMock()
+        update, _delete = _mock_app_activities(adapter, update_id="msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -761,11 +895,12 @@ class TestTeamsHTTPOperations:
         )
         result = await adapter.edit_message(tid, "msg-1", {"markdown": "Updated"})
         assert result.id == "msg-1"
-        adapter._teams_update.assert_called_once()
+        update.assert_called_once()
+        assert update.call_args.args[0] == "msg-1"
 
     async def test_edit_message_with_card(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_update = AsyncMock()
+        update, _delete = _mock_app_activities(adapter, update_id="msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -784,10 +919,13 @@ class TestTeamsHTTPOperations:
             },
         )
         assert result.id == "msg-1"
+        activity = update.call_args.args[1]
+        dumped = activity.model_dump(by_alias=True, exclude_none=True)
+        assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
 
     async def test_delete_message(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_delete = AsyncMock()
+        _update, delete = _mock_app_activities(adapter)
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -796,11 +934,12 @@ class TestTeamsHTTPOperations:
             )
         )
         await adapter.delete_message(tid, "del-1")
-        assert adapter._teams_delete.call_count == 1
+        assert delete.call_count == 1
+        assert delete.call_args.args == ("del-1",)
 
     async def test_delete_message_failure(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_delete = AsyncMock(side_effect=Exception("delete failed"))
+        _update, _delete = _mock_app_activities(adapter, delete_side_effect=Exception("delete failed"))
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -813,7 +952,7 @@ class TestTeamsHTTPOperations:
 
     async def test_start_typing(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "t1", "type": "typing"})
+        send = _mock_app_send(adapter, "t1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -822,14 +961,15 @@ class TestTeamsHTTPOperations:
             )
         )
         await adapter.start_typing(tid)
-        adapter._teams_send.assert_called_once()
-        call_activity = adapter._teams_send.call_args[0][1]
-        assert call_activity["type"] == "typing"
+        send.assert_called_once()
+        activity = send.call_args.args[1]
+        assert activity.type == "typing"
 
     async def test_start_typing_failure_swallowed(self):
         """Typing failures should be logged but not re-raised."""
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(side_effect=Exception("typing error"))
+        send = _mock_app_send(adapter)
+        send.side_effect = Exception("typing error")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -843,7 +983,7 @@ class TestTeamsHTTPOperations:
 
 
 # ---------------------------------------------------------------------------
-# _teams_send / _teams_update / _teams_delete HTTP helpers
+# _teams_send HTTP helper (retained for the still-hand-rolled streaming path)
 # ---------------------------------------------------------------------------
 
 
@@ -1114,7 +1254,6 @@ class TestStream:
             return {"id": f"msg-{send_call_count}"}
 
         adapter._teams_send = mock_send
-        adapter._teams_update = AsyncMock()
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1136,7 +1275,6 @@ class TestStream:
     async def test_stream_string_chunks(self):
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "s1"})
-        adapter._teams_update = AsyncMock()
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1151,14 +1289,12 @@ class TestStream:
 
         result = await adapter.stream(tid, text_stream())
         assert "Hello World" in result.raw["text"]
-        # Group chat: single accumulate-and-post send, no edits.
+        # Group chat: single accumulate-and-post send (no per-chunk edits).
         assert adapter._teams_send.call_count == 1
-        assert adapter._teams_update.call_count == 0
 
     async def test_stream_empty_chunks_skipped(self):
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "s1"})
-        adapter._teams_update = AsyncMock()
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1233,7 +1369,7 @@ class TestExtractCardTitle:
 
 
 # ---------------------------------------------------------------------------
-# _teams_send / _teams_update / _teams_delete error paths
+# _teams_send error path (retained for the still-hand-rolled streaming path)
 # ---------------------------------------------------------------------------
 
 
@@ -1261,54 +1397,6 @@ class TestTeamsHTTPErrorPaths:
 
         with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
             await adapter._teams_send(decoded, {"type": "message"})
-
-    async def test_teams_update_non_ok_response(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
-        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
-
-        mock_session = _MockSession(default_response=error_resp)
-        original_post = mock_session.post
-
-        def routed_post(url, **kwargs):
-            if "oauth2" in url:
-                return mock_session._make_cm(token_resp)
-            return original_post(url, **kwargs)
-
-        mock_session.post = routed_post
-
-        decoded = TeamsThreadId(
-            conversation_id="19:abc@thread.tacv2",
-            service_url="https://smba.trafficmanager.net/teams/",
-        )
-
-        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
-            await adapter._teams_update(decoded, "msg-1", {"type": "message"})
-
-    async def test_teams_delete_non_ok_response(self):
-        adapter = _make_adapter(logger=_make_logger())
-
-        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
-        error_resp = _mock_aiohttp_response({"error": "bad"}, status=500)
-
-        mock_session = _MockSession(default_response=error_resp)
-        original_post = mock_session.post
-
-        def routed_post(url, **kwargs):
-            if "oauth2" in url:
-                return mock_session._make_cm(token_resp)
-            return original_post(url, **kwargs)
-
-        mock_session.post = routed_post
-
-        decoded = TeamsThreadId(
-            conversation_id="19:abc@thread.tacv2",
-            service_url="https://smba.trafficmanager.net/teams/",
-        )
-
-        with patch("aiohttp.ClientSession", return_value=mock_session), pytest.raises(NetworkError):
-            await adapter._teams_delete(decoded, "msg-1")
 
 
 # ---------------------------------------------------------------------------
@@ -1944,7 +2032,7 @@ class TestExtractTextFromGraphMessage:
 class TestEditMessageError:
     async def test_edit_message_update_failure(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_update = AsyncMock(side_effect=Exception("update failed"))
+        _mock_app_activities(adapter, update_side_effect=Exception("update failed"))
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -1964,7 +2052,8 @@ class TestEditMessageError:
 class TestPostMessageCardError:
     async def test_post_card_failure(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(side_effect=Exception("card send failed"))
+        send = _mock_app_send(adapter)
+        send.side_effect = Exception("card send failed")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(

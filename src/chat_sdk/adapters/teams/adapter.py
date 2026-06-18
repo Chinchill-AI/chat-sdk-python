@@ -356,8 +356,21 @@ class TeamsAdapter:
             )
 
         self._bot_user_id: str | None = self._app_id or None
+        # Bot Framework token cache (scope ``api.botframework.com``). Owned by
+        # ``_get_access_token`` and consumed only by the still-hand-rolled Bot
+        # Framework paths: native streaming (``_teams_send``, PR 3) and
+        # ``open_dm``. The SDK ``App`` mints its own Bot Framework token for the
+        # migrated outbound send/edit/delete/typing paths, so those no longer
+        # touch this field.
         self._access_token: str | None = None
         self._token_expiry: float = 0
+        # Microsoft Graph token cache (scope ``graph.microsoft.com``). Kept on
+        # DEDICATED fields so it can never collide with the Bot Framework token
+        # above — the two have different scopes, and sharing one cache caused
+        # last-writer-wins corruption (issue #93). Owned by ``_get_graph_token``
+        # and consumed only by the hand-rolled Graph reads.
+        self._graph_token: str | None = None
+        self._graph_token_expiry: float = 0
         self._token_lock = asyncio.Lock()
 
         # Microsoft Teams SDK ``App`` — owns inbound JWT validation and
@@ -1327,6 +1340,58 @@ class TeamsAdapter:
 
         return attachments
 
+    def _point_app_api_at(self, service_url: str) -> None:
+        """Aim the SDK ``App``'s Bot Framework client at ``service_url``.
+
+        The migrated outbound paths call ``self._app.send(...)`` and
+        ``self._app.api.conversations.activities(...)`` directly (parity with
+        upstream ``this.app.send`` / ``this.app.api.conversations``). The SDK
+        binds the App's :class:`ApiClient` to a single service URL at
+        construction, and ``app.send`` reads ``self.api.service_url`` into the
+        outgoing :class:`ConversationReference`. Our thread IDs encode a
+        per-thread service URL, so before each call we retarget the App's API
+        client — validating against the SSRF allow-list first, exactly as the
+        retired hand-rolled senders did.
+
+        The setter walks the real :class:`ApiClient`'s service-url chain
+        (the client itself, its ``conversations`` sub-client, and that
+        sub-client's ``activities_client``). It is defensive about test doubles
+        that replace ``self._app.api`` with a mock lacking those attributes —
+        an ``AttributeError`` there is harmless because the mock ignores the
+        service URL anyway.
+        """
+        _validate_service_url(service_url)
+        normalized = service_url.rstrip("/")
+        api = self._app.api
+        try:
+            api.service_url = normalized
+            conversations = api.conversations
+            conversations.service_url = normalized
+            conversations.activities_client.service_url = normalized
+        except AttributeError:
+            # ``self._app.api`` is a test double without the real client's
+            # service-url chain; nothing to retarget.
+            pass
+
+    @staticmethod
+    def _message_activity_input(payload: dict[str, Any]) -> Any:
+        """Build the SDK ``MessageActivityInput`` from our camelCase activity dict.
+
+        The dict we construct (``text`` / ``textFormat`` / ``attachments`` with
+        ``contentType`` / ``contentUrl`` / ``content`` / ``name`` keys) is the
+        Bot Framework wire shape, which matches the SDK input model's
+        serialization aliases — so ``model_validate`` round-trips it directly.
+        We keep building the dict (it is still returned as ``RawMessage.raw``,
+        preserving the public contract) and convert at the SDK boundary.
+
+        Upstream constructs a ``MessageActivity``; the Python SDK splits input
+        (``MessageActivityInput``) from output (``MessageActivity``) models and
+        ``app.send`` / ``activities.update`` accept only the input variant.
+        """
+        from microsoft_teams.api import MessageActivityInput
+
+        return MessageActivityInput.model_validate(payload)
+
     async def post_message(
         self,
         thread_id: str,
@@ -1361,8 +1426,16 @@ class TeamsAdapter:
             )
 
             try:
-                result = await self._teams_send(decoded, activity_payload)
-                return RawMessage(id=result.get("id", ""), thread_id=thread_id, raw=activity_payload)
+                self._point_app_api_at(decoded.service_url)
+                sent = await self._app.send(
+                    decoded.conversation_id,
+                    self._message_activity_input(activity_payload),
+                )
+                return RawMessage(
+                    id=getattr(sent, "id", "") or "",
+                    thread_id=thread_id,
+                    raw=activity_payload,
+                )
             except Exception as error:
                 self._logger.error(
                     "Teams API: send failed",
@@ -1371,10 +1444,7 @@ class TeamsAdapter:
                         "error": str(error),
                     },
                 )
-                error_dict: dict[str, Any] = {"message": str(error)}
-                if hasattr(error, "status"):
-                    error_dict["statusCode"] = error.status
-                _handle_teams_error(error_dict, "postMessage")
+                _handle_teams_error(error, "postMessage")
                 raise  # unreachable: _handle_teams_error always raises
 
         # Regular text message
@@ -1401,8 +1471,17 @@ class TeamsAdapter:
         )
 
         try:
-            result = await self._teams_send(decoded, activity_payload)
-            return RawMessage(id=result.get("id", ""), thread_id=thread_id, raw=activity_payload)
+            self._point_app_api_at(decoded.service_url)
+            sent = await self._app.send(
+                decoded.conversation_id,
+                self._message_activity_input(activity_payload),
+            )
+            self._logger.debug("Teams API: send response", {"messageId": getattr(sent, "id", None)})
+            return RawMessage(
+                id=getattr(sent, "id", "") or "",
+                thread_id=thread_id,
+                raw=activity_payload,
+            )
         except Exception as error:
             self._logger.error(
                 "Teams API: send failed",
@@ -1411,10 +1490,7 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            error_dict = {"message": str(error)}
-            if hasattr(error, "status"):
-                error_dict["statusCode"] = error.status
-            _handle_teams_error(error_dict, "postMessage")
+            _handle_teams_error(error, "postMessage")
             # Should not reach here due to _handle_teams_error always raising
             raise  # pragma: no cover
 
@@ -1467,7 +1543,11 @@ class TeamsAdapter:
         )
 
         try:
-            await self._teams_update(decoded, message_id, activity_payload)
+            self._point_app_api_at(decoded.service_url)
+            await self._app.api.conversations.activities(decoded.conversation_id).update(
+                message_id,
+                self._message_activity_input(activity_payload),
+            )
         except Exception as error:
             self._logger.error(
                 "Teams API: updateActivity failed",
@@ -1477,10 +1557,7 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            error_dict = {"message": str(error)}
-            if hasattr(error, "status"):
-                error_dict["statusCode"] = error.status
-            _handle_teams_error(error_dict, "editMessage")
+            _handle_teams_error(error, "editMessage")
             raise  # unreachable: _handle_teams_error always raises
 
         return RawMessage(id=message_id, thread_id=thread_id, raw=activity_payload)
@@ -1498,7 +1575,8 @@ class TeamsAdapter:
         )
 
         try:
-            await self._teams_delete(decoded, message_id)
+            self._point_app_api_at(decoded.service_url)
+            await self._app.api.conversations.activities(decoded.conversation_id).delete(message_id)
         except Exception as error:
             self._logger.error(
                 "Teams API: deleteActivity failed",
@@ -1508,10 +1586,7 @@ class TeamsAdapter:
                     "error": str(error),
                 },
             )
-            error_dict = {"message": str(error)}
-            if hasattr(error, "status"):
-                error_dict["statusCode"] = error.status
-            _handle_teams_error(error_dict, "deleteMessage")
+            _handle_teams_error(error, "deleteMessage")
             raise  # unreachable: _handle_teams_error always raises
 
     async def add_reaction(
@@ -1534,6 +1609,8 @@ class TeamsAdapter:
 
     async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Send typing indicator to a Teams conversation."""
+        from microsoft_teams.api import TypingActivityInput
+
         decoded = self.decode_thread_id(thread_id)
 
         self._logger.debug(
@@ -1544,7 +1621,8 @@ class TeamsAdapter:
         )
 
         try:
-            await self._teams_send(decoded, {"type": "typing"})
+            self._point_app_api_at(decoded.service_url)
+            await self._app.send(decoded.conversation_id, TypingActivityInput())
         except Exception as error:
             self._logger.error(
                 "Teams API: send (typing) failed",
@@ -2751,17 +2829,25 @@ class TeamsAdapter:
         return attachments
 
     async def _get_graph_token(self) -> str:
-        """Get a Microsoft Graph API access token (OAuth2 client credentials)."""
+        """Get a Microsoft Graph API access token (OAuth2 client credentials).
+
+        Caches on the DEDICATED ``_graph_token`` / ``_graph_token_expiry``
+        fields — never the Bot Framework ``_access_token`` field. The two
+        tokens carry different scopes (``graph.microsoft.com`` vs
+        ``api.botframework.com``); sharing one cache slot let whichever was
+        fetched last clobber the other, so a Graph read could end up sending a
+        Bot Framework token (and vice versa). See issue #93.
+        """
         import time as _time
 
         # Reuse cached token if valid
-        if self._access_token and _time.time() < self._token_expiry:
-            return self._access_token
+        if self._graph_token and _time.time() < self._graph_token_expiry:
+            return self._graph_token
 
         async with self._token_lock:
             # Double-check after acquiring lock to avoid redundant refreshes
-            if self._access_token and _time.time() < self._token_expiry:
-                return self._access_token
+            if self._graph_token and _time.time() < self._graph_token_expiry:
+                return self._graph_token
 
             tenant_id = self._app_tenant_id or "botframework.com"
             token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
@@ -2783,16 +2869,25 @@ class TeamsAdapter:
                         f"Failed to get Graph API token: {response.status} {error_text}",
                     )
                 data = await response.json()
-                self._access_token = data["access_token"]
-                self._token_expiry = _time.time() + data.get("expires_in", 3600) - 300
-                return self._access_token  # type: ignore[return-value]
+                self._graph_token = data["access_token"]
+                self._graph_token_expiry = _time.time() + data.get("expires_in", 3600) - 300
+                return self._graph_token  # type: ignore[return-value]
 
     # =========================================================================
     # Teams Bot Framework HTTP API helpers
     # =========================================================================
 
     async def _get_access_token(self) -> str:
-        """Get a Bot Framework access token (OAuth2 client credentials)."""
+        """Get a Bot Framework access token (OAuth2 client credentials).
+
+        Scope ``api.botframework.com``, cached on ``_access_token`` /
+        ``_token_expiry``. The migrated outbound paths
+        (post/edit/delete/typing) now mint their Bot Framework token through
+        the SDK ``App``, so this hand-rolled token is consumed only by the
+        still-hand-rolled Bot Framework callers: native streaming via
+        :meth:`_teams_send` (PR 3) and :meth:`open_dm`. It must never share a
+        cache slot with the Graph token (see :meth:`_get_graph_token`).
+        """
         import time
 
         if self._access_token and time.time() < self._token_expiry:
@@ -2843,7 +2938,14 @@ class TeamsAdapter:
         decoded: TeamsThreadId,
         activity: dict[str, Any],
     ) -> dict[str, Any]:
-        """Send an activity to a Teams conversation via Bot Framework REST API."""
+        """Send an activity to a Teams conversation via Bot Framework REST API.
+
+        Retained for the still-hand-rolled native streaming path (PR 3), which
+        needs the raw ``channelData``/``entities`` streaming envelope and the
+        server-assigned ``streamId`` from the REST response — neither of which
+        the SDK ``app.send`` surface exposes today. The migrated outbound
+        public methods no longer use this; they delegate to the SDK.
+        """
         _validate_service_url(decoded.service_url)
         token = await self._get_access_token()
         url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities"
@@ -2864,55 +2966,6 @@ class TeamsAdapter:
                     f"Teams API error: {response.status} {error_text}",
                 )
             return await response.json()
-
-    async def _teams_update(
-        self,
-        decoded: TeamsThreadId,
-        message_id: str,
-        activity: dict[str, Any],
-    ) -> None:
-        """Update an activity in a Teams conversation via Bot Framework REST API."""
-        _validate_service_url(decoded.service_url)
-        token = await self._get_access_token()
-        url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
-
-        session = await self._get_http_session()
-        async with session.put(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=activity,
-        ) as response:
-            if not response.ok:
-                error_text = await response.text()
-                raise NetworkError(
-                    "teams",
-                    f"Teams API error: {response.status} {error_text}",
-                )
-
-    async def _teams_delete(
-        self,
-        decoded: TeamsThreadId,
-        message_id: str,
-    ) -> None:
-        """Delete an activity from a Teams conversation via Bot Framework REST API."""
-        _validate_service_url(decoded.service_url)
-        token = await self._get_access_token()
-        url = f"{decoded.service_url}v3/conversations/{decoded.conversation_id}/activities/{message_id}"
-
-        session = await self._get_http_session()
-        async with session.delete(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-        ) as response:
-            if not response.ok:
-                error_text = await response.text()
-                raise NetworkError(
-                    "teams",
-                    f"Teams API error: {response.status} {error_text}",
-                )
 
 
 def create_teams_adapter(config: TeamsAdapterConfig | None = None) -> TeamsAdapter:

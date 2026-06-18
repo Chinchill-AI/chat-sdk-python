@@ -87,6 +87,23 @@ def _make_logger():
     )
 
 
+class _SentActivity:
+    """Stand-in for the SDK ``SentActivity`` returned by ``app.send``."""
+
+    def __init__(self, id: str):
+        self.id = id
+
+
+def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
+    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+
+    The migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    """
+    send = AsyncMock(return_value=_SentActivity(sent_id))
+    adapter._app.send = send  # type: ignore[method-assign]
+    return send
+
+
 class _FakeRequest:
     def __init__(self, body: str, headers: dict[str, str] | None = None):
         self._body = body
@@ -280,7 +297,7 @@ class TestPostMessageAdaptiveCard:
     @pytest.mark.asyncio
     async def test_post_card_message(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._teams_send = AsyncMock(return_value={"id": "card-msg-1"})
+        send = _mock_app_send(adapter, "card-msg-1")
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -303,10 +320,11 @@ class TestPostMessageAdaptiveCard:
             },
         )
         assert result.id == "card-msg-1"
-        call_args = adapter._teams_send.call_args[0][1]
-        assert call_args["type"] == "message"
-        assert len(call_args["attachments"]) == 1
-        assert call_args["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
+        activity = send.call_args.args[1]
+        dumped = activity.model_dump(by_alias=True, exclude_none=True)
+        assert dumped["type"] == "message"
+        assert len(dumped["attachments"]) == 1
+        assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +741,6 @@ class TestStream:
         """
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-1"})
-        adapter._teams_update = AsyncMock()
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -740,7 +757,6 @@ class TestStream:
         assert result.id == "stream-msg-1"
         # Single send carrying the full accumulated text — no edits.
         assert adapter._teams_send.call_count == 1
-        assert adapter._teams_update.call_count == 0
         sent_payload = adapter._teams_send.await_args.args[1]
         assert sent_payload["text"] == "Hello world"
         assert sent_payload["type"] == "message"
@@ -750,7 +766,6 @@ class TestStream:
         """Empty streams in a group chat skip the post entirely."""
         adapter = _make_adapter(logger=_make_logger())
         adapter._teams_send = AsyncMock(return_value={"id": "stream-msg-2"})
-        adapter._teams_update = AsyncMock()
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
@@ -768,4 +783,3 @@ class TestStream:
         assert result.id == ""
         assert result.raw["text"] == ""
         assert adapter._teams_send.call_count == 0
-        assert adapter._teams_update.call_count == 0
