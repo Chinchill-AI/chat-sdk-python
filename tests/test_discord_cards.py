@@ -5,6 +5,8 @@ Ported from packages/adapter-discord/src/cards.test.ts.
 
 from __future__ import annotations
 
+import pytest
+
 from chat_sdk.adapters.discord.cards import (
     BUTTON_STYLE_DANGER,
     BUTTON_STYLE_LINK,
@@ -13,6 +15,8 @@ from chat_sdk.adapters.discord.cards import (
     DISCORD_BLURPLE,
     card_to_discord_payload,
     card_to_fallback_text,
+    decode_discord_custom_id,
+    encode_discord_custom_id,
 )
 from chat_sdk.cards import (
     Actions,
@@ -27,6 +31,7 @@ from chat_sdk.cards import (
     LinkButton,
     Section,
 )
+from chat_sdk.shared.errors import ValidationError
 
 # ---------------------------------------------------------------------------
 # cardToDiscordPayload
@@ -113,7 +118,8 @@ class TestCardToDiscordPayload:
         assert buttons[1]["type"] == 2
         assert buttons[1]["style"] == BUTTON_STYLE_DANGER
         assert buttons[1]["label"] == "Reject"
-        assert buttons[1]["custom_id"] == "reject"
+        # Button values are packed into custom_id (vercel/chat#454)
+        assert buttons[1]["custom_id"] == "reject\ndata-123"
 
         assert buttons[2]["type"] == 2
         assert buttons[2]["style"] == BUTTON_STYLE_SECONDARY
@@ -272,3 +278,124 @@ class TestCardToFallbackText:
         card = Card()
         text = card_to_fallback_text(card)
         assert text == ""
+
+
+# ---------------------------------------------------------------------------
+# encodeDiscordCustomId / decodeDiscordCustomId (vercel/chat#454)
+# ---------------------------------------------------------------------------
+
+
+class TestEncodeDecodeDiscordCustomId:
+    """describe("encodeDiscordCustomId / decodeDiscordCustomId")"""
+
+    # it("encodes actionId only when no value")
+    def test_encodes_actionid_only_when_no_value(self):
+        assert encode_discord_custom_id("approve") == "approve"
+
+    # it("encodes actionId with value")
+    def test_encodes_actionid_with_value(self):
+        assert encode_discord_custom_id("approve", "order-123") == "approve\norder-123"
+
+    # it("skips encoding when empty value")
+    def test_skips_encoding_when_empty_value(self):
+        assert encode_discord_custom_id("approve", "") == "approve"
+
+    # it("throws when actionId is empty")
+    def test_throws_when_actionid_is_empty(self):
+        with pytest.raises(ValidationError):
+            encode_discord_custom_id("")
+
+    # it("throws when actionId exceeds 100 chars")
+    def test_throws_when_actionid_exceeds_100_chars(self):
+        with pytest.raises(ValidationError):
+            encode_discord_custom_id("x" * 101)
+
+    # it("throws when encoded custom_id exceeds 100 chars")
+    def test_throws_when_encoded_custom_id_exceeds_100_chars(self):
+        long_value = "x" * 100
+        with pytest.raises(ValidationError):
+            encode_discord_custom_id("btn", long_value)
+
+    # it("throws when a button value makes custom_id too long")
+    def test_throws_when_a_button_value_makes_custom_id_too_long(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Button(
+                            id="x" * 90,
+                            label="Approve",
+                            value="__cb:1234567890abcdef",
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        with pytest.raises(ValidationError):
+            card_to_discord_payload(card)
+
+    # it("decodes actionId only")
+    def test_decodes_actionid_only(self):
+        decoded = decode_discord_custom_id("approve")
+        assert decoded.action_id == "approve"
+        assert decoded.value is None
+
+    # it("decodes actionId with value")
+    def test_decodes_actionid_with_value(self):
+        decoded = decode_discord_custom_id("approve\norder-123")
+        assert decoded.action_id == "approve"
+        assert decoded.value == "order-123"
+
+    # it("round-trips encode/decode")
+    def test_roundtrips_encodedecode(self):
+        encoded = encode_discord_custom_id("btn", "__cb:a1b2c3d4e5f6g7h8")
+        decoded = decode_discord_custom_id(encoded)
+        assert decoded.action_id == "btn"
+        assert decoded.value == "__cb:a1b2c3d4e5f6g7h8"
+
+    # it("preserves embedded delimiter chars in the value (decoder splits on first only)")
+    def test_preserves_embedded_delimiter_chars_in_the_value_decoder_splits_on_first_only(self):
+        decoded = decode_discord_custom_id("btn\nfirst\nsecond")
+        assert decoded.action_id == "btn"
+        assert decoded.value == "first\nsecond"
+
+    # it("treats explicitly null value as no value")
+    def test_treats_explicitly_null_value_as_no_value(self):
+        assert encode_discord_custom_id("approve", None) == "approve"
+
+    # it("encodes a custom_id at the 100 char boundary")
+    def test_encodes_a_custom_id_at_the_100_char_boundary(self):
+        action_id = "a" * 50
+        value = "b" * 49
+        encoded = encode_discord_custom_id(action_id, value)
+        assert len(encoded) == 100
+        decoded = decode_discord_custom_id(encoded)
+        assert decoded.action_id == action_id
+        assert decoded.value == value
+
+    # it("rejects a custom_id one char past the boundary")
+    def test_rejects_a_custom_id_one_char_past_the_boundary(self):
+        action_id = "a" * 50
+        value = "b" * 50
+        with pytest.raises(ValidationError):
+            encode_discord_custom_id(action_id, value)
+
+    # it("renders cards with values into Discord button payloads")
+    def test_renders_cards_with_values_into_discord_button_payloads(self):
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Button(id="approve", label="Approve", value="order-99"),
+                        Button(id="deny", label="Deny"),
+                    ]
+                ),
+            ]
+        )
+
+        payload = card_to_discord_payload(card)
+        buttons = payload["components"][0]["components"]
+
+        assert buttons[0]["custom_id"] == "approve\norder-99"
+        assert buttons[1]["custom_id"] == "deny"

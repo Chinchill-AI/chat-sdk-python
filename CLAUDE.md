@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (porting v4.29.0; last fully-synced release `0.4.27` at upstream `4.27.0`). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to upstream v4.29.0; next wave 4.30.0 is tracked separately). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -25,7 +25,8 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.26` = synced to upstream `4.26.0`
 - `0.4.26.3` = Python-only fixes on top of `4.26.0`
 - `0.4.27` = synced to upstream `4.27.0`
-- `0.4.29a1` = alpha while porting upstream `4.29.0` (current branch; upstream skipped 4.28 tag)
+- `0.4.27.1` = Python-only fix on top of `4.27.0`
+- `0.4.29` = synced to upstream `4.29.0` (upstream never tagged 4.27/4.28 as `chat@*`)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
@@ -34,7 +35,7 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `src/chat_sdk/channel.py` -- Channel (thread listing, metadata)
 - `src/chat_sdk/plan.py` -- Plan (PostableObject for structured task lists)
 - `src/chat_sdk/types.py` -- All types (Message, Author, Adapter protocol)
-- `src/chat_sdk/adapters/` -- 8 platform adapters
+- `src/chat_sdk/adapters/` -- 9 platform adapters
 - `src/chat_sdk/shared/` -- Markdown parser, format converter, streaming renderer
 - `src/chat_sdk/state/` -- Memory, Redis, Postgres backends
 - `tests/` -- 3,400+ tests
@@ -108,26 +109,22 @@ will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` in the mapped core files has a matching Python `def test_*()`,
-pinned to `chat@4.26.0` (upstream skipped tagging `chat@4.27.0` and
-`chat@4.28.0`, then resumed at `chat@4.29.0`; pin moves to `chat@4.29.0`
-once the in-flight 4.29 sync lands). The `MAPPING`
-dict in that script is the authoritative scope list — it currently covers 8
-of 17 `packages/chat/src/*.test.ts` files (extending it is tracked as a
-follow-up). **CI runs `--strict`** (see `.github/workflows/lint.yml`):
+pinned to `chat@4.29.0` (matches `UPSTREAM_PARITY`; upstream never tagged
+`chat@4.27.0`/`chat@4.28.0`). The `MAPPING` dict in that script is the
+authoritative scope list — extending it to the remaining unmapped
+`packages/chat/src/*.test.ts` files is tracked as issue #78.
+**CI runs `--strict`** (see `.github/workflows/lint.yml`):
 any missing translation in a mapped file fails the build, and a missing
 upstream checkout also fails (the script exits non-zero when any mapped
 TS file isn't found). Baseline mode (the default without `--strict`) is
 retained for local workflows where a few ports land in flight —
 regenerate via `--update-baseline` after documenting intentional
-divergence in `docs/UPSTREAM_SYNC.md`. During this sync cycle baseline
-mode reports a parity mismatch (baseline pinned at `chat@4.26.0`,
-`UPSTREAM_PARITY` says `4.29.0`); that's the intended signal until the
-sync lands.
+divergence in `docs/UPSTREAM_SYNC.md`.
 
 Before the fidelity check can run locally, clone the pinned upstream
 checkout (same command CI uses in `lint.yml`):
 ```bash
-git clone --depth 1 --branch chat@4.26.0 \
+git clone --depth 1 --branch chat@4.29.0 \
   https://github.com/vercel/chat.git /tmp/vercel-chat
 ```
 Then `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict`.

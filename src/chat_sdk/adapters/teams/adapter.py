@@ -1700,7 +1700,7 @@ class TeamsAdapter:
             # from typing indicator to message bubble; if that send fails
             # the streaming UI may stay until Teams times the session out
             # client-side, but the recorded ``SentMessage`` and
-            # ``_message_history`` entry still match what the user saw.
+            # ``_thread_history`` entry still match what the user saw.
             self._logger.warn(
                 "Teams stream final activity failed",
                 {"threadId": thread_id, "error": str(exc)},

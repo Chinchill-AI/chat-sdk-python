@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from chat_sdk.callback_url import decode_callback_value
+from chat_sdk.cards import Actions, Button, Card
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter, derive_channel_id
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.testing import (
@@ -29,12 +31,14 @@ from chat_sdk.testing import (
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
 from chat_sdk.types import (
     Attachment,
+    EphemeralMessage,
     FetchResult,
     ListThreadsResult,
     Message,
     PostableAst,
     PostableMarkdown,
     PostableRaw,
+    PostEphemeralOptions,
     RawMessage,
     ScheduledMessage,
     ThreadSummary,
@@ -752,7 +756,7 @@ class TestSerialization:
             "_adapter": original._adapter,
             "_adapter_name": original._adapter_name,
             "_state_adapter_instance": original._state_adapter_instance,
-            "_message_history": original._message_history,
+            "_thread_history": original._thread_history,
         }
 
         with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
@@ -1381,3 +1385,199 @@ class TestJsxAbsorbers:
     # test cannot be faithfully translated. Kept as an absorber for verify_test_fidelity.py.
     def test_should_convert_jsx_card_elements_to_cardelement(self):
         assert True
+
+
+# ===========================================================================
+# callbackUrl processing (vercel/chat#454)
+# ===========================================================================
+
+
+class TestCallbackUrlProcessing:
+    """describe("callbackUrl processing") from channel.test.ts"""
+
+    FUTURE_DATE = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def _make_tracked_channel(self) -> tuple[ChannelImpl, MockAdapter, MockStateAdapter, list[tuple[str, Any]]]:
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        post_calls: list[tuple[str, Any]] = []
+
+        async def tracking_post(channel_id: str, message: Any) -> RawMessage:
+            post_calls.append((channel_id, message))
+            return RawMessage(id="msg-1", thread_id=channel_id, raw={})
+
+        adapter.post_channel_message = tracking_post  # type: ignore[assignment]
+        channel = _make_channel(adapter, state)
+        return channel, adapter, state, post_calls
+
+    def _callback_keys(self, state: MockStateAdapter) -> list[str]:
+        return [k for k in state.cache if k.startswith("chat:callback:")]
+
+    # it("should encode callbackUrl tokens when posting a card")
+    @pytest.mark.asyncio
+    async def test_should_encode_callbackurl_tokens_when_posting_a_card(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        card = Card(
+            title="Test",
+            children=[
+                Actions(
+                    [
+                        Button(
+                            id="approve",
+                            label="Approve",
+                            callback_url="https://example.com/hook",
+                        )
+                    ]
+                ),
+            ],
+        )
+
+        await channel.post(card)
+
+        posted_card = post_calls[0][1]
+        actions = next(c for c in posted_card["children"] if c["type"] == "actions")
+        button = actions["children"][0]
+
+        decoded = decode_callback_value(button["value"])
+        assert decoded.callback_token is not None
+        assert "callback_url" not in button
+
+        stored = await state.get(f"chat:callback:{decoded.callback_token}")
+        assert stored is not None
+        assert stored["url"] == "https://example.com/hook"
+
+    # it("should encode callbackUrl when posting via postEphemeral")
+    @pytest.mark.asyncio
+    async def test_should_encode_callbackurl_when_posting_via_postephemeral(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        mock_post_ephemeral = AsyncMock(
+            return_value=EphemeralMessage(id="e1", thread_id="slack:C123", used_fallback=False, raw={})
+        )
+        adapter.post_ephemeral = mock_post_ephemeral  # type: ignore[attr-defined]
+        channel = _make_channel(adapter, state)
+
+        await channel.post_ephemeral(
+            "U1",
+            Card(
+                children=[
+                    Actions(
+                        [
+                            Button(
+                                id="ack",
+                                label="Ack",
+                                callback_url="https://example.com/eph",
+                            )
+                        ]
+                    ),
+                ]
+            ),
+            PostEphemeralOptions(fallback_to_dm=False),
+        )
+
+        sent_card = mock_post_ephemeral.call_args[0][2]
+        button = sent_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        assert callback_token is not None
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["url"] == "https://example.com/eph"
+
+    # it("should encode callbackUrl when scheduling")
+    @pytest.mark.asyncio
+    async def test_should_encode_callbackurl_when_scheduling(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        adapter.schedule_message = AsyncMock(  # type: ignore[attr-defined]
+            return_value=ScheduledMessage(
+                scheduled_message_id="Q1",
+                channel_id="C123",
+                post_at=self.FUTURE_DATE,
+                raw={},
+                _cancel=AsyncMock(return_value=None),
+            )
+        )
+        channel = _make_channel(adapter, state)
+
+        await channel.schedule(
+            Card(
+                children=[
+                    Actions(
+                        [
+                            Button(
+                                id="later",
+                                label="Later",
+                                callback_url="https://example.com/sch",
+                            )
+                        ]
+                    ),
+                ]
+            ),
+            post_at=self.FUTURE_DATE,
+        )
+
+        sent_card = adapter.schedule_message.call_args[0][1]
+        button = sent_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        assert callback_token is not None
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["url"] == "https://example.com/sch"
+
+    # it("should encode callbackUrl when editing a sent card")
+    @pytest.mark.asyncio
+    async def test_should_encode_callbackurl_when_editing_a_sent_card(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        sent = await channel.post("Hello")
+        await sent.edit(
+            Card(
+                children=[
+                    Actions(
+                        [
+                            Button(
+                                id="redo",
+                                label="Redo",
+                                callback_url="https://example.com/edit",
+                            )
+                        ]
+                    ),
+                ]
+            )
+        )
+
+        edited_card = adapter._edit_calls[0][2]
+        button = edited_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        assert callback_token is not None
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["url"] == "https://example.com/edit"
+
+    # it("should pass plain string posts through unchanged")
+    @pytest.mark.asyncio
+    async def test_should_pass_plain_string_posts_through_unchanged(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        await channel.post("Just text")
+
+        assert post_calls == [("slack:C123", "Just text")]
+        assert self._callback_keys(state) == []
+
+    # it("should leave cards without callback buttons untouched")
+    @pytest.mark.asyncio
+    async def test_should_leave_cards_without_callback_buttons_untouched(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        await channel.post(
+            Card(
+                children=[
+                    Actions([Button(id="ok", label="OK", value="keep")]),
+                ]
+            )
+        )
+
+        posted_card = post_calls[0][1]
+        assert posted_card["children"][0]["children"][0]["value"] == "keep"
+        assert self._callback_keys(state) == []

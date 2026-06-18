@@ -18,6 +18,11 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from chat_sdk.callback_url import (
+    decode_callback_value,
+    post_to_callback_url,
+    resolve_callback_url,
+)
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -29,6 +34,7 @@ from chat_sdk.thread import (
     has_chat_singleton,
     set_chat_singleton,
 )
+from chat_sdk.transcripts import TranscriptsApiImpl
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
@@ -43,6 +49,8 @@ from chat_sdk.types import (
     ConcurrencyConfig,
     ConcurrencyStrategy,
     EmojiValue,
+    IdentityContext,
+    IdentityResolver,
     Lock,
     LockScope,
     LockScopeContext,
@@ -60,6 +68,7 @@ from chat_sdk.types import (
     ReactionEvent,
     SlashCommandEvent,
     StateAdapter,
+    TranscriptsApi,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -172,17 +181,19 @@ class _SlashCommandPattern:
 
 
 class _StoredModalContext:
-    __slots__ = ("thread", "message", "channel")
+    __slots__ = ("thread", "message", "channel", "callback_url")
 
     def __init__(
         self,
         thread: dict[str, Any] | None = None,
         message: dict[str, Any] | None = None,
         channel: dict[str, Any] | None = None,
+        callback_url: str | None = None,
     ) -> None:
         self.thread = thread
         self.message = message
         self.channel = channel
+        self.callback_url = callback_url
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +372,25 @@ class Chat:
             else None
         )
 
-        # -- Message history (placeholder -- real impl would use MessageHistoryCache)
-        self._message_history = _MessageHistoryCache(self._state_adapter, config.message_history)
+        # -- Thread history (placeholder -- real impl would use ThreadHistoryCache)
+        # `config.message_history` is the deprecated alias; `thread_history`
+        # takes precedence when both are set (mirrors upstream
+        # `config.threadHistory ?? config.messageHistory`).
+        self._thread_history = _ThreadHistoryCache(
+            self._state_adapter,
+            config.thread_history if config.thread_history is not None else config.message_history,
+        )
+
+        # -- Transcripts API (cross-platform per-user persistence) -------------
+        self._identity: IdentityResolver | None = config.identity
+        self._transcripts: TranscriptsApiImpl | None = None
+        if config.transcripts is not None:
+            if config.identity is None:
+                raise ValueError(
+                    "ChatConfig.transcripts requires ChatConfig.identity to be set "
+                    "— the cross-platform user key must be resolvable"
+                )
+            self._transcripts = TranscriptsApiImpl(self._state_adapter, config.transcripts)
 
         # -- Logger -----------------------------------------------------------
         if isinstance(config.logger, str):
@@ -407,6 +435,24 @@ class Chat:
             self.webhooks[name] = self._make_webhook_handler(name)
 
         self._logger.debug("Chat instance created", {"adapters": list(config.adapters.keys())})
+
+    # ========================================================================
+    # Transcripts API
+    # ========================================================================
+
+    @property
+    def transcripts(self) -> TranscriptsApi:
+        """Cross-platform per-user transcript store.
+
+        Available only when ``transcripts`` is configured on the Chat
+        instance (and an ``identity`` resolver is set).  Raises on access
+        otherwise so callers fail loudly rather than silently no-op'ing.
+        """
+        if self._transcripts is None:
+            raise ChatError(
+                "chat.transcripts is not configured — pass `transcripts` and `identity` to ChatConfig to enable it"
+            )
+        return self._transcripts
 
     # ========================================================================
     # Singleton management
@@ -909,10 +955,16 @@ class Chat:
         thread_id: str,
         message_or_factory: Message | Callable[[], Awaitable[Message]],
         options: WebhookOptions | None = None,
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Process an incoming message from an adapter.
 
-        Handles waitUntil registration and error catching.
+        Handles waitUntil registration and error catching. Returns the
+        handler task (``None`` only when no event loop is running) so
+        streaming callers can await full handler completion and observe
+        handler exceptions; fire-and-forget webhook callers may ignore it.
+        ``wait_until`` keeps the existing swallowed-error semantics —
+        platforms shouldn't retry on handler bugs. (Core slice of
+        vercel/chat#444; the @chat-adapter/web package itself is not ported.)
         """
 
         async def _task() -> None:
@@ -932,6 +984,7 @@ class Chat:
             )
             if options and options.wait_until:
                 options.wait_until(task)
+        return task
 
     def process_reaction(
         self,
@@ -1008,6 +1061,7 @@ class Chat:
     ) -> ModalResponse | None:
         """Process a modal form submission. Returns optional response."""
         related = await self._retrieve_modal_context(event.adapter.name, context_id)
+        callback_url = related.get("callback_url")
 
         full_event = ModalSubmitEvent(
             adapter=event.adapter,
@@ -1022,18 +1076,50 @@ class Chat:
             raw=event.raw,
         )
 
+        result: ModalResponse | None = None
         for pat in self._modal_submit_handlers:
             if not pat.callback_ids or event.callback_id in pat.callback_ids:
                 try:
                     response = await self._invoke_handler(pat.handler, full_event)
                     if response is not None:
-                        return response
+                        result = response
+                        break
                 except Exception as exc:
                     self._logger.error(
                         "Modal submit handler error",
                         {"callback_id": event.callback_id, "error": str(exc)},
                     )
-        return None
+
+        if callback_url and getattr(result, "action", None) != "errors":
+            # POST the form values to the modal's callback URL. The response
+            # is returned to the platform without waiting for the POST; the
+            # task is handed to options.wait_until for serverless callers.
+            payload = {
+                "type": "modal_submit",
+                "callbackId": event.callback_id,
+                "values": event.values,
+                "user": {"id": event.user.user_id, "name": event.user.user_name},
+            }
+
+            async def _post_modal_callback() -> None:
+                try:
+                    post_result = await post_to_callback_url(callback_url, payload)
+                    if post_result.error is not None:
+                        self._logger.error(
+                            "Modal callbackUrl POST failed",
+                            {"callback_url": callback_url, "error": str(post_result.error)},
+                        )
+                except Exception as error:  # mirrors upstream's trailing .catch
+                    self._logger.error(
+                        "Modal callbackUrl POST failed",
+                        {"callback_url": callback_url, "error": str(error)},
+                    )
+
+            task = _create_task(_post_modal_callback(), self._active_tasks)
+            if task is not None and options and options.wait_until:
+                options.wait_until(task)
+
+        return result
 
     def process_modal_close(
         self,
@@ -1215,7 +1301,12 @@ class Chat:
                 self._logger.warn(f"Cannot open modal: {event.adapter.name} does not support modals")
                 return None
             context_id = str(uuid.uuid4())
-            self._store_modal_context(event.adapter.name, context_id, channel=channel)
+            await self._store_modal_context(
+                event.adapter.name,
+                context_id,
+                channel=channel,
+                callback_url=modal.get("callback_url") if isinstance(modal, dict) else None,
+            )
             return await event.adapter.open_modal(trigger_id, modal, context_id)  # type: ignore[union-attr]
 
         full_event = SlashCommandEvent(
@@ -1242,29 +1333,31 @@ class Chat:
     # Modal context persistence
     # ========================================================================
 
-    def _store_modal_context(
+    async def _store_modal_context(
         self,
         adapter_name: str,
         context_id: str,
         thread: ThreadImpl | None = None,
         message: Message | None = None,
         channel: Channel | None = None,
+        callback_url: str | None = None,
     ) -> None:
+        # Upstream ``storeModalContext`` is ``async`` and the ``openModal``
+        # helper *awaits* it before calling ``adapter.openModal`` (chat.ts
+        # :1280/:1342/:1554). We mirror that: the state write must land
+        # before the modal can be submitted, otherwise with a remote
+        # (Redis/Postgres) backend a fast submit can race ahead of a
+        # fire-and-forget write and miss the stored callbackUrl/channel.
         key = f"modal-context:{adapter_name}:{context_id}"
         context = {
             "thread": thread.to_json() if thread else None,
             "message": message.to_json() if message else None,
             "channel": channel.to_json() if channel else None,
+            # camelCase: stored state is a serialization boundary shared
+            # with the TS SDK (matches the serialized thread/message keys).
+            "callbackUrl": callback_url,
         }
-        task = _create_task(self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS), self._active_tasks)
-        if task is not None:
-            task.add_done_callback(
-                lambda t: (
-                    self._logger.error("Failed to store modal context", {"context_id": context_id})
-                    if not t.cancelled() and t.exception()
-                    else None
-                )
-            )
+        await self._state_adapter.set(key, context, MODAL_CONTEXT_TTL_MS)
 
     async def _retrieve_modal_context(
         self,
@@ -1273,6 +1366,7 @@ class Chat:
     ) -> dict[str, Any]:
         if not context_id:
             return {
+                "callback_url": None,
                 "related_thread": None,
                 "related_message": None,
                 "related_channel": None,
@@ -1283,6 +1377,7 @@ class Chat:
 
         if not stored:
             return {
+                "callback_url": None,
                 "related_thread": None,
                 "related_message": None,
                 "related_channel": None,
@@ -1303,7 +1398,12 @@ class Chat:
         if stored.get("channel"):
             related_channel = ChannelImpl.from_json(stored["channel"], adapter)
 
+        # Accept both camelCase (written by this SDK and the TS SDK) and
+        # snake_case (hand-written state) — same tolerance as from_json.
+        callback_url = stored["callbackUrl"] if "callbackUrl" in stored else stored.get("callback_url")
+
         return {
+            "callback_url": callback_url,
             "related_thread": related_thread,
             "related_message": related_message,
             "related_channel": related_channel,
@@ -1327,6 +1427,46 @@ class Chat:
         if event.user.is_me:
             self._logger.debug("Skipping action from self")
             return
+
+        # Decode a callback token (`__cb:<token>`) planted at post time by
+        # process_card_callback_urls. When one resolves, handlers see the
+        # button's original value and the action payload is POSTed to the
+        # stored callback URL concurrently with the handlers.
+        callback_token = decode_callback_value(event.value).callback_token
+
+        resolved = None
+        if callback_token:
+            resolved = await resolve_callback_url(callback_token, self._state_adapter)
+
+        action_value = resolved.original_value if resolved is not None else event.value
+
+        callback_url_task: asyncio.Task[Any] | None = None
+        if resolved is not None:
+            callback_url = resolved.url
+            # Wire payload: camelCase keys, optional keys omitted (not None)
+            # to mirror upstream's JSON.stringify semantics — hazard #7.
+            payload: dict[str, Any] = {"type": "action", "actionId": event.action_id}
+            if resolved.original_value is not None:
+                payload["value"] = resolved.original_value
+            payload["user"] = {"id": event.user.user_id, "name": event.user.user_name}
+            if event.thread_id is not None:
+                payload["threadId"] = event.thread_id
+            if event.message_id is not None:
+                payload["messageId"] = event.message_id
+
+            async def _post_action_callback() -> None:
+                post_result = await post_to_callback_url(callback_url, payload)
+                if post_result.error is not None:
+                    self._logger.error(
+                        "Button callbackUrl POST failed",
+                        {
+                            "callback_url": callback_url,
+                            "action_id": event.action_id,
+                            "error": str(post_result.error),
+                        },
+                    )
+
+            callback_url_task = _create_task(_post_action_callback(), self._active_tasks)
 
         thread: ThreadImpl | None = None
         if event.thread_id:
@@ -1382,12 +1522,13 @@ class Chat:
 
             context_id = str(uuid.uuid4())
             channel_impl = thread.channel if thread else None
-            self._store_modal_context(
+            await self._store_modal_context(
                 event.adapter.name,
                 context_id,
                 thread=thread,
                 message=fetched_message,
                 channel=channel_impl,
+                callback_url=modal.get("callback_url") if isinstance(modal, dict) else None,
             )
             return await event.adapter.open_modal(trigger_id, modal, context_id)  # type: ignore[union-attr]
 
@@ -1398,7 +1539,7 @@ class Chat:
             message_id=event.message_id,
             user=event.user,
             action_id=event.action_id,
-            value=event.value,
+            value=action_value,
             trigger_id=event.trigger_id,
             raw=event.raw,
             _open_modal=_open_modal,
@@ -1412,6 +1553,9 @@ class Chat:
             if event.action_id in pat.action_ids:
                 self._logger.debug("Running matched action handler", {"action_id": event.action_id})
                 await self._invoke_handler(pat.handler, full_event)
+
+        if callback_url_task is not None:
+            await callback_url_task
 
     # ========================================================================
     # Reaction handling
@@ -1818,12 +1962,16 @@ class Chat:
             self._logger.debug("Skipping duplicate message", {"message_id": message.id})
             return
 
-        # Persist incoming message before acquiring lock
-        if adapter.persist_message_history:
+        # Persist incoming message before acquiring lock.
+        # `persist_message_history` is the deprecated adapter flag; either
+        # being truthy enables persistence (mirrors upstream
+        # `adapter.persistThreadHistory || adapter.persistMessageHistory`).
+        # Both flags are optional on the adapter, hence getattr.
+        if getattr(adapter, "persist_thread_history", None) or getattr(adapter, "persist_message_history", None):
             channel_id = adapter.channel_id_from_thread_id(thread_id)
-            appends = [self._message_history.append(thread_id, message)]
+            appends = [self._thread_history.append(thread_id, message)]
             if channel_id != thread_id:
-                appends.append(self._message_history.append(channel_id, message))
+                appends.append(self._thread_history.append(channel_id, message))
             await asyncio.gather(*appends)
 
         # Resolve lock key
@@ -2158,6 +2306,27 @@ class Chat:
 
         thread = self._create_thread(adapter, thread_id, message, is_subscribed)
 
+        # Resolve cross-platform user key (Transcripts API). Cached on the
+        # Message instance so handlers and the Transcripts API see the same
+        # value without re-invoking the resolver.
+        if self._identity is not None and message.user_key is None:
+            try:
+                resolved = self._identity(IdentityContext(adapter=adapter.name, author=message.author, message=message))
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+                if resolved:
+                    message.user_key = resolved
+            except Exception as err:
+                self._logger.warn(
+                    "Identity resolver threw; skipping userKey",
+                    {
+                        "error": err,
+                        "adapter": adapter.name,
+                        "thread_id": thread_id,
+                        "author_user_id": message.author.user_id,
+                    },
+                )
+
         # DM routing
         is_dm = (
             adapter.is_dm(thread_id)  # type: ignore[union-attr]
@@ -2240,7 +2409,14 @@ class Chat:
                 logger=self._logger,
                 streaming_update_interval_ms=self._streaming_update_interval_ms,
                 fallback_streaming_placeholder_text=self._fallback_streaming_placeholder_text,
-                message_history=(self._message_history if adapter.persist_message_history else None),
+                thread_history=(
+                    self._thread_history
+                    if (
+                        getattr(adapter, "persist_thread_history", None)
+                        or getattr(adapter, "persist_message_history", None)
+                    )
+                    else None
+                ),
             )
         )
 
@@ -2483,12 +2659,19 @@ def _message_from_json(data: dict[str, Any]) -> Message:
 
 
 # ---------------------------------------------------------------------------
-# Minimal MessageHistoryCache (placeholder -- real impl uses StateAdapter lists)
+# Minimal ThreadHistoryCache (placeholder -- real impl uses StateAdapter lists)
 # ---------------------------------------------------------------------------
 
+# Key prefix for thread history entries.
+#
+# Kept as ``msg-history:`` for backwards compatibility — renaming would
+# silently orphan every existing user's stored data. The user-facing names
+# changed; the storage shape didn't. (Matches KEY_PREFIX in thread_history.py.)
+_THREAD_HISTORY_KEY_PREFIX = "msg-history:"
 
-class _MessageHistoryCache:
-    """Lightweight in-SDK message history cache backed by the state adapter."""
+
+class _ThreadHistoryCache:
+    """Lightweight in-SDK per-thread history cache backed by the state adapter."""
 
     def __init__(self, state: StateAdapter, config: dict[str, Any] | None = None) -> None:
         self._state = state
@@ -2496,9 +2679,9 @@ class _MessageHistoryCache:
         self._ttl_ms = (config or {}).get("ttl_ms", 30 * 24 * 60 * 60 * 1000)
 
     async def append(self, thread_id: str, message: Message) -> None:
-        key = f"msg-history:{thread_id}"
+        key = f"{_THREAD_HISTORY_KEY_PREFIX}{thread_id}"
         # Serialize with raw nulled out to save storage (matches
-        # MessageHistoryCache.append in message_history.py). Without this,
+        # ThreadHistoryCache.append in thread_history.py). Without this,
         # SentMessage.raw — now populated post-#117 with platform payloads
         # like Slack team_id/user_id, Discord guild IDs — would persist to
         # the state adapter on every reply, inflating storage and PII surface.
@@ -2507,7 +2690,7 @@ class _MessageHistoryCache:
         await self._state.append_to_list(key, data, max_length=self._max_messages, ttl_ms=self._ttl_ms)
 
     async def get_messages(self, thread_id: str, limit: int | None = None) -> list[Message]:
-        key = f"msg-history:{thread_id}"
+        key = f"{_THREAD_HISTORY_KEY_PREFIX}{thread_id}"
         raw_list = await self._state.get_list(key)
         messages = [_message_from_json(r) if isinstance(r, dict) else r for r in raw_list]
         if limit is not None:

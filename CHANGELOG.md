@@ -1,13 +1,60 @@
 # Changelog
 
-## 0.4.29a3 (unreleased)
+## 0.4.29 (2026-06-12)
+
+Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; upstream never tagged `chat@4.27.0`/`chat@4.28.0`). Headlines: **Meta Messenger adapter** (9th platform), **`chat/ai` tool factories** (`create_chat_tools`), **`callback_url` on buttons and modals**, **Transcripts API + `thread_history` rename**, **`burst` concurrency strategy**, a Slack feature wave (verifier precedence flip, external installation providers, native `markdown_text`, `web_client`), the upstream adapter-hardening security pass, and a Python floor bump to 3.12. Sets `UPSTREAM_PARITY = "4.29.0"`; CI fidelity re-pinned to `chat@4.29.0`.
+
+### Upstream parity ports — core (`packages/chat`)
+
+- **`callback_url` on buttons and modals** (vercel/chat#454). New `src/chat_sdk/callback_url.py` plus plumbing through cards, modals, chat, channel, and thread: card buttons and modals can carry a `callback_url` that the SDK POSTs to when the action/submit fires, alongside regular handlers. Serialized wire keys stay camelCase (`callbackUrl`) for cross-SDK state compatibility.
+- **Transcripts API + per-thread cache rename to `thread_history`** (vercel/chat#448). `MessageHistoryCache` → `ThreadHistoryCache` (module `message_history` → `thread_history`) with back-compat shims at the old import path and config names (new name wins when both are set, matching upstream's `?? config.messageHistory` fallback). The persisted state key prefix `msg-history:` is **unchanged** (renaming would orphan existing data — upstream kept it too). New Transcripts surface for cross-platform per-user history; `ChatConfig.transcripts` requires `ChatConfig.identity` and raises on misconfiguration, matching upstream's guard.
+- **`message.subject` + `fetch_subject` adapter hook** (vercel/chat#459, PR #131). `MessageSubject` dataclass, optional `BaseAdapter.fetch_subject(raw)` hook, lazily-resolved cached `Message.subject` accessor, adapter bound at the `Chat._dispatch_to_handlers` convergence point. The GitHub/Linear adapter halves are blocked on native-client exposure (see Known Non-Parity rows).
+- **`burst` concurrency strategy** (vercel/chat#495, PR #114). Hybrid of `debounce` and `queue`: idle threads coalesce a burst window into one dispatch with earlier messages in `context.skipped`; busy threads drain like `queue`. Note: upstream's PR title says "queue-debounce" but the shipped strategy string is `"burst"` — the Python port matches the string (cross-SDK config parity).
+- **`process_message` returns the handler task** (core slice of vercel/chat#444). Streaming callers can await full handler completion and observe handler exceptions; `wait_until` keeps swallowed-error semantics; fire-and-forget callers are unaffected. The `@chat-adapter/web` package that motivated #444 is browser-only and not ported.
+- **`chat/ai` subpath** (vercel/chat#492, design #109; PRs #116 + #122). `chat_sdk.ai` is now a package: `ai/messages.py` (`to_ai_messages`, moved with deprecation shims) and `ai/tools.py` — `create_chat_tools(chat, preset=, require_approval=, overrides=)` returning the 17 upstream tool factories as `ChatTool` dataclasses (JSON-Schema `input_schema`, async `execute`, `needs_approval`), keyed by upstream's camelCase tool ids. No new runtime dependencies.
+
+### New adapter: Messenger (Meta)
+
+- **`chat_sdk.adapters.messenger`** (vercel/chat#461, design #110; PRs #118 + #124). Full Messenger Platform adapter: GET verification handshake + `X-Hub-Signature-256` HMAC verification, Graph API client with typed error mapping, text/Generic/Button-template sends with documented caps, buffered streaming (no edit API), postback/reaction/delivery/read handlers, attachment extraction with lazy `fetch_data`, local message cache backing `fetch_messages`. New extra: `chat-sdk-python[messenger]`. Capabilities matrix in the design issue; `get_user` tracked as #132.
+
+### Upstream parity ports — adapters
+
+- **Slack: `webhook_verifier` now takes precedence over `signing_secret`** (vercel/chat#468, PR #113). Reverses the 0.4.27 precedence after upstream reversed itself; see the Known Non-Parity row update. **Migration**: if you relied on `signing_secret` shadowing a configured `webhook_verifier`, remove one of the two.
+- **Slack: native `markdown_text` for outgoing messages** (vercel/chat#440). Outgoing posts use Slack's native markdown rendering instead of the legacy Block Kit conversion (deferred from 0.4.27).
+- **Slack: external installation providers for bot token management** (vercel/chat#467). Pluggable multi-workspace token source composing with the existing dynamic `bot_token` resolver (per-request ContextVar caching preserved).
+- **Slack: `web_client` property** (vercel/chat#471/#476/#478, PR #127). Sync `slack_sdk.WebClient` bound to the request-context token; `client` retained as a one-release deprecated alias.
+- **Teams: outbound file delivery via data-URI activity attachments** (PR #125, ports upstream `filesToAttachments`). Execution artifacts now reach Teams; `edit_message` delivery is a documented deliberate superset.
+- **Telegram: `video_note` extraction + typed attachment uploads** (vercel/chat#457, #485; PR #119).
+- **Discord: handle interactions in gateway-only mode** (vercel/chat#490).
+- **Adapter hardening pass** (slices of upstream `9824d33`): Slack timing-safe socket-token comparison (PR #126), GitHub eager bot-user-ID auto-detection (PR #128), Linear OAuth tokens encrypted at rest with AES-256-GCM (PR #129), and Google Chat fail-closed webhook verification (PR #130 — **breaking** for gchat configs that previously constructed without any verification gate; set `google_chat_project_number`, `pubsub_audience`, or the explicit `disable_signature_verification=True` escape hatch).
 
 ### Documentation alignment
 
-- **DM routing precedence docstrings** (vercel/chat#491, commit `67c1794`). The Python runtime already routed direct messages to `on_direct_message` handlers before subscribed-message, mention, and pattern handlers (`Chat._handle_incoming_message`, `chat.py:2154`), but `on_direct_message` and `Thread.subscribe` lacked docstrings clarifying that contract. Refreshed both to match upstream's #491 docstring rewrite, plus a new `tests/integration/test_dm_flow.py::TestDMRoutingDocs` group and a `test_dm_handler_runs_before_pattern_handler` regression test that pin the documented precedence (DM > pattern) the previous suite did not explicitly cover. No runtime behavior change.
-- **Streaming docstring refresh** (vercel/chat#463, commit `0cc3d06`). Replaces stale "fallback mode (post + edit on adapters without native streaming)" wording on `StreamingPlanOptions.update_interval_ms` with "Used by post+edit streaming paths", matching upstream's #463 clarification (the interval is consulted regardless of whether the adapter exposes its own `stream` method — Slack/Teams may still rate-limit edits internally). Also reworks the `ThreadImpl._handle_stream` docstring + the in-function "Use native streaming if adapter supports it" comment so they no longer imply a binary native-vs-fallback split. The unrelated `step-finish` → `finish-step` upstream type fix was already correct in the Python port (`from_full_stream.py`, `thread.py`). No runtime behavior change.
+- **DM routing precedence docstrings** (vercel/chat#491, PR #121). `on_direct_message` and `Thread.subscribe` docstrings now state the DM > subscribed > mention > pattern precedence the runtime already implemented; regression test pins DM > pattern.
+- **Streaming docstring refresh** (vercel/chat#463, PR #123). `StreamingPlanOptions.update_interval_ms` and `ThreadImpl._handle_stream` no longer imply a binary native-vs-fallback split.
 
-> Version bump from `0.4.29a2` to `0.4.29a3` will be cut by a coordinating PR once the parallel 4.29 ports land; this entry intentionally leaves `pyproject.toml` unchanged.
+### Python-only improvements
+
+- **Slack `files_upload_v2` confirmation surfaced through `post()`** (PR #117; also shipped early as 0.4.27.1). `SentMessage.raw` carries `uploaded_file_ids`; history persistence nulls `raw` to avoid storage bloat/PII.
+- **Slack: DM block-action responses no longer thread** (PR #133). `_handle_block_actions` mirrors `_handle_message_event`'s DM handling so HITL button replies don't create phantom "1 reply" threads.
+- **Google Chat: file delivery via multipart media upload** (PR #112).
+
+### Not ported / deferred (documented in docs/UPSTREAM_SYNC.md)
+
+- **`@chat-adapter/web`** (vercel/chat#444) — browser-only; no Python runtime.
+- **`@chat-adapter/tests` kit** (vercel/chat#470) — `chat_sdk.testing` already covers the surface; row added.
+- **GitHub `octokit` / Linear `linear_client` getters** (vercel/chat#459/#478 halves) — both Python adapters are hand-rolled over `aiohttp` with no SDK object to expose; rows added with the revisit conditions (`githubkit` adoption / an official Linear Python SDK).
+- **Teams migration to `microsoft-teams-apps`** (issue #93) — explicitly deferred to the 0.4.30 cycle; row added. The 3.12 floor prerequisite (#111) shipped in this release.
+
+### Build / infra
+
+- **Python floor bumped 3.10 → 3.12** (PR #111).
+- **Fidelity**: CI re-pinned to `chat@4.29.0`; `MAPPING` updated for the 4.29 layout (`ai.test.ts` split into `ai/messages.test.ts` + `ai/index.test.ts`) and extended to the new core test files; converter-exact test renames in `tests/test_ai_tools.py`; two `chat.test.ts` subject-rehydration ports are `skipif`-gated on `BaseAdapter.fetch_subject` and activate automatically when PR #131 lands.
+- **Next wave**: upstream `chat@4.30.0` (tagged 2026-06-01) is tracked in #135.
+
+## 0.4.27.1 (2026-05-29)
+
+Python-only point release on the 0.4.27 line (branched from `v0.4.27`; PR #120). Backports the Slack `files_upload_v2` confirmation fix (PR #117) so `SentMessage.raw` carries `uploaded_file_ids`, plus the history-persistence `raw` null-out. Shipped ahead of 0.4.29 to unblock chinchill-api's delivery-confirmation gating.
 
 ## 0.4.29a2 (2026-05-28)
 

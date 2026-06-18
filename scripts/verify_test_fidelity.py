@@ -14,10 +14,9 @@ Usage:
 ``--strict`` is the current CI contract (see ``.github/workflows/lint.yml``):
 the baseline is ignored and any missing translation — or a missing upstream
 checkout — fails the build. This repo ships at strict fidelity for mapped
-core files (0 missing) against ``chat@4.26.0``. The ``MAPPING`` dict below
-is the authoritative scope list; it currently covers 8 of the 17
-``packages/chat/src/*.test.ts`` files (extending it is tracked as a
-follow-up).
+core files (0 missing) against ``chat@4.29.0``. The ``MAPPING`` dict below
+is the authoritative scope list (extending it to the remaining unmapped
+``packages/chat/src/*.test.ts`` files is tracked as issue #78).
 
 Baseline mode (the default without ``--strict``) is retained for local
 workflows where a few ports land in flight: it succeeds iff the set of
@@ -45,7 +44,14 @@ MAPPING = {
     "packages/chat/src/markdown.test.ts": "tests/test_markdown_faithful.py",
     "packages/chat/src/streaming-markdown.test.ts": "tests/test_streaming_markdown.py",
     "packages/chat/src/serialization.test.ts": "tests/test_serialization.py",
-    "packages/chat/src/ai.test.ts": "tests/test_ai_messages.py",
+    # chat@4.29.0 moved ai.test.ts into ai/ and split it (vercel/chat#492)
+    "packages/chat/src/ai/messages.test.ts": "tests/test_ai_messages.py",
+    "packages/chat/src/ai/index.test.ts": "tests/test_ai_tools.py",
+    # New core test files in chat@4.29.0
+    "packages/chat/src/callback-url.test.ts": "tests/test_callback_url.py",
+    "packages/chat/src/thread-history.test.ts": "tests/test_thread_history.py",
+    "packages/chat/src/transcripts.test.ts": "tests/test_transcripts.py",
+    "packages/chat/src/transcripts-wiring.test.ts": "tests/test_transcripts_wiring.py",
     "packages/chat/src/from-full-stream.test.ts": "tests/test_from_full_stream.py",
 }
 
@@ -275,7 +281,7 @@ _DEFAULT_BASELINE_COMMENT = (
     "against the current UPSTREAM_PARITY tag, so the baseline is "
     "normally empty. Scope: the MAPPING dict in "
     "scripts/verify_test_fidelity.py is the authoritative list of TS "
-    "files checked; it currently covers 8 of the 17 "
+    "files checked (extending to the remaining unmapped files is issue #78) "
     "packages/chat/src/*.test.ts files. Default CI mode runs --strict "
     "via .github/workflows/lint.yml; this file is retained for local "
     "workflows that want to opt back into baseline mode (e.g. during "
@@ -311,7 +317,7 @@ def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> N
     current_parity = _current_parity_tag()
     payload = {
         "_comment": existing_comment if existing_comment is not None else _DEFAULT_BASELINE_COMMENT,
-        "ts_parity": current_parity if current_parity is not None else "chat@4.26.0",
+        "ts_parity": current_parity if current_parity is not None else "chat@4.29.0",
         "total_ts_tests": total_ts,
         "total_missing": sum(len(v) for v in all_missing.values()),
         "missing": {
@@ -440,7 +446,7 @@ def main() -> int:
             print(f"  - {path}")
         print(
             "\nClone the upstream repo at the pinned parity tag, e.g.:\n"
-            "  git clone --depth 1 --branch chat@4.26.0 "
+            "  git clone --depth 1 --branch chat@4.29.0 "
             "https://github.com/vercel/chat.git /tmp/vercel-chat\n"
             "then re-run with TS_ROOT=/tmp/vercel-chat."
         )

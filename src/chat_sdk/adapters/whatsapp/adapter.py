@@ -112,7 +112,7 @@ class WhatsAppAdapter:
     def __init__(self, config: WhatsAppAdapterConfig) -> None:
         self._name = "whatsapp"
         self._lock_scope: LockScope = "channel"
-        self._persist_message_history = True
+        self._persist_thread_history = True
         self._user_name = config.user_name
         self._access_token = config.access_token
         self._app_secret = config.app_secret
@@ -137,8 +137,8 @@ class WhatsAppAdapter:
         return self._lock_scope
 
     @property
-    def persist_message_history(self) -> bool:
-        return self._persist_message_history
+    def persist_thread_history(self) -> bool:
+        return self._persist_thread_history
 
     @property
     def user_name(self) -> str:

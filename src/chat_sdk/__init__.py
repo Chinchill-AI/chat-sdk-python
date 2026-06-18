@@ -65,6 +65,8 @@ from chat_sdk.emoji import (
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError, RateLimitError, StateNotConnectedError
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import ConsoleLogger, Logger, LogLevel
+
+# Deprecated aliases — renamed to ThreadHistoryCache / ThreadHistoryConfig.
 from chat_sdk.message_history import MessageHistoryCache, MessageHistoryConfig
 from chat_sdk.modals import (
     ExternalSelect,
@@ -121,10 +123,13 @@ from chat_sdk.shared.errors import (
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.thread import ThreadImpl
+from chat_sdk.thread_history import ThreadHistoryCache, ThreadHistoryConfig
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
     AdapterPostableMessage,
+    AppendInput,
+    AppendOptions,
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
@@ -138,6 +143,10 @@ from chat_sdk.types import (
     ChatInstance,
     ConcurrencyConfig,
     ConcurrencyStrategy,
+    CountQuery,
+    DeleteResult,
+    DeleteTarget,
+    DurationString,
     EmojiFormats,
     EmojiValue,
     EphemeralMessage,
@@ -146,7 +155,10 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    IdentityContext,
+    IdentityResolver,
     LinkPreview,
+    ListQuery,
     ListThreadsOptions,
     ListThreadsResult,
     Lock,
@@ -185,6 +197,10 @@ from chat_sdk.types import (
     Thread,
     ThreadInfo,
     ThreadSummary,
+    TranscriptEntry,
+    TranscriptRole,
+    TranscriptsApi,
+    TranscriptsConfig,
     UserInfo,
     WebhookOptions,
     WellKnownEmoji,
@@ -298,7 +314,10 @@ __all__ = [
     "ConsoleLogger",
     "Logger",
     "LogLevel",
-    # Message history
+    # Thread history (per-thread cache)
+    "ThreadHistoryCache",
+    "ThreadHistoryConfig",
+    # Thread history — deprecated aliases (renamed upstream)
     "MessageHistoryCache",
     "MessageHistoryConfig",
     # Modal builders (PascalCase primary — matches source TS SDK)
@@ -335,6 +354,8 @@ __all__ = [
     "ActionEvent",
     "Adapter",
     "AdapterPostableMessage",
+    "AppendInput",
+    "AppendOptions",
     "AppHomeOpenedEvent",
     "AssistantContextChangedEvent",
     "AssistantThreadStartedEvent",
@@ -348,6 +369,10 @@ __all__ = [
     "ChatInstance",
     "ConcurrencyConfig",
     "ConcurrencyStrategy",
+    "CountQuery",
+    "DeleteResult",
+    "DeleteTarget",
+    "DurationString",
     "EmojiFormats",
     "EmojiValue",
     "EphemeralMessage",
@@ -356,7 +381,10 @@ __all__ = [
     "FetchResult",
     "FileUpload",
     "FormattedContent",
+    "IdentityContext",
+    "IdentityResolver",
     "LinkPreview",
+    "ListQuery",
     "ListThreadsOptions",
     "ListThreadsResult",
     "Lock",
@@ -396,6 +424,10 @@ __all__ = [
     "Thread",
     "ThreadInfo",
     "ThreadSummary",
+    "TranscriptEntry",
+    "TranscriptRole",
+    "TranscriptsApi",
+    "TranscriptsConfig",
     "UserInfo",
     "WebhookOptions",
     "WellKnownEmoji",

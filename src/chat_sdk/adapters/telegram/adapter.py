@@ -594,7 +594,7 @@ class TelegramAdapter:
 
         self._name: str = "telegram"
         self._lock_scope: LockScope = "channel"
-        self._persist_message_history: bool = True
+        self._persist_thread_history: bool = True
 
         self._bot_token: str = bot_token
         self._api_base_url: str = _trim_trailing_slashes(
@@ -640,8 +640,8 @@ class TelegramAdapter:
         return self._lock_scope
 
     @property
-    def persist_message_history(self) -> bool:
-        return self._persist_message_history
+    def persist_thread_history(self) -> bool:
+        return self._persist_thread_history
 
     @property
     def bot_user_id(self) -> str | None:

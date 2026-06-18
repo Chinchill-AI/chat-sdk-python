@@ -89,6 +89,8 @@ class ModalElement(TypedDict, total=False):
     type: str  # "modal"
     title: str
     callback_id: str
+    # URL to POST form values to when this modal is submitted
+    callback_url: str
     submit_label: str
     close_label: str
     notify_on_close: bool
@@ -127,6 +129,7 @@ def Modal(
     *,
     title: str,
     callback_id: str,
+    callback_url: str | None = None,
     children: list[ModalChild] | None = None,
     submit_label: str | None = None,
     close_label: str | None = None,
@@ -140,6 +143,8 @@ def Modal(
         "callback_id": callback_id,
         "children": children or [],
     }
+    if callback_url is not None:
+        result["callback_url"] = callback_url
     if submit_label is not None:
         result["submit_label"] = submit_label
     if close_label is not None:

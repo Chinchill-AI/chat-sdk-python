@@ -1,14 +1,14 @@
-"""Slack-specific format conversion using AST-based parsing.
+"""Slack format conversion.
 
 Port of markdown.ts from the Vercel Chat SDK Slack adapter.
 
-Slack uses "mrkdwn" format which is similar but not identical to markdown:
-- Bold: *text* (not **text**)
-- Italic: _text_ (same)
-- Strikethrough: ~text~ (not ~~text~~)
-- Links: <url|text> (not [text](url))
-- User mentions: <@U123>
-- Channel mentions: <#C123|name>
+Outgoing: Slack now natively renders markdown via the ``markdown_text`` field
+on chat.postMessage / postEphemeral / update / scheduleMessage. We pass
+markdown through there and let Slack handle it. Interactive ``response_url``
+payloads do not accept ``markdown_text``, so those still use Slack mrkdwn text.
+
+Incoming: Slack ``message`` events still deliver text as mrkdwn
+(``*bold*``, ``<@U123>``, ``<url|text>``), so the ``to_ast`` parser stays.
 """
 
 from __future__ import annotations
@@ -16,33 +16,39 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from chat_sdk.adapters.slack.cards import SlackBlock
+from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.shared.base_format_converter import (
     BaseFormatConverter,
     Content,
     Root,
     parse_markdown,
+    stringify_markdown,
     table_to_ascii,
 )
 
+# Match bare @mentions (e.g. "@george") to rewrite as Slack's `<@george>`.
+# The lookbehind excludes `<` (already-formatted mentions like `<@U123>`) and
+# any word character, so email addresses like `user@example.com` are left alone.
+BARE_MENTION_REGEX = re.compile(r"(?<![<\w])@(\w+)")
+
 
 class SlackFormatConverter(BaseFormatConverter):
-    """Convert between Slack mrkdwn and standard markdown / plain text."""
+    """Convert between Slack formats and standard markdown / plain text."""
 
     # -------------------------------------------------------------------------
     # Core AST methods (required by BaseFormatConverter)
     # -------------------------------------------------------------------------
 
     def from_ast(self, ast: Root) -> str:
-        """Render an AST to Slack mrkdwn format."""
-        return self._from_ast_with_node_converter(ast, self._node_to_mrkdwn)
+        """Render an AST to standard markdown.
+
+        Slack accepts this directly via ``markdown_text`` and the
+        ``markdown`` block.
+        """
+        return stringify_markdown(ast)
 
     def to_ast(self, platform_text: str) -> Root:
-        """Parse Slack mrkdwn into an AST.
-
-        Converts Slack-specific syntax to standard markdown, then parses
-        with the shared parser.
-        """
+        """Parse Slack mrkdwn into an AST. Used for incoming ``message`` events."""
         markdown = platform_text
 
         # User mentions: <@U123|name> -> @name or <@U123> -> @U123
@@ -59,7 +65,7 @@ class SlackFormatConverter(BaseFormatConverter):
         # Bare links: <url> -> url
         markdown = re.sub(r"<(https?://[^<>]+)>", r"\1", markdown)
 
-        # Bold: *text* -> **text** (careful with emphasis)
+        # Bold: *text* -> **text** (Slack uses single * for bold)
         markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
 
         # Strikethrough: ~text~ -> ~~text~~
@@ -68,48 +74,73 @@ class SlackFormatConverter(BaseFormatConverter):
         return parse_markdown(markdown)
 
     # -------------------------------------------------------------------------
-    # Overrides
+    # Outgoing payload builders
     # -------------------------------------------------------------------------
 
-    def render_postable(self, message: Any) -> str:
-        """Render a postable message to Slack mrkdwn string.
+    def to_slack_payload(self, message: Any) -> dict[str, str]:
+        """Build the Slack API payload fields for a message.
 
-        Supports str, ``{"raw": ...}``, ``{"markdown": ...}``, ``{"ast": ...}``,
-        and card types (``{"card": ...}`` / ``CardElement``).
+        - ``str`` / ``{"raw"}`` -> ``{"text"}`` (plain -- preserves literal
+          ``*``, ``_``, etc.)
+        - ``{"markdown"}`` / ``{"ast"}`` -> ``{"markdown_text"}`` (Slack
+          renders natively)
+
+        Bare ``@user`` mentions are rewritten to ``<@user>`` and ``:emoji:``
+        placeholders are normalized for Slack in all branches.
+
+        Note: ``markdown_text`` has a 12,000 character limit; ``text`` allows
+        ~40,000.
+        Note: ``markdown_text`` is mutually exclusive with ``text`` and
+        ``blocks``.
         """
         if isinstance(message, str):
-            return self._convert_mentions_to_slack(message)
-        if hasattr(message, "raw"):
-            return self._convert_mentions_to_slack(message.raw)
+            return {"text": self._finalize(message)}
         if isinstance(message, dict):
             if "raw" in message:
-                return self._convert_mentions_to_slack(message["raw"])
+                return {"text": self._finalize(message["raw"])}
             if "markdown" in message:
-                return self.from_markdown(message["markdown"])
+                return {"markdown_text": self._finalize(message["markdown"])}
             if "ast" in message:
-                return self.from_ast(message["ast"])
-            if "card" in message:
-                from chat_sdk.cards import card_to_fallback_text
+                return {"markdown_text": self._finalize(stringify_markdown(message["ast"]))}
+            return {"text": ""}
+        # Dataclass / object-style messages
+        if getattr(message, "raw", None) is not None:
+            return {"text": self._finalize(message.raw)}
+        if getattr(message, "markdown", None) is not None:
+            return {"markdown_text": self._finalize(message.markdown)}
+        if getattr(message, "ast", None) is not None:
+            return {"markdown_text": self._finalize(stringify_markdown(message.ast))}
+        return {"text": ""}
 
-                return card_to_fallback_text(message["card"])
-            if message.get("type") == "card":
-                from chat_sdk.cards import is_card_element
+    def to_response_url_text(self, message: Any) -> str:
+        """Build text for Slack response_url payloads.
 
-                if is_card_element(message):
-                    from chat_sdk.cards import card_to_fallback_text
+        Slack rejects ``markdown_text`` on response_url (``no_text``), so
+        markdown/AST messages are rendered to Slack's legacy mrkdwn format
+        for this surface.
+        """
+        if isinstance(message, str):
+            return self._finalize(message)
+        if isinstance(message, dict):
+            if "raw" in message:
+                return self._finalize(message["raw"])
+            if "markdown" in message:
+                return convert_emoji_placeholders(self._ast_to_mrkdwn(parse_markdown(message["markdown"])), "slack")
+            if "ast" in message:
+                return convert_emoji_placeholders(self._ast_to_mrkdwn(message["ast"]), "slack")
+            return ""
+        # Dataclass / object-style messages
+        if getattr(message, "raw", None) is not None:
+            return self._finalize(message.raw)
+        if getattr(message, "markdown", None) is not None:
+            return convert_emoji_placeholders(self._ast_to_mrkdwn(parse_markdown(message.markdown)), "slack")
+        if getattr(message, "ast", None) is not None:
+            return convert_emoji_placeholders(self._ast_to_mrkdwn(message.ast), "slack")
+        return ""
 
-                    return card_to_fallback_text(message)  # type: ignore[arg-type]
-                return str(message)
-        # Dataclass-style objects
-        if hasattr(message, "markdown"):
-            return self.from_markdown(message.markdown)
-        if hasattr(message, "ast"):
-            return self.from_ast(message.ast)
-        if hasattr(message, "card"):
-            from chat_sdk.cards import card_to_fallback_text
-
-            return card_to_fallback_text(message.card)
-        return str(message)
+    # -------------------------------------------------------------------------
+    # Overrides
+    # -------------------------------------------------------------------------
 
     def extract_plain_text(self, platform_text: str) -> str:
         """Extract plain text from Slack mrkdwn by stripping formatting."""
@@ -135,72 +166,16 @@ class SlackFormatConverter(BaseFormatConverter):
         return text
 
     # -------------------------------------------------------------------------
-    # Slack table block support
-    # -------------------------------------------------------------------------
-
-    def to_blocks_with_table(self, ast: Root) -> list[SlackBlock] | None:
-        """Convert AST to Slack blocks, using native table block for the first table.
-
-        Returns None if the AST contains no tables (caller should use regular text).
-        Slack allows at most one table block per message; additional tables use ASCII.
-        """
-        if not isinstance(ast, dict):
-            return None
-
-        children = ast.get("children", [])
-        has_table = any(isinstance(node, dict) and node.get("type") == "table" for node in children)
-        if not has_table:
-            return None
-
-        blocks: list[SlackBlock] = []
-        used_native_table = False
-        text_buffer: list[str] = []
-
-        def flush_text() -> None:
-            nonlocal text_buffer
-            if text_buffer:
-                text = "\n\n".join(text_buffer)
-                if text.strip():
-                    blocks.append(
-                        {
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": text},
-                        }
-                    )
-                text_buffer = []
-
-        for child in children:
-            node = child if isinstance(child, dict) else {}
-            if node.get("type") == "table":
-                flush_text()
-                if used_native_table:
-                    # Additional tables fall back to ASCII in a code block
-                    ascii_table = table_to_ascii(node)
-                    blocks.append(
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"```\n{ascii_table}\n```",
-                            },
-                        }
-                    )
-                else:
-                    blocks.append(self._mdast_table_to_slack_block(node))
-                    used_native_table = True
-            else:
-                text_buffer.append(self._node_to_mrkdwn(node))
-
-        flush_text()
-        return blocks
-
-    # -------------------------------------------------------------------------
     # Private helpers
     # -------------------------------------------------------------------------
 
-    def _convert_mentions_to_slack(self, text: str) -> str:
-        """Convert @mentions to Slack format: @name -> <@name>."""
-        return re.sub(r"(?<![\w<])@(\w+)", r"<@\1>", text)
+    def _finalize(self, text: str) -> str:
+        """Rewrite bare @mentions and normalize emoji placeholders for Slack."""
+        return convert_emoji_placeholders(BARE_MENTION_REGEX.sub(r"<@\1>", text), "slack")
+
+    def _ast_to_mrkdwn(self, ast: Root) -> str:
+        """Render an AST to Slack's legacy mrkdwn (response_url surface only)."""
+        return self._from_ast_with_node_converter(ast, self._node_to_mrkdwn)
 
     def _node_to_mrkdwn(self, node: Content) -> str:
         """Convert a single AST node to Slack mrkdwn."""
@@ -215,7 +190,7 @@ class SlackFormatConverter(BaseFormatConverter):
 
         if node_type == "text":
             value = node.get("value", "")
-            return re.sub(r"(?<![\w<])@(\w+)", r"<@\1>", value)
+            return BARE_MENTION_REGEX.sub(r"<@\1>", value)
 
         if node_type == "strong":
             content = "".join(self._node_to_mrkdwn(c) for c in children)
@@ -250,7 +225,7 @@ class SlackFormatConverter(BaseFormatConverter):
             return "\n".join(f"> {self._node_to_mrkdwn(c)}" for c in children)
 
         if node_type == "list":
-            return self._render_list(node, 0, self._node_to_mrkdwn, "\u2022")
+            return self._render_list(node, 0, self._node_to_mrkdwn, "•")
 
         if node_type == "break":
             return "\n"
@@ -270,35 +245,3 @@ class SlackFormatConverter(BaseFormatConverter):
 
         # Default fallback for any node with children
         return self._default_node_to_text(node, self._node_to_mrkdwn)
-
-    def _mdast_table_to_slack_block(self, node: Content) -> SlackBlock:
-        """Convert a table AST node to a Slack table block.
-
-        @see https://docs.slack.dev/reference/block-kit/blocks/table-block/
-        """
-        rows_data: list[list[dict[str, str]]] = []
-
-        for row in node.get("children", []):
-            cells = []
-            for cell in row.get("children", []):
-                # Convert cell children to text, defaulting to a space if empty.
-                # Slack API requires table cell text to be at least 1 character.
-                # Use an explicit length check rather than a truthiness check to
-                # avoid substituting valid strings like "0".
-                raw_text = "".join(self._node_to_mrkdwn(c) for c in cell.get("children", []))
-                text = raw_text if len(raw_text) > 0 else " "
-                cells.append({"type": "raw_text", "text": text})
-            rows_data.append(cells)
-
-        block: SlackBlock = {"type": "table", "rows": rows_data}
-
-        align = node.get("align")
-        if align:
-            column_settings = [{"align": a or "left"} for a in align]
-            block["column_settings"] = column_settings
-
-        return block
-
-
-# Backwards compatibility alias
-SlackMarkdownConverter = SlackFormatConverter

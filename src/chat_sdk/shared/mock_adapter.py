@@ -82,7 +82,11 @@ class MockAdapter:
         self.user_name = f"{name}-bot"
         self.bot_user_id: str | None = None
         self.lock_scope = None
+        # Deprecated alias read alongside persist_thread_history; tests set
+        # either flag per-instance (mirrors the upstream mock, where neither
+        # is defined until a test assigns it).
         self.persist_message_history = None
+        self.persist_thread_history = None
 
         # Call recorders
         self._post_calls: list[tuple[str, AdapterPostableMessage]] = []

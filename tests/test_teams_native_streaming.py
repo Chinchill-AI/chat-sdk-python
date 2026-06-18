@@ -422,7 +422,7 @@ class TestNativeStreamingThrottle:
         the text via the flush), but a flush failure means buffered text
         was never accepted by Teams. Swallowing it would let
         ``Thread.stream`` record the buffered text in ``SentMessage`` /
-        ``_message_history`` even though the user never saw it. Re-raise
+        ``_thread_history`` even though the user never saw it. Re-raise
         so the outer ``Thread.stream`` short-circuits the history append.
         """
         adapter = _make_adapter(clock_step_ms=0.0)
@@ -1413,7 +1413,7 @@ class TestStreamEdgeCases:
         unconditionally on the happy path) would record empty text, and
         ``Thread.stream`` would override its own correct accumulator
         with the empty adapter view. Result: ``SentMessage`` and
-        ``_message_history`` both record an empty string while the user
+        ``_thread_history`` both record an empty string while the user
         sees nothing in Teams.
         """
         from chat_sdk.types import MarkdownTextChunk, PlanUpdateChunk, TaskUpdateChunk

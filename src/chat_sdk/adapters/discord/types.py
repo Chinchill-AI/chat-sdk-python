@@ -306,7 +306,13 @@ class DiscordGatewayReactionData(TypedDict, total=False):
 
 
 class DiscordForwardedEvent(TypedDict):
-    """A Gateway event forwarded to the webhook endpoint."""
+    """A Gateway event forwarded to the webhook endpoint.
+
+    Known types: ``GATEWAY_MESSAGE_CREATE``, ``GATEWAY_MESSAGE_REACTION_ADD``,
+    ``GATEWAY_MESSAGE_REACTION_REMOVE``, ``GATEWAY_INTERACTION_CREATE``.
+    For ``GATEWAY_INTERACTION_CREATE``, ``data`` is the raw wire-format
+    INTERACTION_CREATE dispatch payload (:class:`DiscordInteraction`).
+    """
 
     data: Any
     timestamp: int
