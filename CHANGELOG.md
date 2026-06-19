@@ -6,7 +6,7 @@ Synced to upstream `vercel/chat@4.30.0`. The mapped core (`packages/chat/src`) i
 
 ### New adapter: Twilio (SMS / MMS / Voice)
 
-- **`chat_sdk.adapters.twilio`** (vercel/chat#558; PRs #142 + the scaffolding PR). Twilio Programmable Messaging adapter (10th platform): inbound message webhooks with `X-Twilio-Signature` HMAC-SHA1 verification (`hmac.compare_digest`), outbound SMS/MMS through the Messages REST API (hand-rolled over an injectable transport — no official `twilio` SDK, mirroring upstream), 1:1 DM threads keyed `twilio:{sender}:{recipient}`, plus standalone `api` / `webhook` / `voice` helpers (TwiML builders, call + transcription parsing). New extra: `chat-sdk-python[twilio]`. Imports stay lazy so the package loads without `aiohttp` installed.
+- **`chat_sdk.adapters.twilio`** (vercel/chat#558; PR #142). Twilio Programmable Messaging adapter (10th platform): inbound message webhooks with `X-Twilio-Signature` HMAC-SHA1 verification (`hmac.compare_digest`), outbound SMS/MMS through the Messages REST API (hand-rolled over an injectable transport — no official `twilio` SDK, mirroring upstream), 1:1 DM threads keyed `twilio:{sender}:{recipient}`, plus standalone `api` / `webhook` / `voice` helpers (TwiML builders, call + transcription parsing). New extra: `chat-sdk-python[twilio]`. Imports stay lazy so the package loads without `aiohttp` installed.
 
 ### Teams adapter: migration to the official `microsoft-teams-apps` SDK (issue #93)
 
@@ -80,8 +80,7 @@ Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; 
 ### Python-only improvements
 
 - **Slack `files_upload_v2` confirmation surfaced through `post()`** (PR #117; also shipped early as 0.4.27.1). `SentMessage.raw` carries `uploaded_file_ids`; history persistence nulls `raw` to avoid storage bloat/PII.
-- **Slack: DM block-action responses no longer thread** (PR #133). `_handle_block_actions` mirrors `_handle_message_event`'s DM handling so HITL button replies don't create phantom "1 reply" threads.
-- **Google Chat: file delivery via multipart media upload** (PR #112).
+- **Slack: DM block-action responses no longer thread** (PR #137, supersedes #133). `_handle_block_actions` mirrors `_handle_message_event`'s DM handling so HITL button replies don't create phantom "1 reply" threads.
 
 ### Not ported / deferred (documented in docs/UPSTREAM_SYNC.md)
 
@@ -98,7 +97,7 @@ Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; 
 
 ## 0.4.27.1 (2026-05-29)
 
-Python-only point release on the 0.4.27 line (branched from `v0.4.27`; PR #120). Backports the Slack `files_upload_v2` confirmation fix (PR #117) so `SentMessage.raw` carries `uploaded_file_ids`, plus the history-persistence `raw` null-out. Shipped ahead of 0.4.29 to unblock chinchill-api's delivery-confirmation gating.
+Python-only point release on the 0.4.27 line (branched from `v0.4.27`; shipped via tag `v0.4.27.1` + merged PR #117). Backports the Slack `files_upload_v2` confirmation fix (PR #117) so `SentMessage.raw` carries `uploaded_file_ids`, plus the history-persistence `raw` null-out. Shipped ahead of 0.4.29 to unblock chinchill-api's delivery-confirmation gating.
 
 ## 0.4.29a2 (2026-05-28)
 
