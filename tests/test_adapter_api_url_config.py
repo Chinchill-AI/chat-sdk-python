@@ -225,6 +225,102 @@ class TestSlackApiUrl:
 
 
 # ===========================================================================
+# Slack — webClientOptions spread into both client constructions (chat@4.31, 8336a3e)
+# ===========================================================================
+
+
+class TestSlackWebClientOptions:
+    """``web_client_options`` is forwarded to BOTH the default async client and
+    the per-token sync client. Mirrors upstream's index.test.ts webClientOptions
+    block. DIVERGENCE: maps to slack_sdk ``WebClient`` kwargs (``timeout``,
+    ``retry_handlers``), not ``@slack/web-api`` axios options.
+    """
+
+    def _make(self, **overrides: Any) -> SlackAdapter:
+        config = SlackAdapterConfig(
+            signing_secret=overrides.pop("signing_secret", "test-signing-secret"),
+            bot_token=overrides.pop("bot_token", "xoxb-default-token"),
+            **overrides,
+        )
+        return SlackAdapter(config)
+
+    def test_option_reaches_default_async_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Upstream: "forwards webClientOptions to the internal WebClient".
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make(web_client_options={"timeout": 15})
+        client = adapter._get_client("xoxb-tok")
+        assert client.kwargs["timeout"] == 15
+        assert client.kwargs["token"] == "xoxb-tok"
+
+    def test_option_reaches_per_token_sync_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Upstream: "forwards webClientOptions to token-bound WebClients".
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make(bot_token=None, web_client_options={"timeout": 15})
+        client = adapter._get_web_client_for_token("xoxb-context-token")
+        assert client.kwargs["timeout"] == 15
+        assert client.kwargs["token"] == "xoxb-context-token"
+
+    def test_none_options_spreads_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The default (None) must add no extra kwargs at all.
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make()
+        assert adapter._web_client_options is None
+        client = adapter._get_client("xoxb-tok")
+        assert client.kwargs == {"token": "xoxb-tok"}
+
+    def test_empty_dict_options_still_spreads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Gate is ``is not None`` (not truthiness): an explicit empty ``{}`` is a
+        # valid no-op spread, not a fall-through. Locks ``is not None`` vs ``or``.
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make(web_client_options={})
+        assert adapter._web_client_options == {}
+        client = adapter._get_client("xoxb-tok")
+        assert client.kwargs == {"token": "xoxb-tok"}
+
+    def test_headers_isolated_across_per_token_clients(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Upstream: "isolates custom headers between token-bound WebClients".
+        # Each cached client must get its OWN headers dict so mutating one (e.g.
+        # the per-token Authorization header slack_sdk sets) cannot leak across
+        # tokens. We deep-copy ``headers`` per client to guarantee this.
+        _patch_slack_clients(monkeypatch)
+        headers = {"X-Test": "value"}
+        adapter = self._make(bot_token=None, web_client_options={"headers": headers})
+
+        first = adapter._get_web_client_for_token("xoxb-first")
+        second = adapter._get_web_client_for_token("xoxb-second")
+
+        assert first.kwargs["headers"] == {"X-Test": "value"}
+        assert second.kwargs["headers"] == {"X-Test": "value"}
+        # Distinct dict objects, not a shared reference.
+        assert first.kwargs["headers"] is not second.kwargs["headers"]
+
+    def test_caller_input_headers_not_mutated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The caller's original ``headers`` dict must never be mutated or
+        # aliased by the adapter. Upstream asserts the input ``headers`` is
+        # unchanged after building two clients.
+        _patch_slack_clients(monkeypatch)
+        headers = {"X-Test": "value"}
+        adapter = self._make(bot_token=None, web_client_options={"headers": headers})
+
+        first = adapter._get_web_client_for_token("xoxb-first")
+        adapter._get_web_client_for_token("xoxb-second")
+
+        # The constructed client holds a copy, not the caller's object.
+        assert first.kwargs["headers"] is not headers
+        assert headers == {"X-Test": "value"}
+
+    def test_option_reaches_both_client_kinds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The same option must land in BOTH the async default client and the
+        # sync per-token client (two distinct construction sites in the adapter).
+        _patch_slack_clients(monkeypatch)
+        adapter = self._make(web_client_options={"timeout": 42})
+        async_client = adapter._get_client("xoxb-tok")
+        sync_client = adapter._get_web_client_for_token("xoxb-tok")
+        assert async_client.kwargs["timeout"] == 42
+        assert sync_client.kwargs["timeout"] == 42
+
+
+# ===========================================================================
 # Discord — api_url threaded into _discord_fetch
 # ===========================================================================
 

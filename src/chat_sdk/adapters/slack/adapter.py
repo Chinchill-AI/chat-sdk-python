@@ -552,6 +552,31 @@ class SlackAdapter:
         # synchronous ``web_client`` escape hatch.
         self._slack_api_url: str | None = (config.api_url or os.environ.get("SLACK_API_URL")) or None
 
+        # Extra kwargs forwarded to every slack_sdk client (default async,
+        # per-token async cache, and synchronous WebClient). Mirrors upstream
+        # ``this.webClientOptions = config.webClientOptions`` (vercel/chat
+        # 8336a3e). Stored as-is (may be ``None``); spread is gated on
+        # ``is not None`` so an explicit ``{}`` still spreads. See
+        # ``_web_client_kwargs`` for the per-client deep-copy of ``headers``.
+        self._web_client_options: dict[str, Any] | None = config.web_client_options
+
+    def _web_client_kwargs(self) -> dict[str, Any]:
+        """Return a fresh copy of ``web_client_options`` for one client.
+
+        Spreads the configured options (gated on ``is not None`` so an empty
+        ``{}`` still applies) and **deep-copies any nested ``headers`` dict**,
+        so cached per-token clients never share a mutable ``headers`` object
+        and the caller's input dict is never mutated. Mirrors upstream's
+        per-client ``{ ...headers ? { headers: { ...headers } } : {} }`` spread.
+        """
+        if self._web_client_options is None:
+            return {}
+        kwargs = dict(self._web_client_options)
+        headers = self._web_client_options.get("headers")
+        if headers is not None:
+            kwargs["headers"] = dict(headers)
+        return kwargs
+
     # ------------------------------------------------------------------
     # Properties (Adapter protocol)
     # ------------------------------------------------------------------
@@ -868,7 +893,7 @@ class SlackAdapter:
         # rejects ``base_url=None`` (it requires a string), and an empty string
         # must fall back to the built-in default, so mirroring upstream's truthy
         # spread keeps the default otherwise.
-        client_kwargs: dict[str, Any] = {"token": resolved_token}
+        client_kwargs: dict[str, Any] = {**self._web_client_kwargs(), "token": resolved_token}
         if self._slack_api_url:
             client_kwargs["base_url"] = self._slack_api_url
         client = AsyncWebClient(**client_kwargs)
@@ -916,7 +941,7 @@ class SlackAdapter:
 
             # Same truthy ``base_url`` rule as ``_get_client`` — pass the
             # override only when truthy so slack_sdk keeps its default.
-            web_client_kwargs: dict[str, Any] = {"token": token}
+            web_client_kwargs: dict[str, Any] = {**self._web_client_kwargs(), "token": token}
             if self._slack_api_url:
                 web_client_kwargs["base_url"] = self._slack_api_url
             client = WebClient(**web_client_kwargs)
