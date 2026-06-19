@@ -47,6 +47,7 @@ __all__ = [
     "TeamsApiError",
     "TeamsApiResponse",
     "TeamsAttachment",
+    "TeamsContinuationContext",
     "TeamsConversationMember",
     "TeamsCreatedConversation",
     "TeamsCredential",
@@ -54,6 +55,7 @@ __all__ = [
     "TeamsFetch",
     "TeamsHttpResponse",
     "TeamsPostedMessage",
+    "assert_teams_ok",
     "build_teams_message_activity",
     "build_teams_typing_activity",
     "call_teams_connector_api",
@@ -209,6 +211,27 @@ class TeamsPostedMessage:
 
     id: str
     raw: Any
+
+
+@dataclass
+class TeamsContinuationContext:
+    """Addressing context for resuming a Teams conversation out of band.
+
+    Port of upstream ``TeamsContinuationContext`` (``api/messages.ts``): the
+    minimal set of fields needed to re-target the Bot Connector for a known
+    conversation (e.g. posting a follow-up activity from a background job).
+    ``conversation_id`` and ``service_url`` are required; the remaining fields
+    are optional addressing hints. Exposed as a public type so callers building
+    on the api subpath can persist and rehydrate this context.
+    """
+
+    conversation_id: str
+    service_url: str
+    activity_id: str | None = None
+    channel_id: str | None = None
+    reply_to_id: str | None = None
+    team_id: str | None = None
+    tenant_id: str | None = None
 
 
 async def resolve_teams_credential(credential: TeamsCredential | None) -> str | None:
@@ -563,6 +586,23 @@ def is_trusted_teams_service_url(url: str) -> bool:
     # the ``.com/`` boundary never appears.
     candidate = _ensure_trailing_slash(url)
     return any(pattern.match(candidate) for pattern in _ALLOWED_SERVICE_URL_PATTERNS)
+
+
+async def assert_teams_ok(response: Any) -> None:
+    """Raise :class:`TeamsApiError` when a Teams API response is not OK.
+
+    Port of upstream ``assertTeamsOk``: a no-op for a 2xx response, otherwise it
+    raises :class:`TeamsApiError` carrying the parsed body (see
+    :func:`read_response_body`) and the HTTP status. Accepts any object matching
+    the injected-fetch response protocol (an ``int`` ``status``/``status_code``,
+    an optional ``ok`` flag, and a ``text()`` method).
+    """
+    if not _response_ok(response):
+        raise TeamsApiError(
+            "Teams API request failed",
+            body=await read_response_body(response),
+            status=_response_status(response),
+        )
 
 
 async def read_response_body(response: Any) -> Any:

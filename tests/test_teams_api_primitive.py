@@ -29,7 +29,9 @@ import pytest
 
 from chat_sdk.adapters.teams.api import (
     TeamsApiError,
+    TeamsContinuationContext,
     TeamsCredentials,
+    assert_teams_ok,
     build_teams_message_activity,
     call_teams_connector_api,
     create_teams_conversation,
@@ -305,6 +307,36 @@ class TestTeamsApiPrimitives:
         assert body["isGroup"] is True
         assert body["members"] == [{"id": "user"}]
 
+    async def test_assert_teams_ok_passes_for_ok_responses(self) -> None:
+        # Port of upstream ``assertTeamsOk``: a 2xx response is a no-op (no
+        # raise, no return value).
+        assert await assert_teams_ok(_json_response({"id": "x"}, status=200)) is None
+        assert await assert_teams_ok(_empty_response(status=204)) is None
+
+    async def test_assert_teams_ok_raises_with_body_and_status(self) -> None:
+        # A non-2xx response raises TeamsApiError carrying the parsed body and
+        # status (mirroring upstream's ``readResponseBody`` capture).
+        with pytest.raises(TeamsApiError, match="Teams API request failed") as info:
+            await assert_teams_ok(_json_response({"error": "nope"}, status=403))
+
+        error = info.value
+        assert error.status == 403
+        assert error.body == {"error": "nope"}
+
+    def test_continuation_context_exposes_required_and_optional_fields(self) -> None:
+        # ``TeamsContinuationContext`` is part of the public exported surface
+        # (upstream ``api/messages.ts``): conversation_id + service_url are
+        # required addressing, the rest are optional hints defaulting to None.
+        context = TeamsContinuationContext(conversation_id="c", service_url=TRUSTED_SERVICE_URL)
+
+        assert context.conversation_id == "c"
+        assert context.service_url == TRUSTED_SERVICE_URL
+        assert context.activity_id is None
+        assert context.channel_id is None
+        assert context.reply_to_id is None
+        assert context.team_id is None
+        assert context.tenant_id is None
+
 
 class TestTeamsApiSsrfDivergence:
     """Python-first SSRF / token-leak gate (see docs/UPSTREAM_SYNC.md)."""
@@ -336,6 +368,43 @@ class TestTeamsApiSsrfDivergence:
                 text="hi",
             )
 
+        request.assert_not_awaited()
+
+    async def test_rejects_a_subdomain_suffix_lookalike_host(self) -> None:
+        # ``smba.uk.botframework.com.attacker.example`` embeds a trusted host
+        # (``smba.uk.botframework.com``) as a left-anchored *prefix* of the real
+        # host, with the attacker domain appended as further labels. A loose
+        # suffix/substring match would be fooled; the anchored allowlist regex
+        # (``^https://…\.botframework\.com/``) requires the ``.com/`` boundary to
+        # follow the host immediately, which never appears here. The gate must
+        # therefore reject it BEFORE any token is fetched (no bearer-token leak).
+        lookalike = "https://smba.uk.botframework.com.attacker.example/"
+        assert not is_trusted_teams_service_url(lookalike)
+
+        request = AsyncMock(return_value=_json_response({"access_token": "token"}))
+        with pytest.raises(ValueError, match="untrusted serviceUrl"):
+            await call_teams_connector_api(
+                credentials=CREDENTIALS,
+                path="v3/conversations/c/activities",
+                service_url=lookalike,
+                fetch=request,
+            )
+        request.assert_not_awaited()
+
+    async def test_empty_access_token_falls_back_to_client_credentials(self) -> None:
+        # Upstream ``resolveTeamsAccessToken`` uses a truthiness check
+        # (``if (directToken)``), so an empty-string accessToken is treated as
+        # "not supplied" and falls through to the appId/appPassword path. With
+        # neither present, it raises the credentials-required error rather than
+        # attaching an empty bearer token. The Python port mirrors the same
+        # truthiness fall-through.
+        request = AsyncMock(return_value=_json_response({"access_token": "token"}))
+        with pytest.raises(TeamsApiError, match="require either accessToken or appId and appPassword"):
+            await resolve_teams_access_token(
+                TeamsCredentials(access_token=""),
+                fetch=request,
+            )
+        # No token request was issued for the empty-credential case.
         request.assert_not_awaited()
 
     def test_allowlist_accepts_known_bot_framework_hosts(self) -> None:
