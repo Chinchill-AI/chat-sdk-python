@@ -21,7 +21,11 @@ Python-specific hardening (divergence from upstream, see
 through an exact ``{http, https, mailto}`` protocol allowlist using
 :func:`urllib.parse.urlparse` (port of the upstream ``URL().protocol`` check),
 rejecting ``javascript:``, ``data:``, relative, and other unsafe hrefs so they
-render as plain text rather than active links (SSRF / injection guard).
+render as plain text rather than active links (SSRF / injection guard). Because
+``urlparse`` is more lenient than the upstream ``new URL(...)`` (which throws on
+a bare-scheme href like ``http:`` or ``https://``), the ``http``/``https``
+branch additionally requires a non-empty host so those malformed hrefs are
+rejected to parity.
 """
 
 from __future__ import annotations
@@ -179,8 +183,21 @@ def safe_link_href(href: str) -> bool:
     Port of the upstream ``safeLinkHref`` protocol check using
     :func:`urllib.parse.urlparse`. Rejects ``javascript:``, ``data:``,
     relative, and any other scheme (SSRF / injection guard).
+
+    Upstream parses the href with ``new URL(href)``, which *throws* for a
+    malformed bare-scheme href like ``http:`` or ``https://`` (no authority),
+    so such hrefs are rejected and render as plain label text.
+    :func:`urllib.parse.urlparse` is lenient and would yield a matching scheme
+    with an empty ``netloc`` for those, so the ``http``/``https`` branch
+    additionally requires a non-empty host to match upstream. ``mailto:`` has
+    no ``netloc`` by design and stays allowed.
     """
     try:
-        return urlparse(href).scheme in _SAFE_LINK_PROTOCOLS
+        parsed = urlparse(href)
     except ValueError:
         return False
+    if parsed.scheme not in _SAFE_LINK_PROTOCOLS:
+        return False
+    if parsed.scheme in ("http", "https"):
+        return bool(parsed.netloc)
+    return True

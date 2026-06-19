@@ -14,6 +14,7 @@ forged-tag escaping and the disallowed-protocol SSRF gate.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -102,6 +103,27 @@ class TestTeamsFormatAdversarial:
         assert safe_link_href("/internal") is False
         assert safe_link_href("") is False
 
+    def test_bare_scheme_http_hrefs_are_rejected_to_upstream_parity(self):
+        # Upstream parses with `new URL(href)`, which throws (-> rejected) for a
+        # bare-scheme http(s) href with no host. `urlparse` is lenient and would
+        # yield a matching scheme with an empty netloc, so the gate requires a
+        # non-empty host for http/https to stay at parity.
+        assert safe_link_href("http:") is False
+        assert safe_link_href("https://") is False
+        assert safe_link_href("https:") is False
+        # ...but a host-bearing http(s) href and host-less mailto still pass.
+        assert safe_link_href("https://example.com") is True
+        assert safe_link_href("http://example.com") is True
+        assert safe_link_href("mailto:x@y.com") is True
+
+    def test_bare_scheme_links_render_as_plain_label(self):
+        # End-to-end: a bare-scheme href must render as plain label, while a
+        # host-bearing https link and a mailto link still emit live anchors.
+        assert markdown_to_teams_html("[l](http:)") == "l"
+        assert markdown_to_teams_html("[l](https://)") == "l"
+        assert markdown_to_teams_html("[m](mailto:x@y.com)") == '<a href="mailto:x@y.com">m</a>'
+        assert markdown_to_teams_html("[e](https://example.com)") == '<a href="https://example.com">e</a>'
+
     def test_unescape_does_not_collapse_double_escaped_ampersand(self):
         # `&amp;lt;` must round-trip to `&lt;`, not `<` (reverse-order unescape).
         assert unescape_teams_text("&amp;lt;") == "&lt;"
@@ -111,6 +133,35 @@ def _format_module_source() -> str:
     spec = importlib.util.find_spec("chat_sdk.adapters.teams.format")
     assert spec is not None and spec.origin is not None
     return Path(spec.origin).read_text(encoding="utf8")
+
+
+def _imported_module_paths(source: str) -> list[tuple[str, list[str]]]:
+    """Yield ``(line, modules)`` for each import statement in ``source``.
+
+    ``modules`` is every fully-qualified module path the statement reaches:
+
+    * ``import a.b`` -> ``["a.b"]``
+    * ``from a.b import c, d`` -> ``["a.b", "a.b.c", "a.b.d"]`` (so the split
+      ``from <pkg> import <module>`` form is normalized to ``<pkg>.<module>``)
+
+    AST parsing makes the scan robust to formatting and reconstructs the dotted
+    path that a plain substring check over the raw line would miss.
+    """
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    results: list[tuple[str, list[str]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            modules = [base] if base else []
+            modules += [f"{base}.{alias.name}" if base else alias.name for alias in node.names]
+        else:
+            continue
+        line = lines[node.lineno - 1].strip() if node.lineno - 1 < len(lines) else ""
+        results.append((line, modules))
+    return results
 
 
 class TestFormatImportBoundary:
@@ -127,11 +178,10 @@ class TestFormatImportBoundary:
     def test_source_does_not_import_the_sdk_runtime_or_adapter(self):
         # Inspect only the actual import statements, so the docstring (which
         # *mentions* these modules to describe the boundary) is not flagged.
-        import_lines = [
-            line.strip()
-            for line in _format_module_source().splitlines()
-            if line.strip().startswith(("import ", "from "))
-        ]
+        # Both `import <forbidden>` AND `from <forbidden> import ...` forms must
+        # be caught — including the split `from chat_sdk.adapters.teams import
+        # adapter` form, which a plain substring scan misses (the dotted module
+        # path `chat_sdk.adapters.teams.adapter` never appears on one side).
         forbidden = (
             "microsoft_teams",
             "httpx",
@@ -141,7 +191,12 @@ class TestFormatImportBoundary:
             "chat_sdk.adapters.teams.cards",
             "chat_sdk.chat",
         )
-        present = [f"{token} :: {line}" for line in import_lines for token in forbidden if token in line]
+        present = [
+            f"{token} :: {line}"
+            for line, modules in _imported_module_paths(_format_module_source())
+            for token in forbidden
+            if any(module == token or module.startswith(f"{token}.") for module in modules)
+        ]
         assert not present, f"format primitive imports forbidden modules: {present}"
 
     def test_emoji_reuse_does_not_duplicate_unicode(self):
