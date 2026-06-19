@@ -41,9 +41,11 @@ def extract_teams_continuation(activity: TeamsActivity) -> TeamsContinuation:
 
     ``conversation_id`` / ``service_url`` default to ``""`` (upstream ``?? ""``)
     so the continuation always carries the two fields a reply needs; the rest
-    are populated only when present, applying the same channelData fallbacks
-    as upstream (``channel.id`` then ``teamsChannelId``; ``team.id`` then
-    ``teamsTeamId``; ``conversation.tenantId`` then ``tenant.id``).
+    are populated only when present. Upstream builds the result with an object
+    spread where the *later* source wins when both are present, so the
+    channelData-native fields take precedence: ``teamsChannelId`` over
+    ``channel.id``; ``teamsTeamId`` over ``team.id``; ``channelData.tenant.id``
+    over ``conversation.tenantId``.
     """
     channel_data = _record(activity.get("channelData")) or {}
     conversation = _record(activity.get("conversation")) or {}
@@ -51,17 +53,17 @@ def extract_teams_continuation(activity: TeamsActivity) -> TeamsContinuation:
     team = _record(channel_data.get("team")) or {}
     tenant = _record(channel_data.get("tenant")) or {}
 
-    channel_id = _opt_str(channel.get("id"))
+    channel_id = _opt_str(channel_data.get("teamsChannelId"))
     if channel_id is None:
-        channel_id = _opt_str(channel_data.get("teamsChannelId"))
+        channel_id = _opt_str(channel.get("id"))
 
-    team_id = _opt_str(team.get("id"))
+    team_id = _opt_str(channel_data.get("teamsTeamId"))
     if team_id is None:
-        team_id = _opt_str(channel_data.get("teamsTeamId"))
+        team_id = _opt_str(team.get("id"))
 
-    tenant_id = _opt_str(conversation.get("tenantId"))
+    tenant_id = _opt_str(tenant.get("id"))
     if tenant_id is None:
-        tenant_id = _opt_str(tenant.get("id"))
+        tenant_id = _opt_str(conversation.get("tenantId"))
 
     conversation_id = conversation.get("id")
     service_url = activity.get("serviceUrl")

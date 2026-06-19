@@ -242,24 +242,26 @@ class TestContinuationFallbacks:
         assert continuation.team_id is None
         assert continuation.tenant_id is None
 
-    def test_continuation_prefers_primary_over_fallback(self):
-        # ``channel.id`` wins over ``teamsChannelId``; ``team.id`` over
-        # ``teamsTeamId``; ``conversation.tenantId`` over ``tenant.id``.
+    def test_continuation_channeldata_wins_over_conversation(self):
+        # Upstream builds the continuation via an object spread where the later
+        # source wins: ``teamsChannelId`` beats ``channel.id``; ``teamsTeamId``
+        # beats ``team.id``; ``channelData.tenant.id`` beats
+        # ``conversation.tenantId``.
         continuation = extract_teams_continuation(
             {
                 "channelData": {
-                    "channel": {"id": "primary-channel"},
-                    "team": {"id": "primary-team"},
-                    "teamsChannelId": "fallback-channel",
-                    "teamsTeamId": "fallback-team",
-                    "tenant": {"id": "fallback-tenant"},
+                    "channel": {"id": "channel-id"},
+                    "team": {"id": "team-id"},
+                    "teamsChannelId": "teams-channel-id",
+                    "teamsTeamId": "teams-team-id",
+                    "tenant": {"id": "channeldata-tenant"},
                 },
-                "conversation": {"id": "c", "tenantId": "primary-tenant"},
+                "conversation": {"id": "c", "tenantId": "conversation-tenant"},
             }
         )
-        assert continuation.channel_id == "primary-channel"
-        assert continuation.team_id == "primary-team"
-        assert continuation.tenant_id == "primary-tenant"
+        assert continuation.channel_id == "teams-channel-id"
+        assert continuation.team_id == "teams-team-id"
+        assert continuation.tenant_id == "channeldata-tenant"
 
 
 # ---------------------------------------------------------------------------
