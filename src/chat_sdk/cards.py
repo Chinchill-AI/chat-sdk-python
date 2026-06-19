@@ -44,6 +44,8 @@ class _LinkButtonRequired(TypedDict):
 class LinkButtonElement(_LinkButtonRequired, total=False):
     """Link button element that opens a URL."""
 
+    # Optional action identifier emitted by platforms that report link clicks
+    id: str
     style: ButtonStyle
 
 
@@ -288,14 +290,22 @@ def LinkButton(
     url: str,
     label: str,
     style: ButtonStyle | None = None,
+    id_: str | None = None,
 ) -> LinkButtonElement:
     """Create a LinkButton element that opens a URL when clicked.
 
     Example::
 
         LinkButton(url="https://example.com", label="View Docs")
+
+    ``id_`` is an optional action identifier emitted by platforms that report
+    link clicks. Upstream sets ``id`` unconditionally and relies on
+    ``JSON.stringify`` dropping ``undefined``; in Python we only write the
+    key when it is provided so an unset id never serializes as ``null``.
     """
     element: LinkButtonElement = {"type": "link-button", "url": url, "label": label}
+    if id_ is not None:
+        element["id"] = id_
     if style is not None:
         element["style"] = style
     return element

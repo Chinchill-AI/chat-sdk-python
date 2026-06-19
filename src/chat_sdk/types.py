@@ -242,6 +242,7 @@ class Author:
 
     full_name: str
     is_bot: bool | Literal["unknown"]
+    # Whether this message was sent by this bot/runtime
     is_me: bool
     user_id: str
     user_name: str

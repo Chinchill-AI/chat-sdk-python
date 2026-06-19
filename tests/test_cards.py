@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 from chat_sdk.cards import (
     CardElement,
+    LinkButton,
     card_child_to_fallback_text,
     is_card_element,
     table_element_to_ascii,
@@ -208,3 +211,37 @@ class TestRenderGfmTable:
         # No data rows — only header + separator.
         lines = render_gfm_table(["only"], [])
         assert lines == ["| only |", "| --- |"]
+
+
+class TestLinkButtonId:
+    """Regression tests for the optional stable LinkButton ``id`` field.
+
+    Port of upstream stable-id-for-link-buttons (chat@4.31.0, commit 171657a).
+    cards.test.ts is byte-identical 4.30->4.31, so upstream ships no test for
+    this; these are Python-only regressions that pin our emit/parse behavior.
+    Upstream sets ``id: options.id`` unconditionally and lets ``JSON.stringify``
+    drop ``undefined`` — Python must only write the key when ``id_`` is given.
+    """
+
+    def test_id_written_when_provided(self):
+        btn = LinkButton(url="https://example.com/docs", label="Docs", id_="open-docs")
+        assert btn["id"] == "open-docs"
+
+    def test_no_id_key_when_omitted(self):
+        # Emit/parse symmetry guard: an unset id must NOT serialize as a key
+        # (no literal None/null), so old persisted cards round-trip unchanged.
+        btn = LinkButton(url="https://example.com/docs", label="Docs")
+        assert "id" not in btn
+
+    def test_empty_string_id_is_emitted(self):
+        # Explicit empty string is distinct from unset and must survive
+        # (this is exactly why we use ``is not None`` and not ``id_ or ...``).
+        btn = LinkButton(url="https://example.com/docs", label="Docs", id_="")
+        assert "id" in btn
+        assert btn["id"] == ""
+
+    def test_id_survives_wire_serialization(self):
+        btn = LinkButton(url="https://example.com/docs", label="Docs", id_="open-docs")
+        round_tripped = json.loads(json.dumps(btn))
+        assert round_tripped["id"] == "open-docs"
+        assert round_tripped["type"] == "link-button"
