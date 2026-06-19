@@ -83,6 +83,7 @@ from chat_sdk.types import (
     PostableMarkdown,
     RawMessage,
     ReactionEvent,
+    SlashCommandEvent,
     StreamChunk,
     StreamOptions,
     ThreadInfo,
@@ -1049,7 +1050,15 @@ class TelegramAdapter:
             or update.get("edited_channel_post")
         )
 
-        if message_update:
+        # Slash commands are gated to fresh ``message`` updates only — edited
+        # messages and channel posts never route to the slash-command
+        # handlers. ``handle_slash_command_update`` returns ``True`` when it
+        # consumed the update, in which case the regular message path is
+        # skipped (mirrors upstream ``messageUpdate && !handledSlashCommand``).
+        message = update.get("message")
+        handled_slash_command = message is not None and self.handle_slash_command_update(message, options)
+
+        if message_update and not handled_slash_command:
             self.handle_incoming_message_update(message_update, options)
 
         if update.get("callback_query"):
@@ -1078,6 +1087,103 @@ class TelegramAdapter:
         self.cache_message(parsed_message)
 
         self._chat.process_message(self, thread_id, parsed_message, options)
+
+    def handle_slash_command_update(
+        self,
+        telegram_message: TelegramMessage,
+        options: WebhookOptions | None = None,
+    ) -> bool:
+        """Route a leading ``/command`` message to the slash-command handlers.
+
+        Returns ``True`` when the update was consumed as a slash command (so
+        :meth:`process_update` skips the regular message path), and ``False``
+        otherwise. Like the Discord adapter, the event is built with
+        ``channel=None`` and the resolved thread ID is attached as
+        ``channel_id`` — ``Chat`` re-wraps it into a real ``Channel`` before
+        invoking handlers.
+        """
+        if not self._chat:
+            return False
+
+        slash_command = self.parse_slash_command(telegram_message)
+        if not slash_command:
+            return False
+
+        thread_id = self.encode_thread_id(
+            TelegramThreadId(
+                chat_id=str(telegram_message["chat"]["id"]),
+                message_thread_id=telegram_message.get("message_thread_id"),
+            )
+        )
+
+        parsed_message = self.parse_telegram_message(telegram_message, thread_id)
+        self.cache_message(parsed_message)
+
+        event = SlashCommandEvent(
+            adapter=self,
+            channel=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
+            user=parsed_message.author,
+            command=slash_command["command"],
+            text=slash_command["text"],
+            raw=telegram_message,
+        )
+        event.channel_id = thread_id  # type: ignore[attr-defined]
+        self._chat.process_slash_command(event, options)
+
+        return True
+
+    def parse_slash_command(
+        self,
+        telegram_message: TelegramMessage,
+    ) -> dict[str, str] | None:
+        """Extract a leading ``/command`` (and trailing text) from a message.
+
+        Returns ``None`` unless the message carries a ``bot_command`` entity
+        at offset 0 (a command at any other offset routes to
+        ``process_message``). ``@bot`` targeting is matched
+        case-insensitively against :attr:`user_name`; a command addressed to
+        another bot (``/ping@otherbot``) is ignored. Both the text/caption
+        selection (``has_text = text is not None``, so an empty-string
+        ``text`` still takes the text branch) and the command/trailing-text
+        split use UTF-16-LE offsets, matching Telegram's entity indexing.
+        """
+        has_text = telegram_message.get("text") is not None
+        text = telegram_message.get("text") if has_text else telegram_message.get("caption")
+        entities = (
+            (telegram_message.get("entities") or []) if has_text else (telegram_message.get("caption_entities") or [])
+        )
+
+        if not text:
+            return None
+
+        command_entity = next(
+            (e for e in entities if e.get("type") == "bot_command" and e.get("offset", 0) == 0),
+            None,
+        )
+
+        if not command_entity:
+            return None
+
+        raw_command = self.entity_text(text, command_entity)
+        if not raw_command.startswith("/"):
+            return None
+
+        command_without_slash = raw_command[1:]
+        at_index = command_without_slash.find("@")
+        command_name = command_without_slash if at_index == -1 else command_without_slash[:at_index]
+        target_bot = None if at_index == -1 else command_without_slash[at_index + 1 :]
+
+        if not command_name:
+            return None
+
+        if target_bot and target_bot.lower() != self._user_name.lower():
+            return None
+
+        offset = command_entity.get("offset", 0)
+        length = command_entity.get("length", 0)
+        trailing = self._slice_utf16(text, offset + length).lstrip()
+
+        return {"command": f"/{command_name}", "text": trailing}
 
     def handle_callback_query(
         self,
@@ -2492,6 +2598,18 @@ class TelegramAdapter:
         # Use UTF-16 encoding for correct offset handling
         utf16 = text.encode("utf-16-le")
         return utf16[offset * 2 : (offset + length) * 2].decode("utf-16-le")
+
+    @staticmethod
+    def _slice_utf16(text: str, offset: int) -> str:
+        """Return the substring of ``text`` from a UTF-16 code-unit ``offset``.
+
+        Telegram entity offsets count UTF-16 code units (matching JavaScript
+        ``String.prototype.slice``), so an astral-plane code point (e.g. an
+        emoji) advances the offset by two. Naive Python ``str`` slicing counts
+        code points and would mis-split such text — this encodes to UTF-16-LE
+        and slices by byte, mirroring :meth:`entity_text`.
+        """
+        return text.encode("utf-16-le")[offset * 2 :].decode("utf-16-le")
 
     @staticmethod
     def escape_regex(input_str: str) -> str:
