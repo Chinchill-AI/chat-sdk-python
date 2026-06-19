@@ -219,6 +219,313 @@ class TestTelegramWebhook:
 
 
 # ---------------------------------------------------------------------------
+# Slash command routing (chat@4.31 9c936f8)
+# ---------------------------------------------------------------------------
+
+
+def _slash_adapter_and_chat() -> tuple[TelegramAdapter, Any]:
+    """Wire a ``userName=mybot`` adapter to a mock chat.
+
+    ``Chat.process_slash_command`` / ``process_message`` are *synchronous*
+    methods (they spawn fire-and-forget tasks internally), and the adapter
+    calls them synchronously, so the mock uses ``MagicMock`` — an
+    ``AsyncMock`` would hand the adapter an unawaited coroutine that never
+    reflects the real (sync) call.
+    """
+    from unittest.mock import MagicMock
+
+    adapter = _make_adapter(user_name="mybot")
+    chat = MagicMock()
+    chat.process_slash_command = MagicMock()
+    chat.process_message = MagicMock()
+    adapter._chat = chat
+    return adapter, chat
+
+
+class TestTelegramSlashCommandRouting:
+    """Bot-command routing ported from the TS index.test.ts blocks."""
+
+    @pytest.mark.asyncio
+    async def test_routes_bot_command_messages_to_slash_handlers(self):
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 2,
+                "message": _sample_message(
+                    text="/ping@mybot hello world",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        assert chat.process_slash_command.call_count == 1
+        chat.process_message.assert_not_called()
+
+        event = chat.process_slash_command.call_args.args[0]
+        assert event.channel_id == "telegram:123"
+        assert event.command == "/ping"
+        assert event.text == "hello world"
+        assert event.user.full_name == "User"
+        assert event.user.user_id == "456"
+
+    @pytest.mark.asyncio
+    async def test_routes_bot_command_captions_to_slash_handlers(self):
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 3,
+                "message": _sample_message(
+                    caption="/ping hello world",
+                    text=None,
+                    caption_entities=[{"type": "bot_command", "offset": 0, "length": 5}],
+                    photo=[
+                        {
+                            "file_id": "photo-1",
+                            "file_unique_id": "photo-unique-1",
+                            "height": 100,
+                            "width": 100,
+                        }
+                    ],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        assert chat.process_slash_command.call_count == 1
+        chat.process_message.assert_not_called()
+
+        event = chat.process_slash_command.call_args.args[0]
+        assert event.command == "/ping"
+        assert event.text == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_ignores_bot_commands_addressed_to_another_bot(self):
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 3,
+                "message": _sample_message(
+                    text="/ping@otherbot hello world",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 14}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_only_treats_leading_bot_command_entities_as_slash_commands(self):
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 4,
+                "message": _sample_message(
+                    text="please /ping",
+                    entities=[{"type": "bot_command", "offset": 7, "length": 5}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_string_text_takes_text_branch_not_caption(self):
+        """``has_text = text is not None``: empty ``text`` still uses the
+        text branch, so a caption-side ``bot_command`` entity is ignored and
+        the update routes to ``process_message`` (input-sweep regression)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 5,
+                "message": _sample_message(
+                    text="",
+                    caption="/ping hello",
+                    caption_entities=[{"type": "bot_command", "offset": 0, "length": 5}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    def test_trailing_text_split_uses_utf16_offsets(self):
+        """The command/trailing-text split is computed on UTF-16 code-unit
+        offsets, not Python code points.
+
+        Telegram reports ``length`` in UTF-16 code units. The command token
+        ``/p😀g`` spans 4 code points but 5 UTF-16 units (the astral emoji is
+        a surrogate pair). The trailing text abuts the token with **no
+        separating space** (``/p😀ghello``), so the split offset cannot be
+        masked by a ``lstrip`` after the fact:
+
+        * UTF-16-aware split at unit ``offset + length == 5`` lands exactly on
+          the ``h`` and yields ``"hello"``.
+        * A naive Python code-point slice ``text[5:]`` over-advances (the
+          emoji counts as one code point, not two) and yields ``"ello"`` —
+          the leading ``h`` is silently dropped.
+
+        Because there is no whitespace at the boundary, the two paths diverge
+        in the final result, so this test FAILS against a naive
+        ``text[entity_length:]`` slice.
+        """
+        adapter, _ = _slash_adapter_and_chat()
+        # "/p😀g" = / p <emoji=2 units> g = 4 code points but 5 UTF-16 units;
+        # "hello" follows immediately with no separator.
+        result = adapter.parse_slash_command(
+            _sample_message(
+                text="/p😀ghello",
+                entities=[{"type": "bot_command", "offset": 0, "length": 5}],
+            )
+        )
+        assert result == {"command": "/p😀g", "text": "hello"}
+
+    def test_entity_text_split_naive_codepoint_would_diverge(self):
+        """Guards the UTF-16 split against a naive ``str`` slice regression.
+
+        ``_slice_utf16`` and a naive code-point slice must diverge for astral
+        text, proving the helper is load-bearing (not a no-op on ASCII).
+        With the trailing text abutting the token (no separator), the two
+        slices return different strings that no ``lstrip`` can reconcile."""
+        adapter, _ = _slash_adapter_and_chat()
+        text = "/p😀ghello"
+        # UTF-16-aware slice at code-unit 5 lands on the "h".
+        assert adapter._slice_utf16(text, 5) == "hello"
+        # The naive code-point slice over-advances and eats the leading "h".
+        assert text[5:] == "ello"
+
+    @pytest.mark.asyncio
+    async def test_at_bot_targeting_is_case_insensitive(self):
+        """``/ping@<MixedCase>`` still routes to the slash handler when the
+        casing differs from ``user_name`` — the ``.lower()`` normalization on
+        both sides is load-bearing (mutating it to a case-sensitive ``!=``
+        drops this command to ``process_message``)."""
+        adapter, chat = _slash_adapter_and_chat()  # user_name == "mybot"
+        body = json.dumps(
+            {
+                "update_id": 7,
+                "message": _sample_message(
+                    text="/ping@MyBot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        assert chat.process_slash_command.call_count == 1
+        chat.process_message.assert_not_called()
+        event = chat.process_slash_command.call_args.args[0]
+        assert event.command == "/ping"
+        assert event.text == "hello"
+
+    @pytest.mark.asyncio
+    async def test_edited_message_with_bot_command_does_not_route_to_slash(self):
+        """Slash gating is scoped to ``update.message`` only: an
+        ``edited_message`` carrying a leading ``bot_command`` entity routes to
+        the regular message path, never the slash handler (mutating the gate
+        to read ``edited_message`` would mis-route the edit)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 8,
+                "edited_message": _sample_message(
+                    text="/ping@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_channel_post_with_bot_command_does_not_route_to_slash(self):
+        """A ``channel_post`` carrying a leading ``bot_command`` entity routes
+        to the regular message path, not the slash handler — slash gating only
+        reads ``update.message`` (mirrors upstream ``update.message``)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 9,
+                "channel_post": _sample_message(
+                    text="/ping@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_command_addressed_only_to_another_bot_routes_to_message(self):
+        """``/@bot`` (empty command name) yields no slash command — the
+        ``if not command_name: return None`` guard sends it to
+        ``process_message`` (matches upstream's ``if (!commandName)``)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 10,
+                "message": _sample_message(
+                    text="/@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 7}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bare_slash_routes_to_message(self):
+        """A bare ``/`` (no command name) yields no slash command and routes
+        to ``process_message`` — the empty-``command_name`` guard, plus the
+        ``startswith('/')`` / ``offset == 0`` gating, all hold."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 11,
+                "message": _sample_message(
+                    text="/ hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 1}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # isDM
 # ---------------------------------------------------------------------------
 
