@@ -368,17 +368,28 @@ class TestTelegramSlashCommandRouting:
         """The command/trailing-text split is computed on UTF-16 code-unit
         offsets, not Python code points.
 
-        Telegram reports ``length`` in UTF-16 code units. The entity
+        Telegram reports ``length`` in UTF-16 code units. The command token
         ``/p😀g`` spans 4 code points but 5 UTF-16 units (the astral emoji is
-        a surrogate pair), so the trailing-text split starts at unit 5. A
-        naive code-point slice — ``text[5:]`` — over-advances and drops the
-        leading ``h``; the UTF-16-aware slice keeps it.
+        a surrogate pair). The trailing text abuts the token with **no
+        separating space** (``/p😀ghello``), so the split offset cannot be
+        masked by a ``lstrip`` after the fact:
+
+        * UTF-16-aware split at unit ``offset + length == 5`` lands exactly on
+          the ``h`` and yields ``"hello"``.
+        * A naive Python code-point slice ``text[5:]`` over-advances (the
+          emoji counts as one code point, not two) and yields ``"ello"`` —
+          the leading ``h`` is silently dropped.
+
+        Because there is no whitespace at the boundary, the two paths diverge
+        in the final result, so this test FAILS against a naive
+        ``text[entity_length:]`` slice.
         """
         adapter, _ = _slash_adapter_and_chat()
-        # "/p😀g" = / p <emoji=2 units> g = 4 code points but 5 UTF-16 units.
+        # "/p😀g" = / p <emoji=2 units> g = 4 code points but 5 UTF-16 units;
+        # "hello" follows immediately with no separator.
         result = adapter.parse_slash_command(
             _sample_message(
-                text="/p😀g hello",
+                text="/p😀ghello",
                 entities=[{"type": "bot_command", "offset": 0, "length": 5}],
             )
         )
@@ -388,12 +399,130 @@ class TestTelegramSlashCommandRouting:
         """Guards the UTF-16 split against a naive ``str`` slice regression.
 
         ``_slice_utf16`` and a naive code-point slice must diverge for astral
-        text, proving the helper is load-bearing (not a no-op on ASCII)."""
+        text, proving the helper is load-bearing (not a no-op on ASCII).
+        With the trailing text abutting the token (no separator), the two
+        slices return different strings that no ``lstrip`` can reconcile."""
         adapter, _ = _slash_adapter_and_chat()
-        text = "/p😀g hello"
-        assert adapter._slice_utf16(text, 5) == " hello"
+        text = "/p😀ghello"
+        # UTF-16-aware slice at code-unit 5 lands on the "h".
+        assert adapter._slice_utf16(text, 5) == "hello"
         # The naive code-point slice over-advances and eats the leading "h".
-        assert text[5:] == "hello"
+        assert text[5:] == "ello"
+
+    @pytest.mark.asyncio
+    async def test_at_bot_targeting_is_case_insensitive(self):
+        """``/ping@<MixedCase>`` still routes to the slash handler when the
+        casing differs from ``user_name`` — the ``.lower()`` normalization on
+        both sides is load-bearing (mutating it to a case-sensitive ``!=``
+        drops this command to ``process_message``)."""
+        adapter, chat = _slash_adapter_and_chat()  # user_name == "mybot"
+        body = json.dumps(
+            {
+                "update_id": 7,
+                "message": _sample_message(
+                    text="/ping@MyBot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        assert chat.process_slash_command.call_count == 1
+        chat.process_message.assert_not_called()
+        event = chat.process_slash_command.call_args.args[0]
+        assert event.command == "/ping"
+        assert event.text == "hello"
+
+    @pytest.mark.asyncio
+    async def test_edited_message_with_bot_command_does_not_route_to_slash(self):
+        """Slash gating is scoped to ``update.message`` only: an
+        ``edited_message`` carrying a leading ``bot_command`` entity routes to
+        the regular message path, never the slash handler (mutating the gate
+        to read ``edited_message`` would mis-route the edit)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 8,
+                "edited_message": _sample_message(
+                    text="/ping@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_channel_post_with_bot_command_does_not_route_to_slash(self):
+        """A ``channel_post`` carrying a leading ``bot_command`` entity routes
+        to the regular message path, not the slash handler — slash gating only
+        reads ``update.message`` (mirrors upstream ``update.message``)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 9,
+                "channel_post": _sample_message(
+                    text="/ping@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_command_addressed_only_to_another_bot_routes_to_message(self):
+        """``/@bot`` (empty command name) yields no slash command — the
+        ``if not command_name: return None`` guard sends it to
+        ``process_message`` (matches upstream's ``if (!commandName)``)."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 10,
+                "message": _sample_message(
+                    text="/@mybot hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 7}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bare_slash_routes_to_message(self):
+        """A bare ``/`` (no command name) yields no slash command and routes
+        to ``process_message`` — the empty-``command_name`` guard, plus the
+        ``startswith('/')`` / ``offset == 0`` gating, all hold."""
+        adapter, chat = _slash_adapter_and_chat()
+        body = json.dumps(
+            {
+                "update_id": 11,
+                "message": _sample_message(
+                    text="/ hello",
+                    entities=[{"type": "bot_command", "offset": 0, "length": 1}],
+                ),
+            }
+        )
+
+        response = await adapter.handle_webhook(_make_request(body))
+        assert response["status"] == 200
+
+        chat.process_slash_command.assert_not_called()
+        assert chat.process_message.call_count == 1
 
 
 # ---------------------------------------------------------------------------
