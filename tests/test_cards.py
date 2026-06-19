@@ -14,6 +14,35 @@ from chat_sdk.cards import (
 from chat_sdk.shared.card_utils import escape_table_cell, render_gfm_table
 
 
+class TestLinkButtonFactory:
+    """``LinkButton`` factory — including the optional ``id`` (chat@4.31)."""
+
+    def test_minimal(self):
+        assert LinkButton(url="https://example.com", label="Open") == {
+            "type": "link-button",
+            "url": "https://example.com",
+            "label": "Open",
+        }
+
+    def test_includes_id_when_provided(self):
+        # chat@4.31: ``id`` is an optional action identifier emitted by
+        # platforms that report link clicks.
+        assert LinkButton(url="https://example.com", label="Open", id="open-btn") == {
+            "type": "link-button",
+            "url": "https://example.com",
+            "label": "Open",
+            "id": "open-btn",
+        }
+
+    def test_omits_id_key_when_none(self):
+        # Absent id must NOT add an ``id`` key (so adapter ``??`` fallbacks fire).
+        assert "id" not in LinkButton(url="https://example.com", label="Open")
+
+    def test_empty_string_id_is_kept(self):
+        # An explicit empty-string id is kept (locks ``is not None``, not truthy).
+        assert LinkButton(url="https://example.com", label="Open", id="")["id"] == ""
+
+
 class TestIsCardElement:
     """Tests for is_card_element."""
 

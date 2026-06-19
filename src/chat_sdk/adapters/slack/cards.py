@@ -229,6 +229,9 @@ def _convert_button_to_element(button: ButtonElement) -> SlackButtonElement_:
 def _convert_link_button_to_element(button: LinkButtonElement) -> SlackLinkButtonElement_:
     """Convert a LinkButtonElement to a Slack link button element."""
     url = button.get("url", "")
+    # `??` semantics: an explicit (even empty-string) id is used verbatim;
+    # only a missing/None id falls back to the URL-derived action_id.
+    button_id = button.get("id")
     element: SlackLinkButtonElement_ = {
         "type": "button",
         "text": {
@@ -236,7 +239,7 @@ def _convert_link_button_to_element(button: LinkButtonElement) -> SlackLinkButto
             "text": convert_emoji(button.get("label", "")),
             "emoji": True,
         },
-        "action_id": f"link-{url[:200]}",
+        "action_id": button_id if button_id is not None else f"link-{url[:200]}",
         "url": url,
     }
 

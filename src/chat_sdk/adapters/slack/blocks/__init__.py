@@ -311,9 +311,13 @@ def _button_to_element(button: SlackButtonElement, convert_emoji: _EmojiConverte
 
 
 def _link_button_to_element(button: SlackLinkButtonElement, convert_emoji: _EmojiConverter) -> dict[str, object]:
+    # `??` semantics: an explicit (even empty-string) id is used verbatim;
+    # only a missing/None id falls back to the URL-derived action_id.
+    button_id = button.get("id")
+    action_id = button_id if button_id is not None else f"link-{button['url']}"
     return _compact(
         {
-            "action_id": _truncate_text(f"link-{button['url']}", LIMITS.action_id),
+            "action_id": _truncate_text(action_id, LIMITS.action_id),
             "style": _map_button_style(button.get("style")),
             "text": _plain_text(button["label"], convert_emoji, LIMITS.button_text),
             "type": "button",

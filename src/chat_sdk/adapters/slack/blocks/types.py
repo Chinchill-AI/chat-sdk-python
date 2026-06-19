@@ -63,6 +63,7 @@ class SlackLinkButtonElement(TypedDict):
     type: Literal["link-button"]
     label: str
     url: str
+    id: NotRequired[str]
     style: NotRequired[SlackButtonStyle]
 
 

@@ -187,6 +187,46 @@ class TestCardToBlockKit:
         assert el["text"] == {"type": "plain_text", "text": "View Docs", "emoji": True}
         assert el["url"] == "https://example.com/docs"
         assert el["style"] == "primary"
+        # No explicit id → action_id falls back to the URL-derived form.
+        assert el["action_id"] == "link-https://example.com/docs"
+
+    def test_link_button_uses_custom_action_id(self):
+        # chat@4.31 (171657a): an explicit ``id`` is used verbatim as the
+        # action_id, so platforms that report link clicks get a stable id.
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Actions(
+                        [
+                            LinkButton(
+                                id="agent_slack_auth_signin",
+                                url="https://vercel.com/oauth/authorize",
+                                label="Sign in",
+                            ),
+                        ]
+                    ),
+                ]
+            )
+        )
+        el = blocks[0]["elements"][0]
+        assert el["action_id"] == "agent_slack_auth_signin"
+
+    def test_link_button_empty_id_is_used_verbatim(self):
+        # ``??`` semantics (NOT ``or``): an explicit empty-string id is used
+        # as-is and does NOT fall back to ``link-{url}``. Locks ``is not None``.
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Actions(
+                        [
+                            LinkButton(id="", url="https://example.com/docs", label="View Docs"),
+                        ]
+                    ),
+                ]
+            )
+        )
+        el = blocks[0]["elements"][0]
+        assert el["action_id"] == ""
 
     def test_fields(self):
         blocks = card_to_block_kit(
