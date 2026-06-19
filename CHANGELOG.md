@@ -35,7 +35,7 @@ The residual adapter-level divergences (we keep the SDK as the auth + transport 
 
 ### Pre-existing parity gaps closed (4.30 audit)
 
-A pre-ship parity audit (the CI fidelity check covers only the mapped CORE `packages/chat` tests, never the adapters) surfaced 9 gaps present since 0.4.29 — the `chat@4.29.0` and `chat@4.30.0` tags are content-identical for the mapped core — and the 7 portable ones were closed in this wave:
+A pre-ship parity audit (the CI fidelity check covers only the mapped CORE `packages/chat` tests, never the adapters) surfaced 9 gaps present since 0.4.29 — the `chat@4.29.0` and `chat@4.30.0` tags are content-identical for the mapped core — and all but one (Linear agent sessions, deferred to 4.31) were closed in this wave, across four PRs:
 
 - **Google Chat: clear `cardsV2` on edit-to-plain-text** (PR #148). BUG — editing a card message down to plain text left the old card stranded on the message; `edit_message` now sends an explicit empty `cardsV2` so the card is dropped (streaming finalization is the common trigger). Plus **`Select` / `RadioSelect` → `selectionInput` widgets**: these card elements now render as Google Chat `selectionInput` widgets and the selected option is read back from `formInputs`.
 - **Teams: ChoiceSet auto-submit fan-out** (PR #149). BUG / contract break — an Adaptive Card `Action.Submit` carrying multiple input keys now fires one `process_action` per input key, so each `on_action(input_key)` handler runs, instead of a single `__auto_submit` dispatch that no handler matched. Plus **`list_threads` / `post_channel_message`** (were raising `ChatNotImplementedError`, now implemented) and **`api_url` / `TEAMS_API_URL`** for a custom Bot Framework endpoint (GCC-High / sovereign cloud).
