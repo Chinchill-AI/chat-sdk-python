@@ -908,7 +908,7 @@ class TestStream:
     async def test_group_chat_stream_accumulates_and_posts_single_message(self):
         """Group chats / channels accumulate the stream and post one message.
 
-        Mirrors upstream ``stream`` (adapter-teams@chat@4.30.0): native
+        Mirrors upstream ``stream`` (@chat-adapter/teams@4.30.0): native
         ``streamViaEmit`` is reserved for DMs (where an ``IStreamer`` exists);
         non-DM threads accumulate and ``postMessage`` a single message via the
         SDK ``App.send`` (PR 2-backed).

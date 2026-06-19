@@ -1,17 +1,48 @@
 # Changelog
 
-## Unreleased
+## 0.4.30
 
-In flight toward `vercel/chat@4.30.0` (landing incrementally; `UPSTREAM_PARITY`
-stays `4.29.0` until the wave completes).
+Synced to upstream `vercel/chat@4.30.0`. The mapped core (`packages/chat/src`) is content-identical between the `chat@4.29.0` and `chat@4.30.0` upstream tags, so this wave is all adapter work: a **new Twilio adapter**, a **Telegram native-streaming** port, a **Slack primitives-subpath** wave, a batch of **WhatsApp / Slack / Google Chat** fixes, and the headline — the **Teams adapter migration to the official `microsoft-teams-apps` SDK** (issue #93, delivered across four PRs). Sets `UPSTREAM_PARITY = "4.30.0"`; CI fidelity re-pinned to `chat@4.30.0` (732/732 mapped-core tests still pass, 0 missing).
 
 ### New adapter: Twilio (SMS / MMS / Voice)
 
-- **`chat_sdk.adapters.twilio`** (vercel/chat#558). Twilio Programmable Messaging adapter (10th platform): inbound message webhooks with `X-Twilio-Signature` HMAC-SHA1 verification (`hmac.compare_digest`), outbound SMS/MMS through the Messages REST API (hand-rolled over an injectable transport — no official `twilio` SDK, mirroring upstream), 1:1 DM threads keyed `twilio:{sender}:{recipient}`, plus standalone `api` / `webhook` / `voice` helpers (TwiML builders, call + transcription parsing). New extra: `chat-sdk-python[twilio]`. Imports stay lazy so the package loads without `aiohttp` installed.
+- **`chat_sdk.adapters.twilio`** (vercel/chat#558; PR #142). Twilio Programmable Messaging adapter (10th platform): inbound message webhooks with `X-Twilio-Signature` HMAC-SHA1 verification (`hmac.compare_digest`), outbound SMS/MMS through the Messages REST API (hand-rolled over an injectable transport — no official `twilio` SDK, mirroring upstream), 1:1 DM threads keyed `twilio:{sender}:{recipient}`, plus standalone `api` / `webhook` / `voice` helpers (TwiML builders, call + transcription parsing). New extra: `chat-sdk-python[twilio]`. Imports stay lazy so the package loads without `aiohttp` installed.
+
+### Teams adapter: migration to the official `microsoft-teams-apps` SDK (issue #93)
+
+The hand-rolled Bot Framework REST + JWT stack is replaced by the official Microsoft Teams Python SDK (`microsoft-teams-apps` ≥ 2.0.13, added to the `[teams]` extra), mirroring upstream `@chat-adapter/teams@4.30.0`. Landed as four PRs:
+
+- **PR 1 — inbound + auth** (#143). New `adapters/teams/bridge.py`: a `BridgeHttpAdapter` implementing the SDK `HttpServerAdapter` protocol routes already-authenticated webhooks through the SDK `App`. JWT validation now runs through the SDK's `TokenValidator` (RS256 + audience + Bot Framework issuer via the live JWKS) in place of the hand-rolled `_verify_bot_framework_token` block. Graph reads stay hand-rolled (no `msgraph-sdk` / `[graph]` extra).
+- **PR 2 — outbound** (#144). `post_message` / `start_typing` route through `App.send`; `edit_message` / `delete_message` route through `App.api.conversations.activities(...).update` / `.delete`. Per-thread service-URL routing retargets the SDK `ApiClient`'s service-url chain (validated against the SSRF allow-list). The camelCase wire dict is still returned as `RawMessage.raw`, preserving the public contract (attachment shape, file delivery, returned id).
+- **PR 3 — native streaming** (#145). DM streaming uses the SDK's native `IStreamer` (`microsoft-teams-apps` `HttpStream`) via `app.activity_sender.create_stream(...)` and `stream.emit(...)` per chunk, replacing the hand-rolled Bot Framework streaming wire format. The SDK owns the streamType/streamSequence framing, the inter-flush throttle (~500ms, 429-safe), and 429 retry. Atomically unwinds the two transitional public-type divergences (`RawMessage.text`, `update_interval_ms`) that PR 3 made unnecessary.
+- **PR 4 — release cut** (this entry). Version bump to `0.4.30`, fidelity re-pin to `chat@4.30.0`, docs, and the `@chat-adapter/teams@4.30.0` version-label normalization.
+
+The residual adapter-level divergences (we keep the SDK as the auth + transport layer but route the authenticated activity ourselves through a lenient `CoreActivity`; the streamer is closed in our own `_handle_message_activity` `finally` because our bridge owns dispatch) are documented in `docs/UPSTREAM_SYNC.md`.
+
+### Adapter ports — Telegram, Slack
+
+- **Telegram: native DM draft streaming** (vercel/chat#340; PR #140). DMs stream via the `sendMessageDraft` Bot API method (the draft bubble updates in place, throttled to `update_interval_ms`, default 250ms), then a regular `sendMessage` persists the final text; non-DM threads return `None` before consuming any chunks so the SDK's post+edit fallback handles groups/channels. Adds a shared `with_telegram_markdown_fallback()` retry-without-`parse_mode` path wrapping `post_message` / `edit_message` / `send_document` / `send_attachment`.
+- **Slack: webhook + primitives subpaths** (vercel/chat#538, #547, #548, #555, #559; PR #139). New runtime-free `chat_sdk.adapters.slack.webhook` (and `slack.api`) subpaths for lower-level Slack request verification, signed-body reading, and Events/slash/interactive payload parsing into typed dataclasses. The adapter now verifies through the shared `verify_slack_request` / `verify_slack_signature` primitives (the inline `_verify_signature` method is removed, matching upstream); the slack package `__init__` is now lazy (PEP 562) so importing a subpath does not pull in the full adapter runtime. The new `slack/api` primitives carry SSRF/token-leak guards (`send_slack_response_url` + `fetch_slack_file` host allowlists).
+
+### Adapter fixes — WhatsApp, Slack, Google Chat
+
+- **WhatsApp: typing-indicator support** (vercel/chat#320; PR #141). `start_typing` resolves the latest inbound message id from the `ThreadHistoryCache` and posts a `typing_indicator` payload (also marking the message read); Graph API default bumped v21.0 → v25.0; `_graph_api_request` and the typing-indicator failure path raise `AdapterError` instead of `RuntimeError`.
+- **Slack / Google Chat: 4.30 rendering fixes** (vercel/chat#523, #553, #573; PR #141). Includes collapsing redundant autolink formatting for Google Chat email/`mailto:` links (port of upstream `177735a`).
 
 #### Python-specific (divergence from upstream)
 
 - **Twilio media-download SSRF guard.** `rehydrate_attachment` validates the rehydrated media URL (https + Twilio-owned host) inside the download closure before forwarding the account SID / auth token as HTTP Basic, where upstream `fetchTwilioMedia` GETs the URL blindly. Folded into the existing `rehydrate_attachment` URL allowlist non-parity row (Slack / Teams / Google Chat / **Twilio**); enforces `CLAUDE.md`'s SSRF rule. Regression: `tests/test_twilio_adapter.py::TestRehydrateAttachment::test_media_downloader_refuses_untrusted_hosts`.
+
+### Pre-existing parity gaps closed (4.30 audit)
+
+A pre-ship parity audit (the CI fidelity check covers only the mapped CORE `packages/chat` tests, never the adapters) surfaced 9 gaps present since 0.4.29 — the `chat@4.29.0` and `chat@4.30.0` tags are content-identical for the mapped core — and all but one (Linear agent sessions, deferred to 4.31) were closed in this wave, across four PRs:
+
+- **Google Chat: clear `cardsV2` on edit-to-plain-text** (PR #148). BUG — editing a card message down to plain text left the old card stranded on the message; `edit_message` now sends an explicit empty `cardsV2` so the card is dropped (streaming finalization is the common trigger). Plus **`Select` / `RadioSelect` → `selectionInput` widgets**: these card elements now render as Google Chat `selectionInput` widgets and the selected option is read back from `formInputs`.
+- **Teams: ChoiceSet auto-submit fan-out** (PR #149). BUG / contract break — an Adaptive Card `Action.Submit` carrying multiple input keys now fires one `process_action` per input key, so each `on_action(input_key)` handler runs, instead of a single `__auto_submit` dispatch that no handler matched. Plus **`list_threads` / `post_channel_message`** (were raising `ChatNotImplementedError`, now implemented) and **`api_url` / `TEAMS_API_URL`** for a custom Bot Framework endpoint (GCC-High / sovereign cloud).
+- **`api_url` custom-endpoint config across Slack / Discord / GitHub / Linear** (PR #150). Custom base URLs for GovSlack / Enterprise Grid / GitHub Enterprise / self-hosted Linear; an empty string falls back to the default, matching upstream's truthy-spread default. Plus **GitHub public `get_installation_id()`**.
+- **Core: root `chat_sdk` re-exports the deprecated `chat/ai` type aliases** (PR #147). `AiMessage`, `AiMessagePart`, `ToAiMessagesOptions`, … resolve from the package root again (they had moved to `chat_sdk.ai`); `chat_sdk.ai` stays the canonical home.
+
+**Documented exceptions.** 0.4.30 matches `chat@4.30.0` *with documented exceptions*. The **Linear agent-sessions** surface (#151) is the largest single gap from the audit and is deferred to the 4.31 wave. `adapter-web`, plus the GitHub / Linear native-client (`octokit` / `linearClient`) and `message.subject` halves, remain documented Known Non-Parity in `docs/UPSTREAM_SYNC.md`. The 4.31 wave is tracked in #152.
 
 ## 0.4.29 (2026-06-12)
 
@@ -49,8 +80,7 @@ Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; 
 ### Python-only improvements
 
 - **Slack `files_upload_v2` confirmation surfaced through `post()`** (PR #117; also shipped early as 0.4.27.1). `SentMessage.raw` carries `uploaded_file_ids`; history persistence nulls `raw` to avoid storage bloat/PII.
-- **Slack: DM block-action responses no longer thread** (PR #133). `_handle_block_actions` mirrors `_handle_message_event`'s DM handling so HITL button replies don't create phantom "1 reply" threads.
-- **Google Chat: file delivery via multipart media upload** (PR #112).
+- **Slack: DM block-action responses no longer thread** (PR #137, supersedes #133). `_handle_block_actions` mirrors `_handle_message_event`'s DM handling so HITL button replies don't create phantom "1 reply" threads.
 
 ### Not ported / deferred (documented in docs/UPSTREAM_SYNC.md)
 
@@ -67,7 +97,7 @@ Synced to upstream `vercel/chat@4.29.0` (release commit `6581d31`, May 18 2026; 
 
 ## 0.4.27.1 (2026-05-29)
 
-Python-only point release on the 0.4.27 line (branched from `v0.4.27`; PR #120). Backports the Slack `files_upload_v2` confirmation fix (PR #117) so `SentMessage.raw` carries `uploaded_file_ids`, plus the history-persistence `raw` null-out. Shipped ahead of 0.4.29 to unblock chinchill-api's delivery-confirmation gating.
+Python-only point release on the 0.4.27 line (branched from `v0.4.27`; shipped via tag `v0.4.27.1` + merged PR #117). Backports the Slack `files_upload_v2` confirmation fix (PR #117) so `SentMessage.raw` carries `uploaded_file_ids`, plus the history-persistence `raw` null-out. Shipped ahead of 0.4.29 to unblock chinchill-api's delivery-confirmation gating.
 
 ## 0.4.29a2 (2026-05-28)
 

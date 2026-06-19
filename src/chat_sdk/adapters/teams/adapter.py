@@ -96,7 +96,7 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
     """Convert :class:`TeamsAdapterConfig` (public API) to Teams SDK ``AppOptions``.
 
     Python port of ``packages/adapter-teams/src/config.ts`` ``toAppOptions``
-    (synced to ``adapter-teams@chat@4.30.0``). Maps our public
+    (synced to ``@chat-adapter/teams@4.30.0``). Maps our public
     ``app_id``/``app_password``/``app_tenant_id``/``federated``/``app_type``/
     ``api_url`` fields onto the SDK's ``client_id``/``client_secret``/
     ``tenant_id``/``managed_identity_client_id``/``service_url`` keys, reading
@@ -194,7 +194,7 @@ def _handle_teams_error(error: Any, operation: str) -> NoReturn:
     """Convert Teams SDK / Bot Framework errors to adapter errors and raise.
 
     Python port of ``packages/adapter-teams/src/errors.ts`` ``handleTeamsError``
-    (synced to ``adapter-teams@chat@4.30.0``). Maps the error onto our taxonomy:
+    (synced to ``@chat-adapter/teams@4.30.0``). Maps the error onto our taxonomy:
 
     - ``401`` → :class:`AuthenticationError`
     - ``403`` (or a "permission" message) → :class:`AdapterPermissionError`
@@ -789,7 +789,7 @@ class TeamsAdapter:
         # handler is done and the streamer can be closed.
         #
         # Mirrors upstream ``handleMessageActivity`` in
-        # ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``):
+        # ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``):
         # ``this.activeStreams.set(threadId, ctx.stream)`` → build
         # ``processingDone`` + wrapped ``waitUntil`` → ``await processingDone``.
         # Upstream lets the Teams SDK ``App`` auto-close ``ctx.stream`` after the
@@ -1690,7 +1690,7 @@ class TeamsAdapter:
         streaming only in 1:1 chats.
 
         Mirrors upstream ``stream`` in
-        ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``):
+        ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``):
         delegate to ``streamViaEmit`` when ``activeStream && !activeStream.canceled``,
         else accumulate and ``postMessage``.
         """
@@ -1749,7 +1749,7 @@ class TeamsAdapter:
         delivered (empty stream, or canceled before the first flush).
 
         Mirrors upstream ``streamViaEmit`` in
-        ``packages/adapter-teams/src/index.ts`` (``adapter-teams@chat@4.30.0``).
+        ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``).
         """
         from microsoft_teams.apps import StreamCancelledError
 
