@@ -225,6 +225,101 @@ class TestMentions:
     def test_converts_mentions_adjacent_to_non_word_punctuation(self):
         assert self.converter.to_slack_payload("(cc @george, @anne)") == {"text": "(cc <@george>, <@anne>)"}
 
+    # -- @mention-in-URL fix (chat@4.31, a8bf99a) --------------------------------
+    # A bare ``@handle`` inside a URL (path/query/fragment) or a schemeless host
+    # path must NOT be rewritten into a ``<@handle>`` Slack mention, which would
+    # corrupt the link. These mirror upstream markdown.test.ts:189-230 and are
+    # regression guards for a confirmed pre-existing converter bug — they FAIL on
+    # pre-fix code (where ``@jkyang`` etc. were wrapped into ``<@jkyang>``).
+    # The string surface exercises ``_finalize``; the mrkdwn surface (via
+    # ``to_response_url_text``) exercises the ``_node_to_mrkdwn`` text branch.
+
+    def test_does_not_mangle_mention_in_url_path_plain_string(self):
+        assert self.converter.to_slack_payload("See https://hackmd.io/@jkyang/B1W69XA-fe") == {
+            "text": "See https://hackmd.io/@jkyang/B1W69XA-fe"
+        }
+
+    def test_does_not_mangle_mention_in_url_path_markdown(self):
+        assert self.converter.to_slack_payload({"markdown": "See https://mastodon.social/@user for updates"}) == {
+            "markdown_text": "See https://mastodon.social/@user for updates"
+        }
+
+    def test_does_not_mangle_mention_in_url_query_string(self):
+        assert self.converter.to_slack_payload("Profile https://example.com/p?user=@george") == {
+            "text": "Profile https://example.com/p?user=@george"
+        }
+
+    def test_does_not_mangle_mention_in_url_fragment(self):
+        assert self.converter.to_slack_payload("Jump https://example.com/docs#@george") == {
+            "text": "Jump https://example.com/docs#@george"
+        }
+
+    def test_does_not_mangle_mention_in_schemeless_host_path(self):
+        # ``URL_REGEX`` does not match a schemeless host; the ``/`` in the
+        # mention lookbehind guards this case.
+        assert self.converter.to_slack_payload("See hackmd.io/@jkyang/abc") == {"text": "See hackmd.io/@jkyang/abc"}
+
+    def test_still_rewrites_real_mention_after_url(self):
+        # A genuine mention AFTER a URL (in the trailing slice) is still linked.
+        assert self.converter.to_slack_payload("See https://hackmd.io/@jkyang/abc cc @george") == {
+            "text": "See https://hackmd.io/@jkyang/abc cc <@george>"
+        }
+
+    # -- mrkdwn (node) surface: both substitution sites must carry the fix -------
+
+    def test_url_mention_preserved_on_mrkdwn_surface(self):
+        # ``_node_to_mrkdwn`` text branch must skip the URL span too.
+        assert (
+            self.converter.to_response_url_text({"markdown": "See https://hackmd.io/@jkyang/abc"})
+            == "See https://hackmd.io/@jkyang/abc"
+        )
+
+    def test_real_mention_after_url_rewritten_on_mrkdwn_surface(self):
+        assert (
+            self.converter.to_response_url_text({"markdown": "See https://hackmd.io/@jkyang/abc cc @george"})
+            == "See https://hackmd.io/@jkyang/abc cc <@george>"
+        )
+
+    # -- adversarial budget (docs/SELF_REVIEW.md) -------------------------------
+
+    def test_email_address_still_preserved_after_fix(self):
+        # The ``\w`` lookbehind still protects email local parts.
+        assert self.converter.to_slack_payload("Contact user@example.com for help") == {
+            "text": "Contact user@example.com for help"
+        }
+
+    def test_mailto_link_still_preserved_after_fix(self):
+        assert self.converter.to_slack_payload("Email <mailto:user@example.com>") == {
+            "text": "Email <mailto:user@example.com>"
+        }
+
+    def test_cc_george_regression_guard(self):
+        # The original real-mention behavior must survive the URL-skip rewrite.
+        assert self.converter.to_slack_payload("(cc @george)") == {"text": "(cc <@george>)"}
+
+    def test_url_at_start_of_text(self):
+        assert self.converter.to_slack_payload("https://example.com/@george done") == {
+            "text": "https://example.com/@george done"
+        }
+
+    def test_url_at_end_of_text(self):
+        # Mention before the URL is rewritten; the @handle inside the URL is not.
+        assert self.converter.to_slack_payload("ping @anne https://example.com/@george") == {
+            "text": "ping <@anne> https://example.com/@george"
+        }
+
+    def test_multiple_urls_with_mention_between(self):
+        assert self.converter.to_slack_payload("a https://x.io/@one then @two and https://y.io/@three") == {
+            "text": "a https://x.io/@one then <@two> and https://y.io/@three"
+        }
+
+    def test_already_wrapped_mention_in_url_not_double_wrapped(self):
+        # An already-``<@>``-wrapped handle is left intact, and the URL handle is
+        # preserved — neither is double-wrapped.
+        assert self.converter.to_slack_payload("hi <@U123> see https://x.io/@bob") == {
+            "text": "hi <@U123> see https://x.io/@bob"
+        }
+
 
 # ---------------------------------------------------------------------------
 # toPlainText

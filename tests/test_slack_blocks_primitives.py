@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from chat_sdk.adapters.slack.blocks import (
+    LIMITS,
     answered_slack_input_blocks,
     build_slack_freeform_view,
     card_to_block_kit,
@@ -191,6 +192,92 @@ class TestSlackBlockKitPrimitives:
             ],
             "type": "actions",
         }
+
+    def test_link_button_uses_custom_action_id(self) -> None:
+        # chat@4.31 (171657a): an explicit ``id`` on a link-button is used as
+        # the action_id verbatim (still subject to the action_id length limit).
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    {
+                        "children": [
+                            {
+                                "id": "agent_slack_auth_signin",
+                                "label": "Sign in",
+                                "type": "link-button",
+                                "url": "https://vercel.com/oauth/authorize",
+                            },
+                        ],
+                        "type": "actions",
+                    },
+                ]
+            )
+        )
+        assert blocks[0]["elements"][0]["action_id"] == "agent_slack_auth_signin"
+
+    def test_link_button_falls_back_to_url_action_id(self) -> None:
+        # No ``id`` → action_id falls back to the ``link-{url}`` form.
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    {
+                        "children": [
+                            {
+                                "label": "Docs",
+                                "type": "link-button",
+                                "url": "https://example.com/docs",
+                            },
+                        ],
+                        "type": "actions",
+                    },
+                ]
+            )
+        )
+        assert blocks[0]["elements"][0]["action_id"] == "link-https://example.com/docs"
+
+    def test_link_button_empty_id_is_used_verbatim(self) -> None:
+        # ``??`` semantics (NOT ``or``): an explicit empty-string id is used
+        # as-is and does NOT fall back to ``link-{url}``. Locks ``is not None``.
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    {
+                        "children": [
+                            {
+                                "id": "",
+                                "label": "Docs",
+                                "type": "link-button",
+                                "url": "https://example.com/docs",
+                            },
+                        ],
+                        "type": "actions",
+                    },
+                ]
+            )
+        )
+        assert blocks[0]["elements"][0]["action_id"] == ""
+
+    def test_link_button_custom_id_truncated_to_action_id_limit(self) -> None:
+        # The id path still goes through ``_truncate_text(..., LIMITS.action_id)``.
+        long_id = "x" * (LIMITS.action_id + 50)
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    {
+                        "children": [
+                            {
+                                "id": long_id,
+                                "label": "Docs",
+                                "type": "link-button",
+                                "url": "https://example.com/docs",
+                            },
+                        ],
+                        "type": "actions",
+                    },
+                ]
+            )
+        )
+        assert blocks[0]["elements"][0]["action_id"] == "x" * LIMITS.action_id
 
     def test_limits_action_elements_and_select_options(self) -> None:
         blocks = card_to_slack_blocks(

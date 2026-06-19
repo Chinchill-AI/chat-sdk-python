@@ -49,6 +49,23 @@ class SlackAdapterConfig:
     # ``slackApiUrl`` (vercel/chat 6b17c60). Useful for proxies, Slack-API
     # mocks in tests, or Enterprise-routed deployments.
     api_url: str | None = None
+    # Extra keyword arguments forwarded to every ``slack_sdk`` client the
+    # adapter builds — the default ``AsyncWebClient``, the per-token async
+    # cache, and the synchronous ``WebClient`` escape hatch. Gated on
+    # ``is not None`` so an explicit empty ``{}`` still spreads (a no-op).
+    #
+    # DIVERGENCE (vercel/chat 8336a3e): upstream forwards ``webClientOptions``
+    # to ``@slack/web-api``'s ``WebClient`` (an axios-backed client), so its
+    # most useful keys are ``retryConfig`` and ``timeout``. There is no 1:1
+    # mapping in ``slack_sdk``: it has no ``retryConfig``/``rejectRateLimitedCalls``
+    # — retry behavior is configured via ``retry_handlers`` (a list of
+    # ``slack_sdk.http_retry.RetryHandler``), and ``timeout`` is an int of
+    # seconds. So these map to **slack_sdk WebClient kwargs**, not axios options.
+    # Example: ``web_client_options={"timeout": 15, "retry_handlers": [...]}``.
+    # ``headers`` (a dict) is deep-copied per client so cached per-token clients
+    # never share a mutable dict and caller input is never mutated. See the
+    # ``webClientOptions`` divergence row in docs/UPSTREAM_SYNC.md.
+    web_client_options: dict[str, Any] | None = None
     # App-level token (xapp-...). Required when ``mode == "socket"``.
     app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.
