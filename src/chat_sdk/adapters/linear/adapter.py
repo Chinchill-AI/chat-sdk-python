@@ -119,6 +119,17 @@ class LinearAdapter:
             )
 
         self._name = "linear"
+        # Custom Linear GraphQL endpoint (proxy / mock / self-host). Faithful
+        # port of upstream ``config.apiUrl ?? process.env.LINEAR_API_URL``
+        # (index.ts:239), consumed via the truthy spread
+        # ``...(this.apiUrl ? { apiUrl } : {})`` at every ``LinearClient``
+        # construction — so an empty string falls back to the default endpoint.
+        # We have no LinearClient -- ``_graphql_query`` POSTs raw GraphQL -- so
+        # the override substitutes for the module-level ``LINEAR_API_URL``
+        # default. The truthy check means an empty ``apiUrl`` (or env) uses the
+        # default rather than POSTing to an empty/relative URL.
+        config_api_url = getattr(config, "api_url", None)
+        self._api_url: str = config_api_url or os.environ.get("LINEAR_API_URL") or LINEAR_API_URL
         self._webhook_secret = webhook_secret
         self._logger: Logger = getattr(config, "logger", None) or ConsoleLogger("info", prefix="linear")
         self._user_name = getattr(config, "user_name", None) or os.environ.get("LINEAR_BOT_USERNAME", "linear-bot")
@@ -1168,7 +1179,7 @@ class LinearAdapter:
 
         session = await self._get_http_session()
         async with session.post(
-            LINEAR_API_URL,
+            self._api_url,
             headers=headers,
             json=payload,
         ) as response:

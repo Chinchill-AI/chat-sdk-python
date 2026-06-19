@@ -16,6 +16,11 @@ class GitHubAdapterBaseConfig(TypedDict, total=False):
     """Base configuration options shared by all auth methods.
 
     Attributes:
+        api_url: Override the GitHub API base URL (e.g. a GitHub Enterprise
+            Server endpoint like "https://github.example.com/api/v3"). Mirrors
+            upstream ``config.apiUrl`` → Octokit ``baseUrl`` (index.ts:201,217).
+            Defaults to the GITHUB_API_URL env var, then to
+            "https://api.github.com".
         bot_user_id: Bot's GitHub user ID (numeric). Used for self-message
             detection. If not provided, will be fetched on first API call.
         logger: Logger instance for error reporting. Defaults to ConsoleLogger.
@@ -27,6 +32,7 @@ class GitHubAdapterBaseConfig(TypedDict, total=False):
             Defaults to GITHUB_WEBHOOK_SECRET env var.
     """
 
+    api_url: str
     bot_user_id: int
     logger: Logger
     user_name: str

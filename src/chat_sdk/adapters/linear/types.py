@@ -20,6 +20,12 @@ from chat_sdk.logger import Logger
 class LinearAdapterBaseConfig:
     """Base configuration options shared by all auth methods."""
 
+    # Override the Linear GraphQL API base URL. Defaults to the LINEAR_API_URL
+    # env var, then to "https://api.linear.app/graphql". Mirrors upstream
+    # ``config.apiUrl ?? process.env.LINEAR_API_URL`` → ``LinearClient.apiUrl``
+    # (vercel/chat adapter-linear index.ts:239, types.ts:51). Useful for
+    # proxies, mocks, or self-hosted GraphQL gateways.
+    api_url: str | None = None
     # Logger instance for error reporting. Defaults to ConsoleLogger.
     logger: Logger | None = None
     # Bot display name for @-mention detection.

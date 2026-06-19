@@ -121,6 +121,15 @@ class DiscordAdapter:
                 "application_id is required. Set DISCORD_APPLICATION_ID or provide it in config.",
             )
 
+        # Custom Discord API base URL (proxy / mock / self-host). Port of
+        # upstream's coalescing chain ``config.apiUrl ?? process.env.DISCORD_API_URL
+        # ?? DISCORD_API_BASE`` (index.ts:142). Unlike Slack/GitHub/Linear --
+        # which feed clients via a truthy spread -- ``_discord_fetch`` joins
+        # ``f"{base}{path}"`` directly, so an empty ``apiUrl`` would yield a
+        # broken relative URL. We use a truthy fallback so an empty string (or
+        # env) resolves to the ``DISCORD_API_BASE`` default, matching the
+        # empty-string-is-default contract shared by the other adapters.
+        self._api_base_url: str = config.api_url or os.environ.get("DISCORD_API_URL") or DISCORD_API_BASE
         self._name = "discord"
         self._bot_token = bot_token
         self._public_key = public_key.strip().lower()
@@ -1494,7 +1503,7 @@ class DiscordAdapter:
         """
         import aiohttp  # lazy import (needed for FormData)
 
-        url = f"{DISCORD_API_BASE}{path}"
+        url = f"{self._api_base_url}{path}"
         headers: dict[str, str] = {
             "Authorization": f"Bot {self._bot_token}",
         }

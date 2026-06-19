@@ -41,6 +41,14 @@ SlackAdapterMode = Literal["webhook", "socket"]
 class SlackAdapterConfig:
     """Configuration for the Slack adapter."""
 
+    # Override the Slack Web API base URL (passed as ``base_url`` to every
+    # ``slack_sdk`` client the adapter builds — the default client, the
+    # per-token async cache, and the synchronous ``web_client`` escape hatch).
+    # Defaults to the ``SLACK_API_URL`` env var, then to slack_sdk's built-in
+    # ``https://slack.com/api/``. Mirrors upstream ``config.apiUrl`` →
+    # ``slackApiUrl`` (vercel/chat 6b17c60). Useful for proxies, Slack-API
+    # mocks in tests, or Enterprise-routed deployments.
+    api_url: str | None = None
     # App-level token (xapp-...). Required when ``mode == "socket"``.
     app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.

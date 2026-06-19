@@ -57,12 +57,19 @@ from chat_sdk.types import (
     RawMessage,
     StreamChunk,
     StreamOptions,
+    Thread,
     ThreadInfo,
     ThreadSummary,
     UserInfo,
     WebhookOptions,
     _parse_iso,
 )
+
+# Default GitHub REST API base URL. Overridable per-adapter via
+# ``config["api_url"]`` / ``GITHUB_API_URL`` for GitHub Enterprise Server
+# (mirrors upstream Octokit ``baseUrl``). Stored without a trailing slash so
+# ``f"{base}{path}"`` joins cleanly with leading-slash paths.
+GITHUB_API_BASE_URL = "https://api.github.com"
 
 REVIEW_COMMENT_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+):rc:(\d+)$")
 ISSUE_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):issue:(\d+)$")
@@ -113,6 +120,19 @@ class GitHubAdapter:
         self._bot_user_id: int | None = config.get("bot_user_id")
         self._chat: ChatInstance | None = None
         self._format_converter = GitHubFormatConverter()
+
+        # Custom GitHub API base URL (e.g. GitHub Enterprise Server). Upstream
+        # threads ``config.apiUrl ?? process.env.GITHUB_API_URL`` into every
+        # Octokit ``baseUrl`` via the truthy spread ``...(this.apiUrl ? { baseUrl }
+        # : {})`` (index.ts:201/217/...), so an empty string falls back to the
+        # default. We have no Octokit -- our REST calls go through
+        # ``_github_api_request`` and the installation-token exchange -- so we
+        # normalize the override (strip a trailing slash so ``f"{base}{path}"``
+        # joins cleanly) and substitute it for the hardcoded
+        # ``https://api.github.com`` at both sites. The truthy fallback means an
+        # empty ``apiUrl`` (or env) uses the default endpoint.
+        api_url_raw = config.get("api_url") or os.environ.get("GITHUB_API_URL")
+        self._api_url = api_url_raw.rstrip("/") if api_url_raw else GITHUB_API_BASE_URL
 
         # Auth configuration
         self._auth_token: str | None = None
@@ -1098,7 +1118,7 @@ class GitHubAdapter:
                     return token
 
             app_jwt = self._generate_app_jwt()
-            url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+            url = f"{self._api_url}/app/installations/{installation_id}/access_tokens"
             headers = {
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {app_jwt}",
@@ -1169,7 +1189,7 @@ class GitHubAdapter:
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
 
-        url = f"https://api.github.com{path}" if path.startswith("/") else path
+        url = f"{self._api_url}{path}" if path.startswith("/") else path
 
         session = await self._get_http_session()
         kwargs: dict[str, Any] = {"headers": headers}
@@ -1207,6 +1227,40 @@ class GitHubAdapter:
             return None
         key = f"github:install:{owner}/{repo}"
         return await self._chat.get_state().get(key)
+
+    async def get_installation_id(self, thread: Thread | str) -> int | None:
+        """Get the GitHub App installation ID associated with a thread.
+
+        Returns the fixed installation ID in single-tenant app mode, the cached
+        repository installation in multi-tenant mode, or ``None`` in PAT mode.
+
+        Faithful port of upstream ``getInstallationId`` (index.ts:458-480).
+        ``thread`` may be a :class:`Thread` or a raw thread-ID string. The
+        private :meth:`_get_installation_id` (owner/repo) is retained as the
+        storage-keyed helper this method delegates to in multi-tenant mode.
+
+        Raises:
+            ValidationError: In multi-tenant mode when the adapter has not been
+                initialized via ``chat.initialize()`` (no state store to read).
+        """
+        # Single-tenant GitHub App mode: a fixed installation was configured.
+        if self._installation_id is not None:
+            return self._installation_id
+
+        # PAT mode (or any non-multi-tenant config): no installation concept.
+        if not self.is_multi_tenant:
+            return None
+
+        thread_id = thread if isinstance(thread, str) else thread.id
+        decoded = self.decode_thread_id(thread_id)
+
+        if not self._chat:
+            raise ValidationError(
+                "github",
+                "Adapter not initialized. Ensure chat.initialize() has been called first.",
+            )
+
+        return await self._get_installation_id(decoded.owner, decoded.repo)
 
     @staticmethod
     async def _get_request_body(request: Any) -> str:
