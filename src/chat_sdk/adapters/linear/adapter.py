@@ -25,7 +25,9 @@ from chat_sdk.adapters.linear.types import (
     CommentWebhookPayload,
     LinearAdapterBaseConfig,
     LinearAdapterConfig,
+    LinearAdapterMode,
     LinearCommentData,
+    LinearCommentRawMessage,
     LinearInstallation,
     LinearRawMessage,
     LinearThreadId,
@@ -133,6 +135,13 @@ class LinearAdapter:
         self._webhook_secret = webhook_secret
         self._logger: Logger = getattr(config, "logger", None) or ConsoleLogger("info", prefix="linear")
         self._user_name = getattr(config, "user_name", None) or os.environ.get("LINEAR_BOT_USERNAME", "linear-bot")
+        # Inbound webhook handling model. Faithful port of upstream
+        # ``this.mode = config.mode ?? "comments"`` (index.ts:236). "comments"
+        # is the data-change webhook model (existing behavior); "agent-sessions"
+        # is the app-actor model. The agent-session routing/emit/fetch logic
+        # lands in later waves (L3/L4/L5); L1 only plumbs the field.
+        config_mode: LinearAdapterMode | None = getattr(config, "mode", None)
+        self._mode: LinearAdapterMode = config_mode if config_mode is not None else "comments"
         self._chat: ChatInstance | None = None
         self._bot_user_id: str | None = None
         self._format_converter = LinearFormatConverter()
@@ -219,6 +228,14 @@ class LinearAdapter:
     @property
     def bot_user_id(self) -> str | None:
         return self._bot_user_id
+
+    @property
+    def mode(self) -> LinearAdapterMode:
+        """Inbound webhook handling model ("comments" or "agent-sessions").
+
+        Faithful port of upstream ``protected readonly mode`` (index.ts:201).
+        """
+        return self._mode
 
     @property
     def lock_scope(self) -> LockScope | None:
@@ -644,7 +661,7 @@ class LinearAdapter:
             thread_id=thread_id,
             text=text,
             formatted=formatted,
-            raw=LinearRawMessage(comment=comment),
+            raw=LinearCommentRawMessage(kind="comment", comment=comment),
             author=author,
             metadata=MessageMetadata(
                 date_sent=_parse_iso(created_at) if created_at else datetime.now(timezone.utc),
@@ -702,7 +719,8 @@ class LinearAdapter:
         return RawMessage(
             id=comment_data.get("id", ""),
             thread_id=thread_id,
-            raw=LinearRawMessage(
+            raw=LinearCommentRawMessage(
+                kind="comment",
                 comment={
                     "id": comment_data.get("id", ""),
                     "body": comment_data.get("body", ""),
@@ -755,7 +773,8 @@ class LinearAdapter:
         return RawMessage(
             id=comment_data.get("id", ""),
             thread_id=thread_id,
-            raw=LinearRawMessage(
+            raw=LinearCommentRawMessage(
+                kind="comment",
                 comment={
                     "id": comment_data.get("id", ""),
                     "body": comment_data.get("body", ""),
@@ -962,7 +981,8 @@ class LinearAdapter:
             thread_id=thread_id,
             text=node.get("body", ""),
             formatted=self._format_converter.to_ast(node.get("body", "")),
-            raw=LinearRawMessage(
+            raw=LinearCommentRawMessage(
+                kind="comment",
                 comment={
                     "id": node.get("id", ""),
                     "body": node.get("body", ""),
