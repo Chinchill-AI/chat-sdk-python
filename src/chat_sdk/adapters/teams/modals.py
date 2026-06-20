@@ -20,12 +20,14 @@ Reuse, not duplication:
   format primitive), exactly as upstream's ``index.ts`` imports
   ``convertTeamsEmojiPlaceholders`` from ``../format``.
 * The ``fields`` modal child renders :class:`TeamsFieldElement` (``label`` /
-  ``value``) — the same field shape used by the cards primitive
-  (``TeamsFieldElement`` from ``../cards-primitives`` upstream). It is a plain
-  two-key ``TypedDict``; the modal-specific input element shapes
-  (``text_input`` / ``select`` / ``radio_select``) are defined here because
-  upstream defines them in ``modals-primitives/types.ts``, distinct from the
-  ``cards-primitives`` input request shapes in
+  ``value``) — the same field shape used by the cards primitive. We import the
+  single canonical definition from :mod:`chat_sdk.adapters.teams.cards_input`
+  (re-exported here for the public surface), exactly as upstream's
+  ``modals-primitives/types.ts`` imports ``TeamsFieldElement`` from
+  ``../cards-primitives`` rather than redefining it. The modal-specific input
+  element shapes (``text_input`` / ``select`` / ``radio_select``) are defined
+  here because upstream defines them in ``modals-primitives/types.ts``, distinct
+  from the ``cards-primitives`` input request shapes in
   :mod:`chat_sdk.adapters.teams.cards_input`.
 
 Wire-key fidelity (HAZARDS):
@@ -54,6 +56,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from chat_sdk.adapters.teams.cards_input import TeamsFieldElement
 from chat_sdk.adapters.teams.format import convert_teams_emoji_placeholders
 
 __all__ = [
@@ -81,17 +84,6 @@ ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 
 _ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
 _ADAPTIVE_CARD_VERSION = "1.4"
-
-
-class TeamsFieldElement(TypedDict):
-    """One ``label`` / ``value`` row of a ``fields`` modal child.
-
-    Mirrors the ``TeamsFieldElement`` shared with the cards primitive
-    (upstream ``../cards-primitives``).
-    """
-
-    label: str
-    value: str
 
 
 class TeamsModalTextElement(TypedDict):

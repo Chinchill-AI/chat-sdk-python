@@ -257,11 +257,11 @@ class TestCardsPrimitiveBoundary:
 
         Run in a *subprocess* so the shared test process's ``sys.modules`` is
         never mutated (a global mutation here would pollute downstream
-        module-identity assertions). Mirrors the Round-1 api/webhook boundary
-        tests: we do NOT assert the high-level adapter is absent, because the
-        eager ``teams/__init__.py`` pulls it in transitively until the lazy
-        subpath registration lands in packaging PR T7 — the source scan above
-        already proves the input module itself never imports the adapter.
+        module-identity assertions). This narrower check stays as the input
+        module's own SDK/HTTP-client guard; the full runtime boundary —
+        including that the high-level adapter is absent now that
+        ``teams/__init__.py`` is PEP-562 lazy — is asserted for all six
+        primitive subpaths in ``tests/test_teams_primitives_packaging.py``.
         """
         import subprocess
         import sys

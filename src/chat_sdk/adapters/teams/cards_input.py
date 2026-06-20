@@ -30,6 +30,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 __all__ = [
     "TEAMS_FREEFORM_ACTION_ID",
     "TEAMS_INPUT_ACTION_PREFIX",
+    "TeamsFieldElement",
     "TeamsInputAction",
     "TeamsInputOption",
     "TeamsInputRequest",
@@ -37,6 +38,22 @@ __all__ = [
     "input_request_to_teams_adaptive_card",
     "parse_teams_input_response",
 ]
+
+
+class TeamsFieldElement(TypedDict):
+    """One ``label`` / ``value`` row of a ``fields`` element.
+
+    Canonical home for the shared field shape. Upstream defines it in
+    ``cards-primitives/types.ts`` and re-exports it from the cards primitive;
+    ``modals-primitives/types.ts`` imports it from ``../cards-primitives``. We
+    define it once here (the SDK-free cards-primitives input subpath) and
+    :mod:`chat_sdk.adapters.teams.modals` re-imports it, so both primitives
+    share a single definition rather than duplicating the two-key dict.
+    """
+
+    label: str
+    value: str
+
 
 # Upstream constants (cards-primitives/input.ts). The option ChoiceSet id and
 # every Action.Submit ``actionId`` are prefixed with this; the freeform
