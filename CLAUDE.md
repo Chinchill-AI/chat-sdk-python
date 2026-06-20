@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to upstream v4.30.0). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to upstream v4.31.0). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -28,6 +28,7 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.27.1` = Python-only fix on top of `4.27.0`
 - `0.4.29` = synced to upstream `4.29.0` (upstream never tagged 4.27/4.28 as `chat@*`)
 - `0.4.30` = synced to upstream `4.30.0`
+- `0.4.31` = synced to upstream `4.31.0`
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
@@ -110,7 +111,7 @@ will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` in the mapped core files has a matching Python `def test_*()`,
-pinned to `chat@4.30.0` (matches `UPSTREAM_PARITY`; upstream never tagged
+pinned to `chat@4.31.0` (matches `UPSTREAM_PARITY`; upstream never tagged
 `chat@4.27.0`/`chat@4.28.0`). The `MAPPING` dict in that script is the
 authoritative scope list — extending it to the remaining unmapped
 `packages/chat/src/*.test.ts` files is tracked as issue #78.
@@ -125,7 +126,7 @@ divergence in `docs/UPSTREAM_SYNC.md`.
 Before the fidelity check can run locally, clone the pinned upstream
 checkout (same command CI uses in `lint.yml`):
 ```bash
-git clone --depth 1 --branch chat@4.30.0 \
+git clone --depth 1 --branch chat@4.31.0 \
   https://github.com/vercel/chat.git /tmp/vercel-chat
 ```
 Then `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict`.

@@ -14,7 +14,7 @@ Usage:
 ``--strict`` is the current CI contract (see ``.github/workflows/lint.yml``):
 the baseline is ignored and any missing translation — or a missing upstream
 checkout — fails the build. This repo ships at strict fidelity for mapped
-core files (0 missing) against ``chat@4.30.0``. The ``MAPPING`` dict below
+core files (0 missing) against ``chat@4.31.0``. The ``MAPPING`` dict below
 is the authoritative scope list (extending it to the remaining unmapped
 ``packages/chat/src/*.test.ts`` files is tracked as issue #78).
 
@@ -317,7 +317,7 @@ def write_baseline(path: Path, all_missing: dict[str, list], total_ts: int) -> N
     current_parity = _current_parity_tag()
     payload = {
         "_comment": existing_comment if existing_comment is not None else _DEFAULT_BASELINE_COMMENT,
-        "ts_parity": current_parity if current_parity is not None else "chat@4.30.0",
+        "ts_parity": current_parity if current_parity is not None else "chat@4.31.0",
         "total_ts_tests": total_ts,
         "total_missing": sum(len(v) for v in all_missing.values()),
         "missing": {
@@ -446,7 +446,7 @@ def main() -> int:
             print(f"  - {path}")
         print(
             "\nClone the upstream repo at the pinned parity tag, e.g.:\n"
-            "  git clone --depth 1 --branch chat@4.30.0 "
+            "  git clone --depth 1 --branch chat@4.31.0 "
             "https://github.com/vercel/chat.git /tmp/vercel-chat\n"
             "then re-run with TS_ROOT=/tmp/vercel-chat."
         )
