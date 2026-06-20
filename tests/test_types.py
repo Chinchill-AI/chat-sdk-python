@@ -14,11 +14,15 @@ from chat_sdk.types import (
     Author,
     EmojiFormats,
     EmojiValue,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
     MessageSubject,
     MessageSubjectParty,
+    PlanUpdateChunk,
     RawMessage,
+    TaskUpdateChunk,
+    ThinkingChunk,
     _get_message_adapter,
     _message_adapter_map,
     set_message_adapter,
@@ -632,3 +636,40 @@ class TestSetMessageAdapterWeakref:
         del msg
         gc.collect()
         assert key not in _message_adapter_map
+
+
+class TestThinkingChunk:
+    """Tests for the Python-only ``ThinkingChunk`` StreamChunk variant."""
+
+    def test_defaults(self):
+        chunk = ThinkingChunk()
+        assert chunk.type == "thinking"
+        assert chunk.content == ""
+
+    def test_with_content(self):
+        chunk = ThinkingChunk(content="Analyzing the user's request")
+        assert chunk.type == "thinking"
+        assert chunk.content == "Analyzing the user's request"
+
+    def test_type_discriminant_is_fixed(self):
+        # The discriminant is what adapters/normalizers switch on; it must be
+        # exactly "thinking" so it is never confused with the other variants.
+        assert ThinkingChunk(content="x").type == "thinking"
+        assert ThinkingChunk().type != MarkdownTextChunk().type
+        assert ThinkingChunk().type != TaskUpdateChunk().type
+        assert ThinkingChunk().type != PlanUpdateChunk().type
+
+    def test_is_member_of_streamchunk_union(self):
+        # Structural runtime check that ThinkingChunk is one of the StreamChunk
+        # variants alongside the upstream three.
+        from typing import get_args
+
+        from chat_sdk.types import StreamChunk
+
+        variants = (MarkdownTextChunk, TaskUpdateChunk, PlanUpdateChunk, ThinkingChunk)
+        assert set(get_args(StreamChunk)) == set(variants)
+        assert isinstance(ThinkingChunk(content="reasoning"), variants)
+
+    def test_equality_by_value(self):
+        assert ThinkingChunk(content="a") == ThinkingChunk(content="a")
+        assert ThinkingChunk(content="a") != ThinkingChunk(content="b")

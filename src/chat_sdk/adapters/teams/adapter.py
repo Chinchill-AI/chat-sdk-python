@@ -34,7 +34,12 @@ from chat_sdk.adapters.teams.types import (
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.adapter_utils import (
+    extract_card,
+    extract_files,
+    is_thinking_chunk,
+    maybe_render_thinking,
+)
 from chat_sdk.shared.buffer_utils import buffer_to_data_uri, to_buffer
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
@@ -1724,6 +1729,12 @@ class TeamsAdapter:
                 text = chunk
             elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                 text = chunk.get("text", "")
+            elif is_thinking_chunk(chunk):
+                # Python-only divergence: streaming-only reasoning, not message
+                # content. Default-skip keeps the buffered post byte-identical;
+                # an opt-in ``render_thinking`` hook may display it.
+                await maybe_render_thinking(getattr(self, "render_thinking", None), chunk)
+                continue
             if not text:
                 continue
             accumulated += text
@@ -1796,6 +1807,13 @@ class TeamsAdapter:
                     text = chunk
                 elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
                     text = chunk.get("text", "")
+                elif is_thinking_chunk(chunk):
+                    # Python-only divergence: streaming-only reasoning, not
+                    # message content. Default-skip keeps emitted text
+                    # byte-identical; an opt-in ``render_thinking`` hook may
+                    # display it.
+                    await maybe_render_thinking(getattr(self, "render_thinking", None), chunk)
+                    continue
                 elif getattr(chunk, "type", None) == "markdown_text":
                     # Dataclass ``MarkdownTextChunk`` form — mirror
                     # ``Thread.stream``'s ``_wrapped_stream`` extraction so the

@@ -47,6 +47,7 @@ from chat_sdk.types import (
     StreamChunk,
     StreamOptions,
     TaskUpdateChunk,
+    ThinkingChunk,
 )
 
 if TYPE_CHECKING:
@@ -266,6 +267,11 @@ class _ThreadImplConfig:
     is_subscribed_context: bool = False
     logger: Logger | None = None
     streaming_update_interval_ms: int = 500
+    # Python-only divergence (default-off). When True, raw AI-SDK
+    # ``reasoning`` / ``reasoning-delta`` parts passed to ``post()`` are
+    # surfaced as ``ThinkingChunk`` objects for adapters that render thinking.
+    # Default False keeps the stream byte-for-byte upstream (reasoning dropped).
+    emit_thinking: bool = False
 
     # Direct adapter mode
     adapter: Adapter | None = None
@@ -294,6 +300,7 @@ class ThreadImpl:
         self._logger = config.logger
         self._streaming_update_interval_ms = config.streaming_update_interval_ms
         self._fallback_streaming_placeholder_text = config.fallback_streaming_placeholder_text
+        self._emit_thinking = config.emit_thinking
 
         # Recent messages cache
         self._recent_messages: list[Message] = []
@@ -687,8 +694,11 @@ class ThreadImpl:
         are built into ``StreamOptions`` before both ``adapter.stream`` and
         ``fallbackStream`` are invoked.
         """
-        # Build text-only stream from raw_stream
-        text_stream = _from_full_stream(raw_stream)
+        # Build text-only stream from raw_stream. ``emit_thinking`` is a
+        # Python-only, default-off divergence: when enabled, raw reasoning
+        # parts become ``ThinkingChunk`` objects; when off (the default) the
+        # stream is byte-for-byte upstream.
+        text_stream = _from_full_stream(raw_stream, emit_thinking=self._emit_thinking)
 
         # Build streaming options from current message context + caller
         # options. Upstream parity (vercel/chat#340): seed
@@ -1283,12 +1293,24 @@ def _to_message(sent: SentMessage) -> Message:
 # ---------------------------------------------------------------------------
 
 
-async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]:
+async def _from_full_stream(
+    raw_stream: Any,
+    *,
+    emit_thinking: bool = False,
+) -> AsyncIterator[str | StreamChunk]:
     """Normalise a raw async iterable into str or StreamChunk items.
 
     Handles plain strings, AI SDK fullStream events, and StreamChunk objects.
     Mirrors from-full-stream.ts: tracks ``finish-step`` events so that a
     ``"\n\n"`` separator is emitted between consecutive steps.
+
+    ``emit_thinking`` is a Python-only, default-off divergence. When ``False``
+    (the default) the output is byte-for-byte upstream: AI-SDK ``reasoning`` /
+    ``reasoning-delta`` parts are dropped and pre-built ``ThinkingChunk``
+    objects are *not* forwarded. When ``True``, reasoning parts are surfaced as
+    ``ThinkingChunk`` objects and pre-built ``ThinkingChunk`` objects pass
+    through (for adapters that render thinking). Either way thinking is never
+    accumulated into the posted message text.
     """
     needs_separator = False
     has_emitted_text = False
@@ -1305,6 +1327,21 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
             # Pass through known StreamChunk types
             if item_type in ("markdown_text", "task_update", "plan_update"):
                 yield item
+                continue
+
+            # Opt-in reasoning surfacing (default-off => dropped as upstream).
+            if item_type in ("reasoning", "reasoning-delta", "thinking"):
+                if emit_thinking:
+                    content = next(
+                        (
+                            v
+                            for k in ("content", "text", "delta", "textDelta", "text_delta")
+                            if (v := getattr(item, k, None)) is not None
+                        ),
+                        "",
+                    )
+                    if isinstance(content, str) and content:
+                        yield ThinkingChunk(content=content)
                 continue
 
             # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
@@ -1335,6 +1372,21 @@ async def _from_full_stream(raw_stream: Any) -> AsyncIterator[str | StreamChunk]
             # cast to the declared yield union.
             if t in ("markdown_text", "task_update", "plan_update"):
                 yield cast("MarkdownTextChunk | PlanUpdateChunk | TaskUpdateChunk", item)
+                continue
+
+            # Opt-in reasoning surfacing (default-off => dropped as upstream).
+            if t in ("reasoning", "reasoning-delta", "thinking"):
+                if emit_thinking:
+                    content = next(
+                        (
+                            v
+                            for k in ("content", "text", "delta", "textDelta", "text_delta")
+                            if (v := item.get(k)) is not None
+                        ),
+                        "",
+                    )
+                    if isinstance(content, str) and content:
+                        yield ThinkingChunk(content=content)
                 continue
 
             if t == "text-delta":

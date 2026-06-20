@@ -468,6 +468,37 @@ class TestStreaming:
         http.assert_awaited_once()
         assert _sent_form(http)["Body"] == "hello world"
 
+    @pytest.mark.asyncio
+    async def test_stream_ignores_thinking_chunk(self):
+        """A ``ThinkingChunk`` is streaming-only reasoning, not message content.
+
+        The text-accumulating adapter must skip it without crashing and the
+        posted body must equal the text chunks only.
+        """
+        from chat_sdk.types import ThinkingChunk
+
+        http = _mock_http(
+            {
+                "body": "hello world",
+                "direction": "outbound-api",
+                "from": "+15550000001",
+                "sid": "SM124",
+                "to": "+15550000002",
+            }
+        )
+        adapter = create_twilio_adapter(account_sid="AC123", auth_token="token", http_request=http)
+
+        async def chunks() -> Any:
+            yield ThinkingChunk(content="reasoning")
+            yield "hello "
+            yield ThinkingChunk(content="more reasoning")
+            yield "world"
+
+        result = await adapter.stream("twilio:%2B15550000001:%2B15550000002", chunks())
+
+        assert result.id == "SM124"
+        assert _sent_form(http)["Body"] == "hello world"
+
 
 class TestFetchMessages:
     """fetch_message / fetch_messages over the Messages API."""

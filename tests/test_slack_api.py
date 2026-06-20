@@ -1214,6 +1214,84 @@ class TestStream:
         assert result.id == "777.777"
 
     @pytest.mark.asyncio
+    async def test_stream_skips_thinking_chunk_by_default(self):
+        """A ``ThinkingChunk`` must not change the posted message and must not
+        be sent as a structured chunk (which would disable structured-chunk
+        support for the rest of the stream).
+
+        Python-only divergence: thinking is streaming-only reasoning, not
+        message content. By default the adapter skips it — the appended text
+        equals exactly the text chunks, and no ``{"type": "thinking"}``
+        structured chunk is ever appended.
+        """
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "555.555"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        from chat_sdk.types import ThinkingChunk
+
+        async def chunk_gen() -> AsyncIterator[Any]:
+            yield ThinkingChunk(content="let me reason")
+            yield "Hello "
+            yield ThinkingChunk(content="still reasoning")
+            yield "world"
+
+        result = await adapter.stream(
+            "slack:C123:1234567890.000000",
+            chunk_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert result.id == "555.555"
+        # The accumulated markdown is exactly the text chunks (no thinking).
+        appended_markdown = "".join(
+            call.kwargs.get("markdown_text", "")
+            for call in mock_streamer.append.call_args_list
+            if "markdown_text" in call.kwargs
+        )
+        assert appended_markdown == "Hello world"
+        # No structured "thinking" chunk was ever appended.
+        for call in mock_streamer.append.call_args_list:
+            for chunk in call.kwargs.get("chunks", []) or []:
+                assert chunk.get("type") != "thinking"
+
+    @pytest.mark.asyncio
+    async def test_stream_thinking_chunk_invokes_render_hook(self):
+        """An opt-in ``render_thinking`` hook receives the reasoning text while
+        the posted message stays text-only."""
+        adapter, client, _ = await _init_adapter()
+
+        mock_streamer = MagicMock()
+        mock_streamer.append = AsyncMock()
+        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "444.444"}})
+        client.chat_stream = AsyncMock(return_value=mock_streamer)
+
+        seen: list[str] = []
+
+        async def render_thinking(content: str) -> None:
+            seen.append(content)
+
+        adapter.render_thinking = render_thinking  # type: ignore[attr-defined]
+
+        from chat_sdk.types import ThinkingChunk
+
+        async def chunk_gen() -> AsyncIterator[Any]:
+            yield ThinkingChunk(content="thought A")
+            yield "answer"
+            yield ThinkingChunk(content="thought B")
+
+        await adapter.stream(
+            "slack:C123:1234567890.000000",
+            chunk_gen(),
+            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+        )
+
+        assert seen == ["thought A", "thought B"]
+
+    @pytest.mark.asyncio
     async def test_stream_accepts_dict_markdown_text_chunks(self):
         """Dict-shaped markdown_text chunks must flow into the renderer the
         same as the dataclass form — `_from_full_stream` in thread.py

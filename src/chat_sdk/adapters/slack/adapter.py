@@ -64,7 +64,12 @@ from chat_sdk.adapters.slack.webhook import (
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
-from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.adapter_utils import (
+    extract_card,
+    extract_files,
+    is_thinking_chunk,
+    maybe_render_thinking,
+)
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.types import (
     ActionEvent,
@@ -4006,6 +4011,15 @@ class SlackAdapter:
                     await push_text_and_flush(text_value)
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
                 await push_text_and_flush(chunk.text)  # type: ignore[union-attr]
+            elif is_thinking_chunk(chunk):
+                # Python-only divergence: ``ThinkingChunk`` is streaming-only
+                # agent reasoning, NOT message content. By default it is
+                # skipped (no effect on the posted message). An adapter/consumer
+                # that wants to display thinking sets ``self.render_thinking``;
+                # only then is it invoked. Skipping (not routing to
+                # ``send_structured_chunk``) keeps the default posted message
+                # byte-identical and avoids disabling structured-chunk support.
+                await maybe_render_thinking(getattr(self, "render_thinking", None), chunk)
             else:
                 await send_structured_chunk(chunk)
 
