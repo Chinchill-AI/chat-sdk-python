@@ -33,6 +33,7 @@ from chat_sdk.adapters.telegram.rich import (
     rich_message_media,
     rich_message_to_markdown,
     rich_message_to_text,
+    truncate_rich_markdown,
 )
 from chat_sdk.adapters.telegram.types import (
     TelegramAdapterConfig,
@@ -69,7 +70,7 @@ from chat_sdk.shared.errors import (
     ResourceNotFoundError,
     ValidationError,
 )
-from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown
+from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown, stringify_markdown
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     ActionEvent,
@@ -85,7 +86,6 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
-    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
@@ -172,6 +172,24 @@ class TelegramParsedContent:
     """
 
     formatted: FormattedContent
+    text: str
+
+
+@dataclass
+class RichMessageResolution:
+    """Resolved native rich-message payload for an outgoing message.
+
+    Produced by :meth:`TelegramAdapter.resolve_rich_message` when a markdown
+    or AST postable is eligible for the ``sendRichMessage`` /
+    ``sendRichMessageDraft`` Bot API endpoints. ``markdown`` is the
+    rich-limit-truncated, emoji-resolved body sent verbatim to Telegram;
+    ``formatted`` / ``text`` are the locally pre-rendered AST and plain text
+    reused by :meth:`parse_telegram_message` (so the response isn't
+    re-parsed). Port of upstream ``resolveRichMessage``'s return shape.
+    """
+
+    formatted: FormattedContent
+    markdown: str
     text: str
 
 
@@ -672,6 +690,15 @@ class TelegramAdapter:
         # restarts don't reuse the previous process's draft ids; wraps to 1
         # at 2_147_483_647 to stay within Telegram's signed-int32 range.
         self._next_draft_id: int = max(1, int(time.time() * 1000) % 2_147_483_647)
+
+        # Native rich-message availability (vercel/chat#479). Starts True and
+        # latches to False the first time Telegram reports the rich-message
+        # endpoints are missing/unsupported (a 404 ``method not found`` or a
+        # ``rich message ... unsupported`` validation error), so subsequent
+        # sends skip the rich attempt entirely and go straight to MarkdownV2.
+        # Transient ``can't parse`` failures fall back per-message without
+        # flipping this flag.
+        self._rich_messages_available: bool = True
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -1397,6 +1424,7 @@ class TelegramAdapter:
                 "Telegram adapter does not support mixing file uploads and attachments in one message",
             )
 
+        rich = self.resolve_rich_message(message, card, len(files), len(attachments))
         raw_message: TelegramMessage
 
         if len(files) == 1:
@@ -1420,26 +1448,38 @@ class TelegramAdapter:
             if not text.strip():
                 raise ValidationError("telegram", "Message text cannot be empty")
 
-            async def _send_message(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
-                return await self.telegram_fetch(
-                    "sendMessage",
-                    {
-                        "chat_id": parsed_thread.chat_id,
-                        "message_thread_id": parsed_thread.message_thread_id,
-                        "text": resolved_text,
-                        "reply_markup": reply_markup,
-                        "parse_mode": resolved_parse_mode,
-                    },
+            async def _send_regular() -> TelegramMessage:
+                return await self.send_regular_message(
+                    parsed_thread,
+                    text,
+                    plain_text,
+                    parse_mode,
+                    reply_markup,
+                    thread_id,
                 )
 
-            raw_message = await self.with_telegram_markdown_fallback(
-                parse_mode,
-                _send_message,
-                initial_text=text,
-                fallback_text=plain_text,
-                method="sendMessage",
-                thread_id=thread_id,
-            )
+            if rich is not None:
+                rich_payload = rich
+
+                async def _send_rich() -> TelegramMessage:
+                    return await self.telegram_fetch(
+                        "sendRichMessage",
+                        {
+                            "chat_id": parsed_thread.chat_id,
+                            "message_thread_id": parsed_thread.message_thread_id,
+                            "rich_message": {"markdown": rich_payload.markdown},
+                            "reply_markup": reply_markup,
+                        },
+                    )
+
+                raw_message = await self.with_telegram_rich_fallback(
+                    _send_rich,
+                    _send_regular,
+                    method="sendRichMessage",
+                    thread_id=thread_id,
+                )
+            else:
+                raw_message = await _send_regular()
 
         resulting_thread_id = self.encode_thread_id(
             TelegramThreadId(
@@ -1452,7 +1492,11 @@ class TelegramAdapter:
             )
         )
 
-        parsed_message = self.parse_telegram_message(raw_message, resulting_thread_id)
+        # Reuse the locally pre-rendered AST/text when the rich path produced
+        # the message, so Telegram's echo isn't re-parsed (upstream passes
+        # ``{ formatted, text }`` into ``parseTelegramMessage``).
+        parsed_content = TelegramParsedContent(formatted=rich.formatted, text=rich.text) if rich is not None else None
+        parsed_message = self.parse_telegram_message(raw_message, resulting_thread_id, parsed_content)
         self.cache_message(parsed_message)
 
         return RawMessage(
@@ -1500,6 +1544,7 @@ class TelegramAdapter:
             ),
             parse_mode,
         )
+        rich = self.resolve_rich_message(message, card, 0, 0)
 
         if not text.strip():
             raise ValidationError("telegram", "Message text cannot be empty")
@@ -1519,15 +1564,40 @@ class TelegramAdapter:
                 },
             )
 
-        result = await self.with_telegram_markdown_fallback(
-            parse_mode,
-            _edit_message_text,
-            initial_text=text,
-            fallback_text=plain_text,
-            message_id=message_id,
-            method="editMessageText",
-            thread_id=thread_id,
-        )
+        async def _edit_regular() -> Any:
+            return await self.with_telegram_markdown_fallback(
+                parse_mode,
+                _edit_message_text,
+                initial_text=text,
+                fallback_text=plain_text,
+                message_id=message_id,
+                method="editMessageText",
+                thread_id=thread_id,
+            )
+
+        if rich is not None:
+            rich_payload = rich
+
+            async def _edit_rich() -> Any:
+                return await self.telegram_fetch(
+                    "editMessageText",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": telegram_message_id,
+                        "rich_message": {"markdown": rich_payload.markdown},
+                        "reply_markup": reply_markup or empty_telegram_inline_keyboard(),
+                    },
+                )
+
+            result = await self.with_telegram_rich_fallback(
+                _edit_rich,
+                _edit_regular,
+                message_id=message_id,
+                method="editMessageText",
+                thread_id=thread_id,
+            )
+        else:
+            result = await _edit_regular()
 
         # Telegram returns ``true`` when editing inline messages
         if result is True:
@@ -1538,11 +1608,13 @@ class TelegramAdapter:
                     "editMessage",
                 )
 
+            # ``rich?.text ?? text`` / ``rich?.formatted ?? toAst(text)``: when
+            # the rich path supplied a pre-rendered AST/text, reuse it.
             updated = Message(
                 id=existing.id,
                 thread_id=existing.thread_id,
-                text=text,
-                formatted=self._format_converter.to_ast(text),
+                text=rich.text if rich is not None else text,
+                formatted=rich.formatted if rich is not None else self._format_converter.to_ast(text),
                 raw=existing.raw,
                 author=existing.author,
                 metadata=MessageMetadata(
@@ -1573,7 +1645,8 @@ class TelegramAdapter:
             )
         )
 
-        parsed_message = self.parse_telegram_message(result, resulting_thread_id)
+        parsed_content = TelegramParsedContent(formatted=rich.formatted, text=rich.text) if rich is not None else None
+        parsed_message = self.parse_telegram_message(result, resulting_thread_id, parsed_content)
         self.cache_message(parsed_message)
 
         return RawMessage(
@@ -1661,25 +1734,30 @@ class TelegramAdapter:
     ) -> RawMessage | None:
         """Stream a message to a Telegram private chat via draft updates.
 
-        Port of upstream ``TelegramAdapter.stream`` (vercel/chat#340).
-        Private chats (DMs) get native draft streaming through the
-        ``sendMessageDraft`` Bot API method: the draft bubble updates in
-        place as chunks arrive, throttled to ``options.update_interval_ms``
-        (default :data:`TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS`), and a
-        regular ``sendMessage`` persists the final text when the stream
-        ends. Returns ``None`` for non-DM threads — before consuming any
-        chunks — so the SDK's built-in post+edit fallback handles groups,
-        supergroups, and channels.
+        Port of upstream ``TelegramAdapter.stream`` (vercel/chat#479, on top
+        of the #340 draft-streaming foundation). Private chats (DMs) get
+        native draft streaming: the draft bubble updates in place as chunks
+        arrive, throttled to ``options.update_interval_ms`` (default
+        :data:`TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS`), and a final send
+        persists the message when the stream ends. Returns ``None`` for
+        non-DM threads — before consuming any chunks — so the SDK's built-in
+        post+edit fallback handles groups, supergroups, and channels.
 
-        Draft updates render the in-flight markdown through
-        :class:`StreamingMarkdownRenderer` and
-        :func:`truncate_for_telegram`, so transiently unpaired entity
-        markers are trimmed to a MarkdownV2-safe boundary instead of
-        tripping Telegram's ``can't parse entities`` 400. If Telegram still
-        rejects the markdown, the stream downgrades to plain-text drafts
-        (and a plain-text final send); any other draft failure disables
-        draft updates entirely but never fails the stream — the final
-        message is always attempted.
+        The outbound ladder is **rich → MarkdownV2 → plain**:
+
+        * Drafts first go through ``sendRichMessageDraft`` (native rich
+          markdown), and the final message through ``sendRichMessage``.
+        * If the rich endpoint reports it can't parse / is missing /
+          unsupported, the stream demotes to the MarkdownV2
+          ``sendMessageDraft`` + ``sendMessage`` path (the #340 behaviour,
+          now the second tier).
+        * If Telegram then rejects the MarkdownV2 entities, the stream
+          downgrades again to plain-text drafts and a plain final send.
+
+        Any other (non-fallback) draft failure disables draft updates
+        entirely but never fails the stream — the final message is always
+        attempted. There is no longer an empty opening draft; the first
+        bubble update carries real content.
         """
         if not self.is_dm(thread_id):
             return None
@@ -1699,6 +1777,7 @@ class TelegramAdapter:
         last_flush_at = 0.0
         draft_streaming_enabled = True
         stream_uses_markdown = True
+        stream_uses_rich = self._rich_messages_available
 
         def _now_ms() -> float:
             return time.monotonic() * 1000.0
@@ -1731,13 +1810,54 @@ class TelegramAdapter:
             return payload
 
         async def send_draft(text: str, use_markdown: bool) -> None:
-            nonlocal draft_streaming_enabled, last_draft_text, last_flush_at, stream_uses_markdown
+            nonlocal draft_streaming_enabled, last_draft_text, last_flush_at
+            nonlocal stream_uses_markdown, stream_uses_rich
             if not draft_streaming_enabled or text == last_draft_text:
                 return
 
+            draft_text = text
+            if stream_uses_rich:
+                try:
+                    await self.telegram_fetch(
+                        "sendRichMessageDraft",
+                        {
+                            "chat_id": parsed_thread.chat_id,
+                            "message_thread_id": parsed_thread.message_thread_id,
+                            "draft_id": draft_id,
+                            "rich_message": {"markdown": text},
+                        },
+                    )
+                    last_draft_text = text
+                    last_flush_at = _now_ms()
+                    return
+                except Exception as error:
+                    if not self.can_fallback_from_rich_message(error, "sendRichMessageDraft"):
+                        # Not a rich-availability problem (e.g. a network
+                        # blip): stop draft updates but keep the stream alive
+                        # for the final send. Rich stays enabled.
+                        draft_streaming_enabled = False
+                        self._logger.warn(
+                            "Telegram rich draft streaming update failed",
+                            {"error": str(error), "thread_id": thread_id},
+                        )
+                        return
+
+                    # Rich is unavailable / can't-parse: remember (may latch
+                    # rich off permanently), demote this stream to the
+                    # MarkdownV2 draft path, and re-render the body.
+                    self.remember_rich_message_failure(error, "sendRichMessageDraft")
+                    self._logger.warn(
+                        "Telegram rich draft failed; retrying with a regular draft",
+                        {"error": str(error), "thread_id": thread_id},
+                    )
+                    stream_uses_rich = False
+                    draft_text = (
+                        render_markdown_text(renderer.render()) if use_markdown else render_plain_text(accumulated)
+                    )
+
             try:
-                await self.telegram_fetch("sendMessageDraft", _draft_payload(text, markdown=use_markdown))
-                last_draft_text = text
+                await self.telegram_fetch("sendMessageDraft", _draft_payload(draft_text, markdown=use_markdown))
+                last_draft_text = draft_text
                 last_flush_at = _now_ms()
             except Exception as error:
                 if use_markdown and self.is_telegram_markdown_parse_error(error):
@@ -1767,14 +1887,13 @@ class TelegramAdapter:
         async def flush_draft() -> None:
             if not draft_streaming_enabled:
                 return
-            draft_text = (
-                render_markdown_text(renderer.render()) if stream_uses_markdown else render_plain_text(accumulated)
-            )
+            if stream_uses_rich:
+                draft_text = truncate_rich_markdown(renderer.render())
+            elif stream_uses_markdown:
+                draft_text = render_markdown_text(renderer.render())
+            else:
+                draft_text = render_plain_text(accumulated)
             await send_draft(draft_text, stream_uses_markdown)
-
-        # Open the draft bubble immediately so the user sees activity
-        # before the first chunk lands.
-        await send_draft("", False)
 
         async for chunk in text_stream:
             text: str | None = None
@@ -1798,23 +1917,72 @@ class TelegramAdapter:
             if _now_ms() - last_flush_at >= update_interval_ms:
                 await flush_draft()
 
-        await flush_draft()
-
         if not accumulated.strip():
             raise ValidationError("telegram", "Telegram streaming requires text content")
 
-        # Persist the final message through the regular post path (which
-        # carries its own markdown-parse retry). The returned RawMessage
-        # leaves ``text`` unset so ``Thread.stream`` records its local
-        # accumulator — matching upstream, which records
-        # ``{ markdown: accumulated }``.
-        final_postable: AdapterPostableMessage = (
-            PostableMarkdown(markdown=accumulated)
-            if stream_uses_markdown
-            else self.resolve_telegram_fallback_text(accumulated, _markdown_to_plain_text(accumulated))
-        )
+        # Finalise the renderer FIRST, then flush — a trailing table-like
+        # block only resolves to its final markdown once the renderer is
+        # finished, so the last draft must reflect the post-finish render.
+        final_markdown = renderer.finish()
+        await flush_draft()
 
-        return await self.post_message(thread_id, final_postable)
+        if stream_uses_rich:
+            markdown = truncate_rich_markdown(final_markdown)
+            try:
+                raw = await self.telegram_fetch(
+                    "sendRichMessage",
+                    {
+                        "chat_id": parsed_thread.chat_id,
+                        "message_thread_id": parsed_thread.message_thread_id,
+                        "rich_message": {"markdown": markdown},
+                    },
+                )
+                resulting_thread_id = self.encode_thread_id(
+                    TelegramThreadId(
+                        chat_id=str(raw["chat"]["id"]),
+                        message_thread_id=(
+                            raw.get("message_thread_id")
+                            if raw.get("message_thread_id") is not None
+                            else parsed_thread.message_thread_id
+                        ),
+                    )
+                )
+                formatted = self._format_converter.to_ast(accumulated)
+                message = self.parse_telegram_message(
+                    raw,
+                    resulting_thread_id,
+                    TelegramParsedContent(formatted=formatted, text=ast_to_plain_text(formatted)),
+                )
+                self.cache_message(message)
+                return RawMessage(id=message.id, thread_id=message.thread_id, raw=raw)
+            except Exception as error:
+                if not self.can_fallback_from_rich_message(error, "sendRichMessage"):
+                    raise
+                self.remember_rich_message_failure(error, "sendRichMessage")
+
+        regular_text = render_markdown_text(final_markdown) if stream_uses_markdown else render_plain_text(accumulated)
+        plain_text = render_plain_text(accumulated)
+        raw = await self.send_regular_message(
+            parsed_thread,
+            regular_text,
+            plain_text,
+            TELEGRAM_MARKDOWN_PARSE_MODE if stream_uses_markdown else None,
+            None,
+            thread_id,
+        )
+        resulting_thread_id = self.encode_thread_id(
+            TelegramThreadId(
+                chat_id=str(raw["chat"]["id"]),
+                message_thread_id=(
+                    raw.get("message_thread_id")
+                    if raw.get("message_thread_id") is not None
+                    else parsed_thread.message_thread_id
+                ),
+            )
+        )
+        message = self.parse_telegram_message(raw, resulting_thread_id)
+        self.cache_message(message)
+        return RawMessage(id=message.id, thread_id=message.thread_id, raw=raw)
 
     # -- Fetching messages ---------------------------------------------------
 
@@ -2768,6 +2936,202 @@ class TelegramAdapter:
         body Telegram rejects as empty.
         """
         return fallback_text if fallback_text.strip() else original_text
+
+    # -- Native rich messages (vercel/chat#479) ------------------------------
+
+    def resolve_rich_message(
+        self,
+        message: AdapterPostableMessage,
+        card: Any,
+        file_count: int,
+        attachment_count: int,
+    ) -> RichMessageResolution | None:
+        """Resolve a postable into a native rich-message payload, or ``None``.
+
+        Port of upstream ``resolveRichMessage``. Returns ``None`` — disabling
+        the rich path so the caller sends a regular MarkdownV2/plain message —
+        when ANY of the following hold (a disjunction, ported exactly):
+
+        * rich messages are unavailable (the cached endpoint-missing latch);
+        * the message carries a card;
+        * a file or attachment is being uploaded;
+        * the message is a plain string;
+        * the message carries a ``raw`` field (**key presence**, not
+          truthiness — an empty ``raw`` still opts out of rich rendering).
+
+        Only ``{"markdown": …}`` and ``{"ast": …}`` shapes resolve to a rich
+        payload; everything else falls through to ``None``.
+        """
+        # ``"raw" in message`` — key PRESENCE, not truthiness: dict membership
+        # for mapping payloads, attribute presence for dataclass payloads.
+        has_raw = (isinstance(message, dict) and "raw" in message) or (
+            not isinstance(message, str) and hasattr(message, "raw")
+        )
+        if (
+            not self._rich_messages_available
+            or card
+            or file_count > 0
+            or attachment_count > 0
+            or isinstance(message, str)
+            or has_raw
+        ):
+            return None
+
+        markdown_value = self._postable_field(message, "markdown")
+        if markdown_value is not None:
+            formatted = self._format_converter.to_ast(markdown_value)
+            return RichMessageResolution(
+                formatted=formatted,
+                markdown=truncate_rich_markdown(convert_emoji_placeholders(markdown_value, "gchat")),
+                text=ast_to_plain_text(formatted),
+            )
+
+        ast_value = self._postable_field(message, "ast")
+        if ast_value is not None:
+            return RichMessageResolution(
+                formatted=ast_value,
+                markdown=truncate_rich_markdown(convert_emoji_placeholders(stringify_markdown(ast_value), "gchat")),
+                text=ast_to_plain_text(ast_value),
+            )
+
+        return None
+
+    @staticmethod
+    def _postable_field(message: AdapterPostableMessage, field: str) -> Any:
+        """Return ``message[field]`` for dict / dataclass postables, else ``None``.
+
+        Mirrors upstream's ``"field" in message ? message.field : …`` key-
+        presence narrowing across both the dict-shaped and dataclass-shaped
+        postable representations.
+        """
+        if isinstance(message, dict):
+            return message.get(field)
+        if hasattr(message, field):
+            return getattr(message, field)
+        return None
+
+    async def send_regular_message(
+        self,
+        thread: TelegramThreadId,
+        text: str,
+        plain_text: str,
+        parse_mode: str | None,
+        reply_markup: TelegramInlineKeyboardMarkup | None,
+        thread_id: str,
+    ) -> TelegramMessage:
+        """Send a non-rich message via ``sendMessage`` with markdown fallback.
+
+        Port of upstream ``sendRegularMessage``: the MarkdownV2-or-plain send
+        path used both directly (plain strings, ``raw`` payloads, the
+        rich-unavailable branch) and as the fallback operation passed to
+        :meth:`with_telegram_rich_fallback`.
+        """
+
+        async def _send_message(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
+            return await self.telegram_fetch(
+                "sendMessage",
+                {
+                    "chat_id": thread.chat_id,
+                    "message_thread_id": thread.message_thread_id,
+                    "text": resolved_text,
+                    "reply_markup": reply_markup,
+                    "parse_mode": resolved_parse_mode,
+                },
+            )
+
+        return await self.with_telegram_markdown_fallback(
+            parse_mode,
+            _send_message,
+            initial_text=text,
+            fallback_text=plain_text,
+            method="sendMessage",
+            thread_id=thread_id,
+        )
+
+    def can_fallback_from_rich_message(self, error: object, method: str) -> bool:
+        """Whether a rich-message failure may retry as a regular message.
+
+        Port of upstream ``canFallbackFromRichMessage``. Returns ``True`` for
+        the *transient and the permanent* rich failures alike — i.e. the
+        message should be retried via the regular MarkdownV2/plain path:
+
+        * a ``ResourceNotFoundError`` raised by a ``sendRichMessage*`` call
+          (the 404 ``method not found``); OR
+        * a :class:`ValidationError` whose message contains ``can't parse``,
+          or ``method`` + ``not found``, or ``rich message`` + ``unsupported``.
+
+        Distinct from :meth:`remember_rich_message_failure`, which decides the
+        *narrower* set that additionally latches rich off permanently. A
+        transient ``can't parse`` qualifies here but NOT there.
+        """
+        message = str(error).lower() if isinstance(error, ValidationError) else ""
+        missing_method = "method" in message and "not found" in message
+        unsupported_rich = "rich message" in message and "unsupported" in message
+
+        return bool(
+            (method.startswith("sendRichMessage") and isinstance(error, ResourceNotFoundError))
+            or (isinstance(error, ValidationError) and ("can't parse" in message or missing_method or unsupported_rich))
+        )
+
+    def remember_rich_message_failure(self, error: object, method: str) -> None:
+        """Latch rich messages off when a failure proves the endpoint is gone.
+
+        Port of upstream ``rememberRichMessageFailure``. Flips
+        ``_rich_messages_available`` to ``False`` — permanently, for the life
+        of the adapter instance — ONLY for the endpoint-missing / unsupported
+        class of failures:
+
+        * a ``ResourceNotFoundError`` from a ``sendRichMessage*`` call; OR
+        * a :class:`ValidationError` containing ``method`` + ``not found`` or
+          ``rich message`` + ``unsupported``.
+
+        A transient ``can't parse`` / generic validation failure does NOT
+        match here, so rich remains enabled for subsequent messages — the key
+        distinction from :meth:`can_fallback_from_rich_message`.
+        """
+        message = str(error).lower() if isinstance(error, ValidationError) else ""
+        missing_method = "method" in message and "not found" in message
+        unsupported_rich = "rich message" in message and "unsupported" in message
+
+        if (method.startswith("sendRichMessage") and isinstance(error, ResourceNotFoundError)) or (
+            isinstance(error, ValidationError) and (missing_method or unsupported_rich)
+        ):
+            self._rich_messages_available = False
+
+    async def with_telegram_rich_fallback(
+        self,
+        operation: Callable[[], Awaitable[_T]],
+        fallback: Callable[[], Awaitable[_T]],
+        *,
+        method: str,
+        message_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> _T:
+        """Run *operation* (a rich send), retrying via *fallback* on rich errors.
+
+        Port of upstream ``withTelegramRichFallback``. On failure: if
+        :meth:`can_fallback_from_rich_message` rejects the error it re-raises
+        unchanged (non-rich failures must surface); otherwise it records the
+        failure via :meth:`remember_rich_message_failure` (which may latch
+        rich off) and returns *fallback*'s result — the regular send.
+        """
+        try:
+            return await operation()
+        except Exception as error:
+            if not self.can_fallback_from_rich_message(error, method):
+                raise
+
+            self.remember_rich_message_failure(error, method)
+            log_context: dict[str, Any] = {"error": str(error), "method": method}
+            if message_id is not None:
+                log_context["message_id"] = message_id
+            if thread_id is not None:
+                log_context["thread_id"] = thread_id
+            self._logger.warn(
+                "Telegram rich message failed; retrying with a regular message",
+                log_context,
+            )
+            return await fallback()
 
     # -- Truncation ----------------------------------------------------------
 
