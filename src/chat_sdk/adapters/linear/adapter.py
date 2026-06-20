@@ -243,20 +243,22 @@ query AgentSession($id: String!) {
 # Agent-session children FETCH query. Ports upstream's
 # ``linear.comments({ filter: { parent: { id: { eq: rootComment.id } } }, first|last })``
 # (index.ts:1793). Schema-hardened: the root ``comments(filter: CommentFilter,
-# first: Int, last: Int, after: String): CommentConnection!`` query exists, and
+# first: Int, last: Int): CommentConnection!`` query exists, and
 # the ``CommentFilter.parent: NullableCommentFilter`` → ``.id: IDComparator`` →
 # ``.eq: ID`` chain is all schema-valid. Pagination is direction-driven —
-# ``forward`` → ``first``, otherwise ``last`` (upstream's ternary). The same
-# ``Comment`` sub-fields as the root-comment selection plus ``pageInfo {
-# hasNextPage endCursor }`` (both published ``PageInfo`` fields).
+# ``forward`` → ``first``, otherwise ``last`` (upstream's ternary). Upstream
+# passes ONLY ``first``/``last`` here — it never reads ``options.cursor`` — and
+# the sibling ``_fetch_issue_comments``/``_fetch_comment_thread`` paths likewise
+# forward no cursor, so no ``after`` is sent. The same ``Comment`` sub-fields as
+# the root-comment selection plus ``pageInfo { hasNextPage endCursor }`` (both
+# published ``PageInfo`` fields).
 _AGENT_SESSION_CHILDREN_QUERY = """
 query AgentSessionComments(
     $filter: CommentFilter
     $first: Int
     $last: Int
-    $after: String
 ) {
-    comments(filter: $filter, first: $first, last: $last, after: $after) {
+    comments(filter: $filter, first: $first, last: $last) {
         nodes {
             id
             body
@@ -1692,8 +1694,13 @@ class LinearAdapter:
         )
         agent_session = (session_result.get("data") or {}).get("agentSession")
         if not agent_session:
+            # Port-only guard: upstream has no null-session branch — the
+            # ``@linear/sdk`` ``linear.agentSession(id)`` throws its own
+            # not-found. The raw-GraphQL port returns ``null`` instead, so this
+            # guard describes the REAL failure (session not found), distinct from
+            # the downstream missing-``issueId`` raise after the session resolves.
             raise AdapterError(
-                f"Linear agent session {thread.agent_session_id} is missing issueId",
+                f"Linear agent session {thread.agent_session_id} not found",
                 "linear",
             )
 
@@ -1725,14 +1732,12 @@ class LinearAdapter:
         # ``backward``/unset) with ``last``. Send the unused bound as ``None`` so
         # GraphQL ignores it.
         forward = options is not None and options.direction == "forward"
-        cursor = options.cursor if options is not None else None
         children_result = await self._graphql_query(
             _AGENT_SESSION_CHILDREN_QUERY,
             {
                 "filter": {"parent": {"id": {"eq": root_comment.get("id")}}},
                 "first": limit if forward else None,
                 "last": None if forward else limit,
-                "after": cursor,
             },
         )
 

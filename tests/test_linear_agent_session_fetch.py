@@ -10,9 +10,11 @@ queries against the published Linear schema:
   NO scalar ``issueId`` field (only the ``issue`` relation), so the issue id is
   read off ``issue { id }`` (equivalent to upstream's ``agentSession.issueId``).
   The nullable ``comment: Comment`` relation is the root comment.
-- ``comments(filter: CommentFilter, first/last/after): CommentConnection!`` with
+- ``comments(filter: CommentFilter, first/last): CommentConnection!`` with
   the ``{parent: {id: {eq: root_comment.id}}}`` filter — ``forward`` paginates
-  with ``first``, every other direction with ``last``.
+  with ``first``, every other direction with ``last``. Upstream passes ONLY
+  ``first``/``last`` (it never reads ``options.cursor``), so no ``after`` is
+  forwarded — matching the sibling issue/comment fetch paths.
 
 Each test pins behaviour so a regression — a forward/backward (first↔last) swap,
 a per-comment-id → fixed-thread-id collapse, a nullish (``??``) → ``or`` swap, a
@@ -357,7 +359,15 @@ class TestFetchAgentSessionMessagesPagination:
         assert children_vars["first"] is None
 
     @pytest.mark.asyncio
-    async def test_cursor_passed_as_after(self) -> None:
+    async def test_inbound_cursor_is_not_forwarded_as_after(self) -> None:
+        """Faithfulness: upstream ``fetchAgentSessionMessages`` passes ONLY
+        ``first``/``last`` — it never reads ``options.cursor`` — and the sibling
+        ``_fetch_issue_comments``/``_fetch_comment_thread`` paths forward no
+        cursor either. So an inbound ``cursor`` must NOT be plumbed to the
+        children query as ``after``. A regression that re-introduced
+        ``"after": options.cursor`` (or restored ``$after`` to the query) would
+        surface here.
+        """
         adapter = _make_adapter()
         adapter._graphql_query = _query_router(  # type: ignore[method-assign]
             _session_return(),
@@ -366,8 +376,13 @@ class TestFetchAgentSessionMessagesPagination:
 
         await adapter.fetch_messages(_SESSION_THREAD, FetchOptions(cursor="cursor-xyz"))
 
-        _, children_vars = adapter._graphql_query.call_args_list[1][0]
-        assert children_vars["after"] == "cursor-xyz"
+        children_query, children_vars = adapter._graphql_query.call_args_list[1][0]
+        # No ``after`` variable is sent, and the query declares no ``$after`` param.
+        assert "after" not in children_vars
+        assert "$after" not in children_query
+        assert "after:" not in children_query
+        # Only the pagination bounds and filter are forwarded.
+        assert set(children_vars) == {"filter", "first", "last"}
 
 
 # ===========================================================================
@@ -389,19 +404,163 @@ class TestFetchAgentSessionMessagesNextCursor:
         assert result.next_cursor == "cursor-next"
 
     @pytest.mark.asyncio
-    async def test_next_cursor_absent_when_no_next_page(self) -> None:
+    @pytest.mark.parametrize(
+        ("has_next_page", "end_cursor"),
+        [
+            # endCursor present but hasNextPage False → suppressed by the
+            # ``hasNextPage`` term. A mutation returning endCursor unconditionally
+            # (``next_cursor=end_cursor``, or dropping the ``hasNextPage`` guard)
+            # would leak ``cursor-stale`` here.
+            (False, "cursor-stale"),
+            # hasNextPage True but endCursor absent → ``next_cursor`` is None,
+            # matching upstream's ``hasNextPage ? (endCursor ?? undefined)
+            # : undefined`` (here ``end_cursor if hasNextPage and end_cursor is
+            # not None else None``). Pins the ``and end_cursor is not None`` term
+            # so a present-cursor regression cannot fabricate a cursor here.
+            (True, None),
+        ],
+    )
+    async def test_next_cursor_none_unless_both_has_next_page_and_cursor(
+        self, has_next_page: bool, end_cursor: str | None
+    ) -> None:
         adapter = _make_adapter()
-        # endCursor is present, but hasNextPage is False → next_cursor is None.
-        # A regression that returned endCursor regardless of hasNextPage would
-        # leak ``cursor-stale`` here.
         adapter._graphql_query = _query_router(  # type: ignore[method-assign]
             _session_return(),
-            _children_return(has_next_page=False, end_cursor="cursor-stale"),
+            _children_return(has_next_page=has_next_page, end_cursor=end_cursor),
         )
 
         result = await adapter.fetch_messages(_SESSION_THREAD)
 
+        # next_cursor is set ONLY when BOTH hasNextPage is true AND endCursor is
+        # present; neither case above satisfies both, so it is None.
         assert result.next_cursor is None
+
+
+# ===========================================================================
+# Dispatch ordering — comment-session thread routes to the AGENT-SESSION fetch
+# ===========================================================================
+
+
+class TestFetchDispatchOrdering:
+    @pytest.mark.asyncio
+    async def test_comment_session_thread_dispatches_to_agent_session_fetch(self) -> None:
+        """A ``linear:{issue}:c:{comment}:s:{session}`` thread id must dispatch to
+        the AGENT-SESSION fetch, NOT the comment-thread fetch.
+
+        ``fetch_messages`` tests ``decoded.agent_session_id`` BEFORE
+        ``decoded.comment_id`` (upstream index.ts:1757 — the ``agentSessionId``
+        branch precedes the ``commentId`` branch), and a comment-session thread id
+        decodes to a ``LinearThreadId`` with BOTH ``comment_id`` and
+        ``agent_session_id`` set. If the agent-session branch were moved BELOW the
+        ``comment_id`` branch (a branch-swap mutation), this thread would wrongly
+        route to ``_fetch_comment_thread`` and issue the ``comment(id:)`` query
+        instead of the two-step ``agentSession``/``comments`` queries — failing the
+        assertions below.
+        """
+        adapter = _make_adapter()
+        comment_session_thread = "linear:issue-123:c:comment-root:s:session-789"
+        # Sanity: the id genuinely decodes to all three segments (so the routing
+        # decision is a real precedence choice, not a parse artifact).
+        decoded = adapter.decode_thread_id(comment_session_thread)
+        assert decoded.agent_session_id == "session-789"
+        assert decoded.comment_id == "comment-root"
+
+        child = _bot_comment(comment_id="comment-a", body="reply")
+        adapter._graphql_query = _query_router(  # type: ignore[method-assign]
+            _session_return(session_id="session-789"),
+            _children_return(nodes=[child]),
+        )
+
+        result = await adapter.fetch_messages(comment_session_thread)
+
+        # Two queries ran: the agent-session resolve, then the children connection.
+        # The comment-thread fetch (``comment(id: $commentId)``) issues exactly ONE.
+        assert adapter._graphql_query.await_count == 2
+        first_query, first_vars = adapter._graphql_query.call_args_list[0][0]
+        assert "agentSession(id: $id)" in first_query
+        assert first_vars == {"id": "session-789"}
+        second_query = adapter._graphql_query.call_args_list[1][0][0]
+        assert "comments(" in second_query
+        # The comment-thread query shape MUST NOT appear — proves we did not route
+        # to ``_fetch_comment_thread``.
+        assert "comment(id: $commentId)" not in first_query
+        assert "comment(id: $commentId)" not in second_query
+        # The session path re-encodes each comment's OWN id plus the :s: segment.
+        assert [m.thread_id for m in result.messages] == [
+            "linear:issue-123:c:comment-root:s:session-789",
+            "linear:issue-123:c:comment-a:s:session-789",
+        ]
+
+
+# ===========================================================================
+# Null-session guard — message describes the real failure (not "missing issueId")
+# ===========================================================================
+
+
+class TestNullSessionGuard:
+    @pytest.mark.asyncio
+    async def test_null_session_raises_not_found(self) -> None:
+        """When the raw-GraphQL ``agentSession(id)`` resolves to ``null`` (the
+        port-only branch — upstream's SDK throws its own not-found), the guard
+        must describe the REAL failure: the session was not found, NOT
+        "missing issueId" (which belongs to the SEPARATE downstream guard that
+        only fires AFTER a session resolves but yields no issue id).
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(return_value={"data": {"agentSession": None}})  # type: ignore[method-assign]
+
+        with pytest.raises(AdapterError) as exc_info:
+            await adapter.fetch_messages(_SESSION_THREAD)
+        message = str(exc_info.value)
+        assert message == "Linear agent session session-789 not found"
+        # Guard against the prior misleading wording.
+        assert "missing issueId" not in message
+
+
+# ===========================================================================
+# issueId fallback — nullish (??) NOT truthiness (||): empty issue.id is kept
+# ===========================================================================
+
+
+class TestFetchAgentSessionIssueIdNullish:
+    @pytest.mark.asyncio
+    async def test_empty_session_issue_id_is_kept_not_replaced_by_thread(self) -> None:
+        """A session whose ``issue.id`` is an EMPTY STRING must KEEP ``""`` as the
+        resolved issue id (``session_issue_id if session_issue_id is not None else
+        thread.issue_id``) — NOT fall back to ``thread.issue_id``.
+
+        Upstream is ``agentSession.issueId ?? thread.issueId`` followed by
+        ``if (!issueId) throw`` (index.ts:1775-1781): the ``??`` keeps ``""`` and
+        the ``!issueId`` falsy guard then bails. So with a session ``issue.id`` of
+        ``""`` and a NON-empty ``thread.issue_id`` fallback, the correct (nullish)
+        code keeps ``""`` and raises "missing issueId"; if the fallback were
+        mutated to ``or`` (truthiness), ``""`` would be REPLACED by the non-empty
+        ``thread.issue_id`` and the fetch would SUCCEED — so this raise is the
+        unforgeable signal that the empty string was preserved.
+
+        Called directly (a thread id string cannot encode an empty issue id) with
+        a non-empty ``thread.issue_id`` so the ``or`` mutation is distinguishable
+        from the ``is not None`` truth.
+        """
+        adapter = _make_adapter()
+        # Session resolves with an EMPTY issue.id; the children query must never
+        # run (the falsy guard bails first) — a failing AsyncMock proves that.
+        adapter._graphql_query = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                _session_return(issue_id=""),
+                AssertionError("children query must not run when issue id is empty"),
+            ]
+        )
+        thread = LinearAgentSessionThreadId(issue_id="issue-fallback", agent_session_id="session-789")
+
+        with pytest.raises(AdapterError) as exc_info:
+            await adapter._fetch_agent_session_messages(thread)
+        # The empty string was kept (per ``??``) and tripped the ``!issueId``
+        # guard. Under an ``or`` mutation, ``thread.issue_id`` ("issue-fallback")
+        # would have been substituted and the fetch would have proceeded.
+        assert "missing issueId" in str(exc_info.value)
+        # Only the session query ran; the children query was never reached.
+        assert adapter._graphql_query.await_count == 1
 
 
 # ===========================================================================
