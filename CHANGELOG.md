@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.31
+
+Synced to upstream `vercel/chat@4.31.0`. The mapped-core **test** files (`packages/chat/src/*.test.ts`) are byte-identical between the `chat@4.30.0` and `chat@4.31.0` tags, so the fidelity re-pin to `chat@4.31.0` is string-only (732/732 mapped-core tests still pass, 0 missing); the core **source** delta is the `LinkButton` stable-id field (below). The headline is the **Linear agent-sessions** mode, plus the **Teams SDK-free primitive subpaths**, the **Slack 4.31** changes, **Telegram rich messages**, and a Python-only opt-in **`ThinkingChunk`** stream type. Sets `UPSTREAM_PARITY = "4.31.0"`.
+
+### Headline: Linear agent-sessions mode (issue #151)
+
+Full port of upstream's Linear agent-sessions interaction model, delivered across five PRs (L1–L5). Because no official Linear Python SDK exists, every `@linear/sdk` call is reproduced as **raw GraphQL** over the existing `_graphql_query` helper and **schema-hardened field-by-field against Linear's published GraphQL schema** (`linear/packages/sdk/src/schema.graphql`).
+
+- **L1 — types** (#168). `LinearAgentSessionThreadId`, the `mode: "agent-sessions" | "comments"` config (default `"comments"`), the `kind`-discriminated raw-message variants (`comment` / `agent_session_comment`), and the `AgentSessionEvent` webhook payload types.
+- **L2 — thread-id** (#170). Anchored `linear:{issue}:c:{comment}:s:{session}` / `linear:{issue}:s:{session}` encode/decode with a strict decode order; existing thread-id forms stay byte-identical so cross-SDK state is preserved.
+- **L3 — webhook parse + routing** (#171). The `AgentSessionEvent` branch with mutually-exclusive mode gating (agent-session events flow only in `agent-sessions` mode, comment events only in `comments` mode), `_parse_message_from_agent_session_event` (created/prompted actions + null-return/warn paths), app-ownership guard, and `get_user_name_from_profile_url`.
+- **L4 — emit** (#172). `post_message` / `start_typing` / `stream` route through raw `agentActivityCreate` / `agentSessionUpdate` mutations (lowercase `AgentActivityType` enum, `content: JSONObject!`, `ephemeral` included only when set); streaming flushes markdown deltas as `response`/`thought` activities and maps `task_update`/`plan_update` chunks to `action`/`error` activities and session-plan updates.
+- **L5 — fetch** (#173). `fetch_messages` dispatches agent-session threads to `_fetch_agent_session_messages` (raw `agentSession(id:)` + `comments(filter:{parent})` with forward/backward pagination); `edit_message`/`delete_message` raise append-only errors for session threads.
+
+The schema-hardening caught two live-tenant-breaking selection bugs before they shipped (`AgentActivity` exposes the `agentSession` relation, not a scalar `agentSessionId`; `AgentSession` likewise has no scalar `issueId`). The mutations/queries are confirmed against the published schema but **not yet exercised against a live Linear agent-session tenant** — documented in `docs/UPSTREAM_SYNC.md`.
+
+### Teams: SDK-free primitive subpaths (chat@4.31, commit `8c71411`)
+
+New runtime-free Teams subpaths mirroring upstream's `@chat-adapter/teams/*` exports: `teams/api` (Bot Connector — token grant, post/update/delete message, typing, create conversation), `teams/graph` (Microsoft Graph — channels, messages, pagination), `teams/format` (Teams text/mention/HTML↔Markdown), `teams/webhook` (read/parse, continuation/user/attachment extraction, mention detection), `teams/cards` + `cards_input` (card → Adaptive Card + input parsing), and `teams/modals` (modal → Adaptive Card + dialog-submit parsing). Each network-facing primitive carries an SSRF/token-leak host gate: `call_teams_connector_api` (serviceUrl Bot Framework allowlist) and `call_teams_graph_api` (host pinned to `graph.microsoft.com`, also guarding followed `@odata.nextLink` cursors).
+
+### Slack 4.31 (commit `f801985`, PR #155)
+
+- **`@mention`-inside-URL fix.** Bare `@handle`s inside `http(s)` URLs (paths, query strings, fragments) are no longer rewritten into `<@handle>` mentions (which corrupted the link), via a URL-span exclusion pass.
+- **`web_client_options`** config — forwarded to both the default and per-token `slack_sdk` `WebClient`s to tune the underlying HTTP client (timeout, `retry_handlers`, headers), with per-client header isolation. (Maps to slack_sdk kwargs rather than `@slack/web-api`'s axios options — documented divergence.)
+- **Stable link-button `action_id`** — `LinkButton(id=…)` now flows to the Slack block `action_id` instead of always deriving it from the URL.
+
+### Telegram: rich messages (commit `4662309`)
+
+Character-for-character port of the new `rich.ts` (Telegram rich-message wire types → Markdown + plain text) as `telegram/rich.py`, plus the rich-message/media type family (`TelegramRichText`/`RichBlock`/`RichMessage`, animation/audio/location/video/voice), native `sendRichMessage`/`sendRichMessageDraft` threading through post/edit/stream with a rich→regular fallback, and a `/slash`-command router.
+
+### Core: `LinkButton` stable id + opt-in `ThinkingChunk`
+
+- **`LinkButton(id=…)`** (chat@4.31, commit `171657a`). Optional action identifier for platforms that report link clicks (matches the `Button`/`Select` `id` convention). The JSX-runtime half of the same commit has no Python equivalent (no JSX runtime) and is documented as such.
+- **`ThinkingChunk`** (Python-only, opt-in, default-off; supersedes PR #39, landed in #169). A **separate** `ThinkingChunk(type="thinking", content=str)` stream-input type surfaces AI-SDK `reasoning`/`reasoning-delta` parts. **`StreamChunk` is not widened** — it stays byte-identical to upstream's three variants, so consumers referencing it are unaffected; `ThinkingChunk` is accepted only at the stream boundaries via the `StreamInput = str | StreamChunk | ThinkingChunk` alias. Emitted only when a caller opts in (`emit_thinking=True`); the default stream and persisted `Message` are byte-identical to upstream, so cross-SDK state stays compatible. Gives chinchill a first-class path to stream agent thinking to Slack/Teams without intercepting the model stream out-of-band.
+
+### Not ported (documented)
+
+- **`chat/adapters` static catalog** (new `./adapters` subpath). Upstream's SDK-free adapter/env-var metadata registry is addressed by npm package names and includes ~13 vendor-official adapters this SDK doesn't ship, so it isn't meaningfully portable verbatim; a Python-native equivalent would be a new feature with no current consumer need. Documented in `docs/UPSTREAM_SYNC.md`; deferred demand-driven.
+
 ## 0.4.30
 
 Synced to upstream `vercel/chat@4.30.0`. The mapped core (`packages/chat/src`) is content-identical between the `chat@4.29.0` and `chat@4.30.0` upstream tags, so this wave is all adapter work: a **new Twilio adapter**, a **Telegram native-streaming** port, a **Slack primitives-subpath** wave, a batch of **WhatsApp / Slack / Google Chat** fixes, and the headline — the **Teams adapter migration to the official `microsoft-teams-apps` SDK** (issue #93, delivered across four PRs). Sets `UPSTREAM_PARITY = "4.30.0"`; CI fidelity re-pinned to `chat@4.30.0` (732/732 mapped-core tests still pass, 0 missing).

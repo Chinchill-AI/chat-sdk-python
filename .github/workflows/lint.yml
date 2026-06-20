@@ -60,7 +60,7 @@ jobs:
       - name: Clone upstream vercel/chat at pinned parity tag
         id: clone_upstream
         run: |
-          git clone --depth 1 --branch chat@4.30.0 \
+          git clone --depth 1 --branch chat@4.31.0 \
             https://github.com/vercel/chat.git /tmp/vercel-chat
 
       - name: Test fidelity check (strict — zero missing in mapped core files)
