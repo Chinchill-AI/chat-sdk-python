@@ -693,6 +693,319 @@ class TestTelegramParseMessageAttachments:
 
 
 # ---------------------------------------------------------------------------
+# Inbound rich-message parsing (Bot API 10.1 -- chat@4.31 4662309)
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramParseInboundRichMessage:
+    """parseTelegramMessage handling of inbound ``rich_message`` payloads."""
+
+    def test_normalizes_inbound_rich_message_text_and_ast(self):
+        # Port of "normalizes inbound rich messages": a rich_message with no
+        # text/caption renders its plain text (for `.text`) and its markdown AST
+        # (for `.formatted`).
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {"type": "heading", "size": 2, "text": "Release"},
+                    {
+                        "type": "table",
+                        "cells": [
+                            [
+                                {"align": "left", "is_header": True, "text": "Package", "valign": "top"},
+                                {"align": "left", "is_header": True, "text": "Status", "valign": "top"},
+                            ],
+                            [
+                                {"align": "left", "text": "chat", "valign": "top"},
+                                {"align": "left", "text": "ready", "valign": "top"},
+                            ],
+                        ],
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert "Release" in parsed.text
+        assert "chat" in parsed.text
+        assert "ready" in parsed.text
+        child_types = [node.get("type") for node in parsed.formatted["children"]]
+        assert "heading" in child_types
+        assert "table" in child_types
+
+    def test_rich_message_text_falls_back_when_no_text_or_caption(self):
+        # plainText chains `??`: with text/caption absent (nullish), the rich
+        # message's plain-text rendering supplies `.text`. A mutation that
+        # swapped the rich fallback for "" would leave text empty.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={"blocks": [{"type": "paragraph", "text": "rich body"}]},
+        )
+        parsed = adapter.parse_message(msg)
+        assert parsed.text == "rich body"
+
+    def test_plain_text_caption_wins_over_rich_when_present(self):
+        # `?? raw.caption ?? (rich ? richMessageToText : "")` -- a present caption
+        # short-circuits the rich fallback. Guards against reordering the chain.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            caption="caption wins",
+            rich_message={"blocks": [{"type": "paragraph", "text": "rich body"}]},
+        )
+        parsed = adapter.parse_message(msg)
+        assert parsed.text == "caption wins"
+
+    def test_rich_markdown_drives_formatted_ast(self):
+        # `formatted: ... toAst(richMarkdown || text)` -- when a rich message is
+        # present its rendered markdown (not the bare plain text) seeds the AST.
+        # A bold paragraph must surface a `strong` inline node.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [{"type": "paragraph", "text": [{"type": "bold", "text": "loud"}]}],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        paragraph = parsed.formatted["children"][0]
+        assert paragraph["type"] == "paragraph"
+        inline_types = [child.get("type") for child in paragraph["children"]]
+        assert "strong" in inline_types
+
+    def test_message_without_rich_message_is_unaffected(self):
+        # Regression guard: a plain text message keeps deriving `.formatted`
+        # from its own text (richMarkdown is "", so `richMarkdown || text` == text).
+        adapter = _make_adapter()
+        parsed = adapter.parse_message(_sample_message(text="just text"))
+        assert parsed.text == "just text"
+        assert parsed.formatted["children"][0]["type"] == "paragraph"
+
+
+class TestTelegramParseInboundRichMedia:
+    """extractAttachments handling of media nested in ``rich_message`` blocks."""
+
+    def test_normalizes_nested_rich_media_as_attachments(self):
+        # Port of "normalizes nested rich media as attachments": media nested in
+        # a collage is recursed into; the photo picks its LARGEST size and the
+        # video carries name/mime/dimensions.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "collage",
+                        "blocks": [
+                            {
+                                "type": "photo",
+                                "photo": [
+                                    {"file_id": "small", "file_unique_id": "small-unique", "height": 100, "width": 100},
+                                    {
+                                        "file_id": "large",
+                                        "file_unique_id": "large-unique",
+                                        "file_size": 2048,
+                                        "height": 800,
+                                        "width": 1200,
+                                    },
+                                ],
+                            },
+                            {
+                                "type": "video",
+                                "video": {
+                                    "file_id": "video",
+                                    "file_unique_id": "video-unique",
+                                    "duration": 10,
+                                    "file_name": "clip.mp4",
+                                    "file_size": 4096,
+                                    "height": 720,
+                                    "mime_type": "video/mp4",
+                                    "width": 1280,
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 2
+
+        image = parsed.attachments[0]
+        assert image.type == "image"
+        assert image.fetch_metadata == {"fileId": "large"}  # LARGEST size, not "small"
+        assert image.size == 2048
+        assert image.width == 1200
+        assert image.height == 800
+
+        video = parsed.attachments[1]
+        assert video.type == "video"
+        assert video.fetch_metadata == {"fileId": "video"}
+        assert video.size == 4096
+        assert video.width == 1280
+        assert video.height == 720
+        assert video.name == "clip.mp4"
+        assert video.mime_type == "video/mp4"
+
+    def test_rich_animation_classified_as_image_by_mime(self):
+        # `animation` with an image/* mime maps to type "image" (a GIF rendered
+        # as a still). A mutation defaulting to "video" would fail here.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "animation",
+                        "animation": {
+                            "file_id": "anim-img",
+                            "file_unique_id": "anim-img-u",
+                            "duration": 3,
+                            "file_name": "loop.gif",
+                            "height": 240,
+                            "mime_type": "image/gif",
+                            "width": 320,
+                        },
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.type == "image"
+        assert attachment.fetch_metadata == {"fileId": "anim-img"}
+        assert attachment.mime_type == "image/gif"
+        assert attachment.name == "loop.gif"
+        assert attachment.width == 320
+        assert attachment.height == 240
+
+    def test_rich_animation_classified_as_video_by_mime(self):
+        # The same `animation` block with a video/* mime maps to type "video".
+        # This pins the mime-driven branch (truthiness of `startswith("image/")`).
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "animation",
+                        "animation": {
+                            "file_id": "anim-vid",
+                            "file_unique_id": "anim-vid-u",
+                            "duration": 5,
+                            "mime_type": "video/mp4",
+                            "height": 480,
+                            "width": 640,
+                        },
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        assert parsed.attachments[0].type == "video"
+        assert parsed.attachments[0].mime_type == "video/mp4"
+
+    def test_rich_voice_note_classified_as_audio(self):
+        # `voice_note` maps to type "audio" (no width/height/name fields).
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "voice_note",
+                        "voice_note": {
+                            "file_id": "voice",
+                            "file_unique_id": "voice-u",
+                            "duration": 7,
+                            "file_size": 9001,
+                            "mime_type": "audio/ogg",
+                        },
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.type == "audio"
+        assert attachment.fetch_metadata == {"fileId": "voice"}
+        assert attachment.size == 9001
+        assert attachment.mime_type == "audio/ogg"
+        assert attachment.width is None
+        assert attachment.height is None
+        assert attachment.name is None
+
+    def test_rich_media_recurses_through_list_blocks(self):
+        # `media()` recurses into list item blocks; a photo nested inside a list
+        # entry must still be extracted (guards against dropping list recursion).
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "list",
+                        "style": "bullet",
+                        "items": [
+                            {
+                                "label": "-",
+                                "blocks": [
+                                    {
+                                        "type": "photo",
+                                        "photo": [
+                                            {
+                                                "file_id": "listed-photo",
+                                                "file_unique_id": "listed-u",
+                                                "height": 50,
+                                                "width": 60,
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert len(parsed.attachments) == 1
+        assert parsed.attachments[0].type == "image"
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "listed-photo"}
+
+    def test_rich_media_appends_after_top_level_attachments(self):
+        # Top-level media (a document) and rich-block media coexist: the rich
+        # media is appended *after* the document, preserving upstream ordering.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text=None,
+            document={
+                "file_id": "doc1",
+                "file_unique_id": "udoc1",
+                "file_name": "report.pdf",
+                "mime_type": "application/pdf",
+            },
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "photo",
+                        "photo": [{"file_id": "rich-photo", "file_unique_id": "rp-u", "height": 10, "width": 10}],
+                    },
+                ],
+            },
+        )
+        parsed = adapter.parse_message(msg)
+        assert [a.type for a in parsed.attachments] == ["file", "image"]
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "doc1"}
+        assert parsed.attachments[1].fetch_metadata == {"fileId": "rich-photo"}
+
+
+# ---------------------------------------------------------------------------
 # applyTelegramEntities (complementary to existing tests)
 # ---------------------------------------------------------------------------
 
