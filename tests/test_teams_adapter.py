@@ -512,6 +512,166 @@ class TestRehydrateAttachment:
 
 
 # ---------------------------------------------------------------------------
+# file.download.info attachments (content.downloadUrl fallback)
+#
+# Python-first divergence (supersedes stale PR #136). A SharePoint/OneDrive
+# file shared in a personal/group chat arrives as a
+# ``application/vnd.microsoft.teams.file.download.info`` attachment whose
+# top-level ``contentUrl`` (the SharePoint item) 403s on an anonymous GET,
+# while the nested ``content.downloadUrl`` is a pre-signed link that works.
+# Upstream reads ``contentUrl`` only (adapter-teams/src/index.ts:833), so the
+# attachment is undownloadable. We prefer ``content.downloadUrl`` for this
+# attachment type. See docs/UPSTREAM_SYNC.md Known Non-Parity.
+# ---------------------------------------------------------------------------
+
+_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
+
+
+def _file_download_activity(attachment: dict) -> dict:
+    return {
+        "type": "message",
+        "id": "msg-file-dl",
+        "text": "here is a file",
+        "from": {"id": "user-1", "name": "Alice"},
+        "conversation": {"id": "19:abc@thread.tacv2"},
+        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        "attachments": [attachment],
+    }
+
+
+class TestFileDownloadInfoAttachment:
+    def test_prefers_download_url_over_403_content_url(self):
+        """A file.download.info attachment carries BOTH a (403-ing) contentUrl
+        and a pre-signed content.downloadUrl; the Attachment must use the
+        downloadUrl, not the SharePoint contentUrl.
+
+        Pins the exact URL (not just "non-None") so a mutation that reverts to
+        ``contentUrl`` is caught: the SharePoint item URL would surface instead.
+        """
+        adapter = _make_adapter(app_id="test-app")
+        content_url = "https://contoso.sharepoint.com/personal/jadams/Documents/report.pdf"
+        download_url = "https://contoso.sharepoint.com/_layouts/download.aspx?presigned=abc123"
+        activity = _file_download_activity(
+            {
+                "contentType": _FILE_DOWNLOAD_INFO,
+                "contentUrl": content_url,
+                "name": "report.pdf",
+                "content": {
+                    "downloadUrl": download_url,
+                    "uniqueId": "1150D938-8870-4044-9F2C-5BBDEBA70C9D",
+                    "fileType": "pdf",
+                },
+            }
+        )
+        msg = adapter.parse_message(activity)
+        assert len(msg.attachments) == 1
+        att = msg.attachments[0]
+        assert att.url == download_url
+        assert att.url != content_url
+        # fetch_metadata must carry the SAME (working) URL so rehydrate rebuilds
+        # the closure around the pre-signed link, not the 403-ing one.
+        assert att.fetch_metadata == {"url": download_url}
+        assert att.name == "report.pdf"
+        assert att.type == "file"
+
+    def test_uses_download_url_when_content_url_absent(self):
+        """A file.download.info attachment with no top-level contentUrl still
+        yields a downloadable Attachment via content.downloadUrl."""
+        adapter = _make_adapter(app_id="test-app")
+        download_url = "https://contoso.sharepoint.com/_layouts/download.aspx?presigned=xyz"
+        activity = _file_download_activity(
+            {
+                "contentType": _FILE_DOWNLOAD_INFO,
+                "name": "notes.txt",
+                "content": {"downloadUrl": download_url, "fileType": "txt"},
+            }
+        )
+        msg = adapter.parse_message(activity)
+        assert len(msg.attachments) == 1
+        att = msg.attachments[0]
+        assert att.url == download_url
+        assert att.fetch_metadata == {"url": download_url}
+        assert att.fetch_data is not None
+
+    def test_regular_attachment_uses_content_url_unchanged(self):
+        """An ordinary (inline image) attachment keeps the upstream contentUrl
+        path — the downloadUrl fallback must not perturb it.
+
+        The attachment deliberately ALSO carries a ``content.downloadUrl`` so an
+        over-eager mutation that prefers ``content.downloadUrl`` for *every*
+        attachment type (rather than only ``file.download.info``) is caught: it
+        would surface the downloadUrl instead of the inline-image contentUrl.
+        """
+        adapter = _make_adapter(app_id="test-app")
+        content_url = "https://smba.trafficmanager.net/teams/v3/attachments/img/photo.png"
+        activity = _file_download_activity(
+            {
+                "contentType": "image/png",
+                "contentUrl": content_url,
+                "name": "photo.png",
+                # A bogus competing downloadUrl that must be IGNORED for a
+                # non-file.download.info attachment.
+                "content": {"downloadUrl": "https://attacker.example.com/wrong.png"},
+            }
+        )
+        msg = adapter.parse_message(activity)
+        assert len(msg.attachments) == 1
+        att = msg.attachments[0]
+        assert att.url == content_url
+        assert att.type == "image"
+        assert att.fetch_metadata == {"url": content_url}
+
+    @pytest.mark.asyncio
+    async def test_download_url_flows_through_trusted_fetch(self):
+        """The pre-signed downloadUrl becomes the URL the SSRF-gated fetch
+        closure GETs — proving the fallback URL is what actually gets fetched.
+
+        A SharePoint host is in the Teams allowlist, so the GET proceeds and
+        returns the stubbed bytes.
+        """
+        adapter = _make_adapter(app_id="test-app")
+        download_url = "https://contoso.sharepoint.com/_layouts/download.aspx?presigned=ok"
+        session = _MockAiohttpSession(payload=b"file-contents")
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        activity = _file_download_activity(
+            {
+                "contentType": _FILE_DOWNLOAD_INFO,
+                "contentUrl": "https://contoso.sharepoint.com/personal/jadams/Documents/x.pdf",
+                "name": "x.pdf",
+                "content": {"downloadUrl": download_url, "fileType": "pdf"},
+            }
+        )
+        att = adapter.parse_message(activity).attachments[0]
+        assert att.fetch_data is not None
+        assert await att.fetch_data() == b"file-contents"
+        # The pre-signed URL — not the SharePoint item — is what gets fetched.
+        assert session.get_calls == [download_url]
+
+    @pytest.mark.asyncio
+    async def test_download_url_still_gated_by_ssrf_allowlist(self):
+        """Even via the downloadUrl path, an untrusted host fails closed at
+        fetch time — the fallback does NOT bypass the SSRF allowlist."""
+        adapter = _make_adapter(app_id="test-app")
+        # If the gate were bypassed, the session would be awaited — it must not.
+        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
+
+        activity = _file_download_activity(
+            {
+                "contentType": _FILE_DOWNLOAD_INFO,
+                "name": "evil.bin",
+                "content": {"downloadUrl": "https://attacker.example.com/exfil.bin"},
+            }
+        )
+        att = adapter.parse_message(activity).attachments[0]
+        assert att.url == "https://attacker.example.com/exfil.bin"
+        assert att.fetch_data is not None
+        with pytest.raises(ValidationError):
+            await att.fetch_data()
+        adapter._get_http_session.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # normalizeMentions (via parseMessage)
 # ---------------------------------------------------------------------------
 
