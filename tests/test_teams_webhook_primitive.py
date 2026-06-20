@@ -465,10 +465,11 @@ class TestWebhookImportBoundary:
         files must not import the ``microsoft_teams`` SDK, an HTTP client, the
         shared runtime, or the high-level Teams adapter.
 
-        DIVERGENCE FROM SLACK: a runtime ``sys.modules`` boundary check is not
-        usable yet because the Teams package ``__init__`` still eagerly imports
-        the adapter (the PEP-562 lazy conversion lands in packaging PR T7).
         Upstream's boundary test is itself a source scan, so this mirrors it.
+        The complementary runtime ``sys.modules`` boundary — now usable because
+        the Teams package ``__init__`` is PEP-562 lazy and no longer eagerly
+        imports the adapter — is asserted for all six primitive subpaths in
+        ``tests/test_teams_primitives_packaging.py``.
         """
         directory = Path(__file__).resolve().parents[1] / "src" / "chat_sdk" / "adapters" / "teams" / "webhook"
         sources = [path for path in directory.glob("*.py")]

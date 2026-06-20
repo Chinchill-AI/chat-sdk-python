@@ -171,8 +171,10 @@ class TestFormatImportBoundary:
     reference the ``microsoft_teams`` SDK, an HTTP client (``httpx`` /
     ``aiohttp``), or the high-level adapter / chat runtime. (Upstream's
     boundary test reads the module source and asserts it does not contain the
-    forbidden imports — runtime ``sys.modules`` inspection is deferred until
-    the ``teams/__init__.py`` lazy-subpath migration in the packaging PR.)
+    forbidden imports; the complementary runtime ``sys.modules`` inspection —
+    now enabled by the ``teams/__init__.py`` PEP-562 lazy-subpath migration —
+    is asserted for all six primitive subpaths in
+    ``tests/test_teams_primitives_packaging.py``.)
     """
 
     def test_source_does_not_import_the_sdk_runtime_or_adapter(self):

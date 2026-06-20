@@ -432,10 +432,11 @@ class TestApiImportBoundary:
     Upstream's boundary test is a **static source-scan**: it reads every
     non-test ``.ts`` in the ``api/`` directory and asserts the source never
     imports the full adapter, the shared runtime, or ``@microsoft/teams.apps``.
-    We port that source-scan over the ``api/`` package's ``.py`` files — this
-    is the right granularity while the package's ``teams/__init__.py`` is still
-    eager (the PEP 562 lazy-subpath registration that would let a *runtime*
-    ``sys.modules`` check pass is deferred to the packaging PR T7).
+    We port that source-scan over the ``api/`` package's ``.py`` files. The
+    complementary *runtime* ``sys.modules`` boundary (the package's
+    ``teams/__init__.py`` is PEP-562 lazy as of the packaging PR, so importing
+    the api subpath no longer pulls in the adapter) is proven once for all six
+    primitive subpaths in ``tests/test_teams_primitives_packaging.py``.
     """
 
     def test_api_source_does_not_import_the_adapter_sdk_or_runtime(self) -> None:
@@ -469,10 +470,10 @@ class TestApiImportBoundary:
         """Importing the api subpath in a fresh interpreter must not load an
         HTTP client — the default fetch imports ``httpx`` lazily.
 
-        (We do not assert the high-level adapter is absent here: the eager
-        ``teams/__init__.py`` pulls it in transitively until packaging PR T7
-        makes the subpath lazy. The source-scan above already proves the api
-        sources themselves never import the adapter.)
+        (The full runtime boundary — including that the high-level adapter is
+        absent now that ``teams/__init__.py`` is lazy — is asserted in
+        ``tests/test_teams_primitives_packaging.py``. This narrower check stays
+        as the api subpath's own HTTP-client guard.)
         """
         code = (
             "import sys\n"
