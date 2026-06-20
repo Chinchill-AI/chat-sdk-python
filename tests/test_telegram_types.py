@@ -12,6 +12,13 @@ that:
 
 pyrefly is the primary gate for these types (recursive unions); the assertions
 below also catch a typo'd wire key at runtime.
+
+Typing note: ``TelegramRichText`` / ``TelegramRichBlock`` are recursive *unions*
+that pyrefly cannot narrow from a bare dict literal. Each fixture is therefore
+annotated with its concrete variant TypedDict (e.g. ``TelegramRichBlockText``),
+and recursion into a nested union member is bound to a typed intermediate local
+of the concrete variant so subscripting type-checks. The runtime ``type`` /
+``text`` assertions still exercise the recursive shapes end to end.
 """
 
 from __future__ import annotations
@@ -22,8 +29,21 @@ from chat_sdk.adapters.telegram.types import (
     TelegramLocation,
     TelegramMessage,
     TelegramRichBlock,
+    TelegramRichBlockAnimation,
+    TelegramRichBlockAudio,
+    TelegramRichBlockBlockquote,
+    TelegramRichBlockHeading,
+    TelegramRichBlockList,
+    TelegramRichBlockMap,
+    TelegramRichBlockTable,
+    TelegramRichBlockText,
+    TelegramRichBlockVideo,
+    TelegramRichBlockVoiceNote,
+    TelegramRichItem,
     TelegramRichMessage,
     TelegramRichText,
+    TelegramRichTextStyled,
+    TelegramRichTextUrl,
     TelegramVideo,
     TelegramVideoQuality,
     TelegramVoice,
@@ -43,12 +63,13 @@ def test_recursive_aliases_resolve_at_runtime() -> None:
 def test_rich_text_nested_spans() -> None:
     """A TelegramRichText may be a plain string, a list, or a styled span dict."""
     plain: TelegramRichText = "hello"
-    nested: TelegramRichText = [
-        "Read ",
-        {"type": "url", "text": "the guide", "url": "https://example.com"},
-        " and ",
-        {"type": "bold", "text": "continue"},
-    ]
+    url_span: TelegramRichTextUrl = {
+        "type": "url",
+        "text": "the guide",
+        "url": "https://example.com",
+    }
+    bold_span: TelegramRichTextStyled = {"type": "bold", "text": "continue"}
+    nested: list[TelegramRichText] = ["Read ", url_span, " and ", bold_span]
     assert plain == "hello"
     assert isinstance(nested, list)
     assert nested[1] == {
@@ -57,79 +78,81 @@ def test_rich_text_nested_spans() -> None:
         "url": "https://example.com",
     }
     # Recursion: a span's text may itself be a list of spans.
-    deep: TelegramRichText = {
-        "type": "italic",
-        "text": [{"type": "bold", "text": "x"}],
-    }
-    assert deep["text"][0]["type"] == "bold"
+    inner_bold: TelegramRichTextStyled = {"type": "bold", "text": "x"}
+    deep: TelegramRichTextStyled = {"type": "italic", "text": [inner_bold]}
+    deep_text = deep["text"]
+    assert isinstance(deep_text, list)
+    first: TelegramRichTextStyled = deep_text[0]  # type: ignore[assignment]
+    assert first["type"] == "bold"
 
 
 def test_rich_message_with_heading_paragraph_and_table() -> None:
     """Mirror of the upstream rich.test.ts structured-blocks fixture."""
-    message: TelegramRichMessage = {
-        "blocks": [
-            {"type": "heading", "size": 2, "text": "Summary"},
-            {
-                "type": "paragraph",
-                "text": [
-                    "Read ",
-                    {"type": "url", "text": "the guide", "url": "https://example.com"},
-                    " and ",
-                    {"type": "bold", "text": "continue"},
-                ],
-            },
-            {
-                "type": "table",
-                "cells": [
-                    [
-                        {
-                            "align": "left",
-                            "is_header": True,
-                            "text": "Name",
-                            "valign": "top",
-                        },
-                        {
-                            "align": "right",
-                            "is_header": True,
-                            "text": "Status",
-                            "valign": "top",
-                        },
-                    ],
-                    [
-                        {"align": "left", "text": "Build", "valign": "top"},
-                        {"align": "right", "text": "Ready", "valign": "top"},
-                    ],
-                ],
-            },
+    heading: TelegramRichBlockHeading = {
+        "type": "heading",
+        "size": 2,
+        "text": "Summary",
+    }
+    url_span: TelegramRichTextUrl = {
+        "type": "url",
+        "text": "the guide",
+        "url": "https://example.com",
+    }
+    bold_span: TelegramRichTextStyled = {"type": "bold", "text": "continue"}
+    paragraph: TelegramRichBlockText = {
+        "type": "paragraph",
+        "text": ["Read ", url_span, " and ", bold_span],
+    }
+    table: TelegramRichBlockTable = {
+        "type": "table",
+        "cells": [
+            [
+                {
+                    "align": "left",
+                    "is_header": True,
+                    "text": "Name",
+                    "valign": "top",
+                },
+                {
+                    "align": "right",
+                    "is_header": True,
+                    "text": "Status",
+                    "valign": "top",
+                },
+            ],
+            [
+                {"align": "left", "text": "Build", "valign": "top"},
+                {"align": "right", "text": "Ready", "valign": "top"},
+            ],
         ],
     }
+    message: TelegramRichMessage = {"blocks": [heading, paragraph, table]}
     blocks = message["blocks"]
-    assert blocks[0]["type"] == "heading"
-    assert blocks[0]["size"] == 2
+    head_block: TelegramRichBlockHeading = blocks[0]  # type: ignore[assignment]
+    assert head_block["type"] == "heading"
+    assert head_block["size"] == 2
     # Recursion into a table cell's text.
-    assert blocks[2]["cells"][0][0]["is_header"] is True
-    assert blocks[2]["cells"][1][1]["text"] == "Ready"
+    table_block: TelegramRichBlockTable = blocks[2]  # type: ignore[assignment]
+    assert table_block["cells"][0][0]["is_header"] is True
+    assert table_block["cells"][1][1]["text"] == "Ready"
 
 
 def test_rich_block_nested_blocks_recursion() -> None:
     """Blockquote / list blocks nest further TelegramRichBlock values."""
-    block: TelegramRichBlock = {
+    quoted: TelegramRichBlockText = {"type": "paragraph", "text": "quoted"}
+    item_para: TelegramRichBlockText = {"type": "paragraph", "text": "a"}
+    list_item: TelegramRichItem = {"label": "first", "blocks": [item_para]}
+    list_block: TelegramRichBlockList = {"type": "list", "items": [list_item]}
+    block: TelegramRichBlockBlockquote = {
         "type": "blockquote",
-        "blocks": [
-            {"type": "paragraph", "text": "quoted"},
-            {
-                "type": "list",
-                "items": [
-                    {"label": "first", "blocks": [{"type": "paragraph", "text": "a"}]},
-                ],
-            },
-        ],
+        "blocks": [quoted, list_block],
         "credit": "someone",
     }
-    inner = block["blocks"][1]
+    inner: TelegramRichBlockList = block["blocks"][1]  # type: ignore[assignment]
     assert inner["type"] == "list"
     # Recursion: list item blocks are themselves TelegramRichBlock values.
-    assert inner["items"][0]["blocks"][0]["text"] == "a"
+    nested_para: TelegramRichBlockText = inner["items"][0]["blocks"][0]  # type: ignore[assignment]
+    assert nested_para["text"] == "a"
 
 
 def test_rich_block_media_blocks() -> None:
@@ -156,23 +179,36 @@ def test_rich_block_media_blocks() -> None:
         "qualities": [quality],
         "start_timestamp": 5,
     }
-    message: TelegramRichMessage = {
-        "blocks": [
-            {"type": "animation", "animation": animation, "has_spoiler": True},
-            {"type": "audio", "audio": audio},
-            {"type": "video", "video": video, "has_spoiler": True},
-            {"type": "voice_note", "voice_note": voice},
-        ],
+    anim_block: TelegramRichBlockAnimation = {
+        "type": "animation",
+        "animation": animation,
+        "has_spoiler": True,
     }
-    assert message["blocks"][0]["animation"]["width"] == 640
-    assert message["blocks"][2]["video"]["qualities"][0]["codec"] == "h264"
-    assert message["blocks"][3]["voice_note"]["mime_type"] == "audio/ogg"
+    audio_block: TelegramRichBlockAudio = {"type": "audio", "audio": audio}
+    video_block: TelegramRichBlockVideo = {
+        "type": "video",
+        "video": video,
+        "has_spoiler": True,
+    }
+    voice_block: TelegramRichBlockVoiceNote = {
+        "type": "voice_note",
+        "voice_note": voice,
+    }
+    message: TelegramRichMessage = {
+        "blocks": [anim_block, audio_block, video_block, voice_block],
+    }
+    block0: TelegramRichBlockAnimation = message["blocks"][0]  # type: ignore[assignment]
+    block2: TelegramRichBlockVideo = message["blocks"][2]  # type: ignore[assignment]
+    block3: TelegramRichBlockVoiceNote = message["blocks"][3]  # type: ignore[assignment]
+    assert block0["animation"]["width"] == 640
+    assert block2["video"]["qualities"][0]["codec"] == "h264"
+    assert block3["voice_note"]["mime_type"] == "audio/ogg"
 
 
 def test_rich_block_map_uses_location() -> None:
     """The map block embeds a TelegramLocation with float lat/long."""
     location: TelegramLocation = {"latitude": 40.0, "longitude": -73.0}
-    block: TelegramRichBlock = {
+    block: TelegramRichBlockMap = {
         "type": "map",
         "height": 200,
         "width": 300,
@@ -185,16 +221,16 @@ def test_rich_block_map_uses_location() -> None:
 
 def test_telegram_message_carries_rich_message() -> None:
     """TelegramMessage gains an optional rich_message payload in 4.31."""
+    paragraph: TelegramRichBlockText = {"type": "paragraph", "text": "hi"}
+    rich: TelegramRichMessage = {"blocks": [paragraph], "is_rtl": False}
     message: TelegramMessage = {
         "chat": {"id": 1, "type": "private"},
         "date": 0,
         "message_id": 7,
-        "rich_message": {
-            "blocks": [{"type": "paragraph", "text": "hi"}],
-            "is_rtl": False,
-        },
+        "rich_message": rich,
     }
-    assert message["rich_message"]["blocks"][0]["text"] == "hi"
+    first_block: TelegramRichBlockText = message["rich_message"]["blocks"][0]  # type: ignore[assignment]
+    assert first_block["text"] == "hi"
     assert message["rich_message"]["is_rtl"] is False
 
 
