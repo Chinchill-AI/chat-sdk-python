@@ -1235,7 +1235,22 @@ class TeamsAdapter:
         elif content_type.startswith("audio/"):
             att_type = "audio"
 
-        url = att.get("contentUrl")
+        # Python-first divergence (upstream reads ``contentUrl`` only; see
+        # adapter-teams/src/index.ts:833 and docs/UPSTREAM_SYNC.md Known
+        # Non-Parity). A SharePoint/OneDrive file shared in a personal or group
+        # chat arrives as a ``application/vnd.microsoft.teams.file.download.info``
+        # attachment that carries BOTH a top-level ``contentUrl`` (pointing at the
+        # SharePoint/OneDrive item, which 403s on an anonymous GET) and a nested
+        # ``content.downloadUrl`` — a short-lived pre-signed link that fetches with
+        # no auth header. For that attachment type the top-level URL is unusable,
+        # so we prefer the pre-signed ``content.downloadUrl``. Every other
+        # attachment (inline images, etc.) keeps the upstream ``contentUrl`` path.
+        content = att.get("content")
+        download_url = content.get("downloadUrl") if isinstance(content, dict) else None
+        if content_type == "application/vnd.microsoft.teams.file.download.info" and download_url:
+            url = download_url
+        else:
+            url = att.get("contentUrl") or download_url
         return Attachment(
             type=att_type,
             url=url,
