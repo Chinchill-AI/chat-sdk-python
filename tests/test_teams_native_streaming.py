@@ -252,6 +252,58 @@ class TestStreamViaEmit:
         assert result.raw["text"] == "kept"
 
     @pytest.mark.asyncio
+    async def test_skips_thinking_chunk_by_default(self):
+        """``ThinkingChunk`` is streaming-only reasoning, not message content.
+
+        The default emit path skips it: it is never emitted to the SDK
+        ``IStreamer`` and the recorded text equals the text chunks only.
+        """
+        from chat_sdk.types import ThinkingChunk
+
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer()
+        await _register_streamer(adapter, tid, streamer)
+
+        async def gen():
+            yield ThinkingChunk(content="reasoning A")
+            yield "Hello "
+            yield ThinkingChunk(content="reasoning B")
+            yield "World"
+
+        result = await adapter.stream(tid, gen())
+        assert streamer.emitted == ["Hello ", "World"]
+        assert result.raw["text"] == "Hello World"
+
+    @pytest.mark.asyncio
+    async def test_thinking_chunk_invokes_render_hook(self):
+        """An opt-in ``render_thinking`` hook receives the reasoning while the
+        emitted text stays thinking-free."""
+        from chat_sdk.types import ThinkingChunk
+
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer()
+        await _register_streamer(adapter, tid, streamer)
+
+        seen: list[str] = []
+
+        async def render_thinking(content: str) -> None:
+            seen.append(content)
+
+        adapter.render_thinking = render_thinking  # type: ignore[attr-defined]
+
+        async def gen():
+            yield ThinkingChunk(content="thought A")
+            yield "text"
+            yield ThinkingChunk(content="thought B")
+
+        result = await adapter.stream(tid, gen())
+        assert seen == ["thought A", "thought B"]
+        assert streamer.emitted == ["text"]
+        assert result.raw["text"] == "text"
+
+    @pytest.mark.asyncio
     async def test_never_calls_close(self):
         """``stream()`` / ``_stream_via_emit`` must NEVER call ``stream.close()``.
 

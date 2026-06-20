@@ -345,6 +345,26 @@ class TestStream:
         body = adapter._graph_api_fetch.call_args.kwargs["body"]
         assert body["message"]["text"] == "Structured plain content"
 
+    @pytest.mark.asyncio
+    async def test_ignores_thinking_chunk(self) -> None:
+        """A ``ThinkingChunk`` is skipped (streaming-only reasoning, not message
+        content); the buffered post excludes it and does not crash."""
+        from chat_sdk.types import ThinkingChunk
+
+        adapter = _make_adapter()
+        adapter._graph_api_fetch = AsyncMock(return_value=_send_api_response("mid.t"))
+
+        async def _chunks() -> AsyncIterator[str | StreamChunk]:
+            yield ThinkingChunk(content="reasoning")
+            yield "Hello "
+            yield ThinkingChunk(content="more")
+            yield "world"
+
+        result = await adapter.stream(THREAD_ID, _chunks())
+        assert result.id == "mid.t"
+        body = adapter._graph_api_fetch.call_args.kwargs["body"]
+        assert body["message"]["text"] == "Hello world"
+
 
 # ---------------------------------------------------------------------------
 # Typing indicator

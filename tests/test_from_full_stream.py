@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from chat_sdk.from_full_stream import from_full_stream
-from chat_sdk.types import StreamChunk
+from chat_sdk.types import StreamChunk, ThinkingChunk
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -358,3 +358,118 @@ class TestFidelityAliases:
     async def test_ignores_invalid_events_null_primitives_missing_type(self):
         events: list = [None, 42, True, {"no_type": 1}, {"type": "text-delta", "textDelta": "ok"}]
         assert await _collect(from_full_stream(_async_iter(events))) == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# ThinkingChunk opt-in (Python-only divergence, default-off == upstream)
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingOptIn:
+    """``emit_thinking`` surfaces AI-SDK reasoning as ``ThinkingChunk``.
+
+    Default-off must be byte-for-byte upstream: reasoning parts are dropped
+    and no ``ThinkingChunk`` is ever produced. Opt-in turns them into chunks.
+    """
+
+    async def test_default_off_drops_reasoning_delta(self):
+        # Upstream chat@4.31 drops `reasoning-delta`; default-off must match.
+        events: list[Any] = [
+            {"type": "reasoning-delta", "text": "thinking hard"},
+            {"type": "text-delta", "text": "answer"},
+        ]
+        result = await _collect(from_full_stream(_async_iter(events)))
+        assert result == ["answer"]
+        assert all(not isinstance(c, ThinkingChunk) for c in result)
+
+    async def test_default_off_drops_reasoning_part(self):
+        events: list[Any] = [
+            {"type": "reasoning", "text": "step 1"},
+            {"type": "text-delta", "text": "out"},
+        ]
+        result = await _collect(from_full_stream(_async_iter(events)))
+        assert result == ["out"]
+
+    async def test_default_off_drops_pydantic_thinking_part(self):
+        # pydantic-ai shape: type == "thinking", content carries the text.
+        events: list[Any] = [
+            {"type": "thinking", "content": "reasoning"},
+            {"type": "text-delta", "text": "final"},
+        ]
+        result = await _collect(from_full_stream(_async_iter(events)))
+        assert result == ["final"]
+
+    async def test_default_off_byte_identical_to_no_reasoning(self):
+        # Output with reasoning parts (default-off) must equal output of the
+        # same stream with the reasoning parts removed entirely.
+        with_reasoning: list[Any] = [
+            {"type": "text-delta", "text": "A"},
+            {"type": "reasoning-delta", "text": "secret thought"},
+            {"type": "finish-step"},
+            {"type": "reasoning", "text": "more thought"},
+            {"type": "text-delta", "text": "B"},
+        ]
+        without_reasoning: list[Any] = [
+            {"type": "text-delta", "text": "A"},
+            {"type": "finish-step"},
+            {"type": "text-delta", "text": "B"},
+        ]
+        assert await _collect(from_full_stream(_async_iter(with_reasoning))) == await _collect(
+            from_full_stream(_async_iter(without_reasoning))
+        )
+
+    async def test_opt_in_yields_thinking_chunk_from_reasoning_delta(self):
+        events: list[Any] = [{"type": "reasoning-delta", "text": "analyzing"}]
+        result = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert len(result) == 1
+        chunk = result[0]
+        assert isinstance(chunk, ThinkingChunk)
+        assert chunk.type == "thinking"
+        assert chunk.content == "analyzing"
+
+    async def test_opt_in_yields_thinking_chunk_from_reasoning_part(self):
+        events: list[Any] = [{"type": "reasoning", "text": "deliberating"}]
+        result = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert result == [ThinkingChunk(content="deliberating")]
+
+    async def test_opt_in_yields_thinking_chunk_from_pydantic_content(self):
+        # pydantic-ai ThinkingPart carries text in `content`, not `text`.
+        events: list[Any] = [{"type": "thinking", "content": "pondering"}]
+        result = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert result == [ThinkingChunk(content="pondering")]
+
+    async def test_opt_in_interleaves_thinking_and_text(self):
+        events: list[Any] = [
+            {"type": "reasoning-delta", "text": "let me think"},
+            {"type": "text-delta", "text": "the answer is"},
+            {"type": "reasoning", "text": "double-checking"},
+            {"type": "text-delta", "text": " 42"},
+        ]
+        result = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert result == [
+            ThinkingChunk(content="let me think"),
+            "the answer is",
+            ThinkingChunk(content="double-checking"),
+            " 42",
+        ]
+
+    async def test_opt_in_skips_empty_reasoning(self):
+        # No content => nothing emitted even with opt-in on.
+        events: list[Any] = [
+            {"type": "reasoning-delta", "text": ""},
+            {"type": "reasoning"},
+            {"type": "text-delta", "text": "x"},
+        ]
+        result = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert result == ["x"]
+
+    async def test_opt_in_does_not_change_text_output(self):
+        # The text path is identical with the flag on; only thinking is added.
+        events: list[Any] = [
+            {"type": "text-delta", "text": "A"},
+            {"type": "finish-step"},
+            {"type": "text-delta", "text": "B"},
+        ]
+        off = await _collect(from_full_stream(_async_iter(events)))
+        on = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
+        assert off == on == ["A", "\n\n", "B"]

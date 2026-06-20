@@ -1002,7 +1002,54 @@ class PlanUpdateChunk:
     title: str = ""
 
 
+@dataclass
+class ThinkingChunk:
+    """Streamed agent reasoning / "thinking" content.
+
+    **Python-only divergence — not present in upstream chat@4.31.** Upstream's
+    chat-platform SDK drops AI-SDK ``reasoning`` / ``reasoning-delta`` parts in
+    ``from-full-stream.ts`` (only ``text-delta`` and ``finish-step`` are
+    forwarded); reasoning is left to the AI-SDK web UI. This variant gives the
+    chat-platform SDK a first-class, *opt-in* path so consumers can stream
+    agent thinking to chat platforms (e.g. Slack context blocks, Teams styled
+    text).
+
+    Design guarantees (see ``docs/UPSTREAM_SYNC.md`` Known Non-Parity):
+
+    - **Default-off.** No ``ThinkingChunk`` is ever produced unless a caller
+      explicitly opts in (``from_full_stream(..., emit_thinking=True)``), so the
+      default stream is byte-for-byte upstream.
+    - **Streaming-only.** It is never persisted into :class:`Message` / history
+      / state, so cross-SDK state (Redis/Postgres shared with the TS SDK) stays
+      identical.
+    - **Gracefully skipped.** It is not message content: the default
+      message-rendering path never accumulates it into the posted text, and
+      adapters that do not render thinking simply ignore it.
+
+    The shape mirrors chinchill's thinking-delta model (``part_kind == "thinking"``
+    with a ``content`` string) so it can be consumed directly.
+    """
+
+    type: Literal["thinking"] = "thinking"
+    content: str = ""
+
+
 StreamChunk = MarkdownTextChunk | TaskUpdateChunk | PlanUpdateChunk
+"""Canonical stream-chunk union — **byte-identical to upstream chat@4.31's three
+variants**. A consumer doing an exhaustive ``match`` over ``StreamChunk`` sees
+zero change on upgrade; the Python-only :class:`ThinkingChunk` is *not* a member
+(see :data:`StreamInput`)."""
+
+
+StreamInput = str | StreamChunk | ThinkingChunk
+"""What a stream may *yield* at the stream-input/output boundaries.
+
+This is the canonical :data:`StreamChunk` union plus plain ``str`` text and the
+Python-only, **opt-in** :class:`ThinkingChunk`. ``ThinkingChunk`` is accepted
+only here — a producer may yield it when thinking is enabled, and adapters that
+receive the stream type-check against it — but it is deliberately kept out of
+:data:`StreamChunk` itself so consumers referencing that union are unaffected.
+"""
 
 
 @dataclass
@@ -1479,7 +1526,7 @@ class BaseAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage | None:
         """Stream a message using platform-native streaming APIs.

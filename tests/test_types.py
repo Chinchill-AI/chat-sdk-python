@@ -14,11 +14,15 @@ from chat_sdk.types import (
     Author,
     EmojiFormats,
     EmojiValue,
+    MarkdownTextChunk,
     Message,
     MessageMetadata,
     MessageSubject,
     MessageSubjectParty,
+    PlanUpdateChunk,
     RawMessage,
+    TaskUpdateChunk,
+    ThinkingChunk,
     _get_message_adapter,
     _message_adapter_map,
     set_message_adapter,
@@ -632,3 +636,64 @@ class TestSetMessageAdapterWeakref:
         del msg
         gc.collect()
         assert key not in _message_adapter_map
+
+
+class TestThinkingChunk:
+    """Tests for the Python-only, opt-in ``ThinkingChunk`` stream-input type."""
+
+    def test_defaults(self):
+        chunk = ThinkingChunk()
+        assert chunk.type == "thinking"
+        assert chunk.content == ""
+
+    def test_with_content(self):
+        chunk = ThinkingChunk(content="Analyzing the user's request")
+        assert chunk.type == "thinking"
+        assert chunk.content == "Analyzing the user's request"
+
+    def test_type_discriminant_is_fixed(self):
+        # The discriminant is what adapters/normalizers switch on; it must be
+        # exactly "thinking" so it is never confused with the other variants.
+        assert ThinkingChunk(content="x").type == "thinking"
+        assert ThinkingChunk().type != MarkdownTextChunk().type
+        assert ThinkingChunk().type != TaskUpdateChunk().type
+        assert ThinkingChunk().type != PlanUpdateChunk().type
+
+    def test_streamchunk_union_is_upstream_exact(self):
+        # ``StreamChunk`` must stay byte-identical to upstream's THREE variants.
+        # ``ThinkingChunk`` is deliberately NOT a member: a consumer doing an
+        # exhaustive ``match`` over ``StreamChunk`` must see zero change on
+        # upgrade.
+        from typing import get_args
+
+        from chat_sdk.types import StreamChunk
+
+        upstream_variants = (MarkdownTextChunk, TaskUpdateChunk, PlanUpdateChunk)
+        assert set(get_args(StreamChunk)) == set(upstream_variants)
+        # Exactly three — no fourth (thinking) variant leaked into the union.
+        assert len(get_args(StreamChunk)) == 3
+        assert ThinkingChunk not in get_args(StreamChunk)
+        assert not isinstance(ThinkingChunk(content="reasoning"), upstream_variants)
+
+    def test_thinking_chunk_is_accepted_by_stream_input(self):
+        # ``ThinkingChunk`` is opt-in input only: it lives in ``StreamInput``
+        # (what a stream may yield), NOT in the canonical ``StreamChunk`` union.
+        from typing import get_args
+
+        from chat_sdk.types import StreamChunk, StreamInput
+
+        # StreamInput = str | StreamChunk | ThinkingChunk. ``get_args`` flattens
+        # the nested ``StreamChunk`` alias into its three members, so the input
+        # alias resolves to str + the three canonical variants + ThinkingChunk.
+        input_args = set(get_args(StreamInput))
+        assert input_args == {str, *get_args(StreamChunk), ThinkingChunk}
+        assert str in input_args
+        assert ThinkingChunk in input_args
+        # Every canonical ``StreamChunk`` variant is reachable via the input.
+        assert set(get_args(StreamChunk)) <= input_args
+        # ...but the canonical union itself never gains the thinking variant.
+        assert ThinkingChunk not in get_args(StreamChunk)
+
+    def test_equality_by_value(self):
+        assert ThinkingChunk(content="a") == ThinkingChunk(content="a")
+        assert ThinkingChunk(content="a") != ThinkingChunk(content="b")

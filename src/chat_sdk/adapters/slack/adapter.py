@@ -64,7 +64,12 @@ from chat_sdk.adapters.slack.webhook import (
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
-from chat_sdk.shared.adapter_utils import extract_card, extract_files
+from chat_sdk.shared.adapter_utils import (
+    extract_card,
+    extract_files,
+    is_thinking_chunk,
+    maybe_render_thinking,
+)
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.types import (
     ActionEvent,
@@ -100,7 +105,9 @@ from chat_sdk.types import (
     ScheduledMessage,
     SlashCommandEvent,
     StreamChunk,
+    StreamInput,
     StreamOptions,
+    ThinkingChunk,
     ThreadInfo,
     ThreadSummary,
     UserInfo,
@@ -3873,7 +3880,7 @@ class SlackAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream a message using Slack's native streaming API.
@@ -3945,7 +3952,11 @@ class SlackAdapter:
                 return
             await streamer.append(markdown_text=delta, token=token)
 
-        async def send_structured_chunk(chunk: StreamChunk | dict[str, Any]) -> None:
+        # Accepts the residual stream-input union: ``is_thinking_chunk`` filters
+        # ``ThinkingChunk`` out before this runs (it is never reached with one),
+        # but it stays in the static type since that runtime guard does not
+        # narrow it. The generic ``_read``-based body handles any chunk shape.
+        async def send_structured_chunk(chunk: StreamChunk | ThinkingChunk | dict[str, Any]) -> None:
             nonlocal last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return
@@ -4006,6 +4017,15 @@ class SlackAdapter:
                     await push_text_and_flush(text_value)
             elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
                 await push_text_and_flush(chunk.text)  # type: ignore[union-attr]
+            elif is_thinking_chunk(chunk):
+                # Python-only divergence: ``ThinkingChunk`` is streaming-only
+                # agent reasoning, NOT message content. By default it is
+                # skipped (no effect on the posted message). An adapter/consumer
+                # that wants to display thinking sets ``self.render_thinking``;
+                # only then is it invoked. Skipping (not routing to
+                # ``send_structured_chunk``) keeps the default posted message
+                # byte-identical and avoids disabling structured-chunk support.
+                await maybe_render_thinking(getattr(self, "render_thinking", None), chunk)
             else:
                 await send_structured_chunk(chunk)
 

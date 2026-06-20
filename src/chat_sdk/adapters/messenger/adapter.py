@@ -70,7 +70,7 @@ from chat_sdk.types import (
     PostableMarkdown,
     RawMessage,
     ReactionEvent,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     ThreadInfo,
     UserInfo,
@@ -585,7 +585,7 @@ class MessengerAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Buffer all stream chunks and send as a single message.
