@@ -106,6 +106,82 @@ LINEAR_API_URL = "https://api.linear.app/graphql"
 # Linear OAuth token endpoint
 LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token"
 
+# JS ``String.prototype.trim()`` whitespace set. Upstream's
+# ``flushMarkdown`` computes ``markdown.slice(...).trim()``; Python's bare
+# ``str.strip()`` strips a broader Unicode set (e.g. the C0 separators
+# ``\x1c``-``\x1f`` and NEL ``\x85``, which JS keeps) and does NOT strip the
+# BOM (which JS removes). Passing this explicit string to ``strip`` matches JS
+# character-for-character. Canonical definition lives alongside the Telegram
+# adapter (``adapters/telegram/rich.py``); duplicated here (not imported) to
+# avoid a cross-adapter import for a single shared literal.
+_JS_WHITESPACE = (
+    "\t\n\v\f\r "  # \t \n \v \f \r and SPACE
+    " "  # NO-BREAK SPACE
+    " "  # OGHAM SPACE MARK
+    "           "  # EN QUAD..HAIR SPACE
+    " "  # LINE SEPARATOR
+    " "  # PARAGRAPH SEPARATOR
+    " "  # NARROW NO-BREAK SPACE
+    " "  # MEDIUM MATHEMATICAL SPACE
+    "　"  # IDEOGRAPHIC SPACE
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE (BOM)
+)
+
+# Agent-activity create mutation. The Python adapter has no ``@linear/sdk``;
+# ``createAgentActivity`` is ported as this raw GraphQL mutation. Schema-hardened
+# against Linear's published GraphQL schema (https://linear.app/developers/
+# agent-interaction , https://linear.app/developers/graphql): the mutation is
+# ``agentActivityCreate(input: AgentActivityCreateInput!)`` where ``content`` is
+# a ``JSONObject!`` scalar (so ``type``/``body``/``action``/... are passed inline
+# as a JSON object with LOWERCASE ``type`` enum values — "response"/"thought"/
+# "error"/"action"), ``agentSessionId: String!`` and ``ephemeral: Boolean``. The
+# return selection requests only schema-valid fields that
+# ``_parse_message_from_agent_activity`` reads off the resolved ``sourceComment``.
+_AGENT_ACTIVITY_CREATE_MUTATION = """
+mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+    agentActivityCreate(input: $input) {
+        success
+        agentActivity {
+            id
+            agentSessionId
+            sourceComment {
+                id
+                body
+                parentId
+                createdAt
+                updatedAt
+                url
+                user {
+                    id
+                    displayName
+                    name
+                    email
+                    avatarUrl
+                }
+                botActor {
+                    id
+                    name
+                    userDisplayName
+                    avatarUrl
+                }
+            }
+        }
+    }
+}
+"""
+
+# Agent-session plan-update mutation. Ports ``updateAgentSession``. Schema-
+# hardened: ``agentSessionUpdate(id: String!, input: AgentSessionUpdateInput!)``
+# where ``input.plan`` is an array of ``{content, status}`` items (status
+# ``"completed"`` from upstream).
+_AGENT_SESSION_UPDATE_MUTATION = """
+mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+    agentSessionUpdate(id: $id, input: $input) {
+        success
+    }
+}
+"""
+
 # Emoji mapping for Linear reactions (unicode)
 EMOJI_MAPPING: dict[str, str] = {
     "thumbs_up": "\U0001f44d",
@@ -200,6 +276,13 @@ class LinearAdapter:
         self._mode: LinearAdapterMode = config_mode if config_mode is not None else "comments"
         self._chat: ChatInstance | None = None
         self._bot_user_id: str | None = None
+        # Default organization ID, resolved at ``initialize`` from the viewer's
+        # ``organization.id``. Faithful port of upstream
+        # ``defaultOrganizationId`` (index.ts:206/347): single-tenant fallback
+        # used by the agent-activity emit path when there is no per-request
+        # installation context (no webhook payload to read ``organizationId``
+        # off). ``None`` until the bot identity resolves.
+        self._default_organization_id: str | None = None
         self._format_converter = LinearFormatConverter()
 
         # Shared aiohttp session for connection pooling
@@ -309,11 +392,16 @@ class LinearAdapter:
         if self._client_credentials:
             await self._refresh_client_credentials_token()
 
-        # Fetch the bot's user ID for self-message detection
+        # Fetch the bot's user ID for self-message detection. Also capture the
+        # viewer's ``organization.id`` (upstream resolves the same field from
+        # client identity at init, index.ts:347/727) so the agent-activity emit
+        # path has a default organization ID in single-tenant mode.
         try:
-            viewer = await self._graphql_query("query { viewer { id displayName } }")
+            viewer = await self._graphql_query("query { viewer { id displayName organization { id } } }")
             viewer_data = viewer.get("data", {}).get("viewer", {})
             self._bot_user_id = viewer_data.get("id")
+            organization = viewer_data.get("organization") or {}
+            self._default_organization_id = organization.get("id")
             self._logger.info(
                 "Linear auth completed",
                 {
@@ -1042,6 +1130,18 @@ class LinearAdapter:
         # Convert emoji placeholders to unicode
         body = convert_emoji_placeholders(body, "linear")
 
+        # Agent-session branch (index.ts:1323). When the decoded thread carries a
+        # session, post the reply as a "response" agent activity instead of a
+        # comment, then resolve it back into a raw message from the activity's
+        # ``sourceComment``. The comment path below is byte-identical to before.
+        if decoded.agent_session_id:
+            session = assert_agent_session_thread(decoded)
+            activity_result = await self._create_agent_activity(
+                session.agent_session_id,
+                {"type": "response", "body": body},
+            )
+            return await self._parse_message_from_agent_activity(session, activity_result)
+
         # Create comment via GraphQL API
         result = await self._graphql_query(
             """
@@ -1086,6 +1186,185 @@ class LinearAdapter:
                     "url": comment_data.get("url"),
                 },
             ),
+        )
+
+    async def _create_agent_activity(
+        self,
+        agent_session_id: str,
+        content: dict[str, Any],
+        *,
+        ephemeral: bool | None = None,
+    ) -> dict[str, Any]:
+        """Create a Linear agent activity via raw GraphQL.
+
+        Faithful port of ``@linear/sdk``'s ``createAgentActivity``
+        (index.ts:1336/1522/1580/1608/1616). The TS SDK call shape is
+        ``createAgentActivity({agentSessionId, content, ephemeral?})`` — here the
+        same payload is posted as ``agentActivityCreate(input: ...)`` against the
+        published schema, where ``content`` is a ``JSONObject!`` scalar carrying
+        the lowercase ``type`` plus its body/action fields inline. ``ephemeral``
+        is only included when explicitly set so the serialized input matches
+        upstream's conditional spread (it is absent — not ``False`` — on the
+        ``response``/``thought``/``error`` calls that don't pass it).
+
+        Returns the raw ``agentActivityCreate`` payload node (``{success,
+        agentActivity}``) — the same object upstream's ``AgentActivityPayload``
+        models — for :meth:`_parse_message_from_agent_activity` to resolve.
+        """
+        activity_input: dict[str, Any] = {
+            "agentSessionId": agent_session_id,
+            "content": content,
+        }
+        if ephemeral is not None:
+            activity_input["ephemeral"] = ephemeral
+
+        result = await self._graphql_query(
+            _AGENT_ACTIVITY_CREATE_MUTATION,
+            {"input": activity_input},
+        )
+        return cast("dict[str, Any]", result.get("data", {}).get("agentActivityCreate", {}))
+
+    async def _parse_message_from_agent_activity(
+        self,
+        thread: LinearAgentSessionThreadId,
+        result: dict[str, Any],
+    ) -> RawMessage:
+        """Build a raw message from an ``agentActivityCreate`` mutation result.
+
+        Faithful port of upstream ``parseMessageFromAgentActivity``
+        (index.ts:1082). Resolves the created ``agentActivity`` and its
+        ``sourceComment`` from the mutation payload, raising ``AdapterError`` with
+        the exact upstream strings when the activity failed to create or its
+        source comment could not be resolved. The resulting message is built off
+        the source comment, mirroring upstream's delegation to
+        ``parseMessageFromComment(sourceComment, issueId, agentSessionId)``.
+        """
+        activity = result.get("agentActivity")
+        if not (result.get("success") and activity):
+            raise AdapterError(
+                f"Failed to create Linear agent activity for session {thread.agent_session_id}",
+                "linear",
+            )
+
+        source_comment = activity.get("sourceComment")
+        if not source_comment:
+            raise AdapterError(
+                f"Failed to resolve source comment for Linear agent activity {activity.get('id')}",
+                "linear",
+            )
+
+        activity_session_id = activity.get("agentSessionId")
+        if not activity_session_id:
+            raise AdapterError(
+                f"Missing agentSessionId for Linear agent activity {activity.get('id')}",
+                "linear",
+            )
+
+        return self._raw_message_from_source_comment(
+            source_comment,
+            thread.issue_id,
+            cast("str", activity_session_id),
+        )
+
+    def _raw_message_from_source_comment(
+        self,
+        comment: dict[str, Any],
+        issue_id: str,
+        agent_session_id: str,
+    ) -> RawMessage:
+        """Build the agent-session raw message from a resolved source comment.
+
+        Faithful port of upstream ``parseMessageFromComment`` (index.ts:884) for
+        the agent-activity emit path. Author resolution mirrors upstream: when
+        the comment carries a ``user`` it is a user author; otherwise the comment
+        was created by the app, so the ``botActor`` supplies a bot author (and,
+        as upstream notes, an app comment without a botActor cannot determine an
+        author). ``avatarUrl ?? undefined`` / ``botActor.id ?? this.botUserId``
+        and the display/full-name fallbacks are nullish (``is not None`` / ``or``
+        per upstream's ``??`` vs ``||``) faithful.
+        """
+        comment_user = comment.get("user")
+        if comment_user:
+            avatar_url = comment_user.get("avatarUrl")
+            user: LinearActorData = {
+                "type": "user",
+                "id": cast("str", comment_user.get("id", "")),
+                "displayName": cast("str", comment_user.get("displayName", "")),
+                "fullName": cast("str", comment_user.get("name", "")),
+                "email": cast("str", comment_user.get("email")),
+                **({"avatarUrl": cast("str", avatar_url)} if avatar_url is not None else {}),
+            }
+        else:
+            bot_actor = comment.get("botActor")
+            if not bot_actor:
+                raise AdapterError(
+                    f"Comment {comment.get('id')} has no userId and no botActor, cannot determine author.",
+                    "linear",
+                )
+            # ``botActor.id ?? this.botUserId`` — nullish. Coerce a None
+            # bot-user-id (not yet resolved) to "" via ``is not None``.
+            actor_id = bot_actor.get("id")
+            resolved_id = actor_id if actor_id is not None else (self._bot_user_id or "")
+            # ``userDisplayName ?? name ?? "unknown"`` / ``name ?? userDisplayName
+            # ?? "unknown"`` — chained nullish.
+            display_name = bot_actor.get("userDisplayName")
+            actor_name = bot_actor.get("name")
+            bot_avatar = bot_actor.get("avatarUrl")
+            user = {
+                "type": "bot",
+                "id": cast("str", resolved_id),
+                "displayName": cast(
+                    "str",
+                    display_name if display_name is not None else (actor_name if actor_name is not None else "unknown"),
+                ),
+                "fullName": cast(
+                    "str",
+                    actor_name if actor_name is not None else (display_name if display_name is not None else "unknown"),
+                ),
+                **({"avatarUrl": cast("str", bot_avatar)} if bot_avatar is not None else {}),
+            }
+
+        # ``parentId ?? undefined`` / ``url ?? undefined`` — nullish. createdAt /
+        # updatedAt are ISO strings off the resolved comment node.
+        parent_id = comment.get("parentId")
+        comment_url = comment.get("url")
+        comment_data: LinearCommentData = {
+            "id": cast("str", comment.get("id", "")),
+            "body": cast("str", comment.get("body", "")),
+            "issueId": issue_id,
+            "user": user,
+            "createdAt": cast("str", comment.get("createdAt", "")),
+            "updatedAt": cast("str", comment.get("updatedAt", "")),
+        }
+        if parent_id is not None:
+            comment_data["parentId"] = cast("str", parent_id)
+        if comment_url is not None:
+            comment_data["url"] = cast("str", comment_url)
+
+        raw: LinearAgentSessionCommentRawMessage = {
+            "kind": "agent_session_comment",
+            "organizationId": self._default_organization_id or "",
+            "comment": comment_data,
+            "agentSessionId": agent_session_id,
+        }
+
+        # The Python ``RawMessage`` is the minimal ``{id, thread_id, raw}`` wrapper
+        # (no author field — unlike upstream's richer ``Message extends RawMessage``
+        # return). The fully-parsed author/metadata live under ``raw`` and are
+        # re-derived on read via :meth:`_parse_agent_session_message`. Encode the
+        # routed thread id (carrying the ``:s:{session}`` segment) so callers can
+        # round-trip it, matching the comment branch's ``thread_id`` semantics.
+        thread_id = self.encode_thread_id(
+            LinearThreadId(
+                issue_id=issue_id,
+                comment_id=cast("str | None", comment_data.get("parentId")),
+                agent_session_id=agent_session_id,
+            )
+        )
+        return RawMessage(
+            id=cast("str", comment_data["id"]),
+            thread_id=thread_id,
+            raw=cast("Any", raw),
         )
 
     async def edit_message(
@@ -1188,8 +1467,31 @@ class LinearAdapter:
         self._logger.warn("removeReaction is not fully supported on Linear - reaction ID lookup would be required")
 
     async def start_typing(self, thread_id: str, status: str | None = None) -> None:
-        """Start typing indicator. Not supported by Linear."""
-        pass
+        """Start typing indicator.
+
+        Faithful port of upstream ``startTyping`` (index.ts:1517). For
+        agent-session threads this emits an ephemeral "thought" activity (the
+        Linear-native typing equivalent); for standard comment threads it
+        remains a warn-and-noop. ``status ?? "Thinking..."`` is nullish — an
+        explicit empty-string status stays empty (NOT replaced by the default),
+        so the ``is not None`` guard (not truthiness) is load-bearing.
+        """
+        await self._ensure_valid_token()
+        decoded = self.decode_thread_id(thread_id)
+
+        if decoded.agent_session_id:
+            session = assert_agent_session_thread(decoded)
+            await self._create_agent_activity(
+                session.agent_session_id,
+                {
+                    "type": "thought",
+                    "body": status if status is not None else "Thinking...",
+                },
+                ephemeral=True,
+            )
+            return
+
+        self._logger.warn("startTyping is only supported in agent session threads. Ignoring for comment thread.")
 
     async def fetch_messages(
         self,
@@ -1523,11 +1825,20 @@ class LinearAdapter:
         text_stream: Any,
         options: StreamOptions | None = None,
     ) -> RawMessage:
-        """Stream responses by accumulating chunks and posting/editing a single comment.
+        """Stream responses to a thread.
 
-        Linear does not support native streaming, so this accumulates the
-        full text and posts (or edits) a single comment at the end.
+        Faithful port of upstream ``stream`` (index.ts:1542): dispatch to the
+        agent-session streamer when the decoded thread carries a session, else
+        fall through to the existing comment-path behavior (byte-identical to
+        before — Linear comments do not support native streaming, so the comment
+        path accumulates the full text and posts a single comment at the end).
         """
+        decoded = self.decode_thread_id(thread_id)
+        if decoded.agent_session_id:
+            await self._ensure_valid_token()
+            session = assert_agent_session_thread(decoded)
+            return await self._stream_in_agent_session(session, text_stream, options)
+
         accumulated = ""
         message_id: str | None = None
 
@@ -1552,6 +1863,133 @@ class LinearAdapter:
             thread_id=thread_id,
             raw={"text": accumulated},
         )
+
+    async def _stream_in_agent_session(
+        self,
+        decoded: LinearAgentSessionThreadId,
+        text_stream: Any,
+        _options: StreamOptions | None = None,
+    ) -> RawMessage:
+        """Stream text/chunks into a Linear agent session.
+
+        Faithful port of upstream ``streamInAgentSession`` (index.ts:1560).
+        Unlike the comment path (a single post/edit), an agent session is
+        append-only: committable markdown is flushed as successive "response"
+        activities (with a delta computed against the last appended text),
+        ``task_update`` chunks become "action"/"error" activities, and
+        ``plan_update`` chunks replace the session plan. The final
+        ``renderer.finish()`` is force-flushed as the closing response, then
+        resolved back into a raw message via
+        :meth:`_parse_message_from_agent_activity`.
+        """
+        from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
+
+        renderer = StreamingMarkdownRenderer()
+        agent_session_id = decoded.agent_session_id
+
+        # Mutable closure state. ``last_appended`` tracks the full markdown text
+        # already emitted so each flush sends only the new tail (the delta).
+        last_appended = ""
+
+        async def flush_markdown(
+            activity_type: str,
+            markdown: str | None = None,
+            force: bool = False,
+        ) -> dict[str, Any] | None:
+            """Flush the current markdown buffer into a new "response"/"thought" activity.
+
+            ``delta = markdown[len(last_appended):].trim()`` — the JS ``.trim()``
+            whitespace set (``_JS_WHITESPACE``), NOT Python's broader
+            ``str.strip()``. ``if delta or force`` mirrors upstream: an
+            empty-string delta is falsy in both languages, so a no-delta flush
+            is a no-op unless forced (the final flush). Returns the created
+            activity payload, or ``None`` when nothing was sent.
+            """
+            nonlocal last_appended
+            committable = renderer.get_committable_text() if markdown is None else markdown
+            delta = committable[len(last_appended) :].strip(_JS_WHITESPACE)
+            if delta or force:
+                last_appended = committable
+                return await self._create_agent_activity(
+                    agent_session_id,
+                    {"type": activity_type, "body": delta},
+                )
+            return None
+
+        def _read(chunk: Any, name: str) -> Any:
+            """Read a chunk field from either a dict or a dataclass chunk."""
+            if isinstance(chunk, dict):
+                return chunk.get(name)
+            return getattr(chunk, name, None)
+
+        async for chunk in text_stream:
+            if isinstance(chunk, str):
+                renderer.push(chunk)
+                continue
+
+            chunk_type = _read(chunk, "type")
+
+            if chunk_type == "markdown_text":
+                renderer.push(_read(chunk, "text") or "")
+                continue
+
+            if chunk_type == "task_update":
+                # Flush any buffered markdown as a "thought" before sending the
+                # action so the action card is distinct from the response body.
+                await flush_markdown("thought")
+
+                title = _read(chunk, "title")
+                output = _read(chunk, "output")
+                status = _read(chunk, "status")
+
+                if status == "error":
+                    # ``[title, output].filter(Boolean).join("\n")`` — drops None
+                    # AND empty string (truthiness), faithful.
+                    body = "\n".join(x for x in [title, output] if x)
+                    await self._create_agent_activity(
+                        agent_session_id,
+                        {"type": "error", "body": body},
+                    )
+                else:
+                    # ``ephemeral: status !== "complete"`` — in-progress/pending
+                    # actions are ephemeral; only a completed action persists.
+                    await self._create_agent_activity(
+                        agent_session_id,
+                        {
+                            "type": "action",
+                            "action": title,
+                            "parameter": "",
+                            "result": output,
+                        },
+                        ephemeral=status != "complete",
+                    )
+                continue
+
+            if chunk_type == "plan_update":
+                # Replace the session plan in its entirety (agents cannot patch a
+                # single item). https://linear.app/developers/agent-interaction
+                await self._graphql_query(
+                    _AGENT_SESSION_UPDATE_MUTATION,
+                    {
+                        "id": agent_session_id,
+                        "input": {
+                            "plan": [
+                                {
+                                    "content": _read(chunk, "title"),
+                                    "status": "completed",
+                                }
+                            ]
+                        },
+                    },
+                )
+
+        final_activity = await flush_markdown("response", renderer.finish(), True)
+        if not final_activity:
+            # Upstream throws a bare ``Error`` here (NOT an ``AdapterError``);
+            # ported as ``RuntimeError`` per the repo's bare-Error convention.
+            raise RuntimeError("Failed to flush final markdown delta for agent session stream")
+
+        return await self._parse_message_from_agent_activity(decoded, final_activity)
 
     async def _get_http_session(self) -> Any:
         """Return the shared aiohttp session, creating it lazily if needed."""
