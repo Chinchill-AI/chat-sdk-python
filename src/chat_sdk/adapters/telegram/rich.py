@@ -39,6 +39,43 @@ LINE_BREAKS = re.compile(r"[\r\n]")
 # Upstream: /`+/g -- runs of one or more backticks.
 BACKTICKS = re.compile(r"`+")
 
+# The exact set of characters JS ``String.prototype.trim``/``trimEnd`` removes:
+# the ECMAScript WhiteSpace set plus the LineTerminator set. Python's bare
+# ``str.strip()``/``str.rstrip()`` strip a broader Unicode-whitespace set (e.g.
+# the C0 separators ``\x1c``-``\x1f`` and NEL ``\x85``, which JS keeps; and they
+# do NOT strip the BOM ``﻿``, which JS removes). Passing this explicit
+# string to ``strip``/``rstrip`` matches JS character-for-character.
+JS_WHITESPACE = (
+    "\t\n\v\f\r "  # \t \n \v \f \r and SPACE
+    " "  # NO-BREAK SPACE
+    " "  # OGHAM SPACE MARK
+    "           "  # EN QUAD..HAIR SPACE
+    " "  # LINE SEPARATOR
+    " "  # PARAGRAPH SEPARATOR
+    " "  # NARROW NO-BREAK SPACE
+    " "  # MEDIUM MATHEMATICAL SPACE
+    "　"  # IDEOGRAPHIC SPACE
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE (BOM)
+)
+
+
+def _present(value: TelegramRichText | None) -> bool:
+    """Match JS truthiness for an optional ``TelegramRichText`` field.
+
+    Upstream gates these fields with ``value.x ? ... : ""``. The only values
+    a ``TelegramRichText`` (``str | list | object``) can take that differ from
+    Python truthiness is the empty list ``[]``: JS arrays are ALWAYS truthy, so
+    ``credit: []`` renders upstream but a bare ``if value.get("credit")`` would
+    skip it in Python. We therefore render whenever the value is present and is
+    not the empty string ``""`` (the only falsy ``TelegramRichText`` in JS):
+
+    - ``None`` / absent -> skip (JS ``undefined`` is falsy)
+    - ``""`` -> skip (JS ``""`` is falsy)
+    - ``[]`` -> render (JS arrays are truthy)
+    - ``[span]`` / ``"text"`` / object -> render (truthy)
+    """
+    return value is not None and value != ""
+
 
 def truncate_rich_markdown(markdown: str) -> str:
     """Truncate *markdown* to the Telegram rich-message character limit.
@@ -81,7 +118,7 @@ def _inline_code(value: str) -> str:
     runs = BACKTICKS.findall(value)
     size = max(1, *(len(run) + 1 for run in runs)) if runs else 1
     marker = "`" * size
-    has_boundary_space = value.startswith(" ") and value.endswith(" ") and len(value.strip()) > 0
+    has_boundary_space = value.startswith(" ") and value.endswith(" ") and len(value.strip(JS_WHITESPACE)) > 0
     padding = " " if value.startswith("`") or value.endswith("`") or has_boundary_space else ""
     return f"{marker}{padding}{value}{padding}{marker}"
 
@@ -196,19 +233,19 @@ def _plain(markdown: TelegramRichText) -> str:
 def _caption(value: TelegramRichCaption | None = None) -> str:
     if not value:
         return ""
-    credit = f"\n{_text(value['credit'])}" if value.get("credit") else ""
+    credit = f"\n{_text(value['credit'])}" if _present(value.get("credit")) else ""
     return f"{_text(value['text'])}{credit}"
 
 
 def _plain_caption(value: TelegramRichCaption | None = None) -> str:
     if not value:
         return ""
-    credit = f"\n{_plain(value['credit'])}" if value.get("credit") else ""
+    credit = f"\n{_plain(value['credit'])}" if _present(value.get("credit")) else ""
     return f"{_plain(value['text'])}{credit}"
 
 
 def _cell(value: TelegramRichCell) -> str:
-    return _text(value["text"]) if value.get("text") else ""
+    return _text(value["text"]) if _present(value.get("text")) else ""
 
 
 def _item(value: TelegramRichItem) -> str:
@@ -216,7 +253,7 @@ def _item(value: TelegramRichItem) -> str:
     if value.get("has_checkbox"):
         checked = "[x] " if value.get("is_checked") else "[ ] "
     content = "\n\n".join(_block(b) for b in value["blocks"]).replace("\n", "\n  ")
-    return f"{value['label']} {checked}{content}".rstrip()
+    return f"{value['label']} {checked}{content}".rstrip(JS_WHITESPACE)
 
 
 def _plain_item(value: TelegramRichItem) -> str:
@@ -224,18 +261,18 @@ def _plain_item(value: TelegramRichItem) -> str:
     if value.get("has_checkbox"):
         checked = "[x] " if value.get("is_checked") else "[ ] "
     content = "\n".join(b for b in (_plain_block(blk) for blk in value["blocks"]) if b).replace("\n", "\n  ")
-    return f"{value['label']} {checked}{content}".rstrip()
+    return f"{value['label']} {checked}{content}".rstrip(JS_WHITESPACE)
 
 
 def _table(value: TelegramRichBlockTable) -> str:
     rows = [f"| {' | '.join(_cell(c) for c in row)} |" for row in value["cells"]]
     if len(rows) == 0:
-        return _text(value["caption"]) if value.get("caption") else ""
+        return _text(value["caption"]) if _present(value.get("caption")) else ""
 
     columns = max(len(row) for row in value["cells"])
     separator = f"| {' | '.join('---' for _ in range(columns))} |"
     content = "\n".join([rows[0], separator, *rows[1:]])
-    return f"{_text(value['caption'])}\n\n{content}" if value.get("caption") else content
+    return f"{_text(value['caption'])}\n\n{content}" if _present(value.get("caption")) else content
 
 
 def _quote(value: str) -> str:
@@ -261,10 +298,10 @@ def _block(value: TelegramRichBlock) -> str:
             return "\n".join(_item(i) for i in value["items"])
         case "blockquote":
             content = "\n\n".join(_block(b) for b in value["blocks"])
-            credit = f"\n\n{_text(value['credit'])}" if value.get("credit") else ""
+            credit = f"\n\n{_text(value['credit'])}" if _present(value.get("credit")) else ""
             return _quote(f"{content}{credit}")
         case "pullquote":
-            credit = f"\n\n{_text(value['credit'])}" if value.get("credit") else ""
+            credit = f"\n\n{_text(value['credit'])}" if _present(value.get("credit")) else ""
             return _quote(f"{_text(value['text'])}{credit}")
         case "collage" | "slideshow":
             content = "\n\n".join(b for b in (_block(blk) for blk in value["blocks"]) if b)
@@ -295,10 +332,10 @@ def _plain_block(value: TelegramRichBlock) -> str:
             return "\n".join(_plain_item(i) for i in value["items"])
         case "blockquote":
             content = "\n\n".join(b for b in (_plain_block(blk) for blk in value["blocks"]) if b)
-            credit = f"\n\n{_plain(value['credit'])}" if value.get("credit") else ""
+            credit = f"\n\n{_plain(value['credit'])}" if _present(value.get("credit")) else ""
             return f"{content}{credit}"
         case "pullquote":
-            credit = f"\n\n{_plain(value['credit'])}" if value.get("credit") else ""
+            credit = f"\n\n{_plain(value['credit'])}" if _present(value.get("credit")) else ""
             return f"{_plain(value['text'])}{credit}"
         case "collage" | "slideshow":
             content = "\n\n".join(b for b in (_plain_block(blk) for blk in value["blocks"]) if b)
@@ -306,10 +343,11 @@ def _plain_block(value: TelegramRichBlock) -> str:
             return "\n\n".join(part for part in (content, description) if part)
         case "table":
             rows = [
-                "\t".join(_plain(entry["text"]) if entry.get("text") else "" for entry in row) for row in value["cells"]
+                "\t".join(_plain(entry["text"]) if _present(entry.get("text")) else "" for entry in row)
+                for row in value["cells"]
             ]
             content = "\n".join(rows)
-            return f"{_plain(value['caption'])}\n\n{content}" if value.get("caption") else content
+            return f"{_plain(value['caption'])}\n\n{content}" if _present(value.get("caption")) else content
         case "details":
             body = "\n\n".join(b for b in (_plain_block(blk) for blk in value["blocks"]) if b)
             return f"{_plain(value['summary'])}\n\n{body}"
@@ -403,12 +441,12 @@ def _media(blocks: list[TelegramRichBlock], result: list[RichMedia]) -> None:
 
 def rich_message_to_markdown(message: TelegramRichMessage) -> str:
     """Render a Telegram rich message to Markdown."""
-    return "\n\n".join(b for b in (_block(blk) for blk in message["blocks"]) if b).strip()
+    return "\n\n".join(b for b in (_block(blk) for blk in message["blocks"]) if b).strip(JS_WHITESPACE)
 
 
 def rich_message_to_text(message: TelegramRichMessage) -> str:
     """Render a Telegram rich message to plain text."""
-    return "\n\n".join(b for b in (_plain_block(blk) for blk in message["blocks"]) if b).strip()
+    return "\n\n".join(b for b in (_plain_block(blk) for blk in message["blocks"]) if b).strip(JS_WHITESPACE)
 
 
 def rich_message_media(message: TelegramRichMessage) -> list[RichMedia]:

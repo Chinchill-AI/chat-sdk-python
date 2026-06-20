@@ -32,6 +32,7 @@ from chat_sdk.adapters.telegram.types import (
     TelegramRichBlockList,
     TelegramRichBlockPhoto,
     TelegramRichBlockPre,
+    TelegramRichBlockPullquote,
     TelegramRichBlockTable,
     TelegramRichBlockText,
     TelegramRichCell,
@@ -347,3 +348,91 @@ def test_truncation_passes_through_under_limit_text_unchanged() -> None:
     text = "😀" * 5
     assert truncate_rich_markdown(text) == text
     assert truncate_rich_markdown("plain") == "plain"
+
+
+# ---------------------------------------------------------------------------
+# Fidelity: empty-LIST rich-text field renders (JS arrays are truthy)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_list_credit_renders_like_a_present_credit() -> None:
+    """An empty-list ``credit`` ([]) renders, matching JS array truthiness.
+
+    Upstream gates the credit with ``value.credit ? ... : ""``; a JS array is
+    ALWAYS truthy, so ``credit: []`` produces a blank credit (a leading-newline
+    empty line in the quote), whereas absent / empty-string skip it. A bare
+    Python-truthiness gate (``if value.get("credit")``) would wrongly skip
+    ``[]`` -- this test fails under that regression.
+    """
+    # credit=[] -> truthy in JS -> credit segment "\n\n" + text([]) ("") renders.
+    # quote("Quote\n\n") -> "> Quote\n> \n> " -> trailing ws trimmed by .strip().
+    with_empty_list: TelegramRichBlockPullquote = {"type": "pullquote", "text": "Quote", "credit": []}
+    assert rich_message_to_markdown({"blocks": [with_empty_list]}) == "> Quote\n> \n>"
+
+    # Absent credit -> JS undefined is falsy -> skipped entirely.
+    absent: TelegramRichBlockPullquote = {"type": "pullquote", "text": "Quote"}
+    assert rich_message_to_markdown({"blocks": [absent]}) == "> Quote"
+
+    # Empty-string credit -> JS "" is falsy -> skipped (the ONLY falsy RichText).
+    empty_string: TelegramRichBlockPullquote = {"type": "pullquote", "text": "Quote", "credit": ""}
+    assert rich_message_to_markdown({"blocks": [empty_string]}) == "> Quote"
+
+    # A real credit span renders the same blank-line-separated shape as [].
+    with_author: TelegramRichBlockPullquote = {"type": "pullquote", "text": "Quote", "credit": "Author"}
+    assert rich_message_to_markdown({"blocks": [with_author]}) == "> Quote\n> \n> Author"
+
+
+# ---------------------------------------------------------------------------
+# Mutation coverage: fence default width, truncation reserve, exact boundary
+# ---------------------------------------------------------------------------
+
+
+def test_pre_block_without_internal_backticks_emits_a_three_backtick_fence() -> None:
+    """A code/pre block with NO internal backticks uses the default 3-fence.
+
+    ``_code_block`` sizes the fence as ``max(3, longest_run + 1)`` and falls
+    back to ``3`` when there are no backtick runs. This pins the no-run default:
+    the mutations ``else 3`` -> ``else 2`` and ``max(3, ...)`` -> ``max(2, ...)``
+    both shrink the fence to 2 backticks and fail this assertion.
+    """
+    fence = "`" * 3
+    pre: TelegramRichBlockPre = {"type": "pre", "language": "python", "text": "hello world"}
+    markdown = rich_message_to_markdown({"blocks": [pre]})
+
+    assert markdown == f"{fence}python\nhello world\n{fence}"
+    # Exactly three opening backticks -- never two.
+    assert len(markdown) - len(markdown.lstrip("`")) == 3
+
+
+def test_truncation_reserves_room_for_the_ellipsis() -> None:
+    """Truncation reserves 3 chars for ``...`` so the result stays at the limit.
+
+    With an unclosed bold marker straddling the boundary, the correct reserve
+    (``end = LIMIT - 3``) returns a result of length EXACTLY ``LIMIT`` on the
+    first iteration. The mutation ``end = LIMIT`` over-shoots, the shrink loop
+    diverges, and it returns a shorter (length ``LIMIT - 2``) result -- so an
+    exact-length assertion fails under the mutation.
+    """
+    # 'a' x (LIMIT-1) + '**' opens an unclosed bold span right at the boundary;
+    # the trailing run keeps the input over the limit.
+    over_limit = ("a" * (TELEGRAM_RICH_MESSAGE_LIMIT - 1)) + "**" + ("b" * 200)
+    result = truncate_rich_markdown(over_limit)
+
+    # The ellipsis fits within the limit -- length is exactly the limit here,
+    # never over it (mutation would yield LIMIT - 2, killing the equality).
+    assert len(result) == TELEGRAM_RICH_MESSAGE_LIMIT
+    assert result.endswith("...")
+
+
+def test_exact_limit_length_passes_through_unchanged() -> None:
+    """A string of length EXACTLY ``LIMIT`` is returned verbatim (no ``...``).
+
+    The early-return guard is ``len(characters) <= LIMIT``. At the boundary
+    ``len == LIMIT`` the input must pass through; the mutation ``<=`` -> ``<``
+    would instead truncate it (appending ``...``), failing this assertion.
+    """
+    exact = "a" * TELEGRAM_RICH_MESSAGE_LIMIT
+    result = truncate_rich_markdown(exact)
+
+    assert result == exact
+    assert not result.endswith("...")
