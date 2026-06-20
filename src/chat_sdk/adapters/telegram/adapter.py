@@ -29,6 +29,11 @@ from chat_sdk.adapters.telegram.cards import (
     empty_telegram_inline_keyboard,
 )
 from chat_sdk.adapters.telegram.format_converter import TelegramFormatConverter
+from chat_sdk.adapters.telegram.rich import (
+    rich_message_media,
+    rich_message_to_markdown,
+    rich_message_to_text,
+)
 from chat_sdk.adapters.telegram.types import (
     TelegramAdapterConfig,
     TelegramApiResponse,
@@ -154,6 +159,20 @@ class ResolvedTelegramLongPollingConfig:
     limit: int
     retry_delay_ms: int
     timeout: int
+
+
+@dataclass
+class TelegramParsedContent:
+    """Pre-resolved formatted/plain text for a parsed Telegram message.
+
+    Supplied by the outbound post/edit/stream paths when the SDK already
+    rendered a rich message locally, so :meth:`parse_telegram_message`
+    reuses that AST/text instead of re-deriving it from the raw payload.
+    Port of upstream's ``content?`` argument to ``parseTelegramMessage``.
+    """
+
+    formatted: FormattedContent
+    text: str
 
 
 TelegramRuntimeMode = str  # "webhook" | "polling"
@@ -1975,11 +1994,37 @@ class TelegramAdapter:
         self,
         raw: TelegramMessage,
         thread_id: str,
+        content: TelegramParsedContent | None = None,
     ) -> Message:
         """Parse a Telegram message into a normalised :class:`Message`."""
-        plain_text = raw.get("text") or raw.get("caption") or ""
-        entities = raw.get("entities") or raw.get("caption_entities") or []
-        text = apply_telegram_entities(plain_text, entities)
+        rich_message = raw.get("rich_message")
+        # `raw.rich_message ? ... : ""` -- presence (truthy) check on the field.
+        rich_markdown = rich_message_to_markdown(rich_message) if rich_message else ""
+        # Upstream chains `??` here (nullish): an empty-string text/caption is a
+        # real value and short-circuits the chain. Port each `??` as `is not None`.
+        content_text = content.text if content is not None else None
+        raw_text = raw.get("text")
+        raw_caption = raw.get("caption")
+        if content_text is not None:
+            plain_text = content_text
+        elif raw_text is not None:
+            plain_text = raw_text
+        elif raw_caption is not None:
+            plain_text = raw_caption
+        elif rich_message:
+            plain_text = rich_message_to_text(rich_message)
+        else:
+            plain_text = ""
+        # `raw.entities ?? raw.caption_entities ?? []` -- nullish: present-but-empty
+        # entity lists are honoured rather than falling through to caption_entities.
+        entities = raw.get("entities")
+        if entities is None:
+            entities = raw.get("caption_entities")
+        if entities is None:
+            entities = []
+        # `content?.text ? content.text : applyTelegramEntities(...)` -- TRUTHY `?`:
+        # a present-but-empty `content.text` falls through to the entity-applied text.
+        text = content.text if content is not None and content.text else apply_telegram_entities(plain_text, entities)
 
         # Determine author -- Telegram uses 'from' key which is a reserved word
         from_user = cast(
@@ -2004,11 +2049,19 @@ class TelegramAdapter:
 
         edit_date = raw.get("edit_date")
 
+        # `content?.formatted ?? this.formatConverter.toAst(richMarkdown || text)`:
+        # `??` (nullish) for the supplied AST, then `richMarkdown || text` is a
+        # TRUTHY-OR -- a non-empty rendered rich markdown wins, else fall to text.
+        if content is not None and content.formatted is not None:
+            formatted = content.formatted
+        else:
+            formatted = self._format_converter.to_ast(rich_markdown or text)
+
         return Message(
             id=self.encode_message_id(str(raw["chat"]["id"]), raw["message_id"]),
             thread_id=thread_id,
             text=text,
-            formatted=self._format_converter.to_ast(text),
+            formatted=formatted,
             raw=raw,
             author=author,
             metadata=MessageMetadata(
@@ -2103,6 +2156,26 @@ class TelegramAdapter:
                     height=length,
                 )
             )
+
+        # Bot API 10.1 rich messages carry their media inline in the block tree
+        # (port of chat@4.31 4662309). `rich_message_media` walks the nested
+        # blocks (lists, blockquotes, collages, slideshows, details) and yields
+        # a flat `RichMedia` list; map each onto our `Attachment` shape. The
+        # `mimeType` -> `mime_type` rename is the only field-name boundary.
+        rich_message = raw.get("rich_message")
+        if rich_message:
+            for media in rich_message_media(rich_message):
+                attachments.append(
+                    self.create_attachment(
+                        media.type,
+                        media.file["file_id"],
+                        size=media.file.get("file_size"),
+                        width=media.width,
+                        height=media.height,
+                        name=media.name,
+                        mime_type=media.mime_type,
+                    )
+                )
 
         return attachments
 
