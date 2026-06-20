@@ -13,12 +13,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from chat_sdk.adapters.linear.adapter import LinearAdapter
+from chat_sdk.adapters.linear.adapter import (
+    LinearAdapter,
+    assert_agent_session_thread,
+)
 from chat_sdk.adapters.linear.types import (
     LinearAdapterAPIKeyConfig,
     LinearAdapterAppConfig,
     LinearAdapterBaseConfig,
     LinearAdapterOAuthConfig,
+    LinearAgentSessionThreadId,
     LinearThreadId,
 )
 from chat_sdk.shared.errors import ValidationError
@@ -182,6 +186,38 @@ class TestEncodeThreadId:
         )
         assert result == "linear:2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9:c:a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
+    def test_agent_session_issue(self):
+        # Ported: "should encode an agent-session issue thread ID". When only
+        # agent_session_id is set the issue session form `:s:` is emitted (the
+        # bare `:c:` branch must NOT win), so a missing/misordered branch fails.
+        adapter = _make_adapter()
+        result = adapter.encode_thread_id(LinearThreadId(issue_id="issue-123", agent_session_id="session-789"))
+        assert result == "linear:issue-123:s:session-789"
+
+    def test_agent_session_comment(self):
+        # Ported: "should encode an agent-session comment thread ID".
+        adapter = _make_adapter()
+        result = adapter.encode_thread_id(
+            LinearThreadId(
+                issue_id="issue-123",
+                comment_id="comment-456",
+                agent_session_id="session-789",
+            )
+        )
+        assert result == "linear:issue-123:c:comment-456:s:session-789"
+
+    def test_existing_forms_byte_identical(self):
+        # CRITICAL cross-SDK state-compat guard: the issue-level and
+        # comment-thread outputs are persisted (Redis/Postgres) and shared with
+        # the TS SDK; adding the session branch must not perturb them by a byte.
+        # Locks the exact strings independent of the broader round-trip tests.
+        adapter = _make_adapter()
+        assert adapter.encode_thread_id(LinearThreadId(issue_id="issue-123")) == "linear:issue-123"
+        assert (
+            adapter.encode_thread_id(LinearThreadId(issue_id="issue-123", comment_id="comment-456"))
+            == "linear:issue-123:c:comment-456"
+        )
+
 
 # ---------------------------------------------------------------------------
 # decodeThreadId
@@ -229,6 +265,57 @@ class TestDecodeThreadId:
         with pytest.raises(ValidationError, match="Invalid Linear thread ID"):
             adapter.decode_thread_id("nonsense")
 
+    def test_agent_session_issue(self):
+        # Ported: "should decode an agent-session issue thread ID".
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("linear:issue-123:s:session-789")
+        assert result.issue_id == "issue-123"
+        assert result.comment_id is None
+        assert result.agent_session_id == "session-789"
+
+    def test_agent_session_comment(self):
+        # Ported: "should decode an agent-session comment thread ID".
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("linear:issue-123:c:comment-456:s:session-789")
+        assert result.issue_id == "issue-123"
+        assert result.comment_id == "comment-456"
+        assert result.agent_session_id == "session-789"
+
+    def test_comment_session_not_decoded_as_comment(self):
+        # DECODE-ORDER guard. The COMMENT pattern `^([^:]+):c:([^:]+)$` is
+        # anchored, so it cannot itself match a trailing `:s:session`. But if a
+        # reviewer un-anchors COMMENT (drops the `$`) OR moves it ahead of
+        # COMMENT_SESSION, this id would lose its agent_session_id (or fold the
+        # session into commentId). Assert the FULL session decode so either
+        # mutation fails here.
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("linear:issue-123:c:comment-456:s:session-789")
+        assert result.agent_session_id == "session-789"
+        assert result.comment_id == "comment-456"
+        # The comment id must be exactly the middle segment — not the un-anchored
+        # `comment-456:s:session-789` a leaky regex would capture.
+        assert result.comment_id != "comment-456:s:session-789"
+
+    def test_issue_session_not_decoded_as_bare_issue(self):
+        # DECODE-ORDER guard. If ISSUE_SESSION is dropped or ordered after the
+        # bare-issue fallthrough, this id would decode to a single issue_id of
+        # "issue-123:s:session-789" with no agent_session_id.
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("linear:issue-123:s:session-789")
+        assert result.issue_id == "issue-123"
+        assert result.agent_session_id == "session-789"
+
+    def test_empty_trailing_session_segment_falls_to_bare_issue(self):
+        # Malformed `linear:x:s:` — the anchored `([^:]+)` session group rejects
+        # the empty trailing segment, so (matching upstream byte-for-byte) it is
+        # NOT a session id and falls through to the bare-issue form with the
+        # whole remainder as the issue id.
+        adapter = _make_adapter()
+        result = adapter.decode_thread_id("linear:x:s:")
+        assert result.issue_id == "x:s:"
+        assert result.agent_session_id is None
+        assert result.comment_id is None
+
 
 # ---------------------------------------------------------------------------
 # Round-trip
@@ -253,6 +340,83 @@ class TestRoundTrip:
         decoded = adapter.decode_thread_id(encoded)
         assert decoded.issue_id == original.issue_id
         assert decoded.comment_id == original.comment_id
+
+    def test_agent_session_comment(self):
+        # Ported: "should round-trip agent-session comment thread ID".
+        adapter = _make_adapter()
+        original = LinearThreadId(
+            issue_id="issue-123",
+            comment_id="comment-456",
+            agent_session_id="session-789",
+        )
+        encoded = adapter.encode_thread_id(original)
+        decoded = adapter.decode_thread_id(encoded)
+        assert decoded == original
+
+    @pytest.mark.parametrize(
+        "original",
+        [
+            LinearThreadId(issue_id="2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9"),
+            LinearThreadId(
+                issue_id="2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9",
+                comment_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            ),
+            LinearThreadId(issue_id="issue-123", agent_session_id="session-789"),
+            LinearThreadId(
+                issue_id="issue-123",
+                comment_id="comment-456",
+                agent_session_id="session-789",
+            ),
+        ],
+        ids=["bare-issue", "comment", "issue-session", "comment-session"],
+    )
+    def test_encode_decode_encode_identity_all_forms(self, original):
+        # Property test across ALL four thread-id forms: encode -> decode ->
+        # encode is the identity on the wire string, and decode -> encode ->
+        # decode is the identity on the dataclass. A decode-order swap (e.g.
+        # COMMENT ahead of COMMENT_SESSION) breaks the comment-session row; an
+        # un-anchored regex breaks the issue-session/comment-session rows.
+        adapter = _make_adapter()
+        wire = adapter.encode_thread_id(original)
+        assert adapter.encode_thread_id(adapter.decode_thread_id(wire)) == wire
+        assert adapter.decode_thread_id(wire) == original
+
+
+# ---------------------------------------------------------------------------
+# assert_agent_session_thread
+# ---------------------------------------------------------------------------
+
+
+class TestAssertAgentSessionThread:
+    def test_returns_narrowed_thread_for_session_id(self):
+        # A thread carrying agent_session_id is accepted and returned re-typed.
+        thread = LinearThreadId(issue_id="issue-1", agent_session_id="sess-1")
+        narrowed = assert_agent_session_thread(thread)
+        assert isinstance(narrowed, LinearThreadId)
+        assert narrowed.agent_session_id == "sess-1"
+        assert narrowed.issue_id == "issue-1"
+
+    def test_accepts_comment_session_thread(self):
+        thread = LinearThreadId(issue_id="issue-1", comment_id="c-1", agent_session_id="sess-1")
+        narrowed = assert_agent_session_thread(thread)
+        assert narrowed.agent_session_id == "sess-1"
+        assert narrowed.comment_id == "c-1"
+
+    def test_raises_on_bare_issue_thread(self):
+        # The upstream message must match byte-for-byte.
+        with pytest.raises(ValidationError, match="Expected a Linear agent session thread"):
+            assert_agent_session_thread(LinearThreadId(issue_id="issue-1"))
+
+    def test_raises_on_comment_thread_without_session(self):
+        with pytest.raises(ValidationError, match="Expected a Linear agent session thread"):
+            assert_agent_session_thread(LinearThreadId(issue_id="issue-1", comment_id="c-1"))
+
+    def test_decode_then_assert_round_trips_for_session_form(self):
+        # End-to-end: a session wire id decodes to a thread the assertion accepts.
+        adapter = _make_adapter()
+        decoded = adapter.decode_thread_id("linear:issue-1:s:sess-1")
+        narrowed: LinearAgentSessionThreadId = assert_agent_session_thread(decoded)
+        assert narrowed.agent_session_id == "sess-1"
 
 
 # ---------------------------------------------------------------------------
