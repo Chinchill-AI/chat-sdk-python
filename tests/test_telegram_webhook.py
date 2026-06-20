@@ -783,6 +783,33 @@ class TestTelegramParseInboundRichMessage:
         assert parsed.text == "just text"
         assert parsed.formatted["children"][0]["type"] == "paragraph"
 
+    def test_empty_entities_list_does_not_fall_through_to_caption_entities(self):
+        # TG3 follow-up: `raw.entities ?? raw.caption_entities ?? []` is a
+        # NULLISH ladder. A present-but-EMPTY `entities: []` is a real value
+        # and short-circuits the chain, so the populated `caption_entities`
+        # are NOT applied. With the correct nullish ladder the bold entity
+        # never fires and `.text` stays the bare plain text.
+        #
+        # A truthy-`or` mutation (`entities or caption_entities`) would treat
+        # the empty list as falsy, reach for `caption_entities`, and wrap the
+        # span in `**...**` — so this assertion FAILS on that mutation.
+        adapter = _make_adapter()
+        msg = _sample_message(
+            text="bold body",
+            entities=[],
+            caption_entities=[{"type": "bold", "offset": 0, "length": 9}],
+        )
+        parsed = adapter.parse_message(msg)
+        assert parsed.text == "bold body"
+        # Sanity anchor: the SAME entity, supplied via `entities`, DOES apply
+        # — proving the bold entity is load-bearing and the test above is not
+        # passing for an unrelated reason.
+        msg_applied = _sample_message(
+            text="bold body",
+            entities=[{"type": "bold", "offset": 0, "length": 9}],
+        )
+        assert adapter.parse_message(msg_applied).text == "**bold body**"
+
 
 class TestTelegramParseInboundRichMedia:
     """extractAttachments handling of media nested in ``rich_message`` blocks."""

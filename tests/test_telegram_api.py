@@ -85,7 +85,7 @@ def _init_adapter(adapter: TelegramAdapter) -> MagicMock:
 
 
 class TestPostMessageSendsText:
-    """post_message with plain markdown sends sendMessage."""
+    """post_message with markdown routes through the native rich endpoint."""
 
     @pytest.mark.asyncio
     async def test_post_message_sends_text(self):
@@ -100,9 +100,11 @@ class TestPostMessageSendsText:
         method = call_args[0][0]
         payload = call_args[0][1]
 
-        assert method == "sendMessage"
+        # A ``{markdown}`` payload now goes through ``sendRichMessage`` with the
+        # markdown carried verbatim in ``rich_message`` (vercel/chat#479).
+        assert method == "sendRichMessage"
         assert payload["chat_id"] == CHAT_ID
-        assert payload["text"] == "Hi"
+        assert payload["rich_message"]["markdown"] == "Hi"
         assert result.id is not None
 
 
@@ -151,17 +153,38 @@ class TestPostMessageWithCard:
 
 
 class TestPostMessageParseMode:
-    """post_message with markdown content sends MarkdownV2 parse_mode."""
+    """post_message markdown: rich primary, MarkdownV2 on the regular fallback."""
 
     @pytest.mark.asyncio
     async def test_post_message_parse_mode_markdown(self):
+        # Rich is the primary path: the markdown is sent through
+        # ``sendRichMessage`` with no Bot-API ``parse_mode`` (the rich endpoint
+        # parses markdown natively).
         adapter = _make_adapter()
         _init_adapter(adapter)
         adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message(text="**bold**"))
 
         await adapter.post_message(THREAD_ID, {"markdown": "**bold**"})
 
+        method = adapter.telegram_fetch.call_args[0][0]
         payload = adapter.telegram_fetch.call_args[0][1]
+        assert method == "sendRichMessage"
+        assert payload.get("parse_mode") is None
+
+    @pytest.mark.asyncio
+    async def test_post_message_parse_mode_markdown_on_regular_path(self):
+        # When rich is unavailable the markdown falls to the regular
+        # ``sendMessage`` path, which DOES carry ``parse_mode=MarkdownV2``.
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter._rich_messages_available = False
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message(text="**bold**"))
+
+        await adapter.post_message(THREAD_ID, {"markdown": "**bold**"})
+
+        method = adapter.telegram_fetch.call_args[0][0]
+        payload = adapter.telegram_fetch.call_args[0][1]
+        assert method == "sendMessage"
         assert payload.get("parse_mode") == "MarkdownV2"
 
 
@@ -448,10 +471,13 @@ class TestEditMessage:
         method = adapter.telegram_fetch.call_args[0][0]
         payload = adapter.telegram_fetch.call_args[0][1]
 
+        # A ``{markdown}`` edit routes through the native rich edit
+        # (``editMessageText`` with ``rich_message``), not a MarkdownV2 text
+        # edit (vercel/chat#479).
         assert method == "editMessageText"
         assert payload["chat_id"] == CHAT_ID
         assert payload["message_id"] == MESSAGE_ID_INT
-        assert payload["text"] == "Updated"
+        assert payload["rich_message"]["markdown"] == "Updated"
 
 
 # =============================================================================
@@ -1857,10 +1883,11 @@ class TestPostChannelMessage:
         result = await adapter.post_channel_message(THREAD_ID, {"markdown": "chan"})
         assert result.id == COMPOSITE_MESSAGE_ID
         assert result.thread_id == THREAD_ID
-        # Verify it delegated to telegram_fetch (i.e. post_message internally)
+        # Verify it delegated to telegram_fetch (i.e. post_message internally);
+        # a ``{markdown}`` payload routes through the rich endpoint.
         adapter.telegram_fetch.assert_called_once()
         call_args = adapter.telegram_fetch.call_args
-        assert call_args[0][0] == "sendMessage"
+        assert call_args[0][0] == "sendRichMessage"
 
 
 # =============================================================================
