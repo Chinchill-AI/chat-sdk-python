@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator
 
-from chat_sdk.types import StreamChunk, ThinkingChunk
+from chat_sdk.types import StreamInput, ThinkingChunk
 
 _STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_update"})
 
@@ -51,10 +51,11 @@ async def from_full_stream(
     stream: AsyncIterable[object],
     *,
     emit_thinking: bool = False,
-) -> AsyncIterator[str | StreamChunk]:
+) -> AsyncIterator[StreamInput]:
     """Normalize an async iterable stream for use with ``thread.post()``.
 
-    Yields either plain ``str`` chunks or ``StreamChunk`` objects.
+    Yields plain ``str`` chunks, canonical ``StreamChunk`` objects, or — only
+    when ``emit_thinking=True`` — the opt-in, Python-only ``ThinkingChunk``.
 
     Args:
         stream: The source async iterable (text stream, full stream, or
@@ -91,7 +92,9 @@ async def from_full_stream(
         if not event_type:
             continue
 
-        # Pass through StreamChunk objects (includes pre-built ThinkingChunk).
+        # Pass through canonical StreamChunk objects. (Pre-built ThinkingChunk
+        # has ``type == "thinking"`` and is handled by the reasoning branch
+        # below, gated on ``emit_thinking``.)
         if event_type in _STREAM_CHUNK_TYPES:
             yield event  # type: ignore[misc]
             continue

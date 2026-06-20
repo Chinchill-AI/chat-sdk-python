@@ -639,7 +639,7 @@ class TestSetMessageAdapterWeakref:
 
 
 class TestThinkingChunk:
-    """Tests for the Python-only ``ThinkingChunk`` StreamChunk variant."""
+    """Tests for the Python-only, opt-in ``ThinkingChunk`` stream-input type."""
 
     def test_defaults(self):
         chunk = ThinkingChunk()
@@ -659,16 +659,40 @@ class TestThinkingChunk:
         assert ThinkingChunk().type != TaskUpdateChunk().type
         assert ThinkingChunk().type != PlanUpdateChunk().type
 
-    def test_is_member_of_streamchunk_union(self):
-        # Structural runtime check that ThinkingChunk is one of the StreamChunk
-        # variants alongside the upstream three.
+    def test_streamchunk_union_is_upstream_exact(self):
+        # ``StreamChunk`` must stay byte-identical to upstream's THREE variants.
+        # ``ThinkingChunk`` is deliberately NOT a member: a consumer doing an
+        # exhaustive ``match`` over ``StreamChunk`` must see zero change on
+        # upgrade.
         from typing import get_args
 
         from chat_sdk.types import StreamChunk
 
-        variants = (MarkdownTextChunk, TaskUpdateChunk, PlanUpdateChunk, ThinkingChunk)
-        assert set(get_args(StreamChunk)) == set(variants)
-        assert isinstance(ThinkingChunk(content="reasoning"), variants)
+        upstream_variants = (MarkdownTextChunk, TaskUpdateChunk, PlanUpdateChunk)
+        assert set(get_args(StreamChunk)) == set(upstream_variants)
+        # Exactly three — no fourth (thinking) variant leaked into the union.
+        assert len(get_args(StreamChunk)) == 3
+        assert ThinkingChunk not in get_args(StreamChunk)
+        assert not isinstance(ThinkingChunk(content="reasoning"), upstream_variants)
+
+    def test_thinking_chunk_is_accepted_by_stream_input(self):
+        # ``ThinkingChunk`` is opt-in input only: it lives in ``StreamInput``
+        # (what a stream may yield), NOT in the canonical ``StreamChunk`` union.
+        from typing import get_args
+
+        from chat_sdk.types import StreamChunk, StreamInput
+
+        # StreamInput = str | StreamChunk | ThinkingChunk. ``get_args`` flattens
+        # the nested ``StreamChunk`` alias into its three members, so the input
+        # alias resolves to str + the three canonical variants + ThinkingChunk.
+        input_args = set(get_args(StreamInput))
+        assert input_args == {str, *get_args(StreamChunk), ThinkingChunk}
+        assert str in input_args
+        assert ThinkingChunk in input_args
+        # Every canonical ``StreamChunk`` variant is reachable via the input.
+        assert set(get_args(StreamChunk)) <= input_args
+        # ...but the canonical union itself never gains the thinking variant.
+        assert ThinkingChunk not in get_args(StreamChunk)
 
     def test_equality_by_value(self):
         assert ThinkingChunk(content="a") == ThinkingChunk(content="a")

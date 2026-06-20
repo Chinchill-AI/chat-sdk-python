@@ -89,7 +89,7 @@ from chat_sdk.types import (
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     ThreadInfo,
     UserInfo,
@@ -1729,7 +1729,7 @@ class TelegramAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage | None:
         """Stream a message to a Telegram private chat via draft updates.

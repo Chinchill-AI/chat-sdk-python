@@ -44,7 +44,7 @@ from chat_sdk.types import (
     ScheduledMessage,
     SentMessage,
     StateAdapter,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     TaskUpdateChunk,
     ThinkingChunk,
@@ -732,7 +732,7 @@ class ThreadImpl:
         if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
-            async def _wrapped_stream() -> AsyncGenerator[str | StreamChunk, None]:
+            async def _wrapped_stream() -> AsyncGenerator[StreamInput, None]:
                 nonlocal accumulated
                 async for chunk in text_stream:
                     if isinstance(chunk, str):
@@ -1297,7 +1297,7 @@ async def _from_full_stream(
     raw_stream: Any,
     *,
     emit_thinking: bool = False,
-) -> AsyncIterator[str | StreamChunk]:
+) -> AsyncIterator[StreamInput]:
     """Normalise a raw async iterable into str or StreamChunk items.
 
     Handles plain strings, AI SDK fullStream events, and StreamChunk objects.

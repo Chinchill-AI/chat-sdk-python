@@ -105,7 +105,9 @@ from chat_sdk.types import (
     ScheduledMessage,
     SlashCommandEvent,
     StreamChunk,
+    StreamInput,
     StreamOptions,
+    ThinkingChunk,
     ThreadInfo,
     ThreadSummary,
     UserInfo,
@@ -3878,7 +3880,7 @@ class SlackAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream a message using Slack's native streaming API.
@@ -3950,7 +3952,11 @@ class SlackAdapter:
                 return
             await streamer.append(markdown_text=delta, token=token)
 
-        async def send_structured_chunk(chunk: StreamChunk | dict[str, Any]) -> None:
+        # Accepts the residual stream-input union: ``is_thinking_chunk`` filters
+        # ``ThinkingChunk`` out before this runs (it is never reached with one),
+        # but it stays in the static type since that runtime guard does not
+        # narrow it. The generic ``_read``-based body handles any chunk shape.
+        async def send_structured_chunk(chunk: StreamChunk | ThinkingChunk | dict[str, Any]) -> None:
             nonlocal last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return

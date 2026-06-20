@@ -1034,7 +1034,22 @@ class ThinkingChunk:
     content: str = ""
 
 
-StreamChunk = MarkdownTextChunk | TaskUpdateChunk | PlanUpdateChunk | ThinkingChunk
+StreamChunk = MarkdownTextChunk | TaskUpdateChunk | PlanUpdateChunk
+"""Canonical stream-chunk union — **byte-identical to upstream chat@4.31's three
+variants**. A consumer doing an exhaustive ``match`` over ``StreamChunk`` sees
+zero change on upgrade; the Python-only :class:`ThinkingChunk` is *not* a member
+(see :data:`StreamInput`)."""
+
+
+StreamInput = str | StreamChunk | ThinkingChunk
+"""What a stream may *yield* at the stream-input/output boundaries.
+
+This is the canonical :data:`StreamChunk` union plus plain ``str`` text and the
+Python-only, **opt-in** :class:`ThinkingChunk`. ``ThinkingChunk`` is accepted
+only here — a producer may yield it when thinking is enabled, and adapters that
+receive the stream type-check against it — but it is deliberately kept out of
+:data:`StreamChunk` itself so consumers referencing that union are unaffected.
+"""
 
 
 @dataclass
@@ -1511,7 +1526,7 @@ class BaseAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage | None:
         """Stream a message using platform-native streaming APIs.

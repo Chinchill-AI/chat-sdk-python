@@ -55,7 +55,7 @@ from chat_sdk.types import (
     MessageMetadata,
     PostableMarkdown,
     RawMessage,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     Thread,
     ThreadInfo,
@@ -645,7 +645,7 @@ class GitHubAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream by accumulating text and posting once."""

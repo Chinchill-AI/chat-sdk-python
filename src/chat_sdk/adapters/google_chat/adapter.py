@@ -77,7 +77,7 @@ from chat_sdk.types import (
     RawMessage,
     ReactionEvent,
     StateAdapter,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
@@ -1729,7 +1729,7 @@ class GoogleChatAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream by accumulating all chunks and posting as a single message."""

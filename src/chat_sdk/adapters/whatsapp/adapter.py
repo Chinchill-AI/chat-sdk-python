@@ -57,7 +57,7 @@ from chat_sdk.types import (
     PostableMarkdown,
     RawMessage,
     ReactionEvent,
-    StreamChunk,
+    StreamInput,
     StreamOptions,
     ThreadInfo,
     UserInfo,
@@ -887,7 +887,7 @@ class WhatsAppAdapter:
     async def stream(
         self,
         thread_id: str,
-        text_stream: AsyncIterable[str | StreamChunk],
+        text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage:
         """Stream a message by buffering all chunks and sending as a single message."""
