@@ -1,6 +1,10 @@
 """Linear adapter for chat-sdk."""
 
-from chat_sdk.adapters.linear.adapter import LinearAdapter, create_linear_adapter
+from chat_sdk.adapters.linear.adapter import (
+    LinearAdapter,
+    assert_agent_session_thread,
+    create_linear_adapter,
+)
 from chat_sdk.adapters.linear.types import (
     AgentSessionEventWebhookPayload,
     LinearAdapterMode,
@@ -22,5 +26,6 @@ __all__ = [
     "LinearInstallation",
     "LinearRawMessage",
     "LinearThreadId",
+    "assert_agent_session_thread",
     "create_linear_adapter",
 ]

@@ -26,6 +26,7 @@ from chat_sdk.adapters.linear.types import (
     LinearAdapterBaseConfig,
     LinearAdapterConfig,
     LinearAdapterMode,
+    LinearAgentSessionThreadId,
     LinearCommentData,
     LinearCommentRawMessage,
     LinearInstallation,
@@ -76,7 +77,16 @@ from chat_sdk.types import (
     _parse_iso,
 )
 
+# Anchored thread-id patterns (most-specific first). Faithful ports of the
+# upstream regexes in ``adapter-linear/src/index.ts`` (4.31/#151). All three
+# carry explicit ``^...$`` anchors so ``.match()`` is a *full* match — an
+# un-anchored pattern would mis-parse a thread id (e.g. silently truncate a
+# trailing ``:s:{session}`` segment). The decode order COMMENT_SESSION →
+# ISSUE_SESSION → COMMENT → bare-issue is load-bearing: each later form is a
+# prefix-shaped subset of an earlier one, so a wrong order mis-routes ids.
+COMMENT_SESSION_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+):s:([^:]+)$")
 COMMENT_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+)$")
+ISSUE_SESSION_THREAD_PATTERN = re.compile(r"^([^:]+):s:([^:]+)$")
 
 # Linear GraphQL API endpoint
 LINEAR_API_URL = "https://api.linear.app/graphql"
@@ -101,6 +111,24 @@ EMOJI_MAPPING: dict[str, str] = {
     "hooray": "\U0001f389",
     "confused": "\U0001f615",
 }
+
+
+def assert_agent_session_thread(
+    thread: LinearThreadId,
+) -> LinearAgentSessionThreadId:
+    """Narrow a decoded thread to the agent-session case before session-only work.
+
+    Faithful port of upstream ``assertAgentSessionThread`` (``utils.ts``). The TS
+    signature is ``asserts thread is LinearAgentSessionThreadId`` (a void
+    type-guard). Python has no in-place assertion narrowing for dataclasses, so
+    this returns the same thread re-typed as ``LinearAgentSessionThreadId`` —
+    callers can either ignore the return (assertion side-effect) or bind it to
+    get the narrowed type. Raises ``ValidationError`` when the thread carries no
+    ``agent_session_id``, matching the upstream message byte-for-byte.
+    """
+    if not thread.agent_session_id:
+        raise ValidationError("linear", "Expected a Linear agent session thread")
+    return cast("LinearAgentSessionThreadId", thread)
 
 
 class LinearAdapter:
@@ -1052,13 +1080,36 @@ class LinearAdapter:
         Formats:
         - Issue-level: linear:{issue_id}
         - Comment thread: linear:{issue_id}:c:{comment_id}
+        - Agent-session issue: linear:{issue_id}:s:{agent_session_id}
+        - Agent-session comment:
+          linear:{issue_id}:c:{comment_id}:s:{agent_session_id}
+
+        CRITICAL — cross-SDK state compat: the issue-level and comment-thread
+        outputs are persisted (Redis/Postgres) and shared with the TS SDK, so
+        they MUST stay byte-identical to the prior forms. The ``:s:`` session
+        forms are new (no existing persisted data).
         """
+        if platform_data.agent_session_id:
+            if platform_data.comment_id:
+                return (
+                    f"linear:{platform_data.issue_id}:c:{platform_data.comment_id}:s:{platform_data.agent_session_id}"
+                )
+            return f"linear:{platform_data.issue_id}:s:{platform_data.agent_session_id}"
+
         if platform_data.comment_id:
             return f"linear:{platform_data.issue_id}:c:{platform_data.comment_id}"
         return f"linear:{platform_data.issue_id}"
 
     def decode_thread_id(self, thread_id: str) -> LinearThreadId:
-        """Decode a Linear thread ID."""
+        """Decode a Linear thread ID.
+
+        Patterns are tried most-specific first — COMMENT_SESSION → ISSUE_SESSION
+        → COMMENT → bare-issue — exactly as upstream. The order is load-bearing:
+        a comment-session id ``linear:i:c:cm:s:sess`` also satisfies the bare
+        anchored shape only via its first segment, and an issue-session id
+        ``linear:i:s:sess`` must not be mistaken for a comment id, so the most
+        specific anchored pattern must win.
+        """
         if not thread_id.startswith("linear:"):
             raise ValidationError("linear", f"Invalid Linear thread ID: {thread_id}")
 
@@ -1066,7 +1117,24 @@ class LinearAdapter:
         if not without_prefix:
             raise ValidationError("linear", f"Invalid Linear thread ID format: {thread_id}")
 
-        # Check for comment thread format: {issueId}:c:{commentId}
+        # Agent-session comment format: {issueId}:c:{commentId}:s:{agentSessionId}
+        comment_session_match = COMMENT_SESSION_THREAD_PATTERN.match(without_prefix)
+        if comment_session_match:
+            return LinearThreadId(
+                issue_id=comment_session_match.group(1),
+                comment_id=comment_session_match.group(2),
+                agent_session_id=comment_session_match.group(3),
+            )
+
+        # Agent-session issue format: {issueId}:s:{agentSessionId}
+        issue_session_match = ISSUE_SESSION_THREAD_PATTERN.match(without_prefix)
+        if issue_session_match:
+            return LinearThreadId(
+                issue_id=issue_session_match.group(1),
+                agent_session_id=issue_session_match.group(2),
+            )
+
+        # Comment thread format: {issueId}:c:{commentId}
         match = COMMENT_THREAD_PATTERN.match(without_prefix)
         if match:
             return LinearThreadId(
