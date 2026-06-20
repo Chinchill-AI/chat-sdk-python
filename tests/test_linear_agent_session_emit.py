@@ -110,10 +110,19 @@ def _activity_payload(
     agent_session_id: str | None = "session-789",
     source_comment: Any = "default",
 ) -> dict[str, Any]:
-    """The ``agentActivityCreate`` payload node (``{success, agentActivity}``)."""
+    """The ``agentActivityCreate`` payload node (``{success, agentActivity}``).
+
+    The session id is carried under the ``agentSession { id }`` RELATION — the
+    real server shape. ``agentSessionId`` is NOT a scalar field on Linear's
+    ``AgentActivity`` type (the schema exposes only ``agentSession:
+    AgentSession!``), so a fixture emitting a flat ``agentSessionId`` would
+    fabricate a field the server never returns. ``agent_session_id=None``
+    models a payload with no resolvable ``agentSession.id`` (no relation node).
+    """
+    agent_session: dict[str, Any] | None = {"id": agent_session_id} if agent_session_id is not None else None
     activity: dict[str, Any] | None = {
         "id": activity_id,
-        "agentSessionId": agent_session_id,
+        "agentSession": agent_session,
         "sourceComment": _source_comment(activity_id=activity_id, body=body)
         if source_comment == "default"
         else source_comment,
@@ -149,6 +158,13 @@ class TestPostMessageAgentSession:
         query = call_args[0][0]
         variables = call_args[0][1]
         assert "agentActivityCreate" in query
+        # GraphQL-selection proof (fix #1): the return selection requests the
+        # ``agentSession { id }`` RELATION, NOT a non-existent scalar
+        # ``agentSessionId`` field (which would server-reject the mutation under
+        # strict selection validation). FAILS if the selection regresses to
+        # ``agentSessionId``.
+        assert "agentSession {" in query
+        assert "agentSessionId" not in query
         assert variables["input"]["agentSessionId"] == "session-789"
         # Enum-swap proof: the content type MUST be the lowercase "response".
         assert variables["input"]["content"] == {"type": "response", "body": "Agent response"}
@@ -157,6 +173,11 @@ class TestPostMessageAgentSession:
 
         # The resolved message is built off the source comment.
         assert result.id == "comment-activity-123"
+        # thread_id is encoded from the source comment's OWN id (NOT its
+        # parentId). Source comment id == "comment-activity-123",
+        # parentId == "comment-root" — the encoded ``:c:`` segment MUST be the
+        # own id. (Old parentId code would emit ``:c:comment-root:``.)
+        assert result.thread_id == "linear:issue-123:c:comment-activity-123:s:session-789"
         assert result.raw["kind"] == "agent_session_comment"
         assert result.raw["organizationId"] == "org-123"
         assert result.raw["agentSessionId"] == "session-789"
@@ -250,6 +271,77 @@ class TestParseMessageFromAgentActivity:
 
         with pytest.raises(AdapterError, match="Failed to resolve source comment for Linear agent activity"):
             await adapter.post_message(_SESSION_THREAD, "Agent response")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_agent_session_id_missing(self) -> None:
+        """No resolvable ``agentSession.id`` on the activity → ``AdapterError``.
+
+        The session id is read None-safely off the ``agentSession { id }``
+        RELATION (``(activity.get("agentSession") or {}).get("id")``). When the
+        relation node is absent (``agent_session_id=None`` → ``agentSession:
+        None``), the read yields ``None`` and the guard raises. This must FAIL on
+        the old code that read a flat (non-existent) ``activity["agentSessionId"]``
+        scalar — with the corrected ``agentSession { id }`` fixture there is no
+        such key, so the old read would surface ``None`` differently / KeyError
+        rather than this guarded message.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(return_value=_graphql_return(_activity_payload(agent_session_id=None)))
+
+        with pytest.raises(AdapterError, match="Missing agentSessionId"):
+            await adapter.post_message(_SESSION_THREAD, "Agent response")
+
+    @pytest.mark.asyncio
+    async def test_bot_author_nullish_fallbacks(self) -> None:
+        """``botActor.id ?? bot_user_id`` / display/name chained-nullish fallbacks.
+
+        A botActor with ``id=None`` / ``userDisplayName=None`` / ``name=None``
+        exercises the three ``is not None`` chains:
+        - ``id`` None → falls back to the adapter's ``_bot_user_id``.
+        - ``userDisplayName`` None then ``name`` None → "unknown".
+        - ``name`` None then ``userDisplayName`` None → "unknown".
+
+        Must FAIL if any chain is swapped from ``is not None`` to ``or`` /
+        truthiness (which would coerce identically here only because the values
+        are None — but a partial fixture below pins the precedence so a swap
+        that drops the *first* operand is caught).
+        """
+        adapter = _make_adapter()
+        bot_comment = _source_comment(with_bot_actor=False)
+        bot_comment["botActor"] = {"id": None, "name": None, "userDisplayName": None}
+        adapter._graphql_query = AsyncMock(return_value=_graphql_return(_activity_payload(source_comment=bot_comment)))
+
+        result = await adapter.post_message(_SESSION_THREAD, "Agent response")
+
+        user = result.raw["comment"]["user"]
+        assert user["type"] == "bot"
+        # id None → bot_user_id fallback (NOT "").
+        assert user["id"] == "bot-user-id"
+        assert user["displayName"] == "unknown"
+        assert user["fullName"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_bot_author_nullish_precedence_keeps_first_present_operand(self) -> None:
+        """``userDisplayName ?? name`` keeps ``userDisplayName`` when it is "" (present).
+
+        ``is not None`` keeps an EMPTY-STRING ``userDisplayName`` (it is present,
+        just falsy); a truthiness ``or`` swap would wrongly fall through to
+        ``name``. Conversely ``fullName`` = ``name ?? userDisplayName`` keeps the
+        empty ``name``. This pins the ``is not None`` precedence so a ``or`` swap
+        FAILS.
+        """
+        adapter = _make_adapter()
+        bot_comment = _source_comment(with_bot_actor=False)
+        bot_comment["botActor"] = {"id": "ba-1", "name": "", "userDisplayName": ""}
+        adapter._graphql_query = AsyncMock(return_value=_graphql_return(_activity_payload(source_comment=bot_comment)))
+
+        result = await adapter.post_message(_SESSION_THREAD, "Agent response")
+
+        user = result.raw["comment"]["user"]
+        assert user["id"] == "ba-1"
+        # "" is present → kept (NOT replaced by name / "unknown").
+        assert user["displayName"] == ""
+        assert user["fullName"] == ""
 
 
 # ===========================================================================
@@ -501,15 +593,152 @@ class TestStreamInAgentSession:
         assert types == ["action", "action", "response"]
 
     @pytest.mark.asyncio
-    async def test_raises_when_final_activity_missing(self) -> None:
-        """``if not finalActivity`` → raise (the final mutation resolved nothing)."""
+    async def test_raises_runtime_error_when_final_flush_returns_nothing(self) -> None:
+        """``if not finalActivity`` → ``RuntimeError`` (force-flush resolved an empty node).
+
+        The final force-flush calls ``_create_agent_activity``, which returns
+        ``result["data"].get("agentActivityCreate", {})``. When the mutation
+        response LACKS the ``agentActivityCreate`` key, that read yields an empty
+        ``{}`` (falsy) → ``if not final_activity`` fires the bare
+        ``RuntimeError`` (upstream's missing-final-flush ``throw new Error``),
+        NOT the later ``AdapterError`` parse path. This is a DISTINCT branch from
+        the ``{success:False, agentActivity:None}`` parse failure below.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(return_value={"data": {}})
+
+        with pytest.raises(RuntimeError, match="Failed to flush final markdown delta"):
+            await adapter.stream(_SESSION_THREAD, _astream("Hello world"))
+
+    @pytest.mark.asyncio
+    async def test_raises_adapter_error_when_final_activity_parse_fails(self) -> None:
+        """``{success:False, agentActivity:None}`` is a truthy node that FAILS to parse.
+
+        Here the force-flush DOES return a non-empty payload node
+        (``{success:False, agentActivity:None}`` is truthy, so ``if not
+        final_activity`` is False), and ``_parse_message_from_agent_activity``
+        raises ``AdapterError`` on the unsuccessful activity. Separate branch
+        from the ``RuntimeError`` force-flush case above.
+        """
         adapter = _make_adapter()
         adapter._graphql_query = AsyncMock(
             return_value={"data": {"agentActivityCreate": {"success": False, "agentActivity": None}}}
         )
 
-        with pytest.raises(AdapterError):
+        with pytest.raises(AdapterError, match="Failed to create Linear agent activity"):
             await adapter.stream(_SESSION_THREAD, _astream("Hello world"))
+
+    @pytest.mark.asyncio
+    async def test_stream_thread_id_uses_source_comment_own_id(self) -> None:
+        """The streamed result's ``thread_id`` encodes the source comment's OWN id.
+
+        The final-flush source comment has ``id="comment-final"`` and
+        ``parentId="comment-root"`` (id != parentId). The encoded ``:c:`` segment
+        MUST be the own id ``comment-final`` — NOT ``comment-root``. This FAILS
+        on the old code that encoded ``comment_id=comment_data["parentId"]``.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(
+            return_value=_graphql_return(_activity_payload(activity_id="final", body="Hello world"))
+        )
+
+        result = await adapter.stream(_SESSION_THREAD, _astream("Hello world"))
+
+        assert result.thread_id == "linear:issue-123:c:comment-final:s:session-789"
+
+    @pytest.mark.asyncio
+    async def test_task_update_omits_result_key_when_output_none(self) -> None:
+        """``result: chunk.output`` with ``output=None`` → key OMITTED on the wire.
+
+        Upstream passes ``result: chunk.output`` (string|undefined); JSON.stringify
+        OMITS an undefined key. So a non-error task_update with ``output=None`` must
+        build an action content dict WITHOUT a ``result`` key (NOT ``"result":
+        None``). FAILS on the old code that always set ``"result": output``.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(
+            side_effect=[
+                _graphql_return(_activity_payload(activity_id="task")),
+                _graphql_return(_activity_payload(activity_id="final", body="done")),
+            ]
+        )
+
+        await adapter.stream(
+            _SESSION_THREAD,
+            _astream(
+                TaskUpdateChunk(id="t", title="Search docs", status="in_progress", output=None),
+                MarkdownTextChunk(text="done"),
+            ),
+        )
+
+        action_content = adapter._graphql_query.call_args_list[0].args[1]["input"]["content"]
+        assert action_content == {"type": "action", "action": "Search docs", "parameter": ""}
+        assert "result" not in action_content
+
+    @pytest.mark.asyncio
+    async def test_task_update_includes_result_key_when_output_present(self) -> None:
+        """Companion to the omit case: a present ``output`` keeps the ``result`` key."""
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(
+            side_effect=[
+                _graphql_return(_activity_payload(activity_id="task")),
+                _graphql_return(_activity_payload(activity_id="final", body="done")),
+            ]
+        )
+
+        await adapter.stream(
+            _SESSION_THREAD,
+            _astream(
+                TaskUpdateChunk(id="t", title="Search docs", status="in_progress", output="Found 3"),
+                MarkdownTextChunk(text="done"),
+            ),
+        )
+
+        action_content = adapter._graphql_query.call_args_list[0].args[1]["input"]["content"]
+        assert action_content == {
+            "type": "action",
+            "action": "Search docs",
+            "parameter": "",
+            "result": "Found 3",
+        }
+
+    @pytest.mark.asyncio
+    async def test_final_delta_retains_nel_per_js_trim(self) -> None:
+        """``.strip(_JS_WHITESPACE)`` KEEPS NEL (``\\x85``) — JS ``.trim()`` does not strip it.
+
+        NEL is NOT in the JS-``.trim()`` whitespace set, so the trailing
+        ``\\x85`` survives the delta trim. Python's bare ``str.strip()`` WOULD
+        remove it, so this FAILS if ``.strip(_JS_WHITESPACE)`` is mutated to a
+        bare ``.strip()``.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(
+            return_value=_graphql_return(_activity_payload(activity_id="final", body="x"))
+        )
+
+        await adapter.stream(_SESSION_THREAD, _astream("Hello world\x85"))
+
+        only_input = adapter._graphql_query.call_args.args[1]["input"]
+        assert only_input["content"] == {"type": "response", "body": "Hello world\x85"}
+
+    @pytest.mark.asyncio
+    async def test_final_delta_strips_bom_per_js_trim(self) -> None:
+        """``.strip(_JS_WHITESPACE)`` STRIPS the BOM (``\\ufeff``) — JS ``.trim()`` removes it.
+
+        The BOM IS in the JS-``.trim()`` whitespace set, so a trailing
+        ``\\ufeff`` is trimmed off the delta. Python's bare ``str.strip()`` does
+        NOT strip the BOM, so this FAILS if ``.strip(_JS_WHITESPACE)`` is mutated
+        to a bare ``.strip()`` (the BOM would survive).
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(
+            return_value=_graphql_return(_activity_payload(activity_id="final", body="x"))
+        )
+
+        await adapter.stream(_SESSION_THREAD, _astream("Hello world﻿"))
+
+        only_input = adapter._graphql_query.call_args.args[1]["input"]
+        assert only_input["content"] == {"type": "response", "body": "Hello world"}
 
     @pytest.mark.asyncio
     async def test_dispatches_to_comment_stream_for_non_session_thread(self) -> None:

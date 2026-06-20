@@ -137,13 +137,20 @@ _JS_WHITESPACE = (
 # "error"/"action"), ``agentSessionId: String!`` and ``ephemeral: Boolean``. The
 # return selection requests only schema-valid fields that
 # ``_parse_message_from_agent_activity`` reads off the resolved ``sourceComment``.
+# NOTE: ``agentSessionId`` is NOT a scalar field on Linear's ``AgentActivity``
+# type — the schema exposes only the relation ``agentSession: AgentSession!``.
+# GraphQL strict-validates selections, so requesting a non-existent
+# ``agentSessionId`` field server-rejects the whole mutation; select the
+# ``agentSession { id }`` relation instead.
 _AGENT_ACTIVITY_CREATE_MUTATION = """
 mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
     agentActivityCreate(input: $input) {
         success
         agentActivity {
             id
-            agentSessionId
+            agentSession {
+                id
+            }
             sourceComment {
                 id
                 body
@@ -1253,7 +1260,11 @@ class LinearAdapter:
                 "linear",
             )
 
-        activity_session_id = activity.get("agentSessionId")
+        # The mutation selects the ``agentSession { id }`` relation (NOT a
+        # non-existent scalar ``agentSessionId`` field — see
+        # ``_AGENT_ACTIVITY_CREATE_MUTATION``); read the session id None-safely
+        # off the nested relation node.
+        activity_session_id = (activity.get("agentSession") or {}).get("id")
         if not activity_session_id:
             raise AdapterError(
                 f"Missing agentSessionId for Linear agent activity {activity.get('id')}",
@@ -1354,10 +1365,13 @@ class LinearAdapter:
         # re-derived on read via :meth:`_parse_agent_session_message`. Encode the
         # routed thread id (carrying the ``:s:{session}`` segment) so callers can
         # round-trip it, matching the comment branch's ``thread_id`` semantics.
+        # Upstream ``parseMessage`` (index.ts:2033-2038) and the adapter's own
+        # read-path :meth:`_parse_agent_session_message` encode the source
+        # comment's OWN id (``commentId: raw.comment.id``) — NOT its parentId.
         thread_id = self.encode_thread_id(
             LinearThreadId(
                 issue_id=issue_id,
-                comment_id=cast("str | None", comment_data.get("parentId")),
+                comment_id=cast("str | None", comment_data.get("id")),
                 agent_session_id=agent_session_id,
             )
         )
@@ -1953,14 +1967,21 @@ class LinearAdapter:
                 else:
                     # ``ephemeral: status !== "complete"`` — in-progress/pending
                     # actions are ephemeral; only a completed action persists.
+                    # Upstream passes ``result: chunk.output`` (string|undefined);
+                    # ``JSON.stringify`` OMITS a key whose value is undefined, so
+                    # OMIT ``result`` entirely when ``output`` is None to match
+                    # the key-absent wire shape (rather than serializing
+                    # ``"result": null``).
+                    action_content: dict[str, Any] = {
+                        "type": "action",
+                        "action": title,
+                        "parameter": "",
+                    }
+                    if output is not None:
+                        action_content["result"] = output
                     await self._create_agent_activity(
                         agent_session_id,
-                        {
-                            "type": "action",
-                            "action": title,
-                            "parameter": "",
-                            "result": output,
-                        },
+                        action_content,
                         ephemeral=status != "complete",
                     )
                 continue
