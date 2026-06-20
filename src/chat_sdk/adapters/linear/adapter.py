@@ -22,10 +22,16 @@ from typing import Any, cast
 from chat_sdk.adapters.linear.cards import card_to_linear_markdown
 from chat_sdk.adapters.linear.format_converter import LinearFormatConverter
 from chat_sdk.adapters.linear.types import (
+    AgentActivityWebhookPayload,
+    AgentSessionEventWebhookPayload,
+    AgentSessionUserChild,
+    AgentSessionWebhookPayload,
     CommentWebhookPayload,
+    LinearActorData,
     LinearAdapterBaseConfig,
     LinearAdapterConfig,
     LinearAdapterMode,
+    LinearAgentSessionCommentRawMessage,
     LinearAgentSessionThreadId,
     LinearCommentData,
     LinearCommentRawMessage,
@@ -88,6 +94,12 @@ COMMENT_SESSION_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+):s:([^:]+)$")
 COMMENT_THREAD_PATTERN = re.compile(r"^([^:]+):c:([^:]+)$")
 ISSUE_SESSION_THREAD_PATTERN = re.compile(r"^([^:]+):s:([^:]+)$")
 
+# Linear profile URL → display name. Faithful port of upstream
+# ``PROFILE_URL_REGEX`` (utils.ts:34). Anchored at the start (``^``) and stops
+# the captured slug at the first ``/``, ``?``, or ``#`` so query strings /
+# fragments / trailing path segments are excluded.
+PROFILE_URL_REGEX = re.compile(r"^https://linear\.app/\S+/profiles/([^/?#]+)")
+
 # Linear GraphQL API endpoint
 LINEAR_API_URL = "https://api.linear.app/graphql"
 
@@ -111,6 +123,22 @@ EMOJI_MAPPING: dict[str, str] = {
     "hooray": "\U0001f389",
     "confused": "\U0001f615",
 }
+
+
+def get_user_name_from_profile_url(url: str) -> str:
+    """Extract a user display name from a Linear profile URL.
+
+    Faithful port of upstream ``getUserNameFromProfileUrl`` (utils.ts:40). A bit
+    of a hack to avoid fetching the user just to get the display name: the slug
+    after ``/profiles/`` in a Linear profile URL is the user's name. Returns
+    ``""`` (NOT ``None``) when the URL does not match — upstream returns the
+    empty string so the author's ``userName`` falls back to "" rather than
+    propagating an undefined.
+    """
+    match = PROFILE_URL_REGEX.match(url)
+    if not match:
+        return ""
+    return match.group(1)
 
 
 def assert_agent_session_thread(
@@ -566,10 +594,29 @@ class LinearAdapter:
         # Handle events based on type. The payload shape is determined by
         # `type` at runtime — cast to the matching TypedDict so each handler
         # sees the right variant.
+        #
+        # Mode-gating (faithful port of index.ts:1144-1165):
+        #   - "Comment" events are only handled in mode="comments"
+        #     (``this.mode !== "comments" || action !== "create"`` → return).
+        #   - "AgentSessionEvent" events are only handled in
+        #     mode="agent-sessions"; in any other mode we warn and ignore.
+        # The gates are mutually exclusive, so a comment event in
+        # agent-sessions mode (and vice-versa) is dropped — even when the body
+        # @-mentions the bot's userName.
         payload_type = payload.get("type")
         if payload_type == "Comment":
-            if payload.get("action") == "create":
+            # Combined guard mirrors upstream's single `if` (mode + action). An
+            # empty-string / wrong action and a non-"comments" mode both fall
+            # through to the no-op without dispatching.
+            if self._mode == "comments" and payload.get("action") == "create":
                 self._handle_comment_created(cast("CommentWebhookPayload", payload), options)
+        elif payload_type == "AgentSessionEvent":
+            if self._mode != "agent-sessions":
+                self._logger.warn(
+                    "Received AgentSessionEvent webhook but adapter is not in agent-sessions mode, ignoring"
+                )
+            else:
+                self._handle_agent_session_event(cast("AgentSessionEventWebhookPayload", payload), options)
         elif payload_type == "Reaction":
             self._handle_reaction(cast("ReactionWebhookPayload", payload))
 
@@ -637,6 +684,286 @@ class LinearAdapter:
             return
 
         self._chat.process_message(self, thread_id, message, options)
+
+    def _parse_agent_session_message(
+        self,
+        raw: LinearAgentSessionCommentRawMessage,
+    ) -> Message:
+        """Build a ``Message`` from an agent-session raw message.
+
+        Faithful port of upstream ``parseMessage`` (index.ts:2026) for the
+        ``agent_session_comment`` branch. The existing :meth:`parse_message`
+        predates the upstream rewrite and does not reproduce the threadId
+        encode / ``is_mention`` / structured-author behavior, so the
+        agent-session path renders the ``Message`` here directly:
+
+        - ``is_mention=True`` — agent-session comments directly target the bot,
+          so upstream always treats them as mentions.
+        - ``thread_id`` is re-encoded from the raw comment so the session
+          segment (``:s:{agentSessionId}``) is present on the routed thread.
+        - ``author`` is read from the structured ``comment.user`` written by
+          :meth:`_parse_message_from_agent_session_event` (display name, full
+          name, ``is_bot`` from ``type == "bot"``, ``is_me`` from bot-user-id).
+        """
+        comment = raw["comment"]
+        text = cast("str", comment.get("body", ""))
+        user: LinearActorData = cast("LinearActorData", comment.get("user", {}))
+
+        thread_id = self.encode_thread_id(
+            LinearThreadId(
+                issue_id=cast("str", comment.get("issueId", "")),
+                comment_id=cast("str | None", comment.get("id")),
+                agent_session_id=raw["agentSessionId"],
+            )
+        )
+
+        # createdAt / updatedAt are ISO strings (the "created" branch reads
+        # `payload.createdAt` as a raw string — no Date cast). `edited` mirrors
+        # upstream's `createdAt !== updatedAt`.
+        created_at = cast("str", comment.get("createdAt", ""))
+        updated_at = cast("str", comment.get("updatedAt", ""))
+
+        author = Author(
+            user_id=cast("str", user.get("id", "")),
+            user_name=cast("str", user.get("displayName", "")),
+            full_name=cast("str", user.get("fullName", "")),
+            is_bot=user.get("type") == "bot",
+            is_me=user.get("id") == self._bot_user_id,
+        )
+
+        return Message(
+            id=cast("str", comment.get("id", "")),
+            thread_id=thread_id,
+            is_mention=True,
+            text=text,
+            formatted=self._format_converter.to_ast(text),
+            author=author,
+            metadata=MessageMetadata(
+                date_sent=_parse_iso(created_at) if created_at else datetime.now(timezone.utc),
+                edited=created_at != updated_at,
+                edited_at=_parse_iso(updated_at) if (created_at != updated_at and updated_at) else None,
+            ),
+            attachments=[],
+            raw=cast("LinearRawMessage", raw),
+        )
+
+    def _parse_message_from_agent_session_event(
+        self,
+        payload: AgentSessionEventWebhookPayload,
+    ) -> Message | None:
+        """Parse an agent-session webhook event into a chat message, if applicable.
+
+        Faithful port of upstream ``parseMessageFromAgentSessionEvent``
+        (index.ts:955). Returns ``None`` (and logs a warning) when the event
+        cannot be parsed. Handles two actions:
+
+        - ``"prompted"`` — a user posting a follow-up in an existing session.
+        - ``"created"`` — a user @-mentioning the bot, creating a new session.
+
+        Any other action logs an "Unsupported agent session event action"
+        warning and returns ``None``.
+        """
+        agent_session = cast("AgentSessionWebhookPayload", payload.get("agentSession", {}))
+
+        # `issueId ?? issue?.id` — nullish (NOT truthy) fallback. Only fall back
+        # to the nested issue.id when issueId is *absent*; an empty string would
+        # be a real (if unusual) value, but we mirror upstream's `!issueId`
+        # falsy guard below, which still bails on empty.
+        issue_id = agent_session.get("issueId")
+        if issue_id is None:
+            issue = agent_session.get("issue")
+            issue_id = issue.get("id") if issue is not None else None
+        if not issue_id:
+            return None
+
+        action = payload.get("action")
+
+        #
+        # Follow-up message posted in an existing agent-session thread.
+        #
+        if action == "prompted":
+            agent_activity = cast("AgentActivityWebhookPayload | None", payload.get("agentActivity"))
+            if not agent_activity:
+                self._logger.warn(
+                    "Missing agent activity for prompted action",
+                    {"agentSessionId": agent_session.get("id")},
+                )
+                return None
+
+            source_comment_id = agent_activity.get("sourceCommentId")
+            if not source_comment_id:
+                self._logger.warn(
+                    "Missing source comment ID for agent activity",
+                    {
+                        "agentSessionId": agent_session.get("id"),
+                        "agentActivityId": agent_activity.get("id"),
+                    },
+                )
+                return None
+
+            content = agent_activity.get("content", {})
+            activity_user = cast("AgentSessionUserChild", agent_activity.get("user", {}))
+            # `agentActivity.user.avatarUrl ?? undefined` — nullish.
+            avatar_url = activity_user.get("avatarUrl")
+            # `parentId: payload.agentSession.comment?.id` — optional chain.
+            # Short-circuit only on a missing/None comment (NOT a falsy empty
+            # dict), mirroring `?.`; then read id (absent → None).
+            prompted_session_comment = agent_session.get("comment")
+            parent_id = prompted_session_comment.get("id") if prompted_session_comment is not None else None
+            comment_data: LinearCommentData = {
+                "id": cast("str", source_comment_id),
+                "body": cast("str", content.get("body", "")),
+                "issueId": cast("str", issue_id),
+                "user": {
+                    "type": "user",
+                    "id": cast("str", activity_user.get("id", "")),
+                    "displayName": get_user_name_from_profile_url(cast("str", activity_user.get("url", ""))),
+                    "fullName": cast("str", activity_user.get("name", "")),
+                    "email": cast("str", activity_user.get("email")),
+                    **({"avatarUrl": cast("str", avatar_url)} if avatar_url is not None else {}),
+                },
+                "parentId": cast("str", parent_id),
+                "createdAt": cast("str", agent_activity.get("createdAt", "")),
+                "updatedAt": cast("str", agent_activity.get("createdAt", "")),
+            }
+            # `payload.agentSession.url ?? undefined` — nullish.
+            session_url = agent_session.get("url")
+            if session_url is not None:
+                comment_data["url"] = cast("str", session_url)
+
+            # `payload.promptContext ?? undefined` — nullish.
+            prompt_context = payload.get("promptContext")
+            raw: LinearAgentSessionCommentRawMessage = {
+                "kind": "agent_session_comment",
+                "organizationId": cast("str", payload.get("organizationId", "")),
+                "comment": comment_data,
+                "agentSessionId": cast("str", agent_session.get("id", "")),
+            }
+            if prompt_context is not None:
+                raw["agentSessionPromptContext"] = cast("str", prompt_context)
+            return self._parse_agent_session_message(raw)
+
+        #
+        # New session: a user mentions the bot in an issue, opening a session
+        # and posting the first message.
+        #
+        if action == "created":
+            # App-ownership guard. `agentSession.appUserId !== this.botUserId`.
+            # We deliberately compare on the raw (possibly-None) values so a
+            # mismatch with a foreign bot's appUserId is rejected. A None
+            # botUserId only "matches" when appUserId is *also* None — that
+            # cannot happen for a real created event (appUserId is always set),
+            # so we never falsely accept a foreign session.
+            app_user_id = agent_session.get("appUserId")
+            if app_user_id != self._bot_user_id:
+                self._logger.warn(
+                    "Ignoring agent session event from another bot",
+                    {
+                        "agentSessionId": agent_session.get("id"),
+                        "appUserId": app_user_id,
+                    },
+                )
+                return None
+
+            session_comment = agent_session.get("comment")
+            if not session_comment:
+                self._logger.warn(
+                    "Missing comment for agent session",
+                    {"agentSessionId": agent_session.get("id")},
+                )
+                return None
+
+            creator = agent_session.get("creator")
+            user: LinearActorData
+            if creator:
+                # `agentSession.creator.avatarUrl ?? undefined` — nullish.
+                creator_avatar = creator.get("avatarUrl")
+                user = {
+                    "type": "user",
+                    "id": cast("str", creator.get("id", "")),
+                    "displayName": get_user_name_from_profile_url(cast("str", creator.get("url", ""))),
+                    "fullName": cast("str", creator.get("name", "")),
+                    "email": cast("str", creator.get("email")),
+                    **({"avatarUrl": cast("str", creator_avatar)} if creator_avatar is not None else {}),
+                }
+            else:
+                # No creator → fall back to the bot author (upstream uses
+                # `this.botUserId` / `this.userName`). ``Author.user_id`` is a
+                # non-Optional ``str``, so coerce a None bot-user-id (not yet
+                # resolved by ``initialize``) to "" via ``is not None`` rather
+                # than truthiness (CLAUDE.md hazard).
+                user = {
+                    "type": "bot",
+                    "id": self._bot_user_id if self._bot_user_id is not None else "",
+                    "displayName": self._user_name,
+                    "fullName": self._user_name,
+                }
+
+            comment_data = {
+                "id": cast("str", session_comment.get("id", "")),
+                "body": cast("str", session_comment.get("body", "")),
+                "issueId": cast("str", issue_id),
+                "user": user,
+                # The `created` branch reads `payload.createdAt` as a raw STRING
+                # (no Date cast — upstream's `@ts-expect-error` notes the SDK
+                # types are wrong about Date coercion for webhook payloads).
+                "createdAt": cast("str", payload.get("createdAt", "")),
+                "updatedAt": cast("str", payload.get("createdAt", "")),
+            }
+            # `payload.agentSession.url ?? undefined` — nullish.
+            session_url = agent_session.get("url")
+            if session_url is not None:
+                comment_data["url"] = cast("str", session_url)
+
+            # `payload.promptContext ?? undefined` — nullish.
+            prompt_context = payload.get("promptContext")
+            raw = {
+                "kind": "agent_session_comment",
+                "organizationId": cast("str", payload.get("organizationId", "")),
+                "comment": comment_data,
+                "agentSessionId": cast("str", agent_session.get("id", "")),
+            }
+            if prompt_context is not None:
+                raw["agentSessionPromptContext"] = cast("str", prompt_context)
+            return self._parse_agent_session_message(raw)
+
+        self._logger.warn(
+            "Unsupported agent session event action",
+            {
+                "action": action,
+                "agentSessionId": agent_session.get("id"),
+                "issueId": issue_id,
+            },
+        )
+        return None
+
+    def _handle_agent_session_event(
+        self,
+        payload: AgentSessionEventWebhookPayload,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Handle an agent-session webhook event.
+
+        Faithful port of upstream ``handleAgentSessionEvent`` (index.ts:1269).
+        Builds a message via :meth:`_parse_message_from_agent_session_event`
+        and routes it to ``chat.process_message``. There is NO automatic
+        acknowledgement — the bot does not auto-respond on receipt (no
+        agentActivityCreate / typing / stream side-effect here; those land in
+        L4). When the event cannot be parsed, logs a warning and returns.
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring agent session event")
+            return
+
+        message = self._parse_message_from_agent_session_event(payload)
+        if not message:
+            self._logger.warn(
+                "Unable to build message for Linear agent session event",
+                {"agentSessionId": payload.get("agentSession", {}).get("id")},
+            )
+            return
+
+        self._chat.process_message(self, message.thread_id, message, options)
 
     def _handle_reaction(self, payload: ReactionWebhookPayload) -> None:
         """Handle reaction events (logging only)."""

@@ -186,6 +186,26 @@ class LinearWebhookActor(TypedDict, total=False):
     url: str
 
 
+class LinearActorData(TypedDict, total=False):
+    """Normalized author of a comment stored on a ``LinearCommentData``.
+
+    Faithful port of upstream ``LinearActorData`` (types.ts:214). Distinct from
+    the raw webhook ``LinearWebhookActor``: this is the *normalized* shape that
+    ``_parse_message_from_agent_session_event`` writes onto the raw message's
+    ``comment.user`` so the parsed ``Message.author`` reflects the real
+    poster (display name, full name, bot/user discriminator). ``email`` /
+    ``avatarUrl`` are optional; ``type`` is ``"user" | "bot"`` (NOT the webhook
+    actor's ``"application" | "integration"``).
+    """
+
+    avatarUrl: str
+    displayName: str
+    email: str
+    fullName: str
+    id: str
+    type: str  # "user" | "bot"
+
+
 class LinearCommentData(TypedDict, total=False):
     """Comment data from a webhook payload.
 
@@ -207,8 +227,13 @@ class LinearCommentData(TypedDict, total=False):
     updatedAt: str
     # Direct URL to the comment
     url: str
-    # User UUID who wrote the comment
+    # User UUID who wrote the comment (raw webhook / flat-comment shape).
     userId: str
+    # Normalized author. Upstream's ``LinearCommentData.user`` is a required
+    # ``LinearActorData`` (types.ts:247); kept optional here (``total=False``)
+    # so the existing flat-comment webhook path — which only carries ``userId``
+    # — is unaffected. ``_parse_message_from_agent_session_event`` populates it.
+    user: LinearActorData
 
 
 class CommentWebhookPayload(TypedDict, total=False):
