@@ -189,6 +189,103 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
 }
 """
 
+# Agent-session FETCH query. The Python adapter has no ``@linear/sdk``;
+# upstream's ``linear.agentSession(id)`` (which lazy-resolves ``issueId`` and the
+# root ``comment`` relation off the SDK model) is ported as this raw GraphQL
+# query. Schema-hardened against Linear's published GraphQL schema
+# (``linear/packages/sdk/src/schema.graphql`` @ master): the root query is
+# ``agentSession(id: String!): AgentSession!``; ``AgentSession`` exposes ``id:
+# ID!`` and the nullable ``comment: Comment`` relation.
+#
+# CRITICAL — ``AgentSession`` has NO scalar ``issueId`` field in the published
+# schema (it exposes only the ``issue: Issue`` relation). Upstream's
+# ``agentSession.issueId`` works because the SDK model derives ``issueId`` from
+# the serialized object; in raw GraphQL, requesting a non-existent ``issueId``
+# field server-rejects the WHOLE query (the L4 blocking-bug class). So we select
+# the schema-valid ``issue { id }`` relation and derive the issue id from it —
+# equivalent to upstream's ``agentSession.issueId``, and the same fallback shape
+# upstream itself uses elsewhere (``agentSession.issueId ?? agentSession.issue?.id``
+# at index.ts:959). The ``comment { ... }`` selection requests exactly the
+# sub-fields the author/metadata resolution (``_raw_message_from_source_comment``,
+# a faithful ``parseMessageFromComment``) reads off the root comment.
+_AGENT_SESSION_FETCH_QUERY = """
+query AgentSession($id: String!) {
+    agentSession(id: $id) {
+        id
+        issue {
+            id
+        }
+        comment {
+            id
+            body
+            parentId
+            createdAt
+            updatedAt
+            url
+            user {
+                id
+                displayName
+                name
+                email
+                avatarUrl
+            }
+            botActor {
+                id
+                name
+                userDisplayName
+                avatarUrl
+            }
+        }
+    }
+}
+"""
+
+# Agent-session children FETCH query. Ports upstream's
+# ``linear.comments({ filter: { parent: { id: { eq: rootComment.id } } }, first|last })``
+# (index.ts:1793). Schema-hardened: the root ``comments(filter: CommentFilter,
+# first: Int, last: Int, after: String): CommentConnection!`` query exists, and
+# the ``CommentFilter.parent: NullableCommentFilter`` → ``.id: IDComparator`` →
+# ``.eq: ID`` chain is all schema-valid. Pagination is direction-driven —
+# ``forward`` → ``first``, otherwise ``last`` (upstream's ternary). The same
+# ``Comment`` sub-fields as the root-comment selection plus ``pageInfo {
+# hasNextPage endCursor }`` (both published ``PageInfo`` fields).
+_AGENT_SESSION_CHILDREN_QUERY = """
+query AgentSessionComments(
+    $filter: CommentFilter
+    $first: Int
+    $last: Int
+    $after: String
+) {
+    comments(filter: $filter, first: $first, last: $last, after: $after) {
+        nodes {
+            id
+            body
+            parentId
+            createdAt
+            updatedAt
+            url
+            user {
+                id
+                displayName
+                name
+                email
+                avatarUrl
+            }
+            botActor {
+                id
+                name
+                userDisplayName
+                avatarUrl
+            }
+        }
+        pageInfo {
+            hasNextPage
+            endCursor
+        }
+    }
+}
+"""
+
 # Emoji mapping for Linear reactions (unicode)
 EMOJI_MAPPING: dict[str, str] = {
     "thumbs_up": "\U0001f44d",
@@ -1387,9 +1484,20 @@ class LinearAdapter:
         message_id: str,
         message: AdapterPostableMessage,
     ) -> RawMessage:
-        """Edit an existing message (update a comment)."""
+        """Edit an existing message (update a comment).
+
+        Agent-session activities are append-only: upstream guards the session
+        case first (index.ts:1408) and raises before any mutation. The comment
+        path below is byte-identical to before.
+        """
         await self._ensure_valid_token()
         decoded = self.decode_thread_id(thread_id)
+
+        if decoded.agent_session_id:
+            raise AdapterError(
+                "Linear agent session activities are append-only and cannot be edited",
+                "linear",
+            )
 
         card = extract_card(message)
         body = card_to_linear_markdown(card) if card else self._format_converter.render_postable(message)
@@ -1436,7 +1544,19 @@ class LinearAdapter:
         )
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
-        """Delete a message (delete a comment)."""
+        """Delete a message (delete a comment).
+
+        Agent-session activities are append-only: upstream decodes the thread and
+        guards the session case first (index.ts:1464), raising before any
+        network call. The comment path below is byte-identical to before.
+        """
+        decoded = self.decode_thread_id(thread_id)
+        if decoded.agent_session_id:
+            raise AdapterError(
+                "Linear agent session activities are append-only and cannot be deleted",
+                "linear",
+            )
+
         await self._ensure_valid_token()
 
         await self._graphql_query(
@@ -1521,10 +1641,119 @@ class LinearAdapter:
 
         limit = options.limit if options.limit is not None else 50
 
+        if decoded.agent_session_id:
+            session = assert_agent_session_thread(decoded)
+            return await self._fetch_agent_session_messages(session, options)
+
         if decoded.comment_id:
             return await self._fetch_comment_thread(thread_id, decoded.issue_id, decoded.comment_id, limit)
 
         return await self._fetch_issue_comments(thread_id, decoded.issue_id, limit)
+
+    async def _fetch_agent_session_messages(
+        self,
+        thread: LinearAgentSessionThreadId,
+        options: FetchOptions | None = None,
+    ) -> FetchResult:
+        """Fetch the visible comment thread associated with an agent session.
+
+        Faithful port of upstream ``fetchAgentSessionMessages`` (index.ts:1771).
+        The Python adapter has no ``@linear/sdk``; upstream's
+        ``linear.agentSession(id)`` + ``linear.comments({filter})`` calls are
+        ported as the schema-hardened raw GraphQL queries
+        ``_AGENT_SESSION_FETCH_QUERY`` / ``_AGENT_SESSION_CHILDREN_QUERY``.
+
+        - ``issue_id = agentSession.issue.id ?? thread.issue_id`` — nullish
+          (``is not None``). The published schema has no scalar ``issueId`` on
+          ``AgentSession`` (only the ``issue`` relation), so we read the issue id
+          off ``issue { id }`` — equivalent to upstream's ``agentSession.issueId``.
+          Raise ``AdapterError`` when neither yields an id.
+        - ``root_comment = agentSession.comment`` — raise ``AdapterError`` when
+          the session has no root comment.
+        - children pagination is direction-driven: ``forward`` → ``first``,
+          otherwise ``last`` (default limit 50), passing the
+          ``{parent: {id: {eq: root_comment.id}}}`` filter.
+        - each of ``[root_comment, *children.nodes]`` is parsed via the upstream
+          ``parseMessageFromComment(comment, issue_id, agent_session.id)``
+          semantics — reusing L4's ``_raw_message_from_source_comment`` (author
+          user-vs-botActor resolution) + ``_parse_agent_session_message`` (the
+          ``parseMessage`` agent-session branch). Each resulting message's
+          ``thread_id`` therefore encodes the comment's OWN id plus the session
+          segment: ``linear:{issue_id}:c:{comment.id}:s:{agent_session_id}`` —
+          NOT a single fixed thread_id shared across messages — and is a mention.
+        - ``next_cursor = endCursor if hasNextPage else None`` (upstream's
+          ``hasNextPage ? (endCursor ?? undefined) : undefined``; ``is not None``).
+        """
+        limit = options.limit if (options is not None and options.limit is not None) else 50
+
+        session_result = await self._graphql_query(
+            _AGENT_SESSION_FETCH_QUERY,
+            {"id": thread.agent_session_id},
+        )
+        agent_session = (session_result.get("data") or {}).get("agentSession")
+        if not agent_session:
+            raise AdapterError(
+                f"Linear agent session {thread.agent_session_id} is missing issueId",
+                "linear",
+            )
+
+        # ``agentSession.issueId ?? thread.issueId`` — but the published schema
+        # exposes the issue id only via the ``issue`` relation (no scalar
+        # ``issueId`` field), so read it off ``issue { id }``. Nullish, NOT
+        # truthiness: an empty-string issue id would still short-circuit, but the
+        # ``is not None`` guard matches upstream's ``??``.
+        session_issue = agent_session.get("issue") or {}
+        session_issue_id = session_issue.get("id")
+        issue_id = session_issue_id if session_issue_id is not None else thread.issue_id
+        if not issue_id:
+            raise AdapterError(
+                f"Linear agent session {thread.agent_session_id} is missing issueId",
+                "linear",
+            )
+
+        root_comment = agent_session.get("comment")
+        if not root_comment:
+            raise AdapterError(
+                f"Linear agent session {thread.agent_session_id} is missing a root comment",
+                "linear",
+            )
+
+        agent_session_id = cast("str", agent_session.get("id", ""))
+
+        # ``options?.direction === "forward" ? { first } : { last }`` — forward
+        # paginates with ``first``, every other direction (incl. the default
+        # ``backward``/unset) with ``last``. Send the unused bound as ``None`` so
+        # GraphQL ignores it.
+        forward = options is not None and options.direction == "forward"
+        cursor = options.cursor if options is not None else None
+        children_result = await self._graphql_query(
+            _AGENT_SESSION_CHILDREN_QUERY,
+            {
+                "filter": {"parent": {"id": {"eq": root_comment.get("id")}}},
+                "first": limit if forward else None,
+                "last": None if forward else limit,
+                "after": cursor,
+            },
+        )
+
+        children = ((children_result.get("data") or {}).get("comments")) or {}
+        child_nodes = children.get("nodes") or []
+        page_info = children.get("pageInfo") or {}
+
+        # ``commentsToMessages([rootComment, ...children], issueId, agentSession.id)``
+        # — each comment parsed via the ``parseMessageFromComment`` author logic
+        # (reused from L4) and the ``parseMessage`` agent-session branch, so each
+        # message encodes its OWN comment id in the thread id.
+        messages: list[Message] = []
+        for node in [root_comment, *child_nodes]:
+            raw_message = self._raw_message_from_source_comment(node, issue_id, agent_session_id)
+            messages.append(self._parse_agent_session_message(cast("Any", raw_message.raw)))
+
+        end_cursor = page_info.get("endCursor")
+        return FetchResult(
+            messages=messages,
+            next_cursor=end_cursor if page_info.get("hasNextPage") and end_cursor is not None else None,
+        )
 
     async def _fetch_issue_comments(
         self,
@@ -1711,6 +1940,10 @@ class LinearAdapter:
             metadata={
                 "issueId": decoded.issue_id,
                 "issue_id": decoded.issue_id,  # snake_case alias for compatibility
+                # ``agentSessionId`` mirrors upstream's fetchThread metadata
+                # (index.ts:1928) — the decoded session id (``None`` for non-
+                # session threads), so session-aware callers can round-trip it.
+                "agentSessionId": decoded.agent_session_id,
                 "identifier": issue.get("identifier"),
                 "title": issue.get("title"),
                 "url": issue.get("url"),
