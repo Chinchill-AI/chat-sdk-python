@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.31.1
+
+Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Two Slack adapter bug fixes, both divergences ahead of upstream (which shares the same gaps), documented in `docs/UPSTREAM_SYNC.md`.
+
+- **Slack: empty-DM `thread_ts` fetch routing** (#138). DM roots encode an empty `thread_ts` (`slack:Dxxx:`); the fetch paths (`fetch_messages`/`fetch_message`) called `conversations.replies(ts='')`, which returns no replies and loses the DM root context. They now route an empty `thread_ts` to the existing channel-history path (`conversations.history`) instead — covering DM messages and the #137 DM block-action consumer uniformly. The non-empty (real thread) path is byte-identical.
+- **Slack: `chat.startStream` `team_not_found` on Enterprise Grid** (#95). `chat.startStream` requires an explicit `team_id` for Grid orgs, but `stream()` started the stream without one (while non-streaming `chat.postMessage` worked). The streaming call now threads `team_id` (from the already-plumbed `recipient_team_id`, the per-workspace `T…` id) through to `chat.startStream`. Verified end-to-end against `slack_sdk` that the value reaches the `chat.startStream` API call; `append`/`stop` correctly do not need it. (Live Enterprise-Grid server-side acceptance is pending verification against a real Grid tenant.)
+- **Docs:** marked Linear `"agent-sessions"` mode **experimental** in `LinearAdapterConfig` — its emit/fetch GraphQL is schema-hardened but unverified against a live Linear agent-session tenant (#151).
+
 ## 0.4.31
 
 Synced to upstream `vercel/chat@4.31.0`. The mapped-core **test** files (`packages/chat/src/*.test.ts`) are byte-identical between the `chat@4.30.0` and `chat@4.31.0` tags, so the fidelity re-pin to `chat@4.31.0` is string-only (732/732 mapped-core tests still pass, 0 missing); the core **source** delta is the `LinkButton` stable-id field (below). The headline is the **Linear agent-sessions** mode, plus the **Teams SDK-free primitive subpaths**, the **Slack 4.31** changes, **Telegram rich messages**, and a Python-only opt-in **`ThinkingChunk`** stream type. Sets `UPSTREAM_PARITY = "4.31.0"`.

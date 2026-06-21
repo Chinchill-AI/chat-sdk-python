@@ -46,6 +46,12 @@ class LinearAdapterBaseConfig:
     # handling. Defaults to "comments". Use "agent-sessions" for app-actor
     # installs. Faithful port of upstream ``config.mode ?? "comments"``
     # (types.ts:67, index.ts:236).
+    #
+    # NOTE: ``"agent-sessions"`` mode is **experimental** in this port. The
+    # agent-session emit/fetch paths are raw GraphQL that was schema-hardened
+    # against Linear's published schema but has **not** been exercised against
+    # a live Linear agent-session tenant (tracked in issue #151). The default
+    # ``"comments"`` mode is unaffected.
     mode: LinearAdapterMode | None = None
     # Bot display name for @-mention detection.
     # Defaults to LINEAR_BOT_USERNAME env var or "linear-bot".
