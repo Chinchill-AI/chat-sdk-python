@@ -3926,6 +3926,22 @@ class SlackAdapter:
             "thread_ts": thread_ts,
             "recipient_user_id": options.recipient_user_id,
             "recipient_team_id": options.recipient_team_id,
+            # Enterprise Grid disambiguation (chat-sdk-python#95). On Grid
+            # orgs ``chat.startStream`` fails with ``team_not_found`` unless
+            # the workspace ``team_id`` is supplied explicitly — the
+            # per-workspace bot token alone is not sufficient (whereas
+            # ``chat.postMessage`` succeeds without it). slack_sdk's
+            # ``chat_stream`` stashes unknown kwargs in ``_stream_args`` and
+            # forwards them to BOTH ``chat.startStream`` call sites (the
+            # eager first-flush path and the lazy stop-without-flush path),
+            # so passing ``team_id`` here threads it through to the only API
+            # call that needs it. ``chat.appendStream``/``chat.stopStream``
+            # do not receive ``_stream_args`` and do not require ``team_id``.
+            # ``recipient_team_id`` is the ``team.id`` extracted on the
+            # inbound path (the workspace where the interaction happened =
+            # the streaming target workspace). Harmless on non-Grid
+            # workspaces: passing the correct ``team_id`` is always valid.
+            "team_id": options.recipient_team_id,
         }
         if options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
