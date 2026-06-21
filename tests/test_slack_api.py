@@ -89,6 +89,25 @@ class _DictResponse(dict):
         self.data = data
 
 
+class _FakeSlackApiError(Exception):
+    """Mirror of ``slack_sdk.errors.SlackApiError`` for offline tests.
+
+    The dev-group install (``uv sync --group dev``, what CI runs) does NOT
+    pull in ``slack_sdk`` (it lives in the ``slack`` / ``all`` extras), and
+    ``test_slack_client_cache.py`` injects a bare ``slack_sdk`` ModuleType
+    into ``sys.modules`` that has no ``errors`` submodule. So importing the
+    real ``SlackApiError`` is order-dependent and breaks under CI. This
+    stand-in reproduces the attributes the adapter inspects: ``str(error)``
+    contains the Slack error code and ``error.response`` is a dict carrying
+    ``{"ok": False, "error": <code>}`` (matching ``SlackApiError``'s shape).
+    """
+
+    def __init__(self, message: str, response: dict[str, Any]) -> None:
+        self.response = response
+        server_error = response.get("error")
+        super().__init__(f"{message}\nThe server responded with: {{'ok': False, 'error': '{server_error}'}}")
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -1476,6 +1495,134 @@ class TestStream:
         for call in mock_streamer.append.call_args_list:
             assert call.kwargs["token"] == "xoxb-workspace-token"
         assert mock_streamer.stop.call_args.kwargs["token"] == "xoxb-workspace-token"
+
+    @pytest.mark.asyncio
+    async def test_stream_threads_team_id_to_chat_stream_for_grid(self):
+        """Regression for Enterprise Grid issue #95.
+
+        On Grid orgs ``chat.startStream`` fails with ``team_not_found``
+        unless a workspace ``team_id`` is supplied — the per-workspace bot
+        token alone is not sufficient (whereas ``chat.postMessage``
+        succeeds without it). slack_sdk's ``chat_stream`` forwards unknown
+        kwargs (incl. ``team_id``) to the underlying ``chat.startStream``
+        call, so the adapter must pass ``team_id`` = ``recipient_team_id``.
+
+        This test simulates Grid: a ``post_message`` succeeds with no
+        ``team_id``, while the streaming start raises ``team_not_found``
+        when ``team_id`` is absent and only succeeds when it is present.
+        It MUST FAIL on pre-fix code (which omitted ``team_id``).
+        """
+        adapter, client, _ = await _init_adapter()
+
+        # Grid-aware streamer: the lazy ``chat.startStream`` (triggered on
+        # the first append or on stop, exactly as the real slack_sdk
+        # ``AsyncChatStream`` does) raises ``team_not_found`` unless the
+        # workspace ``team_id`` was threaded through ``chat_stream``.
+        class _GridStreamer:
+            def __init__(self, stream_kwargs: dict[str, Any]) -> None:
+                self._stream_kwargs = stream_kwargs
+                self._started = False
+
+            def _start_stream(self) -> None:
+                # Mirrors slack_sdk forwarding ``_stream_args`` (which holds
+                # ``chat_stream``'s kwargs) to ``chat.startStream``.
+                if not self._stream_kwargs.get("team_id"):
+                    raise _FakeSlackApiError(
+                        message="team_not_found",
+                        response={"ok": False, "error": "team_not_found"},
+                    )
+                self._started = True
+
+            async def append(self, **kwargs: Any) -> dict[str, Any]:
+                if not self._started:
+                    self._start_stream()
+                return {"ok": True}
+
+            async def stop(self, **kwargs: Any) -> dict[str, Any]:
+                if not self._started:
+                    self._start_stream()
+                return {"ok": True, "ts": "1234567890.951951"}
+
+        captured: dict[str, Any] = {}
+
+        async def chat_stream(**kwargs: Any) -> _GridStreamer:
+            captured.update(kwargs)
+            return _GridStreamer(kwargs)
+
+        client.chat_stream = AsyncMock(side_effect=chat_stream)
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.000111"})
+
+        # Sanity: a non-streaming post_message has NO team_id requirement on
+        # the same Grid workspace (it succeeds without one).
+        post_result = await adapter.post_message(
+            "slack:C_GRID:1234567890.000000",
+            "plain post on grid",  # type: ignore[arg-type]
+        )
+        assert post_result.id == "1234567890.000111"  # post_message OK, no team_id
+        for call in client.calls:
+            if call["method"] == "chat_postMessage":
+                assert "team_id" not in call["kwargs"]
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "streamed hello on grid"
+
+        result = await adapter.stream(
+            "slack:C_GRID:1234567890.000000",
+            text_gen(),
+            StreamOptions(recipient_user_id="U_GRID", recipient_team_id="T_GRID_WS"),
+        )
+
+        # The stream completed (chat.startStream did NOT raise team_not_found)
+        # because the workspace team_id was threaded through.
+        assert result.id == "1234567890.951951"
+        # The fix passes team_id = recipient_team_id to chat_stream.
+        client.chat_stream.assert_awaited_once()
+        assert captured["team_id"] == "T_GRID_WS"
+        assert captured["recipient_team_id"] == "T_GRID_WS"
+
+    @pytest.mark.asyncio
+    async def test_stream_raises_team_not_found_without_team_id_on_grid(self):
+        """Mutation guard for issue #95: prove the Grid simulation actually
+        fails when ``team_id`` is missing.
+
+        This drives the same Grid-aware streamer but with ``chat_stream``
+        stripped of any ``team_id`` (mimicking the pre-fix code path), and
+        asserts the stream start raises ``team_not_found``. This anchors the
+        positive test above: if the fix were reverted, the streamer would
+        raise here, so the positive test cannot pass vacuously.
+        """
+        adapter, client, _ = await _init_adapter()
+
+        class _GridStreamer:
+            async def append(self, **kwargs: Any) -> dict[str, Any]:
+                raise _FakeSlackApiError(
+                    message="team_not_found",
+                    response={"ok": False, "error": "team_not_found"},
+                )
+
+            async def stop(self, **kwargs: Any) -> dict[str, Any]:
+                raise _FakeSlackApiError(
+                    message="team_not_found",
+                    response={"ok": False, "error": "team_not_found"},
+                )
+
+        async def chat_stream(**kwargs: Any) -> _GridStreamer:
+            # Simulate slack_sdk dropping team_id (pre-fix behavior): the
+            # underlying chat.startStream then fails on Grid.
+            kwargs.pop("team_id", None)
+            return _GridStreamer()
+
+        client.chat_stream = AsyncMock(side_effect=chat_stream)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "streamed hello on grid"
+
+        with pytest.raises(_FakeSlackApiError, match="team_not_found"):
+            await adapter.stream(
+                "slack:C_GRID:1234567890.000000",
+                text_gen(),
+                StreamOptions(recipient_user_id="U_GRID", recipient_team_id="T_GRID_WS"),
+            )
 
 
 # =============================================================================
