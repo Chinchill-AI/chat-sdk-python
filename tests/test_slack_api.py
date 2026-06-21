@@ -612,6 +612,180 @@ class TestFetchMessages:
         # Should return at most limit messages
         assert len(result.messages) <= 10
 
+    @pytest.mark.asyncio
+    async def test_empty_dm_thread_ts_backward_uses_history_not_replies(self):
+        """A DM root (slack:Dxxx:) encodes thread_ts="" — backward fetch must
+        route to conversations.history (the channel IS the conversation), not
+        conversations.replies(ts="") which returns nothing for a DM (#138)."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_history",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000002", "text": "DM 2", "user": "U2"},
+                    {"ts": "1234567890.000001", "text": "DM 1", "user": "U1"},
+                ],
+                "has_more": False,
+            },
+        )
+
+        result = await adapter.fetch_messages("slack:D999:")
+
+        # The DM root messages come back via conversations.history.
+        assert len(result.messages) == 2
+        history_calls = client.get_calls("conversations_history")
+        assert len(history_calls) == 1
+        assert history_calls[0]["kwargs"]["channel"] == "D999"
+        # conversations.replies must NOT be hit at all (esp. not with ts="").
+        replies_calls = client.get_calls("conversations_replies")
+        assert replies_calls == []
+
+    @pytest.mark.asyncio
+    async def test_empty_dm_thread_ts_forward_uses_history_not_replies(self):
+        """Forward direction over a DM root also routes to conversations.history,
+        preserving cursor/limit semantics, never conversations.replies(ts="")."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_history",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000002", "text": "Newer", "user": "U2"},
+                    {"ts": "1234567890.000001", "text": "Older", "user": "U1"},
+                ],
+                "has_more": True,
+            },
+        )
+
+        result = await adapter.fetch_messages(
+            "slack:D999:",
+            FetchOptions(direction="forward", cursor="1234567890.000000", limit=50),
+        )
+
+        assert len(result.messages) == 2
+        history_calls = client.get_calls("conversations_history")
+        assert len(history_calls) == 1
+        assert history_calls[0]["kwargs"]["channel"] == "D999"
+        # Forward cursor maps to oldest= on conversations.history (channel-history path).
+        assert history_calls[0]["kwargs"]["oldest"] == "1234567890.000000"
+        assert history_calls[0]["kwargs"]["limit"] == 50
+        # has_more + slack messages → next_cursor from the newest ts.
+        assert result.next_cursor == "1234567890.000002"
+        assert client.get_calls("conversations_replies") == []
+
+    @pytest.mark.asyncio
+    async def test_non_empty_thread_ts_still_uses_replies_backward(self):
+        """Regression guard: a real thread root (non-empty thread_ts) MUST keep
+        using conversations.replies — the empty-DM routing must not over-trigger."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_replies",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000001", "text": "Reply 1", "user": "U1"},
+                ],
+                "has_more": False,
+            },
+        )
+
+        result = await adapter.fetch_messages("slack:C123:1234567890.000000")
+
+        assert len(result.messages) == 1
+        replies_calls = client.get_calls("conversations_replies")
+        assert len(replies_calls) == 1
+        assert replies_calls[0]["kwargs"]["ts"] == "1234567890.000000"
+        # Channel-history path must NOT be used for a real thread.
+        assert client.get_calls("conversations_history") == []
+
+    @pytest.mark.asyncio
+    async def test_non_empty_thread_ts_still_uses_replies_forward(self):
+        """Regression guard (forward): non-empty thread_ts keeps conversations.replies."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_replies",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000001", "text": "First", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": "cur"},
+            },
+        )
+
+        result = await adapter.fetch_messages(
+            "slack:C123:1234567890.000000",
+            FetchOptions(direction="forward"),
+        )
+
+        assert len(result.messages) == 1
+        replies_calls = client.get_calls("conversations_replies")
+        assert len(replies_calls) == 1
+        assert replies_calls[0]["kwargs"]["ts"] == "1234567890.000000"
+        assert client.get_calls("conversations_history") == []
+
+
+# =============================================================================
+# fetchMessage (single) Tests
+# =============================================================================
+
+
+class TestFetchSingleMessage:
+    @pytest.mark.asyncio
+    async def test_non_empty_thread_ts_uses_replies(self):
+        """A single-message fetch on a real thread uses conversations.replies
+        (oldest=message_id) — byte-identical to the pre-#138 path."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_replies",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000050", "text": "Target", "user": "U1"},
+                ],
+            },
+        )
+
+        msg = await adapter.fetch_message("slack:C123:1234567890.000000", "1234567890.000050")
+
+        assert msg is not None
+        assert msg.id == "1234567890.000050"
+        replies_calls = client.get_calls("conversations_replies")
+        assert len(replies_calls) == 1
+        assert replies_calls[0]["kwargs"]["ts"] == "1234567890.000000"
+        assert replies_calls[0]["kwargs"]["oldest"] == "1234567890.000050"
+        assert client.get_calls("conversations_history") == []
+
+    @pytest.mark.asyncio
+    async def test_empty_dm_thread_ts_uses_history(self):
+        """A single-message fetch on a DM root (empty thread_ts) reads from
+        conversations.history (latest=message_id), NOT conversations.replies(ts="")
+        which cannot locate the message (#138)."""
+        adapter, client, _ = await _init_adapter()
+        client.set_response(
+            "conversations_history",
+            {
+                "ok": True,
+                "messages": [
+                    {"ts": "1234567890.000050", "text": "DM message", "user": "U1"},
+                ],
+            },
+        )
+
+        msg = await adapter.fetch_message("slack:D999:", "1234567890.000050")
+
+        assert msg is not None
+        assert msg.id == "1234567890.000050"
+        history_calls = client.get_calls("conversations_history")
+        assert len(history_calls) == 1
+        assert history_calls[0]["kwargs"]["channel"] == "D999"
+        assert history_calls[0]["kwargs"]["latest"] == "1234567890.000050"
+        assert history_calls[0]["kwargs"]["inclusive"] is True
+        assert history_calls[0]["kwargs"]["limit"] == 1
+        # conversations.replies must NOT be called with ts="".
+        assert client.get_calls("conversations_replies") == []
+
 
 # =============================================================================
 # fetchThread Tests

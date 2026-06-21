@@ -4317,15 +4317,21 @@ class SlackAdapter:
         thread_ts = decoded.thread_ts
         direction = getattr(opts, "direction", "backward") or "backward"
         limit = getattr(opts, "limit", 100) if getattr(opts, "limit", 100) is not None else 100
+        cursor = getattr(opts, "cursor", None)
 
+        # Divergence (chat-sdk-python#138): a top-level DM root encodes an empty
+        # thread_ts (slack:Dxxx:). conversations.replies(ts="") returns no replies
+        # and loses the DM root context, so route empty thread_ts to the channel
+        # history path (conversations.history), where the channel *is* the
+        # conversation. Upstream's fetchMessages has no empty-thread_ts guard.
         try:
+            if not thread_ts:
+                if direction == "forward":
+                    return await self._fetch_channel_messages_forward(channel, limit, cursor)
+                return await self._fetch_channel_messages_backward(channel, limit, cursor)
             if direction == "forward":
-                return await self._fetch_messages_forward(
-                    channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None)
-                )
-            return await self._fetch_messages_backward(
-                channel, thread_ts, thread_id, limit, getattr(opts, "cursor", None)
-            )
+                return await self._fetch_messages_forward(channel, thread_ts, thread_id, limit, cursor)
+            return await self._fetch_messages_backward(channel, thread_ts, thread_id, limit, cursor)
         except Exception as error:
             self._handle_slack_error(error)
 
@@ -4383,9 +4389,16 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.conversations_replies(
-                channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1
-            )
+            # Divergence (chat-sdk-python#138): a DM root encodes an empty
+            # thread_ts, so conversations.replies(ts="") cannot locate the
+            # message. Fetch the single message from conversations.history
+            # instead (mirrors the link-preview fetch_message at ~3293).
+            if not thread_ts:
+                result = await client.conversations_history(channel=channel, latest=message_id, inclusive=True, limit=1)
+            else:
+                result = await client.conversations_replies(
+                    channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1
+                )
             messages = result.get("messages", [])
             target = next((m for m in messages if m.get("ts") == message_id), None)
             if not target:
