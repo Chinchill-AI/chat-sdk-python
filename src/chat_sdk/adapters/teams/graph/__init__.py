@@ -245,11 +245,11 @@ async def resolve_graph_access_token(options: TeamsGraphOptions) -> str:
 async def call_teams_graph_api(path_or_url: str, options: TeamsGraphOptions) -> Any:
     """Call a Microsoft Graph endpoint with a Graph-scoped bearer token.
 
-    Port of upstream ``callTeamsGraphApi``. An absolute ``path_or_url`` (one
-    starting with ``http``) is used as-is; otherwise it is joined onto the base
-    Graph URL (``options.graph_url`` or ``https://graph.microsoft.com/v1.0/``)
-    after stripping leading slashes. Raises :class:`TeamsApiError` for non-2xx
-    responses.
+    Port of upstream ``callTeamsGraphApi``. An absolute ``path_or_url`` (one that
+    :func:`urllib.parse.urlparse` reads as having a scheme or a host) is used
+    as-is; otherwise it is joined onto the base Graph URL (``options.graph_url``
+    or ``https://graph.microsoft.com/v1.0/``) after stripping leading slashes.
+    Raises :class:`TeamsApiError` for non-2xx responses.
 
     Python-specific hardening: an absolute ``path_or_url`` is validated through
     :func:`is_trusted_graph_url` **before** the token is resolved or attached,
@@ -259,7 +259,15 @@ async def call_teams_graph_api(path_or_url: str, options: TeamsGraphOptions) -> 
     trusted base URL, so they need no host check. Upstream performs no such
     check.
     """
-    if path_or_url.startswith("http"):
+    # Route on the PARSED form, not a case-sensitive ``startswith("http")`` prefix.
+    # ``HTTPS://evil`` (mixed-case scheme) and ``//evil`` (scheme-relative) both slip
+    # past a lowercase-prefix test, yet ``urljoin`` still resolves them to an absolute
+    # attacker URL — so the routing diverged from ``is_trusted_graph_url`` and the
+    # Graph token could attach to an untrusted host. Anything ``urlparse`` reads as
+    # having a scheme or a netloc is treated as absolute and forced through the host
+    # allowlist (fail closed); only a truly relative path is joined onto the base.
+    parsed = urlparse(path_or_url)
+    if parsed.scheme or parsed.netloc:
         if not is_trusted_graph_url(path_or_url):
             raise ValueError(f"Refusing to call Microsoft Graph API on untrusted host: {path_or_url}")
         url = path_or_url

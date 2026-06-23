@@ -309,6 +309,23 @@ class TestTeamsGraphSsrfDivergence:
             await paginate_teams_graph("http://graph.microsoft.com/v1.0/next", _opts("p", fetch=request))
         request.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_rejects_mixed_case_scheme_and_scheme_relative_attacker_urls(self) -> None:
+        # Regression: a case-sensitive ``startswith("http")`` routing test let a
+        # mixed-case scheme (``HTTPS://``) or a scheme-relative (``//host``) URL
+        # skip the absolute branch; ``urljoin`` still resolved it to the attacker
+        # host and attached the Graph token. Routing now keys off the parsed
+        # scheme/netloc, so every absolute form is forced through the allowlist.
+        for hostile in (
+            "HTTPS://evil.example/x",
+            "HtTpS://evil.example/x",
+            "//evil.example/x",
+        ):
+            request = _fetch(_json_response(_TOKEN_BODY))
+            with pytest.raises(ValueError, match="untrusted host"):
+                await paginate_teams_graph(hostile, _opts("p", fetch=request))
+            request.assert_not_awaited()
+
     def test_is_trusted_graph_url_allowlist(self) -> None:
         assert is_trusted_graph_url("https://graph.microsoft.com/v1.0/next") is True
         # Wrong scheme, lookalike suffix, foreign host, and parse junk all fail.
