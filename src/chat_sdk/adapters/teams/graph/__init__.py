@@ -262,12 +262,17 @@ async def call_teams_graph_api(path_or_url: str, options: TeamsGraphOptions) -> 
     # Route on the PARSED form, not a case-sensitive ``startswith("http")`` prefix.
     # ``HTTPS://evil`` (mixed-case scheme) and ``//evil`` (scheme-relative) both slip
     # past a lowercase-prefix test, yet ``urljoin`` still resolves them to an absolute
-    # attacker URL — so the routing diverged from ``is_trusted_graph_url`` and the
-    # Graph token could attach to an untrusted host. Anything ``urlparse`` reads as
-    # having a scheme or a netloc is treated as absolute and forced through the host
-    # allowlist (fail closed); only a truly relative path is joined onto the base.
-    parsed = urlparse(path_or_url)
-    if parsed.scheme or parsed.netloc:
+    # attacker URL — so the routing diverged from ``is_trusted_graph_url`` and the Graph
+    # token could attach to an untrusted host. Anything ``urlparse`` reads as having a
+    # scheme or a netloc is treated as absolute and forced through the host allowlist;
+    # a malformed URL (``urlparse`` raises, e.g. a bad IPv6 literal) fails closed the
+    # same way. Only a truly relative path is joined onto the trusted base.
+    try:
+        parsed = urlparse(path_or_url)
+        is_absolute = bool(parsed.scheme or parsed.netloc)
+    except (ValueError, TypeError):
+        is_absolute = True  # unparseable -> fail closed; the allowlist below rejects it
+    if is_absolute:
         if not is_trusted_graph_url(path_or_url):
             raise ValueError(f"Refusing to call Microsoft Graph API on untrusted host: {path_or_url}")
         url = path_or_url
