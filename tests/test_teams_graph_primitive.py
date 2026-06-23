@@ -343,9 +343,7 @@ class TestTeamsGraphSsrfDivergence:
         # parse-based routing still joins it onto the trusted base — it is not
         # over-rejected as an absolute URL.
         request = _fetch(_json_response(_TOKEN_BODY), _json_response({"id": "x"}))
-        result = await paginate_teams_graph(
-            "me/drive/root:/Reports/jan.csv:/content", _opts("p", fetch=request)
-        )
+        result = await paginate_teams_graph("me/drive/root:/Reports/jan.csv:/content", _opts("p", fetch=request))
         assert _url(request.await_args_list[1]) == (
             "https://graph.microsoft.com/v1.0/me/drive/root:/Reports/jan.csv:/content"
         )
