@@ -309,6 +309,47 @@ class TestTeamsGraphSsrfDivergence:
             await paginate_teams_graph("http://graph.microsoft.com/v1.0/next", _opts("p", fetch=request))
         request.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_rejects_mixed_case_scheme_and_scheme_relative_attacker_urls(self) -> None:
+        # Regression: a case-sensitive ``startswith("http")`` routing test let a
+        # mixed-case scheme (``HTTPS://``) or a scheme-relative (``//host``) URL
+        # skip the absolute branch; ``urljoin`` still resolved it to the attacker
+        # host and attached the Graph token. Routing now keys off the parsed
+        # scheme/netloc, so every absolute form is forced through the allowlist.
+        for hostile in (
+            "HTTPS://evil.example/x",
+            "HtTpS://evil.example/x",
+            "//evil.example/x",
+        ):
+            request = _fetch(_json_response(_TOKEN_BODY))
+            with pytest.raises(ValueError, match="untrusted host"):
+                await paginate_teams_graph(hostile, _opts("p", fetch=request))
+            request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_malformed_url_fails_closed_without_fetching_a_token(self) -> None:
+        # urlparse raises on some inputs (e.g. a bad IPv6 literal). The router must
+        # fail closed — treat it as absolute and reject via the allowlist — never join
+        # it or fetch a token for it.
+        request = _fetch(_json_response(_TOKEN_BODY))
+        with pytest.raises(ValueError, match="untrusted host"):
+            await paginate_teams_graph("https://[oops", _opts("p", fetch=request))
+        request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_colon_in_relative_graph_path_still_joins_onto_the_trusted_base(self) -> None:
+        # A relative Graph segment whose colon falls after a slash (e.g. a OneDrive
+        # ``…/root:/path:/content`` address) parses with no scheme/netloc, so the
+        # parse-based routing still joins it onto the trusted base — it is not
+        # over-rejected as an absolute URL.
+        request = _fetch(_json_response(_TOKEN_BODY), _json_response({"id": "x"}))
+        result = await paginate_teams_graph("me/drive/root:/Reports/jan.csv:/content", _opts("p", fetch=request))
+        assert _url(request.await_args_list[1]) == (
+            "https://graph.microsoft.com/v1.0/me/drive/root:/Reports/jan.csv:/content"
+        )
+        assert _headers(request.await_args_list[1])["authorization"] == "Bearer graph-token"
+        assert result == {"id": "x"}
+
     def test_is_trusted_graph_url_allowlist(self) -> None:
         assert is_trusted_graph_url("https://graph.microsoft.com/v1.0/next") is True
         # Wrong scheme, lookalike suffix, foreign host, and parse junk all fail.
