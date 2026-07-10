@@ -296,3 +296,138 @@ class TestRehydrateAttachment:
         assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://attacker.example/x")
         # Rejects look-alikes
         assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://chat.googleapis.com.attacker.tld/x")
+
+
+# ---------------------------------------------------------------------------
+# _gchat_media_upload
+# ---------------------------------------------------------------------------
+
+
+class TestGChatMediaUpload:
+    """GChat file delivery via the media upload endpoint, exercised through post_message."""
+
+    @staticmethod
+    def _make_fake_session():
+        """Return (session, calls_list). calls_list accumulates every request kwargs dict."""
+        calls: list[dict] = []
+
+        class _FakeResponse:
+            status = 200
+
+            async def json(self) -> dict:
+                return {"name": "spaces/TEST/messages/1"}
+
+            async def text(self) -> str:
+                return ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class _FakeSession:
+            def request(self, method: str, url: str, **kwargs) -> _FakeResponse:
+                calls.append({"method": method, "url": url, **kwargs})
+                return _FakeResponse()
+
+        return _FakeSession(), calls
+
+    @pytest.mark.asyncio
+    async def test_post_message_sends_one_multipart_upload_per_file(self):
+        """Two files produce two POSTs to the GChat media upload endpoint with
+        uploadType=multipart -- the upload API does not support batching."""
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.adapters.google_chat.thread_utils import GoogleChatThreadId, encode_thread_id
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter()
+        adapter._get_access_token = AsyncMock(return_value="tok")  # type: ignore[method-assign]
+        session, calls = self._make_fake_session()
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        thread_id = encode_thread_id(GoogleChatThreadId(space_name="spaces/TEST"))
+        message = PostableMarkdown(
+            markdown="",
+            files=[
+                FileUpload(data=b"csv", filename="data.csv", mime_type="text/csv"),
+                FileUpload(data=b"\x89PNG", filename="chart.png", mime_type="image/png"),
+            ],
+        )
+
+        await adapter.post_message(thread_id, message)
+
+        upload_calls = [call for call in calls if "/upload/v1/" in call["url"]]
+        assert len(upload_calls) == 2, (
+            f"expected one media upload call per file; got {len(upload_calls)}. "
+            "GChat's upload endpoint does not batch -- see _gchat_media_upload in google_chat/adapter.py."
+        )
+        for call in upload_calls:
+            assert call.get("params", {}).get("uploadType") == "multipart", (
+                "uploadType=multipart query param required for GChat media upload; "
+                f"got params={call.get('params')}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_files_only_post_message_does_not_emit_text_message(self):
+        """post_message with files and no text/card returns early after uploading --
+        a separate empty text message must not be posted to the standard endpoint."""
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.adapters.google_chat.thread_utils import GoogleChatThreadId, encode_thread_id
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter()
+        adapter._get_access_token = AsyncMock(return_value="tok")  # type: ignore[method-assign]
+        session, calls = self._make_fake_session()
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        thread_id = encode_thread_id(GoogleChatThreadId(space_name="spaces/TEST"))
+        message = PostableMarkdown(
+            markdown="",
+            files=[FileUpload(data=b"hello", filename="report.txt", mime_type="text/plain")],
+        )
+
+        result = await adapter.post_message(thread_id, message)
+
+        standard_api_calls = [call for call in calls if "/upload/v1/" not in call["url"]]
+        assert standard_api_calls == [], (
+            "post_message must return early after file upload when there is no text or card -- "
+            "an empty text message alongside files is unwanted. "
+            f"unexpected standard-API calls: {standard_api_calls}"
+        )
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_post_message_file_upload_failure_does_not_raise(self):
+        """A file upload network error must not propagate out of post_message --
+        a transport hiccup cannot kill a turn whose text response already landed."""
+        from unittest.mock import AsyncMock
+
+        from chat_sdk.adapters.google_chat.thread_utils import GoogleChatThreadId, encode_thread_id
+        from chat_sdk.types import FileUpload, PostableMarkdown
+
+        adapter = _make_adapter()
+        adapter._get_access_token = AsyncMock(return_value="tok")  # type: ignore[method-assign]
+
+        class _FailResponse:
+            async def __aenter__(self):
+                raise RuntimeError("network error")
+
+            async def __aexit__(self, *args):
+                pass
+
+        class _FailSession:
+            def request(self, method: str, url: str, **kwargs) -> _FailResponse:
+                return _FailResponse()
+
+        adapter._get_http_session = AsyncMock(return_value=_FailSession())  # type: ignore[method-assign]
+
+        thread_id = encode_thread_id(GoogleChatThreadId(space_name="spaces/TEST"))
+        message = PostableMarkdown(
+            markdown="",
+            files=[FileUpload(data=b"x", filename="file.txt", mime_type="text/plain")],
+        )
+
+        await adapter.post_message(thread_id, message)
