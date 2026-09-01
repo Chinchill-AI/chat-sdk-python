@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Docs/licensing:** added `NOTICE` reproducing Vercel Chat's MIT copyright notice — this package is a derivative (port) of `vercel/chat`, and the notice now ships in the sdist and in the wheel's `dist-info/licenses/`. No code changes.
+
 ## 0.4.31.1
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Two Slack adapter bug fixes, both divergences ahead of upstream (which shares the same gaps), documented in `docs/UPSTREAM_SYNC.md`.
