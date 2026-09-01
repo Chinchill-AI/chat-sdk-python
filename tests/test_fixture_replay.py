@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import time
 from typing import Any
@@ -137,8 +138,20 @@ def _teams_skip_auth():
 
     real_initialize = HttpServer.initialize
 
-    def _initialize_skip_auth(self, credentials=None, skip_auth=False, cloud=None):
-        return real_initialize(self, credentials=credentials, skip_auth=True, cloud=cloud)
+    # microsoft-teams-apps 2.0.14+ renamed the SDK's ``skip_auth`` flag to
+    # ``dangerously_allow_unauthenticated_requests``; force whichever flag this
+    # version has and forward everything else untouched (the SDK calls
+    # ``initialize`` with keywords only).
+    skip_flag = (
+        "dangerously_allow_unauthenticated_requests"
+        if "dangerously_allow_unauthenticated_requests" in inspect.signature(real_initialize).parameters
+        else "skip_auth"
+    )
+
+    def _initialize_skip_auth(self, *args, **kwargs):
+        kwargs.pop("skip_auth", None)
+        kwargs.pop("dangerously_allow_unauthenticated_requests", None)
+        return real_initialize(self, *args, **{**kwargs, skip_flag: True})
 
     return patch.object(HttpServer, "initialize", _initialize_skip_auth)
 
