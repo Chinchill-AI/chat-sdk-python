@@ -100,6 +100,7 @@ include = [
   "/scripts",
   "/README.md",
   "/LICENSE",
+  "/NOTICE",
   "/CHANGELOG.md",
   "/CONTRIBUTING.md",
   "/pyproject.toml",
