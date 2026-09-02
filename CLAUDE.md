@@ -30,6 +30,7 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.30` = synced to upstream `4.30.0`
 - `0.4.31` = synced to upstream `4.31.0`
 - `0.4.31.1` = Python-only fixes on top of `4.31.0` (Slack #138/#95)
+- `0.4.31.2` = Python-only fixes on top of `4.31.0` (Teams Graph SSRF-guard hardening #178, NOTICE)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
