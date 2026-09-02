@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.4.31.2
+## 0.4.31.3
 
-Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`).
+Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.
 
 - **Teams: Graph SSRF / token-leak guard hardening** (#178, security). `call_teams_graph_api` decided absolute-vs-relative URLs with a case-sensitive `startswith("http")`, so `HTTPS://evil.example/x`, `HtTpS://…` or the scheme-relative `//evil.example/x` fell into the relative-path branch, where `urljoin` still resolved to the attacker host and the Graph-scoped bearer token was attached without consulting `is_trusted_graph_url`. Routing now uses the same scheme-insensitive parse as the allowlist, so every absolute or scheme-relative target goes through the trust check. Regression tests cover the mixed-case and scheme-relative forms.
 - **Tests:** the Teams skip-auth fixture survives the SDK's flag rename (#180). No runtime change.
