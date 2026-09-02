@@ -17,4 +17,7 @@ jobs:
       - name: Build
         run: uv build
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # release/v1
+        # release/v1 @ v1.14.2 (2026-07-29). The 2025-09 pin bundled a twine that
+        # rejects Metadata-Version 2.5, which uv's build backend now emits — the
+        # v0.4.31.2 publish failed on exactly that check.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
