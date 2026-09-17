@@ -68,6 +68,7 @@ from chat_sdk.types import (
     EphemeralMessage,
     FetchOptions,
     FetchResult,
+    FileUpload,
     FormattedContent,
     ListThreadsOptions,
     ListThreadsResult,
@@ -469,6 +470,72 @@ class GoogleChatAdapter:
                     errors=result.get("error", {}).get("errors"),
                 )
             return result
+
+    # =========================================================================
+    # Media upload
+    # =========================================================================
+
+    async def _gchat_media_upload(
+        self,
+        files: list[FileUpload],
+        space_name: str,
+        thread_name: str | None,
+        label: str,
+    ) -> None:
+        """Upload files to a GChat space via the multipart media upload endpoint.
+
+        One request is sent per file -- the GChat upload API does not support batching.
+        Per-file errors are logged but never raised so a transport hiccup cannot kill
+        a turn whose text response already landed.
+        """
+        if not files:
+            return
+
+        token = await self._get_access_token()
+        session = await self._get_http_session()
+        upload_url = f"https://chat.googleapis.com/upload/v1/{space_name}/messages"
+
+        for file in files:
+            try:
+                boundary = f"boundary_{_random_id()}"
+                metadata: dict[str, Any] = {"text": label}
+                if thread_name:
+                    metadata["thread"] = {"name": thread_name}
+
+                body = (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                    f"{json.dumps(metadata)}\r\n"
+                    f"--{boundary}\r\n"
+                    f"Content-Type: {file.mime_type or 'application/octet-stream'}\r\n\r\n"
+                ).encode() + file.data + f"\r\n--{boundary}--".encode()
+
+                async with session.request(
+                    "POST",
+                    upload_url,
+                    data=body,
+                    params={"uploadType": "multipart"},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": f"multipart/related; boundary={boundary}",
+                    },
+                ) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        self._logger.error(
+                            f"GChat media upload failed for {file.filename}",
+                            {"status": response.status, "error": error_text},
+                        )
+                    else:
+                        self._logger.debug(
+                            "GChat media upload succeeded",
+                            {"filename": file.filename},
+                        )
+            except Exception:
+                self._logger.error(
+                    f"GChat media upload failed for {file.filename}",
+                    {"exc_info": True},
+                )
 
     # =========================================================================
     # Lifecycle
@@ -1466,13 +1533,22 @@ class GoogleChatAdapter:
         thread_name = decoded.thread_name
 
         try:
-            # Check for files - currently not implemented for GChat
             files = extract_files(message)
             if files:
-                self._logger.warn(
-                    "File uploads are not yet supported for Google Chat. Files will be ignored.",
-                    {"fileCount": len(files)},
+                await self._gchat_media_upload(files, space_name, thread_name, "")
+                has_text = (
+                    isinstance(message, str)
+                    or (hasattr(message, "raw") and getattr(message, "raw", None))
+                    or (hasattr(message, "markdown") and getattr(message, "markdown", None))
+                    or (hasattr(message, "ast") and getattr(message, "ast", None))
                 )
+                card = extract_card(message)
+                if not (has_text or card):
+                    return RawMessage(
+                        id=f"file-{int(time.time() * 1000)}",
+                        thread_id=thread_id,
+                        raw={"files": files},
+                    )
 
             # Check if message contains a card
             card = extract_card(message)
