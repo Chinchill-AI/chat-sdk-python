@@ -452,6 +452,9 @@ def _table_to_blocks(element: SlackTableElement, state: _State) -> list[SlackBlo
         [_raw_text(header, state.convert_emoji) for header in element["headers"]],
         *[[_raw_text(cell, state.convert_emoji) for cell in row] for row in element["rows"]],
     ]
+    # Upstream parity: rows are emitted as given, not padded to the header
+    # width (chat@4.41.1 adapter-slack/src/blocks/index.ts:387-416 maps cells 1:1).
+    # Ragged rows pass through unchanged, as upstream; no Python-only padding.
     # The data table block requires a header row plus at least one data row;
     # fall back to the plain table block for header-only tables.
     if len(element["rows"]) == 0:

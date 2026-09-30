@@ -395,6 +395,9 @@ def _convert_table_to_blocks(element: TableElement, state: _CardRenderState) -> 
     header_row = [{"type": "raw_text", "text": convert_emoji(h) or " "} for h in headers]
     data_rows = [[{"type": "raw_text", "text": convert_emoji(cell) or " "} for cell in row] for row in rows]
 
+    # Upstream parity: rows are emitted as given, not padded to the header
+    # width (chat@4.41.1 adapter-slack/src/cards.ts:433-453 maps cells 1:1).
+    # Ragged rows pass through unchanged, as upstream; no Python-only padding.
     # The data table block requires a header row plus at least one data row
     if len(data_rows) == 0:
         return [{"type": "table", "rows": [header_row]}]
