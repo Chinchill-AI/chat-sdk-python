@@ -847,6 +847,89 @@ class TestHandleWebhook:
         assert response["status"] == 400
 
 
+class TestInboundTokenIssuer:
+    """Only Bot Framework-issued inbound tokens reach the handlers (#250).
+
+    ``microsoft-teams-apps`` 2.1 also accepts Entra ID ("Agent ID") tokens
+    for our app id from any tenant. These tests run the real bridge → SDK
+    ``HttpServer`` → validator → ``_dispatch_activity`` path with only the
+    RS256 signature check stubbed, so on 2.1 the Entra token takes the SDK's
+    new Entra branch and on 2.0 the service branch. Either way the adapter
+    must refuse anything but the Bot Framework issuer.
+    """
+
+    ACTIVITY = {
+        "type": "message",
+        "id": "msg-1",
+        "text": "hello",
+        "from": {"id": "user-1", "name": "Alice"},
+        "recipient": {"id": "28:test-app-id", "name": "bot"},
+        "conversation": {"id": "19:abc@thread.tacv2", "conversationType": "channel"},
+        "channelId": "msteams",
+        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _accept_any_signature(self, monkeypatch):
+        import jwt
+        from microsoft_teams.apps.auth.token_validator import TokenValidator
+
+        async def validate_token(self, raw_token, service_url=None, scope=None):
+            return jwt.decode(raw_token, options={"verify_signature": False})
+
+        monkeypatch.setattr(TokenValidator, "validate_token", validate_token)
+
+    @staticmethod
+    def _token(issuer: str) -> str:
+        import time
+
+        import jwt
+
+        now = int(time.time())
+        claims = {
+            "iss": issuer,
+            "aud": "test-app-id",
+            "tid": "11111111-2222-3333-4444-555555555555",
+            "serviceurl": "https://smba.trafficmanager.net/teams/",
+            "iat": now,
+            "nbf": now,
+            "exp": now + 600,
+        }
+        return jwt.encode(claims, "test-signing-key-not-checked-0123456789", algorithm="HS256")
+
+    async def _post(self, issuer: str):
+        import json
+
+        logger = _make_logger()
+        adapter = _make_adapter(logger=logger)
+        chat = MagicMock()
+        chat.get_state = MagicMock(return_value=MagicMock(set=AsyncMock(), get=AsyncMock(return_value=None)))
+        chat.process_message = MagicMock()
+        await adapter.initialize(chat)
+        request = _FakeRequest(
+            json.dumps(self.ACTIVITY),
+            {"content-type": "application/json", "authorization": f"Bearer {self._token(issuer)}"},
+        )
+        response = await adapter.handle_webhook(request)
+        return response, chat, logger
+
+    @pytest.mark.asyncio
+    async def test_entra_issued_token_is_rejected(self):
+        issuer = "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
+        response, chat, logger = await self._post(issuer)
+        assert response["status"] == 401
+        chat.process_message.assert_not_called()
+        warnings = [c for c in logger.warn.call_args_list if "not issued by the Bot Framework" in c.args[0]]
+        assert len(warnings) == 1
+        assert warnings[0].args[1] == {"issuer": issuer, "expectedIssuer": "https://api.botframework.com"}
+
+    @pytest.mark.asyncio
+    async def test_bot_framework_issued_token_is_dispatched(self):
+        response, chat, _logger = await self._post("https://api.botframework.com")
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # initialize
 # ---------------------------------------------------------------------------
@@ -1031,23 +1114,51 @@ class TestOutboundServiceUrlRouting:
         assert seen["conversations"] == self.SOVEREIGN_URL.rstrip("/")
         assert seen["activities"] == self.SOVEREIGN_URL.rstrip("/")
 
+    @staticmethod
+    def _capture_wire(adapter: TeamsAdapter, method: str) -> list[str]:
+        """Stub the REAL activities client's HTTP ``method`` and record each URL.
+
+        Patching at the HTTP boundary (not ``activities_client.update``) keeps
+        the SDK's own call chain in the test, so it holds on every supported
+        ``microsoft-teams-apps`` line: 2.0.x calls ``http.put(url, json=...)``;
+        2.1.x routes ``activities(...).update`` through
+        ``conversations.update_activity(..., service_url=None, agentic_identity=None)``
+        and adds a ``_metadata=`` kwarg (#250).
+        """
+        urls: list[str] = []
+
+        class _Response:
+            def json(self) -> dict[str, str]:
+                return {"id": "edit-1"}
+
+        async def fake_http(url, **_kwargs):
+            urls.append(url)
+            return _Response()
+
+        http = adapter._app.api.conversations.activities_client.http
+        setattr(http, method, fake_http)
+        return urls
+
     @pytest.mark.asyncio
     async def test_edit_message_retargets_real_activities_client(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        seen: dict[str, str] = {}
-
-        # Patch the real activities_client.update so the routing target is read
-        # off the REAL client chain (not a wholesale api mock).
-        async def fake_update(conversation_id, activity_id, activity):
-            seen["url"] = adapter._app.api.conversations.activities_client.service_url
-            return _SentActivity(activity_id)
-
-        adapter._app.api.conversations.activities_client.update = fake_update  # type: ignore[method-assign]
+        urls = self._capture_wire(adapter, "put")
         tid = adapter.encode_thread_id(
             TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
         )
-        await adapter.edit_message(tid, "edit-1", {"markdown": "x"})
-        assert seen["url"] == self.SOVEREIGN_URL.rstrip("/")
+        result = await adapter.edit_message(tid, "edit-1", {"markdown": "x"})
+        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/edit-1"]
+        assert result.id == "edit-1"
+
+    @pytest.mark.asyncio
+    async def test_delete_message_retargets_real_activities_client(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        urls = self._capture_wire(adapter, "delete")
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
+        )
+        await adapter.delete_message(tid, "gone-1")
+        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/gone-1"]
 
 
 class TestFileAttachments:

@@ -56,9 +56,11 @@ teams = [
     "aiohttp>=3.9",
     # Official Microsoft Teams Apps Python SDK (issue #93 migration; mirrors upstream
     # adapter-teams@4.30.0's @microsoft/teams.* deps). Graph stays hand-rolled (no [graph] extra).
-    "microsoft-teams-apps>=2.0.13,<2.1",
-    "microsoft-teams-api>=2.0.13,<2.1",
-    "microsoft-teams-cards>=2.0.13,<2.1",
+    # Both 2.0.x and 2.1.x are supported (feature-detected, #250). The upper bound stays one
+    # minor ahead because uv.lock is not committed and 2.1.0 shipped breaking changes (#251).
+    "microsoft-teams-apps>=2.0.13,<2.2",
+    "microsoft-teams-api>=2.0.13,<2.2",
+    "microsoft-teams-cards>=2.0.13,<2.2",
 ]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
@@ -75,9 +77,9 @@ all = [
     "pynacl>=1.5",
     "aiohttp>=3.9",
     "google-auth>=2.0",
-    "microsoft-teams-apps>=2.0.13,<2.1",
-    "microsoft-teams-api>=2.0.13,<2.1",
-    "microsoft-teams-cards>=2.0.13,<2.1",
+    "microsoft-teams-apps>=2.0.13,<2.2",
+    "microsoft-teams-api>=2.0.13,<2.2",
+    "microsoft-teams-cards>=2.0.13,<2.2",
 ]
 
 [build-system]
@@ -136,9 +138,9 @@ dev = [
     "pyrefly==0.61.1",
     # Teams adapter SDK (issue #93) — in dev so CI (`uv sync --group dev`) installs it
     # and the Teams test suite runs; matches how the other optional adapter deps are wired.
-    "microsoft-teams-apps>=2.0.13,<2.1",
-    "microsoft-teams-api>=2.0.13,<2.1",
-    "microsoft-teams-cards>=2.0.13,<2.1",
+    "microsoft-teams-apps>=2.0.13,<2.2",
+    "microsoft-teams-api>=2.0.13,<2.2",
+    "microsoft-teams-cards>=2.0.13,<2.2",
 ]
 
 # ---------------------------------------------------------------------------
