@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+Sync wave from `chat@4.31.0` to `chat@4.41.1` (tracking #184). `UPSTREAM_PARITY` stays `4.31.0` until #203.
+
+- **Tooling: fidelity tooling for the 4.41 wave** (#185, closes #79, advances #78). Tooling only; no consumer-visible behavior change.
+  - `scripts/upstream_pin.json` is now the single source for the upstream checkout: `pin` (strict CI tag `chat@4.31.0` plus its commit SHA) and `target` (`chat@4.41.1` plus its SHA). `verify_test_fidelity.py`, `lint.yml` (via `jq`) and the `CLAUDE.md` clone snippet all read it.
+  - CI fails if the cloned tag's HEAD differs from `pin.sha`, and writes the SHA to the job summary. The script does the same check when `TS_ROOT` is a git checkout, and only warns for a plain export.
+  - New `--check-docs` step in CI: `CLAUDE.md` and `docs/UPSTREAM_SYNC.md` can no longer name a different pin. This fixed the stale `4.30.0` line. The pin's major.minor must also match `UPSTREAM_PARITY`.
+  - `it.each` / `test.each` templates now count as one logical test each, with placeholders stripped. `test("…")` also counts, and `describe.each` titles are used for reporting. The strict count at the pin is now **733/733** (was 732): `thread.test.ts`'s existing `$label` template is now checked.
+  - Scope is two-tier. `MAPPING` stays strict. New `TARGET_MAPPING` rows are checked only by the new `--report-target` mode. New `UNMAPPED` lists deliberate skips with reasons, and every core `*.test.ts(x)` must be classified in one of the three.
+  - Per-file output now shows exact vs fuzzy match counts.
+  - `scripts/fidelity_target.json` is committed as the authoritative wave-wide missing list at `chat@4.41.1`: 282 missing of 1036 (130 in strict-tier files, 152 in target-tier files), including 16 `.each` templates.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.
