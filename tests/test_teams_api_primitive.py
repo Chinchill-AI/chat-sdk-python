@@ -339,13 +339,15 @@ class TestTeamsApiPrimitives:
 
 
 class TestTeamsApiSsrfDivergence:
-    """Python-first SSRF / token-leak gate (see docs/UPSTREAM_SYNC.md)."""
+    """SSRF / token-leak gate. Upstream validates too since chat@4.40.0
+    (vercel/chat#876); this port's host list is a superset (see
+    docs/UPSTREAM_SYNC.md)."""
 
     async def test_rejects_a_non_teams_service_url_host_before_fetching_a_token(self) -> None:
         request = AsyncMock(return_value=_json_response({"access_token": "token"}))
 
         # Upstream's own fixture host — untrusted under this port's allowlist.
-        with pytest.raises(ValueError, match="untrusted serviceUrl"):
+        with pytest.raises(ValueError, match="untrusted Connector serviceUrl"):
             await call_teams_connector_api(
                 credentials=CREDENTIALS,
                 path="v3/conversations/c/activities",
@@ -356,19 +358,48 @@ class TestTeamsApiSsrfDivergence:
         # The gate runs BEFORE any token request, so no bearer token leaks.
         request.assert_not_awaited()
 
-    async def test_post_teams_message_rejects_untrusted_host(self) -> None:
+    @pytest.mark.parametrize("service_url", ["https://attacker.example/", "https://attacker.trafficmanager.net/"])
+    async def test_rejects_untrusted_service_url_before_acquiring_a_token(self, service_url: str) -> None:
+        # Port of upstream api/index.test.ts ``it.each`` (chat@4.40.0).
         request = AsyncMock(return_value=_json_response({"access_token": "token"}))
 
-        with pytest.raises(ValueError, match="untrusted serviceUrl"):
+        with pytest.raises(ValueError, match="untrusted Connector serviceUrl"):
             await post_teams_message(
-                conversation_id="c",
+                conversation_id="conversation",
                 credentials=CREDENTIALS,
                 fetch=request,
-                service_url="https://attacker.example/",
-                text="hi",
+                service_url=service_url,
+                text="hello",
             )
 
         request.assert_not_awaited()
+
+    @pytest.mark.parametrize("path", ["https://attacker.example/v3/x", "http://smba.trafficmanager.net/v3/x"])
+    async def test_rejects_a_path_that_leaves_the_service_url_origin(self, path: str) -> None:
+        request = AsyncMock(return_value=_json_response({"access_token": "token"}))
+
+        with pytest.raises(ValueError, match="outside the Connector serviceUrl origin"):
+            await call_teams_connector_api(
+                credentials=CREDENTIALS,
+                path=path,
+                service_url="https://smba.trafficmanager.net/teams/",
+                fetch=request,
+            )
+        request.assert_not_awaited()
+
+    async def test_local_emulator_service_url_is_called(self) -> None:
+        request = AsyncMock(side_effect=[_json_response({"access_token": "token"}), _json_response({"id": "a1"})])
+
+        await call_teams_connector_api(
+            credentials=CREDENTIALS,
+            path="v3/conversations/c/activities",
+            service_url="http://localhost:3978",
+            method="POST",
+            body={"type": "message"},
+            fetch=request,
+        )
+
+        assert request.await_args_list[1].args[0] == "http://localhost:3978/v3/conversations/c/activities"
 
     async def test_rejects_a_subdomain_suffix_lookalike_host(self) -> None:
         # ``smba.uk.botframework.com.attacker.example`` embeds a trusted host
@@ -382,7 +413,7 @@ class TestTeamsApiSsrfDivergence:
         assert not is_trusted_teams_service_url(lookalike)
 
         request = AsyncMock(return_value=_json_response({"access_token": "token"}))
-        with pytest.raises(ValueError, match="untrusted serviceUrl"):
+        with pytest.raises(ValueError, match="untrusted Connector serviceUrl"):
             await call_teams_connector_api(
                 credentials=CREDENTIALS,
                 path="v3/conversations/c/activities",
@@ -412,6 +443,13 @@ class TestTeamsApiSsrfDivergence:
         assert is_trusted_teams_service_url("https://smba.uk.botframework.com/")
         assert is_trusted_teams_service_url("https://smba.gov.botframework.us/")
         assert is_trusted_teams_service_url("https://smba.infra.gcc.teams.microsoft.com/")
+        # Upstream TRUSTED_CONNECTOR_HOSTS additions (chat@4.40.0).
+        assert is_trusted_teams_service_url("https://msteams.botframework.azure.cn")
+        assert is_trusted_teams_service_url("https://smba.infra.dod.teams.microsoft.us/")
+        # Local Bot Framework Emulator: plain http on loopback only.
+        assert is_trusted_teams_service_url("http://localhost:3978")
+        assert is_trusted_teams_service_url("http://127.0.0.1:3978/")
+        assert is_trusted_teams_service_url("http://[::1]:3978/")
 
     def test_allowlist_rejects_untrusted_and_malformed_hosts(self) -> None:
         # Plain attacker host.
@@ -424,6 +462,13 @@ class TestTeamsApiSsrfDivergence:
         assert not is_trusted_teams_service_url("https://smba.trafficmanager.net@attacker.example/")
         # Non-string input fails closed.
         assert not is_trusted_teams_service_url(None)  # type: ignore[arg-type]
+        # Loopback lookalikes: https, suffix, userinfo, bad port, backslash.
+        assert not is_trusted_teams_service_url("https://localhost:3978/")
+        assert not is_trusted_teams_service_url("http://localhost.attacker.example/")
+        assert not is_trusted_teams_service_url("http://localhost@attacker.example/")
+        assert not is_trusted_teams_service_url("http://localhost:3978@attacker.example/")
+        assert not is_trusted_teams_service_url("http://localhost:notaport/")
+        assert not is_trusted_teams_service_url("http://attacker.example\\@localhost/")
 
 
 class TestApiImportBoundary:

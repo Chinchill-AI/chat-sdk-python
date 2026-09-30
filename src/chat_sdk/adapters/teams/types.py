@@ -6,8 +6,9 @@ See: https://learn.microsoft.com/en-us/microsoftteams/platform/bots/
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, TypedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -45,6 +46,20 @@ class TeamsAuthFederated(TypedDict, total=False):
     client_id: str
 
 
+# Custom token factory: ``(scope, tenant_id) -> access token`` (sync or async).
+# Same shape as the Teams SDK ``AppOptions.token`` it is forwarded to.
+TeamsTokenFactory: TypeAlias = Callable[[str | list[str], str | None], str | Awaitable[str]]
+
+# Lazy app-id resolver, awaited during ``initialize()`` when it returns an
+# awaitable. Must produce a non-empty ``str``.
+TeamsAppIdResolver: TypeAlias = Callable[[], str | Awaitable[str]]
+
+# Verify a forwarded webhook instead of Microsoft's native JWT. Called with the
+# framework request object and the exact raw body string; return a truthy value
+# (or an awaitable resolving to one) to accept, a falsy value or raise to reject.
+TeamsWebhookVerifier: TypeAlias = Callable[[Any, str], Any]
+
+
 @dataclass
 class TeamsAdapterConfig:
     """Teams adapter configuration.
@@ -57,8 +72,10 @@ class TeamsAdapterConfig:
     # Override the Teams Bot Framework service URL (e.g. for GCC-High /
     # sovereign-cloud environments). Defaults to TEAMS_API_URL env var.
     api_url: str | None = None
-    # Microsoft App ID. Defaults to TEAMS_APP_ID env var.
-    app_id: str | None = None
+    # Microsoft App ID, or a zero-argument resolver (sync or async) called once
+    # during ``initialize()``. Defaults to TEAMS_APP_ID env var. With a
+    # resolver, the Teams SDK ``App`` is built lazily in ``initialize()``.
+    app_id: str | TeamsAppIdResolver | None = None
     # Microsoft App Password. Defaults to TEAMS_APP_PASSWORD env var.
     app_password: str | None = None
     # Microsoft App Tenant ID. Defaults to TEAMS_APP_TENANT_ID env var.
@@ -75,6 +92,17 @@ class TeamsAdapterConfig:
     logger: Logger | None = None
     # Override bot username (optional).
     user_name: str | None = None
+    # Custom token factory for outbound Bot Framework / Graph calls, forwarded
+    # to the Teams SDK ``AppOptions.token``. Called as ``token(scope,
+    # tenant_id)``; may return the token or an awaitable. Takes precedence over
+    # ``app_password``, ``federated`` credentials and client-secret environment
+    # variables (``TEAMS_APP_PASSWORD`` and the SDK's ``CLIENT_SECRET``).
+    token: TeamsTokenFactory | None = field(default=None, kw_only=True)
+    # Custom verifier used instead of Microsoft JWT verification for inbound
+    # webhooks. Called as ``webhook_verifier(request, raw_body)`` before the
+    # body is parsed; a falsy result (or a raise) answers ``401``. When set,
+    # the SDK's own JWT validation is disabled (the bridge verifies instead).
+    webhook_verifier: TeamsWebhookVerifier | None = field(default=None, kw_only=True)
 
 
 # =============================================================================

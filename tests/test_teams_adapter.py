@@ -120,6 +120,15 @@ class TestCreateTeamsAdapter:
         assert isinstance(adapter, TeamsAdapter)
         assert adapter.name == "teams"
 
+    def test_should_create_adapter_with_a_custom_token_factory(self):
+        async def token(_scope, _tenant_id=None):
+            return "custom-access-token"
+
+        adapter = create_teams_adapter(TeamsAdapterConfig(app_id="test", app_tenant_id="test-tenant", token=token))
+        assert isinstance(adapter, TeamsAdapter)
+        # The factory reaches the SDK App (no client secret configured at all).
+        assert adapter._app.credentials.token is token
+
 
 # ---------------------------------------------------------------------------
 # Thread ID encoding

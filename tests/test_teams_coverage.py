@@ -255,6 +255,39 @@ class TestValidateServiceUrl:
         with pytest.raises(ValidationError):
             _validate_service_url("https://fake-botframework.com.evil.com/")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Upstream TRUSTED_CONNECTOR_HOSTS (chat@4.40.0) additions.
+            "https://msteams.botframework.azure.cn/teams/",
+            "https://smba.infra.dod.teams.microsoft.us/teams/",
+            # Local Bot Framework Emulator (plain http on loopback).
+            "http://localhost:3978/",
+            "http://127.0.0.1:52673/",
+            "http://[::1]:3978/",
+            "HTTP://LOCALHOST:3978",
+        ],
+    )
+    def test_accepts_sovereign_connectors_and_the_local_emulator(self, url):
+        _validate_service_url(url)  # no exception = pass
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://localhost:3978/",  # loopback is http-only (the Emulator)
+            "http://localhost.example/",  # suffix must not match
+            "http://127.0.0.1.evil.example/",
+            "http://evil.example#@localhost/",
+            "http://user@localhost/",  # userinfo is refused outright
+            "http://localhost:99999/",  # invalid port
+            "http://localhost\\@evil.example/",  # parser-differential character
+            "https://msteams.botframework.azure.cn.evil.example/",
+        ],
+    )
+    def test_rejects_loopback_lookalikes(self, url):
+        with pytest.raises(ValidationError):
+            _validate_service_url(url)
+
 
 # ---------------------------------------------------------------------------
 # _get_access_token (Bot Framework token)

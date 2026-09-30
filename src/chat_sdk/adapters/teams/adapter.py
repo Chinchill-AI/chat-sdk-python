@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
+import inspect
 import json
 import os
 import re
@@ -21,6 +23,7 @@ from urllib.parse import quote, urlparse
 if TYPE_CHECKING:
     from microsoft_teams.apps import StreamerProtocol
 
+from chat_sdk.adapters.teams.api import _is_loopback_emulator_url
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID, card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -86,15 +89,25 @@ _AAD_OBJECT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
 
 # Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
-# Covers commercial, GCC, GCCH, DoD, and sovereign cloud endpoints.
+# Covers commercial, GCC, GCCH, DoD, China (21Vianet) and sovereign cloud
+# endpoints. A superset of upstream's ``TRUSTED_CONNECTOR_HOSTS`` (chat@4.40.0):
+# the ``*.botframework.*`` / ``*.teams.microsoft.*`` wildcards are kept so no
+# existing deployment regresses. Divergence from upstream — see
+# docs/UPSTREAM_SYNC.md. Plain-``http`` loopback (the local Bot Framework
+# Emulator) is accepted separately by ``_validate_service_url``.
 ALLOWED_SERVICE_URL_PATTERNS = [
     re.compile(r"^https://smba\.trafficmanager\.net/"),
+    re.compile(r"^https://msteams\.botframework\.azure\.cn/"),
     re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/"),
     re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/"),
     re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/"),
     re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/"),
-    re.compile(r"^https://smba\.infra\.(gcc|gov)\.teams\.microsoft\.(com|us)/"),
+    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/"),
 ]
+
+_BOT_FRAMEWORK_SCOPE = "https://api.botframework.com/.default"
+_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+_APP_ID_UNRESOLVED_MESSAGE = "appId has not been resolved. Ensure chat.initialize() has completed."
 
 
 def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
@@ -114,18 +127,33 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
     Certificate auth is rejected here for exact parity with upstream — the
     adapter constructor also guards it, but mirroring the check keeps the
     config conversion self-contained.
+
+    A custom ``token`` factory is forwarded as the SDK ``token`` and no
+    ``client_secret`` is emitted (neither the configured ``app_password`` nor
+    ``TEAMS_APP_PASSWORD``). Upstream additionally passes ``clientSecret: ""``
+    to suppress the SDK's ``CLIENT_SECRET`` env fallback; the Python SDK
+    ignores an empty string there (``client_secret or os.getenv(...)``), so the
+    adapter enforces the factory's precedence in the ``App`` subclass built by
+    :func:`_token_precedence_app_class` instead.
+
+    ``config.app_id`` must already be resolved: a callable resolver is
+    replaced by its result (``dataclasses.replace``) before this is called.
     """
     if config.certificate is not None:
         raise ValidationError(
             "teams",
             "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
-            "Use appPassword (client secret) or federated (workload identity) authentication instead.",
+            "Use appPassword (client secret), federated (workload identity), or token (custom token factory) "
+            "authentication instead.",
         )
+    if callable(config.app_id):
+        raise TypeError("_to_app_options requires a resolved app_id; resolve the app_id callable first")
 
     client_id = config.app_id if config.app_id is not None else os.environ.get("TEAMS_APP_ID")
     # Federated (workload identity) auth derives the secret from a managed
-    # identity, so no client secret is supplied in that mode.
-    if config.federated is not None:
+    # identity, and a custom token factory mints tokens itself, so no client
+    # secret is supplied in either mode.
+    if config.federated is not None or config.token is not None:
         client_secret = None
     elif config.app_password is not None:
         client_secret = config.app_password
@@ -160,9 +188,62 @@ def _to_app_options(config: TeamsAdapterConfig) -> dict[str, Any]:
         options["tenant_id"] = tenant_id
     if managed_identity_client_id:
         options["managed_identity_client_id"] = managed_identity_client_id
+    if config.token is not None:
+        options["token"] = config.token
     if service_url:
         options["service_url"] = service_url
     return options
+
+
+_TOKEN_PRECEDENCE_APP_CLASS: type | None = None
+
+
+def _token_precedence_app_class() -> type:
+    """Return (building once) the SDK ``App`` subclass that lets ``token`` win.
+
+    Divergence from upstream — see docs/UPSTREAM_SYNC.md. The Python Teams SDK's
+    ``App._init_credentials`` (``microsoft-teams-apps`` 2.0.13 – 2.0.16) reads
+    ``options.client_secret or os.getenv("CLIENT_SECRET")`` and checks
+    ``client_id and client_secret`` *before* ``client_id and token``, so a
+    stray ``CLIENT_SECRET`` in the environment would silently beat a configured
+    token factory (upstream's ``clientSecret: ""`` trick relies on JS ``??``
+    semantics and does not carry over). This subclass returns
+    ``TokenCredentials`` whenever a ``token`` factory and a client id are
+    present, and defers to the SDK otherwise. Built lazily because the SDK is
+    the optional ``[teams]`` extra.
+    """
+    global _TOKEN_PRECEDENCE_APP_CLASS
+    if _TOKEN_PRECEDENCE_APP_CLASS is None:
+        from microsoft_teams.api import TokenCredentials
+        from microsoft_teams.apps import App
+
+        class _TokenPrecedenceApp(App):
+            def _init_credentials(self) -> Any:
+                token = self.options.token
+                client_id = self.options.client_id or os.getenv("CLIENT_ID")
+                if token is not None and client_id:
+                    tenant_id = self.options.tenant_id or os.getenv("TENANT_ID")
+                    return TokenCredentials(client_id=client_id, tenant_id=tenant_id, token=token)
+                return super()._init_credentials()
+
+        _TOKEN_PRECEDENCE_APP_CLASS = _TokenPrecedenceApp
+    return _TOKEN_PRECEDENCE_APP_CLASS
+
+
+def _sdk_skip_auth_option() -> str:
+    """Name of the SDK ``AppOptions`` flag that disables inbound JWT validation.
+
+    ``microsoft-teams-apps`` 2.0.14+ renamed ``skip_auth`` to
+    ``dangerously_allow_unauthenticated_requests`` (the old name still works
+    but emits a ``DeprecationWarning``); feature-detect so both ends of the
+    supported ``>=2.0.13,<2.1`` range get the right key.
+    """
+    from microsoft_teams.apps.options import AppOptions
+
+    keys = getattr(AppOptions, "__annotations__", {})
+    if "dangerously_allow_unauthenticated_requests" in keys:
+        return "dangerously_allow_unauthenticated_requests"
+    return "skip_auth"
 
 
 def _validate_service_url(url: str) -> None:
@@ -170,10 +251,14 @@ def _validate_service_url(url: str) -> None:
 
     Raises :class:`~chat_sdk.shared.errors.ValidationError` if the URL is not
     in the allow-list, preventing SSRF attacks via crafted ``serviceUrl`` values.
+    Plain-``http`` loopback (``localhost`` / ``127.x.x.x`` / ``::1``) is accepted
+    for the local Bot Framework Emulator, as upstream does.
     """
     for pattern in ALLOWED_SERVICE_URL_PATTERNS:
         if pattern.match(url):
             return
+    if _is_loopback_emulator_url(url):
+        return
     raise ValidationError(
         "teams",
         f"Service URL is not an allowed Bot Framework endpoint: {url}",
@@ -276,6 +361,11 @@ class TeamsAdapter:
     def __init__(self, config: TeamsAdapterConfig | None = None) -> None:
         if config is None:
             config = TeamsAdapterConfig()
+        # Snapshot the config (shallow copy, like upstream's ``{ ...config }``)
+        # so later mutation of the caller's object — e.g. assigning a
+        # ``webhook_verifier`` after construction — cannot change the
+        # authentication captured here or at lazy ``initialize()`` time.
+        config = dataclasses.replace(config)
 
         self._name = "teams"
         self._config = config
@@ -284,7 +374,10 @@ class TeamsAdapter:
         self._chat: ChatInstance | None = None
         self._format_converter = TeamsFormatConverter()
 
-        self._app_id = config.app_id or os.environ.get("TEAMS_APP_ID", "")
+        # A callable ``app_id`` is resolved (once) in ``initialize()``; until
+        # then the id is empty, ``bot_user_id`` is ``None`` and the SDK ``App``
+        # does not exist (accessing ``_app`` raises ``ValidationError``).
+        self._app_id: str = "" if callable(config.app_id) else (config.app_id or os.environ.get("TEAMS_APP_ID", ""))
         self._app_password = config.app_password or os.environ.get("TEAMS_APP_PASSWORD", "")
         self._app_tenant_id = config.app_tenant_id or os.environ.get("TEAMS_APP_TENANT_ID", "")
 
@@ -294,16 +387,15 @@ class TeamsAdapter:
             raise ValidationError(
                 "teams",
                 "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
-                "Use appPassword (client secret) or federated (workload identity) authentication instead.",
+                "Use appPassword (client secret), federated (workload identity), or token (custom token factory) "
+                "authentication instead.",
             )
 
-        if not self._app_id:
+        if not self._app_id and not callable(config.app_id) and config.webhook_verifier is None:
             self._logger.warn(
                 "Teams app_id is empty — webhook verification will reject all incoming requests. "
                 "Set TEAMS_APP_ID or pass app_id in config."
             )
-
-        self._bot_user_id: str | None = self._app_id or None
         # Bot Framework token cache (scope ``api.botframework.com``). Owned by
         # ``_get_access_token`` and consumed only by the still-hand-rolled
         # ``open_dm`` REST call (the SDK ``App`` does not expose a 1:1
@@ -327,9 +419,19 @@ class TeamsAdapter:
         # ``handle_webhook`` can dispatch serverless webhooks through it. The
         # SDK is an optional ([teams] extra) dependency, so it is imported
         # lazily here rather than at module scope.
-        self._bridge = BridgeHttpAdapter(self._logger)
-        self._app = self._build_app(config)
-        self._app_initialized = False
+        #
+        # With a ``webhook_verifier`` the bridge verifies every request before
+        # it reaches the SDK handler, and the App is built with the SDK's
+        # skip-auth flag. With a callable ``app_id`` the App is built in
+        # ``initialize()`` once the id is resolved (upstream ``createApp``).
+        self._bridge = BridgeHttpAdapter(self._logger, webhook_verifier=config.webhook_verifier)
+        self._app_instance: Any | None = None
+        if not callable(config.app_id):
+            self._app_instance = self._build_app(config)
+        # One shared in-flight ``initialize()`` task (cleared on failure so a
+        # later call retries) and a guard so SDK handlers register only once.
+        self._initialization: asyncio.Task[None] | None = None
+        self._handlers_registered = False
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -351,15 +453,18 @@ class TeamsAdapter:
         stamps the ``User-Agent: Vercel.ChatSDK`` client header — matching
         upstream ``adapter-teams/src/index.ts`` App construction.
 
-        The SDK's ``App`` enforces inbound JWT validation by default
-        (``skip_auth`` defaults to ``False``); when ``client_id`` is configured
-        it builds a Bot Framework ``TokenValidator`` (RS256, audience =
-        ``app_id`` + ``api://`` variants, Bot Framework issuer + JWKS). We pass
-        no ``skip_auth`` so that default stands — replacing the previously
-        hand-rolled ``_verify_bot_framework_token`` block.
+        The SDK's ``App`` enforces inbound JWT validation by default; when
+        ``client_id`` is configured it builds a Bot Framework
+        ``TokenValidator`` (RS256, audience = ``app_id`` + ``api://`` variants,
+        Bot Framework issuer + JWKS). Only when a ``webhook_verifier`` is
+        configured do we pass the SDK skip-auth flag — the bridge then verifies
+        every request itself before the SDK handler runs (upstream
+        ``skipAuth: Boolean(config.webhookVerifier)``).
+
+        ``config.app_id`` must already be a string (or ``None``); the lazy path
+        passes a copy with the resolved id.
         """
         try:
-            from microsoft_teams.apps import App
             from microsoft_teams.common import ClientOptions
         except ImportError as exc:  # pragma: no cover - exercised via packaging
             raise ImportError(
@@ -367,11 +472,26 @@ class TeamsAdapter:
             ) from exc
 
         options = _to_app_options(config)
-        return App(
+        if config.webhook_verifier is not None:
+            options[_sdk_skip_auth_option()] = True
+        app_class = _token_precedence_app_class()
+        return app_class(
             **options,
             client=ClientOptions(headers={"User-Agent": "Vercel.ChatSDK"}),
             http_server_adapter=self._bridge,
         )
+
+    @property
+    def _app(self) -> Any:
+        """The Microsoft Teams SDK ``App``.
+
+        Raises :class:`ValidationError` while a callable ``app_id`` is still
+        unresolved (upstream's ``app`` getter), so an outbound call made before
+        ``chat.initialize()`` fails with an actionable message.
+        """
+        if self._app_instance is None:
+            raise ValidationError("teams", _APP_ID_UNRESOLVED_MESSAGE)
+        return self._app_instance
 
     @property
     def name(self) -> str:
@@ -383,7 +503,10 @@ class TeamsAdapter:
 
     @property
     def bot_user_id(self) -> str | None:
-        return self._bot_user_id
+        # Derived from the (possibly lazily resolved) app id; ``None`` until a
+        # callable ``app_id`` has been resolved. The bare-id format is tracked
+        # separately (#217).
+        return self._app_id or None
 
     @property
     def lock_scope(self) -> LockScope | None:
@@ -396,25 +519,56 @@ class TeamsAdapter:
     async def initialize(self, chat: ChatInstance) -> None:
         """Initialize the adapter and the underlying Teams SDK ``App``.
 
-        Mirrors upstream ``TeamsAdapter.initialize`` (set ``chat`` → register
-        event handlers → ``await app.initialize()``). ``app.initialize()``
-        registers the messaging-endpoint route with the
+        Mirrors upstream ``TeamsAdapter.initialize`` / ``initializeApp``: set
+        ``chat``, then (once) resolve a callable ``app_id`` and build the App,
+        register the event handlers, and ``await app.initialize()``.
+        ``app.initialize()`` registers the messaging-endpoint route with the
         :class:`BridgeHttpAdapter` (so :meth:`handle_webhook` can dispatch) and
         configures inbound JWT validation. We then point the SDK's
         ``server.on_request`` at :meth:`_dispatch_activity` so JWT-validated
         activities route to our chat-processing handlers.
+
+        Concurrent calls share one in-flight task. A failed attempt is not
+        cached: the next call retries, without re-resolving an already
+        resolved ``app_id`` or re-registering handlers. The shared task is
+        shielded so cancelling one caller does not cancel it for the others.
         """
         self._chat = chat
-        self._register_event_handlers()
-        if not self._app_initialized:
-            await self._app.initialize()
-            # The SDK's ``HttpServer`` invokes ``on_request`` *after* JWT
-            # validation. The default callback runs the SDK's strict typed
-            # router + a live user-token fetch; we replace it with our own
-            # dispatcher that routes the (already-authenticated) activity to
-            # the registered handlers using the adapter's existing logic.
-            self._app.server.on_request = self._dispatch_activity
-            self._app_initialized = True
+        task = self._initialization
+        if task is None:
+            task = asyncio.ensure_future(self._initialize_app())
+            self._initialization = task
+            task.add_done_callback(self._clear_failed_initialization)
+        await asyncio.shield(task)
+
+    def _clear_failed_initialization(self, task: asyncio.Task[None]) -> None:
+        """Forget a failed/cancelled initialization so the next call retries."""
+        if self._initialization is task and (task.cancelled() or task.exception() is not None):
+            self._initialization = None
+
+    async def _initialize_app(self) -> None:
+        if self._app_instance is None:
+            resolver = self._config.app_id
+            if not callable(resolver):  # pragma: no cover - constructor builds the App eagerly
+                raise ValidationError("teams", _APP_ID_UNRESOLVED_MESSAGE)
+            resolved: Any = resolver()
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            if not isinstance(resolved, str) or not resolved.strip():
+                raise ValidationError("teams", "appId resolver must return a nonempty string.")
+            self._app_instance = self._build_app(dataclasses.replace(self._config, app_id=resolved))
+            self._app_id = resolved
+        if not self._handlers_registered:
+            self._register_event_handlers()
+            self._handlers_registered = True
+        app = self._app
+        await app.initialize()
+        # The SDK's ``HttpServer`` invokes ``on_request`` *after* JWT
+        # validation. The default callback runs the SDK's strict typed
+        # router + a live user-token fetch; we replace it with our own
+        # dispatcher that routes the (already-authenticated) activity to
+        # the registered handlers using the adapter's existing logic.
+        app.server.on_request = self._dispatch_activity
         self._logger.info("Teams adapter initialized")
 
     def _register_event_handlers(self) -> None:
@@ -2768,8 +2922,20 @@ class TeamsAdapter:
         ``api.botframework.com``); sharing one cache slot let whichever was
         fetched last clobber the other, so a Graph read could end up sending a
         Bot Framework token (and vice versa). See issue #93.
+
+        With a custom ``token`` factory configured, the factory is called
+        instead (scope ``https://graph.microsoft.com/.default``) and
+        ``app_password`` is never read (upstream routes Graph through the SDK
+        ``App``, which uses the same factory).
         """
         import time as _time
+
+        if self._app_instance is None:
+            # A callable ``app_id`` is still unresolved: there is no client id
+            # to mint a token for yet.
+            raise ValidationError("teams", _APP_ID_UNRESOLVED_MESSAGE)
+        if self._config.token is not None:
+            return await self._token_from_factory(_GRAPH_SCOPE)
 
         # Reuse cached token if valid
         if self._graph_token and _time.time() < self._graph_token_expiry:
@@ -2790,7 +2956,7 @@ class TeamsAdapter:
                     "grant_type": "client_credentials",
                     "client_id": self._app_id,
                     "client_secret": self._app_password,
-                    "scope": "https://graph.microsoft.com/.default",
+                    "scope": _GRAPH_SCOPE,
                 },
             ) as response:
                 if not response.ok:
@@ -2817,8 +2983,19 @@ class TeamsAdapter:
         the SDK ``App``, so this hand-rolled token is consumed only by the
         still-hand-rolled :meth:`open_dm` REST call. It must never share a
         cache slot with the Graph token (see :meth:`_get_graph_token`).
+
+        With a custom ``token`` factory configured, the factory is called
+        instead (scope ``https://api.botframework.com/.default``) and
+        ``app_password`` is never read.
         """
         import time
+
+        if self._app_instance is None:
+            # A callable ``app_id`` is still unresolved: there is no client id
+            # to mint a token for yet.
+            raise ValidationError("teams", _APP_ID_UNRESOLVED_MESSAGE)
+        if self._config.token is not None:
+            return await self._token_from_factory(_BOT_FRAMEWORK_SCOPE)
 
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
@@ -2841,7 +3018,7 @@ class TeamsAdapter:
                         "grant_type": "client_credentials",
                         "client_id": self._app_id,
                         "client_secret": self._app_password,
-                        "scope": "https://api.botframework.com/.default",
+                        "scope": _BOT_FRAMEWORK_SCOPE,
                     },
                 ) as response:
                     if not response.ok:
@@ -2862,6 +3039,31 @@ class TeamsAdapter:
                     f"Network error obtaining Bot Framework access token: {exc}",
                     exc,
                 ) from exc
+
+    async def _token_from_factory(self, scope: str) -> str:
+        """Mint a token through the configured ``token`` factory.
+
+        Called as ``token(scope, tenant_id)`` — the same contract the Teams SDK
+        uses for ``AppOptions.token`` — with the tenant the hand-rolled
+        client-credentials path would use (``app_tenant_id``, else
+        ``botframework.com``). The result is not cached: the factory owns
+        token lifetime, as it does for the SDK's own calls. A non-string or
+        empty result, or a raising factory, becomes an
+        :class:`AuthenticationError`.
+        """
+        factory = self._config.token
+        if factory is None:  # pragma: no cover - callers check first
+            raise AuthenticationError("teams", "No custom token factory is configured")
+        tenant_id = self._app_tenant_id or "botframework.com"
+        try:
+            result: Any = factory(scope, tenant_id)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            raise AuthenticationError("teams", f"Custom token factory failed for {scope}: {exc}") from exc
+        if not isinstance(result, str) or not result:
+            raise AuthenticationError("teams", f"Custom token factory returned no token for {scope}")
+        return result
 
 
 def create_teams_adapter(config: TeamsAdapterConfig | None = None) -> TeamsAdapter:
