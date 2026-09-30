@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+Work toward upstream `chat@4.41.1` parity (tracking issue #184). `UPSTREAM_PARITY` stays `4.31.0` until the wave's final PR (#203).
+
+- **BREAKING (security) — Telegram: webhook verification is required by default; repeated updates are deduplicated** (#224; upstream vercel/chat#858, #799, #813).
+  - Telegram webhook deployments without `TELEGRAM_WEBHOOK_SECRET_TOKEN` / `secret_token` now **fail to start or return 401**: `mode="webhook"` raises `ValidationError` in the constructor, `mode="auto"` raises from `initialize()` when it resolves to webhook mode (so `Chat` initialization fails and is retried on every webhook until the config is fixed), and `handle_webhook` returns 401 `"Webhook verification required"` before reading the body. Previously the adapter logged a warning and dispatched every update, including `callback_query` button actions.
+  - **Escape hatch:** `TelegramAdapterConfig(allow_unverified_webhooks=True)` or `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true` (only the exact string `"true"` counts; an explicit `allow_unverified_webhooks=False` wins over the env var). Polling mode needs neither.
+  - Each accepted webhook update's integer `update_id` is claimed via the state adapter's `set_if_not_exists` (`telegram:webhook-update:{sha256(bot_user_id)}:{update_id}`, 24h TTL) before dispatch, so a Telegram redelivery runs handlers once. Duplicates return 200 without dispatch; a state or bot-identity failure returns 503 without dispatch (Telegram retries later). The scope is derived from the bot's user id, not its token, so it survives token rotation.
+  - Bot identity (`getMe`) is now resolved through a shared, retrying lookup: a failed startup `getMe` is retried on the next webhook instead of leaving `bot_user_id` unset.
+  - `secret_token` now resolves with `??` semantics: an explicit `secret_token=""` no longer falls back to `TELEGRAM_WEBHOOK_SECRET_TOKEN` (it counts as "no secret").
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.
