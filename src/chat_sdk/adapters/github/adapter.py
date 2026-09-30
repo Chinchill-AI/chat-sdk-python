@@ -39,6 +39,7 @@ from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     AdapterPostableMessage,
     Author,
@@ -348,15 +349,25 @@ class GitHubAdapter:
     async def handle_webhook(self, request: Any, options: WebhookOptions | None = None) -> Any:
         """Handle incoming webhook from GitHub."""
         body = await self._get_request_body(request)
-        self._logger.debug("GitHub webhook raw body", {"body": body[:500]})
+        signature = self._get_header(request, "x-hub-signature-256")
+        event_type = self._get_header(request, "x-github-event")
+        # Log request-shape metadata only — never the body or any slice of it
+        # (upstream fc7df9c4). ``bodyBytes`` is the UTF-8 byte length, matching
+        # ``Buffer.byteLength``; ``signaturePresent`` mirrors ``!== null``, so
+        # an empty header still counts as present.
+        webhook_metadata: dict[str, Any] = {
+            "bodyBytes": utf8_byte_length(body),
+            "contentType": self._get_header(request, "content-type"),
+            "eventType": event_type,
+            "signaturePresent": signature is not None,
+        }
 
         # Verify request signature
-        signature = self._get_header(request, "x-hub-signature-256")
         if not self._verify_signature(body, signature):
+            self._logger.debug("GitHub webhook signature verification failed", webhook_metadata)
             return self._make_response("Invalid signature", 401)
 
-        event_type = self._get_header(request, "x-github-event")
-        self._logger.debug("GitHub webhook event type", {"eventType": event_type})
+        self._logger.debug("GitHub webhook request verified", webhook_metadata)
 
         if event_type == "ping":
             self._logger.info("GitHub webhook ping received")
@@ -367,10 +378,7 @@ class GitHubAdapter:
         except (json.JSONDecodeError, ValueError):
             self._logger.error(
                 "GitHub webhook invalid JSON",
-                {
-                    "contentType": self._get_header(request, "content-type"),
-                    "bodyPreview": body[:200],
-                },
+                {**webhook_metadata, "jsonParseStatus": "error"},
             )
             return self._make_response(
                 "Invalid JSON. Make sure webhook Content-Type is set to application/json",

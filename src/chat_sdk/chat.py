@@ -1273,7 +1273,9 @@ class Chat:
             {
                 "adapter": event.adapter.name,
                 "command": event.command,
-                "text": event.text,
+                # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the
+                # command text's length, not its content.
+                "textLength": len(event.text or ""),
                 "user": event.user.user_name,
             },
         )
@@ -1946,7 +1948,7 @@ class Chat:
                 "adapter": adapter.name,
                 "thread_id": thread_id,
                 "message_id": message.id,
-                "author": message.author.user_name,
+                "is_bot": message.author.is_bot,
                 "is_me": message.author.is_me,
             },
         )
