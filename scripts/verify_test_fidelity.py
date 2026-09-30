@@ -962,6 +962,21 @@ def list_core_test_files(ts_root: str) -> list[str]:
     return sorted(p.relative_to(ts_root).as_posix() for p in found if "node_modules" not in p.parts)
 
 
+def committed_core_test_files(ts_root: str) -> list[str] | None:
+    """Core test files recorded in the ``ts_root`` checkout's HEAD commit.
+
+    Unlike ``list_core_test_files`` this reads the commit, not the working
+    tree, so a sparse or partially deleted checkout cannot hide a file.
+    Returns None when git cannot list the tree.
+    """
+    out, _ = _run_git(ts_root, "ls-tree", "-r", "-z", "--name-only", "HEAD", "--", CORE_TEST_DIR)
+    if out is None:
+        return None
+    return sorted(
+        p for p in out.split("\0") if p.endswith((".test.ts", ".test.tsx")) and "node_modules" not in p.split("/")
+    )
+
+
 def find_unclassified(files: list[str]) -> list[str]:
     classified = MAPPING.keys() | TARGET_MAPPING.keys() | UNMAPPED.keys()
     return [f for f in files if f not in classified]
@@ -1239,11 +1254,30 @@ def run_report_target(pin: dict[str, dict[str, str]]) -> int:
     if not (Path(TS_ROOT) / CORE_TEST_DIR).is_dir():
         print(f"\nupstream checkout missing: {CORE_TEST_DIR} not found under TS_ROOT={TS_ROOT!r}")
         return 1
-    sha_error = verify_checkout_sha(TS_ROOT, target)
+    head = resolve_checkout_sha(TS_ROOT)
+    sha_error = verify_checkout_sha(TS_ROOT, target, head=head)
     if sha_error:
         print(f"\nerror: {sha_error}")
         return 1
-    unclassified = find_unclassified(list_core_test_files(TS_ROOT))
+    core_files = list_core_test_files(TS_ROOT)
+    if head is not None:
+        # A sparse or partial checkout passes the SHA and clean-tree checks
+        # but would silently drop mapped files from the report. Classify
+        # against the commit itself, and require every committed core test
+        # file to be on disk.
+        committed = committed_core_test_files(TS_ROOT)
+        if committed is None:
+            print(f"\nerror: git could not list {CORE_TEST_DIR} at HEAD of TS_ROOT={TS_ROOT!r}.")
+            return 1
+        not_on_disk = sorted(set(committed) - set(core_files))
+        if not_on_disk:
+            print(f"\nerror: TS_ROOT={TS_ROOT!r} is an incomplete checkout of {target['tag']}; missing on disk:")
+            for f in not_on_disk:
+                print(f"  - {f}")
+            print(f"Report not written. {_fresh_clone_hint(TS_ROOT, target['tag'])}")
+            return 1
+        core_files = committed
+    unclassified = find_unclassified(core_files)
     if unclassified:
         print("\nerror: core test files not in MAPPING, TARGET_MAPPING or UNMAPPED:")
         for f in unclassified:
@@ -1266,6 +1300,16 @@ def run_report_target(pin: dict[str, dict[str, str]]) -> int:
 
     if _report_extraction_errors(warnings):
         print(f"\nReport not written: {TARGET_REPORT_PATH.name} would undercount the missing tests.")
+        return 1
+    if absent and head is None:
+        # Only a verified git checkout proves a mapped file is really gone at
+        # the target (every committed core file was confirmed on disk above);
+        # in a plain export it may simply be missing.
+        print(
+            f"\nerror: {len(absent)} mapped file(s) are absent and TS_ROOT={TS_ROOT!r} is not a git "
+            f"checkout, so they cannot be confirmed absent at {target['tag']}. Report not written.\n"
+            f"{_fresh_clone_hint(TS_ROOT, target['tag'])}"
+        )
         return 1
 
     report = build_target_report(target, results, absent)

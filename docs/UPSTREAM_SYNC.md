@@ -170,6 +170,11 @@ Infra guardrails:
   refusal). A plain export without `.git` cannot be verified and only warns.
 - The script fails with exit 1 if any mapped TS file is missing under
   `TS_ROOT` (defense in depth against silent skips).
+- `--report-target` records a mapped file as absent only when a verified
+  git checkout's HEAD commit lacks it. It fails without writing the report
+  if a core test file in the commit is missing on disk (a sparse or partial
+  checkout, which passes the clean-tree check), or if any mapped file is
+  absent from a plain export, where absence cannot be verified.
 - `--strict` and `--report-target` fail if any upstream test cannot be
   extracted (a non-literal title, an unknown call form such as `it.todo`,
   an unreadable `.each` table) — an unextracted test would otherwise go

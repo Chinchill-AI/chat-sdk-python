@@ -763,8 +763,57 @@ def test_report_target_lists_missing_without_a_baseline_marker(vtf, fake_upstrea
 )
 def test_report_target_verifies_checkout_against_target_sha(vtf, fake_upstream, monkeypatch, head, code):
     monkeypatch.setattr(vtf, "resolve_checkout_sha", lambda _root: head)
+    monkeypatch.setattr(vtf, "committed_core_test_files", vtf.list_core_test_files)
     assert vtf.main(["--report-target"]) == code
     assert (fake_upstream / "fidelity_target.json").exists() is (code == 0)
+
+
+def _commit_fake_upstream(vtf, fake_upstream, monkeypatch) -> Path:
+    """Turn the fake TS tree into a real git checkout that claims to be the target commit."""
+    ts_root = fake_upstream / "ts"
+    _git(ts_root, "init", "-q")
+    _git(ts_root, "add", ".")
+    _git(ts_root, "commit", "-q", "-m", "upstream")
+    # Only the HEAD-vs-pin comparison is faked; ls-tree / status run for real.
+    monkeypatch.setattr(vtf, "resolve_checkout_sha", lambda _root: _TARGET_SHA)
+    return ts_root
+
+
+def test_report_target_rejects_a_sparse_checkout_that_hides_a_mapped_file(vtf, fake_upstream, monkeypatch, capsys):
+    ts_root = _commit_fake_upstream(vtf, fake_upstream, monkeypatch)
+    # Like a sparse checkout: the file is in the commit but not on disk, and
+    # git status stays clean, so the clean-tree check alone cannot see it.
+    _git(ts_root, "update-index", "--skip-worktree", "packages/chat/src/b.test.ts")
+    (ts_root / "packages/chat/src/b.test.ts").unlink()
+    assert _git(ts_root, "status", "--porcelain") == ""
+    assert vtf.main(["--report-target"]) == 1
+    out = capsys.readouterr().out
+    assert "incomplete checkout of chat@4.41.1; missing on disk:\n  - packages/chat/src/b.test.ts\n" in out
+    assert not (fake_upstream / "fidelity_target.json").exists()
+
+
+def test_report_target_records_a_mapped_file_absent_from_the_target_commit(vtf, fake_upstream, monkeypatch):
+    ts_root = _commit_fake_upstream(vtf, fake_upstream, monkeypatch)
+    _git(ts_root, "rm", "-q", "packages/chat/src/b.test.ts")
+    _git(ts_root, "commit", "-q", "-m", "upstream deleted b")
+    assert vtf.main(["--report-target"]) == 0
+    report = json.loads((fake_upstream / "fidelity_target.json").read_text())
+    assert report["absent_ts_files"] == ["packages/chat/src/b.test.ts"]
+
+
+def test_report_target_fails_when_git_cannot_list_the_checkout(vtf, fake_upstream, monkeypatch, capsys):
+    _commit_fake_upstream(vtf, fake_upstream, monkeypatch)
+    monkeypatch.setattr(vtf, "committed_core_test_files", lambda _root: None)
+    assert vtf.main(["--report-target"]) == 1
+    assert "git could not list packages/chat/src at HEAD" in capsys.readouterr().out
+    assert not (fake_upstream / "fidelity_target.json").exists()
+
+
+def test_report_target_rejects_an_absent_mapped_file_in_a_plain_export(vtf, fake_upstream, capsys):
+    (fake_upstream / "ts/packages/chat/src/b.test.ts").unlink()
+    assert vtf.main(["--report-target"]) == 1
+    assert "cannot be confirmed absent at chat@4.41.1" in capsys.readouterr().out
+    assert not (fake_upstream / "fidelity_target.json").exists()
 
 
 def test_report_target_rejects_file_in_both_tiers(vtf, fake_upstream, monkeypatch):
