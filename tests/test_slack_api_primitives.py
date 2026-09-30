@@ -321,22 +321,53 @@ class TestSlackApiPrimitives:
         assert result is response
         assert request.await_args.kwargs["headers"]["authorization"] == "Bearer xoxb"
 
-    async def test_refuses_to_fetch_files_from_untrusted_hosts(self) -> None:
-        """Python-specific token-leak guard: file host must be Slack-owned.
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://docs.google.com/document/d/external",
+            "http://files.slack.com/files-pri/T/F/report.txt",
+            "https://files.slack.com.attacker.example/report.txt",
+            "https://files.slack.com@attacker.example/report.txt",
+        ],
+    )
+    async def test_refuses_external_url_without_resolving_the_token(self, url: str) -> None:
+        """Adapted port of upstream "fetches external URL %s without bearer auth".
 
-        Diverges from upstream, which forwards the bearer token to any URL.
-        See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
+        Upstream fetches these URLs without credentials; Python refuses them
+        (token-leak guard, ``docs/UPSTREAM_SYNC.md`` Known Non-Parity). Both
+        never resolve the token.
         """
         request = AsyncMock()
+        token = AsyncMock(return_value="xoxb")
 
         with pytest.raises(ValueError, match="untrusted URL"):
-            await fetch_slack_file(
-                token="xoxb",
-                url="https://evil.example/files-pri/x",
-                fetch=request,
-            )
+            await fetch_slack_file(token=token, url=url, fetch=request)
 
         request.assert_not_awaited()
+        token.assert_not_called()
+
+    async def test_authenticates_file_urls_on_the_configured_api_origin(self) -> None:
+        request = AsyncMock(return_value=_json_response("file", status=200))
+
+        await fetch_slack_file(
+            api_url="https://slack-proxy.example/api/",
+            token="xoxb",
+            url="https://slack-proxy.example/files-pri/T/F/report.txt",
+            fetch=request,
+        )
+
+        assert request.await_args.kwargs["headers"]["authorization"] == "Bearer xoxb"
+
+    async def test_fetches_allowlisted_non_auth_origin_without_resolving_the_token(self) -> None:
+        # ``*.slack-edge.com`` is on the Python download allowlist but is not
+        # a Slack auth origin (upstream ``isSlackAuthUrl``), so no token.
+        request = AsyncMock(return_value=_json_response("file", status=200))
+        token = AsyncMock(return_value="xoxb")
+
+        await fetch_slack_file(token=token, url="https://ca.slack-edge.com/T-U-x-512", fetch=request)
+
+        assert request.await_args.kwargs["headers"] is None
+        token.assert_not_called()
 
     async def test_fetches_thread_replies_with_cursor_metadata(self) -> None:
         request = AsyncMock(

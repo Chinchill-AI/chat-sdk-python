@@ -21,9 +21,11 @@ import json
 import os
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+
+from tests._slack_file_transport import FakeFileResponse, FakeFileTransport
 
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter, create_slack_adapter
@@ -1349,7 +1351,7 @@ class TestAttachmentFetchDataRotationSafety:
         }
 
     @pytest.mark.asyncio
-    async def test_attachment_fetch_data_re_resolves_token_in_single_workspace_mode(self):
+    async def test_re_resolves_the_default_provider_at_fetch_time_in_single_workspace_mode(self):
         """``fetch_data`` re-invokes the resolver in single-workspace mode.
 
         Same rotation contract as ``schedule_message().cancel()`` — a
@@ -1370,14 +1372,10 @@ class TestAttachmentFetchDataRotationSafety:
             )
         )
 
-        # Stub _fetch_slack_file so we can assert which token it received.
-        fetched: list[tuple[str, str]] = []
-
-        async def fake_fetch(url: str, token: str) -> bytes:
-            fetched.append((url, token))
-            return b"bytes"
-
-        adapter._fetch_slack_file = fake_fetch  # type: ignore[method-assign]
+        # Stub the guarded downloader's transport so we can assert which
+        # token each download sent.
+        transport = FakeFileTransport(FakeFileResponse(b"bytes"))
+        adapter._file_transport = transport
 
         # Build the attachment OUTSIDE any request context (single-workspace
         # mode: no ctx token to snapshot — the closure must defer to the
@@ -1389,16 +1387,17 @@ class TestAttachmentFetchDataRotationSafety:
         result = await attachment.fetch_data()
         assert result == b"bytes"
         assert i[0] == 1, "resolver must be invoked once at fetch_data() time"
-        assert fetched == [("https://files.slack.com/img.png", "xoxb-att-old")]
+        assert [url for url, _ in transport.calls] == ["https://files.slack.com/img.png"]
+        assert transport.authorizations == ["Bearer xoxb-att-old"]
 
         # Second fetch picks up the rotated token.
         result2 = await attachment.fetch_data()
         assert result2 == b"bytes"
         assert i[0] == 2, "resolver must be invoked again on a second fetch (rotation)"
-        assert fetched[-1] == ("https://files.slack.com/img.png", "xoxb-att-new")
+        assert transport.authorizations[-1] == "Bearer xoxb-att-new"
 
     @pytest.mark.asyncio
-    async def test_attachment_fetch_data_uses_snapshot_in_multi_workspace_mode(self):
+    async def test_snapshots_ctx_token_at_attachment_creation_in_multi_workspace_mode(self):
         """``fetch_data`` uses the snapshotted per-team token in multi-workspace mode.
 
         The closure must NOT consult the InstallationStore at fetch time —
@@ -1415,13 +1414,8 @@ class TestAttachmentFetchDataRotationSafety:
             SlackInstallation(bot_token="xoxb-att-team", bot_user_id="U_ATT", team_name="ATT"),
         )
 
-        fetched: list[tuple[str, str]] = []
-
-        async def fake_fetch(url: str, token: str) -> bytes:
-            fetched.append((url, token))
-            return b"bytes"
-
-        adapter._fetch_slack_file = fake_fetch  # type: ignore[method-assign]
+        transport = FakeFileTransport(FakeFileResponse(b"bytes"))
+        adapter._file_transport = transport
 
         # Spy on get_installation — fetch_data must not consult it.
         get_install_calls: list[str] = []
@@ -1445,7 +1439,8 @@ class TestAttachmentFetchDataRotationSafety:
         get_install_calls.clear()
         result = await attachment.fetch_data()
         assert result == b"bytes"
-        assert fetched == [("https://files.slack.com/img.png", "xoxb-att-team")], (
+        assert transport.calls == [("https://files.slack.com/img.png", ANY)]
+        assert transport.authorizations == ["Bearer xoxb-att-team"], (
             "fetch_data in multi-workspace mode must use the snapshotted ctx_token captured at attachment-creation time"
         )
         assert get_install_calls == [], (

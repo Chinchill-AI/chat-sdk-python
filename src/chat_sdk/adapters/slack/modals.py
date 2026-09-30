@@ -7,7 +7,10 @@ Port of modals.ts from the Vercel Chat SDK Slack adapter.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from chat_sdk.adapters.slack.cards import (
@@ -15,7 +18,10 @@ from chat_sdk.adapters.slack.cards import (
     convert_fields_to_block,
     convert_text_to_block,
 )
+from chat_sdk.cards import _js_number_to_string
 from chat_sdk.modals import ModalChild, ModalElement
+
+logger = logging.getLogger(__name__)
 
 # Slack view type aliases
 SlackView = dict[str, Any]
@@ -100,6 +106,10 @@ def _modal_child_to_block(child: ModalChild) -> SlackBlock:
 
     if child_type == "text_input":
         return _text_input_to_block(child)  # type: ignore[arg-type]
+    if child_type == "date_input":
+        return _date_input_to_block(child)  # type: ignore[arg-type]
+    if child_type == "number_input":
+        return _number_input_to_block(child)  # type: ignore[arg-type]
     if child_type == "select":
         return _select_to_block(child)  # type: ignore[arg-type]
     if child_type == "external_select":
@@ -143,6 +153,103 @@ def _text_input_to_block(input_el: dict[str, Any]) -> SlackBlock:
     }
 
 
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _to_initial_date(value: str | None) -> str | None:
+    """Return ``value`` if it is a real ``YYYY-MM-DD`` date, else ``None``.
+
+    Slack rejects a ``datepicker`` whose ``initial_date`` is not a real
+    ``YYYY-MM-DD`` date, and it fails the WHOLE ``views.open`` with
+    ``invalid_arguments`` rather than degrading the one field. Drop it with a
+    warning instead (upstream ``toInitialDate``).
+
+    Upstream round-trips through JS ``Date`` because it rolls impossible dates
+    over (``2026-02-31`` becomes Mar 3); ``date.fromisoformat`` raises on them
+    instead. ``fullmatch`` with ``[0-9]`` mirrors the anchored ASCII-only JS
+    regex.
+
+    Divergence from upstream — see docs/UPSTREAM_SYNC.md: Python has no year 0,
+    so ``0000-MM-DD`` is dropped where JS keeps it.
+    """
+    if not value:
+        return None
+    try:
+        valid = (
+            isinstance(value, str)
+            and _ISO_DATE_RE.fullmatch(value) is not None
+            and date.fromisoformat(value).isoformat() == value
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        logger.warning('[chat] DateInput "%s" is not a YYYY-MM-DD date — ignoring initial_value', value)
+        return None
+    return value
+
+
+def _date_input_to_block(input_el: dict[str, Any]) -> SlackBlock:
+    """Convert a DateInputElement to a Slack input block with a datepicker."""
+    element: dict[str, Any] = {
+        "type": "datepicker",
+        "action_id": input_el.get("id", ""),
+    }
+
+    placeholder = input_el.get("placeholder")
+    if placeholder:
+        element["placeholder"] = {"type": "plain_text", "text": placeholder}
+    initial_date = _to_initial_date(input_el.get("initial_value"))
+    if initial_date:
+        element["initial_date"] = initial_date
+
+    return {
+        "type": "input",
+        "block_id": input_el.get("id", ""),
+        "optional": input_el.get("optional", False),
+        "label": {"type": "plain_text", "text": input_el.get("label", "")},
+        "element": element,
+    }
+
+
+def _number_input_to_block(input_el: dict[str, Any]) -> SlackBlock:
+    """Convert a NumberInputElement to a Slack input block with a number_input.
+
+    Slack's number_input requires ``is_decimal_allowed``, and takes its numeric
+    bounds/initial value as strings. They are formatted as JS ``String(n)``
+    does (``1.0`` -> ``"1"``), and ``0`` is kept.
+    """
+    decimal = input_el.get("decimal")
+    element: dict[str, Any] = {
+        "type": "number_input",
+        "action_id": input_el.get("id", ""),
+        "is_decimal_allowed": decimal if decimal is not None else False,
+    }
+
+    placeholder = input_el.get("placeholder")
+    if placeholder:
+        element["placeholder"] = {"type": "plain_text", "text": placeholder}
+    for source_key, slack_key in (("initial_value", "initial_value"), ("min", "min_value"), ("max", "max_value")):
+        value = input_el.get(source_key)
+        if value is not None:
+            element[slack_key] = _js_number_to_string(value)
+
+    return {
+        "type": "input",
+        "block_id": input_el.get("id", ""),
+        "optional": input_el.get("optional", False),
+        "label": {"type": "plain_text", "text": input_el.get("label", "")},
+        "element": element,
+    }
+
+
+def _with_dispatch_action(block: SlackBlock, element: dict[str, Any]) -> SlackBlock:
+    """Set ``dispatch_action`` on an input block when the element sets it (``False`` included)."""
+    dispatch_action = element.get("dispatch_action")
+    if dispatch_action is not None:
+        block["dispatch_action"] = dispatch_action
+    return block
+
+
 def _select_to_block(select: dict[str, Any]) -> SlackBlock:
     """Convert a SelectElement to a Slack input block with static_select."""
     options: list[dict[str, Any]] = []
@@ -172,13 +279,16 @@ def _select_to_block(select: dict[str, Any]) -> SlackBlock:
         if initial_opt:
             element["initial_option"] = initial_opt
 
-    return {
-        "type": "input",
-        "block_id": select.get("id", ""),
-        "optional": select.get("optional", False),
-        "label": {"type": "plain_text", "text": select.get("label", "")},
-        "element": element,
-    }
+    return _with_dispatch_action(
+        {
+            "type": "input",
+            "block_id": select.get("id", ""),
+            "optional": select.get("optional", False),
+            "label": {"type": "plain_text", "text": select.get("label", "")},
+            "element": element,
+        },
+        select,
+    )
 
 
 def _external_select_to_block(select: dict[str, Any]) -> SlackBlock:
@@ -259,10 +369,13 @@ def _radio_select_to_block(radio_select: dict[str, Any]) -> SlackBlock:
         if initial_opt:
             element["initial_option"] = initial_opt
 
-    return {
-        "type": "input",
-        "block_id": radio_select.get("id", ""),
-        "optional": radio_select.get("optional", False),
-        "label": {"type": "plain_text", "text": radio_select.get("label", "")},
-        "element": element,
-    }
+    return _with_dispatch_action(
+        {
+            "type": "input",
+            "block_id": radio_select.get("id", ""),
+            "optional": radio_select.get("optional", False),
+            "label": {"type": "plain_text", "text": radio_select.get("label", "")},
+            "element": element,
+        },
+        radio_select,
+    )

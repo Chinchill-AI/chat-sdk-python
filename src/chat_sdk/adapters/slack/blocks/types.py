@@ -126,6 +126,72 @@ class SlackTableElement(TypedDict):
     headers: list[str]
     rows: list[list[str]]
     align: NotRequired[list[SlackTableAlignment]]
+    # Accessible table caption for the data table block
+    caption: NotRequired[str]
+    # Rows per page (1-100; Slack defaults to 5)
+    page_size: NotRequired[int]
+
+
+class SlackChartSegment(TypedDict):
+    """A pie chart segment."""
+
+    # Legend label (max 20 characters)
+    label: str
+    # Segment value; must be greater than 0
+    value: float
+
+
+class SlackChartDataPoint(TypedDict):
+    """A single data point within a chart series."""
+
+    # Category label; must match an entry in the chart's ``categories``
+    label: str
+    # Y-axis value (negative values are permitted)
+    value: float
+
+
+class SlackChartSeries(TypedDict):
+    """A named data series for bar, area, and line charts."""
+
+    # One data point per category
+    data: list[SlackChartDataPoint]
+    # Legend label; unique within the chart (max 20 characters)
+    name: str
+
+
+class SlackPieChartDefinition(TypedDict):
+    """A pie chart definition."""
+
+    type: Literal["pie"]
+    # Pie segments (1-12)
+    segments: list[SlackChartSegment]
+
+
+class SlackSeriesChartDefinition(TypedDict):
+    """A bar, area, or line chart definition."""
+
+    type: Literal["area", "bar", "line"]
+    # X-axis category labels in display order (max 20 characters each)
+    categories: list[str]
+    # Data series (1-12); each series needs one point per category
+    series: list[SlackChartSeries]
+    # X-axis title (max 50 characters)
+    x_label: NotRequired[str]
+    # Y-axis title (max 50 characters)
+    y_label: NotRequired[str]
+
+
+# A chart definition, discriminated on the ``type`` key.
+SlackChartDefinition = SlackPieChartDefinition | SlackSeriesChartDefinition
+
+
+class SlackChartElement(TypedDict):
+    """A chart rendered as a ``data_visualization`` block or a text fallback."""
+
+    type: Literal["chart"]
+    chart: SlackChartDefinition
+    # Chart title (max 50 characters)
+    title: str
 
 
 class SlackActionsElement(TypedDict):
@@ -145,6 +211,7 @@ class SlackSectionElement(TypedDict):
 # A child of a card or section. Discriminated on the ``type`` key.
 SlackCardChild = (
     SlackActionsElement
+    | SlackChartElement
     | SlackDividerElement
     | SlackFieldsElement
     | SlackImageElement
