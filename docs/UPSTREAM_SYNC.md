@@ -346,6 +346,52 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 (`test_uses_the_full_dm_thread_id_as_its_channel_id`,
 `test_isolates_concurrent_recipients_with_thread_scoped_locks`).
 
+### Card and modal builders (chat@4.34–4.41, #202)
+
+Parity, not a divergence. The core slice of upstream `4717a384` (chat@4.34.0),
+`0153a39f` (chat@4.36.0), `4a0b5c0c` (chat@4.40.0), `84219537` and `ad904325`
+(chat@4.41.0) is ported in `cards.py` / `modals.py`: `Chart()` and the
+`Chart*` TypedDicts, `Table()` `caption` / `page_size` / `widths` /
+`vertical_align` / `grid_lines` / `grid_style`, `tooltip` on
+`Button()` / `LinkButton()`, `Card(width=…)`, `DateInput()` / `NumberInput()`,
+and `dispatch_action` on `Select()` / `RadioSelect()`. Adapter rendering lands
+separately (Slack #212, Teams #220); other adapters ignore the new fields.
+
+- **Omitted keys.** Upstream assigns `undefined` options and `JSON.stringify`
+  drops them. The Python builders omit a key whose argument is `None`, and keep
+  falsy values (`grid_lines=False`, `decimal=False`, `dispatch_action=False`,
+  `NumberInput(initial_value=0, min=0)`). With the new options unset,
+  `Card()` / `Table()` / `Button()` / `LinkButton()` / `Select()` /
+  `RadioSelect()` output is unchanged.
+- **Keys** are snake_case inside the SDK (`page_size`, `vertical_align`,
+  `grid_lines`, `grid_style`, `initial_value`, `dispatch_action`, `x_label`,
+  `y_label`); adapters convert at the wire boundary.
+- **Chart fallback numbers.** `chart_element_to_fallback_text` (upstream
+  `chartElementToFallbackText`, `markdown.ts`) formats each value as JS
+  `String(value)` does, via `cards._js_number_to_string`, an implementation of
+  ECMAScript `Number::toString` over `repr(float)`'s shortest round-trip
+  digits: `45.0` → `"45"`, `0.00001` → `"0.00001"`, `1e21` → `"1e+21"`,
+  `-0.0` → `"0"`, NaN → `"NaN"`. It was checked against Node's `String()`
+  on 80,000 random doubles with no mismatch. `int` values below `1e21` render
+  exactly (JS would round above 2**53); `bool` renders `"true"` / `"false"`.
+  A series point is found by category label, and a missing point is an empty
+  cell.
+- **`chart` fallback wiring.** `card_child_to_fallback_text` (and therefore
+  `card_to_fallback_text`, `BaseFormatConverter.render_postable`, and each
+  adapter's unknown-child fallback) and `shared/card_utils.py` render a chart
+  as its title plus an ASCII table. This matches upstream, where every adapter
+  without native charts falls through to `cardChildToFallbackText`.
+- **Interim Slack gaps (until #212).** `modal_to_slack_view` raises
+  `ValueError("Unknown modal child type: date_input")` (or `number_input`) for
+  the new modal children; the SDK-free `slack.blocks` primitive raises
+  `SlackBlockError` for a `chart` child; the Slack adapter posts a chart as a
+  mrkdwn section holding the fallback text; and `dispatch_action`, `caption`
+  and `page_size` are ignored.
+- **Not ported (JSX):** `fromReactElement` / `fromReactModalElement` handling of
+  `Chart`, `DateInput`, `NumberInput`, `tooltip`, `width` and `dispatchAction`,
+  and `929878b5` (chat@4.39.0, link-button ids in JSX). See the jsx-runtime row
+  in the non-parity table.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
@@ -801,6 +847,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams modal-submit webhook options (vercel/chat#454 adapter-teams slice) | Not ported — the Python Teams adapter has no task-module/modal-submit flow (`handleTaskSubmit`/`processModalSubmit` are absent), so upstream's change passing `bridgeAdapter.getWebhookOptions(activity.id)` into `processModalSubmit` has no landing site | `TeamsAdapter.handleTaskSubmit` forwards webhook options so modal callbackUrl POSTs are registered with `waitUntil` | Pre-existing gap: Teams modals are unported. The Slack adapter already forwards options to `process_modal_submit`, so the new waitUntil plumbing is exercised there. Add the Teams call when Teams modal support lands. |
 | jsx-runtime `callbackUrl` props (vercel/chat#454 slice) | Not ported | `ButtonProps`/`ModalProps` gain `callbackUrl`; `resolveJSXElement` forwards it | Covered by the existing "JSX Card/Modal elements" row — Python has no JSX runtime; `Button()`/`Modal()` builders accept `callback_url` directly. |
 | jsx-runtime `id` prop for link buttons (stable-id-for-link-buttons, chat@4.31.0 commit `171657a`) | Not ported | `LinkButtonProps` gains `id?`; `resolveJSXElement` forwards `id: props.id` | Covered by the existing "JSX Card/Modal elements" row — Python has no JSX runtime. The core half of the same commit (`LinkButton()` factory + `LinkButtonElement` `id`) **is** ported: the `LinkButton(id=…)` builder accepts the optional stable identifier directly (matching the `Button`/`Select` `id` convention). |
+| jsx-runtime 4.34–4.41 card/modal props (#202; upstream `929878b5`, `4717a384`, `0153a39f`, `4a0b5c0c`, `ad904325`) | Not ported | `fromReactElement` converts `Chart`, `Card` `width` and `Button`/`LinkButton` `tooltip`; `fromReactModalElement` converts `DateInput`, `NumberInput` and `Select`/`RadioSelect` `dispatchAction`; `929878b5` (chat@4.39.0) lets JSX `LinkButton` carry an `id` | Covered by the existing "JSX Card/Modal elements" row — Python has no JSX runtime. The builders (`Chart()`, `Card(width=…)`, `tooltip=`, `DateInput()`, `NumberInput()`, `dispatch_action=`, `LinkButton(id=…)`) take these directly. The JSX-only upstream tests (`modals.test.ts` "should convert a DateInput/NumberInput react element" and the `fromReactModalElement` copy of "preserves dispatchAction=%s"; `jsx-runtime.test.ts` tooltip/width cases) are skipped. |
 | Transcripts API Python adaptations (vercel/chat#448) | `transcripts.delete()` returns a `DeleteResult` dataclass; misconfiguration raises `ValueError` (constructor/`AppendInput` guards, invalid duration) or `ChatError` (`chat.transcripts` accessor); guard messages name the Python kwarg (`options.user_key`); `DurationString` is a `str` alias validated at runtime by `_parse_duration` | Inline `{ deleted: number }`; generic `Error` for all of the above; template-literal `` `${number}${"s"\|"m"\|"h"\|"d"}` `` type | Port rules: typed dataclasses over raw dicts; repo error-type conventions (constructor misconfig → `ValueError`, runtime API misuse → `ChatError`) with upstream-matching message wording; Python has no template-literal types. Same shapes and values throughout. |
 | Slack legacy mrkdwn renderer (response_url surface only, post-#440) | `_node_to_mrkdwn` renders headings as `*bold*` and images as `{alt} ({url})` / bare URL | TS `nodeToMrkdwn` has no heading/image branches — both fall through to `defaultNodeToText`, dropping heading emphasis and image URLs | Pre-existing Python improvement; after vercel/chat#440 it affects only `to_response_url_text` (ephemeral edits via response_url). Preserves visual hierarchy and image URLs Slack would otherwise lose. |
 | Slack `api` primitives `send_slack_response_url` URL gate (vercel/chat#548; allowlist aligned with vercel/chat#876 in #205) | `send_slack_response_url` (`slack/api/__init__.py`) calls `_assert_slack_response_url(url)` before POSTing, which routes through the same `_is_trusted_slack_response_url` helper the high-level adapter uses, and raises `ValueError` for anything else | Upstream's **adapter** validates `response_url` since chat@4.40 (`isTrustedSlackResponseUrl`, vercel/chat#876 — checked at ephemeral-id encode, decode and before the send; the Python adapter ports that 1:1). Upstream's SDK-free `api/client.ts` `sendResponseUrl` still POSTs to whatever `response_url` it is handed, with no scheme/host validation | SSRF guard. The only remaining divergence is that the SDK-free primitive also validates. The `response_url` reaching this primitive can originate from a parsed-but-unverified interaction payload; without a gate a crafted value could redirect the POST (which carries no bearer token but does echo SDK-controlled message content and trigger an arbitrary outbound request) to another host. Enforces `CLAUDE.md`'s "Validate external URLs before requests (SSRF)" rule. Allowlist (shared with the adapter): scheme `https`, no userinfo, no explicit port, host exactly `hooks.slack.com` or `hooks.slack-gov.com` (set membership, never a suffix match; a non-numeric port is untrusted). The shared helper is marginally stricter than upstream's WHATWG-`URL` check on two edges Slack never emits: an explicit default port (`:443`) and an empty userinfo (`https://@hooks.slack.com/...`) are rejected, where `new URL()` normalizes both away. Before #205 this primitive accepted any `*.slack.com` host. Regression coverage: `tests/test_slack_api_primitives.py::TestSlackApiPrimitives::test_rejects_non_slack_response_urls`. |

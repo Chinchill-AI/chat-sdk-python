@@ -10,8 +10,10 @@ import warnings
 import pytest
 
 from chat_sdk.modals import (
+    DateInput,
     ExternalSelect,
     Modal,
+    NumberInput,
     RadioSelect,
     Select,
     SelectOption,
@@ -19,6 +21,31 @@ from chat_sdk.modals import (
     filter_modal_children,
     is_modal_element,
 )
+
+# ---------------------------------------------------------------------------
+# Select / RadioSelect action dispatch (chat@4.41, #202)
+# ---------------------------------------------------------------------------
+
+
+class TestActionDispatch:
+    """Port of upstream ``describe.each([Select, RadioSelect])("%s action dispatch")``."""
+
+    @pytest.mark.parametrize("component", [Select, RadioSelect])
+    @pytest.mark.parametrize("dispatch_action", [True, False, None])
+    def test_preserves_dispatchaction(self, component, dispatch_action):
+        element = component(
+            id="scope",
+            label="Scope",
+            dispatch_action=dispatch_action,
+            options=[SelectOption(label="Team", value="team")],
+        )
+        if dispatch_action is None:
+            # Unset is omitted (upstream: undefined), never serialized as null.
+            assert "dispatch_action" not in element
+        else:
+            # ``is`` so a truthiness bug (False dropped or coerced) fails.
+            assert element["dispatch_action"] is dispatch_action
+
 
 # ---------------------------------------------------------------------------
 # Modal builder
@@ -119,6 +146,60 @@ class TestTextInputBuilder:
         assert "multiline" not in ti
         assert "max_length" not in ti
         assert "optional" not in ti
+
+
+# ---------------------------------------------------------------------------
+# DateInput / NumberInput builders (chat@4.36, #202)
+# ---------------------------------------------------------------------------
+
+
+class TestDateInput:
+    def test_should_create_with_required_fields(self):
+        # Unset options are omitted rather than serialized as None.
+        assert DateInput(id="d1", label="Due date") == {"type": "date_input", "id": "d1", "label": "Due date"}
+
+    def test_should_include_optional_fields(self):
+        date_input = DateInput(
+            id="d1",
+            label="Due date",
+            placeholder="Pick a date",
+            initial_value="2026-08-01",
+            optional=True,
+        )
+        assert date_input["placeholder"] == "Pick a date"
+        assert date_input["initial_value"] == "2026-08-01"
+        assert date_input["optional"] is True
+
+
+class TestNumberInput:
+    def test_should_create_with_required_fields(self):
+        assert NumberInput(id="n1", label="Quantity") == {"type": "number_input", "id": "n1", "label": "Quantity"}
+
+    def test_should_include_optional_fields(self):
+        number_input = NumberInput(
+            id="n1",
+            label="Quantity",
+            placeholder="How many?",
+            initial_value=3,
+            min=1,
+            max=10,
+            decimal=True,
+            optional=True,
+        )
+        assert number_input["placeholder"] == "How many?"
+        assert number_input["initial_value"] == 3
+        assert number_input["min"] == 1
+        assert number_input["max"] == 10
+        assert number_input["decimal"] is True
+        assert number_input["optional"] is True
+
+    def test_should_keep_a_zero_initial_value(self):
+        number_input = NumberInput(id="n1", label="Quantity", initial_value=0, min=0, max=0, decimal=False)
+        # Falsy but set: kept (``is not None``, never truthiness).
+        assert number_input["initial_value"] == 0
+        assert number_input["min"] == 0
+        assert number_input["max"] == 0
+        assert number_input["decimal"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -301,17 +382,21 @@ class TestIsModalElement:
 
 
 class TestFilterModalChildren:
-    def test_valid_children_pass_through(self):
+    def test_should_keep_valid_child_types(self):
         children = [
             {"type": "text_input", "id": "a", "label": "A"},
+            DateInput(id="d1", label="Due date"),
+            NumberInput(id="n1", label="Quantity"),
             {"type": "select", "id": "b", "label": "B", "options": []},
             {"type": "external_select", "id": "x", "label": "X"},
             {"type": "radio_select", "id": "c", "label": "C", "options": []},
             {"type": "text", "content": "hello"},
             {"type": "fields", "items": []},
         ]
-        result = filter_modal_children(children)
-        assert len(result) == 6
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # a dropped child would warn
+            result = filter_modal_children(children)
+        assert result == children
 
     def test_filters_out_invalid_types(self):
         children = [
