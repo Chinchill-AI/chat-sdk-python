@@ -190,6 +190,63 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
 }
 """
 
+# Comment-thread ROOT query (``fetchCommentThread`` step 1, chat@4.41.1 /
+# vercel/chat#965). Upstream loads ``linear.comment({ id })`` FIRST and checks
+# ``rootComment.issueId`` against the thread's issue before fetching replies.
+# Unlike ``AgentSession``, ``Comment`` DOES expose the nullable scalar
+# ``issueId: String`` in the published schema (``linear/packages/sdk/src/
+# schema.graphql`` @ master, alongside the ``issue: Issue`` relation), so select
+# the scalar exactly as the SDK's ``comment`` document does.
+_COMMENT_THREAD_ROOT_QUERY = """
+query CommentThreadRoot($commentId: String!) {
+    comment(id: $commentId) {
+        id
+        issueId
+        body
+        createdAt
+        updatedAt
+        url
+        user {
+            id
+            displayName
+            name
+        }
+    }
+}
+"""
+
+# Comment-thread CHILDREN query (``fetchCommentThread`` step 2), issued only
+# after the root's issue ownership is validated.
+# Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream calls the root
+# ``comments(filter: {parent: {id: {eq}}}, first|last)`` connection; this port
+# keeps the pre-existing ``comment(id) { children(...) }`` connection (same
+# replies, same pagination semantics). Direction-driven like upstream:
+# ``forward`` → ``first``, otherwise ``last``.
+_COMMENT_THREAD_CHILDREN_QUERY = """
+query CommentThreadChildren($commentId: String!, $first: Int, $last: Int) {
+    comment(id: $commentId) {
+        children(first: $first, last: $last) {
+            nodes {
+                id
+                body
+                createdAt
+                updatedAt
+                url
+                user {
+                    id
+                    displayName
+                    name
+                }
+            }
+            pageInfo {
+                hasNextPage
+                endCursor
+            }
+        }
+    }
+}
+"""
+
 # Agent-session FETCH query. The Python adapter has no ``@linear/sdk``;
 # upstream's ``linear.agentSession(id)`` (which lazy-resolves ``issueId`` and the
 # root ``comment`` relation off the SDK model) is ported as this raw GraphQL
@@ -1648,7 +1705,7 @@ class LinearAdapter:
             return await self._fetch_agent_session_messages(session, options)
 
         if decoded.comment_id:
-            return await self._fetch_comment_thread(thread_id, decoded.issue_id, decoded.comment_id, limit)
+            return await self._fetch_comment_thread(thread_id, decoded.issue_id, decoded.comment_id, limit, options)
 
         return await self._fetch_issue_comments(thread_id, decoded.issue_id, limit)
 
@@ -1665,11 +1722,15 @@ class LinearAdapter:
         ported as the schema-hardened raw GraphQL queries
         ``_AGENT_SESSION_FETCH_QUERY`` / ``_AGENT_SESSION_CHILDREN_QUERY``.
 
-        - ``issue_id = agentSession.issue.id ?? thread.issue_id`` — nullish
-          (``is not None``). The published schema has no scalar ``issueId`` on
-          ``AgentSession`` (only the ``issue`` relation), so we read the issue id
-          off ``issue { id }`` — equivalent to upstream's ``agentSession.issueId``.
-          Raise ``AdapterError`` when neither yields an id.
+        - Ownership check (chat@4.41.1, vercel/chat#974): ``issue_id =
+          agentSession.issue.id``; when it is missing (``None``/``""``) or differs
+          from ``thread.issue_id``, raise ``ValidationError("linear", "Agent
+          session does not belong to this issue")`` BEFORE the root comment is
+          read or the children query is issued. There is no ``thread.issue_id``
+          fallback — a thread id naming issue A must not read a session on issue
+          B. The published schema has no scalar ``issueId`` on ``AgentSession``
+          (only the ``issue`` relation), so we read the issue id off
+          ``issue { id }`` — equivalent to upstream's ``agentSession.issueId``.
         - ``root_comment = agentSession.comment`` — raise ``AdapterError`` when
           the session has no root comment.
         - children pagination is direction-driven: ``forward`` → ``first``,
@@ -1698,25 +1759,26 @@ class LinearAdapter:
             # ``@linear/sdk`` ``linear.agentSession(id)`` throws its own
             # not-found. The raw-GraphQL port returns ``null`` instead, so this
             # guard describes the REAL failure (session not found), distinct from
-            # the downstream missing-``issueId`` raise after the session resolves.
+            # the downstream ownership ``ValidationError`` after the session
+            # resolves.
             raise AdapterError(
                 f"Linear agent session {thread.agent_session_id} not found",
                 "linear",
             )
 
-        # ``agentSession.issueId ?? thread.issueId`` — but the published schema
-        # exposes the issue id only via the ``issue`` relation (no scalar
-        # ``issueId`` field), so read it off ``issue { id }``. Nullish, NOT
-        # truthiness: an empty-string issue id would still short-circuit, but the
-        # ``is not None`` guard matches upstream's ``??``.
+        # Ownership check — upstream ``if (!issueId || issueId !== thread.issueId)``
+        # (vercel/chat#974). The published schema exposes the issue id only via
+        # the ``issue`` relation (no scalar ``issueId`` field), so read it off
+        # ``issue { id }``. Missing and mismatched are the SAME failure: ``None``,
+        # ``""`` and a foreign id all raise, so truthiness is correct here (it
+        # mirrors upstream's ``!issueId``). This runs before ``comment`` is read
+        # and before the children query, so a forged thread id never surfaces
+        # another issue's history. The message is upstream's verbatim text and
+        # deliberately echoes neither issue id.
         session_issue = agent_session.get("issue") or {}
-        session_issue_id = session_issue.get("id")
-        issue_id = session_issue_id if session_issue_id is not None else thread.issue_id
-        if not issue_id:
-            raise AdapterError(
-                f"Linear agent session {thread.agent_session_id} is missing issueId",
-                "linear",
-            )
+        issue_id = session_issue.get("id")
+        if not issue_id or issue_id != thread.issue_id:
+            raise ValidationError("linear", "Agent session does not belong to this issue")
 
         root_comment = agent_session.get("comment")
         if not root_comment:
@@ -1812,59 +1874,63 @@ class LinearAdapter:
         issue_id: str,
         comment_id: str,
         limit: int,
+        options: FetchOptions | None = None,
     ) -> FetchResult:
-        """Fetch a comment thread (root comment + its children/replies)."""
-        result = await self._graphql_query(
-            """
-            query CommentThread($commentId: String!, $first: Int) {
-                comment(id: $commentId) {
-                    id
-                    body
-                    createdAt
-                    updatedAt
-                    url
-                    user {
-                        id
-                        displayName
-                        name
-                    }
-                    children(first: $first) {
-                        nodes {
-                            id
-                            body
-                            createdAt
-                            updatedAt
-                            url
-                            user {
-                                id
-                                displayName
-                                name
-                            }
-                        }
-                        pageInfo {
-                            hasNextPage
-                            endCursor
-                        }
-                    }
-                }
-            }
-            """,
-            {"commentId": comment_id, "first": limit},
-        )
+        """Fetch a comment thread (root comment + its children/replies).
 
-        comment = result.get("data", {}).get("comment")
-        if not comment:
+        Port of upstream ``fetchCommentThread`` (chat@4.41.1, vercel/chat#965):
+
+        1. Load the ROOT comment first (``_COMMENT_THREAD_ROOT_QUERY``, which
+           selects the scalar ``issueId``) and raise ``ValidationError("linear",
+           "Comment does not belong to this issue")`` when the root's issue id is
+           missing or differs from the thread's ``issue_id``. A thread id naming
+           issue A therefore can never read a comment thread on issue B.
+        2. Only then load the children (``_COMMENT_THREAD_CHILDREN_QUERY``) —
+           direction-driven like upstream: ``forward`` → ``first``, otherwise
+           ``last`` (default limit 50). A foreign comment never triggers the
+           children query.
+        3. Build every message with the VALIDATED root issue id.
+
+        A ``null`` root (the raw-GraphQL not-found shape) keeps the pre-existing
+        port-only behavior of returning an empty result, also without issuing
+        the children query.
+        """
+        root_result = await self._graphql_query(
+            _COMMENT_THREAD_ROOT_QUERY,
+            {"commentId": comment_id},
+        )
+        root_comment = (root_result.get("data") or {}).get("comment")
+        if not root_comment:
             return FetchResult(messages=[])
 
-        # Root comment as first message
-        messages = [self._comment_node_to_message(comment, thread_id, issue_id)]
+        # Ownership check — upstream ``if (!rootComment.issueId ||
+        # rootComment.issueId !== issueId)``, reading the same nullable scalar
+        # ``issueId`` the SDK selects. Missing (``None``/``""``) and mismatched
+        # are the SAME failure, so truthiness mirrors upstream's ``!issueId``.
+        # The message is upstream's verbatim text and echoes neither issue id.
+        root_issue_id = root_comment.get("issueId")
+        if not root_issue_id or root_issue_id != issue_id:
+            raise ValidationError("linear", "Comment does not belong to this issue")
 
-        # Child comments
-        children = comment.get("children", {})
-        for node in children.get("nodes", []):
-            messages.append(self._comment_node_to_message(node, thread_id, issue_id))
+        forward = options is not None and options.direction == "forward"
+        children_result = await self._graphql_query(
+            _COMMENT_THREAD_CHILDREN_QUERY,
+            {
+                "commentId": comment_id,
+                "first": limit if forward else None,
+                "last": None if forward else limit,
+            },
+        )
+        children_root = (children_result.get("data") or {}).get("comment") or {}
+        children = children_root.get("children") or {}
 
-        page_info = children.get("pageInfo", {})
+        # Root comment as first message, then its children — all under the
+        # validated root issue id.
+        messages = [self._comment_node_to_message(root_comment, thread_id, root_issue_id)]
+        for node in children.get("nodes") or []:
+            messages.append(self._comment_node_to_message(node, thread_id, root_issue_id))
+
+        page_info = children.get("pageInfo") or {}
 
         return FetchResult(
             messages=messages,

@@ -61,11 +61,17 @@ The Teams adapter implements its own JWT validation rather than using the Micros
 
 ### Google Chat
 
-- **Method**: Google-issued JWT token verification
+- **Method**: Google-signed JWT verification, bound to a configured identity for each transport (#222)
 - **Header**: `Authorization: Bearer <jwt>`
-- **Verification**: `google.oauth2.id_token.verify_token()` from the `google-auth` library
-- **Audience**: The Google Cloud project number
-- **Fallback**: If `use_application_default_credentials` is enabled, the adapter trusts Google Cloud's internal authentication.
+- **Direct webhooks, "Project number" audience** (`google_chat_project_number`): a JWT self-signed by `chat@system.gserviceaccount.com`. It is verified against that account's X.509 certs (`https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com`), with issuer `chat@system.gserviceaccount.com` and audience equal to the project number.
+- **Direct webhooks, "HTTP endpoint URL" audience** (`endpoint_url`): a Google OIDC ID token verified against `https://www.googleapis.com/oauth2/v3/certs`. The issuer must be `accounts.google.com` or `https://accounts.google.com`, and the audience must equal the configured `endpoint_url` exactly. `email_verified` must be `true`, and `email` must be `chat@system.gserviceaccount.com` or the exact `workspace_add_on_service_account_email`. When both direct verifiers are configured, the endpoint-URL check runs first, then the project-number check.
+- **Pub/Sub pushes** (`pubsub_audience`): the same OIDC checks with audience equal to `pubsub_audience`. `email_verified` must be `true`, and `email` must equal `pubsub_service_account_email`. If that setting is unset, every push is rejected.
+- **Why identity matters**: none of the audiences is secret. Anyone can get Google to sign a token for a public URL, so only the `email` claim (or the Chat issuer's own key) identifies the sender.
+- **Key caching**: both key sets are fetched asynchronously and cached for 1 hour. A failed fetch is not cached.
+- **Token lifetime**: `exp` and `iat` are required and checked with 300 s of clock skew. A token whose `exp` is 24 hours or more in the future is rejected, as google-auth-library does.
+- **Transports verify independently**: a request shape whose verifier is not configured is rejected with 401 unless `disable_signature_verification` is set. The constructor refuses to start when no verifier is configured and the opt-out is not set.
+- **A configured verifier beats the opt-out**: `disable_signature_verification` only covers a transport that has no verifier. Setting `endpoint_url` (even only for button routing) makes it a direct-webhook verifier, so direct webhooks are verified and the opt-out no longer applies to them. The constructor logs a warning when both are set.
+- **Endpoint inference**: when `endpoint_url` is unset, the button-click routing URL is inferred from `request.url`, but only after a direct webhook passes verification. It is never used as a verification audience.
 
 ### GitHub
 
@@ -101,9 +107,10 @@ When downloading media attachments from WhatsApp messages, the adapter validates
 
 ### Slack `response_url` Validation
 
-Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's domains:
+Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's response-URL hosts (port of upstream `isTrustedSlackResponseUrl`, vercel/chat#876). The check runs when an ephemeral message id is encoded, when it is decoded, and again right before the request is sent, and the SDK-free `send_slack_response_url` primitive applies the same check:
 
-- `https://hooks.slack.com/`
+- scheme `https`, no userinfo, no explicit port
+- host exactly `hooks.slack.com` or `hooks.slack-gov.com` (exact match, never a suffix match)
 
 ## Crypto: AES-256-GCM for Slack Token Encryption
 

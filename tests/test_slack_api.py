@@ -12,7 +12,11 @@ parseMessage edge cases, renderFormatted, link extraction, date parsing.
 
 from __future__ import annotations
 
+import base64
+import json
+import sys
 import time
+import types
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -148,6 +152,21 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat.get_user_name = MagicMock(return_value="test-bot")
     chat.get_logger = MagicMock(return_value=MagicMock())
     return chat
+
+
+def _install_recording_httpx(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Swap in a stand-in ``httpx`` whose ``AsyncClient`` records each
+    construction, so a test can prove no response_url request was made."""
+    created: list[Any] = []
+
+    class _RecordingAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            created.append(self)
+
+    fake = types.ModuleType("httpx")
+    fake.AsyncClient = _RecordingAsyncClient  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "httpx", fake)
+    return created
 
 
 def _patch_client(adapter: SlackAdapter, mock_client: MockSlackClient) -> None:
@@ -517,6 +536,30 @@ class TestEditMessage:
         assert "```" in body["text"]
         assert "markdown_text" not in body
 
+    @pytest.mark.asyncio
+    async def test_rejects_an_untrusted_encoded_response_url_before_fetching(self, monkeypatch):
+        adapter, client, _ = await _init_adapter()
+        created = _install_recording_httpx(monkeypatch)
+        # Hand-built: the encoder itself refuses untrusted URLs.
+        data = json.dumps({"responseUrl": "https://attacker.example/respond", "userId": "U123"})
+        ephemeral_id = f"ephemeral:1234567890.123456:{base64.b64encode(data.encode()).decode()}"
+
+        with pytest.raises(ValidationError, match="Invalid Slack ephemeral message ID"):
+            await adapter.edit_message("slack:C123:1234567890.000000", ephemeral_id, "private message")
+
+        assert created == []
+        client.chat_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_defends_the_response_url_fetch_sink_against_untrusted_callers(self, monkeypatch):
+        adapter, _, _ = await _init_adapter()
+        created = _install_recording_httpx(monkeypatch)
+
+        with pytest.raises(ValidationError, match="untrusted Slack response_url"):
+            await adapter._send_to_response_url("https://hooks.slack.com.attacker.example/respond", "delete")
+
+        assert created == []
+
 
 # =============================================================================
 # deleteMessage Tests
@@ -545,6 +588,51 @@ class TestDeleteMessage:
 
         calls = client.get_calls("chat_delete")
         assert calls[0]["kwargs"]["channel"] == "CXYZ"
+
+    @pytest.mark.asyncio
+    async def test_delete_rejects_malformed_ephemeral_id(self, monkeypatch):
+        """Python-specific: an undecodable ``ephemeral:`` id must raise rather
+        than fall through to ``chat.delete`` with a bogus ts."""
+        adapter, client, _ = await _init_adapter()
+        created = _install_recording_httpx(monkeypatch)
+
+        with pytest.raises(ValidationError, match="Invalid Slack ephemeral message ID"):
+            await adapter.delete_message("slack:C123:1234567890.000000", "ephemeral:1234567890.123456:!!not-base64!!")
+
+        client.chat_delete.assert_not_awaited()
+        assert created == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ephemeral_posts_to_gov_slack_response_url(self, monkeypatch):
+        """Python-specific: the response_url sink used to require
+        ``*.slack.com`` and so rejected GovSlack's ``hooks.slack-gov.com``."""
+        adapter, client, _ = await _init_adapter()
+        url = "https://hooks.slack-gov.com/actions/T123/456/abc"
+        ephemeral_id = adapter._encode_ephemeral_message_id("1234567890.123456", url, "U_GOV")
+
+        response = MagicMock(is_success=True, status_code=200, text="")
+        post = AsyncMock(return_value=response)
+
+        class _FakeAsyncClient:
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        _FakeAsyncClient.post = post  # type: ignore[attr-defined]
+        fake = types.ModuleType("httpx")
+        fake.AsyncClient = _FakeAsyncClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        await adapter.delete_message("slack:C123:1234567890.000000", ephemeral_id)
+
+        post.assert_awaited_once_with(
+            url,
+            json={"delete_original": True},
+            headers={"Content-Type": "application/json"},
+        )
+        client.chat_delete.assert_not_awaited()
 
 
 # =============================================================================
@@ -743,6 +831,73 @@ class TestFetchMessages:
         assert len(replies_calls) == 1
         assert replies_calls[0]["kwargs"]["ts"] == "1234567890.000000"
         assert client.get_calls("conversations_history") == []
+
+
+class TestFetchedMessagesKeepCachedUnfurls:
+    """Messages from ``conversations.history`` / ``conversations.replies`` carry
+    no ``channel`` field, so the unfurl cache key's channel must come from the
+    thread id the message is parsed under. Otherwise ``_enrich_links`` returns
+    early and fetched messages lose the ``message_changed`` unfurl metadata.
+
+    What to fix if this fails: ``SlackAdapter._unfurl_channel_for`` and its use
+    in ``_parse_slack_message``.
+    """
+
+    _TS = "1234567890.000050"
+    _URL = "https://example.com/article"
+
+    def _history_message(self) -> dict[str, Any]:
+        # Shape of a history/replies item: no ``channel`` key, bare link.
+        return {"ts": self._TS, "text": f"see <{self._URL}>", "user": "U1"}
+
+    def _unfurl_payload(self) -> dict[str, Any]:
+        return {self._URL: {"title": "Cached Title", "description": "Cached body"}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["fetch_messages", "fetch_message", "fetch_channel_messages"])
+    async def test_fetched_message_links_are_enriched_from_the_unfurl_cache(self, path: str):
+        adapter, client, state = await _init_adapter()
+        state._cache[f"slack:unfurls:C123:{self._TS}"] = self._unfurl_payload()
+        page = {"ok": True, "messages": [self._history_message()], "has_more": False}
+        client.set_response("conversations_replies", page)
+        client.set_response("conversations_history", page)
+
+        if path == "fetch_messages":
+            messages = (await adapter.fetch_messages("slack:C123:1234567890.000000")).messages
+        elif path == "fetch_message":
+            msg = await adapter.fetch_message("slack:C123:1234567890.000000", self._TS)
+            assert msg is not None
+            messages = [msg]
+        else:
+            messages = (await adapter.fetch_channel_messages("slack:C123")).messages
+
+        assert len(messages) == 1
+        links = messages[0].links
+        assert [link.url for link in links] == [self._URL]
+        assert links[0].title == "Cached Title"
+        assert links[0].description == "Cached body"
+
+    @pytest.mark.asyncio
+    async def test_fetched_message_uses_the_installation_scoped_unfurl_key(self):
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter, client, state = await _init_adapter()
+        # Only the T_A-scoped entry exists; an unscoped or wrong-install key
+        # must not be read.
+        state._cache[f"slack:unfurls:T_A:C123:{self._TS}"] = self._unfurl_payload()
+        client.set_response(
+            "conversations_replies",
+            {"ok": True, "messages": [self._history_message()], "has_more": False},
+        )
+
+        tok = adapter._request_context.set(RequestContext(token="xoxb-T_A", installation_id="T_A"))
+        try:
+            result = await adapter.fetch_messages("slack:C123:1234567890.000000")
+        finally:
+            adapter._request_context.reset(tok)
+
+        assert result.messages[0].links[0].title == "Cached Title"
+        state.get.assert_any_await(f"slack:unfurls:T_A:C123:{self._TS}")
 
 
 # =============================================================================
@@ -2156,6 +2311,53 @@ class TestEphemeralMessageId:
         adapter = _make_adapter()
         result = adapter._decode_ephemeral_message_id("ephemeral:123")
         assert result is None
+
+    def test_rejects_the_legacy_non_json_response_url_format(self):
+        adapter = _make_adapter()
+        encoded = "ephemeral:1234567890.123456:" + base64.b64encode(b"https://hooks.slack.com/respond").decode()
+
+        assert adapter._decode_ephemeral_message_id(encoded) is None
+
+    @pytest.mark.parametrize(
+        "response_url",
+        [
+            "http://hooks.slack.com/respond",
+            "https://hooks.slack.com.attacker.example/respond",
+            "https://user@hooks.slack.com/respond",
+            "https://hooks.slack.com:444/respond",
+            "https://attacker.example/respond",
+            # Python-specific: ``urlsplit(...).port`` raises on a non-numeric
+            # port; that must read as untrusted, not crash the decode.
+            "https://hooks.slack.com:abc/respond",
+        ],
+    )
+    def test_rejects_untrusted_response_url(self, response_url: str):
+        adapter = _make_adapter()
+        data = json.dumps({"responseUrl": response_url, "userId": "U123"})
+        encoded = f"ephemeral:1234567890.123456:{base64.b64encode(data.encode()).decode()}"
+
+        assert adapter._decode_ephemeral_message_id(encoded) is None
+        with pytest.raises(ValidationError, match="Refusing to encode an untrusted Slack response_url"):
+            adapter._encode_ephemeral_message_id("1234567890.123456", response_url, "U123")
+
+    def test_gov_slack_response_url_round_trips(self):
+        """Python-specific: GovSlack response URLs (``hooks.slack-gov.com``)
+        are trusted on both encode and decode."""
+        adapter = _make_adapter()
+        url = "https://hooks.slack-gov.com/actions/T123/456/abc"
+
+        decoded = adapter._decode_ephemeral_message_id(
+            adapter._encode_ephemeral_message_id("1234567890.123456", url, "U_GOV")
+        )
+
+        assert decoded == {"message_ts": "1234567890.123456", "response_url": url, "user_id": "U_GOV"}
+
+    def test_decode_rejects_missing_user_id(self):
+        adapter = _make_adapter()
+        data = json.dumps({"responseUrl": "https://hooks.slack.com/respond", "userId": ""})
+        encoded = f"ephemeral:1234567890.123456:{base64.b64encode(data.encode()).decode()}"
+
+        assert adapter._decode_ephemeral_message_id(encoded) is None
 
 
 # =============================================================================
