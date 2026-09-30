@@ -723,6 +723,11 @@ class Chat:
         if attempt is None:
             self._logger.info("Initializing chat instance...")
             attempt = asyncio.get_running_loop().create_task(self._run_init_attempt())
+            # Mark the failure observed: if every caller was cancelled, the
+            # shield drops its callback and nobody retrieves the exception
+            # ("Task exception was never retrieved"). Awaiting callers still
+            # get it re-raised.
+            attempt.add_done_callback(lambda t: t.cancelled() or t.exception())
             self._init_promise = attempt
         # Shield so a cancelled caller (e.g. an aborted webhook request) does
         # not cancel the attempt that concurrent callers share.

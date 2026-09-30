@@ -682,13 +682,17 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   the instance until `shutdown()`. `_do_initialize` logs it at error level
   (upstream only rejects). Python-specific: callers await the attempt through
   `asyncio.shield`, so a cancelled caller (an aborted webhook request) does not
-  cancel the attempt other callers share. The redundant `_init_lock` is gone;
+  cancel the attempt other callers share. A done-callback marks the attempt's
+  exception retrieved, so a failure nobody is left awaiting (every caller
+  cancelled) does not trigger asyncio's "Task exception was never retrieved".
+  The redundant `_init_lock` is gone;
   there is no `await` between the check and the assignment.
 - **Dedupe TTL.** `DEDUPE_TTL_MS` is 10 minutes (was 5), so an entry outlives
   Slack's ~+5 min Events API retry. `ChatConfig.dedupe_ttl_ms` now defaults to
   `None` and resolves with `is not None` (upstream `??`). Before this change the
   dataclass default `300000` always won and `0` fell through `or` to the
-  constant. The Slack Socket Mode retry-envelope half of `0b63791b` is #209.
+  constant. `0` now reaches the state adapter, and the bundled backends treat a
+  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #209.
 - **`wait_until` and handler errors (`c21ccbc0`, `91683e52`).** Upstream hands
   `waitUntil` a `task.catch(log)` promise that fulfils when the handler fails.
   Python passed the raw task, so a host that awaited it saw handler errors

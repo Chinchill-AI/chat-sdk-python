@@ -1731,7 +1731,9 @@ class ChatConfig:
     # or a full ConcurrencyConfig for fine-grained control.
     concurrency: ConcurrencyStrategy | ConcurrencyConfig | None = None
     # Milliseconds to remember a message ID for deduplication. ``None`` uses
-    # the default (10 min, ``chat.DEDUPE_TTL_MS``); ``0`` is passed through.
+    # the default (10 min, ``chat.DEDUPE_TTL_MS``). ``0`` is passed through;
+    # the bundled state backends treat it as no expiry, so message IDs are
+    # then deduped permanently (matches upstream).
     dedupe_ttl_ms: int | None = None
     fallback_streaming_placeholder_text: str | None = "..."
     # Resolves a stable cross-platform user key from inbound messages.

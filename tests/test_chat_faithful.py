@@ -31,6 +31,7 @@ from chat_sdk.testing import (
 )
 from chat_sdk.types import (
     ActionEvent,
+    AppHomeOpenedEvent,
     Attachment,
     Author,
     ChatConfig,
@@ -4611,7 +4612,66 @@ class TestWaitUntilHandlerErrors:
 
         assert returned.cancelled()
         assert tasks[0] is not returned
-        assert tasks[0].done()
+        # The wrapper is tracked in ``_active_tasks`` and cancelled by
+        # shutdown() itself; an untracked wrapper would finish with ``None``.
+        assert tasks[0].cancelled()
+
+    # Python-specific: when the handler task is cancelled (not the wrapper),
+    # the wrapper treats it as completion rather than re-raising.
+    async def test_cancelled_handler_completes_wait_until_wrapper_normally(self):
+        chat, adapter, _state = await _init_chat()
+        started = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            started.set()
+            await asyncio.Event().wait()
+
+        tasks: list[Any] = []
+        returned = chat.process_message(
+            adapter,
+            "slack:C123:wrap.3",
+            create_test_message("msg-cancel-handler", "Hey @slack-bot hi"),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        assert returned is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        returned.cancel()
+        (wrapper,) = tasks
+        (result,) = await asyncio.gather(wrapper, return_exceptions=True)
+
+        assert returned.cancelled()
+        assert result is None
+        assert not wrapper.cancelled()
+
+    # vercel/chat#942: reaction and lifecycle handlers always hand wait_until
+    # the error-swallowing wrapper; ``propagate_handler_errors`` only covers
+    # message, action and slash-command handlers.
+    async def test_reaction_and_lifecycle_wait_until_ignores_propagate_handler_errors(self):
+        chat, adapter, _state = await _init_chat()
+        handler_error = RuntimeError("handler failed")
+
+        async def fail(*_args: Any, **_kwargs: Any) -> None:
+            raise handler_error
+
+        chat.on_reaction(fail)
+        chat.on_app_home_opened(fail)
+        options_tasks: list[Any] = []
+        options = WebhookOptions(wait_until=options_tasks.append, propagate_handler_errors=True)
+
+        returned = chat.process_reaction(_make_reaction_event(adapter), options)
+        assert isinstance(returned, asyncio.Task)
+        chat.process_app_home_opened(AppHomeOpenedEvent(adapter=adapter, channel_id="D123", user_id="U123"), options)
+
+        reaction_wrapper, home_wrapper = options_tasks
+        assert reaction_wrapper is not returned
+        direct, reaction_result, home_result = await asyncio.gather(
+            returned, reaction_wrapper, home_wrapper, return_exceptions=True
+        )
+        assert direct is handler_error
+        assert reaction_result is None
+        assert home_result is None
 
 
 # ============================================================================
@@ -5423,6 +5483,12 @@ class TestChatInitializationRetry:
             ready.handle_webhook.assert_not_awaited()
             assert results[0] is failed
             assert results[1] is failed
+            logger = chat._logger
+            assert isinstance(logger, MockLogger)
+            assert (
+                "Adapter initialization failed; call shutdown() before retrying initialization",
+                {"error": "Adapter unavailable"},
+            ) in logger.error.calls
         finally:
             await chat.shutdown()
         assert active == 0
@@ -5599,3 +5665,41 @@ class TestChatInitializationRetry:
         await survivor
         assert state.connect.await_count == 1
         assert adapter.initialize.await_count == 1
+
+    # Python-specific: when the only caller is cancelled and the shielded
+    # attempt then fails, the failure must not surface as asyncio's
+    # "Task exception was never retrieved".
+    async def test_orphaned_failed_attempt_does_not_leak_unretrieved_exception(self):
+        import gc
+
+        state = create_mock_state()
+        connect_gate = asyncio.Event()
+
+        async def connect() -> None:
+            await connect_gate.wait()
+            raise ConnectionRefusedError("connect ECONNREFUSED")
+
+        state.connect = AsyncMock(side_effect=connect)  # type: ignore[method-assign]
+        chat = _retry_chat({}, state)
+        loop = asyncio.get_running_loop()
+        reported: list[str | None] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context.get("message")))
+        try:
+            caller = asyncio.ensure_future(chat.initialize())
+            await _settle()
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            connect_gate.set()
+            await _settle()
+            assert chat._init_promise is None
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert reported == []
+        # The next call still retries the (now failing) connection.
+        with pytest.raises(ConnectionRefusedError):
+            await chat.initialize()
