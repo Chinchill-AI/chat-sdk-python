@@ -100,9 +100,12 @@ _ATTACHMENT_TIMEOUT_S = 30.0
 _ATTACHMENT_CHUNK_BYTES = 64 * 1024
 _ATTACHMENT_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _UNTRUSTED_ATTACHMENT_URL_MESSAGE = "Refusing to fetch an untrusted attachment URL"
-# Plain DNS labels only. Rejects IP literals in brackets, percent-encoded or
-# non-ASCII hosts, empty labels and a trailing dot (``cdn.fbsbx.com.``), so the
-# host we validate is byte-for-byte the host aiohttp/yarl connects to.
+# Plain DNS labels only (matched against the lowercased ``hostname``; the raw
+# netloc is separately required to be ASCII, since ``str.lower()`` folds some
+# non-ASCII characters such as U+212A KELVIN SIGN to ASCII). Rejects IP
+# literals in brackets, percent-encoded or non-ASCII hosts, empty labels and a
+# trailing dot (``cdn.fbsbx.com.``), so the host we validate is the host
+# aiohttp/yarl connects to.
 _ATTACHMENT_HOSTNAME_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*")
 
 
@@ -111,7 +114,8 @@ def _is_trusted_messenger_media_url(url: str) -> bool:
 
     The host must equal one of :data:`_MESSENGER_MEDIA_HOSTS` or be a
     subdomain of one (case-insensitive). Userinfo, a non-443 explicit port,
-    whitespace/control characters and backslashes are rejected outright so
+    a non-ASCII authority, whitespace/control characters and backslashes
+    are rejected outright so
     ``urlsplit`` and aiohttp's URL parser cannot disagree about the host.
     """
     if not isinstance(url, str) or not url:
@@ -123,7 +127,7 @@ def _is_trusted_messenger_media_url(url: str) -> bool:
         port = parts.port
     except ValueError:
         return False
-    if parts.scheme != "https" or "@" in parts.netloc:
+    if parts.scheme != "https" or "@" in parts.netloc or not parts.netloc.isascii():
         return False
     if port is not None and port != 443:
         return False
@@ -992,6 +996,11 @@ class MessengerAdapter:
                     location = response.headers.get("Location")
                     if not location:
                         raise NetworkError("messenger", "Attachment redirect has no location")
+                    # Upstream order: the hop limit is checked before the next
+                    # Location is validated, so a 6th redirect always reports
+                    # "Too many attachment redirects" wherever it points.
+                    if _hop == _ATTACHMENT_MAX_REDIRECTS:
+                        raise NetworkError("messenger", "Too many attachment redirects")
                     try:
                         next_url = urljoin(current, location)
                     except ValueError:
@@ -1004,8 +1013,9 @@ class MessengerAdapter:
                     reason = response.reason or ""
                     raise NetworkError("messenger", f"Failed to fetch file: {status} {reason}".strip())
                 return await self._read_attachment_body(response)
-        # The initial request plus _ATTACHMENT_MAX_REDIRECTS hops all redirected.
-        raise NetworkError("messenger", "Too many attachment redirects")
+        # Unreachable: the final iteration either returns, raises on a non-2xx
+        # status, or raises "Too many attachment redirects" above.
+        raise NetworkError("messenger", "Too many attachment redirects")  # pragma: no cover
 
     @staticmethod
     async def _read_attachment_body(response: Any) -> bytes:

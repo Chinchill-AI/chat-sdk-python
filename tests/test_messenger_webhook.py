@@ -1081,6 +1081,30 @@ class TestRehydrateAttachment:
             await rehydrated.fetch_data()
         assert session.calls == []
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tampered_url", [123, ["https://cdn.fbsbx.com/x"], {"href": "https://cdn.fbsbx.com/x"}])
+    async def test_rehydrated_closure_refuses_non_string_url_without_io(self, tampered_url: object) -> None:
+        """A truthy non-string ``fetch_metadata["url"]`` fails as ``NetworkError``.
+
+        Without the ``isinstance(url, str)`` guard the URL check would raise a
+        raw ``TypeError`` from ``urlsplit`` instead.
+        """
+        from chat_sdk.types import Attachment
+
+        session = FakeSession(FakeResponse(b"internal"))
+        adapter = make_adapter(session)
+        tampered = Attachment(
+            type="image",
+            url="https://scontent.xx.fbcdn.net/img.jpg",
+            fetch_metadata={"url": tampered_url},
+        )
+
+        rehydrated = adapter.rehydrate_attachment(tampered)
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
+            await rehydrated.fetch_data()
+        assert session.calls == []
+
     def test_rehydrate_no_metadata_returns_unchanged(self) -> None:
         """Degraded mode: attachment without ``fetch_metadata`` is returned as-is."""
         adapter = _make_adapter()

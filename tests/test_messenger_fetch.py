@@ -260,6 +260,21 @@ class TestMessengerAttachmentFetchRedirects:
         assert len(session.calls) == 6
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("location", ["https://example.com/final", "https://[::1/file"])
+    async def test_sixth_redirect_reports_the_limit_before_validating_location(self, location: str) -> None:
+        # Upstream download.ts checks ``hop === redirects`` before
+        # ``validateAttachmentUrl(new URL(location, url))``, so the 6th
+        # redirect is "Too many" even when it points somewhere untrusted
+        # or malformed.
+        hops = [redirect(f"https://cdn.fbsbx.com/hop{i}") for i in range(1, 6)]
+        session = FakeSession(*hops, redirect(location))
+        adapter = make_adapter(session)
+
+        with pytest.raises(NetworkError, match="Too many attachment redirects"):
+            await adapter._download_attachment("https://cdn.fbsbx.com/hop0")
+        assert len(session.calls) == 6
+
+    @pytest.mark.asyncio
     async def test_redirect_without_location_raises_network_error(self) -> None:
         adapter = make_adapter(FakeSession(FakeResponse(status=302, reason="Found")))
 
@@ -353,6 +368,9 @@ class TestMessengerAttachmentUrlParsing:
             "https://[cdn.fbsbx.com]/file",
             "https://cdn..fbsbx.com/file",
             "https://cdnfbsbx.com/file",
+            # U+212A KELVIN SIGN lowercases to ASCII "k"; a non-ASCII
+            # authority must not pass the ASCII-label check via ``.lower()``.
+            "https://\u212a.fbcdn.net/file",
         ],
     )
     async def test_rejects_ambiguous_or_non_default_urls(self, url: str) -> None:
