@@ -106,9 +106,10 @@ When downloading media attachments from WhatsApp messages, the adapter validates
 
 ### Slack `response_url` Validation
 
-Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's domains:
+Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's response-URL hosts (port of upstream `isTrustedSlackResponseUrl`, vercel/chat#876). The check runs when an ephemeral message id is encoded, when it is decoded, and again right before the request is sent, and the SDK-free `send_slack_response_url` primitive applies the same check:
 
-- `https://hooks.slack.com/`
+- scheme `https`, no userinfo, no explicit port
+- host exactly `hooks.slack.com` or `hooks.slack-gov.com` (exact match, never a suffix match)
 
 ## Crypto: AES-256-GCM for Slack Token Encryption
 

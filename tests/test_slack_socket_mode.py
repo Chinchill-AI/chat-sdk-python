@@ -734,11 +734,11 @@ class TestSocketContextVar:
             return_value=RequestContext(token="xoxb-team-1")
         )
 
-        captured_tokens: list[str | None] = []
+        captured: list[tuple[str, str | None] | None] = []
 
         def capture_message(*args: Any, **kwargs: Any) -> None:
             ctx = adapter._request_context.get()
-            captured_tokens.append(ctx.token if ctx else None)
+            captured.append((ctx.token, ctx.installation_id) if ctx else None)
 
         chat.process_message = MagicMock(side_effect=capture_message)
         ack = AsyncMock()
@@ -753,8 +753,94 @@ class TestSocketContextVar:
             },
         }
         await adapter._route_socket_event(body, "events_api", ack)
-        assert captured_tokens == ["xoxb-team-1"]
+        # The installation id rides along so cache keys are scoped to it.
+        assert captured == [("xoxb-team-1", "T1")]
         # And the outer context wasn't polluted.
+        assert adapter._request_context.get() is None
+
+    @staticmethod
+    def _multi_workspace_socket_adapter() -> tuple[SlackAdapter, MagicMock, AsyncMock]:
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                mode="socket",
+                app_token="xapp-1-x",
+                client_id="cid",
+                client_secret="csec",
+            )
+        )
+        chat = _make_mock_chat()
+        adapter._chat = chat
+        # The stub returns a context WITHOUT installation_id, so only the
+        # route's own ``replace(ctx, installation_id=...)`` can set it.
+        resolve = AsyncMock(return_value=RequestContext(token="xoxb-team-1"))
+        adapter._resolve_token_for_team = resolve  # type: ignore[method-assign]
+        return adapter, chat, resolve
+
+    async def test_slash_command_runs_under_the_team_installation_id(self):
+        """Python-specific: without the installation id in context, slash
+        handlers write user caches to the unscoped global keys (#205)."""
+        adapter, _, resolve = self._multi_workspace_socket_adapter()
+        captured: list[tuple[str, str | None] | None] = []
+
+        async def capture_slash(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            ctx = adapter._request_context.get()
+            captured.append((ctx.token, ctx.installation_id) if ctx else None)
+            return {"body": "", "status": 200}
+
+        adapter._handle_slash_command = AsyncMock(side_effect=capture_slash)  # type: ignore[method-assign]
+        ack = AsyncMock()
+
+        await adapter._route_socket_event(
+            {"command": "/foo", "text": "bar", "user_id": "U1", "channel_id": "C1", "team_id": "T1"},
+            "slash_commands",
+            ack,
+        )
+        # Slash dispatch is fire-and-forget; let the spawned task finish.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        resolve.assert_awaited_once_with("T1")
+        assert captured == [("xoxb-team-1", "T1")]
+        assert adapter._request_context.get() is None
+
+    @pytest.mark.parametrize(
+        "team_fields",
+        [
+            {"team": {"id": "T1"}},
+            # Upstream ``team?.id || payload.team_id``: a ``team`` object
+            # with no id still falls back to the top-level ``team_id``.
+            {"team": {"domain": "acme"}, "team_id": "T1"},
+            {"team_id": "T1"},
+        ],
+    )
+    async def test_interactive_payload_runs_under_the_team_installation_id(self, team_fields: dict[str, Any]):
+        adapter, chat, resolve = self._multi_workspace_socket_adapter()
+        captured: list[tuple[str, str | None] | None] = []
+
+        def capture_action(*args: Any, **kwargs: Any) -> None:
+            ctx = adapter._request_context.get()
+            captured.append((ctx.token, ctx.installation_id) if ctx else None)
+
+        chat.process_action = MagicMock(side_effect=capture_action)
+        ack = AsyncMock()
+
+        await adapter._route_socket_event(
+            {
+                "type": "block_actions",
+                **team_fields,
+                "actions": [{"type": "button", "action_id": "test_action", "value": "v"}],
+                "channel": {"id": "C123", "name": "test"},
+                "message": {"ts": "1234567890.123456"},
+                "user": {"id": "U_USER", "username": "testuser"},
+            },
+            "interactive",
+            ack,
+        )
+
+        resolve.assert_awaited_once_with("T1")
+        assert captured == [("xoxb-team-1", "T1")]
         assert adapter._request_context.get() is None
 
     async def test_concurrent_events_for_different_teams_do_not_cross_contaminate(self):
@@ -833,6 +919,99 @@ class TestSocketContextVar:
         assert observed["T2"] == ["xoxb-T2"], f"T2 saw wrong token(s): {observed}"
         # Outer context wasn't polluted by either dispatch.
         assert adapter._request_context.get() is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-workspace: unresolved installations are acked, never dispatched
+# (vercel/chat#877)
+# ---------------------------------------------------------------------------
+
+
+class TestSocketUnresolvedInstallations:
+    @staticmethod
+    def _multi_workspace_adapter(resolved: Any) -> tuple[SlackAdapter, MagicMock, AsyncMock]:
+        adapter = SlackAdapter(
+            SlackAdapterConfig(
+                mode="socket",
+                app_token="xapp-1-x",
+                client_id="cid",
+                client_secret="csec",
+            )
+        )
+        chat = _make_mock_chat()
+        adapter._chat = chat
+        resolve = AsyncMock(return_value=resolved)
+        adapter._resolve_token_for_team = resolve  # type: ignore[method-assign]
+        return adapter, chat, resolve
+
+    async def test_drops_socket_interactive_payloads_with_no_installation(self):
+        adapter, chat, resolve = self._multi_workspace_adapter(None)
+        ack = AsyncMock()
+
+        await adapter._route_socket_event(
+            {
+                "type": "block_actions",
+                "team": {"id": "T_UNKNOWN"},
+                "actions": [{"type": "button", "action_id": "test_action", "value": "v"}],
+                "channel": {"id": "C123", "name": "test"},
+                "message": {"ts": "1234567890.123456"},
+                "user": {"id": "U_USER", "username": "testuser"},
+            },
+            "interactive",
+            ack,
+        )
+
+        resolve.assert_awaited_once_with("T_UNKNOWN")
+        chat.process_action.assert_not_called()
+        ack.assert_awaited_once_with()
+
+    async def test_socket_interactive_without_team_id_is_not_dispatched(self):
+        """Python-specific: a falsy team id used to skip resolution and
+        dispatch the interactive payload with no token context."""
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter, chat, resolve = self._multi_workspace_adapter(RequestContext(token="xoxb-unused"))
+        ack = AsyncMock()
+
+        await adapter._route_socket_event(
+            {
+                "type": "block_actions",
+                "actions": [{"type": "button", "action_id": "test_action", "value": "v"}],
+                "channel": {"id": "C123", "name": "test"},
+                "message": {"ts": "1234567890.123456"},
+                "user": {"id": "U_USER", "username": "testuser"},
+            },
+            "interactive",
+            ack,
+        )
+
+        resolve.assert_not_awaited()
+        chat.process_action.assert_not_called()
+        ack.assert_awaited_once_with()
+
+    async def test_socket_slash_without_team_id_is_not_dispatched(self):
+        """Python-specific: a multi-workspace socket slash command with no
+        ``team_id`` used to dispatch with no token context."""
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter, chat, resolve = self._multi_workspace_adapter(RequestContext(token="xoxb-unused"))
+        handle = AsyncMock()
+        adapter._handle_slash_command = handle  # type: ignore[method-assign]
+        ack = AsyncMock()
+
+        await adapter._route_socket_event(
+            {"command": "/foo", "text": "bar", "user_id": "U1", "channel_id": "C1"},
+            "slash_commands",
+            ack,
+        )
+        # Slash dispatch is fire-and-forget; let the spawned task finish.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        ack.assert_awaited_once_with()
+        resolve.assert_not_awaited()
+        handle.assert_not_awaited()
+        chat.process_slash_command.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

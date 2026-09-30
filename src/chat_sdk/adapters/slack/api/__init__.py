@@ -29,7 +29,8 @@ returned by the default fetch.
 
 Python-specific hardening (divergences from upstream, see
 ``docs/UPSTREAM_SYNC.md``): ``send_slack_response_url`` requires an
-``https://*.slack.com`` URL and ``fetch_slack_file`` requires a trusted
+``https://hooks.slack.com`` / ``https://hooks.slack-gov.com`` URL and
+``fetch_slack_file`` requires a trusted
 Slack file host before forwarding the bearer token (SSRF / token-leak
 guards mirroring the high-level adapter).
 """
@@ -41,7 +42,7 @@ import json as _json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse, urlsplit
 
 __all__ = [
     "SlackApiError",
@@ -375,9 +376,10 @@ async def send_slack_response_url(
 ) -> None:
     """POST a JSON payload to a Slack interaction ``response_url``.
 
-    Python-specific hardening: the URL must be ``https://*.slack.com``
-    (response URLs always are) — refuses to POST elsewhere (SSRF guard,
-    mirrors the high-level adapter).
+    Python-specific hardening: the URL must be a Slack-issued response URL
+    (``https`` on ``hooks.slack.com`` / ``hooks.slack-gov.com``, no userinfo
+    or explicit port) — refuses to POST elsewhere (SSRF guard, same check
+    as the high-level adapter).
     """
     _assert_slack_response_url(url)
     payload: dict[str, Any] = {}
@@ -682,10 +684,50 @@ def _slack_message_body(
     }
 
 
+# Hosts Slack issues ``response_url``s on (commercial + GovSlack). Exact-set
+# membership only — never a suffix match, so lookalike hosts such as
+# ``hooks.slack.com.attacker.example`` are rejected. Shared with the
+# high-level adapter (port of upstream ``SLACK_RESPONSE_URL_HOSTS``,
+# vercel/chat#876).
+_SLACK_RESPONSE_URL_HOSTS = frozenset({"hooks.slack.com", "hooks.slack-gov.com"})
+
+
+def _is_trusted_slack_response_url(value: object) -> bool:
+    """Return True when *value* is a Slack-issued ``response_url``.
+
+    Port of upstream ``isTrustedSlackResponseUrl`` (vercel/chat#876):
+    scheme ``https``, no userinfo, no explicit port, and a host in
+    :data:`_SLACK_RESPONSE_URL_HOSTS`. Anything unparsable (including a
+    non-numeric port, which makes ``urlsplit(...).port`` raise) is untrusted.
+
+    Marginally stricter than upstream's WHATWG ``URL`` check: an explicit
+    ``:443`` and an empty ``@`` userinfo are rejected rather than normalized
+    away. Slack never issues either form.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return False
+    hostname = parts.hostname
+    return (
+        parts.scheme == "https"
+        and parts.username is None
+        and parts.password is None
+        and port is None
+        and hostname is not None
+        and hostname.lower() in _SLACK_RESPONSE_URL_HOSTS
+    )
+
+
 def _assert_slack_response_url(url: str) -> None:
-    parsed = urlparse(url)
-    if not (parsed.scheme == "https" and parsed.hostname and parsed.hostname.endswith(".slack.com")):
-        raise ValueError(f"Invalid response_url: must be https://*.slack.com, got {url}")
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's
+    # SDK-free ``sendResponseUrl`` POSTs to any URL; this primitive applies
+    # the same allowlist the high-level adapter uses.
+    if not _is_trusted_slack_response_url(url):
+        raise ValueError("Invalid response_url: must be an https://hooks.slack.com or https://hooks.slack-gov.com URL")
 
 
 def _encode_slack_api_value(value: Any) -> str:
