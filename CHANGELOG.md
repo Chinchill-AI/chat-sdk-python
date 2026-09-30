@@ -4,6 +4,8 @@
 
 Work toward upstream `chat@4.41.1` parity, tracked in #184. `UPSTREAM_PARITY` stays `4.31.0` until the wave's final PR (#203).
 
+- **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
 ### Google Chat: webhook JWT verification bound to configured identities (#222, security)
 
 Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) and `c3b5a08e` (#797, chat@4.37.0). Before this change, Google Chat webhook verification checked only a Google signature and the `aud` claim. The audiences in play (project number, endpoint URL, Pub/Sub push URL) are not secrets, so that check did not identify the caller. Every transport is now bound to a configured identity:
