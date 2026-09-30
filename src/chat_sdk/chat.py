@@ -212,9 +212,9 @@ async def _sleep(ms: int) -> None:
 def _now_ms() -> int:
     """Wall-clock epoch milliseconds (``Date.now()``).
 
-    Used for everything compared against state-backend timestamps
-    (``Lock.expires_at``, ``QueueEntry.expires_at``). Module-level so tests
-    can swap in a fake clock together with :func:`_sleep`.
+    Used for timestamps stored in the state backend (``QueueEntry``
+    ``enqueued_at`` / ``expires_at``). Module-level so tests can swap in a
+    fake clock together with :func:`_sleep`.
     """
     return int(time.time() * 1000)
 
@@ -223,8 +223,12 @@ def _monotonic_ms() -> int:
     """Monotonic milliseconds for measuring elapsed local durations.
 
     Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream measures
-    the ``maxLockLifetimeMs`` cap with ``Date.now()``; a wall-clock jump
-    (NTP step) could then end renewal early or extend it indefinitely.
+    the ``maxLockLifetimeMs`` cap and the heartbeat's ``heldUntil`` with
+    ``Date.now()`` and seeds ``heldUntil`` from ``Lock.expiresAt``. Here both
+    use this clock: a wall-clock jump (NTP step) cannot end renewal early or
+    extend it indefinitely, and a backend whose ``expires_at`` is on another
+    clock (the Python Postgres backend stamps it with the database's
+    ``now()``) cannot make a fresh lock look lapsed.
     """
     return int(time.monotonic() * 1000)
 
@@ -239,6 +243,13 @@ class _LockHeartbeat:
     lock lapses at its TTL), and marks ownership lost when an extend returns
     ``False`` or the backend stays unreachable past the last known expiry.
 
+    ``held_until`` is a local monotonic deadline, not ``Lock.expires_at``:
+    ``acquired_at_ms`` is the monotonic instant just *before* the
+    ``acquire_lock`` request, so ``acquired_at_ms + DEFAULT_LOCK_TTL_MS`` is a
+    lower bound on when the backend's TTL can run out, whichever clock the
+    backend used for ``expires_at``. Each successful extend refreshes it the
+    same way, from the instant the extend was requested.
+
     Use via :meth:`Chat._with_held_lock`, which always awaits :meth:`stop`
     before ``release_lock`` so an in-flight extend cannot land after the
     release.
@@ -248,6 +259,7 @@ class _LockHeartbeat:
         self,
         state: StateAdapter,
         lock: Lock,
+        acquired_at_ms: int,
         max_lifetime_ms: int,
         logger: Logger,
     ) -> None:
@@ -256,10 +268,10 @@ class _LockHeartbeat:
         self._max_lifetime_ms = max_lifetime_ms
         self._logger = logger
         self._started_at = _monotonic_ms()
-        # Latest wall-clock instant (epoch ms) we know the lock is still ours;
-        # refreshed on each successful extend. Once it passes, the lock has
-        # lapsed on the backend.
-        self._held_until = lock.expires_at
+        # Monotonic deadline (ms) until which we know the lock is still ours;
+        # refreshed on each successful extend. Once it passes, the lock may
+        # have lapsed on the backend.
+        self._held_until = acquired_at_ms + DEFAULT_LOCK_TTL_MS
         self._ownership_lost = False
         self._stopped = False
         self._in_flight: asyncio.Task[bool] | None = None
@@ -272,11 +284,23 @@ class _LockHeartbeat:
 
     def is_ownership_lost(self) -> bool:
         """True once this instance can no longer assume it still owns the lock."""
-        return self._ownership_lost or _now_ms() >= self._held_until
+        return self._ownership_lost or _monotonic_ms() >= self._held_until
 
     async def _run(self) -> None:
-        # CancelledError is deliberately not caught here: ``stop()`` cancels
-        # this task and must observe the cancellation.
+        # CancelledError is deliberately not caught: ``stop()`` cancels this
+        # task and must observe the cancellation.
+        try:
+            await self._renew()
+        except Exception as err:
+            # A lapsed lock lets another message run on the thread, so a
+            # crashed renewal loop must never be silent. The ``held_until``
+            # rule still ends drains once the lock may have lapsed.
+            self._logger.error(
+                "Lock heartbeat crashed — the lock will lapse at its TTL",
+                {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
+            )
+
+    async def _renew(self) -> None:
         interval_ms = DEFAULT_LOCK_TTL_MS // 3
         while True:
             await _sleep(interval_ms)
@@ -304,12 +328,13 @@ class _LockHeartbeat:
 
     async def _extend_once(self) -> bool:
         """Run one extend. Returns ``False`` when renewal must stop."""
+        requested_at = _monotonic_ms()
         try:
             extended = await self._state.extend_lock(self._lock, DEFAULT_LOCK_TTL_MS)
         except Exception as err:
             if self._stopped:
                 return False
-            if _now_ms() >= self._held_until:
+            if _monotonic_ms() >= self._held_until:
                 self._ownership_lost = True
                 self._logger.warn(
                     "Lock lapsed while the heartbeat could not reach the state backend",
@@ -322,7 +347,9 @@ class _LockHeartbeat:
             )
             return True
         if extended:
-            self._held_until = _now_ms() + DEFAULT_LOCK_TTL_MS
+            # The backend applied the new TTL after ``requested_at``, so this
+            # deadline never runs past the backend's expiry.
+            self._held_until = requested_at + DEFAULT_LOCK_TTL_MS
             return True
         self._ownership_lost = True
         if not self._stopped:
@@ -348,9 +375,17 @@ class _LockHeartbeat:
         await asyncio.wait(pending)
         # Retrieve outcomes so a finished task never logs "exception was
         # never retrieved"; a cancelled loop task is the expected outcome.
+        # ``_run`` and ``_extend_once`` handle ``Exception`` themselves, so
+        # anything left here is unexpected: log it rather than drop it.
         for task in pending:
-            if not task.cancelled():
-                task.exception()
+            if task.cancelled():
+                continue
+            err = task.exception()
+            if err is not None:
+                self._logger.error(
+                    "Lock heartbeat task failed",
+                    {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
+                )
 
 
 def _create_task(
@@ -483,6 +518,16 @@ class Chat:
                 concurrency.max_lock_lifetime_ms
                 if concurrency.max_lock_lifetime_ms is not None
                 else DEFAULT_MAX_LOCK_LIFETIME_MS
+            )
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Fail fast on
+        # a non-integer cap (e.g. a string read from an env var): the
+        # heartbeat compares it with elapsed milliseconds on every tick, and
+        # a TypeError there would stop renewal. ``bool`` is rejected too.
+        lifetime = self._concurrency_max_lock_lifetime_ms
+        if isinstance(lifetime, bool) or not isinstance(lifetime, int) or lifetime < 0:
+            raise ValueError(
+                f"ConcurrencyConfig.max_lock_lifetime_ms must be a non-negative integer (milliseconds) or None; "
+                f"got {lifetime!r}."
             )
 
         # -- Concurrent-strategy semaphore ------------------------------------
@@ -2156,10 +2201,10 @@ class Chat:
         lock_key: str,
         message: Message,
     ) -> None:
-        lock = await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+        lock, acquired_at = await self._acquire_thread_lock(lock_key)
         if lock is None:
             # Lock acquisition failed -- consult on_lock_conflict policy
-            lock = await self._resolve_lock_conflict(thread_id, lock_key, message)
+            lock, acquired_at = await self._resolve_lock_conflict(thread_id, lock_key, message)
             if lock is None:
                 self._logger.warn("Could not acquire lock on thread", {"thread_id": thread_id, "lock_key": lock_key})
                 raise LockError(
@@ -2172,24 +2217,34 @@ class Chat:
         async def _run(_heartbeat: _LockHeartbeat) -> None:
             await self._dispatch_to_handlers(adapter, thread_id, message)
 
-        await self._with_held_lock(lock, thread_id, lock_key, _run)
+        await self._with_held_lock(lock, acquired_at, thread_id, lock_key, _run)
+
+    async def _acquire_thread_lock(self, lock_key: str) -> tuple[Lock | None, int]:
+        """Acquire ``lock_key`` for ``DEFAULT_LOCK_TTL_MS``.
+
+        Also returns the monotonic instant taken just before the request,
+        which seeds the heartbeat's ``held_until`` (see :class:`_LockHeartbeat`).
+        """
+        requested_at = _monotonic_ms()
+        lock = await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+        return lock, requested_at
 
     async def _resolve_lock_conflict(
         self,
         thread_id: str,
         lock_key: str,
         message: Message,
-    ) -> Lock | None:
+    ) -> tuple[Lock | None, int]:
         """Attempt to resolve a lock conflict based on the ``on_lock_conflict`` policy.
 
-        Returns a :class:`Lock` if the conflict was resolved and the lock
-        was successfully re-acquired, or ``None`` if the message should be
-        dropped.
+        Returns ``(lock, acquired_at)`` from :meth:`_acquire_thread_lock` if
+        the conflict was resolved and the lock was successfully re-acquired,
+        or ``(None, 0)`` if the message should be dropped.
         """
         conflict = self._on_lock_conflict
 
         if conflict is None or conflict == "drop":
-            return None
+            return None, 0
 
         if conflict == "force":
             self._logger.info(
@@ -2197,7 +2252,7 @@ class Chat:
                 {"thread_id": thread_id, "lock_key": lock_key},
             )
             await self._state_adapter.force_release_lock(lock_key)
-            return await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+            return await self._acquire_thread_lock(lock_key)
 
         # Callable handler -- invoke and inspect result
         if callable(conflict):
@@ -2211,9 +2266,9 @@ class Chat:
                     {"thread_id": thread_id, "lock_key": lock_key},
                 )
                 await self._state_adapter.force_release_lock(lock_key)
-                return await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+                return await self._acquire_thread_lock(lock_key)
 
-        return None
+        return None, 0
 
     # -- Queue / Debounce strategy -------------------------------------------
 
@@ -2230,7 +2285,7 @@ class Chat:
         on_queue_full = self._concurrency_on_queue_full
         debounce_ms = self._concurrency_debounce_ms
 
-        lock = await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+        lock, acquired_at = await self._acquire_thread_lock(lock_key)
 
         if lock is None:
             # Lock busy -- enqueue. Debounce shares the queue capacity
@@ -2320,13 +2375,14 @@ class Chat:
                 await self._dispatch_to_handlers(adapter, thread_id, message)
                 await self._drain_queue(heartbeat, adapter, lock_key)
 
-        await self._with_held_lock(lock, thread_id, lock_key, _run)
+        await self._with_held_lock(lock, acquired_at, thread_id, lock_key, _run)
 
     # -- Held-lock lifecycle -------------------------------------------------
 
     async def _with_held_lock(
         self,
         lock: Lock,
+        acquired_at: int,
         thread_id: str,
         lock_key: str,
         fn: Callable[[_LockHeartbeat], Awaitable[None]],
@@ -2342,6 +2398,7 @@ class Chat:
         heartbeat = _LockHeartbeat(
             self._state_adapter,
             lock,
+            acquired_at,
             self._concurrency_max_lock_lifetime_ms,
             self._logger,
         )

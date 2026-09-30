@@ -449,3 +449,348 @@ class TestLockLifetimeConfig:
 
         release.set()
         await task
+
+
+def _skew_acquired_expiry(state: MockStateAdapter, skew_ms: int) -> None:
+    """Return ``Lock.expires_at`` on a backend clock ``skew_ms`` off the app's.
+
+    The Python Postgres backend stamps ``expires_at`` with the database's
+    ``now()``; a negative skew is a database clock running behind the app
+    host. The backend's own expiry bookkeeping is unchanged.
+    """
+    real_acquire = state.acquire_lock
+
+    async def skewed_acquire(thread_id: str, ttl_ms: int) -> Lock | None:
+        lock = await real_acquire(thread_id, ttl_ms)
+        if lock is None:
+            return None
+        return Lock(thread_id=lock.thread_id, token=lock.token, expires_at=lock.expires_at + skew_ms)
+
+    state.acquire_lock = skewed_acquire  # type: ignore[method-assign]
+
+
+class TestHeldUntilIsLocal:
+    """``held_until`` is seeded from the local clock, not ``Lock.expires_at``."""
+
+    async def test_lagging_backend_expiry_still_dispatches_the_debounced_message(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        _skew_acquired_expiry(state, -29_000)
+        chat, adapter, logger = await _make_chat(
+            state, concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=1500)
+        )
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("skew-d-1", "Hey @slack-bot"))
+        )
+        await clock.advance(1500)
+        await clock.advance(1500)
+        await task
+
+        assert handled == ["skew-d-1"]
+        assert "Stopping debounce loop after lock ownership was lost" not in _warn_messages(logger)
+
+    async def test_lagging_backend_expiry_still_drains_the_queue(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        _skew_acquired_expiry(state, -31_000)
+        chat, adapter, _ = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "skew-q-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("skew-q-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["skew-q-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("skew-q-2", "Hey @slack-bot two"))
+        await clock.advance(1_000)
+        release.set()
+        await first
+
+        assert handled == ["skew-q-1", "skew-q-2"]
+        assert await state.queue_depth(THREAD) == 0
+
+    async def test_leading_backend_expiry_does_not_stretch_ownership_past_the_ttl(self, monkeypatch):
+        # Backend clock 60s ahead: expires_at claims 90s of ownership. With
+        # the backend unreachable, the drain must still stop once the TTL
+        # measured locally has run out.
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        _skew_acquired_expiry(state, 60_000)
+        state.extend_lock = AsyncMock(side_effect=ConnectionError("backend down"))  # type: ignore[method-assign]
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "lead-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("lead-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["lead-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("lead-2", "Hey @slack-bot two"))
+        await clock.advance(DEFAULT_LOCK_TTL_MS + 1)
+        release.set()
+        await first
+
+        assert handled == ["lead-1"]
+        assert "Lock lapsed while the heartbeat could not reach the state backend" in _warn_messages(logger)
+        assert await state.queue_depth(THREAD) == 1
+
+    async def test_slow_extend_refreshes_ownership_from_when_it_was_requested(self, monkeypatch):
+        # The backend applies the new TTL somewhere inside a slow extend, so
+        # the local deadline counts from the request (10s -> 40s), not from
+        # when the call returned (18s -> 48s).
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        calls = 0
+
+        async def slow_then_down(lock: Lock, ttl_ms: int) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await clock.sleep(8_000)
+                return True
+            raise ConnectionError("backend down")
+
+        state.extend_lock = AsyncMock(side_effect=slow_then_down)  # type: ignore[method-assign]
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "slow-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("slow-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["slow-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("slow-2", "Hey @slack-bot two"))
+        await clock.advance(41_000)
+        release.set()
+        await first
+
+        assert handled == ["slow-1"]
+        assert "Stopping queue drain after lock ownership was lost" in _warn_messages(logger)
+        assert await state.queue_depth(THREAD) == 1
+
+    async def test_wall_clock_step_does_not_make_a_held_lock_look_lapsed(self, monkeypatch):
+        # Divergence from upstream (heldUntil on Date.now()) -- see
+        # docs/UPSTREAM_SYNC.md. An NTP step forward must not strand the queue.
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        state.extend_lock = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "step-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("step-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["step-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("step-2", "Hey @slack-bot two"))
+        clock.jump_wall_clock(DEFAULT_LOCK_TTL_MS + 1)
+        release.set()
+        await first
+
+        assert handled == ["step-1", "step-2"]
+        assert "Stopping queue drain after lock ownership was lost" not in _warn_messages(logger)
+
+
+class TestLifetimeCapEndsDrains:
+    """``max_lock_lifetime_ms`` bounds drains: renewal stops, the lock lapses, the loop exits."""
+
+    async def test_queue_drain_stops_after_the_capped_lock_lapses(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        chat, adapter, logger = await _make_chat(
+            state, concurrency=ConcurrencyConfig(strategy="queue", max_lock_lifetime_ms=20_000)
+        )
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "cap-q-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("cap-q-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["cap-q-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("cap-q-2", "Hey @slack-bot two"))
+        # Extend at 10s (held until 40s); the cap stops renewal at the 20s tick.
+        await clock.advance(40_001)
+        release.set()
+        await first
+
+        warns = _warn_messages(logger)
+        assert "Lock heartbeat reached max_lock_lifetime_ms — the lock will lapse at its TTL" in warns
+        assert "Stopping queue drain after lock ownership was lost" in warns
+        assert handled == ["cap-q-1"]
+        assert await state.queue_depth(THREAD) == 1
+
+    async def test_continuous_debounce_traffic_ends_one_ttl_after_the_cap(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        chat, adapter, logger = await _make_chat(
+            state,
+            concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=1500, max_lock_lifetime_ms=20_000),
+        )
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            return None
+
+        started_at = clock.now
+        holder = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("cap-d-0", "Hey @slack-bot"))
+        )
+        others: list[asyncio.Task[None]] = []
+        n = 0
+        while not holder.done() and clock.now - started_at < 60_000:
+            await clock.advance(1_000)
+            n += 1
+            others.append(
+                asyncio.create_task(
+                    chat.handle_incoming_message(adapter, THREAD, create_test_message(f"cap-d-{n}", "Hey @slack-bot"))
+                )
+            )
+        ended_after = clock.now - started_at
+
+        assert holder.done()
+        # Held until 40s (extend at 10s, cap at the 20s tick); the loop
+        # notices after its next debounce sleep.
+        assert 40_000 <= ended_after <= 40_000 + 1_500 + 1_000
+        assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
+
+        await clock.advance(10_000)
+        await asyncio.gather(holder, *others)
+
+    async def test_skipped_resets_between_dispatches_in_one_debounce_loop(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        chat, adapter, _ = await _make_chat(state, concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=1500))
+        release = asyncio.Event()
+        received: list[tuple[str, list[str]]] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append((message.id, [m.id for m in context.skipped]))
+            if message.id == "reset-2":
+                await release.wait()
+
+        holder = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("reset-1", "Hey @slack-bot one"))
+        )
+        await clock.advance(500)
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("reset-2", "Hey @slack-bot two"))
+        await clock.wait_for(lambda: len(received) == 1)
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("reset-3", "Hey @slack-bot three"))
+        release.set()
+        await clock.advance(1500)
+        await clock.advance(1500)
+        await holder
+
+        assert received == [("reset-2", ["reset-1"]), ("reset-3", [])]
+
+    async def test_holder_self_enqueue_keeps_a_leftover_entry_as_skipped(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        chat, adapter, _ = await _make_chat(state, concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=1500))
+        received: list[tuple[str, list[str]]] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append((message.id, [m.id for m in context.skipped]))
+
+        # A message left queued by a previous holder whose lock lapsed.
+        leftover = create_test_message("left-1", "Hey @slack-bot earlier")
+        await state.enqueue(
+            THREAD, QueueEntry(message=leftover, enqueued_at=clock.now, expires_at=clock.now + 90_000), 10
+        )
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("left-2", "Hey @slack-bot now"))
+        )
+        await clock.advance(1500)
+        await clock.advance(1500)
+        await task
+
+        assert received == [("left-2", ["left-1"])]
+
+
+class TestHeartbeatFailuresAreVisible:
+    @pytest.mark.parametrize("bad", ["600000", 1.5, True, -1])
+    def test_invalid_max_lock_lifetime_ms_is_rejected_at_init(self, bad):
+        with pytest.raises(ValueError, match="max_lock_lifetime_ms"):
+            Chat(
+                ChatConfig(
+                    user_name="testbot",
+                    adapters={"slack": create_mock_adapter("slack")},
+                    state=create_mock_state(),
+                    logger=MockLogger(),
+                    concurrency=ConcurrencyConfig(strategy="queue", max_lock_lifetime_ms=bad),
+                )
+            )
+
+    async def test_crashed_renewal_loop_is_logged(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        heartbeats = _record_heartbeats(monkeypatch)
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            await release.wait()
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("crash-1", "Hey @slack-bot"))
+        )
+        await clock.settle()
+
+        def broken_clock() -> int:
+            raise RuntimeError("clock unavailable")
+
+        monkeypatch.setattr(chat_module, "_monotonic_ms", broken_clock)
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3)
+        monkeypatch.setattr(chat_module, "_monotonic_ms", clock.monotonic_ms)
+
+        assert heartbeats[0].task.done()
+        assert [call[0] for call in logger.error.calls] == ["Lock heartbeat crashed — the lock will lapse at its TTL"]
+
+        release.set()
+        await task
