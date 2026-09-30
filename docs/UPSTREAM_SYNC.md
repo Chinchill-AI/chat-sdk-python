@@ -317,6 +317,16 @@ Both modules were checked against the TS sources at `chat@4.41.1` (run under Nod
 
 `ast_to_plain_text` follows upstream `toPlainText` from `5c926f19` (chat@4.34.0) and the core half of `764e4759` (chat@4.38.1). Root children are joined with `"\n\n"`. `list`, `listItem` and `blockquote` children are joined with `"\n"`. A `tableRow` joins its cells with `"\t"` and keeps empty cells. A `table` joins its rows with `"\n"` and drops rows that are empty after `trim()`. A string `value`/`alt` is returned as-is. The Python parser already kept soft line breaks inside text nodes, which was the remark half of #604. `table_to_ascii` reads cells, so its output does not change.
 
+### Slack outbound mentions (chat@4.32–4.37, #206)
+
+Slack adopts the shared scanner in both outbound passes: `SlackFormatConverter` (`_finalize` and mrkdwn text nodes) via `_link_bare_mention_names` (`a8c4af74`), and `SlackAdapter._resolve_outgoing_mentions` (`07c11129`, `a8c4af74`, `d4c52cad`). The old ASCII lookbehind regex (converter) and Unicode-`\w` regex (resolver) are gone. The native `stream()` path resolves mentions line by line before each `append` (`6f0d2f02`). `resolve_committed` ports `resolveCommitted`, and `last_appended` tracks the resolved buffer. Fence lines toggle state only once their newline is committed. #208 replaces this with a marker-matching tracker.
+
+Parity fix: the final native-stream delta now comes from `renderer.get_committable_text()` after `renderer.finish()`, as upstream does (4.31 and 4.37). It used to come from `finish()`'s return value, which is the `_remend`'d render. That value is not guaranteed to extend the committable prefix, so it could not share the resolved buffer's coordinate space. As a side effect, a stream that ends with an unclosed inline marker (`**bold`) no longer gets a closing marker appended on the native path. Upstream behaves the same way.
+
+Known upstream-parity edge: a segment committed after an inline-marker holdback cut is resolved without the text before the cut. So in `https://x.io/*@alice`, where the renderer cuts at the unclosed `*`, the handle is resolved. Upstream `resolveCommitted` does the same, and the adapter code has a comment noting it.
+
+Renderer-dependent edge (native stream only): holdback cut positions come from the Python `StreamingMarkdownRenderer`, whose `_remend` is simplified compared with npm `remend` (a known limitation in CLAUDE.md). Rare inputs with inline markers inside URLs or code spans can therefore be cut at different points, and because each post-cut segment is resolved without the text before it, a handle can resolve differently from upstream on the native stream (for example, a `@name` inside a URL after a `*` cut). Post/edit resolve the full text and are not affected. Fence detection likewise uses Python `str.lstrip()` rather than JS `trimStart()`, to stay consistent with the Python renderer's fence tracking; the two differ only for lines starting with U+FEFF or U+001C–U+001F.
+
 ### SDK-free primitive subpaths (Teams, chat@4.31)
 
 These six runtime-free Teams primitive subpaths mirror upstream's
@@ -503,9 +513,10 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
   `TestBusinessScopedUserIdsMalformedPayloads`.
 - **Casing:** upstream's `WhatsAppRawMessage.userId` is `user_id` here,
   matching the existing snake_case raw key `phone_number_id`.
-- **Not yet ported here:** the `recipient()` calls in upstream `sendTemplate`
-  (#237), media sends (#238) and `reply` (#239), because those send paths do
-  not exist in the Python adapter yet. `mark_as_read` and typing indicators
+- **Not yet ported here:** the `recipient()` calls in upstream media sends
+  (#238) and `reply` (#239), because those send paths do not exist in the
+  Python adapter yet. `send_template` (#237) resolves its recipient the same
+  way `post_message` does. `mark_as_read` and typing indicators
   address a `message_id` only, so they need no recipient.
 - **Known limitations kept at parity** (upstream behaves the same at
   chat@4.41.1; revisit if upstream changes them):
@@ -537,6 +548,66 @@ Regression coverage: `tests/test_whatsapp_webhook.py`
 (`TestHandleWebhookBusinessScopedUserIds`, `TestParseMessageBusinessScopedUserIds`,
 `TestPostMessageBusinessScopedRecipients`, `TestBusinessScopedUserIdsPythonSpecific`,
 `TestBusinessScopedUserIdsMalformedPayloads`, `TestBusinessScopedUserIdsIdentityInvariants`).
+
+### WhatsApp templates and typed Graph API errors (chat@4.34–4.40, #237)
+
+Ports upstream `2338a665` (vercel/chat#588, chat@4.34.0; `sendTemplate`, with
+the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
+(vercel/chat#896, chat@4.40.0; `errors.ts`, `graphFetchJson`).
+
+- **`send_template(thread_id, template)`** posts `type: "template"` with
+  `template: {name, language: {code}, components?}`. `components` is sent only
+  when non-empty (`if template.get("components")`, like `components?.length`).
+  Emoji placeholders are converted only in `type == "text"` parameters of
+  every component; payloads, URLs and media references stay literal. New dicts
+  are built, so the caller's template is not mutated. The template TypedDicts
+  (`WhatsAppTemplateMessage`, `WhatsAppTemplateComponent`,
+  `WhatsAppTemplateParameter`, `WhatsAppTemplateButtonParameter`) are
+  snake_case wire shapes, as upstream's are.
+- **`WhatsAppApiError(message, status, body)`** subclasses
+  `AdapterError(message, "whatsapp", code)`, so existing `except AdapterError`
+  handlers still catch it. **Casing:** upstream's camelCase fields
+  `errorCode`, `providerMessage`, `traceId` are `error_code`,
+  `provider_message`, `trace_id` here; `status`, `type`, `details`, `subcode`
+  and `raw` keep their names. The message is `"{label}: {status}
+  {error.message ?? body}"` (a body without a Meta message is cut to 500
+  characters plus `…`; `raw` keeps it whole). `code` maps onto the shared
+  taxonomy exactly as upstream `taxonomyCode` does.
+- **`_integer` and JS numbers:** `bool` is rejected (it subclasses `int`;
+  JSON `true` is not a JS number). An integral float such as JSON `4.0` or
+  `1e3` is accepted as an `int`, because `JSON.parse` yields the JS number `4`
+  and `Number.isInteger(4)` holds. Numeric strings must fully match ASCII
+  `-?[0-9]+` (JS `\d` has no Unicode digits, and `$` does not match before a
+  trailing newline). A numeric string past CPython's 4300-digit `int()` limit
+  reads as absent (upstream's `Number()` gives `Infinity`, which matches no
+  taxonomy code).
+- **JSON parsing (`parse_json_text`)** is shared by `WhatsAppApiError` and the
+  `_graph_fetch_json` success path, and follows `JSON.parse`: `NaN` /
+  `Infinity` are rejected (error bodies stay text in `raw`; success bodies
+  raise `NetworkError`), an integer literal past the `int()` digit limit reads
+  as a float like a JS number, and **Python-specific** nesting deep enough to
+  raise `RecursionError` in CPython's recursive scanner is treated as invalid
+  JSON, so it still surfaces as `WhatsAppApiError` / `NetworkError`.
+- **`_graph_fetch_json`** (upstream `graphFetchJson`) backs `_graph_api_request`
+  (label `"WhatsApp API error"`) and the `download_media` metadata GET (label
+  `"Failed to get media URL"`, which used to raise `RuntimeError`). The
+  multipart upload call site lands with #238; the binary download step moves
+  to the shared downloader in #239.
+  - **Status range:** success is any 2xx, like `response.ok`. The old port
+    accepted only 200, so a 201/204 used to raise.
+  - The body is read as bytes, decoded like WHATWG `Response.text()` (UTF-8
+    with replacement, one leading BOM stripped: `utf-8-sig`), and parsed with
+    `parse_json_text`. aiohttp's
+    `response.json()` would reject a non-`application/json` content type and
+    `text()` would sniff the charset; `fetch` does neither.
+  - **Python-specific:** a transport failure while reading the body
+    (`aiohttp.ClientPayloadError`, a timeout) is also wrapped as
+    `NetworkError("{label}: request failed")`. Upstream wraps only the
+    `fetch()` call, so a body-read failure there escapes as a raw `TypeError`.
+
+Regression coverage: `tests/test_whatsapp_errors.py`,
+`tests/test_whatsapp_api.py` (`TestSendTemplate`, `TestGraphApiErrors`,
+`TestGraphFetchJsonPythonSpecific`).
 
 ### Postgres state: expired claims and migration-owned schemas (chat@4.35–4.41, #240)
 
