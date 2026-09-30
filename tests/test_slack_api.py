@@ -833,6 +833,73 @@ class TestFetchMessages:
         assert client.get_calls("conversations_history") == []
 
 
+class TestFetchedMessagesKeepCachedUnfurls:
+    """Messages from ``conversations.history`` / ``conversations.replies`` carry
+    no ``channel`` field, so the unfurl cache key's channel must come from the
+    thread id the message is parsed under. Otherwise ``_enrich_links`` returns
+    early and fetched messages lose the ``message_changed`` unfurl metadata.
+
+    What to fix if this fails: ``SlackAdapter._unfurl_channel_for`` and its use
+    in ``_parse_slack_message``.
+    """
+
+    _TS = "1234567890.000050"
+    _URL = "https://example.com/article"
+
+    def _history_message(self) -> dict[str, Any]:
+        # Shape of a history/replies item: no ``channel`` key, bare link.
+        return {"ts": self._TS, "text": f"see <{self._URL}>", "user": "U1"}
+
+    def _unfurl_payload(self) -> dict[str, Any]:
+        return {self._URL: {"title": "Cached Title", "description": "Cached body"}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["fetch_messages", "fetch_message", "fetch_channel_messages"])
+    async def test_fetched_message_links_are_enriched_from_the_unfurl_cache(self, path: str):
+        adapter, client, state = await _init_adapter()
+        state._cache[f"slack:unfurls:C123:{self._TS}"] = self._unfurl_payload()
+        page = {"ok": True, "messages": [self._history_message()], "has_more": False}
+        client.set_response("conversations_replies", page)
+        client.set_response("conversations_history", page)
+
+        if path == "fetch_messages":
+            messages = (await adapter.fetch_messages("slack:C123:1234567890.000000")).messages
+        elif path == "fetch_message":
+            msg = await adapter.fetch_message("slack:C123:1234567890.000000", self._TS)
+            assert msg is not None
+            messages = [msg]
+        else:
+            messages = (await adapter.fetch_channel_messages("slack:C123")).messages
+
+        assert len(messages) == 1
+        links = messages[0].links
+        assert [link.url for link in links] == [self._URL]
+        assert links[0].title == "Cached Title"
+        assert links[0].description == "Cached body"
+
+    @pytest.mark.asyncio
+    async def test_fetched_message_uses_the_installation_scoped_unfurl_key(self):
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter, client, state = await _init_adapter()
+        # Only the T_A-scoped entry exists; an unscoped or wrong-install key
+        # must not be read.
+        state._cache[f"slack:unfurls:T_A:C123:{self._TS}"] = self._unfurl_payload()
+        client.set_response(
+            "conversations_replies",
+            {"ok": True, "messages": [self._history_message()], "has_more": False},
+        )
+
+        tok = adapter._request_context.set(RequestContext(token="xoxb-T_A", installation_id="T_A"))
+        try:
+            result = await adapter.fetch_messages("slack:C123:1234567890.000000")
+        finally:
+            adapter._request_context.reset(tok)
+
+        assert result.messages[0].links[0].title == "Cached Title"
+        state.get.assert_any_await(f"slack:unfurls:T_A:C123:{self._TS}")
+
+
 # =============================================================================
 # fetchMessage (single) Tests
 # =============================================================================

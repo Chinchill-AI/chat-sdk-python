@@ -3444,8 +3444,35 @@ class SlackAdapter:
             # ~2s of latency to message handling worst-case (it returns
             # immediately when the cache is already populated or when
             # there are no links to enrich).
-            links=await self._enrich_links(self._extract_links(event), event.get("channel"), event.get("ts")),
+            links=await self._enrich_links(
+                self._extract_links(event),
+                self._unfurl_channel_for(event, thread_id),
+                event.get("ts"),
+            ),
         )
+
+    def _unfurl_channel_for(self, event: dict[str, Any], thread_id: str) -> str | None:
+        """Channel for the unfurl cache key of a message being parsed.
+
+        Webhook events carry ``channel``, but messages returned by
+        ``conversations.history`` / ``conversations.replies`` (``fetch_message``,
+        ``fetch_messages``, channel history, ``list_threads``) do not. Those are
+        always parsed with a ``thread_id`` built from the channel they were
+        fetched from, so fall back to it; otherwise ``_enrich_links`` would
+        return early and fetched messages would lose the unfurl metadata that
+        ``message_changed`` cached for them.
+
+        Python divergence: upstream passes ``event.channel`` only (4.40+),
+        which silently drops enrichment for fetched messages.
+        """
+        channel = event.get("channel")
+        if isinstance(channel, str) and channel:
+            return channel
+        try:
+            decoded = self.decode_thread_id(thread_id)
+        except ValidationError:
+            return None
+        return decoded.channel or None
 
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
         """Synchronous message parsing (no user lookup, falls back to user ID)."""
