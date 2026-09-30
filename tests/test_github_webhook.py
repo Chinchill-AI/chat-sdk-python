@@ -516,6 +516,29 @@ class TestGitHubParseMessage:
         assert msg.author.user_name == "testuser"
         assert msg.author.is_bot is False
 
+    def test_should_preserve_whitespace_in_newline_separated_issue_comment_mentions(self):
+        adapter = _make_adapter()
+        raw = {
+            "type": "issue_comment",
+            "comment": {
+                "id": 100,
+                "body": "@test-bot\nhi there",
+                "user": {"id": 1, "login": "testuser", "type": "User"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/acme/app/pull/42#issuecomment-100",
+            },
+            "repository": {
+                "id": 1,
+                "name": "app",
+                "full_name": "acme/app",
+                "owner": {"id": 10, "login": "acme", "type": "User"},
+            },
+            "pr_number": 42,
+        }
+        msg = adapter.parse_message(raw)
+        assert msg.text == "@test-bot\nhi there"
+
     def test_issue_comment_from_issue_thread(self):
         """Parse an issue_comment raw message from an issue thread."""
         adapter = _make_adapter()
@@ -597,6 +620,35 @@ class TestGitHubParseMessage:
         msg = adapter.parse_message(raw)
         assert msg.id == "200"
         assert msg.thread_id == "github:acme/app:42:rc:200"
+
+    def test_should_preserve_whitespace_in_newline_separated_review_comment_mentions(self):
+        adapter = _make_adapter()
+        raw = {
+            "type": "review_comment",
+            "comment": {
+                "id": 200,
+                "body": "@test-bot\n\nhi there",
+                "user": {"id": 2, "login": "reviewer", "type": "User"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/acme/app/pull/42#discussion_r200",
+                "path": "src/index.ts",
+                "diff_hunk": "@@",
+                "commit_id": "abc",
+                "original_commit_id": "abc",
+            },
+            "repository": {
+                "id": 1,
+                "name": "app",
+                "full_name": "acme/app",
+                "owner": {"id": 10, "login": "acme", "type": "User"},
+            },
+            "pr_number": 42,
+        }
+        msg = adapter.parse_message(raw)
+        # Upstream uses a single newline here; the Python parser always kept
+        # soft breaks, so a paragraph break exercises the #604 change instead.
+        assert msg.text == "@test-bot\n\nhi there"
 
     def test_review_comment_reply(self):
         adapter = _make_adapter()

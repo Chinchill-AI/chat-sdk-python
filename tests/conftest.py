@@ -36,6 +36,19 @@ def _clear_ambient_identity_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_github_bot_user_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``GITHUB_BOT_USER_ID`` out of every test unless it sets it.
+
+    ``GitHubAdapter`` reads it at construction (``config.botUserId ??
+    GITHUB_BOT_USER_ID``), which skips auto-detection. A developer shell or CI
+    job that exports it would otherwise break every test that expects
+    detection to run. Mirrors the upstream ``beforeEach`` in
+    ``describe("createGitHubAdapter")``. Tests that need it call ``setenv``.
+    """
+    monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
