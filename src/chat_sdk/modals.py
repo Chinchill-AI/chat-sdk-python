@@ -21,6 +21,33 @@ class TextInputElement(TypedDict, total=False):
     optional: bool
 
 
+class DateInputElement(TypedDict, total=False):
+    """Date picker form element."""
+
+    type: str  # "date_input"
+    id: str
+    label: str
+    placeholder: str
+    # Pre-filled date as ``YYYY-MM-DD``
+    initial_value: str
+    optional: bool
+
+
+class NumberInputElement(TypedDict, total=False):
+    """Number input form element."""
+
+    type: str  # "number_input"
+    id: str
+    label: str
+    placeholder: str
+    initial_value: float
+    min: float
+    max: float
+    # Allow decimal values. Defaults to false (integers only).
+    decimal: bool
+    optional: bool
+
+
 class SelectOptionElement(TypedDict, total=False):
     """Option for select elements."""
 
@@ -39,6 +66,8 @@ class SelectElement(TypedDict, total=False):
     options: list[SelectOptionElement]
     initial_option: str
     optional: bool
+    # Emit a selection change event when the value changes (Slack)
+    dispatch_action: bool
 
 
 class RadioSelectElement(TypedDict, total=False):
@@ -50,6 +79,8 @@ class RadioSelectElement(TypedDict, total=False):
     options: list[SelectOptionElement]
     initial_option: str
     optional: bool
+    # Emit a selection change event when the value changes (Slack)
+    dispatch_action: bool
 
 
 class OptionsLoadGroup(TypedDict):
@@ -80,7 +111,16 @@ class ExternalSelectElement(TypedDict, total=False):
 
 
 # Union of all modal child types
-ModalChild = TextInputElement | SelectElement | ExternalSelectElement | RadioSelectElement | TextElement | FieldsElement
+ModalChild = (
+    TextInputElement
+    | DateInputElement
+    | NumberInputElement
+    | SelectElement
+    | ExternalSelectElement
+    | RadioSelectElement
+    | TextElement
+    | FieldsElement
+)
 
 
 class ModalElement(TypedDict, total=False):
@@ -98,7 +138,16 @@ class ModalElement(TypedDict, total=False):
     children: list[ModalChild]
 
 
-VALID_MODAL_CHILD_TYPES = {"text_input", "select", "external_select", "radio_select", "text", "fields"}
+VALID_MODAL_CHILD_TYPES = {
+    "text_input",
+    "date_input",
+    "number_input",
+    "select",
+    "external_select",
+    "radio_select",
+    "text",
+    "fields",
+}
 
 
 def is_modal_element(value: Any) -> bool:
@@ -185,6 +234,69 @@ def TextInput(
     return result
 
 
+def DateInput(
+    *,
+    id: str,
+    label: str,
+    placeholder: str | None = None,
+    initial_value: str | None = None,
+    optional: bool | None = None,
+) -> DateInputElement:
+    """Build a :class:`DateInputElement` dict.
+
+    ``initial_value`` is a pre-filled date as ``YYYY-MM-DD``.
+    """
+    result: DateInputElement = {
+        "type": "date_input",
+        "id": id,
+        "label": label,
+    }
+    if placeholder is not None:
+        result["placeholder"] = placeholder
+    if initial_value is not None:
+        result["initial_value"] = initial_value
+    if optional is not None:
+        result["optional"] = optional
+    return result
+
+
+def NumberInput(
+    *,
+    id: str,
+    label: str,
+    placeholder: str | None = None,
+    initial_value: float | None = None,
+    optional: bool | None = None,
+    min: float | None = None,
+    max: float | None = None,
+    decimal: bool | None = None,
+) -> NumberInputElement:
+    """Build a :class:`NumberInputElement` dict.
+
+    ``decimal`` allows decimal values (platforms default to integers only).
+    Unset options are omitted; ``initial_value=0``, ``min=0`` and
+    ``decimal=False`` are kept.
+    """
+    result: NumberInputElement = {
+        "type": "number_input",
+        "id": id,
+        "label": label,
+    }
+    if placeholder is not None:
+        result["placeholder"] = placeholder
+    if initial_value is not None:
+        result["initial_value"] = initial_value
+    if optional is not None:
+        result["optional"] = optional
+    if min is not None:
+        result["min"] = min
+    if max is not None:
+        result["max"] = max
+    if decimal is not None:
+        result["decimal"] = decimal
+    return result
+
+
 def Select(
     *,
     id: str,
@@ -193,8 +305,13 @@ def Select(
     placeholder: str | None = None,
     initial_option: str | None = None,
     optional: bool | None = None,
+    dispatch_action: bool | None = None,
 ) -> SelectElement:
-    """Build a :class:`SelectElement` dict."""
+    """Build a :class:`SelectElement` dict.
+
+    ``dispatch_action=True`` asks the platform to emit a selection change
+    event as soon as the value changes (Slack); unset, it is omitted.
+    """
     if not options:
         raise ValueError("Select requires at least one option")
     result: SelectElement = {
@@ -209,6 +326,8 @@ def Select(
         result["initial_option"] = initial_option
     if optional is not None:
         result["optional"] = optional
+    if dispatch_action is not None:
+        result["dispatch_action"] = dispatch_action
     return result
 
 
@@ -267,8 +386,13 @@ def RadioSelect(
     options: list[SelectOptionElement],
     initial_option: str | None = None,
     optional: bool | None = None,
+    dispatch_action: bool | None = None,
 ) -> RadioSelectElement:
-    """Build a :class:`RadioSelectElement` dict."""
+    """Build a :class:`RadioSelectElement` dict.
+
+    ``dispatch_action=True`` asks the platform to emit a selection change
+    event as soon as the value changes (Slack); unset, it is omitted.
+    """
     if not options:
         raise ValueError("RadioSelect requires at least one option")
     result: RadioSelectElement = {
@@ -281,6 +405,8 @@ def RadioSelect(
         result["initial_option"] = initial_option
     if optional is not None:
         result["optional"] = optional
+    if dispatch_action is not None:
+        result["dispatch_action"] = dispatch_action
     return result
 
 
@@ -290,6 +416,8 @@ def RadioSelect(
 
 modal = Modal
 text_input = TextInput
+date_input = DateInput
+number_input = NumberInput
 select = Select
 external_select = ExternalSelect
 select_option = SelectOption

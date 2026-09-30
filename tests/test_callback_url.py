@@ -214,11 +214,9 @@ class TestProcessCardCallbackUrls:
             style="primary",
             disabled=True,
             action_type="modal",
+            tooltip="Approve the request",
             callback_url="https://example.com/hook",
         )
-        # `Button(tooltip=...)` arrives with #202; a raw key proves unknown
-        # fields survive the token swap.
-        button_in["tooltip"] = "Approve the request"  # type: ignore[typeddict-unknown-key]
         card = Card(title="Test", children=[Actions([button_in])])
 
         result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)

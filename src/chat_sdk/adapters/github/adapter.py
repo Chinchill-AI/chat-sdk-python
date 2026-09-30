@@ -76,6 +76,12 @@ REVIEW_COMMENT_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+):rc:(\d+)$")
 ISSUE_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):issue:(\d+)$")
 PR_THREAD_PATTERN = re.compile(r"^([^/]+)/([^:]+):(\d+)$")
 
+# Whole base-10 integer for ``GITHUB_BOT_USER_ID`` (ASCII digits only, optional
+# sign as ``parseInt`` allows). The digit cap keeps ``int()`` clear of CPython's
+# 4300-digit string-conversion limit (a ``ValueError`` in the constructor);
+# GitHub ids fit in 64 bits. See ``GitHubAdapter._bot_user_id_from_env``.
+_BOT_USER_ID_ENV_PATTERN = re.compile(r"[+-]?[0-9]{1,20}", re.ASCII)
+
 # GitHub reaction content types
 EMOJI_TO_GITHUB_REACTION: dict[str, GitHubReactionContent] = {
     "thumbs_up": "+1",
@@ -118,7 +124,13 @@ class GitHubAdapter:
         self._webhook_secret = webhook_secret
         self._logger: Logger = config.get("logger") or ConsoleLogger("info").child("github")
         self._user_name = config.get("user_name") or os.environ.get("GITHUB_BOT_USERNAME") or "github-bot"
-        self._bot_user_id: int | None = config.get("bot_user_id")
+        # ``config.botUserId ?? GITHUB_BOT_USER_ID ?? null`` (upstream 6750d59e,
+        # chat@4.33). Explicit config wins even when falsy; see
+        # ``_bot_user_id_from_env`` for the env parse.
+        config_bot_user_id = config.get("bot_user_id")
+        self._bot_user_id: int | None = (
+            config_bot_user_id if config_bot_user_id is not None else self._bot_user_id_from_env()
+        )
         self._chat: ChatInstance | None = None
         self._format_converter = GitHubFormatConverter()
 
@@ -198,6 +210,55 @@ class GitHubAdapter:
                         "Authentication is required. Set GITHUB_TOKEN or GITHUB_APP_ID/GITHUB_PRIVATE_KEY.",
                     )
 
+    def _bot_user_id_from_env(self) -> int | None:
+        """Read ``GITHUB_BOT_USER_ID`` (upstream 6750d59e, chat@4.33).
+
+        Unset or ``""`` means no id, silently (upstream's falsy check).
+
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream uses
+        ``Number.parseInt(value, 10)``, which keeps the leading digits of a
+        malformed value (``"12abc"`` → ``12``). A truncated id would make
+        ``is_me`` match the wrong user and still miss the bot's own comments,
+        so any value that is not a whole base-10 integer (surrounding
+        whitespace allowed) is ignored with a warning instead. The pattern is
+        ASCII-only: ``int()`` alone would also accept ``"1_000"`` and non-ASCII
+        digits, which ``parseInt`` truncates or rejects.
+        """
+        raw = os.environ.get("GITHUB_BOT_USER_ID")
+        if not raw:
+            return None
+        stripped = raw.strip()
+        if not _BOT_USER_ID_ENV_PATTERN.fullmatch(stripped):
+            # The value itself is not logged: a misconfigured env var may hold
+            # something other than an id (e.g. a pasted token).
+            self._logger.warn(
+                "Ignoring GITHUB_BOT_USER_ID: not a base-10 integer",
+                {"length": len(raw)},
+            )
+            return None
+        return int(stripped)
+
+    def _capture_bot_user_id(self, user: Any) -> None:
+        """Learn the bot user id from a comment the bot just posted.
+
+        Port of upstream ``captureBotUserId`` (6750d59e, chat@4.33). When
+        neither config, ``GITHUB_BOT_USER_ID`` nor auto-detection produced an
+        id, ``is_me`` never matches and the bot can reply to its own comments
+        in a loop. The ``user`` of a comment we created is the bot itself, so
+        record it. Never overwrites a known id: ``_detect_bot_user_id`` resolves
+        the same identity, so no lock is needed.
+        """
+        if self._bot_user_id is not None or not isinstance(user, dict):
+            return
+        uid = user.get("id")
+        # ``typeof user.id === "number"``; ``bool`` is an ``int`` subclass.
+        if isinstance(uid, int) and not isinstance(uid, bool):
+            self._bot_user_id = uid
+            self._logger.info(
+                "GitHub bot user ID learned from posted comment",
+                {"botUserId": uid, "login": user.get("login")},
+            )
+
     @property
     def name(self) -> str:
         return self._name
@@ -208,7 +269,7 @@ class GitHubAdapter:
 
     @property
     def bot_user_id(self) -> str | None:
-        return str(self._bot_user_id) if self._bot_user_id else None
+        return str(self._bot_user_id) if self._bot_user_id is not None else None
 
     @property
     def lock_scope(self) -> LockScope | None:
@@ -615,6 +676,10 @@ class GitHubAdapter:
                 f"/repos/{decoded.owner}/{decoded.repo}/issues/{decoded.pr_number}/comments",
                 {"body": body},
             )
+
+        # Both create-comment branches (upstream calls it after each);
+        # edit_message deliberately does not, matching upstream.
+        self._capture_bot_user_id(comment.get("user"))
 
         return RawMessage(
             id=str(comment["id"]),

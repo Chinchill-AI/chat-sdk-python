@@ -22,7 +22,14 @@ class GitHubAdapterBaseConfig(TypedDict, total=False):
             Defaults to the GITHUB_API_URL env var, then to
             "https://api.github.com".
         bot_user_id: Bot's GitHub user ID (numeric). Used for self-message
-            detection. If not provided, will be fetched on first API call.
+            detection. Defaults to the GITHUB_BOT_USER_ID env var (a whole
+            base-10 integer; any other non-empty value is ignored with a
+            warning). If neither is set, the adapter auto-detects it
+            (``GET /user``, then ``GET /app`` → ``GET /users/{slug}[bot]``)
+            and, if that fails, learns it from the ``user`` of the first
+            comment the bot posts. Until then the bot's own comments are not
+            recognised as ``is_me``, so set this (or GITHUB_BOT_USER_ID)
+            whenever the token cannot call either detection endpoint.
         logger: Logger instance for error reporting. Defaults to ConsoleLogger.
         user_name: Bot username (e.g., "my-bot" or "my-bot[bot]" for GitHub Apps).
             Used for @-mention detection.
