@@ -2942,7 +2942,11 @@ class TeamsAdapter:
         With a custom ``token`` factory configured, the factory is called
         instead (scope ``https://graph.microsoft.com/.default``) and
         ``app_password`` is never read (upstream routes Graph through the SDK
-        ``App``, which uses the same factory).
+        ``App``, which uses the same factory). The scope stays the public
+        Graph scope even under a sovereign ``CLOUD``: every hand-rolled Graph
+        read targets ``https://graph.microsoft.com`` (sovereign Graph routing
+        for these reads is a pre-existing gap), and the token audience must
+        match the host it is sent to.
         """
         import time as _time
 
@@ -3001,8 +3005,11 @@ class TeamsAdapter:
         cache slot with the Graph token (see :meth:`_get_graph_token`).
 
         With a custom ``token`` factory configured, the factory is called
-        instead (scope ``https://api.botframework.com/.default``) and
-        ``app_password`` is never read.
+        instead and ``app_password`` is never read. The scope is the SDK
+        ``App``'s cloud Bot Framework scope (``https://api.botframework.com/.default``
+        on the public cloud, ``https://api.botframework.us/.default`` under
+        ``CLOUD=USGov`` …), the same one the SDK asks the factory for, since
+        :meth:`open_dm` posts to that cloud's Connector.
         """
         import time
 
@@ -3011,7 +3018,9 @@ class TeamsAdapter:
             # to mint a token for yet.
             raise ValidationError("teams", _APP_ID_UNRESOLVED_MESSAGE)
         if self._config.token is not None:
-            return await self._token_from_factory(_BOT_FRAMEWORK_SCOPE)
+            cloud_scope = getattr(getattr(self._app, "cloud", None), "bot_scope", None)
+            scope = cloud_scope if isinstance(cloud_scope, str) and cloud_scope else _BOT_FRAMEWORK_SCOPE
+            return await self._token_from_factory(scope)
 
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token

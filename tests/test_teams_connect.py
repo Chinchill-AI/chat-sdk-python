@@ -459,6 +459,25 @@ class TestCustomTokenPrecedence:
         assert (sdk_bot, sdk_graph) == expected
         assert (ours_bot, ours_graph) == (sdk_bot, sdk_graph)
 
+    async def test_hand_rolled_bot_token_uses_the_sdk_cloud_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Under a sovereign cloud the SDK asks the factory for that cloud's Bot
+        # Framework scope; ``open_dm`` posts to the same cloud's Connector, so
+        # the hand-rolled path must ask for the same scope and tenant.
+        monkeypatch.setenv("CLOUD", "USGov")
+        monkeypatch.delenv("TENANT_ID", raising=False)
+        calls: list[tuple[Any, Any]] = []
+
+        def token(scope: Any, tenant_id: Any) -> str:
+            calls.append((scope, tenant_id))
+            return _unsigned_jwt()
+
+        adapter = _make_adapter(token=token, app_type="MultiTenant")
+        await adapter._app._get_bot_token()
+        await adapter._get_access_token()
+
+        assert calls[0] == ("https://api.botframework.us/.default", "MicrosoftServices.onmicrosoft.us")
+        assert calls[1] == calls[0]
+
     @pytest.mark.parametrize("result", ["", None, 42])
     async def test_factory_without_a_token_raises_authentication_error(self, result: Any) -> None:
         adapter = _make_adapter(token=lambda _scope, _tenant: result)
