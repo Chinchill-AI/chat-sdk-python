@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._slack_file_transport import FakeFileResponse, FakeFileTransport
+
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import SlackAdapterConfig, SlackInstallation, SlackThreadId
@@ -446,6 +448,89 @@ class TestInteractivePayloads:
         response = await adapter.handle_webhook(req)
         assert response["status"] == 200
 
+    async def _submit_values(self, state_values: dict[str, Any]) -> dict[str, str]:
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        chat.process_modal_submit = AsyncMock(return_value=None)
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "view_submission",
+                "trigger_id": "trigger123",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "view": {"id": "V123", "callback_id": "renewal_form", "state": {"values": state_values}},
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+        chat.process_modal_submit.assert_awaited_once()
+        event = chat.process_modal_submit.await_args.args[0]
+        assert event.callback_id == "renewal_form"
+        return event.values
+
+    @pytest.mark.asyncio
+    async def test_flattens_datepicker_and_number_input_state_into_submitted_values(self):
+        values = await self._submit_values(
+            {
+                "renewal_date": {"renewal_date": {"type": "datepicker", "selected_date": "2026-08-01"}},
+                "quantity": {"quantity": {"type": "number_input", "value": "3"}},
+            }
+        )
+        assert values == {"renewal_date": "2026-08-01", "quantity": "3"}
+
+    @pytest.mark.asyncio
+    async def test_submits_empty_and_unset_inputs_with_nullish_fallbacks(self):
+        # Upstream ``value ?? selected_date ?? selected_option?.value ?? ""``: a cleared
+        # text input keeps its "" rather than falling through to the next key.
+        values = await self._submit_values(
+            {
+                "note": {"note": {"type": "plain_text_input", "value": "", "selected_date": "2026-08-01"}},
+                "date": {"date": {"type": "datepicker", "selected_date": None}},
+                "plan": {"plan": {"type": "static_select", "selected_option": {"value": "pro"}}},
+                "none": {"none": {"type": "static_select", "selected_option": None}},
+            }
+        )
+        assert values == {"note": "", "date": "", "plan": "pro", "none": ""}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected", ["team", ""])
+    async def test_dispatch_action_select_in_a_modal_reaches_on_action_with_the_selected_value(self, selected):
+        # A ``dispatch_action`` select inside a modal sends ``block_actions`` from a
+        # ``view`` container with no channel; it must still reach process_action.
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "block_actions",
+                "trigger_id": "trigger123",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "container": {"type": "view", "view_id": "V123"},
+                "view": {"id": "V123", "callback_id": "permissions"},
+                "actions": [
+                    {
+                        "type": "static_select",
+                        "action_id": "scope",
+                        "block_id": "scope",
+                        "selected_option": {"text": {"type": "plain_text", "text": "Team"}, "value": selected},
+                        "value": "stale",
+                    }
+                ],
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+        chat.process_action.assert_called_once()
+        action_event = chat.process_action.call_args.args[0]
+        assert action_event.action_id == "scope"
+        # ``selected_option?.value ?? value``: an empty option value is kept, not replaced.
+        assert action_event.value == selected
+        assert action_event.trigger_id == "trigger123"
+        assert action_event.thread_id == ""
+
     @pytest.mark.asyncio
     async def test_handles_view_closed(self):
         adapter = _make_adapter()
@@ -638,9 +723,9 @@ class TestRehydrateAttachment:
             ),
         )
 
-        # Stub the network GET — assert the tenant token is forwarded.
-        fetch_mock = AsyncMock(return_value=b"workspace-bytes")
-        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+        # Stub the download transport — assert the tenant token is forwarded.
+        transport = FakeFileTransport(FakeFileResponse(b"workspace-bytes"))
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -656,10 +741,8 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         result = await rehydrated.fetch_data()
         assert result == b"workspace-bytes"
-        fetch_mock.assert_awaited_once_with(
-            "https://files.slack.com/img.png",
-            "xoxb-multi-workspace-token",
-        )
+        assert [url for url, _ in transport.calls] == ["https://files.slack.com/img.png"]
+        assert transport.authorizations == ["Bearer xoxb-multi-workspace-token"]
 
     # TS: "should fall back to getToken when no teamId in fetchMetadata"
     @pytest.mark.asyncio
@@ -667,8 +750,8 @@ class TestRehydrateAttachment:
         from chat_sdk.types import Attachment
 
         adapter = _make_adapter(bot_token="xoxb-single")
-        fetch_mock = AsyncMock(return_value=b"single-bytes")
-        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+        transport = FakeFileTransport(FakeFileResponse(b"single-bytes"))
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -681,10 +764,7 @@ class TestRehydrateAttachment:
         result = await rehydrated.fetch_data()
         assert result == b"single-bytes"
         # Bot token (not a workspace-specific install token) is forwarded.
-        fetch_mock.assert_awaited_once_with(
-            "https://files.slack.com/img.png",
-            "xoxb-single",
-        )
+        assert transport.authorizations == ["Bearer xoxb-single"]
 
     # TS: "should return attachment unchanged when no url"
     def test_should_return_attachment_unchanged_when_no_url(self):
@@ -704,18 +784,10 @@ class TestRehydrateAttachment:
     async def test_rehydrated_fetch_data_rejects_untrusted_host(self):
         from chat_sdk.types import Attachment
 
-        adapter = _make_adapter(bot_token="xoxb-ssrf-token")
-
-        # Sentinel — should NEVER be reached because validation rejects first.
-        evil_fetch = AsyncMock(return_value=b"should-not-run")
-        adapter._fetch_slack_file = evil_fetch  # type: ignore[method-assign]
-        # Restore the real validator + wrap it so we can assert on behavior.
-        real_fetch = SlackAdapter._fetch_slack_file
-
-        async def guarded_fetch(url: str, token: str) -> bytes:
-            return await real_fetch(adapter, url, token)
-
-        adapter._fetch_slack_file = guarded_fetch  # type: ignore[method-assign]
+        resolver = MagicMock(return_value="xoxb-ssrf-token")
+        adapter = _make_adapter(bot_token=resolver)
+        transport = FakeFileTransport()
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -727,6 +799,9 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         with pytest.raises(ValidationError):
             await rehydrated.fetch_data()
+        # Refused before the token is resolved and before any request.
+        assert transport.calls == []
+        resolver.assert_not_called()
 
     def test_is_trusted_slack_download_url_allowlist(self):
         # Accepts Slack-owned HTTPS hosts
@@ -739,6 +814,53 @@ class TestRehydrateAttachment:
         assert not SlackAdapter._is_trusted_slack_download_url("https://attacker.example/x")
         # Rejects look-alike hosts that merely contain "slack.com"
         assert not SlackAdapter._is_trusted_slack_download_url("https://slack.com.attacker.tld/x")
+        # GovSlack and slack-files hosts (vercel/chat 7c269653)
+        for url in (
+            "https://files.slack-gov.com/f.png",
+            "https://slack-gov.com/files-pri/T/F/f.png",
+            "https://slack-files.com/files-tmb/T-F-x/f.png",
+            "https://slack-files-gov.com/f.png",
+        ):
+            assert SlackAdapter._is_trusted_slack_download_url(url), url
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-files.com.attacker.tld/x")
+        # GovSlack subdomains are downloadable (the ``*.slack.com`` analogue)
+        # but are not auth origins, so they never receive the token.
+        assert SlackAdapter._is_trusted_slack_download_url("https://edge.slack-gov.com/x")
+        assert not SlackAdapter._is_slack_auth_url("https://edge.slack-gov.com/x")
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-gov.com.attacker.tld/x")
+        # The configured api_url origin, exactly (scheme, host and port)
+        api_url = "https://slack-proxy.example:8443/api/"
+        assert SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example:8443/files/f.png", api_url)
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example/files/f.png", api_url)
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example:8443/files/f.png")
+
+    def test_slack_auth_url_is_an_exact_origin_match(self):
+        # Port of upstream ``isSlackAuthUrl`` (file.ts): only these origins
+        # (plus the api_url origin) ever receive the bot token.
+        for url in (
+            "https://files.slack.com/f",
+            "https://FILES.SLACK.COM/f",
+            "https://files.slack.com:443/f",
+            "https://files.slack-gov.com/f",
+            "https://slack-files.com/f",
+            "https://slack-files-gov.com/f",
+            "https://slack.com/f",
+            "https://slack-gov.com/f",
+        ):
+            assert SlackAdapter._is_slack_auth_url(url), url
+        for url in (
+            "https://edge.slack.com/f",
+            "https://foo.slack-edge.com/f",
+            "http://files.slack.com/f",
+            "https://files.slack.com:8443/f",
+            "https://files.slack.com.attacker.example/f",
+            "https://files.slack.com@attacker.example/f",
+            "not a url",
+            "",
+        ):
+            assert not SlackAdapter._is_slack_auth_url(url), url
+        assert SlackAdapter._is_slack_auth_url("https://proxy.example/f", "https://proxy.example/api/")
+        assert not SlackAdapter._is_slack_auth_url("https://proxy.example:444/f", "https://proxy.example/api/")
 
 
 # ---------------------------------------------------------------------------

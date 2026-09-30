@@ -25,9 +25,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, NoReturn, TypedDict, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
-from chat_sdk.adapters.slack.api import _is_trusted_slack_response_url
+from chat_sdk.adapters.slack.api import (
+    _is_trusted_slack_response_url,
+    is_slack_auth_url,
+    is_trusted_slack_file_url,
+    resolve_slack_bot_token,
+)
 from chat_sdk.adapters.slack.cards import (
     card_to_block_kit,
     card_to_fallback_text,
@@ -71,7 +76,19 @@ from chat_sdk.shared.adapter_utils import (
     is_thinking_chunk,
     maybe_render_thinking,
 )
-from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
+from chat_sdk.shared.download import (
+    AttachmentResponse,
+    AttachmentTransport,
+    download_attachment,
+    validate_attachment_url,
+)
+from chat_sdk.shared.errors import (
+    AdapterError,
+    AdapterRateLimitError,
+    AuthenticationError,
+    NetworkError,
+    ValidationError,
+)
 from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.shared.mentions import replace_bare_mentions
 from chat_sdk.types import (
@@ -237,6 +254,11 @@ class _InstallationInfo:
     installation_id: str
     is_enterprise_install: bool
     enterprise_id: str | None = None
+
+
+def _json_stringify(value: Any) -> str:
+    """Compact, non-ASCII-preserving JSON like JS ``JSON.stringify`` (for log and error text)."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _find_next_mention(text: str) -> int:
@@ -572,6 +594,11 @@ class SlackAdapter:
         # ``is not None`` so an explicit ``{}`` still spreads. See
         # ``_web_client_kwargs`` for the per-client deep-copy of ``headers``.
         self._web_client_options: dict[str, Any] | None = config.web_client_options
+        # Egress plumbing (vercel/chat 6adca361): the guarded-download
+        # transport (``_create_file_transport`` returns it unless a subclass
+        # overrides) and the httpx client factory for ``response_url`` posts.
+        self._file_transport: AttachmentTransport | None = config.file_transport
+        self._http_client_factory: Callable[[], Any] | None = config.http_client_factory
 
     def _web_client_kwargs(self) -> dict[str, Any]:
         """Return a fresh copy of ``web_client_options`` for one client.
@@ -1902,7 +1929,11 @@ class SlackAdapter:
             message_id = message_ts or ""
 
         for action in payload.get("actions", []):
-            action_value = (action.get("selected_option") or {}).get("value") or action.get("value")
+            # Upstream ``selected_option?.value ?? value``: a selected option
+            # whose value is "" reports "", not the action's ``value``.
+            action_value = (action.get("selected_option") or {}).get("value")
+            if action_value is None:
+                action_value = action.get("value")
             action_event = ActionEvent(
                 action_id=action.get("action_id", ""),
                 value=action_value,
@@ -2101,13 +2132,18 @@ class SlackAdapter:
         view = payload.get("view", {})
         state_values = view.get("state", {}).get("values", {})
 
-        # Flatten values
+        # Flatten values. Upstream ``value ?? selected_date ??
+        # selected_option?.value ?? ""``: a cleared text input submits ``""``
+        # (not the next fallback); a datepicker reports ``selected_date``.
         values: dict[str, str] = {}
         for block_values in state_values.values():
             for action_id, input_val in block_values.items():
-                values[action_id] = (
-                    input_val.get("value") or (input_val.get("selected_option") or {}).get("value") or ""
-                )
+                submitted = input_val.get("value")
+                if submitted is None:
+                    submitted = input_val.get("selected_date")
+                if submitted is None:
+                    submitted = (input_val.get("selected_option") or {}).get("value")
+                values[action_id] = submitted if submitted is not None else ""
 
         meta = decode_modal_metadata(view.get("private_metadata") or None)
         user_ref = payload.get("user", {})
@@ -2342,7 +2378,7 @@ class SlackAdapter:
         backoff = self._socket_initial_backoff_s
         try:
             while not self._socket_shutdown_event.is_set():
-                client = SocketModeClient(app_token=cast(str, self._app_token))
+                client = SocketModeClient(**self._socket_client_kwargs())
                 # Register our request handler. ``socket_mode_request_listeners``
                 # is the documented public extension point on the slack_sdk
                 # client; each listener is ``async (client, request) -> None``.
@@ -2410,6 +2446,31 @@ class SlackAdapter:
             if client is not None:
                 with contextlib.suppress(Exception):  # pragma: no cover - best-effort
                     await client.disconnect()
+
+    def _socket_client_kwargs(self) -> dict[str, Any]:
+        """Constructor kwargs for one ``SocketModeClient`` (vercel/chat 6adca361).
+
+        Port of upstream ``socketTransportOptions``: only the transport-shaped
+        options reach Socket Mode. ``web_client_options["proxy"]`` is passed as
+        ``proxy=`` (used for the WebSocket), and a dedicated ``web_client`` for
+        ``apps.connections.open`` gets the ``proxy``/``ssl`` subset plus the
+        ``api_url`` override as ``base_url``. Headers, timeouts and retry
+        handlers are not forwarded, and every call builds a fresh client so
+        no state is shared across reconnects. With none of those configured
+        the kwargs are just ``app_token`` (slack_sdk defaults).
+        """
+        kwargs: dict[str, Any] = {"app_token": cast(str, self._app_token)}
+        options = self._web_client_options if self._web_client_options is not None else {}
+        web_kwargs: dict[str, Any] = {key: options[key] for key in ("proxy", "ssl") if options.get(key) is not None}
+        if self._slack_api_url:
+            web_kwargs["base_url"] = self._slack_api_url
+        if "proxy" in web_kwargs:
+            kwargs["proxy"] = web_kwargs["proxy"]
+        if web_kwargs:
+            from slack_sdk.web.async_client import AsyncWebClient
+
+            kwargs["web_client"] = AsyncWebClient(**web_kwargs)
+        return kwargs
 
     async def _socket_sleep_with_backoff(self, seconds: float) -> None:
         """Sleep for ``seconds`` but wake immediately on shutdown.
@@ -3555,8 +3616,10 @@ class SlackAdapter:
             att_type = "audio"
 
         async def fetch_data() -> bytes:
-            token = ctx_token if ctx_token is not None else await self._resolve_token_async()
-            return await self._fetch_slack_file(url, token)  # type: ignore[arg-type]
+            # The token is resolved lazily by ``_fetch_slack_file``, and only
+            # when the URL is on a Slack auth origin (vercel/chat 7c269653).
+            token: SlackBotToken = ctx_token if ctx_token is not None else self._resolve_token_async
+            return await self._fetch_slack_file(cast(str, url), token)
 
         fetch_meta: dict[str, str] = {}
         if url:
@@ -3583,59 +3646,111 @@ class SlackAdapter:
         )
 
     @staticmethod
-    def _is_trusted_slack_download_url(url: str) -> bool:
+    def _is_trusted_slack_download_url(url: str, api_url: str | None = None) -> bool:
         """Gate Slack file downloads to known Slack-owned hosts.
 
-        We refuse to forward ``Authorization: Bearer {token}`` to an
-        arbitrary URL.  After ``rehydrate_attachment`` reconstructs the
-        fetch closure from serialized ``fetch_metadata``, that URL may
-        have been tampered with in the state store — a crafted value
-        could exfiltrate the workspace bot token.
+        We refuse to start a download (and so to resolve or forward the bot
+        token) from an arbitrary URL. After ``rehydrate_attachment``
+        reconstructs the fetch closure from serialized ``fetch_metadata``,
+        that URL may have been tampered with in the state store.
 
-        This is a Python-first divergence: upstream Slack adapter does not
-        validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
+        This is a Python-first divergence: upstream fetches other URLs
+        without credentials instead of refusing them. The host list is shared
+        with the ``api`` subpath (:func:`is_trusted_slack_file_url`): https
+        Slack file hosts (commercial, GovSlack, ``slack-files``), Slack-owned
+        subdomains, and the configured ``api_url`` origin. See
+        ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
         """
-        try:
-            parsed = urlparse(url)
-        except (ValueError, TypeError):
-            return False
-        if parsed.scheme != "https":
-            return False
-        host = (parsed.hostname or "").lower()
-        if not host:
-            return False
-        # Exact-match hosts
-        if host in {"files.slack.com", "slack.com"}:
-            return True
-        # Suffix match for Slack-owned subdomains
-        return host.endswith(".slack.com") or host.endswith(".slack-edge.com")
+        return is_trusted_slack_file_url(url, api_url=api_url)
 
-    async def _fetch_slack_file(self, url: str, token: str) -> bytes:
-        """Download a file from a Slack ``url_private`` endpoint.
+    @staticmethod
+    def _is_slack_auth_url(url: str, api_url: str | None = None) -> bool:
+        """Whether ``url`` may receive the bot token (upstream ``isSlackAuthUrl``).
+
+        Exact-origin match against the Slack file/API origins (commercial and
+        GovSlack) plus the ``api_url`` origin; see :func:`is_slack_auth_url`.
+        """
+        return is_slack_auth_url(url, api_url)
+
+    async def _fetch_slack_file(self, url: str, token: SlackBotToken) -> bytes:
+        """Download a Slack file through the guarded downloader.
+
+        Port of upstream ``fetchSlackFile`` (vercel/chat ``b6fa24c6`` #865,
+        ``7c269653`` #859, ``6adca361`` #916). ``token`` is a string or a
+        zero-arg (sync or async) resolver, resolved only when ``url`` is on
+        a Slack auth origin. The bot token is then attached per redirect hop,
+        only to hops whose origin is a Slack auth origin, so a redirect never
+        carries it to another host. The shared downloader refuses internal
+        addresses, caps the decoded body at 25 MB and bounds the whole
+        download (every hop and the body) at 30 s. An HTML response (Slack's
+        login page when the app lacks ``files:read``) is rejected before the
+        body is read. Failures raise :class:`NetworkError`.
 
         Shared by :meth:`_create_attachment` (direct fetch closure) and
         :meth:`rehydrate_attachment` (reconstructed closure after JSON
-        roundtrip).  Validates the host against the Slack allowlist
-        before forwarding the bot token (SSRF guard).
+        roundtrip).
         """
-        if not self._is_trusted_slack_download_url(url):
+        api_url = self._slack_api_url
+        # The URL as the downloader will request it (WHATWG-normalized), so the
+        # allowlist and token decisions see the same host the request goes to.
+        try:
+            target: str | None = validate_attachment_url(url, "slack")
+        except NetworkError:
+            target = None
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: a URL off the
+        # Slack allowlist is refused before any token resolution or I/O.
+        if target is None or not self._is_trusted_slack_download_url(target, api_url):
             raise ValidationError(
                 "slack",
                 f"Refusing to fetch Slack file from untrusted URL: {url}",
             )
 
-        import httpx
+        value: str | None = None
+        if self._is_slack_auth_url(target, api_url):
+            value = await resolve_slack_bot_token(token)
 
-        async with httpx.AsyncClient() as http:
-            resp = await http.get(url, headers={"Authorization": f"Bearer {token}"})
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
+        def headers(target: str) -> dict[str, str] | None:
+            # The bot token is sent only on hops to trusted Slack origins, so a
+            # redirect cannot carry it to another host.
+            if value and self._is_slack_auth_url(target, api_url):
+                return {"authorization": f"Bearer {value}"}
+            return None
+
+        def on_response(response: AttachmentResponse) -> None:
+            content_type = next(
+                (item for key, item in response.headers.items() if key.lower() == "content-type"),
+                "",
+            )
             if "text/html" in content_type:
-                raise RuntimeError(
-                    "Failed to download file from Slack: received HTML login page. "
-                    'Ensure your Slack app has the "files:read" OAuth scope.'
+                raise NetworkError(
+                    "slack",
+                    "Failed to download file from Slack: received HTML login page instead of file data. "
+                    'Ensure your Slack app has the "files:read" OAuth scope. '
+                    f"URL: {url}",
                 )
-            return resp.content
+
+        try:
+            return await download_attachment(
+                target,
+                adapter="slack",
+                headers=headers,
+                transport=self._create_file_transport(),
+                on_response=on_response,
+            )
+        except NetworkError:
+            raise
+        except Exception as error:
+            raise NetworkError("slack", "Failed to fetch Slack file", error) from error
+
+    def _create_file_transport(self) -> AttachmentTransport | None:
+        """Transport for guarded file downloads (upstream ``createFileTransport``).
+
+        Returns the configured ``file_transport`` (``None`` selects the
+        downloader's DNS-pinned aiohttp default). Subclasses can override it
+        to return a custom :class:`AttachmentTransport`, which takes
+        precedence over the configured one.
+        """
+        return self._file_transport
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on a deserialized Slack attachment.
@@ -3661,7 +3776,7 @@ class SlackAdapter:
 
         adapter = self
 
-        async def fetch_data() -> bytes:
+        async def resolve_token() -> str:
             installation_id = enterprise_id if is_enterprise_install else team_id
             if installation_id:
                 # Route through ``_resolve_token_for_team`` so
@@ -3675,12 +3790,15 @@ class SlackAdapter:
                         f"Installation not found for "
                         f"{'enterprise' if is_enterprise_install else 'team'} {installation_id}",
                     )
-                token = ctx.token
-            else:
-                # Use the async resolver so a dynamic ``bot_token`` provider
-                # is invoked at fetch time (rotation-safe).
-                token = await adapter._resolve_token_async()
-            return await adapter._fetch_slack_file(url, token)
+                return ctx.token
+            # Use the async resolver so a dynamic ``bot_token`` provider
+            # is invoked at fetch time (rotation-safe).
+            return await adapter._resolve_token_async()
+
+        async def fetch_data() -> bytes:
+            # Lazy: ``_fetch_slack_file`` resolves the installation token only
+            # for a Slack auth origin, so a non-Slack URL never looks one up.
+            return await adapter._fetch_slack_file(url, resolve_token)
 
         return Attachment(
             type=attachment.type,
@@ -3752,14 +3870,20 @@ class SlackAdapter:
                     "Slack API: chat.postMessage (blocks)",
                     {"channel": channel, "threadTs": thread_ts, "blockCount": len(blocks)},
                 )
-                result = await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    text=fallback_text,
-                    blocks=blocks,
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
+                try:
+                    result = await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts or None,
+                        text=fallback_text,
+                        blocks=blocks,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as error:
+                    enriched = self._enrich_invalid_blocks_error(error, blocks)
+                    if enriched is None:
+                        raise
+                    raise enriched from error
                 return RawMessage(
                     id=result.get("ts", ""),
                     thread_id=thread_id,
@@ -4848,6 +4972,45 @@ class SlackAdapter:
     # Error handling
     # ==================================================================
 
+    def _enrich_invalid_blocks_error(self, error: Exception, blocks: list[Any]) -> AdapterError | None:
+        """Surface Slack's per-block validation details on ``invalid_blocks`` errors.
+
+        Port of upstream ``enrichInvalidBlocksError``. The Slack error alone
+        just says ``invalid_blocks``; the actionable details (which block,
+        which field) live in the response's ``errors`` and
+        ``response_metadata.messages``. Returns ``None`` for any other error.
+        Upstream throws a plain ``Error`` with the original as ``cause``; the
+        port raises :class:`AdapterError` (code ``"invalid_blocks"``) with the
+        original as ``__cause__``.
+        """
+        resp = getattr(error, "response", None)
+        data: Any = None
+        if resp is not None and isinstance(getattr(resp, "data", None), dict):
+            data = resp.data
+        elif isinstance(resp, dict):
+            data = resp
+        if not isinstance(data, dict) or data.get("error") != "invalid_blocks":
+            return None
+        errors = data.get("errors")
+        metadata = data.get("response_metadata")
+        messages = metadata.get("messages") if isinstance(metadata, dict) else None
+        details = [
+            *(errors if isinstance(errors, list) else []),
+            *(messages if isinstance(messages, list) else []),
+        ]
+        # Upstream parity: the serialized blocks are logged at error level on
+        # purpose (chat@4.41.1 adapter-slack/src/index.ts:173-176) so the
+        # rejected payload can be debugged. Redact via a custom ``logger``.
+        self._logger.error(
+            "Slack rejected blocks (invalid_blocks)",
+            {"details": details, "blocks": _json_stringify(blocks)},
+        )
+        return AdapterError(
+            f"Slack rejected blocks (invalid_blocks): {_json_stringify(details)}",
+            "slack",
+            "invalid_blocks",
+        )
+
     def _handle_slack_error(self, error: Any) -> NoReturn:
         """Re-raise Slack errors with appropriate SDK error types.
 
@@ -4945,6 +5108,20 @@ class SlackAdapter:
     # Response URL
     # ==================================================================
 
+    def _create_http_client(self) -> Any:
+        """The ``httpx.AsyncClient`` for one ``response_url`` request.
+
+        Uses the configured ``http_client_factory`` (upstream ``fetch``,
+        vercel/chat 6adca361) so egress-proxied deployments can route these
+        posts; otherwise a default client. httpx is imported lazily, and only
+        when no factory is configured.
+        """
+        if self._http_client_factory is not None:
+            return self._http_client_factory()
+        import httpx
+
+        return httpx.AsyncClient()
+
     async def _send_to_response_url(
         self,
         response_url: str,
@@ -4959,8 +5136,6 @@ class SlackAdapter:
         # userinfo or explicit port. Checked before httpx is even imported.
         if not _is_trusted_slack_response_url(response_url):
             raise ValidationError("slack", "Refusing to send content to an untrusted Slack response_url")
-
-        import httpx
 
         payload: dict[str, Any]
 
@@ -4994,7 +5169,7 @@ class SlackAdapter:
             {"action": action, "threadTs": thread_ts},
         )
 
-        async with httpx.AsyncClient() as http:
+        async with self._create_http_client() as http:
             resp = await http.post(
                 response_url,
                 json=payload,

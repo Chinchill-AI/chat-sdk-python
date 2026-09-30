@@ -815,6 +815,8 @@ class TestHandleWebhook:
     async def test_webhook_accepts_valid_secret(self):
         adapter = _make_adapter(secret_token="my-secret")
         chat = _init_adapter(adapter)
+        # A private message also fires a typing chat action; keep it offline.
+        adapter.telegram_fetch = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
         class FakeReq:
             headers = {"x-telegram-bot-api-secret-token": "my-secret"}

@@ -84,7 +84,8 @@ from chat_sdk.types import (
 
 DEFAULT_LOCK_TTL_MS = 30_000  # 30 seconds
 DEFAULT_MAX_LOCK_LIFETIME_MS = 600_000  # 10 minutes
-DEDUPE_TTL_MS = 5 * 60 * 1000  # 5 minutes
+# 10 minutes: outlives Slack's ~+5 min Events API retry (vercel/chat#667).
+DEDUPE_TTL_MS = 10 * 60 * 1000
 MODAL_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
 
 SLACK_USER_ID_REGEX = re.compile(r"^[UW][A-Z0-9]+$")
@@ -456,7 +457,7 @@ class Chat:
         self._adapters: dict[str, Adapter] = {}
         self._streaming_update_interval_ms = config.streaming_update_interval_ms
         self._fallback_streaming_placeholder_text = config.fallback_streaming_placeholder_text
-        self._dedupe_ttl_ms = config.dedupe_ttl_ms or DEDUPE_TTL_MS
+        self._dedupe_ttl_ms = config.dedupe_ttl_ms if config.dedupe_ttl_ms is not None else DEDUPE_TTL_MS
         self._lock_scope_config = config.lock_scope
         self._on_lock_conflict: OnLockConflict | None = config.on_lock_conflict
 
@@ -592,7 +593,6 @@ class Chat:
         # -- Init state -------------------------------------------------------
         self._init_promise: asyncio.Task[None] | None = None
         self._initialized = False
-        self._init_lock = asyncio.Lock()
 
         # -- Active handler tasks (for cancellation on shutdown) --------------
         self._active_tasks: set[asyncio.Task[Any]] = set()
@@ -714,21 +714,43 @@ class Chat:
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
-        async with self._init_lock:
-            if self._initialized:
-                return
-            if self._init_promise is None:
-                self._init_promise = asyncio.get_running_loop().create_task(self._do_initialize())
-            try:
-                await self._init_promise
-            except Exception:
-                # Reset so a subsequent call can retry initialization.
+        # Avoid concurrent initialization: every caller shares one attempt
+        # task. A failed *state* connection is forgotten so the next caller
+        # retries once the dependency (e.g. Redis) has recovered; an adapter
+        # ``initialize()`` failure stays cached until ``shutdown()`` so a retry
+        # never re-initializes adapters that already started (vercel/chat#924).
+        # No await between the check and the assignment, so no lock is needed.
+        attempt = self._init_promise
+        if attempt is None:
+            self._logger.info("Initializing chat instance...")
+            # Construct the Task directly (never eagerly started) rather than
+            # via ``loop.create_task``: an eager task factory would run a
+            # synchronously failing ``connect()`` before ``_init_promise`` is
+            # assigned, and the failure would then be cached. Upstream's
+            # ``.catch`` always runs after the assignment.
+            attempt = asyncio.Task(self._run_init_attempt(), loop=asyncio.get_running_loop())
+            # Mark the failure observed: if every caller was cancelled, the
+            # shield drops its callback and nobody retrieves the exception
+            # ("Task exception was never retrieved"). Awaiting callers still
+            # get it re-raised.
+            attempt.add_done_callback(lambda t: t.cancelled() or t.exception())
+            self._init_promise = attempt
+        # Shield so a cancelled caller (e.g. an aborted webhook request) does
+        # not cancel the attempt that concurrent callers share.
+        await asyncio.shield(attempt)
+
+    async def _run_init_attempt(self) -> None:
+        try:
+            await self._state_adapter.connect()
+        except BaseException:
+            # Only forget this attempt if it is still the current one: a
+            # ``shutdown()`` + newer ``initialize()`` may have replaced it.
+            if self._init_promise is asyncio.current_task():
                 self._init_promise = None
-                raise
+            raise
+        await self._do_initialize()
 
     async def _do_initialize(self) -> None:
-        self._logger.info("Initializing chat instance...")
-        await self._state_adapter.connect()
         self._logger.debug("State connected")
 
         init_tasks = []
@@ -736,7 +758,14 @@ class Chat:
             self._logger.debug("Initializing adapter", adapter.name)
             init_tasks.append(adapter.initialize(self))  # type: ignore[arg-type]
 
-        await asyncio.gather(*init_tasks)
+        try:
+            await asyncio.gather(*init_tasks)
+        except Exception as err:
+            self._logger.error(
+                "Adapter initialization failed; call shutdown() before retrying initialization",
+                {"error": str(err)},
+            )
+            raise
         self._initialized = True
         self._logger.info(
             "Chat instance initialized",
@@ -768,6 +797,10 @@ class Chat:
                 self._logger.error("Adapter disconnect failed", str(r))
         await self._state_adapter.disconnect()
         self._initialized = False
+        # Upstream parity (chat.ts ``shutdown``): an in-flight initialization
+        # attempt is forgotten, not cancelled. It settles for its own callers,
+        # as in upstream where the attempt promise cannot be cancelled (pinned
+        # by test_keeps_a_newer_attempt_when_a_preshutdown_state_connection_rejects).
         self._init_promise = None
         self._logger.info("Chat instance shut down")
 
@@ -1122,6 +1155,52 @@ class Chat:
     # Process* methods (called by adapters)
     # ========================================================================
 
+    def _hand_to_wait_until(
+        self,
+        task: asyncio.Task[Any],
+        options: WebhookOptions | None,
+        *,
+        propagate: bool = False,
+    ) -> None:
+        """Hand a handler task to ``options.wait_until``.
+
+        Upstream passes ``waitUntil`` a ``task.catch(log)`` promise that
+        fulfils even when the handler fails; only message/action/slash-command
+        honour ``propagateHandlerErrors`` (vercel/chat#943). ``propagate``
+        marks those three call sites.
+        """
+        if not options or not options.wait_until:
+            return
+        if propagate and options.propagate_handler_errors:
+            options.wait_until(task)
+            return
+        tracked = self._tracked(task)
+        if tracked is not None:
+            options.wait_until(tracked)
+
+    def _tracked(self, task: asyncio.Task[Any]) -> asyncio.Task[None] | None:
+        """Return a Task that completes when *task* does, swallowing its error.
+
+        The TS ``task.catch(...)`` equivalent. It must be a real ``Task`` (the
+        Teams DM streaming gate hooks ``add_done_callback``), and it awaits
+        ``asyncio.shield(task)`` so cancelling the wrapper (e.g. a host's
+        ``wait_until`` bookkeeping) never cancels the handler. The error is
+        already logged by the handler task's done-callback.
+        """
+
+        async def _await_quietly() -> None:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise  # the wrapper itself was cancelled
+                # The handler task was cancelled: treat as completion.
+            except Exception:  # noqa: S110 — logged by the task's done-callback
+                pass
+
+        return _create_task(_await_quietly(), self._active_tasks)
+
     def process_message(
         self,
         adapter: Adapter,
@@ -1135,18 +1214,23 @@ class Chat:
         handler task (``None`` only when no event loop is running) so
         streaming callers can await full handler completion and observe
         handler exceptions; fire-and-forget webhook callers may ignore it.
-        ``wait_until`` keeps the existing swallowed-error semantics —
-        platforms shouldn't retry on handler bugs. (Core slice of
-        vercel/chat#444; the @chat-adapter/web package itself is not ported.)
+        By default ``wait_until`` receives a task that completes normally
+        when the handler fails (the error is logged) — platforms shouldn't
+        retry on handler bugs; ``WebhookOptions.propagate_handler_errors``
+        hands it the raw task instead (vercel/chat#943). ``deduplicate=False``
+        skips chat-level deduplication (vercel/chat#942).
         """
+        skip_dedupe = options is not None and options.deduplicate is False
 
         async def _task() -> None:
             msg = await message_or_factory() if callable(message_or_factory) else message_or_factory
-            # handle_incoming_message enters the conversation itself.
-            # TODO(C1b): the ``deduplicate=False`` bypass (#191) must wrap its
-            # direct routing call in ``conversation(thread_id)`` too, as
-            # upstream processMessage does.
-            await self.handle_incoming_message(adapter, thread_id, msg)
+            if skip_dedupe:
+                # Upstream processMessage wraps the dedupe-bypass route in
+                # runInConversation too; handle_incoming_message enters it itself.
+                with conversation(thread_id):
+                    await self._route_incoming_message(adapter, thread_id, msg, deduplicate=False)
+            else:
+                await self.handle_incoming_message(adapter, thread_id, msg)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1159,16 +1243,20 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options, propagate=True)
         return task
 
     def process_reaction(
         self,
         event: ReactionEvent,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Process an incoming reaction event."""
+    ) -> asyncio.Task[None] | None:
+        """Process an incoming reaction event.
+
+        Returns the handler task (``None`` without a running loop); it raises
+        on handler failure. ``wait_until`` always receives the error-swallowing
+        wrapper (vercel/chat#942).
+        """
 
         async def _task() -> None:
             # Enter the conversation inside the task: create_task copies the
@@ -1185,15 +1273,19 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
+        return task
 
     def process_action(
         self,
         event: ActionEvent,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Process an incoming action event (button click)."""
+    ) -> asyncio.Task[None] | None:
+        """Process an incoming action event (button click).
+
+        Returns the handler task (``None`` without a running loop); it raises
+        on handler failure. See :meth:`process_message` for ``wait_until``.
+        """
 
         async def _task() -> None:
             with conversation(event.thread_id):
@@ -1203,13 +1295,16 @@ class Chat:
         if task is not None:
             task.add_done_callback(
                 lambda t: (
-                    self._logger.error("Action processing error", {"error": str(t.exception())})
+                    self._logger.error(
+                        "Action processing error",
+                        {"error": str(t.exception()), "action_id": event.action_id, "message_id": event.message_id},
+                    )
                     if not t.cancelled() and t.exception()
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options, propagate=True)
+        return task
 
     async def process_options_load(
         self,
@@ -1348,26 +1443,32 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
 
     def process_slash_command(
         self,
         event: SlashCommandEvent,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Process a slash command event."""
+    ) -> asyncio.Task[None] | None:
+        """Process a slash command event.
+
+        Returns the handler task (``None`` without a running loop); it raises
+        on handler failure. See :meth:`process_message` for ``wait_until``.
+        """
         task = _create_task(self._handle_slash_command_event(event), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
-                    self._logger.error("Slash command processing error", {"error": str(t.exception())})
+                    self._logger.error(
+                        "Slash command processing error",
+                        {"error": str(t.exception()), "command": event.command, "text": event.text},
+                    )
                     if not t.cancelled() and t.exception()
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options, propagate=True)
+        return task
 
     def process_assistant_thread_started(
         self,
@@ -1388,8 +1489,7 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
 
     def process_assistant_context_changed(
         self,
@@ -1410,8 +1510,7 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
 
     def process_app_home_opened(
         self,
@@ -1436,8 +1535,7 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
 
     def process_member_joined_channel(
         self,
@@ -1458,8 +1556,7 @@ class Chat:
                     else None
                 )
             )
-            if options and options.wait_until:
-                options.wait_until(task)
+            self._hand_to_wait_until(task, options)
 
     # ========================================================================
     # Slash command handling
@@ -2166,7 +2263,9 @@ class Chat:
         adapter: Adapter,
         thread_id: str,
         message: Message,
+        deduplicate: bool = True,
     ) -> None:
+        """Self-filter, then (unless ``deduplicate`` is False) dedupe, then dispatch."""
         self._logger.debug(
             "Incoming message",
             {
@@ -2183,6 +2282,10 @@ class Chat:
             self._logger.debug("Skipping message from self (is_me=True)")
             return
 
+        if not deduplicate:
+            await self._dispatch_incoming_message(adapter, thread_id, message)
+            return
+
         # Deduplicate
         dedupe_key = f"dedupe:{adapter.name}:{message.id}"
         is_first = await self._state_adapter.set_if_not_exists(dedupe_key, True, self._dedupe_ttl_ms)
@@ -2190,6 +2293,15 @@ class Chat:
             self._logger.debug("Skipping duplicate message", {"message_id": message.id})
             return
 
+        await self._dispatch_incoming_message(adapter, thread_id, message)
+
+    async def _dispatch_incoming_message(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message,
+    ) -> None:
+        """Persist history, resolve the lock key, and run the concurrency strategy."""
         # Persist incoming message before acquiring lock.
         # `persist_message_history` is the deprecated adapter flag; either
         # being truthy enables persistence (mirrors upstream

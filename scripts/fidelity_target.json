@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 772,
-    "matched_fuzzy": 77,
-    "missing": 215,
-    "extra": 452
+    "matched_exact": 781,
+    "matched_fuzzy": 76,
+    "missing": 207,
+    "extra": 460
   },
   "absent_ts_files": [],
   "files": {
@@ -18,16 +18,14 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 142,
-      "matched_fuzzy": 12,
-      "missing_count": 23,
-      "extra_count": 15,
+      "matched_exact": 151,
+      "matched_fuzzy": 11,
+      "missing_count": 15,
+      "extra_count": 23,
       "missing": [
-        ["Chat", "should optionally propagate handler errors through waitUntil"],
         ["Chat", "aborts an active thread signal from another Chat instance"],
         ["Chat", "should dispatch message updates without normal message routing"],
         ["Chat", "should dispatch message deletes with normalized event data"],
-        ["message deduplication", "lets transports own deduplication when retrying admission"],
         ["isMention property", "should not treat %s as a mention (%s)"],
         ["isMention property", "should still detect %s as a mention (%s)"],
         ["isMention property", "should keep a definitive non-mention reported by the adapter"],
@@ -39,17 +37,10 @@
         ["thread", "passes only explicit placeholder config to adapter streaming"],
         ["getUser", "should return null when user is not found"],
         ["getUser", "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"],
-        ["concurrency: queue", "should keep a definitive non-mention on skipped queued messages"],
-        ["Chat initialization retry (#922)", "does not restart an initialized adapter when another adapter fails"],
-        ["Chat initialization retry (#922)", "does not overlap adapter initialization after a sibling fails"],
-        ["Chat initialization retry (#922)", "recovers through a webhook after repeated state connection failures"],
-        ["Chat initialization retry (#922)", "keeps a newer attempt when a pre-shutdown state connection rejects"],
-        ["Chat initialization retry (#922)", "retries initialization after a failed attempt once the state recovers"],
-        ["Chat initialization retry (#922)", "still shares one attempt between concurrent callers, including a failing one"]
+        ["concurrency: queue", "should keep a definitive non-mention on skipped queued messages"]
       ],
       "fuzzy_matches": [
         ["should return adapter by name", "test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals"],
-        ["should use default dedupe TTL of 10 minutes", "test_should_use_default_dedupe_ttl_of_5_minutes"],
         ["should not trigger onNewMention when a bot with a hyphen-suffixed name is mentioned", "test_should_return_none_when_user_is_not_found"],
         ["should not trigger onNewMention when a hyphen-suffixed user ID is mentioned", "test_should_throw_when_adapter_does_not_support_get_user"],
         ["should throw when adapter does not support getUser", "test_should_throw_ambiguous_when_short_numeric_matches_telegram_and_github"],

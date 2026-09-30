@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, TypedDict
 
 # Custom webhook verifier — defined in (and re-exported from) the low-level
 # ``chat_sdk.adapters.slack.webhook`` subpath since vercel/chat#538. See
@@ -12,6 +12,10 @@ from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 # comparison, replay protection, body-substitution safety).
 from chat_sdk.adapters.slack.webhook.types import SlackWebhookVerifier
 from chat_sdk.logger import Logger
+from chat_sdk.shared.download import AttachmentTransport
+
+if TYPE_CHECKING:
+    import httpx
 
 # ---------------------------------------------------------------------------
 # Bot token resolver
@@ -65,7 +69,39 @@ class SlackAdapterConfig:
     # ``headers`` (a dict) is deep-copied per client so cached per-token clients
     # never share a mutable dict and caller input is never mutated. See the
     # ``webClientOptions`` divergence row in docs/UPSTREAM_SYNC.md.
+    #
+    # Socket Mode (vercel/chat 6adca361): ``proxy`` (an HTTP proxy URL) is
+    # passed to ``SocketModeClient(proxy=...)`` for the WebSocket, and
+    # ``proxy``, ``ssl`` and ``api_url`` reach the ``apps.connections.open``
+    # client it uses. Other keys apply only to Web API clients, and none of
+    # them configure ``http_client_factory`` or ``file_transport``.
     web_client_options: dict[str, Any] | None = None
+    # Transport for lazy and rehydrated file downloads (vercel/chat 6adca361,
+    # upstream ``fileTransport``). Replaces the default DNS-pinned aiohttp
+    # transport, which is the only place resolved addresses are checked
+    # against the private-range blocklist, so the transport or egress proxy
+    # must itself reject internal destinations and DNS rebinding. It must
+    # return the raw response without following redirects. The downloader
+    # still validates every hop URL, limits redirects, sends the bot token
+    # only on hops to Slack origins, enforces the 30 s deadline and caps the
+    # decoded body at 25 MB. A subclass ``_create_file_transport()`` wins.
+    #
+    # The default transport ignores ``HTTPS_PROXY`` / ``HTTP_PROXY`` (aiohttp
+    # ``trust_env=False``: a proxy would resolve hosts itself and bypass the
+    # pinned-address check). Before this, downloads used ``httpx.AsyncClient()``,
+    # which honored those env vars, so a deployment whose only egress is an
+    # env-configured proxy must now set ``file_transport`` (Python-only
+    # change; upstream's Node transport never read env proxies).
+    file_transport: AttachmentTransport | None = None
+    # Factory for the ``httpx.AsyncClient`` used for ``response_url`` posts
+    # (ephemeral replace/delete). Python counterpart of upstream ``fetch``
+    # (vercel/chat 6adca361): set ``proxy=``/``verify=``/``transport=`` on
+    # the client to route these requests through an egress proxy. Called
+    # once per request and the adapter closes the client it returns, so
+    # return a fresh client each time. Defaults to ``httpx.AsyncClient()``.
+    # Does not affect Web API clients (``web_client_options``), Socket Mode
+    # or file downloads (``file_transport``).
+    http_client_factory: Callable[[], httpx.AsyncClient] | None = None
     # App-level token (xapp-...). Required when ``mode == "socket"``.
     app_token: str | None = None
     # Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace.
@@ -440,6 +476,7 @@ class SlackViewStateInput(TypedDict, total=False):
     """A single input value in a view submission."""
 
     value: str
+    selected_date: str
     selected_option: dict[str, str]  # {"value": "..."}
 
 

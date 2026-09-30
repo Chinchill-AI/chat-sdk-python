@@ -22,6 +22,7 @@ import time
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, TypeVar, cast
 
 from chat_sdk.adapters.telegram.cards import (
@@ -49,6 +50,7 @@ from chat_sdk.adapters.telegram.types import (
     TelegramMessageReactionUpdated,
     TelegramRawMessage,
     TelegramReactionType,
+    TelegramStickerFile,
     TelegramThreadId,
     TelegramUpdate,
     TelegramUser,
@@ -57,12 +59,14 @@ from chat_sdk.adapters.telegram.types import (
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.adapter_utils import (
     extract_card,
     extract_files,
     extract_postable_attachments,
 )
 from chat_sdk.shared.card_utils import card_to_fallback_text
+from chat_sdk.shared.download import DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
     AdapterRateLimitError,
@@ -104,6 +108,10 @@ from chat_sdk.types import (
 TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
+# Inbound file downloads are capped at 25 MB and 30 s (vercel/chat#865),
+# the same limits as the shared attachment downloader.
+TELEGRAM_FILE_LIMIT = DEFAULT_LIMIT
+TELEGRAM_FILE_TIMEOUT_MS = DEFAULT_TIMEOUT_MS
 TELEGRAM_SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"  # pragma: allowlist secret
 TELEGRAM_WEBHOOK_VERIFICATION_ERROR = (
     "secret_token is required in webhook mode. Set TELEGRAM_WEBHOOK_SECRET_TOKEN or provide "
@@ -597,6 +605,111 @@ def _integral_update_id(value: Any) -> int | None:
     return None
 
 
+def _js_number_str(value: Any) -> str:
+    """Render a JSON number the way JavaScript's ``String(number)`` does.
+
+    Python's ``str(float)`` differs from JS for integral floats (``51.0`` vs
+    ``51``) and switches to exponent notation at other thresholds (``1e-05``
+    vs ``0.00001``). ``repr`` already yields the shortest round-tripping
+    digits (the same digits JS picks), so only the notation is rewritten:
+    fixed-point when the leading digit's exponent is in ``(-7, 21)``,
+    otherwise ``d[.ddd]e+n`` / ``d[.ddd]e-n``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    if value == 0:
+        return "0"
+    number = Decimal(repr(value)).normalize()
+    exponent = number.adjusted()
+    if -7 < exponent < 21:
+        return format(number, "f")
+    sign, digits, _ = number.as_tuple()
+    text = "".join(str(d) for d in digits)
+    mantissa = text[0] + (f".{text[1:]}" if len(text) > 1 else "")
+    return f"{'-' if sign else ''}{mantissa}e{'+' if exponent >= 0 else '-'}{abs(exponent)}"
+
+
+# An invoice's total_amount is in the currency's smallest unit, and the
+# exponent varies per currency: Telegram's own list
+# (https://core.telegram.org/bots/payments/currencies.json) has these seven
+# at 0 and three at 3, with everything else at 2. XTR (Telegram Stars) is
+# not in that list and counts whole Stars.
+_ZERO_EXPONENT_CURRENCIES = frozenset({"CLP", "ISK", "JPY", "KRW", "PYG", "UGX", "VND", "XTR"})
+_THREE_EXPONENT_CURRENCIES = frozenset({"BHD", "IQD", "JOD"})
+
+
+def _format_invoice_amount(total_amount: float, currency: str) -> str:
+    """Port of upstream ``formatInvoiceAmount``: ``(amount / 10**e).toFixed(e)``."""
+    exponent = 2
+    if currency in _ZERO_EXPONENT_CURRENCIES:
+        exponent = 0
+    elif currency in _THREE_EXPONENT_CURRENCIES:
+        exponent = 3
+    return f"{total_amount / 10**exponent:.{exponent}f}"
+
+
+def _describe_non_file_content(raw: TelegramMessage) -> str | None:
+    """Readable text for message kinds that carry neither text nor a file.
+
+    Port of upstream ``describeNonFileContent`` (vercel/chat#836). Without it
+    a location, poll, etc. arrives with ``text == ""`` and a handler cannot
+    tell it from an empty delivery; the structured payload stays on ``raw``.
+    Presence checks are ``is not None`` because a JS object is always truthy.
+    """
+    # Telegram sets ``location`` alongside ``venue`` for backward
+    # compatibility, so the venue check has to come first.
+    venue = raw.get("venue")
+    if venue is not None:
+        return f"📍 {venue.get('title')}, {venue.get('address')}"
+    location = raw.get("location")
+    if location is not None:
+        latitude = _js_number_str(location.get("latitude"))
+        longitude = _js_number_str(location.get("longitude"))
+        return f"📍 {latitude}, {longitude}"
+    contact = raw.get("contact")
+    if contact is not None:
+        name = " ".join(part for part in (contact.get("first_name"), contact.get("last_name")) if part)
+        return f"👤 {name} {contact.get('phone_number')}".strip(JS_WHITESPACE)
+    poll = raw.get("poll")
+    if poll is not None:
+        return f"📊 {poll.get('question')}"
+    dice = raw.get("dice")
+    if dice is not None:
+        return f"{dice.get('emoji')} {_js_number_str(dice.get('value'))}"
+    game = raw.get("game")
+    if game is not None:
+        return f"🎮 {game.get('title')}"
+    invoice = raw.get("invoice")
+    if invoice is not None:
+        currency = invoice.get("currency", "")
+        amount = _format_invoice_amount(invoice.get("total_amount", 0), currency)
+        return f"🧾 {invoice.get('title')} — {amount} {currency}"
+    if raw.get("story") is not None:
+        return "📖 Story"
+    return None
+
+
+def _sticker_attachment_format(sticker: TelegramStickerFile) -> tuple[str, str]:
+    """Attachment ``(type, mime_type)`` for a sticker's real file format.
+
+    A still sticker is WebP, a video sticker WebM and an animated (Lottie)
+    one the TGS container. The type follows the real format so type-driven
+    consumers never route a WebM through ``sendPhoto``. Port of upstream
+    ``stickerAttachmentFormat``.
+    """
+    if sticker.get("is_video"):
+        return "video", "video/webm"
+    if sticker.get("is_animated"):
+        return "file", "application/x-tgsticker"
+    return "image", "image/webp"
+
+
 def _escape_markdown_in_entity(text: str) -> str:
     """Escape markdown-special characters inside entity text."""
     return re.sub(r"([\[\]()\\])", r"\\\1", text)
@@ -713,7 +826,40 @@ class TelegramAdapter:
             else os.environ.get("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS") == "true"
         )
         self._warned_no_verification: bool = False
+        # User allowlist (vercel/chat#742): ``allowedUserIds ??
+        # TELEGRAM_ALLOWED_USER_IDS.split(",")``, each id stringified and
+        # trimmed, empties dropped. An empty result allows everyone (None).
+        raw_allowed_user_ids: list[int | str] | None = config.allowed_user_ids
+        # Python-only guard: a bare string (e.g. ``"123,456"`` straight from an
+        # env var) would iterate per character; upstream's ``.map`` throws.
+        if raw_allowed_user_ids is not None and not isinstance(raw_allowed_user_ids, list | tuple | set | frozenset):
+            raise ValidationError(
+                "telegram",
+                f"allowed_user_ids must be a list of user IDs, got {type(raw_allowed_user_ids).__name__}",
+            )
+        if raw_allowed_user_ids is None:
+            env_allowed_user_ids = os.environ.get("TELEGRAM_ALLOWED_USER_IDS")
+            if env_allowed_user_ids is not None:
+                raw_allowed_user_ids = list(env_allowed_user_ids.split(","))
+        normalized_allowed_user_ids = (
+            [
+                normalized
+                for normalized in (_js_number_str(value).strip(JS_WHITESPACE) for value in raw_allowed_user_ids)
+                if normalized
+            ]
+            if raw_allowed_user_ids is not None
+            else []
+        )
+        self._allowed_user_ids: set[str] | None = (
+            set(normalized_allowed_user_ids) if normalized_allowed_user_ids else None
+        )
         self._logger: Logger = config.logger or ConsoleLogger("info").child("telegram")
+        # Mention regex compiled once per username (vercel/chat#706).
+        self._mention_regex: re.Pattern[str] | None = None
+        self._mention_regex_username: str | None = None
+        # Strong references to fire-and-forget typing tasks so they are not
+        # garbage-collected mid-flight when no ``wait_until`` is supplied.
+        self._typing_tasks: set[asyncio.Task[None]] = set()
         self._format_converter: TelegramFormatConverter = TelegramFormatConverter()
         self._message_cache: dict[str, list[Message]] = {}
 
@@ -1046,6 +1192,13 @@ class TelegramAdapter:
     async def disconnect(self) -> None:
         """Disconnect the adapter, stop polling, and close the shared HTTP session."""
         await self.stop_polling()
+        # Python-only: a pending receipt-typing task would otherwise reopen the
+        # shared aiohttp session via ``_get_http_session`` after it is closed.
+        typing_tasks = [task for task in self._typing_tasks if not task.done()]
+        for task in typing_tasks:
+            task.cancel()
+        if typing_tasks:
+            await asyncio.gather(*typing_tasks, return_exceptions=True)
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
             self._http_session = None
@@ -1246,12 +1399,29 @@ class TelegramAdapter:
         options: WebhookOptions | None = None,
     ) -> None:
         """Dispatch a Telegram update to the appropriate handler."""
-        message_update = (
-            update.get("message")
-            or update.get("edited_message")
-            or update.get("channel_post")
-            or update.get("edited_channel_post")
+        # ``message ?? edited_message ?? channel_post ?? edited_channel_post``:
+        # the first present (non-None) payload, as upstream's nullish chain.
+        message_update: TelegramMessage | None = next(
+            (
+                candidate
+                for candidate in (
+                    update.get("message"),
+                    update.get("edited_message"),
+                    update.get("channel_post"),
+                    update.get("edited_channel_post"),
+                )
+                if candidate is not None
+            ),
+            None,
         )
+
+        # User allowlist (vercel/chat#742), checked before any routing. With an
+        # allowlist set, an update with no acting user (e.g. an anonymous
+        # channel post) is dropped too.
+        if self._allowed_user_ids is not None:
+            user_id = self._update_user_id(update, message_update)
+            if user_id is None or _js_number_str(user_id) not in self._allowed_user_ids:
+                return
 
         # Slash commands are gated to fresh ``message`` updates only — edited
         # messages and channel posts never route to the slash-command
@@ -1261,7 +1431,7 @@ class TelegramAdapter:
         message = update.get("message")
         handled_slash_command = message is not None and self.handle_slash_command_update(message, options)
 
-        if message_update and not handled_slash_command:
+        if message_update is not None and not handled_slash_command:
             self.handle_incoming_message_update(message_update, options)
 
         if update.get("callback_query"):
@@ -1269,6 +1439,28 @@ class TelegramAdapter:
 
         if update.get("message_reaction"):
             self.handle_message_reaction_update(update["message_reaction"], options)
+
+    @staticmethod
+    def _update_user_id(update: TelegramUpdate, message_update: TelegramMessage | None) -> Any:
+        """The acting user's id for the allowlist, or ``None`` when absent.
+
+        ``callback_query.from.id ?? message_reaction.user?.id ??
+        messageUpdate.from?.id`` — each step nullish (``is not None``).
+        """
+
+        def sender(payload: Any) -> Any:
+            # Telegram's ``from`` key; typed as ``from_user`` (reserved word).
+            return None if payload is None else (payload.get("from_user") or payload.get("from"))
+
+        reaction = update.get("message_reaction")
+        for user in (
+            sender(update.get("callback_query")),
+            reaction.get("user") if reaction is not None else None,
+            sender(message_update),
+        ):
+            if user is not None and user.get("id") is not None:
+                return user["id"]
+        return None
 
     def handle_incoming_message_update(
         self,
@@ -1285,6 +1477,8 @@ class TelegramAdapter:
                 message_thread_id=telegram_message.get("message_thread_id"),
             )
         )
+
+        self._start_typing_for_private_message(telegram_message, thread_id, options)
 
         parsed_message = self.parse_telegram_message(telegram_message, thread_id)
         self.cache_message(parsed_message)
@@ -1319,6 +1513,8 @@ class TelegramAdapter:
             )
         )
 
+        self._start_typing_for_private_message(telegram_message, thread_id, options)
+
         parsed_message = self.parse_telegram_message(telegram_message, thread_id)
         self.cache_message(parsed_message)
 
@@ -1334,6 +1530,47 @@ class TelegramAdapter:
         self._chat.process_slash_command(event, options)
 
         return True
+
+    def _start_typing_for_private_message(
+        self,
+        telegram_message: TelegramMessage,
+        thread_id: str,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Show ``typing`` on receipt of a private, non-bot message.
+
+        Port of upstream ``startTypingForPrivateMessage`` (vercel/chat#612).
+        The chat action is fired as a background task scheduled before the
+        handler task, never awaited inline, so it cannot delay dispatch; a
+        failure is only logged.
+        """
+        if telegram_message["chat"].get("type") != "private":
+            return
+        sender = cast(
+            "TelegramUser | None",
+            telegram_message.get("from_user") or telegram_message.get("from"),  # type: ignore[call-overload]
+        )
+        if sender and sender.get("is_bot"):
+            return
+
+        async def _typing() -> None:
+            try:
+                await self.start_typing(thread_id)
+            except Exception as error:
+                self._logger.warn(
+                    "Failed to send Telegram typing action",
+                    {"error": str(error), "threadId": thread_id},
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_typing())
+        self._typing_tasks.add(task)
+        task.add_done_callback(self._typing_tasks.discard)
+        if options is not None and options.wait_until is not None:
+            options.wait_until(task)
 
     def parse_slash_command(
         self,
@@ -2330,12 +2567,30 @@ class TelegramAdapter:
         content_text = content.text if content is not None else None
         raw_text = raw.get("text")
         raw_caption = raw.get("caption")
+        sticker = raw.get("sticker")
+        # A sticker carries no text, only the emoji it stands for; fall back to
+        # the set name, then a plain label, so it never arrives empty
+        # (vercel/chat#835). ``emoji ?? set_name ?? "sticker"`` is nullish.
+        sticker_text: str | None = None
+        if sticker is not None:
+            sticker_emoji = sticker.get("emoji")
+            sticker_set_name = sticker.get("set_name")
+            if sticker_emoji is not None:
+                sticker_text = sticker_emoji
+            elif sticker_set_name is not None:
+                sticker_text = sticker_set_name
+            else:
+                sticker_text = "sticker"
         if content_text is not None:
             plain_text = content_text
         elif raw_text is not None:
             plain_text = raw_text
         elif raw_caption is not None:
             plain_text = raw_caption
+        elif sticker_text is not None:
+            plain_text = sticker_text
+        elif (non_file_text := _describe_non_file_content(raw)) is not None:
+            plain_text = non_file_text
         elif rich_message:
             plain_text = rich_message_to_text(rich_message)
         else:
@@ -2414,6 +2669,9 @@ class TelegramAdapter:
                     size=photo.get("file_size"),
                     width=photo.get("width"),
                     height=photo.get("height"),
+                    # Telegram re-encodes every photo size as JPEG (vercel/chat#752).
+                    mime_type="image/jpeg",
+                    file_unique_id=photo.get("file_unique_id"),
                 )
             )
 
@@ -2428,6 +2686,7 @@ class TelegramAdapter:
                     height=video.get("height"),
                     name=video.get("file_name"),
                     mime_type=video.get("mime_type"),
+                    file_unique_id=video.get("file_unique_id"),
                 )
             )
 
@@ -2440,6 +2699,7 @@ class TelegramAdapter:
                     size=audio.get("file_size"),
                     name=audio.get("file_name"),
                     mime_type=audio.get("mime_type"),
+                    file_unique_id=audio.get("file_unique_id"),
                 )
             )
 
@@ -2451,11 +2711,16 @@ class TelegramAdapter:
                     voice["file_id"],
                     size=voice.get("file_size"),
                     mime_type=voice.get("mime_type"),
+                    file_unique_id=voice.get("file_unique_id"),
                 )
             )
 
+        # When a message carries an animation, Telegram also sets `document`
+        # for backward compatibility; it is the same file, so it is reported
+        # once, as the animation below (vercel/chat#835).
         document = raw.get("document")
-        if document:
+        animation = raw.get("animation")
+        if document and not animation:
             attachments.append(
                 self.create_attachment(
                     "file",
@@ -2463,6 +2728,7 @@ class TelegramAdapter:
                     size=document.get("file_size"),
                     name=document.get("file_name"),
                     mime_type=document.get("mime_type"),
+                    file_unique_id=document.get("file_unique_id"),
                 )
             )
 
@@ -2479,6 +2745,43 @@ class TelegramAdapter:
                     size=video_note.get("file_size"),
                     width=length,
                     height=length,
+                    file_unique_id=video_note.get("file_unique_id"),
+                )
+            )
+
+        # An animation is Telegram's GIF: an MP4 without sound. Upstream parity
+        # (chat@4.41.1 adapter-telegram index.ts:2798-2809): always a "video"
+        # attachment, even for an ``image/gif`` mime type, so re-posting it
+        # goes through ``sendVideo`` exactly as upstream's ATTACHMENT_UPLOADS
+        # table does; no GIF-specific outbound route is added here.
+        if animation:
+            attachments.append(
+                self.create_attachment(
+                    "video",
+                    animation["file_id"],
+                    size=animation.get("file_size"),
+                    width=animation.get("width"),
+                    height=animation.get("height"),
+                    name=animation.get("file_name"),
+                    mime_type=animation.get("mime_type"),
+                    file_unique_id=animation.get("file_unique_id"),
+                )
+            )
+
+        # A still sticker is a WebP image; a video sticker is WebM and a
+        # Lottie one the TGS container, neither of which renders as an image.
+        sticker = raw.get("sticker")
+        if sticker:
+            sticker_type, sticker_mime_type = _sticker_attachment_format(sticker)
+            attachments.append(
+                self.create_attachment(
+                    sticker_type,
+                    sticker["file_id"],
+                    size=sticker.get("file_size"),
+                    width=sticker.get("width"),
+                    height=sticker.get("height"),
+                    mime_type=sticker_mime_type,
+                    file_unique_id=sticker.get("file_unique_id"),
                 )
             )
 
@@ -2499,6 +2802,7 @@ class TelegramAdapter:
                         height=media.height,
                         name=media.name,
                         mime_type=media.mime_type,
+                        file_unique_id=media.file.get("file_unique_id"),
                     )
                 )
 
@@ -2514,8 +2818,17 @@ class TelegramAdapter:
         height: int | None = None,
         name: str | None = None,
         mime_type: str | None = None,
+        file_unique_id: str | None = None,
     ) -> Attachment:
-        """Create an :class:`Attachment` with a lazy ``fetch_data`` callback."""
+        """Create an :class:`Attachment` with a lazy ``fetch_data`` callback.
+
+        ``file_unique_id`` is Telegram's stable identity for a file (the
+        ``file_id`` changes per resend); it is kept in ``fetch_metadata`` only
+        when truthy, matching upstream's conditional spread (vercel/chat#752).
+        """
+        fetch_metadata: dict[str, Any] = {"fileId": file_id}
+        if file_unique_id:
+            fetch_metadata["fileUniqueId"] = file_unique_id
         return Attachment(
             type=type_,  # type: ignore[arg-type]
             size=size,
@@ -2524,7 +2837,7 @@ class TelegramAdapter:
             name=name,
             mime_type=mime_type,
             fetch_data=lambda _fid=file_id: self.download_file(_fid),
-            fetch_metadata={"fileId": file_id},
+            fetch_metadata=fetch_metadata,
         )
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
@@ -2567,21 +2880,53 @@ class TelegramAdapter:
 
         file_url = f"{self._api_base_url}/file/bot{self._bot_token}/{file_path}"
 
+        # The host is operator-configured (self-hosted Bot API servers are
+        # common) and the path comes from Telegram's getFile, so -- like
+        # upstream (vercel/chat#865) -- the guard here is a size cap and a
+        # timeout, not the shared downloader's public-host checks. The 30 s
+        # total timeout covers connecting and reading the body.
         try:
             session = await self._get_http_session()
-            async with session.get(file_url) as response:
+            async with session.get(
+                file_url,
+                timeout=aiohttp.ClientTimeout(total=TELEGRAM_FILE_TIMEOUT_MS / 1000),
+            ) as response:
                 if not response.ok:
                     raise NetworkError(
                         "telegram",
                         f"Failed to download Telegram file {file_id}: {response.status}",
                     )
-                return await response.read()
-        except aiohttp.ClientError as error:
+                return await self._read_telegram_file(response, file_id)
+        except (aiohttp.ClientError, TimeoutError) as error:
             raise NetworkError(
                 "telegram",
                 f"Failed to download Telegram file {file_id}",
                 error,
             ) from error
+
+    @staticmethod
+    async def _read_telegram_file(response: Any, file_id: str) -> bytes:
+        """Read a file body, refusing anything over :data:`TELEGRAM_FILE_LIMIT`.
+
+        Port of upstream ``readTelegramFile``: a declared ``Content-Length``
+        over the cap is refused before reading; otherwise a running byte
+        count stops the read as soon as the cap is passed, so nothing beyond
+        one chunk past the cap is ever buffered.
+        """
+        try:
+            declared = response.content_length
+        except ValueError:
+            # An unparseable header is ignored, as ``Number(...)`` -> NaN is
+            # upstream; the running count below still applies.
+            declared = None
+        if declared is not None and declared > TELEGRAM_FILE_LIMIT:
+            raise NetworkError("telegram", f"Telegram file {file_id} exceeds the download limit")
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > TELEGRAM_FILE_LIMIT:
+                raise NetworkError("telegram", f"Telegram file {file_id} exceeds the download limit")
+            body.extend(chunk)
+        return bytes(body)
 
     async def send_document(
         self,
@@ -2986,8 +3331,24 @@ class TelegramAdapter:
                 if command_text.lower().endswith(f"@{username.lower()}"):
                     return True
 
-        mention_regex = re.compile(rf"@{self.escape_regex(username)}\b", re.IGNORECASE)
-        return bool(mention_regex.search(text))
+        return bool(self._get_mention_regex(username).search(text))
+
+    def _get_mention_regex(self, username: str) -> re.Pattern[str]:
+        """The ``@username`` pattern, compiled once per username.
+
+        ``(?![\\w-])`` rather than ``\\b`` so ``@mybot-dev`` does not mention
+        ``@mybot`` (vercel/chat#621); cached per username (vercel/chat#706).
+        JS ``\\w`` (no ``u`` flag) is ASCII-only, so the lookahead spells out
+        ``[A-Za-z0-9_-]``; ``re.ASCII`` is not used because JS ``/i`` still
+        case-folds non-ASCII letters (``@ботик`` matches ``@БОТИК``).
+        """
+        if self._mention_regex is None or self._mention_regex_username != username:
+            self._mention_regex_username = username
+            self._mention_regex = re.compile(
+                rf"@{self.escape_regex(username)}(?![A-Za-z0-9_-])",
+                re.IGNORECASE,
+            )
+        return self._mention_regex
 
     def entity_text(self, text: str, entity: TelegramMessageEntity) -> str:
         """Extract entity text from a message using UTF-16 offsets."""

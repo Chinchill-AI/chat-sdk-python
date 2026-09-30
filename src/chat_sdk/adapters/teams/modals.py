@@ -25,7 +25,8 @@ Reuse, not duplication:
   (re-exported here for the public surface), exactly as upstream's
   ``modals-primitives/types.ts`` imports ``TeamsFieldElement`` from
   ``../cards-primitives`` rather than redefining it. The modal-specific input
-  element shapes (``text_input`` / ``select`` / ``radio_select``) are defined
+  element shapes (``text_input`` / ``date_input`` / ``number_input`` /
+  ``select`` / ``radio_select``) are defined
   here because upstream defines them in ``modals-primitives/types.ts``, distinct
   from the ``cards-primitives`` input request shapes in
   :mod:`chat_sdk.adapters.teams.cards_input`.
@@ -40,13 +41,18 @@ Wire-key fidelity (HAZARDS):
 * The Adaptive Card content type is the literal
   ``"application/vnd.microsoft.card.adaptive"``.
 * ``action == "close"`` (and a missing response) yields ``None`` — no card.
-* Only string-typed values pass the value filter (mirrors upstream's
-  ``typeof value === "string"``).
+* String values pass the value filter as-is; numbers (``Input.Number``
+  submits a JSON number) are stringified the way JS ``String(value)`` does.
+  Every other type, including ``bool``, is dropped (mirrors upstream's
+  ``typeof value === "string"`` / ``typeof value === "number"`` branches).
 
 Truthiness mirrors upstream intentionally: optional emit guards
-(``maxLength`` / ``placeholder`` / ``initialValue`` / ``initialOption`` /
-``contextId``) use truthiness so an empty string / ``maxLength: 0`` is omitted,
-byte-for-byte with the upstream ``...(x ? { ... } : {})`` spreads. The
+(``maxLength`` / ``placeholder`` / text and date ``initialValue`` /
+``initialOption`` / ``contextId``) use truthiness so an empty string /
+``maxLength: 0`` is omitted, byte-for-byte with the upstream
+``...(x ? { ... } : {})`` spreads. The ``number_input`` ``max`` / ``min`` /
+``initialValue`` guards use ``is not None`` instead, mirroring upstream's
+``=== undefined`` checks, so ``0`` is emitted. The
 nullish-coalescing reads (``callbackId`` fallback, ``submitLabel`` default,
 ``multiline`` / ``optional`` defaults) use ``is not None`` so an explicit empty
 string survives, matching upstream's ``??``.
@@ -58,6 +64,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from chat_sdk.adapters.teams.cards_input import TeamsFieldElement
 from chat_sdk.adapters.teams.format import convert_teams_emoji_placeholders
+from chat_sdk.cards import _js_number_to_string
 
 __all__ = [
     "ADAPTIVE_CARD_CONTENT_TYPE",
@@ -65,7 +72,9 @@ __all__ = [
     "TeamsFieldElement",
     "TeamsFieldsModalElement",
     "TeamsModalChild",
+    "TeamsModalDateInputElement",
     "TeamsModalElement",
+    "TeamsModalNumberInputElement",
     "TeamsModalRadioSelectElement",
     "TeamsModalResponse",
     "TeamsModalSelectElement",
@@ -83,7 +92,7 @@ __all__ = [
 ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 
 _ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
-_ADAPTIVE_CARD_VERSION = "1.4"
+_ADAPTIVE_CARD_VERSION = "1.5"
 
 
 class TeamsModalTextElement(TypedDict):
@@ -121,6 +130,30 @@ class TeamsModalTextInputElement(TypedDict):
     placeholder: NotRequired[str]
 
 
+class TeamsModalDateInputElement(TypedDict):
+    """A date picker (``Input.Date``); ``initialValue`` is ``YYYY-MM-DD``."""
+
+    id: str
+    label: str
+    type: Literal["date_input"]
+    initialValue: NotRequired[str]
+    optional: NotRequired[bool]
+    placeholder: NotRequired[str]
+
+
+class TeamsModalNumberInputElement(TypedDict):
+    """A numeric input (``Input.Number``)."""
+
+    id: str
+    label: str
+    type: Literal["number_input"]
+    initialValue: NotRequired[float]
+    max: NotRequired[float]
+    min: NotRequired[float]
+    optional: NotRequired[bool]
+    placeholder: NotRequired[str]
+
+
 class TeamsModalSelectElement(TypedDict):
     """A dropdown (``compact``) choice set."""
 
@@ -149,6 +182,8 @@ TeamsModalChild = (
     TeamsFieldsModalElement
     | TeamsModalTextElement
     | TeamsModalTextInputElement
+    | TeamsModalDateInputElement
+    | TeamsModalNumberInputElement
     | TeamsModalSelectElement
     | TeamsModalRadioSelectElement
 )
@@ -262,8 +297,12 @@ def parse_teams_dialog_submit_values(
     Port of ``parseTeamsDialogSubmitValues``. The reserved keys
     ``__callbackId`` / ``__contextId`` / ``msteams`` are skipped (exactly those
     three, nothing else) and surfaced as ``callbackId`` / ``contextId`` only
-    when string-typed. Every other key is copied into ``values`` only when its
-    value is a string (mirrors upstream's ``typeof value === "string"``).
+    when string-typed. Every other key is copied into ``values`` when its
+    value is a string, or stringified when it is a number (``Input.Number``
+    submits a JSON number), formatted as JS ``String(value)`` does so ``5.0``
+    becomes ``"5"``, infinities become ``"Infinity"`` / ``"-Infinity"`` and
+    NaN becomes ``"NaN"``.
+    ``bool`` is not a number upstream and is dropped, as is any other type.
     """
     if not data:
         return {"callbackId": None, "contextId": None, "values": {}}
@@ -274,6 +313,17 @@ def parse_teams_dialog_submit_values(
             continue
         if isinstance(value, str):
             values[key] = value
+        elif isinstance(value, bool):
+            # ``True`` is an ``int`` in Python but not a number upstream.
+            continue
+        elif isinstance(value, (int, float)):
+            # Input.Number submits a JSON number. Every number is kept, as
+            # upstream's ``typeof value === "number"`` does: ``JSON.parse``
+            # yields ``Infinity`` for ``1e400``, rendered as "Infinity". A
+            # Teams client serializes Input.Number from a JS double, so an
+            # integer literal on the wire is already exactly representable
+            # and ``str(int)`` gives the digits ``String()`` would.
+            values[key] = _js_number_to_string(value)
 
     raw_callback_id = data.get("__callbackId")
     raw_context_id = data.get("__contextId")
@@ -343,6 +393,10 @@ def _modal_child_to_adaptive_elements(child: TeamsModalChild) -> list[Any]:
         return [_fields_block(child)]  # type: ignore[arg-type]
     if child_type == "text_input":
         return [_text_input(child)]  # type: ignore[arg-type]
+    if child_type == "date_input":
+        return [_date_input(child)]  # type: ignore[arg-type]
+    if child_type == "number_input":
+        return [_number_input(child)]  # type: ignore[arg-type]
     if child_type == "select":
         return [_choice_set(child, "compact")]  # type: ignore[arg-type]
     if child_type == "radio_select":
@@ -389,6 +443,49 @@ def _text_input(input_element: TeamsModalTextInputElement) -> dict[str, Any]:
     if initial_value:
         result["value"] = initial_value
     result["type"] = "Input.Text"
+    return result
+
+
+def _date_input(input_element: TeamsModalDateInputElement) -> dict[str, Any]:
+    optional = input_element.get("optional")
+    result: dict[str, Any] = {
+        "id": input_element["id"],
+        "isRequired": not (optional if optional is not None else False),
+        "label": input_element["label"],
+    }
+    placeholder = input_element.get("placeholder")
+    initial_value = input_element.get("initialValue")
+    if placeholder:
+        result["placeholder"] = placeholder
+    if initial_value:
+        result["value"] = initial_value
+    result["type"] = "Input.Date"
+    return result
+
+
+def _number_input(input_element: TeamsModalNumberInputElement) -> dict[str, Any]:
+    # Adaptive Cards has no decimal switch: Input.Number always accepts
+    # decimals. ``max`` / ``min`` / ``initialValue`` are emitted whenever
+    # present (upstream ``=== undefined`` checks), so ``0`` is kept.
+    optional = input_element.get("optional")
+    result: dict[str, Any] = {
+        "id": input_element["id"],
+        "isRequired": not (optional if optional is not None else False),
+        "label": input_element["label"],
+    }
+    maximum = input_element.get("max")
+    minimum = input_element.get("min")
+    placeholder = input_element.get("placeholder")
+    initial_value = input_element.get("initialValue")
+    if maximum is not None:
+        result["max"] = maximum
+    if minimum is not None:
+        result["min"] = minimum
+    if placeholder:
+        result["placeholder"] = placeholder
+    if initial_value is not None:
+        result["value"] = initial_value
+    result["type"] = "Input.Number"
     return result
 
 

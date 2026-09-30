@@ -327,6 +327,33 @@ def _js_number_to_string(value: Any) -> str:
     return sign + digits[0] + "." + digits[1:] + exp
 
 
+def _chart_value_to_json_number(value: Any) -> int | float | None:
+    """Return a chart value as a JSON-serializable finite ``int`` / ``float``.
+
+    Native renderers (Slack ``data_visualization``) embed chart values in the
+    block payload, which ``json.dumps`` must serialize. JS numbers always
+    serialize, but in Python a ``Decimal`` (Postgres NUMERIC), ``Fraction`` or
+    NumPy scalar raises ``TypeError`` and a non-finite ``float`` becomes invalid
+    JSON. Numbers are normalised like ``_js_number_to_string`` does; anything
+    else (``bool``, non-numbers, non-finite values) returns ``None`` so the
+    caller can fall back to text.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, (Decimal, numbers.Real)):
+        try:
+            value = float(value)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
 def chart_element_to_fallback_text(element: ChartElement) -> str:
     """Render a chart element as its title followed by its data as a padded ASCII table.
 

@@ -584,6 +584,7 @@ class _FakeSocketModeClient:
 
     def __init__(self, *args: Any, app_token: str | None = None, **kwargs: Any):
         self.app_token = app_token
+        self.kwargs = kwargs
         self.socket_mode_request_listeners: list[Any] = []
         self._connected = False
         self.connect_calls = 0
@@ -618,6 +619,76 @@ def patched_socket_client(monkeypatch):
     monkeypatch.setattr(sm, "SocketModeClient", _FakeSocketModeClient)
     yield _FakeSocketModeClient
     _FakeSocketModeClient.instances.clear()
+
+
+class _CapturingWebClient:
+    """Stands in for ``AsyncWebClient``; records its constructor kwargs."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def patched_async_web_client(monkeypatch):
+    """Patch ``slack_sdk.web.async_client.AsyncWebClient`` (stubbing the module if absent)."""
+    web = sys.modules.setdefault("slack_sdk.web", ModuleType("slack_sdk.web"))
+    async_client = sys.modules.setdefault("slack_sdk.web.async_client", ModuleType("slack_sdk.web.async_client"))
+    monkeypatch.setattr(web, "async_client", async_client, raising=False)
+    monkeypatch.setattr(sys.modules["slack_sdk"], "web", web, raising=False)
+    monkeypatch.setattr(async_client, "AsyncWebClient", _CapturingWebClient, raising=False)
+    return _CapturingWebClient
+
+
+class TestSocketModeTransport:
+    """Port of upstream transport.test.ts "passes fresh transport options to
+    persistent and transient Socket Mode clients" (vercel/chat 6adca361).
+
+    Python has only the persistent client (the transient listener is not
+    ported). ``agent``/``tls``/``slackApiUrl`` map to the ``proxy``/``ssl``
+    ``web_client_options`` keys and ``api_url``.
+    """
+
+    async def test_passes_fresh_transport_options_to_socket_mode_clients(
+        self, patched_socket_client, patched_async_web_client
+    ):
+        ssl_context = object()
+        options = {
+            "proxy": "http://proxy.internal:3128",
+            "ssl": ssl_context,
+            "headers": {"Authorization": "do-not-forward"},
+            "retry_handlers": [],
+            "timeout": 42,
+        }
+        adapter = _make_socket_adapter(api_url="https://slack-gov.com/api/", web_client_options=options)
+        adapter._socket_initial_backoff_s = 0.05
+        await adapter.start_socket_mode()
+        try:
+            client = patched_socket_client.instances[0]
+            assert client.app_token == "xapp-1-test"
+            assert set(client.kwargs) == {"proxy", "web_client"}
+            assert client.kwargs["proxy"] == "http://proxy.internal:3128"
+            web_client = client.kwargs["web_client"]
+            assert isinstance(web_client, patched_async_web_client)
+            assert web_client.kwargs == {
+                "proxy": "http://proxy.internal:3128",
+                "ssl": ssl_context,
+                "base_url": "https://slack-gov.com/api/",
+            }
+        finally:
+            await adapter.stop_socket_mode()
+
+        # Every client gets its own web client; caller options are untouched.
+        assert adapter._socket_client_kwargs()["web_client"] is not web_client
+        assert options["headers"] == {"Authorization": "do-not-forward"}
+
+    def test_socket_mode_uses_slack_sdk_defaults_without_transport_options(self, patched_async_web_client):
+        adapter = _make_socket_adapter(web_client_options={"timeout": 42, "headers": {"X-Test": "value"}})
+        assert adapter._socket_client_kwargs() == {"app_token": "xapp-1-test"}
+
+    def test_api_url_alone_reaches_the_connections_open_client(self, patched_async_web_client):
+        kwargs = _make_socket_adapter(api_url="https://slack-gov.com/api/")._socket_client_kwargs()
+        assert "proxy" not in kwargs
+        assert kwargs["web_client"].kwargs == {"base_url": "https://slack-gov.com/api/"}
 
 
 class TestSocketModeLifecycle:

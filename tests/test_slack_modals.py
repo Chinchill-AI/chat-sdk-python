@@ -6,6 +6,9 @@ Port of packages/adapter-slack/src/modals.test.ts.
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from chat_sdk.adapters.slack.modals import (
     ModalMetadata,
@@ -14,10 +17,16 @@ from chat_sdk.adapters.slack.modals import (
     modal_to_slack_view,
 )
 from chat_sdk.modals import (
+    DateInput,
     ExternalSelectElement,
+    Modal,
     ModalElement,
+    NumberInput,
+    RadioSelect,
     RadioSelectElement,
+    Select,
     SelectElement,
+    SelectOption,
     SelectOptionElement,
     TextInputElement,
 )
@@ -640,3 +649,220 @@ class TestModalExternalSelect:
         modal = _modal(children=[_external_select(id="person", label="Person", optional=True)])
         view = modal_to_slack_view(modal)
         assert view["blocks"][0]["optional"] is True
+
+
+# ---------------------------------------------------------------------------
+# Selection change events (upstream describe.each([Select, RadioSelect])("%s action dispatch"))
+# ---------------------------------------------------------------------------
+
+
+class TestActionDispatch:
+    @pytest.mark.parametrize("component", [Select, RadioSelect], ids=["Select", "RadioSelect"])
+    @pytest.mark.parametrize("dispatch_action", [True, False, None])
+    def test_renders_dispatch_action_on_the_input_block(self, component, dispatch_action):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="permissions",
+                title="Permissions",
+                children=[
+                    component(
+                        id="scope",
+                        label="Scope",
+                        dispatch_action=dispatch_action,
+                        initial_option="team",
+                        options=[SelectOption(label="Team", value="team")],
+                    )
+                ],
+            )
+        )
+        block = view["blocks"][0]
+
+        if dispatch_action is None:
+            assert "dispatch_action" not in block
+        else:
+            # ``is``: False must be emitted explicitly, not dropped or coerced.
+            assert block["dispatch_action"] is dispatch_action
+        assert block["type"] == "input"
+        assert block["block_id"] == "scope"
+        assert block["element"]["action_id"] == "scope"
+        assert block["element"]["initial_option"]["value"] == "team"
+        assert "dispatch_action" not in block["element"]
+
+
+# ---------------------------------------------------------------------------
+# Date and number inputs (upstream describe("date and number inputs"))
+# ---------------------------------------------------------------------------
+
+
+class TestDateAndNumberInputs:
+    def test_converts_a_date_input_to_a_block_kit_datepicker(self):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="renewal_form",
+                title="Renewal",
+                children=[
+                    DateInput(
+                        id="renewal_date",
+                        label="Renewal Date",
+                        placeholder="Pick a date",
+                        initial_value="2026-08-01",
+                    )
+                ],
+            )
+        )
+
+        assert view["blocks"][0] == {
+            "type": "input",
+            "block_id": "renewal_date",
+            "optional": False,
+            "label": {"type": "plain_text", "text": "Renewal Date"},
+            "element": {
+                "type": "datepicker",
+                "action_id": "renewal_date",
+                "placeholder": {"type": "plain_text", "text": "Pick a date"},
+                "initial_date": "2026-08-01",
+            },
+        }
+
+    def test_omits_datepicker_fields_that_were_not_provided(self):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="renewal_form",
+                title="Renewal",
+                children=[DateInput(id="renewal_date", label="Renewal Date", optional=True)],
+            )
+        )
+
+        assert view["blocks"][0] == {
+            "type": "input",
+            "block_id": "renewal_date",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Renewal Date"},
+            "element": {"type": "datepicker", "action_id": "renewal_date"},
+        }
+
+    def test_drops_an_initial_date_that_slack_would_reject(self, caplog):
+        # Python-specific additions after upstream's four: "2026-08-01\n" (a regex
+        # ``$`` would accept the trailing newline), "2026-W31-6" and "20260801"
+        # (other ``fromisoformat`` formats) and non-ASCII digits (Python ``\d``
+        # would match them).
+        rejected = [
+            "30 days from signing",
+            "2026-2-1",
+            "2026-02-31",
+            "not a date",
+            "2026-08-01\n",
+            "2026-W31-6",
+            "20260801",
+            "٢٠٢٦-08-01",
+        ]
+        with caplog.at_level(logging.WARNING, logger="chat_sdk.adapters.slack.modals"):
+            for initial_value in rejected:
+                view = modal_to_slack_view(
+                    Modal(
+                        callback_id="renewal_form",
+                        title="Renewal",
+                        children=[DateInput(id="renewal_date", label="Renewal Date", initial_value=initial_value)],
+                    )
+                )
+
+                assert view["blocks"][0] == {
+                    "type": "input",
+                    "block_id": "renewal_date",
+                    "optional": False,
+                    "label": {"type": "plain_text", "text": "Renewal Date"},
+                    "element": {"type": "datepicker", "action_id": "renewal_date"},
+                }
+
+        warnings = [r for r in caplog.records if r.name == "chat_sdk.adapters.slack.modals"]
+        assert len(warnings) == len(rejected)
+
+    def test_drops_a_year_zero_initial_date(self):
+        # Divergence from upstream (docs/UPSTREAM_SYNC.md): JS ``Date`` round-trips
+        # year 0000; ``datetime.date`` has no year 0, so the value is dropped.
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="renewal_form",
+                title="Renewal",
+                children=[DateInput(id="renewal_date", label="Renewal Date", initial_value="0000-01-01")],
+            )
+        )
+
+        assert "initial_date" not in view["blocks"][0]["element"]
+
+    def test_keeps_a_leap_day_initial_date(self):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="renewal_form",
+                title="Renewal",
+                children=[DateInput(id="renewal_date", label="Renewal Date", initial_value="2028-02-29")],
+            )
+        )
+
+        assert view["blocks"][0]["element"]["initial_date"] == "2028-02-29"
+
+    def test_converts_a_number_input_to_a_block_kit_number_input_with_string_bounds(self):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="order_form",
+                title="Order",
+                children=[
+                    NumberInput(
+                        id="quantity",
+                        label="Quantity",
+                        placeholder="How many?",
+                        initial_value=3,
+                        min=1,
+                        max=10,
+                        decimal=True,
+                    )
+                ],
+            )
+        )
+
+        assert view["blocks"][0] == {
+            "type": "input",
+            "block_id": "quantity",
+            "optional": False,
+            "label": {"type": "plain_text", "text": "Quantity"},
+            "element": {
+                "type": "number_input",
+                "action_id": "quantity",
+                "is_decimal_allowed": True,
+                "placeholder": {"type": "plain_text", "text": "How many?"},
+                "initial_value": "3",
+                "min_value": "1",
+                "max_value": "10",
+            },
+        }
+
+    def test_defaults_number_input_to_integers_only_and_keeps_zero_bounds(self):
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="order_form",
+                title="Order",
+                children=[NumberInput(id="quantity", label="Quantity", initial_value=0, min=0)],
+            )
+        )
+
+        element = view["blocks"][0]["element"]
+        assert element["type"] == "number_input"
+        assert element["is_decimal_allowed"] is False
+        assert element["initial_value"] == "0"
+        assert element["min_value"] == "0"
+        assert "max_value" not in element
+
+    def test_formats_float_number_input_values_like_js_string(self):
+        # JS ``String(1.0)`` is "1" (Python ``str`` gives "1.0"); fractional values keep their digits.
+        view = modal_to_slack_view(
+            Modal(
+                callback_id="order_form",
+                title="Order",
+                children=[NumberInput(id="price", label="Price", initial_value=1.0, min=0.5, max=1e21, decimal=True)],
+            )
+        )
+
+        element = view["blocks"][0]["element"]
+        assert element["initial_value"] == "1"
+        assert element["min_value"] == "0.5"
+        assert element["max_value"] == "1e+21"
