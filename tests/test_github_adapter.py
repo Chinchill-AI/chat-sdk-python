@@ -260,8 +260,7 @@ class TestCreateGitHubAdapter:
             if old_key is not None:
                 os.environ["GITHUB_PRIVATE_KEY"] = old_key
 
-    def test_adapter_properties(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
+    def test_adapter_properties(self):
         adapter = _make_adapter()
         assert adapter.name == "github"
         assert adapter.lock_scope is None
@@ -323,11 +322,6 @@ def _signed_issue_comment_request(sender_id: int) -> _WebhookRequest:
     )
 
 
-@pytest.fixture
-def _no_bot_user_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
-
-
 class TestGitHubBotUserIdEnv:
     """``config.botUserId ?? GITHUB_BOT_USER_ID`` (describe("createGitHubAdapter"))."""
 
@@ -385,10 +379,20 @@ class TestGitHubBotUserIdEnv:
         assert adapter._bot_user_id is None
         assert logger.warn.calls == []
 
-    def test_env_value_with_surrounding_whitespace_is_accepted(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("GITHUB_BOT_USER_ID", " 4242\n")
-        adapter = _make_adapter()
-        assert adapter._bot_user_id == 4242
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(" 4242\n", 4242, id="surrounding-whitespace"),
+            # ``parseInt("+4242", 10) === 4242``: the optional sign is parity.
+            pytest.param("+4242", 4242, id="leading-plus"),
+        ],
+    )
+    def test_whole_integer_env_value_is_accepted(self, monkeypatch: pytest.MonkeyPatch, value: str, expected: int):
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", value)
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        assert adapter._bot_user_id == expected
+        assert logger.warn.calls == []
 
     @pytest.mark.asyncio
     async def test_env_bot_user_id_skips_auto_detection(self, monkeypatch: pytest.MonkeyPatch):
@@ -401,7 +405,6 @@ class TestGitHubBotUserIdEnv:
         assert adapter._bot_user_id == 4242
 
 
-@pytest.mark.usefixtures("_no_bot_user_id_env")
 class TestGitHubCaptureBotUserId:
     """``captureBotUserId``: describe("GitHubAdapter - Vercel Connect mode"), ported without Connect."""
 
