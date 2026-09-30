@@ -2,6 +2,8 @@
 
 ## Unreleased (4.41 wave)
 
+- **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
 ### Security
 
 - **Webhook log hygiene: raw bodies and message content no longer reach DEBUG logs** (#187; ports upstream `fc7df9c4` / vercel/chat#500 and the logging parts of `f485255b` / vercel/chat#877). Several adapters logged raw webhook bodies, or previews of them, at DEBUG. In some cases this happened before signature or JWT verification, so unauthenticated input and message content could be copied into log sinks. Webhook handlers now log only request-shape metadata:
