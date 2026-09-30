@@ -573,8 +573,10 @@ class WhatsAppAdapter:
         matches only ``user_id`` / ``wa_id`` and otherwise falls back to
         ``contacts[0]``. In a batched webhook that first contact can belong to
         another sender, and ``_fields`` would then borrow its phone/BSUID and
-        alias this sender to the wrong user. We also match ``parent_user_id``
-        and fall back only when the payload has exactly one contact.
+        alias this sender to the wrong user. We also match ``parent_user_id``,
+        and fall back only when the payload has exactly one contact and the
+        message carries no sender identifier of its own. A message whose
+        identifiers match no contact cannot be tied to one.
         """
         from_user_id = inbound.get("from_user_id")
         from_parent_user_id = inbound.get("from_parent_user_id")
@@ -588,6 +590,8 @@ class WhatsAppAdapter:
                 or (from_phone and item.get("wa_id") == from_phone)
             ):
                 return item
+        if from_user_id or from_parent_user_id or from_phone:
+            return None
         return contacts[0] if len(contacts) == 1 else None
 
     def _author(self, identity: _WhatsAppIdentity, contact: WhatsAppContact | None = None) -> Author:

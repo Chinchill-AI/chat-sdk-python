@@ -1430,6 +1430,43 @@ class TestBusinessScopedUserIdsPythonSpecific:
         ]
         assert await state.get(f"whatsapp:identity:alias:123456789:{PHONE}") is None
 
+    async def test_does_not_pair_a_single_unmatched_contact_with_another_sender(self):
+        """Divergence from upstream (see docs/UPSTREAM_SYNC.md): a batch with
+        Alice's and Bob's messages but only Alice's contact must not merge Bob
+        into Alice's identity or overwrite her route with his phone."""
+        adapter, chat, state, _ = await _bsuid_env()
+        alice = {"profile": {"name": "Alice"}, "wa_id": PHONE, "user_id": "US.ALICE"}
+
+        await _deliver(
+            adapter,
+            _notification(
+                [_inbound({"from": PHONE}), _inbound({"id": "wamid.2", "from": NEW_PHONE})],
+                [alice],
+            ),
+        )
+
+        dispatched = [(call[0][1], call[0][2].author.full_name) for call in chat.process_message.call_args_list]
+        assert dispatched == [
+            (f"whatsapp:123456789:{PHONE}", "Alice"),
+            (f"whatsapp:123456789:{NEW_PHONE}", NEW_PHONE),
+        ]
+        assert await state.get(f"whatsapp:identity:route:123456789:{PHONE}") == {"bsuid": "US.ALICE", "phone": PHONE}
+        assert await state.get(f"whatsapp:identity:route:123456789:{NEW_PHONE}") == {"phone": NEW_PHONE}
+
+    async def test_uses_the_only_contact_when_the_message_has_no_sender_ids(self):
+        """The single-contact fallback survives for messages that carry no
+        sender identifier of their own."""
+        adapter, chat, _, _ = await _bsuid_env()
+
+        await _deliver(
+            adapter,
+            _notification([_inbound({})], [{"profile": {"name": "Bob"}, "user_id": BSUID}]),
+        )
+
+        _, thread_id, parsed, _ = chat.process_message.call_args[0]
+        assert thread_id == f"whatsapp:123456789:{BSUID}"
+        assert parsed.author.full_name == "Bob"
+
     async def test_forwarded_context_without_id_parses(self):
         adapter, chat, _, logger = await _bsuid_env()
 
