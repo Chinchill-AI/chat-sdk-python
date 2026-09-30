@@ -322,6 +322,38 @@ class TestRehydrateAttachment:
             await default.fetch_data()
         assert http.await_count == 1
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("media_url", "error", "match"),
+        [
+            # Twilio-hosted media is not on the proxy origin: upstream's check refuses it.
+            ("https://api.twilio.com/2010-04-01/media/photo", TwilioApiError, "configured Twilio API origin"),
+            # Proxy-origin media passes the origin check but not the Python-only host allowlist.
+            ("https://twilio-proxy.internal.example/2010-04-01/media/photo", ValidationError, "untrusted URL"),
+        ],
+    )
+    async def test_non_twilio_api_url_refuses_media_on_every_origin(
+        self, media_url: str, error: type[Exception], match: str
+    ):
+        # Documented dead end (docs/UPSTREAM_SYNC.md): with a proxy ``api_url``
+        # the two layers together let no media URL through.
+        http = _mock_http("photo")
+        adapter = create_twilio_adapter(
+            account_sid="AC123",
+            api_url="https://twilio-proxy.internal.example",
+            auth_token="token",
+            http_request=http,
+        )
+
+        attachment = adapter.rehydrate_attachment(
+            Attachment(type="image", fetch_metadata={"twilioMediaUrl": media_url})
+        )
+
+        assert attachment.fetch_data is not None
+        with pytest.raises(error, match=match):
+            await attachment.fetch_data()
+        http.assert_not_awaited()
+
 
 class TestPostMessage:
     """Outbound send paths through the Messages API."""

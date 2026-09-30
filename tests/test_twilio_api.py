@@ -414,6 +414,12 @@ class TestFetchTwilioMedia:
             ("https://api.twilio.com:99999/m", None, None),
             ("/2010-04-01/media/photo", None, None),
             ("", None, None),
+            # The scheme is part of the origin: ``http`` on ``https``'s port 443 is refused.
+            ("http://api.twilio.com:443/m", None, None),
+            # Both sides opaque must not compare equal (two ``None`` / host-less origins).
+            ("/2010-04-01/media/photo", "api.dublin.ie1.twilio.com", None),
+            ("", "", None),
+            ("/m", "/base", None),
         ],
     )
     async def test_media_origin_rejects_mismatched_and_malformed_urls(
