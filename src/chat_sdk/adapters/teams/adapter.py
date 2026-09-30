@@ -542,7 +542,7 @@ class TeamsAdapter:
         self._chat = chat
         task = self._initialization
         if task is None:
-            task = asyncio.ensure_future(self._initialize_app())
+            task = asyncio.get_running_loop().create_task(self._initialize_app())
             self._initialization = task
             task.add_done_callback(self._clear_failed_initialization)
         await asyncio.shield(task)

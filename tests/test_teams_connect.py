@@ -333,8 +333,8 @@ class TestLazyTeamsIdentity:
 
         adapter = _make_adapter(app_id=app_id)
         chat = _make_chat()
-        first = asyncio.ensure_future(adapter.initialize(chat))
-        second = asyncio.ensure_future(adapter.initialize(chat))
+        first = asyncio.get_running_loop().create_task(adapter.initialize(chat))
+        second = asyncio.get_running_loop().create_task(adapter.initialize(chat))
         await asyncio.sleep(0)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
