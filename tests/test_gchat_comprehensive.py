@@ -350,38 +350,28 @@ class TestConstructorEnvVarResolution:
             self._clear_gchat_env()
             os.environ.update(saved)
 
-    def test_resolves_bot_user_id_from_env_var(self):
-        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
-        try:
-            self._clear_gchat_env()
-            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = "users/BOT_ENV"
-            adapter = _make_adapter()
-            assert adapter.bot_user_id == "users/BOT_ENV"
-        finally:
-            self._clear_gchat_env()
-            os.environ.update(saved)
+    def test_resolves_bot_user_id_from_env_var(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GOOGLE_CHAT_BOT_USER_ID", "users/BOT_ENV")
+        adapter = _make_adapter()
+        assert adapter.bot_user_id == "users/BOT_ENV"
 
-    def test_configured_bot_user_id_takes_priority_over_env_var(self):
-        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
-        try:
-            self._clear_gchat_env()
-            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = "users/BOT_ENV"
-            adapter = _make_adapter(bot_user_id="users/BOT_CONFIG")
-            assert adapter.bot_user_id == "users/BOT_CONFIG"
-        finally:
-            self._clear_gchat_env()
-            os.environ.update(saved)
+    def test_configured_bot_user_id_takes_priority_over_env_var(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GOOGLE_CHAT_BOT_USER_ID", "users/BOT_ENV")
+        adapter = _make_adapter(bot_user_id="users/BOT_CONFIG")
+        assert adapter.bot_user_id == "users/BOT_CONFIG"
 
-    def test_empty_bot_user_id_env_var_is_treated_as_unset(self):
-        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
-        try:
-            self._clear_gchat_env()
-            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = ""
-            adapter = _make_adapter()
-            assert adapter.bot_user_id is None
-        finally:
-            self._clear_gchat_env()
-            os.environ.update(saved)
+    def test_empty_configured_bot_user_id_does_not_fall_back_to_env_var(self, monkeypatch: pytest.MonkeyPatch):
+        # `is not None` precedence (upstream `??`): an explicit "" is a
+        # configured value, so the env var is not consulted and the id
+        # stays unset. `config.bot_user_id or env` would pick up the env.
+        monkeypatch.setenv("GOOGLE_CHAT_BOT_USER_ID", "users/BOT_ENV")
+        adapter = _make_adapter(bot_user_id="")
+        assert adapter.bot_user_id is None
+
+    def test_empty_bot_user_id_env_var_is_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GOOGLE_CHAT_BOT_USER_ID", "")
+        adapter = _make_adapter()
+        assert adapter.bot_user_id is None
 
     def test_config_credentials_take_priority_over_env_vars(self):
         saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}

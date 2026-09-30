@@ -80,6 +80,7 @@ Ports upstream `32687038` (vercel/chat#830, chat@4.38.1), the Google Chat part o
 
 - A media `resourceName` is validated before it is put into the request path: an empty value, `?`, `#`, `%`, backslash, anything outside printable ASCII (whitespace, control or non-ASCII characters), or a `.` / `..` segment raise `ValidationError` before a token is minted. Upstream hands the value to the googleapis client, which encodes it.
 - An empty `bot_user_id` counts as unset, no mention is rewritten when the id is unset (upstream would still rewrite a BOT annotation with no `user.name`), and the "not configured" warning is logged once per adapter rather than on every `initialize()`.
+- Forward `fetch_messages` with `limit=0` sends `pageSize=1` and returns at most one message. The limit resolves with `is not None`, so `0` is not replaced by the default; upstream's `options.limit || 100` requests 100.
 
 ### Security
 
