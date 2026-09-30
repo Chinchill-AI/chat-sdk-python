@@ -346,6 +346,45 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 (`test_uses_the_full_dm_thread_id_as_its_channel_id`,
 `test_isolates_concurrent_recipients_with_thread_scoped_locks`).
 
+### WhatsApp business-scoped user IDs (chat@4.37–4.39, #236)
+
+Parity, not a divergence. Ports upstream `3e6e866a` (vercel/chat#818,
+chat@4.39.0) and the type-only context variants of `16879fdc` (vercel/chat#723,
+chat@4.37.0). Meta can now deliver username-only / BSUID-only webhooks whose
+messages carry `from_user_id` / `from_parent_user_id` and no `from`; before
+this port the Python adapter indexed `inbound["from"]` and the per-message
+`try/except` silently dropped them.
+
+- **Identity precedence** (`_fields`, upstream `fields()`): phone
+  (`system.wa_id ?? from ?? contact.wa_id`), then BSUID, then parent BSUID,
+  ported as `is not None` chains. `_author` keeps upstream's `||` (an empty
+  profile name falls through to `username`, then the user ID).
+- **State keys are byte-identical to the TS SDK**, so TS and Python
+  deployments sharing a state backend interoperate:
+  `whatsapp:identity:alias:{phone_number_id}:{identifier}` → canonical user id,
+  and `whatsapp:identity:route:{phone_number_id}:{user_id}` →
+  `{"bsuid"?, "parent"?, "phone"?}` with absent keys omitted (never `None`).
+  `_link` writes only aliases that differ and a route whose bsuid/parent/phone
+  changed. Aliases are read concurrently and honored in list order.
+- **State errors never drop a message**: `_resolve`, `_handle_user_id_update`
+  and `_recipient` log a warning and fall back to the un-linked identity or the
+  `_BSUID_PATTERN` recipient, as upstream does. A stored alias or route of the
+  wrong type is read as absent.
+- **Outbound addressing**: `post_message` resolves `{"to"?, "recipient"?}` once
+  per logical post (shared by every chunk); `add_reaction` / `remove_reaction`
+  resolve their own. `_BSUID_PATTERN` uses `fullmatch`, so, as with JS
+  `/^...$/`, a trailing newline does not match.
+- **Casing:** upstream's `WhatsAppRawMessage.userId` is `user_id` here,
+  matching the existing snake_case raw key `phone_number_id`.
+- **Not yet ported here:** the `recipient()` calls in upstream `sendTemplate`
+  (#237), media sends (#238) and `reply` (#239), because those send paths do
+  not exist in the Python adapter yet. `mark_as_read` and typing indicators
+  address a `message_id` only, so they need no recipient.
+
+Regression coverage: `tests/test_whatsapp_webhook.py`
+(`TestHandleWebhookBusinessScopedUserIds`, `TestParseMessageBusinessScopedUserIds`,
+`TestPostMessageBusinessScopedRecipients`, `TestBusinessScopedUserIdsPythonSpecific`).
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1

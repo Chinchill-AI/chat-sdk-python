@@ -7,7 +7,7 @@ See: https://developers.facebook.com/docs/whatsapp/cloud-api
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -59,7 +59,8 @@ class WhatsAppThreadId:
 
     # Business phone number ID
     phone_number_id: str
-    # User's WhatsApp ID (their phone number)
+    # User routing identifier, which may be a phone number or a
+    # business-scoped user ID (BSUID)
     user_wa_id: str
 
 
@@ -75,11 +76,25 @@ class WhatsAppWebhookMetadata(TypedDict):
     phone_number_id: str
 
 
-class WhatsAppContact(TypedDict):
-    """Contact information from an inbound message."""
+class WhatsAppContactProfile(TypedDict):
+    """Profile block of a contact."""
 
-    profile: dict[str, str]  # {"name": str}
-    wa_id: str
+    name: str
+    # WhatsApp username, present for users who have set one
+    username: NotRequired[str]
+
+
+class WhatsAppContact(TypedDict):
+    """Contact information from an inbound message.
+
+    Business-scoped user ID (BSUID) webhooks may omit ``wa_id`` (the phone
+    number) and carry ``user_id`` / ``parent_user_id`` instead.
+    """
+
+    parent_user_id: NotRequired[str]
+    profile: WhatsAppContactProfile
+    user_id: NotRequired[str]
+    wa_id: NotRequired[str]
 
 
 class WhatsAppStatus(TypedDict, total=False):
@@ -89,24 +104,59 @@ class WhatsAppStatus(TypedDict, total=False):
     id: str
     pricing: dict[str, Any]
     recipient_id: str
+    recipient_parent_user_id: str
+    recipient_user_id: str
     status: str  # "sent" | "delivered" | "read" | "failed"
     timestamp: str
 
 
+class WhatsAppUserIdChange(TypedDict, total=False):
+    """Previous and current value of a rotated identifier."""
+
+    current: str
+    previous: str
+
+
+class WhatsAppUserIdUpdate(TypedDict, total=False):
+    """A business-scoped user ID rotation delivered under ``field: "user_id_update"``.
+
+    Meta sends it when a phone number change regenerates a user's BSUID,
+    carrying the previous and current values so existing records can be
+    re-linked.
+
+    See: https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids
+    """
+
+    # Human-readable description of the update
+    detail: str
+    # Previous and current parent BSUID, when parent BSUIDs are enabled
+    parent_user_id: WhatsAppUserIdChange
+    timestamp: str
+    # Previous and current BSUID
+    user_id: WhatsAppUserIdChange
+    # User's phone number, omitted when sharing conditions aren't met
+    wa_id: str
+
+
 class WhatsAppWebhookValue(TypedDict, total=False):
-    """The value payload containing messages, contacts, and statuses."""
+    """The value payload containing messages, contacts, statuses and user ID updates."""
 
     contacts: list[WhatsAppContact]
     messages: list[dict[str, Any]]  # WhatsAppInboundMessage as dict
     messaging_product: str  # "whatsapp"
     metadata: WhatsAppWebhookMetadata
     statuses: list[WhatsAppStatus]
+    user_id_update: list[WhatsAppUserIdUpdate]
 
 
 class WhatsAppWebhookChange(TypedDict):
-    """A change object containing the actual event data."""
+    """A change object containing the actual event data.
 
-    field: str  # "messages"
+    Only ``messages`` and ``user_id_update`` changes are consumed by the
+    adapter; other subscription fields are ignored.
+    """
+
+    field: str
     value: WhatsAppWebhookValue
 
 
@@ -132,6 +182,51 @@ class WhatsAppWebhookPayload(TypedDict):
 # =============================================================================
 
 
+class WhatsAppReferredProduct(TypedDict):
+    """Product a customer is asking about (catalog product inquiries)."""
+
+    catalog_id: str
+    product_retailer_id: str
+
+
+# Context accompanying quoted replies, forwarded messages, and catalog
+# product inquiries. The shape depends on the message origin: replies (and
+# interactions with a business message) carry `from` and `id`, forwarded
+# messages carry only `forwarded` or `frequently_forwarded`, and catalog
+# product inquiries add `referred_product`. No field is present in every
+# variant. Functional form because `from` is a Python keyword.
+#
+# See: https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages/text
+WhatsAppInboundContext = TypedDict(
+    "WhatsAppInboundContext",
+    {
+        # True when the message was forwarded five or fewer times; forwards only
+        "forwarded": bool,
+        # True when the message was forwarded more than five times; forwards only
+        "frequently_forwarded": bool,
+        # Sender of the quoted message on a reply, or the business display
+        # phone number for a "Message business" button. Absent on forwards.
+        "from": str,
+        # ID of the quoted message on a reply, or of the message the user
+        # tapped "Message business" from. Absent on forwards.
+        "id": str,
+        # Product the customer is asking about; catalog inquiries only
+        "referred_product": WhatsAppReferredProduct,
+    },
+    total=False,
+)
+
+
+class WhatsAppSystemEvent(TypedDict):
+    """System message payload (``type: "system"``) for identity changes."""
+
+    body: str
+    parent_user_id: NotRequired[str]
+    type: str  # "user_changed_number" | "user_changed_user_id"
+    user_id: str
+    wa_id: NotRequired[str]
+
+
 # Inbound message from a user. The `"from"` field name matches the raw JSON
 # key (a Python keyword at class-body level, so we use the functional
 # TypedDict form to preserve it verbatim).
@@ -144,12 +239,17 @@ WhatsAppInboundMessage = TypedDict(
         "audio": dict[str, Any],
         # Legacy button response (from template quick replies)
         "button": dict[str, str],
-        # Context for quoted replies
-        "context": dict[str, str],
+        # Context for quoted replies, forwards and product inquiries
+        "context": WhatsAppInboundContext,
         # Document message content
         "document": dict[str, Any],
-        # Sender's WhatsApp ID
+        # Sender's WhatsApp ID (phone number). Absent on username-only /
+        # BSUID-only webhooks.
         "from": str,
+        # Sender's parent business-scoped user ID, when parent BSUIDs are enabled
+        "from_parent_user_id": str,
+        # Sender's business-scoped user ID (BSUID)
+        "from_user_id": str,
         # Unique message ID
         "id": str,
         # Image message content
@@ -162,6 +262,8 @@ WhatsAppInboundMessage = TypedDict(
         "reaction": dict[str, str],
         # Sticker message content
         "sticker": dict[str, Any],
+        # System message content (identity changes)
+        "system": WhatsAppSystemEvent,
         # Text message content
         "text": dict[str, str],
         # Unix timestamp string
@@ -201,10 +303,18 @@ class WhatsAppMediaResponse(TypedDict):
 # =============================================================================
 
 
+class WhatsAppSendResponseContact(TypedDict):
+    """A contact entry in a send response."""
+
+    input: str
+    user_id: NotRequired[str]
+    wa_id: NotRequired[str]
+
+
 class WhatsAppSendResponse(TypedDict):
     """Response from sending a message via the Cloud API."""
 
-    contacts: list[dict[str, str]]
+    contacts: list[WhatsAppSendResponseContact]
     messages: list[dict[str, str]]
     messaging_product: str  # "whatsapp"
 
@@ -270,3 +380,6 @@ class WhatsAppRawMessage(TypedDict, total=False):
     phone_number_id: str
     # Contact info from the webhook
     contact: WhatsAppContact | None
+    # Canonical user ID the thread is keyed by (phone number or BSUID).
+    # Upstream's camelCase `userId`, snake_cased like `phone_number_id`.
+    user_id: str
