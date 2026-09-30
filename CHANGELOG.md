@@ -2,6 +2,8 @@
 
 ## Unreleased (4.41 wave)
 
+- **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
 ### Security
 
 - **Slack: installation-scoped caches, unresolved installs dropped, strict `response_url`** (#205, security). Ports the Slack parts of vercel/chat#877 (webhook tenant isolation), the cache part of #724 (Enterprise Grid), #876 (external request targets) and the Slack half of #779 (bounded URL parsing).
