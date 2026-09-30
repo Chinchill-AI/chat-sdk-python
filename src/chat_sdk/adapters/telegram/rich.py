@@ -410,6 +410,8 @@ def _media(blocks: list[TelegramRichBlock], result: list[RichMedia]) -> None:
                         RichMedia(
                             file=photo,
                             height=photo.get("height"),
+                            # Telegram re-encodes photos as JPEG (vercel/chat#752).
+                            mime_type="image/jpeg",
                             type="image",
                             width=photo.get("width"),
                         )

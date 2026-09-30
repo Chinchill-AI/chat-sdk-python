@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chat_sdk.adapters.telegram.adapter import (
+    TELEGRAM_FILE_LIMIT,
     TelegramAdapter,
+    _js_number_str,
     apply_telegram_entities,
     create_telegram_adapter,
 )
@@ -27,6 +29,7 @@ from chat_sdk.adapters.telegram.cards import encode_telegram_callback_data
 from chat_sdk.adapters.telegram.types import TelegramAdapterConfig, TelegramThreadId
 from chat_sdk.shared.errors import NetworkError, ValidationError
 from chat_sdk.shared.mock_adapter import MockStateAdapter, create_mock_state
+from chat_sdk.types import Message, WebhookOptions
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -316,6 +319,9 @@ def _slash_adapter_and_chat() -> tuple[TelegramAdapter, Any]:
     adapter._chat = chat
     adapter._bot_user_id = "999"
     adapter._webhook_scope = hashlib.sha256(b"999").hexdigest()
+    # Private messages also fire a typing chat action (vercel/chat#612); keep
+    # it offline.
+    adapter.telegram_fetch = AsyncMock(return_value=True)  # type: ignore[method-assign]
     return adapter, chat
 
 
@@ -735,7 +741,7 @@ class TestTelegramParseMessageAttachments:
         )
         parsed = adapter.parse_message(msg)
         assert len(parsed.attachments) == 1
-        assert parsed.attachments[0].fetch_metadata == {"fileId": "vn2"}
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "vn2", "fileUniqueId": "uvn2"}
 
     def test_video_note_attachment_without_optional_fields(self):
         # Edge case not covered upstream: video_note with no length and no
@@ -939,14 +945,15 @@ class TestTelegramParseInboundRichMedia:
 
         image = parsed.attachments[0]
         assert image.type == "image"
-        assert image.fetch_metadata == {"fileId": "large"}  # LARGEST size, not "small"
+        assert image.fetch_metadata == {"fileId": "large", "fileUniqueId": "large-unique"}  # LARGEST size, not "small"
+        assert image.mime_type == "image/jpeg"
         assert image.size == 2048
         assert image.width == 1200
         assert image.height == 800
 
         video = parsed.attachments[1]
         assert video.type == "video"
-        assert video.fetch_metadata == {"fileId": "video"}
+        assert video.fetch_metadata == {"fileId": "video", "fileUniqueId": "video-unique"}
         assert video.size == 4096
         assert video.width == 1280
         assert video.height == 720
@@ -980,7 +987,7 @@ class TestTelegramParseInboundRichMedia:
         assert len(parsed.attachments) == 1
         attachment = parsed.attachments[0]
         assert attachment.type == "image"
-        assert attachment.fetch_metadata == {"fileId": "anim-img"}
+        assert attachment.fetch_metadata == {"fileId": "anim-img", "fileUniqueId": "anim-img-u"}
         assert attachment.mime_type == "image/gif"
         assert attachment.name == "loop.gif"
         assert attachment.width == 320
@@ -1037,7 +1044,7 @@ class TestTelegramParseInboundRichMedia:
         assert len(parsed.attachments) == 1
         attachment = parsed.attachments[0]
         assert attachment.type == "audio"
-        assert attachment.fetch_metadata == {"fileId": "voice"}
+        assert attachment.fetch_metadata == {"fileId": "voice", "fileUniqueId": "voice-u"}
         assert attachment.size == 9001
         assert attachment.mime_type == "audio/ogg"
         assert attachment.width is None
@@ -1080,7 +1087,7 @@ class TestTelegramParseInboundRichMedia:
         parsed = adapter.parse_message(msg)
         assert len(parsed.attachments) == 1
         assert parsed.attachments[0].type == "image"
-        assert parsed.attachments[0].fetch_metadata == {"fileId": "listed-photo"}
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "listed-photo", "fileUniqueId": "listed-u"}
 
     def test_rich_media_appends_after_top_level_attachments(self):
         # Top-level media (a document) and rich-block media coexist: the rich
@@ -1105,8 +1112,8 @@ class TestTelegramParseInboundRichMedia:
         )
         parsed = adapter.parse_message(msg)
         assert [a.type for a in parsed.attachments] == ["file", "image"]
-        assert parsed.attachments[0].fetch_metadata == {"fileId": "doc1"}
-        assert parsed.attachments[1].fetch_metadata == {"fileId": "rich-photo"}
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "doc1", "fileUniqueId": "udoc1"}
+        assert parsed.attachments[1].fetch_metadata == {"fileId": "rich-photo", "fileUniqueId": "rp-u"}
 
 
 # ---------------------------------------------------------------------------
@@ -1610,3 +1617,747 @@ class TestTelegramWebhookDeduplicationPythonEdges:
 
         assert adapter.runtime_mode == "polling"
         adapter.start_polling.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# 4.41 inbound (#225): allowlist, early typing, mention regex, media identity,
+# stickers/animations, non-file content, download cap
+# ---------------------------------------------------------------------------
+
+
+def _message_without_text(**overrides: Any) -> dict[str, Any]:
+    """``sampleMessage({ text: undefined, ...overrides })``: no ``text`` key."""
+    message = _sample_message(**overrides)
+    if "text" not in overrides:
+        del message["text"]
+    return message
+
+
+async def _dispatch(message: dict[str, Any]) -> Any:
+    """Deliver ``message`` through ``handle_webhook``; return the parsed Message."""
+    adapter, chat = _slash_adapter_and_chat()
+    response = await adapter.handle_webhook(_make_request(json.dumps({"update_id": 1, "message": message})))
+    assert response["status"] == 200
+    assert chat.process_message.call_count == 1
+    return chat.process_message.call_args.args[2]
+
+
+class TestTelegramAllowedUserIds:
+    """Ports of the upstream allowlist cases (vercel/chat#742)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_telegram_env(monkeypatch)
+
+    def test_should_resolve_allowed_user_ids_from_telegram_allowed_user_ids_env_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-bot-token")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123, 456")
+        adapter = TelegramAdapter()
+        assert adapter._allowed_user_ids == {"123", "456"}
+
+    def test_should_allow_all_users_when_telegram_allowed_user_ids_is_empty(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-bot-token")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", " , ")
+        adapter = TelegramAdapter()
+        assert adapter._allowed_user_ids is None
+
+    def test_explicit_config_list_wins_over_env_and_normalizes_ids(self, monkeypatch: pytest.MonkeyPatch):
+        # ``allowedUserIds ?? env``: an explicit list (even empty) is not
+        # nullish, so the env var is ignored; ints and floats stringify like
+        # JS ``String()`` (``456.0`` -> ``"456"``).
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "999")
+        assert _make_adapter(allowed_user_ids=[]).__dict__["_allowed_user_ids"] is None
+        adapter = _make_adapter(allowed_user_ids=[123, 456.0, " 789 ", ""])
+        assert adapter._allowed_user_ids == {"123", "456", "789"}
+
+    @pytest.mark.parametrize("value", ["123,456", 123456, {"123": True}])
+    def test_non_list_allowed_user_ids_raise(self, value: Any):
+        # A bare string would otherwise iterate per character ({"1","2",...}).
+        with pytest.raises(ValidationError, match="allowed_user_ids must be a list"):
+            _make_adapter(allowed_user_ids=value)
+
+    @pytest.mark.asyncio
+    async def test_rejects_disallowed_and_identityless_updates_before_dispatch(self):
+        adapter = _make_adapter(user_name="mybot", allow_unverified_webhooks=True, allowed_user_ids=[456])
+        chat = MagicMock()
+        adapter._chat = chat
+        adapter.telegram_fetch = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        disallowed_user = {"id": 789, "is_bot": False, "first_name": "Other User"}
+        group_message = _sample_message(chat={"id": -100123, "type": "supergroup", "title": "General"})
+        channel_post = dict(group_message)
+        del channel_post["from"]
+        updates: list[dict[str, Any]] = [
+            {"update_id": 1, "message": {**group_message, "from": disallowed_user}},
+            {
+                "update_id": 2,
+                "callback_query": {
+                    "id": "callback-1",
+                    "from": disallowed_user,
+                    "message": group_message,
+                    "chat_instance": "ci_1",
+                    "data": "approve",
+                },
+            },
+            {
+                "update_id": 3,
+                "message_reaction": {
+                    "chat": group_message["chat"],
+                    "message_id": group_message["message_id"],
+                    "date": group_message["date"],
+                    "old_reaction": [],
+                    "new_reaction": [{"type": "emoji", "emoji": "\U0001f44d"}],
+                    "user": disallowed_user,
+                },
+            },
+            {"update_id": 4, "channel_post": channel_post},
+            # Private ``/command`` and plain DM from a disallowed user: the gate
+            # must run before both slash dispatch and early typing.
+            {
+                "update_id": 6,
+                "message": {
+                    **_sample_message(text="/ping", entities=[{"type": "bot_command", "offset": 0, "length": 5}]),
+                    "from": disallowed_user,
+                },
+            },
+            {"update_id": 7, "message": {**_sample_message(), "from": disallowed_user}},
+        ]
+        for update in updates:
+            adapter.process_update(update)  # type: ignore[arg-type]
+        adapter.process_update({"update_id": 5, "message": group_message})  # type: ignore[typeddict-item]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert chat.process_message.call_count == 1
+        adapter.telegram_fetch.assert_not_awaited()
+        chat.process_slash_command.assert_not_called()
+        chat.process_action.assert_not_called()
+        chat.process_reaction.assert_not_called()
+
+    def test_allowed_callback_and_reaction_users_are_dispatched(self):
+        # The acting user is ``callback_query.from`` / ``message_reaction.user``
+        # for those updates, so an allowlisted clicker or reactor still routes.
+        adapter = _make_adapter(allowed_user_ids=["456"])
+        chat = MagicMock()
+        adapter._chat = chat
+        allowed_user = {"id": 456, "is_bot": False, "first_name": "User"}
+        group_message = _sample_message(chat={"id": -100123, "type": "supergroup", "title": "General"})
+        adapter.process_update(
+            {  # type: ignore[typeddict-item]
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cb",
+                    "from": allowed_user,
+                    "message": group_message,
+                    "chat_instance": "ci",
+                    "data": "approve",
+                },
+            }
+        )
+        adapter.process_update(
+            {  # type: ignore[typeddict-item]
+                "update_id": 2,
+                "message_reaction": {
+                    "chat": group_message["chat"],
+                    "message_id": 11,
+                    "date": 1,
+                    "old_reaction": [],
+                    "new_reaction": [{"type": "emoji", "emoji": "\U0001f44d"}],
+                    "user": allowed_user,
+                },
+            }
+        )
+        assert chat.process_action.call_count == 1
+        assert chat.process_reaction.call_count == 1
+
+
+def _record_process(events: list[str], label: str) -> Any:
+    """A ``Chat.process_*`` stand-in that, like the real one, schedules its work
+    as a task and returns synchronously."""
+
+    async def _run() -> None:
+        events.append(label)
+
+    def _process(*_args: Any, **_kwargs: Any) -> asyncio.Task[None]:
+        return asyncio.get_running_loop().create_task(_run())
+
+    return MagicMock(side_effect=_process)
+
+
+class TestTelegramTypingOnReceipt:
+    """Ports of vercel/chat#612: private messages start typing on receipt."""
+
+    @staticmethod
+    def _typing_fetch(events: list[str]) -> AsyncMock:
+        async def _fetch(method: str, _payload: Any = None, **_kwargs: Any) -> Any:
+            assert method == "sendChatAction"
+            events.append("typing")
+            return True
+
+        return AsyncMock(side_effect=_fetch)
+
+    @pytest.mark.asyncio
+    async def test_starts_typing_before_processing_private_message_updates(self):
+        events: list[str] = []
+        adapter, chat = _slash_adapter_and_chat()
+        adapter.telegram_fetch = self._typing_fetch(events)  # type: ignore[method-assign]
+        chat.process_message = _record_process(events, "processMessage")
+        wait_until = MagicMock()
+
+        response = await adapter.handle_webhook(
+            _make_request(json.dumps({"update_id": 1, "message": _sample_message(text="hello")})),
+            WebhookOptions(wait_until=wait_until),
+        )
+        assert response["status"] == 200
+        await asyncio.gather(*(call.args[0] for call in wait_until.call_args_list))
+        await asyncio.sleep(0)
+
+        assert events == ["typing", "processMessage"]
+        assert wait_until.call_count == 1
+        adapter.telegram_fetch.assert_awaited_once_with(
+            "sendChatAction", {"chat_id": "123", "message_thread_id": None, "action": "typing"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_starts_typing_before_processing_private_slash_command_updates(self):
+        events: list[str] = []
+        adapter, chat = _slash_adapter_and_chat()
+        adapter.telegram_fetch = self._typing_fetch(events)  # type: ignore[method-assign]
+        chat.process_slash_command = _record_process(events, "processSlashCommand")
+        wait_until = MagicMock()
+
+        response = await adapter.handle_webhook(
+            _make_request(
+                json.dumps(
+                    {
+                        "update_id": 2,
+                        "message": _sample_message(
+                            text="/ping@mybot hello world",
+                            entities=[{"type": "bot_command", "offset": 0, "length": 11}],
+                        ),
+                    }
+                )
+            ),
+            WebhookOptions(wait_until=wait_until),
+        )
+        assert response["status"] == 200
+        await asyncio.gather(*(call.args[0] for call in wait_until.call_args_list))
+        await asyncio.sleep(0)
+
+        assert events == ["typing", "processSlashCommand"]
+        assert wait_until.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"chat": {"id": -100123, "type": "supergroup", "title": "General"}},
+            {"from": {"id": 777, "is_bot": True, "first_name": "Other Bot"}},
+        ],
+        ids=["group-chat", "bot-sender"],
+    )
+    async def test_does_not_start_typing_for_group_chats_or_bot_senders(self, overrides: dict[str, Any]):
+        adapter, chat = _slash_adapter_and_chat()
+        wait_until = MagicMock()
+        adapter.process_update(
+            {"update_id": 1, "message": _sample_message(**overrides)},  # type: ignore[typeddict-item]
+            WebhookOptions(wait_until=wait_until),
+        )
+        await asyncio.sleep(0)
+
+        assert chat.process_message.call_count == 1
+        wait_until.assert_not_called()
+        adapter.telegram_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failing_typing_action_is_logged_and_does_not_block_dispatch(self):
+        adapter, chat = _slash_adapter_and_chat()
+        adapter.telegram_fetch = AsyncMock(side_effect=NetworkError("telegram", "boom"))  # type: ignore[method-assign]
+        logger = MagicMock()
+        adapter._logger = logger
+
+        adapter.process_update({"update_id": 1, "message": _sample_message()})  # type: ignore[typeddict-item]
+        assert chat.process_message.call_count == 1
+        # No ``wait_until``: the adapter holds the task itself until it settles.
+        (typing_task,) = adapter._typing_tasks
+        await typing_task
+
+        logger.warn.assert_called_once_with(
+            "Failed to send Telegram typing action",
+            {"error": "boom", "threadId": "telegram:123"},
+        )
+        assert adapter._typing_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_pending_typing_so_the_session_is_not_reopened(self):
+        adapter, _chat = _slash_adapter_and_chat()
+        adapter.start_typing = AsyncMock()  # type: ignore[method-assign]
+        adapter.process_update({"update_id": 1, "message": _sample_message()})  # type: ignore[typeddict-item]
+        (typing_task,) = adapter._typing_tasks
+
+        await adapter.disconnect()
+        await asyncio.sleep(0)
+
+        assert typing_task.cancelled()
+        adapter.start_typing.assert_not_awaited()
+        assert adapter._typing_tasks == set()
+
+
+class TestTelegramMentionRegex:
+    """Ports of vercel/chat#621 / #706 (mention boundary + caching)."""
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_a_mention_when_a_hyphen_suffixed_name_is_mentioned(self):
+        parsed = await _dispatch(
+            _sample_message(
+                chat={"id": -100123, "type": "supergroup", "title": "General"},
+                text="see @mybot-dev for details",
+            )
+        )
+        assert parsed.is_mention is False
+
+    def test_matches_with_the_cached_regex_and_recompiles_when_the_username_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import re
+
+        adapter = _make_adapter(user_name="first_bot", allow_unverified_webhooks=True, mode="webhook")
+        compiled: list[str] = []
+        real_compile = re.compile
+
+        def counting_compile(pattern: Any, flags: int = 0) -> Any:
+            if isinstance(pattern, str) and pattern.startswith("@"):
+                compiled.append(pattern)
+            return real_compile(pattern, flags)
+
+        monkeypatch.setattr(re, "compile", counting_compile)
+
+        assert adapter.is_bot_mentioned({}, "hi @first_bot") is True  # type: ignore[typeddict-item]
+        # Second call exercises the cached-regex path.
+        assert adapter.is_bot_mentioned({}, "hi @first_bot, again") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @second_bot") is False  # type: ignore[typeddict-item]
+        assert len(compiled) == 1
+
+        adapter._user_name = "second_bot"
+        assert adapter.is_bot_mentioned({}, "hi @second_bot") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @first_bot") is False  # type: ignore[typeddict-item]
+        assert len(compiled) == 2
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            # JS ``\w`` is ASCII-only, so a non-ASCII letter ends the handle.
+            ("hi @mybotж", True),
+            ("hi @mybot_x", False),
+            ("hi @mybot2", False),
+            ("hi @MYBOT!", True),
+            ("@mybot", True),
+        ],
+    )
+    def test_mention_boundary_uses_ascii_word_characters(self, text: str, expected: bool):
+        adapter = _make_adapter(user_name="mybot")
+        assert adapter.is_bot_mentioned({}, text) is expected  # type: ignore[typeddict-item]
+
+    def test_mention_regex_case_folds_non_ascii_usernames_like_js_i(self):
+        # JS ``/i`` (no ``u``) still folds Cyrillic, so ``@БОТИК`` mentions
+        # ``ботик``; only the ``\w`` lookahead is ASCII-only.
+        adapter = _make_adapter(user_name="ботик")
+        assert adapter.is_bot_mentioned({}, "hi @БОТИК") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @БОТИКж") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @БОТИК_2") is False  # type: ignore[typeddict-item]
+
+
+class TestTelegramMediaIdentity:
+    """Ports of vercel/chat#752 (``fileUniqueId`` + photo MIME)."""
+
+    def test_preserves_stable_photo_identity_and_jpeg_metadata_across_resends_and_serialization(self):
+        adapter = _make_adapter(user_name="mybot")
+        parsed = adapter.parse_message(
+            _message_without_text(
+                photo=[
+                    {"file_id": "photo-small", "file_unique_id": "photo-small-unique", "width": 100, "height": 100},
+                    {"file_id": "photo-download-1", "file_unique_id": "photo-stable", "width": 800, "height": 600},
+                ],
+                caption="Nice photo",
+            )
+        )
+        resent = adapter.parse_message(
+            _sample_message(
+                photo=[{"file_id": "photo-download-2", "file_unique_id": "photo-stable", "width": 800, "height": 600}]
+            )
+        )
+
+        assert len(parsed.attachments) == 1
+        attachment = parsed.attachments[0]
+        assert attachment.type == "image"
+        assert attachment.width == 800
+        assert attachment.height == 600
+        assert attachment.mime_type == "image/jpeg"
+        assert attachment.fetch_metadata == {"fileId": "photo-download-1", "fileUniqueId": "photo-stable"}
+        assert resent.attachments[0].fetch_metadata == {"fileId": "photo-download-2", "fileUniqueId": "photo-stable"}
+        assert parsed.text == "Nice photo"
+
+        restored = Message.from_json(json.loads(json.dumps(parsed.to_json())))
+        (restored_attachment,) = [adapter.rehydrate_attachment(a) for a in restored.attachments]
+        assert restored_attachment.fetch_metadata == {"fileId": "photo-download-1", "fileUniqueId": "photo-stable"}
+        assert callable(restored_attachment.fetch_data)
+
+    def test_preserves_stable_identity_for_voice_attachments(self):
+        adapter = _make_adapter(user_name="mybot")
+        parsed = adapter.parse_message(
+            _sample_message(
+                voice={
+                    "file_id": "voice1",
+                    "file_unique_id": "voice-stable",
+                    "duration": 30,
+                    "mime_type": "audio/ogg",
+                    "file_size": 512000,
+                }
+            )
+        )
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "voice1", "fileUniqueId": "voice-stable"}
+
+    def test_empty_file_unique_id_is_omitted_from_fetch_metadata(self):
+        # Upstream spreads ``fileUniqueId`` only when truthy.
+        adapter = _make_adapter()
+        parsed = adapter.parse_message(_sample_message(document={"file_id": "doc", "file_unique_id": ""}))
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "doc"}
+
+
+class TestTelegramStickerMessages:
+    """Ports of ``describe("sticker messages")`` (vercel/chat#835)."""
+
+    @pytest.mark.asyncio
+    async def test_represents_a_sticker_by_the_emoji_it_stands_for(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                sticker={"emoji": "\U0001f600", "file_id": "sticker-file", "file_unique_id": "sticker-unique"}
+            )
+        )
+        assert parsed.text == "\U0001f600"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_set_name_when_the_emoji_is_missing(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                sticker={"set_name": "CorgiPack", "file_id": "sticker-file", "file_unique_id": "sticker-unique"}
+            )
+        )
+        assert parsed.text == "CorgiPack"
+
+    @pytest.mark.asyncio
+    async def test_never_delivers_a_sticker_as_an_empty_message(self):
+        parsed = await _dispatch(
+            _message_without_text(sticker={"file_id": "sticker-file", "file_unique_id": "sticker-unique"})
+        )
+        assert parsed.text == "sticker"
+
+
+class TestTelegramStickerAndAnimationAttachments:
+    """Ports of ``describe("sticker and animation attachments")`` (vercel/chat#835)."""
+
+    @pytest.mark.asyncio
+    async def test_carries_a_sticker_through_as_an_image(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                sticker={
+                    "emoji": "\U0001f600",
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-unique",
+                    "width": 512,
+                    "height": 512,
+                }
+            )
+        )
+        assert [(a.type, a.mime_type, a.width) for a in parsed.attachments] == [("image", "image/webp", 512)]
+
+    @pytest.mark.asyncio
+    async def test_carries_a_video_sticker_through_as_a_video(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                sticker={
+                    "emoji": "\U0001f525",
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-unique",
+                    "is_video": True,
+                }
+            )
+        )
+        assert [(a.type, a.mime_type) for a in parsed.attachments] == [("video", "video/webm")]
+
+    @pytest.mark.asyncio
+    async def test_carries_a_lottie_sticker_through_as_a_file(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                sticker={
+                    "emoji": "\U0001f389",
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-unique",
+                    "is_animated": True,
+                }
+            )
+        )
+        assert [(a.type, a.mime_type) for a in parsed.attachments] == [("file", "application/x-tgsticker")]
+
+    @pytest.mark.asyncio
+    async def test_carries_an_animation_through_as_a_single_video_attachment(self):
+        # Telegram sets ``document`` alongside ``animation`` for backward
+        # compatibility; the same file must not surface twice.
+        media = {
+            "file_id": "animation-file",
+            "file_unique_id": "animation-unique",
+            "mime_type": "video/mp4",
+            "file_name": "cat.mp4",
+        }
+        parsed = await _dispatch(_message_without_text(animation=dict(media), document=dict(media)))
+        assert [(a.type, a.mime_type, a.name) for a in parsed.attachments] == [("video", "video/mp4", "cat.mp4")]
+        assert parsed.attachments[0].fetch_metadata == {"fileId": "animation-file", "fileUniqueId": "animation-unique"}
+
+    @pytest.mark.asyncio
+    async def test_still_carries_a_plain_document_through_as_a_file(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                document={
+                    "file_id": "document-file",
+                    "file_unique_id": "document-unique",
+                    "mime_type": "application/pdf",
+                    "file_name": "report.pdf",
+                }
+            )
+        )
+        assert [(a.type, a.mime_type) for a in parsed.attachments] == [("file", "application/pdf")]
+
+
+class TestTelegramNonFileContent:
+    """Ports of ``describe("non-file content")`` (vercel/chat#836)."""
+
+    @pytest.mark.asyncio
+    async def test_describes_a_shared_location(self):
+        parsed = await _dispatch(_message_without_text(location={"latitude": 55.75, "longitude": 37.61}))
+        assert parsed.text == "\U0001f4cd 55.75, 37.61"
+
+    @pytest.mark.asyncio
+    async def test_describes_a_venue_by_name_and_address(self):
+        # Telegram sets the top-level location on every venue message for
+        # backward compatibility; the venue description must still win.
+        location = {"latitude": 55.75, "longitude": 37.61}
+        parsed = await _dispatch(
+            _message_without_text(
+                venue={"title": "Central Library", "address": "12 Main St", "location": location},
+                location=location,
+            )
+        )
+        assert parsed.text == "\U0001f4cd Central Library, 12 Main St"
+
+    @pytest.mark.asyncio
+    async def test_describes_a_shared_contact(self):
+        parsed = await _dispatch(
+            _message_without_text(
+                contact={"first_name": "Ada", "last_name": "Lovelace", "phone_number": "+15551234567"}
+            )
+        )
+        assert parsed.text == "\U0001f464 Ada Lovelace +15551234567"
+
+    @pytest.mark.asyncio
+    async def test_describes_a_poll_by_its_question(self):
+        parsed = await _dispatch(_message_without_text(poll={"id": "1", "question": "Lunch or dinner?"}))
+        assert parsed.text == "\U0001f4ca Lunch or dinner?"
+
+    @pytest.mark.asyncio
+    async def test_describes_a_dice_roll(self):
+        parsed = await _dispatch(_message_without_text(dice={"emoji": "\U0001f3b2", "value": 4}))
+        assert parsed.text == "\U0001f3b2 4"
+
+    @pytest.mark.asyncio
+    async def test_describes_a_game_by_its_title(self):
+        parsed = await _dispatch(_message_without_text(game={"title": "Corsairs"}))
+        assert parsed.text == "\U0001f3ae Corsairs"
+
+    @pytest.mark.asyncio
+    async def test_describes_an_invoice_with_its_amount(self):
+        parsed = await _dispatch(
+            _message_without_text(invoice={"title": "Yearly plan", "total_amount": 4999, "currency": "USD"})
+        )
+        assert parsed.text == "\U0001f9fe Yearly plan — 49.99 USD"
+
+    @pytest.mark.asyncio
+    async def test_keeps_zero_exponent_invoice_currencies_in_whole_units(self):
+        jpy = await _dispatch(
+            _message_without_text(invoice={"title": "Yearly plan", "total_amount": 5000, "currency": "JPY"})
+        )
+        xtr = await _dispatch(_message_without_text(invoice={"title": "Boost", "total_amount": 250, "currency": "XTR"}))
+        assert jpy.text == "\U0001f9fe Yearly plan — 5000 JPY"
+        assert xtr.text == "\U0001f9fe Boost — 250 XTR"
+
+    @pytest.mark.asyncio
+    async def test_scales_three_exponent_invoice_currencies_by_a_thousand(self):
+        parsed = await _dispatch(
+            _message_without_text(invoice={"title": "Yearly plan", "total_amount": 5000, "currency": "BHD"})
+        )
+        assert parsed.text == "\U0001f9fe Yearly plan — 5.000 BHD"
+
+    @pytest.mark.asyncio
+    async def test_marks_a_shared_story(self):
+        parsed = await _dispatch(_message_without_text(story={"id": 7}))
+        assert parsed.text == "\U0001f4d6 Story"
+
+    @pytest.mark.asyncio
+    async def test_integral_and_tiny_float_coordinates_render_like_js_string(self):
+        # ``json.loads`` keeps ``51.0`` a float; JS ``String(51.0)`` is "51",
+        # and ``String(0.00001)`` is "0.00001" where Python prints "1e-05".
+        parsed = await _dispatch(_message_without_text(location={"latitude": 51.0, "longitude": 0.00001}))
+        assert parsed.text == "\U0001f4cd 51, 0.00001"
+
+    def test_caption_still_wins_over_non_file_description(self):
+        # ``text ?? caption ?? sticker ?? describeNonFileContent``: an empty
+        # caption is a real value and short-circuits the fallbacks.
+        adapter = _make_adapter()
+        parsed = adapter.parse_message(_message_without_text(caption="", poll={"id": "1", "question": "Q?"}))
+        assert parsed.text == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (51.0, "51"),
+        (-0.0, "0"),
+        (0.000001, "0.000001"),
+        (1.5e-7, "1.5e-7"),
+        (-1e-7, "-1e-7"),
+        (123.456, "123.456"),
+        (1e20, "100000000000000000000"),
+        (1e21, "1e+21"),
+        (2.5e22, "2.5e+22"),
+        (4, "4"),
+    ],
+)
+def test_js_number_str_matches_javascript_string_conversion(value: float, expected: str):
+    assert _js_number_str(value) == expected
+
+
+class _FakeContent:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.consumed = 0
+
+    async def iter_chunked(self, _size: int) -> Any:
+        for chunk in self._chunks:
+            self.consumed += 1
+            yield chunk
+
+
+class _FakeResponse:
+    def __init__(self, chunks: list[bytes], content_length: int | None, status: int = 200) -> None:
+        self.content = _FakeContent(chunks)
+        self.content_length = content_length
+        self.status = status
+        self.ok = status < 400
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.get_calls: list[tuple[str, Any]] = []
+
+    def get(self, url: str, *, timeout: Any = None) -> Any:
+        self.get_calls.append((url, timeout))
+        return self.response
+
+
+def _download_adapter(session: _FakeSession) -> TelegramAdapter:
+    adapter = _make_adapter(bot_token="token")
+    adapter.telegram_fetch = AsyncMock(return_value={"file_id": "f1", "file_path": "photos/a.jpg"})  # type: ignore[method-assign]
+    adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+    return adapter
+
+
+class TestTelegramDownloadLimits:
+    """25 MB / 30 s download guard (vercel/chat#865, Telegram half)."""
+
+    @pytest.mark.asyncio
+    async def test_downloads_body_within_limit_with_a_total_timeout(self):
+        import aiohttp
+
+        session = _FakeSession(_FakeResponse([b"abc", b"def"], content_length=6))
+        adapter = _download_adapter(session)
+
+        assert await adapter.download_file("f1") == b"abcdef"
+        ((url, timeout),) = session.get_calls
+        assert url == "https://api.telegram.org/file/bottoken/photos/a.jpg"
+        assert timeout == aiohttp.ClientTimeout(total=30)
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_declared_content_length_over_the_limit_without_reading(self):
+        response = _FakeResponse([b"x"], content_length=TELEGRAM_FILE_LIMIT + 1)
+        adapter = _download_adapter(_FakeSession(response))
+
+        with pytest.raises(NetworkError, match="Telegram file f1 exceeds the download limit"):
+            await adapter.download_file("f1")
+        assert response.content.consumed == 0
+
+    @pytest.mark.asyncio
+    async def test_rejects_an_undeclared_body_once_the_running_count_passes_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import chat_sdk.adapters.telegram.adapter as telegram_adapter_module
+
+        monkeypatch.setattr(telegram_adapter_module, "TELEGRAM_FILE_LIMIT", 10)
+        response = _FakeResponse([b"12345", b"67890", b"1", b"never-read"], content_length=None)
+        adapter = _download_adapter(_FakeSession(response))
+
+        with pytest.raises(NetworkError, match="exceeds the download limit"):
+            await adapter.download_file("f1")
+        # Stopped at the chunk that crossed the cap; nothing after it is read.
+        assert response.content.consumed == 3
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_body_exactly_at_the_limit(self, monkeypatch: pytest.MonkeyPatch):
+        import chat_sdk.adapters.telegram.adapter as telegram_adapter_module
+
+        monkeypatch.setattr(telegram_adapter_module, "TELEGRAM_FILE_LIMIT", 10)
+        adapter = _download_adapter(_FakeSession(_FakeResponse([b"12345", b"67890"], content_length=10)))
+        assert await adapter.download_file("f1") == b"1234567890"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_content_length_falls_back_to_the_running_count(self, monkeypatch: pytest.MonkeyPatch):
+        # aiohttp's ``content_length`` raises ``ValueError`` on a malformed
+        # header; upstream's ``Number(...)`` gives NaN and skips the check.
+        import chat_sdk.adapters.telegram.adapter as telegram_adapter_module
+
+        class _BadLength(_FakeResponse):
+            @property  # type: ignore[override]
+            def content_length(self) -> int | None:
+                raise ValueError("invalid literal for int()")
+
+            @content_length.setter
+            def content_length(self, _value: Any) -> None:
+                pass
+
+        monkeypatch.setattr(telegram_adapter_module, "TELEGRAM_FILE_LIMIT", 4)
+        ok = _download_adapter(_FakeSession(_BadLength([b"ab"], content_length=None)))
+        assert await ok.download_file("f1") == b"ab"
+        too_big = _download_adapter(_FakeSession(_BadLength([b"abc", b"de"], content_length=None)))
+        with pytest.raises(NetworkError, match="exceeds the download limit"):
+            await too_big.download_file("f1")
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_network_error(self):
+        class _TimingOut:
+            async def __aenter__(self) -> Any:
+                raise TimeoutError
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+        adapter = _download_adapter(_FakeSession(_TimingOut()))
+        with pytest.raises(NetworkError, match="Failed to download Telegram file f1") as info:
+            await adapter.download_file("f1")
+        assert isinstance(info.value.original_error, TimeoutError)
