@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from chat_sdk.callback_url import process_card_callback_urls
+from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
@@ -613,10 +613,11 @@ class ThreadImpl:
         """
         user_id = user if isinstance(user, str) else user.user_id
 
-        message = await self._process_callback_urls(message)  # type: ignore[assignment]
-
+        # Callback tokens are minted per delivery path so each is bound to
+        # the conversation the card actually lands in (vercel/chat#875).
         # Try native ephemeral
         if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
+            message = await self._process_callback_urls(message)  # type: ignore[assignment]
             return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
 
         if not options.fallback_to_dm:
@@ -625,6 +626,10 @@ class ThreadImpl:
         # Fallback: send via DM
         if hasattr(self.adapter, "open_dm") and self.adapter.open_dm:  # type: ignore[union-attr]
             dm_thread_id: str = await self.adapter.open_dm(user_id)  # type: ignore[union-attr]
+            message = await self._process_callback_urls(  # type: ignore[assignment]
+                message,
+                CallbackScope(id=self.adapter.channel_id_from_thread_id(dm_thread_id), type="channel"),
+            )
             result: RawMessage = await self.adapter.post_message(dm_thread_id, message)
             return EphemeralMessage(
                 id=result.id,
@@ -638,20 +643,27 @@ class ThreadImpl:
     async def _process_callback_urls(
         self,
         postable: str | AdapterPostableMessage,
+        scope: CallbackScope | None = None,
     ) -> str | AdapterPostableMessage:
-        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454)."""
+        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454).
+
+        Tokens are bound to ``scope``, which defaults to this thread.
+        """
         if isinstance(postable, str):
             return postable
 
+        if scope is None:
+            scope = CallbackScope(id=self._id, type="thread")
+
         if isinstance(postable, dict) and postable.get("type") == "card":
-            return await process_card_callback_urls(postable, self._state_adapter)
+            return await process_card_callback_urls(postable, self._state_adapter, scope)
 
         if (
             isinstance(postable, PostableCard)
             and isinstance(postable.card, dict)
             and postable.card.get("type") == "card"
         ):
-            processed = await process_card_callback_urls(postable.card, self._state_adapter)
+            processed = await process_card_callback_urls(postable.card, self._state_adapter, scope)
             if processed is not postable.card:
                 return replace(postable, card=processed)
 

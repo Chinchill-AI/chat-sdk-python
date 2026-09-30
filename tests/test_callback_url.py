@@ -1,4 +1,4 @@
-"""Faithful translation of callback-url.test.ts (17 tests).
+"""Faithful translation of callback-url.test.ts (21 tests at chat@4.41.1).
 
 Each ``it("...")`` block from the TypeScript test suite is translated
 to a corresponding ``async def test_...`` method, preserving the same
@@ -7,17 +7,27 @@ inputs, assertions, and test structure.
 TS stubs the global ``fetch``; Python patches the ``_fetch`` seam in
 ``chat_sdk.callback_url`` (the lazy aiohttp wrapper).
 
+Python-specific coverage for the token lock / consume path lives in
+``TestResolveCallbackUrlLocking`` at the bottom of the resolve section.
+
 TS file: packages/chat/src/callback-url.test.ts
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
 from unittest.mock import AsyncMock, call, patch
 
+import pytest
+
 from chat_sdk.callback_url import (
+    CALLBACK_LOCK_TTL_MS,
+    CALLBACK_TTL_MS,
+    CallbackContext,
+    CallbackScope,
     decode_callback_value,
     encode_callback_value,
     post_to_callback_url,
@@ -25,6 +35,7 @@ from chat_sdk.callback_url import (
     resolve_callback_url,
 )
 from chat_sdk.cards import Actions, Button, Card, CardText, Section
+from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.testing import MockStateAdapter, create_mock_state
 
 CALLBACK_TOKEN_PATTERN = re.compile(r"^__cb:[a-f0-9]{16}$")
@@ -71,6 +82,9 @@ class TestEncodeDecodeCallbackValue:
 # ===========================================================================
 
 
+CHANNEL_SCOPE = CallbackScope(id="slack:C1", type="channel")
+
+
 class TestProcessCardCallbackUrls:
     """describe("processCardCallbackUrls")"""
 
@@ -88,7 +102,7 @@ class TestProcessCardCallbackUrls:
             ],
         )
 
-        result = await process_card_callback_urls(card, state)
+        result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)
         assert result is card
 
     # it("encodes callbackUrl into button value and stores in state")
@@ -109,7 +123,7 @@ class TestProcessCardCallbackUrls:
             ],
         )
 
-        result = await process_card_callback_urls(card, state)
+        result = await process_card_callback_urls(card, state, CallbackScope(id="slack:C1:1.1", type="thread"))
 
         actions = next(c for c in result["children"] if c["type"] == "actions")
         button = actions["children"][0]
@@ -120,9 +134,14 @@ class TestProcessCardCallbackUrls:
         decoded = decode_callback_value(button["value"])
         assert decoded.callback_token is not None
 
-        resolved = await resolve_callback_url(decoded.callback_token, state)
+        resolved = await resolve_callback_url(
+            decoded.callback_token,
+            state,
+            CallbackContext(action_id="approve", thread_id="slack:C1:1.1"),
+        )
         assert resolved is not None
         assert resolved.url == "https://example.com/webhook/123"
+        assert resolved.scope == CallbackScope(id="slack:C1:1.1", type="thread")
 
     # it("stores original value in state alongside callback URL")
     async def test_stores_original_value_in_state_alongside_callback_url(self):
@@ -143,13 +162,17 @@ class TestProcessCardCallbackUrls:
             ],
         )
 
-        result = await process_card_callback_urls(card, state)
+        result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)
         button = next(c for c in result["children"] if c["type"] == "actions")["children"][0]
 
         assert CALLBACK_TOKEN_PATTERN.match(button["value"])
 
         decoded = decode_callback_value(button["value"])
-        resolved = await resolve_callback_url(decoded.callback_token or "", state)
+        resolved = await resolve_callback_url(
+            decoded.callback_token or "",
+            state,
+            CallbackContext(action_id="btn", channel_id="slack:C1"),
+        )
         assert resolved is not None
         assert resolved.url == "https://hook.example.com"
         assert resolved.original_value == "item-99"
@@ -173,13 +196,45 @@ class TestProcessCardCallbackUrls:
             ],
         )
 
-        result = await process_card_callback_urls(card, state)
+        result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)
         actions = next(c for c in result["children"] if c["type"] == "actions")
         normal_btn = actions["children"][0]
         callback_btn = actions["children"][1]
 
         assert normal_btn["value"] == "keep"
         assert CALLBACK_PREFIX_PATTERN.match(callback_btn["value"])
+
+    # it("keeps every other button field when replacing the callback URL")
+    async def test_keeps_every_other_button_field_when_replacing_the_callback_url(self):
+        state = self._state()
+        button_in = Button(
+            id="approve",
+            label="Approve",
+            style="primary",
+            disabled=True,
+            action_type="modal",
+            callback_url="https://example.com/hook",
+        )
+        # `Button(tooltip=...)` arrives with #202; a raw key proves unknown
+        # fields survive the token swap.
+        button_in["tooltip"] = "Approve the request"  # type: ignore[typeddict-unknown-key]
+        card = Card(title="Test", children=[Actions([button_in])])
+
+        result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)
+        actions = next(c for c in result["children"] if c["type"] == "actions")
+        button = actions["children"][0]
+
+        assert {k: v for k, v in button.items() if k != "value"} == {
+            "type": "button",
+            "id": "approve",
+            "label": "Approve",
+            "style": "primary",
+            "disabled": True,
+            "action_type": "modal",
+            "tooltip": "Approve the request",
+        }
+        assert "callback_url" not in button
+        assert CALLBACK_PREFIX_PATTERN.match(button["value"])
 
     # it("processes buttons nested inside sections")
     async def test_processes_buttons_nested_inside_sections(self):
@@ -204,7 +259,7 @@ class TestProcessCardCallbackUrls:
             ],
         )
 
-        result = await process_card_callback_urls(card, state)
+        result = await process_card_callback_urls(card, state, CHANNEL_SCOPE)
         section = next(c for c in result["children"] if c["type"] == "section")
         actions = next(c for c in section["children"] if c["type"] == "actions")
         button = actions["children"][0]
@@ -214,7 +269,11 @@ class TestProcessCardCallbackUrls:
         assert "callback_url" not in button
 
         decoded = decode_callback_value(button["value"])
-        resolved = await resolve_callback_url(decoded.callback_token or "", state)
+        resolved = await resolve_callback_url(
+            decoded.callback_token or "",
+            state,
+            CallbackContext(action_id="nested-btn", channel_id="slack:C1"),
+        )
         assert resolved is not None
         assert resolved.url == "https://example.com/nested"
 
@@ -237,8 +296,53 @@ class TestProcessCardCallbackUrls:
         )
 
         original = copy.deepcopy(card)
-        await process_card_callback_urls(card, state)
+        await process_card_callback_urls(card, state, CHANNEL_SCOPE)
         assert card == original
+
+
+class TestProcessCardCallbackUrlsStoredRecord:
+    """Python-specific: the exact record written to state (cross-SDK shape)."""
+
+    async def test_stores_camelcase_record_with_scope_and_seven_day_ttl(self):
+        state = create_mock_state()
+        state.set = AsyncMock(wraps=state.set)  # type: ignore[method-assign]
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Button(id="with-value", label="A", value="v1", callback_url="https://example.com/a"),
+                        Button(id="no-value", label="B", callback_url="https://example.com/b"),
+                    ]
+                )
+            ]
+        )
+
+        result = await process_card_callback_urls(card, state, CallbackScope(id="slack:C9:9.9", type="thread"))
+
+        tokens = [decode_callback_value(b["value"]).callback_token for b in result["children"][0]["children"]]
+        assert state.set.await_args_list == [
+            call(
+                f"chat:callback:{tokens[0]}",
+                {
+                    "actionId": "with-value",
+                    "url": "https://example.com/a",
+                    "originalValue": "v1",
+                    "scope": {"id": "slack:C9:9.9", "type": "thread"},
+                },
+                CALLBACK_TTL_MS,
+            ),
+            # `originalValue` is omitted, never written as None.
+            call(
+                f"chat:callback:{tokens[1]}",
+                {
+                    "actionId": "no-value",
+                    "url": "https://example.com/b",
+                    "scope": {"id": "slack:C9:9.9", "type": "thread"},
+                },
+                CALLBACK_TTL_MS,
+            ),
+        ]
+        assert CALLBACK_TTL_MS == 7 * 24 * 60 * 60 * 1000
 
 
 # ===========================================================================
@@ -260,21 +364,254 @@ class TestResolveCallbackUrl:
         state = create_mock_state()
         await state.set(
             "chat:callback:test-token",
-            {"url": "https://example.com/hook", "originalValue": "item-42"},
+            {
+                "actionId": "approve",
+                "url": "https://example.com/hook",
+                "originalValue": "item-42",
+                "scope": {"id": "slack:C1:1.1", "type": "thread"},
+            },
         )
-        result = await resolve_callback_url("test-token", state)
+        result = await resolve_callback_url(
+            "test-token",
+            state,
+            CallbackContext(action_id="approve", thread_id="slack:C1:1.1"),
+        )
         assert result is not None
         assert result.url == "https://example.com/hook"
         assert result.original_value == "item-42"
+        assert result.scope == CallbackScope(id="slack:C1:1.1", type="thread")
+        assert await state.get("chat:callback:test-token") is None
 
-    # it("handles legacy string format")
+    # it("rejects legacy unbound callback records")
+    async def test_rejects_legacy_unbound_callback_records(self):
+        state = create_mock_state()
+        await state.set("chat:callback:legacy-token", "https://example.com/hook")
+        result = await resolve_callback_url("legacy-token", state, CallbackContext(action_id="approve"))
+        assert result is None
+
+    # it("handles legacy string format") — chat@4.31.0 title, behavior now
+    # reversed. Kept so strict fidelity at the 4.31.0 pin stays green until
+    # the pin moves to 4.41.1 (#203), where upstream replaced it with the
+    # test above. Asserts what the rejection above does not: even a context
+    # that would match any record resolves nothing, and the legacy record is
+    # left for its TTL rather than deleted.
     async def test_handles_legacy_string_format(self):
         state = create_mock_state()
         await state.set("chat:callback:legacy-token", "https://example.com/hook")
-        result = await resolve_callback_url("legacy-token", state)
+        state.delete = AsyncMock(wraps=state.delete)  # type: ignore[method-assign]
+
+        result = await resolve_callback_url(
+            "legacy-token",
+            state,
+            CallbackContext(action_id="approve", channel_id="slack:C1", thread_id="slack:C1:1.1"),
+        )
+
+        assert result is None
+        state.delete.assert_not_awaited()
+        assert await state.get("chat:callback:legacy-token") == "https://example.com/hook"
+        assert state._locks == {}
+
+    # it("allows a callback token to be consumed only once")
+    async def test_allows_a_callback_token_to_be_consumed_only_once(self):
+        state = create_mock_state()
+        await state.set(
+            "chat:callback:single-use",
+            {
+                "actionId": "approve",
+                "scope": {"id": "slack:C1", "type": "channel"},
+                "url": "https://example.com/hook",
+            },
+        )
+        context = CallbackContext(action_id="approve", channel_id="slack:C1")
+
+        first = await resolve_callback_url("single-use", state, context)
+        assert first is not None
+        assert first.url == "https://example.com/hook"
+        assert await resolve_callback_url("single-use", state, context) is None
+
+    # it("rejects callback tokens outside their action and thread")
+    async def test_rejects_callback_tokens_outside_their_action_and_thread(self):
+        state = create_mock_state()
+        await state.set(
+            "chat:callback:bound-token",
+            {
+                "actionId": "approve",
+                "scope": {"id": "slack:C1:1.1", "type": "thread"},
+                "url": "https://example.com/hook",
+            },
+        )
+
+        assert (
+            await resolve_callback_url(
+                "bound-token",
+                state,
+                CallbackContext(action_id="deny", thread_id="slack:C1:1.1"),
+            )
+            is None
+        )
+        assert (
+            await resolve_callback_url(
+                "bound-token",
+                state,
+                CallbackContext(action_id="approve", thread_id="slack:C1:2.2"),
+            )
+            is None
+        )
+        assert await state.get("chat:callback:bound-token") is not None
+
+    # it("rejects callback tokens outside their channel")
+    async def test_rejects_callback_tokens_outside_their_channel(self):
+        state = create_mock_state()
+        await state.set(
+            "chat:callback:channel-token",
+            {
+                "actionId": "approve",
+                "scope": {"id": "slack:C1", "type": "channel"},
+                "url": "https://example.com/hook",
+            },
+        )
+
+        assert (
+            await resolve_callback_url(
+                "channel-token",
+                state,
+                CallbackContext(action_id="approve", channel_id="slack:C2", thread_id="slack:C2:2.2"),
+            )
+            is None
+        )
+        resolved = await resolve_callback_url(
+            "channel-token",
+            state,
+            CallbackContext(action_id="approve", channel_id="slack:C1", thread_id="slack:C1:2.2"),
+        )
+        assert resolved is not None
+        assert resolved.url == "https://example.com/hook"
+
+
+# Python-specific: strict record validation (isinstance, never truthiness).
+_VALID_RECORD = {
+    "actionId": "approve",
+    "url": "https://example.com/hook",
+    "scope": {"id": "slack:C1", "type": "channel"},
+}
+
+
+class TestResolveCallbackUrlValidation:
+    """Python-specific: record shapes upstream's ``typeof`` checks reject."""
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            pytest.param({**_VALID_RECORD, "actionId": None}, id="actionId-none"),
+            pytest.param({k: v for k, v in _VALID_RECORD.items() if k != "actionId"}, id="actionId-missing"),
+            pytest.param({**_VALID_RECORD, "url": 42}, id="url-not-str"),
+            pytest.param({**_VALID_RECORD, "originalValue": None}, id="originalValue-none"),
+            pytest.param({**_VALID_RECORD, "originalValue": 7}, id="originalValue-not-str"),
+            pytest.param({k: v for k, v in _VALID_RECORD.items() if k != "scope"}, id="scope-missing"),
+            pytest.param({**_VALID_RECORD, "scope": "slack:C1"}, id="scope-not-dict"),
+            pytest.param({**_VALID_RECORD, "scope": {"id": 1, "type": "channel"}}, id="scope-id-not-str"),
+            pytest.param({**_VALID_RECORD, "scope": {"id": "slack:C1", "type": "dm"}}, id="scope-type-unknown"),
+            pytest.param(["https://example.com/hook"], id="list"),
+        ],
+    )
+    async def test_rejects_malformed_records_without_deleting(self, record):
+        state = create_mock_state()
+        state.cache["chat:callback:tok"] = record
+
+        result = await resolve_callback_url("tok", state, CallbackContext(action_id="approve", channel_id="slack:C1"))
+
+        assert result is None
+        assert state.cache["chat:callback:tok"] == record
+
+    async def test_accepts_empty_string_action_id_like_upstream(self):
+        state = create_mock_state()
+        state.cache["chat:callback:tok"] = {**_VALID_RECORD, "actionId": ""}
+
+        result = await resolve_callback_url("tok", state, CallbackContext(action_id="", channel_id="slack:C1"))
+
         assert result is not None
-        assert result.url == "https://example.com/hook"
+        assert result.action_id == ""
         assert result.original_value is None
+
+    async def test_ignores_snake_case_original_value_key(self):
+        # The pre-4.41 Python-only `original_value` fallback read is gone:
+        # only the cross-SDK camelCase `originalValue` key is honored.
+        state = create_mock_state()
+        state.cache["chat:callback:tok"] = {**_VALID_RECORD, "original_value": "legacy"}
+
+        result = await resolve_callback_url("tok", state, CallbackContext(action_id="approve", channel_id="slack:C1"))
+
+        assert result is not None
+        assert result.original_value is None
+
+    async def test_none_context_never_matches(self):
+        state = create_mock_state()
+        state.cache["chat:callback:tok"] = dict(_VALID_RECORD)
+
+        assert await resolve_callback_url("tok", state) is None
+        assert "chat:callback:tok" in state.cache
+
+
+class TestResolveCallbackUrlLocking:
+    """Python-specific: the consume path is serialized by a per-token lock."""
+
+    async def test_concurrent_resolves_yield_exactly_one_result(self):
+        state = MemoryStateAdapter()
+        await state.connect()
+        await state.set("chat:callback:race", dict(_VALID_RECORD))
+        context = CallbackContext(action_id="approve", channel_id="slack:C1")
+        real_get = state.get
+
+        async def yielding_get(key: str):
+            # Yield inside the critical section so the second click runs
+            # while the first still holds the token's lock.
+            await asyncio.sleep(0)
+            return await real_get(key)
+
+        state.get = yielding_get  # type: ignore[method-assign]
+
+        results = await asyncio.gather(
+            resolve_callback_url("race", state, context),
+            resolve_callback_url("race", state, context),
+        )
+
+        assert sum(r is not None for r in results) == 1
+        assert await state.get("chat:callback:race") is None
+
+    async def test_returns_none_without_reading_when_lock_is_held(self):
+        state = create_mock_state()
+        state.cache["chat:callback:held"] = dict(_VALID_RECORD)
+        held = await state.acquire_lock("chat:callback:held", CALLBACK_LOCK_TTL_MS)
+        assert held is not None
+        state.get = AsyncMock(wraps=state.get)  # type: ignore[method-assign]
+
+        result = await resolve_callback_url("held", state, CallbackContext(action_id="approve", channel_id="slack:C1"))
+
+        assert result is None
+        state.get.assert_not_awaited()
+        assert state.cache["chat:callback:held"] == _VALID_RECORD
+
+    async def test_locks_the_record_key_with_a_ten_second_ttl(self):
+        state = create_mock_state()
+        state.cache["chat:callback:tok"] = dict(_VALID_RECORD)
+
+        await resolve_callback_url("tok", state, CallbackContext(action_id="approve", channel_id="slack:C1"))
+
+        assert state._acquire_lock_calls == [("chat:callback:tok", 10_000)]
+        # Released afterwards, so a later click is not locked out.
+        assert state._locks == {}
+
+    async def test_releases_lock_when_get_raises(self):
+        state = create_mock_state()
+        state.get = AsyncMock(side_effect=RuntimeError("state down"))  # type: ignore[method-assign]
+        state.release_lock = AsyncMock(wraps=state.release_lock)  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="state down"):
+            await resolve_callback_url("tok", state, CallbackContext(action_id="approve", channel_id="slack:C1"))
+
+        state.release_lock.assert_awaited_once()
+        assert state.release_lock.await_args.args[0].thread_id == "chat:callback:tok"
+        assert state._locks == {}
 
 
 # ===========================================================================

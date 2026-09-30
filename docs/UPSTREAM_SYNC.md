@@ -346,6 +346,65 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 (`test_uses_the_full_dm_thread_id_as_its_channel_id`,
 `test_isolates_concurrent_recipients_with_thread_scoped_locks`).
 
+### Callback-URL tokens (chat@4.40, #194)
+
+Parity, not a divergence. The callback-token part of upstream `b7c9316b`
+(vercel/chat#875, chat@4.40.0) plus the button copy from `4a0b5c0c`
+(vercel/chat#895):
+
+- **Stored record.** `chat:callback:<token>` now holds
+  `{"actionId", "url", "originalValue"?, "scope": {"id", "type"}}`. The keys
+  stay camelCase so either SDK can resolve the other's tokens.
+  `originalValue` is omitted when the button has no value. The TTL is 7 days
+  (was 30).
+- **Scope.** Thread posts, schedules and edits bind to
+  `{thread.id, "thread"}`. Channel posts and schedules bind to
+  `{channel.id, "channel"}`, and a channel `SentMessage.edit` binds to
+  `{thread_id, "thread"}`. The `post_ephemeral` DM fallback mints tokens only
+  after `open_dm`, bound to
+  `{adapter.channel_id_from_thread_id(dm_thread_id), "channel"}`. When neither
+  the native path nor the DM fallback runs, no token is minted.
+- **Resolve.** `resolve_callback_url(token, state, context)` acquires
+  `acquire_lock("chat:callback:<token>", 10_000)` and returns `None` if the
+  lock is taken. Otherwise it validates the record, requires `actionId` and
+  the scope id to match the click's `CallbackContext`, deletes the record, and
+  releases the lock in `finally`. The scope id is `channel_id` for a channel
+  scope and `thread_id` for a thread scope. The action's POST body carries the
+  stored `actionId`.
+- **Legacy records are rejected.** A bare URL string (the "legacy string
+  format" the old resolver accepted), a pre-upgrade `{url, originalValue}`
+  record, or any other object without `actionId` / `scope` no longer resolves. Such a click
+  dispatches the raw `__cb:` value and nothing is POSTed, as upstream.
+  Validation uses `isinstance` checks, not truthiness, so an empty-string
+  `actionId` still passes, and a present `originalValue` must be a `str`.
+- **Dropped Python-only fallback.** The resolver used to fall back to a
+  snake_case `original_value` key. No Python release wrote that key, and
+  upstream never read it, so it is gone. Only `originalValue` is read.
+- **Button copy.** The token swap copies every button key except
+  `callback_url` (it used to copy a whitelist), so fields such as `tooltip`
+  (#202) survive.
+
+Channel-scoped tokens resolve only when `adapter.channel_id_from_thread_id`
+of the clicked message's thread equals the `ChannelImpl.id` that minted the
+token. In every adapter, `thread.channel` derives its id with that same
+function (`derive_channel_id`). For a `chat.channel(id)` handle the ids match
+when `id` is canonical for the adapter (Slack `slack:C123`, Discord
+`discord:{guild}:{channel}`, Google Chat `gchat:spaces/X`, GitHub
+`github:owner/repo`, Linear `linear:{issueId}`, Telegram `telegram:{chatId}`,
+Teams: the thread id re-encoded with `;messageid=…` stripped from the
+conversation id; WhatsApp, Messenger and
+Twilio (#235): the thread id itself).
+
+**Breaking for `callback_url` users:** tokens minted before the upgrade stop
+resolving, a repeat click no longer POSTs, tokens expire after 7 days, and the
+POST's `actionId` is the minted button's id. The record is deleted before the
+POST, so a failed POST is not retried, as upstream. Regression coverage:
+`tests/test_callback_url.py` (including the Python-specific
+`TestResolveCallbackUrlValidation` / `TestResolveCallbackUrlLocking`),
+`tests/test_chat_faithful.py::TestActionsCallbackTokenBinding`, and the
+`should bind fallback DM callbacks to the DM channel` ports in
+`tests/test_thread_faithful.py` and `tests/test_channel_faithful.py`.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1

@@ -1446,6 +1446,7 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{decoded.callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/hook"
+        assert stored["scope"] == {"id": "slack:C123", "type": "channel"}
 
     # it("should encode callbackUrl when posting via postEphemeral")
     @pytest.mark.asyncio
@@ -1483,6 +1484,39 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/eph"
+
+    # it("should bind fallback DM callbacks to the DM channel")
+    @pytest.mark.asyncio
+    async def test_should_bind_fallback_dm_callbacks_to_the_dm_channel(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        channel = _make_channel(adapter, state)
+
+        await channel.post_ephemeral(
+            "U1",
+            Card(
+                children=[
+                    Actions(
+                        [
+                            Button(
+                                id="ack",
+                                label="Ack",
+                                callback_url="https://example.com/dm",
+                            )
+                        ]
+                    ),
+                ]
+            ),
+            PostEphemeralOptions(fallback_to_dm=True),
+        )
+
+        dm_thread_id, sent_card = adapter._post_calls[0]
+        assert dm_thread_id == "slack:DU1:"
+        button = sent_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["scope"] == {"id": "slack:DU1", "type": "channel"}
 
     # it("should encode callbackUrl when scheduling")
     @pytest.mark.asyncio
@@ -1554,6 +1588,30 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/edit"
+
+    # Python-specific: an edited channel message binds its tokens to the
+    # thread the adapter reported for the post, not to the channel.
+    @pytest.mark.asyncio
+    async def test_edit_binds_callback_tokens_to_the_posted_thread(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+
+        async def post_into_thread(channel_id: str, message: Any) -> RawMessage:
+            return RawMessage(id="msg-1", thread_id="slack:C123:1700.1", raw={})
+
+        adapter.post_channel_message = post_into_thread  # type: ignore[assignment]
+        channel = _make_channel(adapter, state)
+
+        sent = await channel.post("Hello")
+        await sent.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edit_thread_id, _, edited_card = adapter._edit_calls[0]
+        assert edit_thread_id == "slack:C123:1700.1"
+        callback_token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["actionId"] == "redo"
+        assert stored["scope"] == {"id": "slack:C123:1700.1", "type": "thread"}
 
     # it("should pass plain string posts through unchanged")
     @pytest.mark.asyncio
