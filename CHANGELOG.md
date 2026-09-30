@@ -4,6 +4,10 @@
 
 Tracking: #184. `UPSTREAM_PARITY` stays `4.31.0` until the wave's pin bump.
 
+### Fixes
+
+- **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
 ### Security
 
 - **Linear: comment-thread and agent-session history are now bound to the thread's issue** (#231, security; ports vercel/chat#965 `d7aa75b1` and #974 `2d2b933a`, chat@4.41.1). Linear thread ids carry an issue id plus a comment id or agent session id, and `fetch_messages` trusted the second segment without checking it against the first, so a caller naming issue A could read comment or session history from issue B. Anything that authorizes by issue id was affected, for example conversation-scoped AI tools.
