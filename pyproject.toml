@@ -58,9 +58,11 @@ teams = [
     # adapter-teams@4.30.0's @microsoft/teams.* deps). Graph stays hand-rolled (no [graph] extra).
     # Both 2.0.x and 2.1.x are supported (feature-detected, #250). The upper bound stays one
     # minor ahead because uv.lock is not committed and 2.1.0 shipped breaking changes (#251).
+    # common is imported directly (ClientOptions) and apps leaves it unbounded, so bound it too.
     "microsoft-teams-apps>=2.0.13,<2.2",
     "microsoft-teams-api>=2.0.13,<2.2",
     "microsoft-teams-cards>=2.0.13,<2.2",
+    "microsoft-teams-common>=2.0.13,<2.2",
 ]
 telegram = ["aiohttp>=3.9"]
 whatsapp = ["aiohttp>=3.9"]
@@ -80,6 +82,7 @@ all = [
     "microsoft-teams-apps>=2.0.13,<2.2",
     "microsoft-teams-api>=2.0.13,<2.2",
     "microsoft-teams-cards>=2.0.13,<2.2",
+    "microsoft-teams-common>=2.0.13,<2.2",
 ]
 
 [build-system]
@@ -141,6 +144,7 @@ dev = [
     "microsoft-teams-apps>=2.0.13,<2.2",
     "microsoft-teams-api>=2.0.13,<2.2",
     "microsoft-teams-cards>=2.0.13,<2.2",
+    "microsoft-teams-common>=2.0.13,<2.2",
 ]
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ Ported from packages/adapter-teams/src/index.test.ts.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import re
 from datetime import datetime, timezone
@@ -847,17 +848,29 @@ class TestHandleWebhook:
         assert response["status"] == 400
 
 
+@functools.cache
+def _test_rsa_key():
+    """One RSA key per test run for signing test JWTs (generation is slow)."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
 class TestInboundTokenIssuer:
     """Only Bot Framework-issued inbound tokens reach the handlers (#250).
 
     ``microsoft-teams-apps`` 2.1 also accepts Entra ID ("Agent ID") tokens
-    for our app id from any tenant. These tests run the real bridge → SDK
-    ``HttpServer`` → validator → ``_dispatch_activity`` path with only the
-    RS256 signature check stubbed, so on 2.1 the Entra token takes the SDK's
-    new Entra branch and on 2.0 the service branch. Either way the adapter
-    must refuse anything but the Bot Framework issuer.
+    for our app id from any tenant, and picks that branch (with a per-tenant
+    JWKS fetch) from the token's unverified issuer. These tests run the real
+    bridge -> SDK ``HttpServer`` -> SDK validator -> ``_dispatch_activity`` path
+    with RS256 tokens signed by a test key. Only JWKS key *resolution* is
+    stubbed (``PyJWKClient.get_signing_key_from_jwt`` returns the test public
+    key and records which JWKS URI was asked), so the SDK's own signature,
+    issuer, audience, expiry and ``serviceurl`` checks all run.
     """
 
+    TENANT = "11111111-2222-3333-4444-555555555555"
+    SERVICE_URL = "https://smba.trafficmanager.net/teams/"
     ACTIVITY = {
         "type": "message",
         "id": "msg-1",
@@ -866,21 +879,32 @@ class TestInboundTokenIssuer:
         "recipient": {"id": "28:test-app-id", "name": "bot"},
         "conversation": {"id": "19:abc@thread.tacv2", "conversationType": "channel"},
         "channelId": "msteams",
-        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        "serviceUrl": SERVICE_URL,
     }
 
+    @pytest.fixture
+    def signing_key(self):
+        return _test_rsa_key()
+
     @pytest.fixture(autouse=True)
-    def _accept_any_signature(self, monkeypatch):
+    def jwks_uris(self, monkeypatch, signing_key):
+        """Resolve every JWKS lookup to the test key; return the URIs asked for."""
+        from types import SimpleNamespace
+
         import jwt
-        from microsoft_teams.apps.auth.token_validator import TokenValidator
 
-        async def validate_token(self, raw_token, service_url=None, scope=None):
-            return jwt.decode(raw_token, options={"verify_signature": False})
+        asked: list[str] = []
 
-        monkeypatch.setattr(TokenValidator, "validate_token", validate_token)
+        def get_signing_key_from_jwt(self, token):
+            asked.append(self.uri)
+            return SimpleNamespace(key=signing_key.public_key())
 
-    @staticmethod
-    def _token(issuer: str) -> str:
+        monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", get_signing_key_from_jwt)
+        monkeypatch.delenv("CLOUD", raising=False)
+        monkeypatch.delenv("DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS", raising=False)
+        return asked
+
+    def _token(self, signing_key, issuer: str, **overrides) -> str:
         import time
 
         import jwt
@@ -889,15 +913,16 @@ class TestInboundTokenIssuer:
         claims = {
             "iss": issuer,
             "aud": "test-app-id",
-            "tid": "11111111-2222-3333-4444-555555555555",
-            "serviceurl": "https://smba.trafficmanager.net/teams/",
+            "tid": self.TENANT,
+            "serviceurl": self.SERVICE_URL,
             "iat": now,
             "nbf": now,
             "exp": now + 600,
+            **overrides,
         }
-        return jwt.encode(claims, "test-signing-key-not-checked-0123456789", algorithm="HS256")
+        return jwt.encode(claims, signing_key, algorithm="RS256", headers={"kid": "test-kid"})
 
-    async def _post(self, issuer: str):
+    async def _post(self, token: str):
         import json
 
         logger = _make_logger()
@@ -908,26 +933,106 @@ class TestInboundTokenIssuer:
         await adapter.initialize(chat)
         request = _FakeRequest(
             json.dumps(self.ACTIVITY),
-            {"content-type": "application/json", "authorization": f"Bearer {self._token(issuer)}"},
+            {"content-type": "application/json", "authorization": f"Bearer {token}"},
         )
         response = await adapter.handle_webhook(request)
         return response, chat, logger
 
-    @pytest.mark.asyncio
-    async def test_entra_issued_token_is_rejected(self):
-        issuer = "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
-        response, chat, logger = await self._post(issuer)
-        assert response["status"] == 401
-        chat.process_message.assert_not_called()
-        warnings = [c for c in logger.warn.call_args_list if "not issued by the Bot Framework" in c.args[0]]
-        assert len(warnings) == 1
-        assert warnings[0].args[1] == {"issuer": issuer, "expectedIssuer": "https://api.botframework.com"}
+    @staticmethod
+    def _issuer_warnings(logger):
+        return [c.args[1] for c in logger.warn.call_args_list if "not issued by the Bot Framework" in c.args[0]]
 
     @pytest.mark.asyncio
-    async def test_bot_framework_issued_token_is_dispatched(self):
-        response, chat, _logger = await self._post("https://api.botframework.com")
+    async def test_entra_issued_token_is_rejected_before_any_jwks_fetch(self, signing_key, jwks_uris):
+        # A correctly signed Entra token for our app id: 2.1's validator would
+        # accept it on its Entra branch after fetching the tenant's JWKS.
+        issuer = f"https://login.microsoftonline.com/{self.TENANT}/v2.0"
+        response, chat, logger = await self._post(self._token(signing_key, issuer))
+        assert response["status"] == 401
+        chat.process_message.assert_not_called()
+        assert jwks_uris == []
+        assert self._issuer_warnings(logger) == [{"issuer": issuer, "expectedIssuer": "https://api.botframework.com"}]
+
+    @pytest.mark.asyncio
+    async def test_attacker_chosen_tenant_jwks_is_never_fetched(self, jwks_uris):
+        # Unsigned tokens naming arbitrary tenants must not make the bot fetch
+        # those tenants' JWKS (v2 and v1 Entra issuer shapes).
+        import jwt
+
+        for issuer in (
+            "https://login.microsoftonline.com/attacker-tenant/v2.0",
+            "https://sts.windows.net/attacker-tenant/",
+        ):
+            token = jwt.encode({"iss": issuer, "aud": "test-app-id", "tid": "attacker-tenant"}, "k" * 40)
+            response, _chat, _logger = await self._post(token)
+            assert response["status"] == 401
+        assert jwks_uris == []
+
+    @pytest.mark.asyncio
+    async def test_bot_framework_issued_token_is_dispatched(self, signing_key, jwks_uris):
+        response, chat, logger = await self._post(self._token(signing_key, "https://api.botframework.com"))
         assert response["status"] == 200
         chat.process_message.assert_called_once()
+        assert jwks_uris == ["https://login.botframework.com/v1/.well-known/keys"]
+        assert self._issuer_warnings(logger) == []
+
+    @pytest.mark.asyncio
+    async def test_bot_framework_token_still_gets_sdk_validation(self, signing_key):
+        # The pre-check only narrows: a Bot Framework-issued token for another
+        # app id (audience) or another service URL is still refused by the SDK.
+        for overrides in ({"aud": "someone-elses-app"}, {"serviceurl": "https://smba.trafficmanager.net/other/"}):
+            token = self._token(signing_key, "https://api.botframework.com", **overrides)
+            response, chat, _logger = await self._post(token)
+            assert response["status"] == 401, overrides
+            chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sovereign_cloud_uses_its_own_issuer(self, monkeypatch, signing_key):
+        # App.cloud comes from the CLOUD env var; the issuer rule must follow it.
+        monkeypatch.setenv("CLOUD", "USGov")
+        response, chat, _logger = await self._post(self._token(signing_key, "https://api.botframework.us"))
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+
+        response, chat, logger = await self._post(self._token(signing_key, "https://api.botframework.com"))
+        assert response["status"] == 401
+        chat.process_message.assert_not_called()
+        assert self._issuer_warnings(logger) == [
+            {"issuer": "https://api.botframework.com", "expectedIssuer": "https://api.botframework.us"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_rejects_validated_non_bot_framework_token(self, signing_key):
+        # Defence in depth: even if a validated Entra token reached the SDK's
+        # on_request callback, _dispatch_activity refuses it before routing.
+        from types import SimpleNamespace
+
+        from microsoft_teams.api import JsonWebToken
+
+        logger = _make_logger()
+        adapter = _make_adapter(logger=logger)
+        adapter._handle_message_activity = AsyncMock()
+        issuer = f"https://login.microsoftonline.com/{self.TENANT}/v2.0"
+        event = SimpleNamespace(body=MagicMock(), token=JsonWebToken(value=self._token(signing_key, issuer)))
+        response = await adapter._dispatch_activity(event)
+        assert response == {"status": 401, "body": {"error": "Unauthorized"}}
+        adapter._handle_message_activity.assert_not_awaited()
+        assert self._issuer_warnings(logger) == [{"issuer": issuer, "expectedIssuer": "https://api.botframework.com"}]
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_mode_ignores_the_header(self, monkeypatch, jwks_uris):
+        # In the SDK's dangerously_allow_unauthenticated_requests mode the SDK
+        # ignores Authorization entirely; the pre-check must not add auth back.
+        import jwt
+
+        logger = _make_logger()
+        adapter = _make_adapter(logger=logger)
+        adapter._app.options.dangerously_allow_unauthenticated_requests = True
+        token = jwt.encode({"iss": "https://login.microsoftonline.com/t/v2.0"}, "k" * 40)
+        assert adapter._rejects_before_auth({"authorization": f"Bearer {token}"}) is False
+        adapter._app.options.dangerously_allow_unauthenticated_requests = False
+        assert adapter._rejects_before_auth({"authorization": f"Bearer {token}"}) is True
+        assert jwks_uris == []
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1085,35 @@ class TestSdkAppConstruction:
     def test_app_id_mapped_to_sdk_client_id(self):
         adapter = _make_adapter(app_id="my-bot-id")
         assert adapter._app.id == "my-bot-id"
+
+
+class TestSdkDependencyDeclarations:
+    def test_every_imported_sdk_package_is_declared_with_an_upper_bound(self):
+        # uv.lock is not committed, so an SDK package that only arrives
+        # transitively (microsoft-teams-apps leaves -common unbounded) can
+        # drift to a new minor on a fresh install (#250/#251). Every
+        # microsoft_teams.<pkg> the adapter imports must be declared, capped,
+        # in each dependency list that installs the Teams SDK.
+        import pathlib
+        import tomllib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        source = "\n".join(p.read_text() for p in (root / "src/chat_sdk/adapters/teams").glob("*.py"))
+        imported = set(re.findall(r"\bmicrosoft_teams\.(\w+)", source))
+        assert {"api", "apps", "common"} <= imported
+
+        project = tomllib.loads((root / "pyproject.toml").read_text())
+        lists = {
+            "[teams]": project["project"]["optional-dependencies"]["teams"],
+            "[all]": project["project"]["optional-dependencies"]["all"],
+            "dev": project["dependency-groups"]["dev"],
+        }
+        for list_name, deps in lists.items():
+            specs = {d.split(">")[0].split("<")[0].split("=")[0]: d for d in deps}
+            for pkg in sorted(imported):
+                dist = f"microsoft-teams-{pkg}"
+                assert dist in specs, f"{dist} missing from {list_name}"
+                assert "<" in specs[dist], f"{dist} has no upper bound in {list_name}"
 
 
 # ---------------------------------------------------------------------------

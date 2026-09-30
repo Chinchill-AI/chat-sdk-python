@@ -328,7 +328,7 @@ class TeamsAdapter:
         # ``handle_webhook`` can dispatch serverless webhooks through it. The
         # SDK is an optional ([teams] extra) dependency, so it is imported
         # lazily here rather than at module scope.
-        self._bridge = BridgeHttpAdapter(self._logger)
+        self._bridge = BridgeHttpAdapter(self._logger, reject_before_auth=self._rejects_before_auth)
         self._app = self._build_app(config)
         self._app_initialized = False
 
@@ -573,37 +573,86 @@ class TeamsAdapter:
 
         return {"status": 200, "body": None}
 
-    def _is_bot_framework_token(self, token: Any) -> bool:
-        """Return ``False`` for a validated inbound token not issued by the Bot Framework.
+    def _rejects_before_auth(self, headers: dict[str, str]) -> bool:
+        """Return ``True`` to answer 401 before the SDK's JWT validator runs.
 
         ``microsoft-teams-apps`` 2.0.x validates inbound activities against the
         Bot Framework issuer only (``TokenValidator.for_service``). 2.1.x
-        switched to ``InboundActivityTokenValidator``,
-        which also accepts Entra ID tokens for Agent 365 "Agent ID" activities:
-        any tenant's Entra token whose audience is our app id passes, and the
-        Bot Framework ``serviceurl`` claim check is skipped on that path. This
-        adapter does not support Agent ID activities, so lifting the ``<2.1``
-        cap (#250) must not widen who can deliver activities. We therefore
-        require the cloud's Bot Framework issuer on every SDK-validated token.
-        On 2.0.x the SDK already enforces this, so the check never fires there.
+        switched to ``InboundActivityTokenValidator``, which picks its branch
+        from the token's *unverified* ``iss``. An Entra-looking issuer
+        (``login.microsoftonline.com/...`` or ``sts.windows.net/...``) sends it
+        down the Agent 365 "Agent ID" branch: it builds a per-``tid`` Entra
+        validator and fetches that tenant's JWKS (a blocking HTTP call), and it
+        accepts any tenant's Entra token whose audience is our app id, without
+        the Bot Framework ``serviceurl`` claim check. This adapter does not
+        support Agent ID activities, so lifting the ``<2.1`` cap (#250) must
+        not widen who can deliver activities, nor let an unauthenticated
+        request pick which JWKS the bot fetches.
+
+        We therefore read the Bearer token's unverified ``iss`` here and reject
+        anything but the cloud's Bot Framework issuer. A token that passes still
+        goes through the SDK's full validation (signature, audience, expiry,
+        ``serviceurl``), so this only narrows. On 2.0.x the SDK would reject
+        the same tokens after fetching the fixed Bot Framework JWKS.
+
+        Requests without a ``Bearer`` Authorization header, and every request
+        in ``dangerously_allow_unauthenticated_requests`` mode (where the SDK
+        ignores the header), are left to the SDK unchanged.
+        """
+        if self._auth_disabled():
+            return False
+        authorization = headers.get("authorization") or headers.get("Authorization") or ""
+        if not authorization.startswith("Bearer "):
+            return False
+        import jwt
+
+        try:
+            claims = jwt.decode(authorization.removeprefix("Bearer "), options={"verify_signature": False})
+        except jwt.InvalidTokenError:
+            # Unreadable token: the SDK would reject it too. Its issuer is not
+            # the Bot Framework's, so reject here without touching the SDK.
+            claims = {}
+        return not self._is_bot_framework_issuer(claims.get("iss"))
+
+    def _auth_disabled(self) -> bool:
+        """Whether the SDK App skips inbound JWT validation.
+
+        ``dangerously_allow_unauthenticated_requests`` on 2.0.14+ (set from the
+        option or the SDK's env var), ``skip_auth`` on 2.0.13.
+        """
+        options = self._app.options
+        allow = getattr(options, "dangerously_allow_unauthenticated_requests", None)
+        if allow is None:
+            allow = getattr(options, "skip_auth", False)
+        return bool(allow)
+
+    def _is_bot_framework_token(self, token: Any) -> bool:
+        """Return ``False`` for a validated inbound token not issued by the Bot Framework.
+
+        Defence in depth behind :meth:`_rejects_before_auth`, which already
+        turns such tokens away before validation: the same issuer rule, applied
+        to the token the SDK validated, in case a request ever reaches
+        :meth:`_dispatch_activity` without passing the bridge's pre-check.
 
         Only a ``JsonWebToken`` is checked: the SDK wraps every token it
         validated in one. In ``dangerously_allow_unauthenticated_requests``
         mode the SDK passes a placeholder token instead, and that mode is left
-        as the SDK defines it. If a future SDK stopped wrapping validated tokens
-        in ``JsonWebToken``, this check would pass everything;
-        ``TestInboundTokenIssuer`` runs the real SDK path to catch that.
+        as the SDK defines it.
         """
         from microsoft_teams.api import JsonWebToken
 
         if not isinstance(token, JsonWebToken):
             return True
+        return self._is_bot_framework_issuer(token.issuer)
+
+    def _is_bot_framework_issuer(self, issuer: Any) -> bool:
+        """Whether ``issuer`` is this cloud's Bot Framework token issuer; logs a rejection."""
         expected = self._app.cloud.token_issuer
-        if token.issuer == expected:
+        if issuer == expected:
             return True
         self._logger.warn(
             "Teams activity rejected: inbound token was not issued by the Bot Framework",
-            {"issuer": token.issuer, "expectedIssuer": expected},
+            {"issuer": issuer, "expectedIssuer": expected},
         )
         return False
 
