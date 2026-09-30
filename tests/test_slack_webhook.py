@@ -1297,6 +1297,24 @@ class TestUnfurlMetadata:
         assert enriched is original
 
     @pytest.mark.asyncio
+    async def test_enrich_links_returns_unchanged_without_a_channel(self):
+        """Upstream ``!(this.chat && channelId && messageTs)``: without a
+        channel there is no scoped unfurl key to poll, so return at once
+        rather than polling ``slack:unfurls:...None:{ts}`` for ~2s."""
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter = _make_adapter()
+        state = _make_mock_state()
+        state.get = AsyncMock(return_value=None)
+        await adapter.initialize(_make_mock_chat(state))
+
+        original = [_LinkPreview(url="https://example.com")]
+        enriched = await adapter._enrich_links(original, None, "1234567890.111111")
+
+        assert enriched is original
+        state.get.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_enrich_links_unfurl_overrides_existing_description(self):
         """Unfurl description WINS over a pre-existing preview description.
 
@@ -1567,6 +1585,17 @@ class TestInstallationScopedCaches:
 
         assert (await state.get("slack:user:U1"))["display_name"] == "Alice"
         assert await state.get_list("slack:user-by-name:alice") == ["U1"]
+
+    @pytest.mark.asyncio
+    async def test_empty_installation_id_uses_unscoped_keys(self):
+        """Upstream ``installationId ? `${installationId}:` : ""``: only a
+        truthy id scopes the key; ``""`` must not produce ``slack:user::U1``."""
+        adapter, state, _ = await self._make_cache_adapter()
+
+        await self._run_as(adapter, "", lambda: adapter._lookup_user("U1"))
+
+        assert (await state.get("slack:user:U1"))["display_name"] == "Alice"
+        assert await state.get("slack:user::U1") is None
 
     @pytest.mark.asyncio
     async def test_scopes_the_display_name_reverse_index_by_installation(self):

@@ -224,18 +224,26 @@ class TestSlackApiPrimitives:
                 fetch=request,
             )
 
-    async def test_sends_response_url_json_payloads(self) -> None:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://hooks.slack.com/actions/T/1/abc",
+            # Python-specific: GovSlack response URLs are trusted too (#205).
+            "https://hooks.slack-gov.com/actions/T/1/abc",
+        ],
+    )
+    async def test_sends_response_url_json_payloads(self, url: str) -> None:
         request = AsyncMock(return_value=_json_response(None, status=200))
 
         await send_slack_response_url(
-            "https://hooks.slack.com/actions/T/1/abc",
+            url,
             replace_original=True,
             text="updated",
             fetch=request,
         )
 
         call = request.await_args
-        assert _url(call) == "https://hooks.slack.com/actions/T/1/abc"
+        assert _url(call) == url
         assert json.loads(call.kwargs["body"]) == {
             "replace_original": True,
             "text": "updated",

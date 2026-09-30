@@ -602,6 +602,38 @@ class TestDeleteMessage:
         client.chat_delete.assert_not_awaited()
         assert created == []
 
+    @pytest.mark.asyncio
+    async def test_delete_ephemeral_posts_to_gov_slack_response_url(self, monkeypatch):
+        """Python-specific: the response_url sink used to require
+        ``*.slack.com`` and so rejected GovSlack's ``hooks.slack-gov.com``."""
+        adapter, client, _ = await _init_adapter()
+        url = "https://hooks.slack-gov.com/actions/T123/456/abc"
+        ephemeral_id = adapter._encode_ephemeral_message_id("1234567890.123456", url, "U_GOV")
+
+        response = MagicMock(is_success=True, status_code=200, text="")
+        post = AsyncMock(return_value=response)
+
+        class _FakeAsyncClient:
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        _FakeAsyncClient.post = post  # type: ignore[attr-defined]
+        fake = types.ModuleType("httpx")
+        fake.AsyncClient = _FakeAsyncClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        await adapter.delete_message("slack:C123:1234567890.000000", ephemeral_id)
+
+        post.assert_awaited_once_with(
+            url,
+            json={"delete_original": True},
+            headers={"Content-Type": "application/json"},
+        )
+        client.chat_delete.assert_not_awaited()
+
 
 # =============================================================================
 # fetchMessages Tests

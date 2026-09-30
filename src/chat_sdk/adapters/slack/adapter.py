@@ -2573,7 +2573,11 @@ class SlackAdapter:
             try:
                 # Multi-workspace: scope token resolution to the dispatch.
                 team_ref = body.get("team")
-                team_id_interactive = team_ref.get("id") if isinstance(team_ref, dict) else body.get("team_id")
+                # Upstream ``team?.id || payload.team_id``: a ``team`` object
+                # without an id still falls back to the top-level field.
+                team_id_interactive = (team_ref.get("id") if isinstance(team_ref, dict) else None) or body.get(
+                    "team_id"
+                )
                 if not self._is_single_workspace:
                     ctx = await self._resolve_token_for_team(team_id_interactive) if team_id_interactive else None
                     if ctx is None:
