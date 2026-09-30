@@ -2325,6 +2325,42 @@ class TestNativeStreamingOutgoingMentionResolution:
         )
 
     @pytest.mark.asyncio
+    async def test_closing_fence_committed_before_its_newline_toggles_once(self):
+        # One character per chunk: the closing fence line is committed while
+        # still inside the fence, before its newline arrives. Fence state must
+        # toggle only once that newline is committed, or it flips twice and
+        # stays stuck "inside", leaving the final mention literal.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, *list("```\ncode\n```\ndone @alice"))
+
+        assert "".join(_appended_markdown(streamer)) == "```\ncode\n```\ndone <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_closing_fence_split_across_commits_is_detected_on_the_whole_line(self):
+        # The closing fence arrives as "``" then "`\n...": fence detection must
+        # read the whole line from its start, not only the newly committed
+        # segment ("`\n"), or the fence never closes.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "```\ncode\n``", "`\nping @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "```\ncode\n```\nping <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_final_flush_appends_raw_text_without_remend_closing_marker(self):
+        # The final delta comes from ``get_committable_text()`` after
+        # ``finish()`` (upstream parity), not from ``finish()``'s remend'd
+        # render, so an unclosed inline marker is not closed on the way out.
+        adapter, streamer, _ = await _init_mention_stream_adapter()
+
+        await _stream_texts(adapter, "hello **bold")
+
+        assert "".join(_appended_markdown(streamer)) == "hello **bold"
+
+    @pytest.mark.asyncio
     async def test_resolves_text_flushed_before_a_structured_chunk(self):
         # ``send_structured_chunk`` pre-flushes committed text; that delta
         # must be resolved and share the resolved coordinate space.

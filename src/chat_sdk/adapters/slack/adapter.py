@@ -4068,6 +4068,10 @@ class SlackAdapter:
         inside_resolved_fence = False
 
         def is_fence_line(line: str) -> bool:
+            # Python ``lstrip()`` rather than JS ``trimStart()`` (different
+            # whitespace sets, e.g. U+FEFF / U+001C-U+001F) on purpose: it
+            # matches the Python StreamingMarkdownRenderer's own fence
+            # tracking, which decides what gets committed mid-fence.
             trimmed = line.lstrip()
             return trimmed.startswith("```") or trimmed.startswith("~~~")
 
