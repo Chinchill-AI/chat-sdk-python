@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from chat_sdk.adapters.teams.modals import (
     TeamsModalElement,
@@ -201,12 +202,12 @@ class TestTeamsModalPrimitives:
             "values": {},
         }
 
-    def test_ignores_non_string_submit_values(self) -> None:
-        """it("ignores non-string submit values")."""
-        assert parse_teams_dialog_submit_values({"count": 5, "note": "ok"}) == {
+    def test_stringifies_numeric_submit_values_and_ignores_other_non_strings(self) -> None:
+        """it("stringifies numeric submit values and ignores other non-strings") (chat@4.36)."""
+        assert parse_teams_dialog_submit_values({"count": 5, "note": "ok", "flag": True}) == {
             "callbackId": None,
             "contextId": None,
-            "values": {"note": "ok"},
+            "values": {"count": "5", "note": "ok"},
         }
 
     def test_creates_continue_responses_for_push_actions(self) -> None:
@@ -220,6 +221,114 @@ class TestTeamsModalPrimitives:
     def test_returns_undefined_when_there_is_no_response(self) -> None:
         """it("returns undefined when there is no response")."""
         assert to_teams_task_module_response(None) is None
+
+
+class TestDateAndNumberInputs:
+    """Port of upstream ``modals.test.ts`` ``describe("date and number inputs")`` (chat@4.36, #757).
+
+    Upstream runs these against the SDK-bound ``modalToAdaptiveCard``; Python
+    has no SDK-bound modal converter (adapter-level dialogs are a known gap),
+    so they run against the modals primitive with its camelCase child keys.
+    """
+
+    @staticmethod
+    def _render(child: dict[str, Any]) -> dict[str, Any]:
+        modal: TeamsModalElement = {
+            "callbackId": "cb-1",
+            "children": [child],  # type: ignore[list-item]
+            "title": "Renewal",
+            "type": "modal",
+        }
+        return modal_to_adaptive_card(modal, {"contextId": "ctx-1"})["body"][0]
+
+    def test_renders_a_date_input_as_input_date(self) -> None:
+        assert self._render(
+            {
+                "id": "renewal_date",
+                "initialValue": "2026-08-01",
+                "label": "Renewal Date",
+                "placeholder": "Pick a date",
+                "type": "date_input",
+            }
+        ) == {
+            "id": "renewal_date",
+            "isRequired": True,
+            "label": "Renewal Date",
+            "placeholder": "Pick a date",
+            "type": "Input.Date",
+            "value": "2026-08-01",
+        }
+
+    def test_marks_an_optional_date_input_as_not_required(self) -> None:
+        # Empty placeholder / initialValue are omitted (upstream truthy spreads).
+        assert self._render(
+            {"id": "renewal_date", "initialValue": "", "label": "Renewal Date", "optional": True, "type": "date_input"}
+        ) == {"id": "renewal_date", "isRequired": False, "label": "Renewal Date", "type": "Input.Date"}
+
+    def test_renders_a_number_input_as_input_number_with_numeric_bounds(self) -> None:
+        assert self._render(
+            {
+                "id": "quantity",
+                "initialValue": 3,
+                "label": "Quantity",
+                "max": 10,
+                "min": 1,
+                "placeholder": "How many?",
+                "type": "number_input",
+            }
+        ) == {
+            "id": "quantity",
+            "isRequired": True,
+            "label": "Quantity",
+            "max": 10,
+            "min": 1,
+            "placeholder": "How many?",
+            "type": "Input.Number",
+            "value": 3,
+        }
+
+    def test_number_input_keeps_zero_bounds_and_value_and_omits_unset_ones(self) -> None:
+        # Python-specific guard: ``0`` is a valid bound / value (upstream
+        # ``=== undefined`` checks), so a truthiness check would drop it.
+        assert self._render({"id": "n", "initialValue": 0, "label": "N", "min": 0, "type": "number_input"}) == {
+            "id": "n",
+            "isRequired": True,
+            "label": "N",
+            "min": 0,
+            "type": "Input.Number",
+            "value": 0,
+        }
+
+    def test_stringifies_numeric_submit_values(self) -> None:
+        parsed = parse_teams_dialog_submit_values(
+            {
+                "__callbackId": "cb-1",
+                "__contextId": "ctx-1",
+                "quantity": 3,
+                "ratio": 0,
+                "renewal_date": "2026-08-01",
+            }
+        )
+        assert parsed["values"] == {"quantity": "3", "ratio": "0", "renewal_date": "2026-08-01"}
+
+    def test_python_numeric_submit_values_format_as_js_string(self) -> None:
+        # Python-specific: JSON ``5.0`` parses to a float, which must read
+        # "5" as JS ``String(5)`` does, not "5.0"; ``False`` is a bool, not a
+        # number; NaN / infinities (Python's ``json`` accepts them, JSON.parse
+        # never produces them) are dropped rather than stringified.
+        parsed = parse_teams_dialog_submit_values(
+            {
+                "a": 5.0,
+                "b": 2.5,
+                "c": 1e21,
+                "d": False,
+                "e": float("nan"),
+                "f": float("inf"),
+                "g": None,
+                "h": [1],
+            }
+        )
+        assert parsed["values"] == {"a": "5", "b": "2.5", "c": "1e+21"}
 
 
 class TestModalsImportBoundary:

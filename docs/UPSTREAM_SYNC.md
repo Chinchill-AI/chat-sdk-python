@@ -663,6 +663,47 @@ separately (Slack #212, Teams #220); other adapters ignore the new fields.
   and `929878b5` (chat@4.39.0, link-button ids in JSX). See the jsx-runtime row
   in the non-parity table.
 
+### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
+
+Parity, not a divergence. The Teams half of `0153a39f` (chat@4.36.0),
+`4a0b5c0c` (chat@4.40.0) and `84219537` (chat@4.41.0) is ported in
+`teams/cards.py`, `teams/cards_input.py` and `teams/modals.py`. Python's
+`teams/cards.py` is the single converter behind both the adapter and the
+SDK-free cards-primitives surface, so upstream's two table converters (and the
+`it.each` that keeps them in step) collapse into one.
+
+- Every Teams card, input-request card and modal card declares `version: "1.5"`.
+- `Table` renders as the native Adaptive Card `Table`: one column definition
+  per column (weight from `widths`, else 1; `horizontalCellContentAlignment`
+  from `align`), rows padded to the widest row, a `weight: "Bolder"` header
+  row when `headers` is non-empty, `firstRowAsHeaders` (plural, deliberately),
+  `showGridLines` (default `True`; an explicit `False` wins), and `gridStyle` /
+  `verticalCellContentAlignment` when set. A table with no columns emits
+  nothing. `card_to_fallback_text` is unchanged.
+- **Column weights.** Upstream accepts `Number.isInteger(w) && w > 0`. Python
+  rejects `bool` (an `int` subclass, not a number upstream) and accepts an
+  integral float such as `2.0`, emitted as the int `2`, since JS has one number
+  type and serializes `2.0` as `2`.
+- Buttons and link buttons emit `tooltip` (emoji-converted) when it is
+  truthy. `Card(width="full")` sets `msteams: {"width": "full"}`.
+- The modals primitive renders `date_input` as `Input.Date` and
+  `number_input` as `Input.Number` (`max` / `min` / `initialValue` whenever
+  present, so `0` is kept; `placeholder` only when truthy). Keys are the
+  primitive's literal camelCase.
+- **Dialog submit numbers.** `parse_teams_dialog_submit_values` stringifies
+  numbers as JS `String(value)` does, via `cards._js_number_to_string`
+  (`5.0` → `"5"`, `1e21` → `"1e+21"`). `bool` is dropped, as upstream drops
+  every non-number. NaN and infinities, which Python's `json` parses but
+  `JSON.parse` never produces, are dropped rather than rendered as `"NaN"`.
+- **Primitive emoji.** Upstream's plain-object converter resolves Slack-style
+  `:white_check_mark:` shortcodes in cell text and tooltips; the shared
+  Python converter resolves the SDK's `{{emoji:…}}` placeholders, as it
+  already did for every other card text before #220.
+- **No adapter modal path.** Upstream's SDK-bound `modals.ts` also renders the
+  core `DateInput` / `NumberInput`. The Python adapter never converts core
+  modals to cards (see the "Teams dialog/modal inbound" row in the non-parity
+  table), so only the primitive gains the new children.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
