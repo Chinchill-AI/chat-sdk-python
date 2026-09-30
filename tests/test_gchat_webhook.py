@@ -299,7 +299,7 @@ class TestParseMessage:
 
 class TestBotMentions:
     def test_replace_bot_mention_with_user_name(self):
-        adapter = _make_adapter(user_name="mybot")
+        adapter = _make_adapter(bot_user_id="users/BOT123", user_name="mybot")
         event = _make_message_event(
             message_text="@Chat SDK Demo hello",
             annotations=[
@@ -322,7 +322,10 @@ class TestBotMentions:
         assert "@mybot" in msg.text
         assert "@Chat SDK Demo" not in msg.text
 
-    def test_learn_bot_user_id_from_annotations(self):
+    def test_does_not_learn_bot_user_id_from_inbound_annotations(self):
+        # Upstream f485255b: the identity is never learned from a mention (a
+        # learned id let another bot become "self"), and with no configured
+        # id no mention is normalized.
         adapter = _make_adapter()
         assert adapter.bot_user_id is None
 
@@ -344,12 +347,12 @@ class TestBotMentions:
                 }
             ],
         )
-        adapter.parse_message(event)
-        assert adapter.bot_user_id == "users/LEARNED_BOT_ID"
+        msg = adapter.parse_message(event)
+        assert adapter.bot_user_id is None
+        assert msg.text == "@BotName hi"
 
-    def test_does_not_overwrite_bot_user_id(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/FIRST_BOT"
+    def test_ignores_mentions_of_other_bots(self):
+        adapter = _make_adapter(bot_user_id="users/FIRST_BOT")
 
         event = _make_message_event(
             message_text="@AnotherBot hi",
@@ -369,8 +372,39 @@ class TestBotMentions:
                 }
             ],
         )
-        adapter.parse_message(event)
+        msg = adapter.parse_message(event)
         assert adapter.bot_user_id == "users/FIRST_BOT"
+        assert msg.text == "@AnotherBot hi"
+
+    def test_normalizes_only_this_app_when_another_bot_is_mentioned_first(self):
+        adapter = _make_adapter(bot_user_id="users/OUR_BOT", user_name="ourbot")
+
+        event = _make_message_event(
+            message_text="@OtherBot @OurBot hi",
+            annotations=[
+                {
+                    "type": "USER_MENTION",
+                    "startIndex": 0,
+                    "length": 9,
+                    "userMention": {
+                        "user": {"name": "users/OTHER_BOT", "displayName": "OtherBot", "type": "BOT"},
+                        "type": "MENTION",
+                    },
+                },
+                {
+                    "type": "USER_MENTION",
+                    "startIndex": 10,
+                    "length": 7,
+                    "userMention": {
+                        "user": {"name": "users/OUR_BOT", "displayName": "OurBot", "type": "BOT"},
+                        "type": "MENTION",
+                    },
+                },
+            ],
+        )
+        msg = adapter.parse_message(event)
+        assert msg.text == "@OtherBot @ourbot hi"
+        assert adapter.bot_user_id == "users/OUR_BOT"
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +414,7 @@ class TestBotMentions:
 
 class TestIsMessageFromSelf:
     def test_detects_self_message(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/BOT123"
+        adapter = _make_adapter(bot_user_id="users/BOT123")
         event = _make_message_event(
             sender_name="users/BOT123",
             sender_type="BOT",
@@ -391,8 +424,7 @@ class TestIsMessageFromSelf:
         assert msg.author.is_me is True
 
     def test_other_bot_not_self(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/BOT123"
+        adapter = _make_adapter(bot_user_id="users/BOT123")
         event = _make_message_event(
             sender_name="users/OTHER_BOT",
             sender_type="BOT",
@@ -401,14 +433,16 @@ class TestIsMessageFromSelf:
         msg = adapter.parse_message(event)
         assert msg.author.is_me is False
 
-    def test_unknown_bot_id_returns_false(self):
+    def test_fails_closed_for_bot_senders_when_bot_user_id_is_unknown(self):
+        # Upstream f485255b: without a configured id every BOT sender counts
+        # as self, so the app can never reply to its own messages in a loop.
         adapter = _make_adapter()
         event = _make_message_event(
             sender_type="BOT",
             sender_display_name="SomeBot",
         )
         msg = adapter.parse_message(event)
-        assert msg.author.is_me is False
+        assert msg.author.is_me is True
 
 
 # ---------------------------------------------------------------------------

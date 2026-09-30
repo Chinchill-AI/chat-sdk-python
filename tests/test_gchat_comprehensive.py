@@ -350,6 +350,39 @@ class TestConstructorEnvVarResolution:
             self._clear_gchat_env()
             os.environ.update(saved)
 
+    def test_resolves_bot_user_id_from_env_var(self):
+        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
+        try:
+            self._clear_gchat_env()
+            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = "users/BOT_ENV"
+            adapter = _make_adapter()
+            assert adapter.bot_user_id == "users/BOT_ENV"
+        finally:
+            self._clear_gchat_env()
+            os.environ.update(saved)
+
+    def test_configured_bot_user_id_takes_priority_over_env_var(self):
+        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
+        try:
+            self._clear_gchat_env()
+            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = "users/BOT_ENV"
+            adapter = _make_adapter(bot_user_id="users/BOT_CONFIG")
+            assert adapter.bot_user_id == "users/BOT_CONFIG"
+        finally:
+            self._clear_gchat_env()
+            os.environ.update(saved)
+
+    def test_empty_bot_user_id_env_var_is_treated_as_unset(self):
+        saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
+        try:
+            self._clear_gchat_env()
+            os.environ["GOOGLE_CHAT_BOT_USER_ID"] = ""
+            adapter = _make_adapter()
+            assert adapter.bot_user_id is None
+        finally:
+            self._clear_gchat_env()
+            os.environ.update(saved)
+
     def test_config_credentials_take_priority_over_env_vars(self):
         saved = {k: v for k, v in os.environ.items() if k.startswith("GOOGLE_CHAT_")}
         try:
@@ -389,22 +422,23 @@ class TestConstructorWithADC:
 # ===========================================================================
 
 
-class TestInitializeRestoreBotUserId:
+class TestInitializeBotUserId:
     @pytest.mark.asyncio
-    async def test_restore_bot_user_id_from_state(self):
-        adapter = _make_adapter()
+    async def test_uses_configured_bot_user_id_instead_of_persisted_state(self):
+        adapter = _make_adapter(bot_user_id="users/BOT_CONFIGURED")
         state = _make_mock_state()
         state._storage["gchat:botUserId"] = "users/BOT999"
         chat = _make_mock_chat(state)
 
         await adapter.initialize(chat)
 
-        assert adapter.bot_user_id == "users/BOT999"
+        assert adapter.bot_user_id == "users/BOT_CONFIGURED"
 
     @pytest.mark.asyncio
-    async def test_does_not_overwrite_existing_bot_user_id(self):
+    async def test_does_not_restore_untrusted_learned_bot_id_from_state(self):
+        # Upstream f485255b: the learned id persisted by earlier releases may
+        # belong to another bot, so the legacy state key is never read.
         adapter = _make_adapter()
-        adapter._bot_user_id = "users/EXISTING"
 
         state = _make_mock_state()
         state._storage["gchat:botUserId"] = "users/OTHERFROMSTATE"
@@ -412,7 +446,30 @@ class TestInitializeRestoreBotUserId:
 
         await adapter.initialize(chat)
 
-        assert adapter.bot_user_id == "users/EXISTING"
+        assert adapter.bot_user_id is None
+        assert all(c.args[0] != "gchat:botUserId" for c in state.get.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_warns_once_when_bot_user_id_is_unset(self):
+        logger = MagicMock()
+        adapter = _make_adapter(logger=logger)
+        chat = _make_mock_chat(_make_mock_state())
+
+        await adapter.initialize(chat)
+        await adapter.initialize(chat)
+
+        warnings = [c.args[0] for c in logger.warn.call_args_list if "botUserId is not configured" in c.args[0]]
+        assert len(warnings) == 1
+        assert "GOOGLE_CHAT_BOT_USER_ID" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_bot_user_id_is_configured(self):
+        logger = MagicMock()
+        adapter = _make_adapter(logger=logger, bot_user_id="users/BOT123")
+
+        await adapter.initialize(_make_mock_chat(_make_mock_state()))
+
+        assert not any("botUserId is not configured" in c.args[0] for c in logger.warn.call_args_list)
 
 
 # ===========================================================================
@@ -433,10 +490,10 @@ class TestParseMessageAttachmentEdgeCases:
             ],
         )
         msg = adapter.parse_message(event)
-        assert len(msg.attachments) >= 1
-        # URL should be None or empty if no downloadUri
+        assert len(msg.attachments) == 1
         att = msg.attachments[0]
-        assert att.url is None or att.url == ""
+        assert att.fetch_data is None
+        assert att.url is None
 
     def test_file_type_attachment_classified(self):
         adapter = _make_adapter()
@@ -546,7 +603,7 @@ class TestNormalizeBotMentionsComprehensive:
         assert "Hello" in msg.text or "hello" in msg.text
 
     def test_multiple_bot_mentions_replaced(self):
-        adapter = _make_adapter(user_name="mybot")
+        adapter = _make_adapter(bot_user_id="users/BOT1", user_name="mybot")
         event = _make_message_event(
             message_text="@Bot hi @Bot bye",
             annotations=[
@@ -579,8 +636,26 @@ class TestNormalizeBotMentionsComprehensive:
             ],
         )
         msg = adapter.parse_message(event)
-        assert "@mybot" in msg.text
-        assert "@Bot" not in msg.text
+        assert msg.text == "@mybot hi @mybot bye"
+
+    def test_nameless_bot_annotation_not_rewritten_when_bot_user_id_unset(self):
+        # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (bot identity
+        # edge cases). Upstream compares ``undefined !== undefined`` and would
+        # rewrite this annotation; with no configured id nothing is rewritten.
+        adapter = _make_adapter(user_name="mybot")
+        event = _make_message_event(
+            message_text="@Bot hi",
+            annotations=[
+                {
+                    "type": "USER_MENTION",
+                    "startIndex": 0,
+                    "length": 4,
+                    "userMention": {"user": {"displayName": "Bot", "type": "BOT"}, "type": "MENTION"},
+                },
+            ],
+        )
+        msg = adapter.parse_message(event)
+        assert msg.text == "@Bot hi"
 
 
 # ===========================================================================
@@ -590,8 +665,7 @@ class TestNormalizeBotMentionsComprehensive:
 
 class TestIsMessageFromSelfByDisplayName:
     def test_detects_self_by_user_id_match(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/BOT123"
+        adapter = _make_adapter(bot_user_id="users/BOT123")
         event = _make_message_event(
             sender_name="users/BOT123",
             sender_type="BOT",
@@ -600,23 +674,19 @@ class TestIsMessageFromSelfByDisplayName:
         msg = adapter.parse_message(event)
         assert msg.author.is_me is True
 
-    def test_detects_self_by_user_name_fallback(self):
-        """When botUserId is not set, use displayName matching with user_name."""
+    def test_unknown_bot_user_id_does_not_mark_human_senders_as_self(self):
+        """The fail-closed rule for an unset bot_user_id covers BOT senders only."""
         adapter = _make_adapter(user_name="MyBot")
-        # No bot_user_id set
         event = _make_message_event(
-            sender_name="users/UNKNOWN_BOT",
-            sender_type="BOT",
+            sender_name="users/HUMAN1",
+            sender_type="HUMAN",
             sender_display_name="MyBot",
         )
         msg = adapter.parse_message(event)
-        # Depending on implementation, may or may not match by display name
-        # Just assert it doesn't crash
-        assert isinstance(msg.author.is_me, bool)
+        assert msg.author.is_me is False
 
     def test_other_bot_not_detected_as_self(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/BOT123"
+        adapter = _make_adapter(bot_user_id="users/BOT123")
         event = _make_message_event(
             sender_name="users/OTHER_BOT",
             sender_type="BOT",

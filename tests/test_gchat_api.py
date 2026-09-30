@@ -7,7 +7,8 @@ and response handling without network access.
 Covers: postMessage, editMessage, deleteMessage, fetchMessages,
 fetchChannelMessages, listThreads, openDM, addReaction, removeReaction,
 startTyping, stream, user info caching, workspace events subscription
-lifecycle, bot user ID learning from annotations.
+lifecycle, explicit bot user ID (never learned from annotations), message
+space check, fetchMessage.
 """
 
 from __future__ import annotations
@@ -395,7 +396,9 @@ class TestFetchMessages:
         assert result.next_cursor is None
 
     @pytest.mark.asyncio
-    async def test_fetch_forward(self):
+    async def test_fetch_one_bounded_forward_page(self):
+        # Upstream f485255b: forward history is ONE native messages.list call
+        # (createTime asc, pageSize = limit) and nextPageToken is the cursor.
         adapter, api, _ = await _init_adapter()
         tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
         api.set_response_prefix(
@@ -418,12 +421,35 @@ class TestFetchMessages:
                         "thread": {"name": "spaces/ABC123/threads/T1"},
                     },
                 ],
+                "nextPageToken": "page-2",
             },
         )
 
-        result = await adapter.fetch_messages(tid, FetchOptions(direction="forward"))
+        result = await adapter.fetch_messages(tid, FetchOptions(direction="forward", limit=2))
 
-        assert len(result.messages) == 2
+        assert [m.text for m in result.messages] == ["First", "Second"]
+        assert result.next_cursor == "page-2"
+        calls = api.get_calls("GET", "spaces/ABC123/messages")
+        assert len(calls) == 1
+        assert calls[0]["params"] == {
+            "pageSize": "2",
+            "orderBy": "createTime asc",
+            "filter": 'thread.name = "spaces/ABC123/threads/T1"',
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("limit", "page_size"), [(0, "1"), (-5, "1"), (1000, "1000"), (5000, "1000")])
+    async def test_forward_page_size_is_clamped(self, limit: int, page_size: str):
+        adapter, api, _ = await _init_adapter()
+        tid = _encode_tid("spaces/ABC123")
+        api.set_response_prefix("GET", "spaces/ABC123/messages", {"messages": []})
+
+        result = await adapter.fetch_messages(tid, FetchOptions(direction="forward", limit=limit))
+
+        assert result.next_cursor is None
+        calls = api.get_calls("GET", "spaces/ABC123/messages")
+        assert len(calls) == 1
+        assert calls[0]["params"]["pageSize"] == page_size
 
     @pytest.mark.asyncio
     async def test_fetch_backward_with_pagination(self):
@@ -451,7 +477,9 @@ class TestFetchMessages:
         assert result.next_cursor == "page2_token"
 
     @pytest.mark.asyncio
-    async def test_fetch_forward_with_cursor(self):
+    async def test_supports_cursor_based_forward_pagination(self):
+        # The forward cursor is the opaque API page token, passed through as
+        # ``pageToken`` -- never matched against message names.
         adapter, api, _ = await _init_adapter()
         tid = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
         api.set_response_prefix(
@@ -460,14 +488,8 @@ class TestFetchMessages:
             {
                 "messages": [
                     {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "text": "First",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "createTime": "2024-01-01T00:00:00Z",
-                    },
-                    {
                         "name": "spaces/ABC123/messages/msg2",
-                        "text": "Second (cursor start)",
+                        "text": "Second",
                         "sender": {"name": "users/101", "displayName": "User2", "type": "HUMAN"},
                         "createTime": "2024-01-01T00:01:00Z",
                     },
@@ -483,12 +505,16 @@ class TestFetchMessages:
 
         result = await adapter.fetch_messages(
             tid,
-            FetchOptions(direction="forward", cursor="spaces/ABC123/messages/msg1", limit=1),
+            FetchOptions(direction="forward", cursor="page-2", limit=10),
         )
 
-        # Should start after cursor (msg1), so should get msg2
-        assert len(result.messages) == 1
-        assert result.messages[0].id == "spaces/ABC123/messages/msg2"
+        assert [m.text for m in result.messages] == ["Second", "Third"]
+        assert result.next_cursor is None
+        calls = api.get_calls("GET", "spaces/ABC123/messages")
+        assert len(calls) == 1
+        assert calls[0]["params"]["pageToken"] == "page-2"
+        assert calls[0]["params"]["pageSize"] == "10"
+        assert calls[0]["params"]["orderBy"] == "createTime asc"
 
 
 # =============================================================================
@@ -652,6 +678,152 @@ class TestOpenDM:
         body = setup_calls[0]["body"]
         assert body["space"]["spaceType"] == "DIRECT_MESSAGE"
         assert body["memberships"][0]["member"]["name"] == "users/67890"
+
+
+# =============================================================================
+# Message space check (upstream d6343460)
+# =============================================================================
+
+_SPACE_THREAD = "gchat:spaces/ABC123"
+_FOREIGN_MESSAGE = "spaces/OTHER/messages/msg9"
+_FOREIGN_SPACE = "does not belong to space"
+_INVALID_MESSAGE_ID = "Invalid Google Chat message id"
+
+
+class TestMessageSpaceCheck:
+    @pytest.mark.asyncio
+    async def test_edit_message_rejects_a_message_from_another_space(self):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.edit_message(_SPACE_THREAD, _FOREIGN_MESSAGE, "edit")
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_delete_message_rejects_a_message_from_another_space(self):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.delete_message(_SPACE_THREAD, _FOREIGN_MESSAGE)
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_rejects_a_message_from_another_space(self):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.add_reaction(_SPACE_THREAD, _FOREIGN_MESSAGE, "\U0001f44d")
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_rejects_a_message_from_another_space(self):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.remove_reaction(_SPACE_THREAD, _FOREIGN_MESSAGE, "\U0001f44d")
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message_id",
+        [
+            pytest.param("spaces/ABC123/messages/../../OTHER/messages/msg9", id="path traversal"),
+            pytest.param("spaces/ABC123/messages/./msg1", id="dot segment"),
+            pytest.param("spaces/ABC123/messages/msg1/reactions/r1", id="extra segment"),
+            pytest.param("spaces/ABC123/messages/msg1?alt=json", id="query string"),
+            pytest.param("spaces/ABC123/messages/msg1#x", id="fragment"),
+            pytest.param("spaces/ABC123/messages/%2e%2e/OTHER", id="percent encoding"),
+            pytest.param("spaces/ABC123/messages/msg1 ", id="whitespace"),
+            pytest.param("msg1", id="bare id"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    async def test_rejects_a_malformed_message_id(self, message_id: str):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_INVALID_MESSAGE_ID):
+            await adapter.delete_message(_SPACE_THREAD, message_id)
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_message_in_the_threads_space(self):
+        adapter, api, _ = await _init_adapter()
+        await adapter.delete_message(_SPACE_THREAD, "spaces/ABC123/messages/msg1")
+        assert [(c["method"], c["path"]) for c in api.calls] == [("DELETE", "spaces/ABC123/messages/msg1")]
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_space_that_only_shares_the_threads_prefix(self):
+        # Exact space comparison, not a prefix check: spaces/ABC1234 is not
+        # spaces/ABC123.
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.delete_message(_SPACE_THREAD, "spaces/ABC1234/messages/msg1")
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_threaded_and_dm_thread_ids_use_their_space(self):
+        adapter, api, _ = await _init_adapter()
+        threaded = _encode_tid("spaces/ABC123", "spaces/ABC123/threads/T1")
+        dm = _encode_tid("spaces/DM1", is_dm=True)
+
+        await adapter.delete_message(threaded, "spaces/ABC123/messages/msg1")
+        await adapter.delete_message(dm, "spaces/DM1/messages/msg2")
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.delete_message(dm, "spaces/ABC123/messages/msg1")
+
+        assert [c["path"] for c in api.calls] == ["spaces/ABC123/messages/msg1", "spaces/DM1/messages/msg2"]
+
+
+# =============================================================================
+# fetchMessage (upstream d6343460)
+# =============================================================================
+
+
+class TestFetchMessage:
+    @pytest.mark.asyncio
+    async def test_returns_the_message_with_the_thread_google_reports_for_it(self):
+        adapter, api, _ = await _init_adapter()
+        api.set_response(
+            "GET",
+            "spaces/ABC123/messages/msg1",
+            {
+                "name": "spaces/ABC123/messages/msg1",
+                "text": "hello",
+                "thread": {"name": "spaces/ABC123/threads/other"},
+                "sender": {"name": "users/1", "displayName": "Alice", "type": "HUMAN"},
+                "createTime": "2024-01-01T00:00:00Z",
+            },
+        )
+
+        message = await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/msg1")
+
+        assert [(c["method"], c["path"]) for c in api.calls] == [("GET", "spaces/ABC123/messages/msg1")]
+        assert message is not None
+        assert message.id == "spaces/ABC123/messages/msg1"
+        assert message.text == "hello"
+        assert message.thread_id == adapter.encode_thread_id(
+            GoogleChatThreadId(space_name="spaces/ABC123", thread_name="spaces/ABC123/threads/other")
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_the_message_does_not_exist(self):
+        adapter, api, _ = await _init_adapter()
+        api.set_response("GET", "spaces/ABC123/messages/gone", _FakeApiError(404, "Not found"))
+
+        assert await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/gone") is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_message_from_another_space_without_calling_the_api(self):
+        adapter, api, _ = await _init_adapter()
+        with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
+            await adapter.fetch_message(_SPACE_THREAD, _FOREIGN_MESSAGE)
+        assert api.calls == []
+
+    @pytest.mark.asyncio
+    async def test_other_api_errors_go_through_error_handling(self):
+        adapter, api, _ = await _init_adapter()
+        api.set_response("GET", "spaces/ABC123/messages/msg1", _FakeApiError(429, "Rate limited"))
+        with pytest.raises(AdapterRateLimitError):
+            await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/msg1")
+
+        api.set_response("GET", "spaces/ABC123/messages/msg1", _FakeApiError(403, "Forbidden"))
+        with pytest.raises(_FakeApiError, match="Forbidden"):
+            await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/msg1")
 
 
 # =============================================================================
@@ -949,132 +1121,76 @@ class TestWorkspaceEventsSubscription:
 
 
 # =============================================================================
-# Bot user ID learning from annotations Tests
+# Bot user ID: explicit configuration only (upstream f485255b)
 # =============================================================================
 
 
-class TestBotUserIdLearning:
-    def test_learns_bot_id_from_annotations(self):
-        adapter = _make_adapter()
+def _mention_event(bot_name: str, display_name: str, text: str) -> dict[str, Any]:
+    return {
+        "chat": {
+            "messagePayload": {
+                "space": {"name": "spaces/ABC123", "type": "ROOM"},
+                "message": {
+                    "name": "spaces/ABC123/messages/msg1",
+                    "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
+                    "text": text,
+                    "createTime": "2024-01-01T00:00:00Z",
+                    "annotations": [
+                        {
+                            "type": "USER_MENTION",
+                            "startIndex": 0,
+                            "length": len(display_name) + 1,
+                            "userMention": {
+                                "user": {"name": bot_name, "displayName": display_name, "type": "BOT"},
+                                "type": "MENTION",
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+
+class TestBotUserIdIsNotLearned:
+    @pytest.mark.asyncio
+    async def test_mention_does_not_write_bot_id_to_state(self):
+        # Earlier releases persisted the first mentioned BOT as
+        # ``gchat:botUserId`` via a fire-and-forget task. Nothing may be
+        # written now, even after pending tasks get a chance to run.
+        adapter, _, state = await _init_adapter()
+
+        adapter.parse_message(_mention_event("users/LEARNED_BOT_ID", "BotName", "@BotName hi"))
+        await asyncio.sleep(0)
+
         assert adapter.bot_user_id is None
+        assert "gchat:botUserId" not in state._storage
+        # Only the sender's display name is cached; no identity key is set.
+        assert [c.args[0] for c in state.set.await_args_list] == ["gchat:user:users/100"]
 
-        event = {
-            "chat": {
-                "messagePayload": {
-                    "space": {"name": "spaces/ABC123", "type": "ROOM"},
-                    "message": {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "text": "@BotName hi",
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "annotations": [
-                            {
-                                "type": "USER_MENTION",
-                                "startIndex": 0,
-                                "length": 8,
-                                "userMention": {
-                                    "user": {
-                                        "name": "users/LEARNED_BOT_ID",
-                                        "displayName": "BotName",
-                                        "type": "BOT",
-                                    },
-                                    "type": "MENTION",
-                                },
-                            }
-                        ],
-                    },
-                },
-            },
-        }
-        adapter.parse_message(event)
-        assert adapter.bot_user_id == "users/LEARNED_BOT_ID"
+    def test_mentioned_bot_does_not_become_self(self):
+        # The takeover this closes: another bot mentioned first used to become
+        # "self", so its messages were dropped as the app's own.
+        adapter = _make_adapter(bot_user_id="users/OUR_BOT")
 
-    def test_does_not_overwrite_existing_bot_id(self):
-        adapter = _make_adapter()
-        adapter._bot_user_id = "users/FIRST_BOT"
+        adapter.parse_message(_mention_event("users/OTHER_BOT", "OtherBot", "@OtherBot hello"))
 
-        event = {
-            "chat": {
-                "messagePayload": {
-                    "space": {"name": "spaces/ABC123", "type": "ROOM"},
-                    "message": {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "text": "@AnotherBot hi",
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "annotations": [
-                            {
-                                "type": "USER_MENTION",
-                                "startIndex": 0,
-                                "length": 11,
-                                "userMention": {
-                                    "user": {
-                                        "name": "users/SECOND_BOT",
-                                        "displayName": "AnotherBot",
-                                        "type": "BOT",
-                                    },
-                                    "type": "MENTION",
-                                },
-                            }
-                        ],
-                    },
-                },
-            },
-        }
-        adapter.parse_message(event)
-        assert adapter.bot_user_id == "users/FIRST_BOT"
-
-    def test_persists_bot_id_after_learning(self):
-        """The bot user ID should be available for self-detection after learning."""
-        adapter = _make_adapter()
-
-        # First message: learn bot ID
-        event = {
-            "chat": {
-                "messagePayload": {
-                    "space": {"name": "spaces/ABC123", "type": "ROOM"},
-                    "message": {
-                        "name": "spaces/ABC123/messages/msg1",
-                        "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
-                        "text": "@MyBot hello",
-                        "createTime": "2024-01-01T00:00:00Z",
-                        "annotations": [
-                            {
-                                "type": "USER_MENTION",
-                                "startIndex": 0,
-                                "length": 6,
-                                "userMention": {
-                                    "user": {
-                                        "name": "users/MY_BOT_ID",
-                                        "displayName": "MyBot",
-                                        "type": "BOT",
-                                    },
-                                    "type": "MENTION",
-                                },
-                            }
-                        ],
-                    },
-                },
-            },
-        }
-        adapter.parse_message(event)
-
-        # Second message: detect self
-        self_event = {
+        other_bot_event = {
             "chat": {
                 "messagePayload": {
                     "space": {"name": "spaces/ABC123", "type": "ROOM"},
                     "message": {
                         "name": "spaces/ABC123/messages/msg2",
-                        "sender": {"name": "users/MY_BOT_ID", "displayName": "MyBot", "type": "BOT"},
+                        "sender": {"name": "users/OTHER_BOT", "displayName": "OtherBot", "type": "BOT"},
                         "text": "Hello back",
                         "createTime": "2024-01-01T00:00:01Z",
                     },
                 },
             },
         }
-        msg = adapter.parse_message(self_event)
-        assert msg.author.is_me is True
+        msg = adapter.parse_message(other_bot_event)
+        assert adapter.bot_user_id == "users/OUR_BOT"
+        assert msg.author.is_me is False
 
 
 # =============================================================================

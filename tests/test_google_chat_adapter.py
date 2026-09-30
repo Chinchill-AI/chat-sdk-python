@@ -8,16 +8,19 @@ import pytest
 
 from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
 from chat_sdk.adapters.google_chat.thread_utils import (
+    GoogleChatMessageName,
     GoogleChatThreadId,
     decode_thread_id,
     encode_thread_id,
     is_dm_thread,
+    parse_message_name,
 )
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
+from chat_sdk.types import Attachment
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,6 +172,69 @@ class TestIsDmThread:
 
 
 # ---------------------------------------------------------------------------
+# parse_message_name (upstream thread-utils.test.ts, d6343460)
+# ---------------------------------------------------------------------------
+
+
+class TestParseMessageName:
+    def test_parses_a_server_assigned_message_name(self):
+        assert parse_message_name("spaces/AAQAJ9CXYcg/messages/FGEOaAwNIcs.FGEOaAwNIcs") == GoogleChatMessageName(
+            space_name="spaces/AAQAJ9CXYcg",
+            message_id="FGEOaAwNIcs.FGEOaAwNIcs",
+        )
+
+    def test_parses_a_client_assigned_message_name(self):
+        space_name, message_id = parse_message_name("spaces/ABC_1-2/messages/client-my_id-3")
+        assert space_name == "spaces/ABC_1-2"
+        assert message_id == "client-my_id-3"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "spaces/ABC/messages/../../OTHER/messages/x",
+            "spaces/ABC/messages/./x",
+            "spaces/ABC/messages/x/",
+            "spaces/ABC/messages/",
+            "spaces/ABC/messages/x?y=1",
+            "spaces/ABC/messages/x#y",
+            "spaces/ABC/messages/%2e%2e",
+            "spaces/ABC/messages/a..b",
+            "spaces//messages/x",
+            "spaces/ABC/threads/x",
+            "/spaces/ABC/messages/x",
+            "https://chat.googleapis.com/v1/spaces/ABC/messages/x",
+            "x",
+            "",
+        ],
+    )
+    def test_rejects(self, name: str):
+        with pytest.raises(ValidationError, match="Invalid Google Chat message id"):
+            parse_message_name(name)
+
+    # Python-only sweep: ``re.match`` + ``$`` would accept a trailing newline,
+    # and ``\w`` / ``\d`` would accept non-ASCII letters and digits.
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "spaces/ABC/messages/x\n",
+            "spaces/ABC/messages/x\r\n",
+            "spaces/ABC/messages/\uff58",
+            "spaces/ABC/messages/x\u0661",
+            "spaces/ABC\n/messages/x",
+            "spaces/ABC/messages/.x",
+            "spaces/ABC/messages/x.",
+        ],
+    )
+    def test_rejects_non_ascii_and_trailing_newlines(self, name: str):
+        with pytest.raises(ValidationError, match="Invalid Google Chat message id"):
+            parse_message_name(name)
+
+    def test_rejects_a_non_string_id(self):
+        with pytest.raises(ValidationError, match="Invalid Google Chat message id"):
+            parse_message_name(None)
+
+
+# ---------------------------------------------------------------------------
 # create_google_chat_adapter factory
 # ---------------------------------------------------------------------------
 
@@ -217,6 +283,179 @@ class TestCreateGoogleChatAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Media download (upstream 32687038)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self._body = body
+
+    async def read(self) -> bytes:
+        return self._body
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeSession:
+    """Records ``session.get`` calls made by the media download closure."""
+
+    def __init__(self, status: int = 200, body: bytes = b"\x89PNG") -> None:
+        self.status = status
+        self.body = body
+        self.calls: list[tuple[str, dict[str, str]]] = []
+        self.closed = False
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _FakeResponse:
+        self.calls.append((url, headers))
+        return _FakeResponse(self.status, self.body)
+
+
+def _media_adapter(status: int = 200, body: bytes = b"\x89PNG") -> tuple[GoogleChatAdapter, _FakeSession]:
+    from unittest.mock import AsyncMock
+
+    adapter = _make_adapter()
+    session = _FakeSession(status, body)
+    adapter._get_access_token = AsyncMock(return_value="test-token")  # type: ignore[method-assign]
+    adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+    return adapter, session
+
+
+def _attachment_event(attachment: dict) -> dict:
+    return {
+        "chat": {
+            "messagePayload": {
+                "space": {"name": "spaces/ABC123", "type": "ROOM"},
+                "message": {
+                    "name": "spaces/ABC123/messages/msg1",
+                    "sender": {"name": "users/100", "displayName": "User", "type": "HUMAN"},
+                    "text": "file",
+                    "createTime": "2024-01-01T00:00:00Z",
+                    "attachment": [attachment],
+                },
+            },
+        },
+    }
+
+
+class TestMediaDownload:
+    """Attachment bytes come only from the media API (upstream 32687038)."""
+
+    @pytest.mark.asyncio
+    async def test_uses_media_download_api_when_attachment_data_ref_is_present(self):
+        adapter, session = _media_adapter()
+        msg = adapter.parse_message(
+            _attachment_event(
+                {
+                    "name": "att1",
+                    "contentName": "photo.png",
+                    "contentType": "image/png",
+                    "downloadUri": "https://example.com/photo.png",
+                    "attachmentDataRef": {"resourceName": "spaces/ABC123/attachments/att1"},
+                }
+            )
+        )
+        att = msg.attachments[0]
+        assert att.fetch_data is not None
+        assert att.url == "https://example.com/photo.png"
+
+        assert await att.fetch_data() == b"\x89PNG"
+        assert session.calls == [
+            (
+                "https://chat.googleapis.com/v1/media/spaces/ABC123/attachments/att1?alt=media",
+                {"Authorization": "Bearer test-token"},
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_provides_fetch_data_when_only_attachment_data_ref_is_present(self):
+        adapter, session = _media_adapter()
+        msg = adapter.parse_message(
+            _attachment_event(
+                {
+                    "name": "att1",
+                    "contentName": "photo.png",
+                    "contentType": "image/png",
+                    "attachmentDataRef": {"resourceName": "spaces/ABC123/attachments/att1"},
+                }
+            )
+        )
+        att = msg.attachments[0]
+        assert att.fetch_data is not None
+        assert att.url is None
+        assert await att.fetch_data() == b"\x89PNG"
+        assert [url for url, _ in session.calls] == [
+            "https://chat.googleapis.com/v1/media/spaces/ABC123/attachments/att1?alt=media"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_does_not_fetch_download_uri_when_media_download_fails(self):
+        from chat_sdk.adapters.google_chat.adapter import _GoogleApiError
+
+        adapter, session = _media_adapter(status=403)
+        msg = adapter.parse_message(
+            _attachment_event(
+                {
+                    "name": "att1",
+                    "contentName": "photo.png",
+                    "contentType": "image/png",
+                    "downloadUri": "https://example.com/photo.png",
+                    "attachmentDataRef": {"resourceName": "spaces/ABC123/attachments/att1"},
+                }
+            )
+        )
+        att = msg.attachments[0]
+        assert att.fetch_data is not None
+        with pytest.raises(_GoogleApiError) as exc_info:
+            await att.fetch_data()
+        assert exc_info.value.code == 403
+        # Exactly one request, to the media API -- never the downloadUri.
+        assert [url for url, _ in session.calls] == [
+            "https://chat.googleapis.com/v1/media/spaces/ABC123/attachments/att1?alt=media"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_raises_adapter_rate_limit_error_when_media_download_returns_429(self):
+        adapter, _ = _media_adapter(status=429)
+        msg = adapter.parse_message(
+            _attachment_event(
+                {
+                    "name": "att1",
+                    "contentName": "photo.png",
+                    "contentType": "image/png",
+                    "attachmentDataRef": {"resourceName": "spaces/ABC123/attachments/att1"},
+                }
+            )
+        )
+        att = msg.attachments[0]
+        assert att.fetch_data is not None
+        with pytest.raises(AdapterRateLimitError):
+            await att.fetch_data()
+
+    def test_does_not_provide_fetch_data_when_only_download_uri_is_present(self):
+        adapter = _make_adapter()
+        msg = adapter.parse_message(
+            _attachment_event(
+                {
+                    "name": "att1",
+                    "contentName": "photo.png",
+                    "contentType": "image/png",
+                    "downloadUri": "https://example.com/photo.png",
+                }
+            )
+        )
+        att = msg.attachments[0]
+        assert att.fetch_data is None
+        assert att.url == "https://example.com/photo.png"
+        assert att.fetch_metadata == {"url": "https://example.com/photo.png"}
+
+
+# ---------------------------------------------------------------------------
 # rehydrate_attachment
 # ---------------------------------------------------------------------------
 
@@ -224,75 +463,100 @@ class TestCreateGoogleChatAdapter:
 class TestRehydrateAttachment:
     """Cover ``GoogleChatAdapter.rehydrate_attachment``."""
 
-    def test_rehydrates_from_resource_name(self):
-        from chat_sdk.types import Attachment
-
-        adapter = _make_adapter()
+    @pytest.mark.asyncio
+    async def test_rehydrates_from_resource_name(self):
+        adapter, session = _media_adapter()
         attachment = Attachment(
             type="image",
+            url="https://example.com/display.png",
             fetch_metadata={"resourceName": "spaces/ABC/messages/X/attachments/Y"},
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
+        assert rehydrated.url == "https://example.com/display.png"
         assert rehydrated.fetch_metadata == {
             "resourceName": "spaces/ABC/messages/X/attachments/Y",
         }
+        assert await rehydrated.fetch_data() == b"\x89PNG"
+        assert [url for url, _ in session.calls] == [
+            "https://chat.googleapis.com/v1/media/spaces/ABC/messages/X/attachments/Y?alt=media"
+        ]
 
-    def test_rehydrates_from_url_when_no_resource_name(self):
-        from chat_sdk.types import Attachment
-
+    def test_does_not_rehydrate_fetch_data_from_a_download_url(self):
         adapter = _make_adapter()
         attachment = Attachment(
             type="file",
-            url="https://chat.googleapis.com/v1/media/X?alt=media",
-            fetch_metadata={"url": "https://chat.googleapis.com/v1/media/X?alt=media"},
+            url="https://example.com/document.pdf",
+            fetch_metadata={"url": "https://example.com/document.pdf"},
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
-        assert rehydrated.fetch_data is not None
+        assert rehydrated is attachment
+        assert rehydrated.fetch_data is None
 
     def test_returns_unchanged_when_no_metadata(self):
-        from chat_sdk.types import Attachment
-
         adapter = _make_adapter()
         attachment = Attachment(type="file", name="local.bin")
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated is attachment
 
-    # Python-first divergence: SSRF guard on the downloadUri fallback path.
-    # The resource_name branch stays trusted (the URL is constructed by
-    # `_build_gchat_fetch_data` from a validated ``spaces/.../messages/...``
-    # identifier, not from an attacker-controllable string).  The `url`
-    # branch is the one that accepts serialized fetch_metadata.
+    # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (media
+    # resourceName validation). ``resourceName`` is interpolated into the
+    # request path and can come from serialized ``fetch_metadata``, so shapes
+    # that would change what ``/v1/media/{resourceName}`` addresses are
+    # rejected before a token is minted or a request is made.
     @pytest.mark.asyncio
-    async def test_rehydrated_fetch_data_rejects_untrusted_url(self):
-        from unittest.mock import AsyncMock
+    @pytest.mark.parametrize(
+        "resource_name",
+        [
+            "../../spaces/X/messages/Y",
+            "spaces/ABC/attachments/../../../spaces/X",
+            "spaces/ABC/./attachments/Y",
+            "..",
+            ".",
+            "spaces/ABC/attachments/Y?alt=json",
+            "spaces/ABC/attachments/Y#frag",
+            "spaces/ABC/attachments/%2e%2e",
+            "spaces/ABC/attachments/Y Z",
+            "spaces/ABC/attachments/Y\n",
+            "spaces/ABC/attachments/Y\t",
+            "spaces/ABC/attachments/Y\x00",
+            "spaces/ABC/attachments/Y\x85",
+            "spaces\\..\\x",
+            "spaces/ABC/attachments/\uff0e\uff0e",
+        ],
+    )
+    async def test_rehydrated_fetch_data_rejects_unsafe_resource_names(self, resource_name: str):
+        adapter, session = _media_adapter()
+        attachment = Attachment(type="image", fetch_metadata={"resourceName": resource_name})
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError, match="Invalid Google Chat attachment resource name"):
+            await rehydrated.fetch_data()
+        adapter._get_access_token.assert_not_awaited()  # type: ignore[attr-defined]
+        adapter._get_http_session.assert_not_awaited()  # type: ignore[attr-defined]
+        assert session.calls == []
 
-        from chat_sdk.types import Attachment
+    @pytest.mark.asyncio
+    async def test_rehydrated_fetch_data_rejects_a_non_string_resource_name(self):
+        adapter, session = _media_adapter()
+        rehydrated = adapter.rehydrate_attachment(Attachment(type="file", fetch_metadata={"resourceName": 42}))
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError, match="Invalid Google Chat attachment resource name"):
+            await rehydrated.fetch_data()
+        assert session.calls == []
 
-        adapter = _make_adapter()
-        # These must never be awaited — validation rejects first.
-        adapter._get_access_token = AsyncMock()  # type: ignore[method-assign]
-        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
-
+    @pytest.mark.asyncio
+    async def test_accepts_opaque_resource_names(self):
+        # resourceName is opaque (it may be a base64-style token), so only the
+        # denylisted shapes are rejected.
+        adapter, session = _media_adapter()
         attachment = Attachment(
             type="image",
-            url="https://attacker.example.com/pwn",
-            fetch_metadata={"url": "https://attacker.example.com/pwn"},
+            fetch_metadata={"resourceName": "ClxjaGF0LmNvbS9+abc_DEF-123=/x.y"},
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
-        with pytest.raises(ValidationError):
-            await rehydrated.fetch_data()
-        adapter._get_access_token.assert_not_awaited()
-        adapter._get_http_session.assert_not_awaited()
-
-    def test_is_trusted_gchat_download_url_allowlist(self):
-        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://chat.googleapis.com/v1/media/X?alt=media")
-        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://lh3.googleusercontent.com/photo.jpg")
-        assert GoogleChatAdapter._is_trusted_gchat_download_url("https://foo.google.com/x")
-        # Rejects non-HTTPS
-        assert not GoogleChatAdapter._is_trusted_gchat_download_url("http://chat.googleapis.com/x")
-        # Rejects arbitrary hosts
-        assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://attacker.example/x")
-        # Rejects look-alikes
-        assert not GoogleChatAdapter._is_trusted_gchat_download_url("https://chat.googleapis.com.attacker.tld/x")
+        assert await rehydrated.fetch_data() == b"\x89PNG"
+        assert [url for url, _ in session.calls] == [
+            "https://chat.googleapis.com/v1/media/ClxjaGF0LmNvbS9+abc_DEF-123=/x.y?alt=media"
+        ]
