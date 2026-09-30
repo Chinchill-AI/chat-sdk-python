@@ -696,14 +696,25 @@ def _ensure_trailing_slash(value: str) -> str:
     return value if value.endswith("/") else f"{value}/"
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _origin(url: str) -> tuple[str, str | None, int | None]:
-    """``(scheme, lowercased host, explicit port)`` of ``url``, for origin comparison."""
+    """``(scheme, lowercased host, effective port)`` of ``url``, for origin comparison.
+
+    An omitted port becomes the scheme's default, as in a WHATWG ``URL.origin``
+    (upstream compares ``new URL(...).origin``), so ``https://host:443/`` and
+    ``https://host/`` are the same origin. An invalid port compares as ``-1``.
+    """
     parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
     try:
         port = parsed.port
     except ValueError:
         port = -1
-    return (parsed.scheme.lower(), parsed.hostname, port)
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    return (scheme, parsed.hostname, port)
 
 
 def _response_status(response: Any) -> int:

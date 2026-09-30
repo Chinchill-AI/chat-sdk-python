@@ -402,6 +402,21 @@ class TestTeamsApiSsrfDivergence:
             )
         request.assert_not_awaited()
 
+    async def test_an_explicit_default_port_is_the_same_origin(self) -> None:
+        # WHATWG ``URL.origin`` (upstream) normalizes the default port away.
+        # (A port on ``service_url`` itself is refused by the host patterns.)
+        request = AsyncMock(side_effect=[_json_response({"access_token": "token"}), _json_response({"id": "a1"})])
+        path = "https://smba.trafficmanager.net:443/v3/x"
+
+        await call_teams_connector_api(
+            credentials=CREDENTIALS,
+            path=path,
+            service_url="https://smba.trafficmanager.net/teams/",
+            fetch=request,
+        )
+
+        assert request.await_args_list[1].args[0] == path
+
     async def test_local_emulator_service_url_is_called(self) -> None:
         request = AsyncMock(side_effect=[_json_response({"access_token": "token"}), _json_response({"id": "a1"})])
 
