@@ -23,6 +23,7 @@ import pytest
 from chat_sdk import chat as chat_module
 from chat_sdk.chat import DEFAULT_LOCK_TTL_MS, DEFAULT_MAX_LOCK_LIFETIME_MS, Chat
 from chat_sdk.errors import LockError
+from chat_sdk.state import create_memory_state
 from chat_sdk.testing import (
     MockAdapter,
     MockLogger,
@@ -108,7 +109,9 @@ class TestDropStrategyHeartbeat:
 
         assert handled == ["drop-long-1"]
         assert len(heartbeats) == 1
-        assert heartbeats[0].task.done()
+        # stop() cancels an idle loop without yielding; it finishes on the next turn.
+        await clock.settle()
+        assert heartbeats[0].task.cancelled()
         assert clock.pending_timers() == 0
 
     async def test_force_acquired_lock_is_renewed_by_the_heartbeat(self, monkeypatch):
@@ -193,7 +196,9 @@ class TestHeartbeatStopOrdering:
 
         assert order == ["extend-start", "extend-end", "release"]
         state.release_lock.assert_awaited_once()
-        assert heartbeats[0].task.done()
+        # stop() cancels an idle loop without yielding; it finishes on the next turn.
+        await clock.settle()
+        assert heartbeats[0].task.cancelled()
 
     async def test_handler_error_still_stops_the_heartbeat_and_releases_once(self, monkeypatch):
         clock = FakeClock().install(monkeypatch)
@@ -211,7 +216,9 @@ class TestHeartbeatStopOrdering:
             await chat.handle_incoming_message(adapter, THREAD, create_test_message("err-1", "Hey @slack-bot"))
 
         state.release_lock.assert_awaited_once()
-        assert heartbeats[0].task.done()
+        # stop() cancels an idle loop without yielding; it finishes on the next turn.
+        await clock.settle()
+        assert heartbeats[0].task.cancelled()
         assert clock.pending_timers() == 0
 
 
@@ -689,9 +696,11 @@ class TestLifetimeCapEndsDrains:
         ended_after = clock.now - started_at
 
         assert holder.done()
-        # Held until 40s (extend at 10s, cap at the 20s tick); the loop
-        # notices after its next debounce sleep.
-        assert 40_000 <= ended_after <= 40_000 + 1_500 + 1_000
+        # Renewal stops at the 20s cap tick. The last full-TTL extend (a
+        # heartbeat tick or a pre-dispatch ownership check just before the
+        # cap) keeps the lock at most one TTL longer; the loop notices after
+        # its next debounce sleep.
+        assert 40_000 <= ended_after <= 20_000 + DEFAULT_LOCK_TTL_MS + 1_500 + 1_000
         assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
 
         await clock.advance(10_000)
@@ -794,3 +803,98 @@ class TestHeartbeatFailuresAreVisible:
 
         release.set()
         await task
+
+
+class TestHeldLockHandoff:
+    """Windows between the heartbeat and the drain that must not strand or double-run work."""
+
+    async def test_back_to_back_queue_messages_are_both_handled(self):
+        # The second message finds the lock held and enqueues; the holder's
+        # drain must still see it -- stopping an idle heartbeat must not open
+        # an event-loop turn between the last empty-queue check and release.
+        state = create_memory_state()
+        chat, adapter, _ = await _make_chat(state, concurrency="queue")  # type: ignore[arg-type]
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+
+        await asyncio.gather(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("b2b-1", "Hey @slack-bot one")),
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("b2b-2", "Hey @slack-bot two")),
+        )
+
+        assert handled == ["b2b-1", "b2b-2"]
+        assert await state.queue_depth(THREAD) == 0
+
+    async def test_drain_confirms_the_token_before_dispatching_after_a_takeover(self, monkeypatch):
+        # Another worker force-releases and re-acquires between heartbeat
+        # ticks; the old holder must not dispatch queued work under a lock it
+        # no longer owns. Divergence from upstream -- see docs/UPSTREAM_SYNC.md.
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        holder = install_token_lock_mock(state, clock)
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "take-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("take-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["take-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("take-2", "Hey @slack-bot two"))
+        await state.force_release_lock(THREAD)
+        new_owner = await state.acquire_lock(THREAD, DEFAULT_LOCK_TTL_MS)
+        assert new_owner is not None
+        release.set()
+        await first
+
+        assert handled == ["take-1"]
+        assert "Stopping queue drain after lock ownership was lost" in _warn_messages(logger)
+        assert await state.queue_depth(THREAD) == 1
+        # The old holder's release is token-checked and leaves the new owner alone.
+        assert holder["active"] is new_owner
+
+    async def test_stalled_extend_does_not_block_release_past_the_known_expiry(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        never = asyncio.Event()
+
+        async def stalled_extend(lock: Lock, ttl_ms: int) -> bool:
+            await never.wait()
+            return True
+
+        state.extend_lock = AsyncMock(side_effect=stalled_extend)  # type: ignore[method-assign]
+        real_release = state.release_lock
+        state.release_lock = AsyncMock(side_effect=real_release)  # type: ignore[method-assign]
+        chat, adapter, logger = await _make_chat(state)
+        finish = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            await finish.wait()
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("stall-1", "Hey @slack-bot"))
+        )
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3)  # the extend starts and stalls
+        finish.set()
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3)
+        assert not task.done()  # still inside the window where the lock is known held
+        state.release_lock.assert_not_awaited()
+
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3 + 1)
+        assert task.done()
+        await task
+
+        state.release_lock.assert_awaited_once()
+        assert "Releasing lock while a heartbeat extend is still in flight" in _warn_messages(logger)
+        never.set()
+        await clock.settle()

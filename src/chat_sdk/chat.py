@@ -251,8 +251,8 @@ class _LockHeartbeat:
     same way, from the instant the extend was requested.
 
     Use via :meth:`Chat._with_held_lock`, which always awaits :meth:`stop`
-    before ``release_lock`` so an in-flight extend cannot land after the
-    release.
+    before ``release_lock`` (see :meth:`stop` for how long it waits for an
+    in-flight extend).
     """
 
     def __init__(
@@ -274,8 +274,12 @@ class _LockHeartbeat:
         self._held_until = acquired_at_ms + DEFAULT_LOCK_TTL_MS
         self._ownership_lost = False
         self._stopped = False
+        # True until the renewal loop exits for any reason (cap, lost
+        # ownership, crash, stop); read by ``confirm_ownership``.
+        self._renewing = True
         self._in_flight: asyncio.Task[bool] | None = None
         self._task: asyncio.Task[None] = asyncio.get_running_loop().create_task(self._run())
+        self._task.add_done_callback(self._log_task_failure)
 
     @property
     def task(self) -> asyncio.Task[None]:
@@ -299,6 +303,8 @@ class _LockHeartbeat:
                 "Lock heartbeat crashed — the lock will lapse at its TTL",
                 {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
             )
+        finally:
+            self._renewing = False
 
     async def _renew(self) -> None:
         interval_ms = DEFAULT_LOCK_TTL_MS // 3
@@ -321,6 +327,7 @@ class _LockHeartbeat:
             # Shield the extend so cancelling the loop (``stop()``) never
             # abandons a half-finished backend call; ``stop()`` awaits it.
             self._in_flight = asyncio.get_running_loop().create_task(self._extend_once())
+            self._in_flight.add_done_callback(self._log_task_failure)
             keep_going = await asyncio.shield(self._in_flight)
             self._in_flight = None
             if not keep_going:
@@ -359,33 +366,89 @@ class _LockHeartbeat:
             )
         return False
 
-    async def stop(self) -> None:
-        """Stop renewing; waits for any in-flight extend so it cannot land after release.
+    async def confirm_ownership(self) -> bool:
+        """Token-checked extend before a drain/debounce step dispatches queued work.
 
-        Idempotent. ``asyncio.wait`` (not ``gather``) is used so that if the
-        caller of ``stop()`` is itself cancelled, the in-flight extend is not
-        cancelled mid-call.
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's drain
+        only consults ``isOwnershipLost()``, which cannot see a takeover
+        (``on_lock_conflict="force"`` on another worker) until the next
+        heartbeat tick. ``extend_lock`` compares the token, so a ``False`` here
+        means another holder owns the thread now. A backend error falls back
+        to the ``held_until`` rule, like the heartbeat's own extends.
+
+        While the heartbeat is still renewing, the check extends by the full
+        TTL, like a heartbeat tick (full-TTL extends only ever move the expiry
+        forward, so racing the heartbeat's own extend is harmless). Once
+        renewal has ended (``max_lock_lifetime_ms``), it extends only by the
+        time still known held, so the backend expiry stays at about
+        ``held_until`` and the cap still bounds a busy drain.
+        """
+        requested_at = _monotonic_ms()
+        ttl_ms = DEFAULT_LOCK_TTL_MS if self._renewing else self._held_until - requested_at
+        # Checked after ``requested_at`` is taken, so ``ttl_ms`` is positive.
+        if self.is_ownership_lost():
+            return False
+        try:
+            extended = await self._state.extend_lock(self._lock, ttl_ms)
+        except Exception:
+            return not self.is_ownership_lost()
+        if extended:
+            self._held_until = max(self._held_until, requested_at + ttl_ms)
+            return not self.is_ownership_lost()
+        self._ownership_lost = True
+        return False
+
+    async def stop(self) -> None:
+        """Stop renewing before ``release_lock``.
+
+        Idempotent. With no extend in flight the loop task is parked in its
+        sleep (or has not started), so cancelling it is enough and ``stop()``
+        returns without yielding to the event loop: a message that enqueues
+        between the drain's last empty-queue check and ``release_lock`` would
+        otherwise be stranded until the next webhook.
+
+        With an extend in flight, waits for it -- but only while the lock is
+        still known held (``held_until``). Past that the lock may have lapsed
+        anyway, and ``extend_lock``'s token-compare contract means a late
+        extend cannot resurrect a released lock; an unbounded wait would let a
+        stalled backend call hang the handler's cleanup and ``Chat.shutdown()``.
+        ``asyncio.wait`` is used so that cancelling the caller never cancels
+        the extend mid-call.
         """
         self._stopped = True
         self._task.cancel()
-        pending: set[asyncio.Task[Any]] = {self._task}
         in_flight = self._in_flight
-        if in_flight is not None:
-            pending.add(in_flight)
-        await asyncio.wait(pending)
-        # Retrieve outcomes so a finished task never logs "exception was
-        # never retrieved"; a cancelled loop task is the expected outcome.
-        # ``_run`` and ``_extend_once`` handle ``Exception`` themselves, so
-        # anything left here is unexpected: log it rather than drop it.
-        for task in pending:
-            if task.cancelled():
-                continue
-            err = task.exception()
-            if err is not None:
-                self._logger.error(
-                    "Lock heartbeat task failed",
-                    {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
-                )
+        if in_flight is None or in_flight.done():
+            return
+        remaining_ms = self._held_until - _monotonic_ms()
+        if remaining_ms > 0:
+            timer = asyncio.get_running_loop().create_task(_sleep(remaining_ms))
+            try:
+                await asyncio.wait({in_flight, timer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                timer.cancel()
+        if not in_flight.done():
+            self._logger.warn(
+                "Releasing lock while a heartbeat extend is still in flight",
+                {"thread_id": self._lock.thread_id, "token": self._lock.token},
+            )
+
+    def _log_task_failure(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback: surface an unexpected failure instead of dropping it.
+
+        ``_run`` and ``_extend_once`` handle ``Exception`` themselves, so this
+        only fires for anything that escapes them; it also retrieves the
+        outcome so an un-awaited task never logs "exception was never
+        retrieved".
+        """
+        if task.cancelled():
+            return
+        err = task.exception()
+        if err is not None:
+            self._logger.error(
+                "Lock heartbeat task failed",
+                {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
+            )
 
 
 def _create_task(
@@ -2391,8 +2454,9 @@ class Chat:
 
         Every lock-holding path goes through here so acquiring a lock is
         never paired with a missing heartbeat. ``stop()`` is awaited before
-        ``release_lock`` so an in-flight extend cannot land after the
-        release; ``release_lock`` is a no-op for a foreign token if
+        ``release_lock`` so an in-flight extend does not land after the
+        release while the lock is still known held (see
+        :meth:`_LockHeartbeat.stop`); ``release_lock`` is a no-op for a foreign token if
         ownership was lost meanwhile.
         """
         heartbeat = _LockHeartbeat(
@@ -2450,7 +2514,7 @@ class Chat:
 
         while True:
             await _sleep(debounce_ms)
-            if heartbeat.is_ownership_lost():
+            if not await heartbeat.confirm_ownership():
                 # Another instance may hold the lock now -- leave the queue to it.
                 self._logger.warn("Stopping debounce loop after lock ownership was lost", {"lock_key": lock_key})
                 return
@@ -2505,7 +2569,7 @@ class Chat:
     ) -> None:
         """Dispatch the latest pending message with the rest as skipped; repeat until empty."""
         while True:
-            if heartbeat.is_ownership_lost():
+            if not await heartbeat.confirm_ownership():
                 # Another instance may hold the lock now -- leave the queue to it.
                 self._logger.warn("Stopping queue drain after lock ownership was lost", {"lock_key": lock_key})
                 return

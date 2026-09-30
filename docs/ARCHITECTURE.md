@@ -195,7 +195,7 @@ The simplest strategy. If another handler is already processing the same thread,
 
 ### Lock heartbeat
 
-Every lock-holding strategy (drop, queue, debounce, burst) runs through `Chat._with_held_lock`, which starts a `_LockHeartbeat`: every `30s / 3` it calls `state.extend_lock(lock, 30s)`, so a handler running longer than the TTL keeps its lock. Renewal stops after `ConcurrencyConfig.max_lock_lifetime_ms` (default 10 minutes); the lock then lapses one TTL later so a hung handler cannot block the thread forever. An extend returning `False`, or the backend staying unreachable past the last known expiry, marks ownership lost; drain and debounce loops check `is_ownership_lost()` and leave the queue to the new holder. The heartbeat is stopped (waiting for any in-flight extend) before `release_lock`.
+Every lock-holding strategy (drop, queue, debounce, burst) runs through `Chat._with_held_lock`, which starts a `_LockHeartbeat`: every `30s / 3` it calls `state.extend_lock(lock, 30s)`, so a handler running longer than the TTL keeps its lock. Renewal stops after `ConcurrencyConfig.max_lock_lifetime_ms` (default 10 minutes); the lock then lapses one TTL later so a hung handler cannot block the thread forever. An extend returning `False`, or the backend staying unreachable past the last known expiry, marks ownership lost; drain and debounce loops run a token-checked `extend_lock` (`confirm_ownership()`) before each dispatch and leave the queue to the new holder when it fails. The heartbeat is stopped before `release_lock`, waiting for an in-flight extend only while the lock is still known held.
 
 ### Queue
 
