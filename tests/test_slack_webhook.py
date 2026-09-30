@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._slack_file_transport import FakeFileResponse, FakeFileTransport
+
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import SlackAdapterConfig, SlackInstallation, SlackThreadId
@@ -638,9 +640,9 @@ class TestRehydrateAttachment:
             ),
         )
 
-        # Stub the network GET — assert the tenant token is forwarded.
-        fetch_mock = AsyncMock(return_value=b"workspace-bytes")
-        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+        # Stub the download transport — assert the tenant token is forwarded.
+        transport = FakeFileTransport(FakeFileResponse(b"workspace-bytes"))
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -656,10 +658,8 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         result = await rehydrated.fetch_data()
         assert result == b"workspace-bytes"
-        fetch_mock.assert_awaited_once_with(
-            "https://files.slack.com/img.png",
-            "xoxb-multi-workspace-token",
-        )
+        assert [url for url, _ in transport.calls] == ["https://files.slack.com/img.png"]
+        assert transport.authorizations == ["Bearer xoxb-multi-workspace-token"]
 
     # TS: "should fall back to getToken when no teamId in fetchMetadata"
     @pytest.mark.asyncio
@@ -667,8 +667,8 @@ class TestRehydrateAttachment:
         from chat_sdk.types import Attachment
 
         adapter = _make_adapter(bot_token="xoxb-single")
-        fetch_mock = AsyncMock(return_value=b"single-bytes")
-        adapter._fetch_slack_file = fetch_mock  # type: ignore[method-assign]
+        transport = FakeFileTransport(FakeFileResponse(b"single-bytes"))
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -681,10 +681,7 @@ class TestRehydrateAttachment:
         result = await rehydrated.fetch_data()
         assert result == b"single-bytes"
         # Bot token (not a workspace-specific install token) is forwarded.
-        fetch_mock.assert_awaited_once_with(
-            "https://files.slack.com/img.png",
-            "xoxb-single",
-        )
+        assert transport.authorizations == ["Bearer xoxb-single"]
 
     # TS: "should return attachment unchanged when no url"
     def test_should_return_attachment_unchanged_when_no_url(self):
@@ -704,18 +701,10 @@ class TestRehydrateAttachment:
     async def test_rehydrated_fetch_data_rejects_untrusted_host(self):
         from chat_sdk.types import Attachment
 
-        adapter = _make_adapter(bot_token="xoxb-ssrf-token")
-
-        # Sentinel — should NEVER be reached because validation rejects first.
-        evil_fetch = AsyncMock(return_value=b"should-not-run")
-        adapter._fetch_slack_file = evil_fetch  # type: ignore[method-assign]
-        # Restore the real validator + wrap it so we can assert on behavior.
-        real_fetch = SlackAdapter._fetch_slack_file
-
-        async def guarded_fetch(url: str, token: str) -> bytes:
-            return await real_fetch(adapter, url, token)
-
-        adapter._fetch_slack_file = guarded_fetch  # type: ignore[method-assign]
+        resolver = MagicMock(return_value="xoxb-ssrf-token")
+        adapter = _make_adapter(bot_token=resolver)
+        transport = FakeFileTransport()
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -727,6 +716,9 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         with pytest.raises(ValidationError):
             await rehydrated.fetch_data()
+        # Refused before the token is resolved and before any request.
+        assert transport.calls == []
+        resolver.assert_not_called()
 
     def test_is_trusted_slack_download_url_allowlist(self):
         # Accepts Slack-owned HTTPS hosts
@@ -739,6 +731,48 @@ class TestRehydrateAttachment:
         assert not SlackAdapter._is_trusted_slack_download_url("https://attacker.example/x")
         # Rejects look-alike hosts that merely contain "slack.com"
         assert not SlackAdapter._is_trusted_slack_download_url("https://slack.com.attacker.tld/x")
+        # GovSlack and slack-files hosts (vercel/chat 7c269653)
+        for url in (
+            "https://files.slack-gov.com/f.png",
+            "https://slack-gov.com/files-pri/T/F/f.png",
+            "https://slack-files.com/files-tmb/T-F-x/f.png",
+            "https://slack-files-gov.com/f.png",
+        ):
+            assert SlackAdapter._is_trusted_slack_download_url(url), url
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-files.com.attacker.tld/x")
+        # The configured api_url origin, exactly (scheme, host and port)
+        api_url = "https://slack-proxy.example:8443/api/"
+        assert SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example:8443/files/f.png", api_url)
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example/files/f.png", api_url)
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example:8443/files/f.png")
+
+    def test_slack_auth_url_is_an_exact_origin_match(self):
+        # Port of upstream ``isSlackAuthUrl`` (file.ts): only these origins
+        # (plus the api_url origin) ever receive the bot token.
+        for url in (
+            "https://files.slack.com/f",
+            "https://FILES.SLACK.COM/f",
+            "https://files.slack.com:443/f",
+            "https://files.slack-gov.com/f",
+            "https://slack-files.com/f",
+            "https://slack-files-gov.com/f",
+            "https://slack.com/f",
+            "https://slack-gov.com/f",
+        ):
+            assert SlackAdapter._is_slack_auth_url(url), url
+        for url in (
+            "https://edge.slack.com/f",
+            "https://foo.slack-edge.com/f",
+            "http://files.slack.com/f",
+            "https://files.slack.com:8443/f",
+            "https://files.slack.com.attacker.example/f",
+            "https://files.slack.com@attacker.example/f",
+            "not a url",
+            "",
+        ):
+            assert not SlackAdapter._is_slack_auth_url(url), url
+        assert SlackAdapter._is_slack_auth_url("https://proxy.example/f", "https://proxy.example/api/")
+        assert not SlackAdapter._is_slack_auth_url("https://proxy.example:444/f", "https://proxy.example/api/")
 
 
 # ---------------------------------------------------------------------------
