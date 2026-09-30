@@ -22,6 +22,7 @@ import importlib
 import socket
 import sys
 import time
+import tracemalloc
 import types
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -593,6 +594,23 @@ class TestBodyDecoding:
 
         with pytest.raises(Exception, match="unexpected end of file"):
             await read_attachment_body(message, "test")
+
+    async def test_memory_tracks_decoded_size_not_gzip_member_count(self) -> None:
+        member = gzip.compress(b"x")
+        body = member * 50_000  # ~1 MB on the wire, 50 KB decoded
+        chunks = [body[i : i + 65536] for i in range(0, len(body), 65536)]
+        message = FakeResponse(headers={"content-encoding": "gzip"}, chunks=chunks)
+
+        tracemalloc.start()
+        try:
+            result = await read_attachment_body(message, "test")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+        assert result == b"x" * 50_000
+        # One object per member (the naive approach) peaks well above 1 MB.
+        assert peak < 1024 * 1024
 
     async def test_deflate_bodies_are_decoded(self) -> None:
         import zlib

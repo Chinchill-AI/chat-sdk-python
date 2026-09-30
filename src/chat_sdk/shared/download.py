@@ -608,29 +608,27 @@ async def _read_body(response: AttachmentResponse, adapter: str, limit: int) -> 
     if declared is not None and declared > limit:
         raise NetworkError(adapter, _OVER_LIMIT)
 
-    chunks: list[bytes] = []
-    size = 0
+    # One growing buffer: memory tracks the decoded size, not the number of
+    # pieces (many tiny gzip members would otherwise cost an object each).
+    body = bytearray()
 
     def take(piece: bytes) -> None:
-        nonlocal size
-        if not piece:
-            return
-        size += len(piece)
+        size = len(body) + len(piece)
         if declared is not None and size > declared:
             raise NetworkError(adapter, "Attachment body exceeds its declared length")
         if size > limit:
             raise NetworkError(adapter, _OVER_LIMIT)
-        chunks.append(piece)
+        body.extend(piece)
 
     async for chunk in response.iter_chunks():
         if decoder is None:
-            take(bytes(chunk))
+            take(chunk)
             continue
         for piece in decoder.feed(bytes(chunk)):
             take(piece)
     if decoder is not None:
         decoder.finish()
-    return b"".join(chunks)
+    return bytes(body)
 
 
 # ---------------------------------------------------------------------------
