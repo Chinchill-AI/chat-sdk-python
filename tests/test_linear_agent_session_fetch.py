@@ -16,8 +16,12 @@ queries against the published Linear schema:
   ``first``/``last`` (it never reads ``options.cursor``), so no ``after`` is
   forwarded — matching the sibling issue/comment fetch paths.
 
+The session's issue must match the thread's issue (chat@4.41.1,
+vercel/chat#974): a missing or foreign ``issue.id`` raises ``ValidationError``
+before the root comment or the children are loaded.
+
 Each test pins behaviour so a regression — a forward/backward (first↔last) swap,
-a per-comment-id → fixed-thread-id collapse, a nullish (``??``) → ``or`` swap, a
+a per-comment-id → fixed-thread-id collapse, a dropped ownership check, a
 missing append-only guard, or a ``hasNextPage`` cursor-logic flip — fails the
 assertion. The append-only edit/delete guards (index.ts:1408 / 1464) are
 covered here too.
@@ -32,7 +36,7 @@ import pytest
 
 from chat_sdk.adapters.linear.adapter import LinearAdapter
 from chat_sdk.adapters.linear.types import LinearAdapterAPIKeyConfig, LinearAgentSessionThreadId
-from chat_sdk.shared.errors import AdapterError
+from chat_sdk.shared.errors import AdapterError, ValidationError
 from chat_sdk.types import FetchOptions
 
 # ---------------------------------------------------------------------------
@@ -133,8 +137,8 @@ def _session_return(
     The issue id is carried under the ``issue { id }`` RELATION — the real
     server shape. ``AgentSession`` exposes NO scalar ``issueId`` field, so a
     fixture emitting a flat ``issueId`` would fabricate a server-rejected field.
-    ``issue_id=None`` models a session whose issue relation is absent (so the
-    ``thread.issue_id`` fallback / missing-issueId raise is exercised).
+    ``issue_id=None`` models a session whose issue relation is ``null`` (an
+    ownership-check failure).
     """
     if root_comment == "default":
         root_comment = _user_comment(comment_id="comment-root", body="root prompt")
@@ -261,40 +265,166 @@ class TestFetchAgentSessionMessagesHappyPath:
 
 
 # ===========================================================================
-# _fetch_agent_session_messages — issueId fallback + raises
+# _fetch_agent_session_messages — issue ownership (chat@4.41.1 / vercel/chat#974)
 # ===========================================================================
 
 
-class TestFetchAgentSessionMessagesIssueId:
+class _FakeLinearResponse:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self.ok = True
+        self.status = 200
+        self._body = body
+
+    async def json(self) -> dict[str, Any]:
+        return self._body
+
+    async def __aenter__(self) -> _FakeLinearResponse:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeLinearHttp:
+    """Stands in for the aiohttp session under the REAL ``_graphql_query``.
+
+    Replays ``bodies`` in order and records each request's JSON payload.
+    """
+
+    def __init__(self, *bodies: dict[str, Any]) -> None:
+        self._bodies = list(bodies)
+        self.requests: list[dict[str, Any]] = []
+
+    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeLinearResponse:
+        self.requests.append(json)
+        return _FakeLinearResponse(self._bodies.pop(0))
+
+
+class _ReadTrackingDict(dict):
+    """A GraphQL node that records which keys the adapter read.
+
+    Upstream asserts the lazy ``agentSession.comment`` getter is never invoked
+    for a foreign session. The raw-GraphQL port receives the node as a dict, so
+    the equivalent proof is that ``comment`` is never READ off it.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.reads: list[str] = []
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self.reads.append(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key: Any) -> Any:
+        self.reads.append(key)
+        return super().__getitem__(key)
+
+
+# ``issue`` relation shapes that must all be rejected for thread issue
+# ``issue-public``: a foreign issue, an absent relation (JS ``undefined``), a
+# ``null`` relation / id (JS ``null``), and an empty id.
+_UNVERIFIED_SESSION_ISSUES = {
+    "issue-private": {"issue": {"id": "issue-private"}},
+    "undefined": {},
+    "null": {"issue": {"id": None}},
+    "empty": {"issue": {"id": ""}},
+}
+
+
+class TestAgentSessionOwnership:
     @pytest.mark.asyncio
-    async def test_falls_back_to_thread_issue_id_when_session_issue_absent(self) -> None:
+    @pytest.mark.parametrize(
+        "thread_id",
+        [
+            "linear:issue-public:s:private-session",
+            "linear:issue-public:c:source-comment:s:private-session",
+        ],
+    )
+    @pytest.mark.parametrize("issue_case", list(_UNVERIFIED_SESSION_ISSUES))
+    async def test_rejects_an_unverified_issue_id_before_loading_content(self, thread_id: str, issue_case: str) -> None:
+        # Ported: describe.each("agent session ownership for %s") →
+        # it.each("rejects an unverified issueId before loading content: %s").
         adapter = _make_adapter()
-        # Session has no ``issue`` relation; the thread's own issue id is used.
-        adapter._graphql_query = _query_router(  # type: ignore[method-assign]
-            _session_return(issue_id=None),
-            _children_return(),
+        agent_session = _ReadTrackingDict(
+            id="private-session",
+            comment=_user_comment(comment_id="source-comment", body="Private issue content"),
+            **_UNVERIFIED_SESSION_ISSUES[issue_case],
+        )
+        adapter._graphql_query = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"data": {"agentSession": agent_session}},
+                AssertionError("no content query may run for a foreign session"),
+            ]
         )
 
-        result = await adapter.fetch_messages(_SESSION_THREAD)
+        with pytest.raises(ValidationError) as exc_info:
+            await adapter.fetch_messages(thread_id)
 
-        # The root message's thread id is built from the THREAD's issue id
-        # (issue-123) — proving the ``agentSession.issue.id ?? thread.issue_id``
-        # fallback fired.
-        assert result.messages[0].thread_id == "linear:issue-123:c:comment-root:s:session-789"
+        assert str(exc_info.value) == "Agent session does not belong to this issue"
+        assert exc_info.value.adapter == "linear"
+        # Only the session lookup ran — no children (or activities) query.
+        assert adapter._graphql_query.await_count == 1
+        first_query, first_vars = adapter._graphql_query.call_args_list[0][0]
+        assert "agentSession(id: $id)" in first_query
+        assert first_vars == {"id": "private-session"}
+        # The root comment was never read off the foreign session.
+        assert "comment" not in agent_session.reads
 
     @pytest.mark.asyncio
-    async def test_raises_when_issue_id_missing_everywhere(self) -> None:
+    @pytest.mark.parametrize("issue_id", ["issue-private", None])
+    async def test_validates_agent_session_ownership_through_the_transport(self, issue_id: str | None) -> None:
+        # Ported: it.each("validates agent session ownership through the Linear
+        # SDK: %s") — the reject cases. Upstream stubs ``fetch`` beneath the SDK;
+        # the Python equivalent stubs the aiohttp session beneath the REAL
+        # ``_graphql_query``, so the JSON → ``issue { id }`` mapping is exercised
+        # end to end. (The ``issue-public`` + ``comment: null`` case resolves via
+        # the activities fallback, which lands with #232.)
         adapter = _make_adapter()
-        # Thread carries no issue id AND the session has no issue relation, so
-        # the ``agentSession.issue.id ?? thread.issue_id`` fallback yields
-        # nothing. (Called directly: a thread id can't encode an empty issue id,
-        # so this guard is reached via a degenerate decoded thread.)
-        adapter._graphql_query = AsyncMock(return_value=_session_return(issue_id=None))  # type: ignore[method-assign]
+        http = _FakeLinearHttp(
+            {
+                "data": {
+                    "agentSession": {
+                        "id": "session-1",
+                        "issue": {"id": issue_id} if issue_id else None,
+                        "comment": None,
+                    }
+                }
+            },
+            {"data": {"comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}},
+        )
+        adapter._get_http_session = AsyncMock(return_value=http)  # type: ignore[method-assign]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await adapter.fetch_messages("linear:issue-public:s:session-1")
+
+        assert str(exc_info.value) == "Agent session does not belong to this issue"
+        # Exactly one request went out, and it selected the session's issue id.
+        assert len(http.requests) == 1
+        assert http.requests[0]["variables"] == {"id": "session-1"}
+        assert "issue {" in http.requests[0]["query"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_session_and_thread_issue_ids_are_both_empty(self) -> None:
+        """``"" == ""`` must NOT count as ownership: the ``not issue_id`` term
+        rejects an empty session issue id even when the (degenerate, directly
+        constructed) thread issue id is also empty. Dropping that term would let
+        the equality check pass and load the session's content.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                _session_return(issue_id=""),
+                AssertionError("children query must not run for an unverified session"),
+            ]
+        )
         thread = LinearAgentSessionThreadId(issue_id="", agent_session_id="session-789")
 
-        with pytest.raises(AdapterError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             await adapter._fetch_agent_session_messages(thread)
-        assert "missing issueId" in str(exc_info.value)
+
+        assert str(exc_info.value) == "Agent session does not belong to this issue"
+        assert adapter._graphql_query.await_count == 1
 
     @pytest.mark.asyncio
     async def test_raises_when_root_comment_missing(self) -> None:
@@ -493,7 +623,7 @@ class TestFetchDispatchOrdering:
 
 
 # ===========================================================================
-# Null-session guard — message describes the real failure (not "missing issueId")
+# Null-session guard — message describes the real failure (not an ownership error)
 # ===========================================================================
 
 
@@ -502,65 +632,17 @@ class TestNullSessionGuard:
     async def test_null_session_raises_not_found(self) -> None:
         """When the raw-GraphQL ``agentSession(id)`` resolves to ``null`` (the
         port-only branch — upstream's SDK throws its own not-found), the guard
-        must describe the REAL failure: the session was not found, NOT
-        "missing issueId" (which belongs to the SEPARATE downstream guard that
-        only fires AFTER a session resolves but yields no issue id).
+        must describe the REAL failure: the session was not found — an
+        ``AdapterError``, NOT the ownership ``ValidationError`` that only fires
+        AFTER a session resolves with a missing or foreign issue id.
         """
         adapter = _make_adapter()
         adapter._graphql_query = AsyncMock(return_value={"data": {"agentSession": None}})  # type: ignore[method-assign]
 
         with pytest.raises(AdapterError) as exc_info:
             await adapter.fetch_messages(_SESSION_THREAD)
-        message = str(exc_info.value)
-        assert message == "Linear agent session session-789 not found"
-        # Guard against the prior misleading wording.
-        assert "missing issueId" not in message
-
-
-# ===========================================================================
-# issueId fallback — nullish (??) NOT truthiness (||): empty issue.id is kept
-# ===========================================================================
-
-
-class TestFetchAgentSessionIssueIdNullish:
-    @pytest.mark.asyncio
-    async def test_empty_session_issue_id_is_kept_not_replaced_by_thread(self) -> None:
-        """A session whose ``issue.id`` is an EMPTY STRING must KEEP ``""`` as the
-        resolved issue id (``session_issue_id if session_issue_id is not None else
-        thread.issue_id``) — NOT fall back to ``thread.issue_id``.
-
-        Upstream is ``agentSession.issueId ?? thread.issueId`` followed by
-        ``if (!issueId) throw`` (index.ts:1775-1781): the ``??`` keeps ``""`` and
-        the ``!issueId`` falsy guard then bails. So with a session ``issue.id`` of
-        ``""`` and a NON-empty ``thread.issue_id`` fallback, the correct (nullish)
-        code keeps ``""`` and raises "missing issueId"; if the fallback were
-        mutated to ``or`` (truthiness), ``""`` would be REPLACED by the non-empty
-        ``thread.issue_id`` and the fetch would SUCCEED — so this raise is the
-        unforgeable signal that the empty string was preserved.
-
-        Called directly (a thread id string cannot encode an empty issue id) with
-        a non-empty ``thread.issue_id`` so the ``or`` mutation is distinguishable
-        from the ``is not None`` truth.
-        """
-        adapter = _make_adapter()
-        # Session resolves with an EMPTY issue.id; the children query must never
-        # run (the falsy guard bails first) — a failing AsyncMock proves that.
-        adapter._graphql_query = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[
-                _session_return(issue_id=""),
-                AssertionError("children query must not run when issue id is empty"),
-            ]
-        )
-        thread = LinearAgentSessionThreadId(issue_id="issue-fallback", agent_session_id="session-789")
-
-        with pytest.raises(AdapterError) as exc_info:
-            await adapter._fetch_agent_session_messages(thread)
-        # The empty string was kept (per ``??``) and tripped the ``!issueId``
-        # guard. Under an ``or`` mutation, ``thread.issue_id`` ("issue-fallback")
-        # would have been substituted and the fetch would have proceeded.
-        assert "missing issueId" in str(exc_info.value)
-        # Only the session query ran; the children query was never reached.
-        assert adapter._graphql_query.await_count == 1
+        assert str(exc_info.value) == "Linear agent session session-789 not found"
+        assert not isinstance(exc_info.value, ValidationError)
 
 
 # ===========================================================================
@@ -671,32 +753,41 @@ class TestCommentPathFetchUnchanged:
 
     @pytest.mark.asyncio
     async def test_comment_thread_fetch_uses_comment_query(self) -> None:
-        """A ``:c:`` thread still routes to the comment-thread fetch unchanged."""
+        """A ``:c:`` thread still routes to the comment-thread fetch."""
         adapter = _make_adapter()
         adapter._graphql_query = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "data": {
-                    "comment": {
-                        "id": "comment-root",
-                        "body": "root",
-                        "createdAt": "2025-06-01T12:00:00.000Z",
-                        "updatedAt": "2025-06-01T12:00:00.000Z",
-                        "url": "https://linear.app/comment/comment-root",
-                        "user": {"id": "u1", "displayName": "u", "name": "User"},
-                        "children": {
-                            "nodes": [],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        },
+            side_effect=[
+                {
+                    "data": {
+                        "comment": {
+                            "id": "comment-root",
+                            "body": "root",
+                            "createdAt": "2025-06-01T12:00:00.000Z",
+                            "updatedAt": "2025-06-01T12:00:00.000Z",
+                            "url": "https://linear.app/comment/comment-root",
+                            "user": {"id": "u1", "displayName": "u", "name": "User"},
+                            "issue": {"id": "issue-123"},
+                        }
                     }
-                }
-            }
+                },
+                {
+                    "data": {
+                        "comment": {
+                            "children": {
+                                "nodes": [],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            }
+                        }
+                    }
+                },
+            ]
         )
 
         result = await adapter.fetch_messages(_COMMENT_THREAD)
 
-        query = adapter._graphql_query.call_args[0][0]
-        assert "comment(id: $commentId)" in query
-        assert "agentSession" not in query
+        queries = [call[0][0] for call in adapter._graphql_query.call_args_list]
+        assert all("comment(id: $commentId)" in query for query in queries)
+        assert not any("agentSession" in query for query in queries)
         assert [m.id for m in result.messages] == ["comment-root"]
         # Comment path keeps the fixed thread_id.
         assert result.messages[0].thread_id == _COMMENT_THREAD
