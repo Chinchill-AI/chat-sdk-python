@@ -17,6 +17,7 @@ the network and every signature/claim check executes unmocked.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime
 import json
@@ -37,10 +38,12 @@ from chat_sdk.adapters.google_chat.adapter import (
     GOOGLE_OIDC_CERTS_URL,
     GoogleChatAdapter,
 )
+from chat_sdk.adapters.google_chat.thread_utils import GoogleChatThreadId
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
+from chat_sdk.cards import Actions, Button, Card
 from chat_sdk.shared.errors import ValidationError
 
 # Env vars that gate the constructor's fail-closed check. Cleared on a
@@ -655,6 +658,41 @@ class TestPerShapeVerificationRejection:
         assert pubsub_result["status"] != 401
 
 
+class TestEndpointUrlOverridesSignatureOptOut:
+    """Breaking change (#222, upstream index.ts branch order): a configured
+    ``endpoint_url`` is a direct-webhook verifier and wins over
+    ``disable_signature_verification``, which used to cover direct webhooks
+    whenever no project number was set."""
+
+    @pytest.mark.asyncio
+    async def test_endpoint_url_verifies_direct_webhooks_despite_opt_out(self):
+        adapter = _make_adapter(endpoint_url=_ENDPOINT, disable_signature_verification=True)
+        chat = _make_mock_chat()
+        await adapter.initialize(chat)
+
+        result = await adapter.handle_webhook(_direct(None))
+
+        assert result == {"body": "Unauthorized", "status": 401}
+        chat.process_message.assert_not_called()
+
+    def test_constructor_warns_that_opt_out_no_longer_covers_direct_webhooks(
+        self, clear_verification_env: pytest.MonkeyPatch
+    ):
+        logger = _logger_mock()
+        GoogleChatAdapter(_config(endpoint_url=_ENDPOINT, disable_signature_verification=True, logger=logger))
+
+        assert any(
+            m.startswith("disable_signature_verification does not cover direct Google Chat webhooks")
+            for m in _warn_messages(logger)
+        ), _warn_messages(logger)
+
+    def test_no_precedence_warning_without_the_opt_out(self, clear_verification_env: pytest.MonkeyPatch):
+        logger = _logger_mock()
+        GoogleChatAdapter(_config(endpoint_url=_ENDPOINT, logger=logger))
+
+        assert not any("does not cover direct" in m for m in _warn_messages(logger))
+
+
 # =============================================================================
 # Tests -- GoogleChatAdapterConfig field order (Finding 2)
 #
@@ -770,6 +808,37 @@ class TestProjectNumberVerification:
     async def test_rejects_chat_issuer_token_with_wrong_issuer_claim(self):
         adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
         token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789", iss="https://accounts.google.com"))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "iss",
+        [
+            pytest.param("chat", id="a substring"),
+            pytest.param("", id="the empty string"),
+            pytest.param("gserviceaccount.com", id="a domain suffix"),
+            pytest.param([_CHAT_SA], id="a list holding the issuer"),
+        ],
+    )
+    async def test_rejects_chat_issuer_token_whose_issuer_only_partially_matches(self, iss: Any):
+        # PyJWT 2.10.0 (allowed by `pyjwt>=2.8`) matched `issuer=` as a
+        # substring (CVE-2024-53861); the issuer is compared exactly by hand.
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789", iss=iss))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_chat_issuer_token_with_list_audience(self):
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789", aud=["123456789", "999999999"]))
 
         result = await adapter.handle_webhook(_direct(token))
 
@@ -916,6 +985,60 @@ class TestEndpointUrlVerification:
         chat.process_message.assert_not_called()
         # Only the project-number verifier ran; the OIDC keys were never used.
         assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+
+_DIRECT_TOKEN_PATHS = ("endpoint_url", "project_number")
+
+
+async def _direct_webhook_with_claims(
+    path: str, *, drop: str | None = None, **overrides: Any
+) -> tuple[dict[str, Any], MagicMock]:
+    """Send a direct webhook whose token is otherwise valid for ``path``."""
+    if path == "endpoint_url":
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+        key, kid, claims = _OIDC_KEY, _OIDC_KID, _oidc_claims(_ENDPOINT, **overrides)
+    else:
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        key, kid, claims = _CHAT_KEY, _CHAT_KID, _chat_claims("123456789", **overrides)
+    if drop is not None:
+        del claims[drop]
+    return await adapter.handle_webhook(_direct(_mint(key, kid, claims))), chat
+
+
+class TestDirectTokenTimeClaims:
+    """google-auth-library's time checks, applied on both direct-token paths:
+    300 s clock skew on ``iat``/``exp``, ``exp``/``iat``/``iss`` required, and
+    ``exp`` less than 24 h ahead (DEFAULT_MAX_TOKEN_LIFETIME_SECS_)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", _DIRECT_TOKEN_PATHS)
+    @pytest.mark.parametrize(
+        ("iat_offset", "exp_offset", "expected_status"),
+        [
+            pytest.param(200, 3600, 200, id="iat 200s ahead is within skew"),
+            pytest.param(400, 3600, 401, id="iat 400s ahead is too early"),
+            pytest.param(-3600, -200, 200, id="exp 200s past is within skew"),
+            pytest.param(-3600, -400, 401, id="exp 400s past is too late"),
+            pytest.param(0, 86400 - 60, 200, id="exp just under 24h ahead"),
+            pytest.param(0, 86400 + 60, 401, id="exp over 24h ahead"),
+            pytest.param(0, 400 * 86400, 401, id="exp 400 days ahead"),
+        ],
+    )
+    async def test_time_claim_boundaries(self, path: str, iat_offset: int, exp_offset: int, expected_status: int):
+        now = int(time.time())
+        result, chat = await _direct_webhook_with_claims(path, iat=now + iat_offset, exp=now + exp_offset)
+
+        assert result["status"] == expected_status
+        assert chat.process_message.call_count == (1 if expected_status == 200 else 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", _DIRECT_TOKEN_PATHS)
+    @pytest.mark.parametrize("claim", ["exp", "iat", "iss"])
+    async def test_rejects_token_missing_a_required_claim(self, path: str, claim: str):
+        result, chat = await _direct_webhook_with_claims(path, drop=claim)
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
 
 
 class TestWorkspaceAddOnIdentity:
@@ -1129,6 +1252,25 @@ class TestVerificationKeyCache:
         assert (await adapter.handle_webhook(_direct(unknown)))["status"] == 401
         assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
 
+    @pytest.mark.asyncio
+    async def test_concurrent_webhooks_on_a_cold_cache_fetch_once(self):
+        adapter, chat, server = await _verifying_adapter(google_chat_project_number="123456789")
+
+        async def slow_fetch(url: str) -> Any:
+            # Yield so every webhook reaches the key lookup before any fetch
+            # completes; without the lock each one would fetch.
+            await asyncio.sleep(0.01)
+            return await server.fetch(url)
+
+        adapter._fetch_json = AsyncMock(side_effect=slow_fetch)  # type: ignore[method-assign]
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        results = await asyncio.gather(*(adapter.handle_webhook(_direct(token)) for _ in range(5)))
+
+        assert [r["status"] for r in results] == [200] * 5
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+        assert chat.process_message.call_count == 5
+
 
 # =============================================================================
 # Tests -- button-click endpoint inference (upstream 270b1c25, #518)
@@ -1201,3 +1343,65 @@ class TestButtonClickEndpointInference:
         await adapter.handle_webhook(FakeRequest(json.dumps({"chat": {}}), url="/api/webhooks/gchat"))
 
         assert adapter._inferred_endpoint_url is None
+
+
+def _card_with_button() -> Card:
+    return Card(children=[Actions([Button(id="approve", label="Approve")])])
+
+
+async def _post_card(adapter: GoogleChatAdapter, method: str) -> None:
+    thread_id = adapter.encode_thread_id(GoogleChatThreadId(space_name="spaces/ABC123"))
+    card = _card_with_button()
+    if method == "post_message":
+        await adapter.post_message(thread_id, card)
+    elif method == "post_ephemeral":
+        await adapter.post_ephemeral(thread_id, "users/100", card)
+    elif method == "edit_message":
+        await adapter.edit_message(thread_id, "spaces/ABC123/messages/m1", card)
+    else:
+        await adapter.post_channel_message("gchat:spaces/ABC123", card)
+
+
+def _rendered_button_function(api: AsyncMock) -> str:
+    bodies = [call.kwargs.get("body") for call in api.await_args_list]
+    cards = [body["cardsV2"] for body in bodies if isinstance(body, dict) and "cardsV2" in body]
+    assert len(cards) == 1, bodies
+    button = cards[0][0]["card"]["sections"][0]["widgets"][0]["buttonList"]["buttons"][0]
+    return button["onClick"]["action"]["function"]
+
+
+_CARD_POSTING_METHODS = ("post_message", "post_ephemeral", "edit_message", "post_channel_message")
+
+
+class TestButtonClickEndpointReachesRenderedCards:
+    """Each card-rendering site routes buttons through
+    ``_button_click_endpoint_url()``: the inferred URL is no longer written
+    into ``_endpoint_url``, so a site reading ``_endpoint_url`` directly would
+    silently lose button routing for inference-only deployments."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", _CARD_POSTING_METHODS)
+    async def test_inferred_endpoint_url_is_rendered_into_card_buttons(self, method: str):
+        inferred = "https://my-app.example/api/webhooks/gchat"
+        adapter = _make_adapter()  # explicit opt-out; no endpoint_url configured
+        await adapter.initialize(_make_mock_chat())
+        assert (await adapter.handle_webhook(FakeRequest(json.dumps({"chat": {}}), url=inferred)))["status"] == 200
+        api = AsyncMock(return_value={"name": "spaces/ABC123/messages/m1"})
+        adapter._gchat_api_request = api  # type: ignore[method-assign]
+
+        await _post_card(adapter, method)
+
+        assert _rendered_button_function(api) == inferred
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", _CARD_POSTING_METHODS)
+    async def test_configured_endpoint_url_wins_over_inferred_in_card_buttons(self, method: str):
+        adapter = _make_adapter(endpoint_url=_ENDPOINT)
+        await adapter.initialize(_make_mock_chat())
+        adapter._inferred_endpoint_url = "https://inferred.example/webhook"
+        api = AsyncMock(return_value={"name": "spaces/ABC123/messages/m1"})
+        adapter._gchat_api_request = api  # type: ignore[method-assign]
+
+        await _post_card(adapter, method)
+
+        assert _rendered_button_function(api) == _ENDPOINT

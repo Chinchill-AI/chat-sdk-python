@@ -126,6 +126,10 @@ _VERIFICATION_KEYS_TTL_SECONDS = 60 * 60
 # Clock skew tolerated on exp/iat (google-auth-library's default, which
 # upstream's verifyIdToken / verifySignedJwtWithCertsAsync apply).
 _JWT_CLOCK_SKEW_SECONDS = 300
+# Maximum token lifetime: google-auth-library rejects a token whose ``exp`` is
+# this far or further in the future ("Expiration time too far in future",
+# DEFAULT_MAX_TOKEN_LIFETIME_SECS_), on both upstream verification paths.
+_JWT_MAX_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60
 
 # Google Chat API base URL
 GCHAT_API_BASE = "https://chat.googleapis.com/v1"
@@ -238,6 +242,22 @@ class GoogleChatAdapter:
                 "will be accepted without JWT verification. Do not use this in "
                 "production -- set google_chat_project_number, endpoint_url "
                 "and/or pubsub_audience instead.",
+            )
+
+        # ``endpoint_url`` is a direct-webhook verifier (upstream 270b1c25), and
+        # a configured verifier takes precedence over the opt-out. Deployments
+        # that set ``endpoint_url`` only for button routing and relied on the
+        # opt-out for direct webhooks now get 401s -- say so at startup.
+        # Python-only log line; the precedence itself matches upstream.
+        if self._disable_signature_verification and self._endpoint_url:
+            self._logger.warn(
+                "disable_signature_verification does not cover direct Google Chat "
+                "webhooks while endpoint_url is set: endpoint_url is a direct-webhook "
+                "verifier, so each direct webhook must carry a Google OIDC token "
+                "whose aud is endpoint_url (the 'HTTP endpoint URL' authentication "
+                "audience). For the 'Project number' audience, also set "
+                "google_chat_project_number.",
+                {"endpointUrl": self._endpoint_url},
             )
 
         # In-progress subscription creations to prevent duplicate requests
@@ -824,6 +844,9 @@ class GoogleChatAdapter:
             return False
 
         claims = {"iss": payload.get("iss"), "aud": payload.get("aud"), "email": payload.get("email")}
+        if _exceeds_max_token_lifetime(payload):
+            self._logger.warn("JWT expiration time too far in future", claims)
+            return False
         # Issuer is checked by hand rather than through PyJWT's ``issuer=``
         # sequence support, whose behaviour varies across the supported
         # ``pyjwt>=2.8`` range. ``isinstance`` first: a list-valued ``iss``
@@ -904,19 +927,31 @@ class GoogleChatAdapter:
             import jwt as pyjwt
 
             key = await self._get_verification_key(token, chat_issuer=True)
-            pyjwt.decode(
+            payload = pyjwt.decode(
                 token,
                 key,
                 algorithms=["RS256"],
                 audience=project_number,
-                issuer=GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL,
                 leeway=_JWT_CLOCK_SKEW_SECONDS,
                 options={"require": ["exp", "iat", "iss"], "strict_aud": True},
             )
-            return True
         except Exception as error:
             self._logger.warn("Project-number JWT verification failed", {"error": error})
             return False
+
+        claims = {"iss": payload.get("iss"), "aud": payload.get("aud")}
+        # Issuer checked by hand, not with PyJWT's ``issuer=``: PyJWT 2.10.0
+        # (inside the supported ``pyjwt>=2.8`` range) matched a string
+        # ``issuer`` as a substring (CVE-2024-53861), accepting e.g. ``"chat"``
+        # or ``""``.
+        iss = payload.get("iss")
+        if not isinstance(iss, str) or iss != GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL:
+            self._logger.warn("Project-number JWT issuer is not the Chat service account", claims)
+            return False
+        if _exceeds_max_token_lifetime(payload):
+            self._logger.warn("Project-number JWT expiration time too far in future", claims)
+            return False
+        return True
 
     async def _verify_direct_webhook_token(self, request: Any) -> bool:
         """Verify a direct Google Chat webhook.
@@ -3175,6 +3210,20 @@ class _GoogleApiError(Exception):
         super().__init__(message)
         self.code = code
         self.errors = errors
+
+
+def _exceeds_max_token_lifetime(payload: dict[str, Any]) -> bool:
+    """Whether ``exp`` is at least 24 hours ahead of the wall clock.
+
+    Mirrors google-auth-library's ``exp >= now + maxExpiry`` check (no clock
+    skew applied), which PyJWT does not perform. An ``exp`` that cannot be
+    read as a number fails closed.
+    """
+    try:
+        exp = float(payload["exp"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return exp >= time.time() + _JWT_MAX_TOKEN_LIFETIME_SECONDS
 
 
 def _absolute_request_url(request: Any) -> str | None:

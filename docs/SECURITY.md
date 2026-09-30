@@ -67,7 +67,9 @@ The Teams adapter implements its own JWT validation rather than using the Micros
 - **Pub/Sub pushes** (`pubsub_audience`): the same OIDC checks with audience equal to `pubsub_audience`. `email_verified` must be `true`, and `email` must equal `pubsub_service_account_email`. If that setting is unset, every push is rejected.
 - **Why identity matters**: none of the audiences is secret. Anyone can get Google to sign a token for a public URL, so only the `email` claim (or the Chat issuer's own key) identifies the sender.
 - **Key caching**: both key sets are fetched asynchronously and cached for 1 hour. A failed fetch is not cached.
+- **Token lifetime**: `exp` and `iat` are required and checked with 300 s of clock skew. A token whose `exp` is 24 hours or more in the future is rejected, as google-auth-library does.
 - **Transports verify independently**: a request shape whose verifier is not configured is rejected with 401 unless `disable_signature_verification` is set. The constructor refuses to start when no verifier is configured and the opt-out is not set.
+- **A configured verifier beats the opt-out**: `disable_signature_verification` only covers a transport that has no verifier. Setting `endpoint_url` (even only for button routing) makes it a direct-webhook verifier, so direct webhooks are verified and the opt-out no longer applies to them. The constructor logs a warning when both are set.
 - **Endpoint inference**: when `endpoint_url` is unset, the button-click routing URL is inferred from `request.url`, but only after a direct webhook passes verification. It is never used as a verification audience.
 
 ### GitHub

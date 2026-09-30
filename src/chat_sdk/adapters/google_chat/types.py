@@ -331,6 +331,12 @@ class GoogleChatAdapterConfig:
     # equivalent guarantees. Falls back to the
     # GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION env var when left unset (None).
     #
+    # The opt-out only covers a transport with no verifier configured: a set
+    # google_chat_project_number or endpoint_url still verifies direct
+    # webhooks, and a set pubsub_audience still verifies Pub/Sub pushes. So
+    # setting endpoint_url (even only for button routing) means direct
+    # webhooks are verified despite this flag.
+    #
     # Kept at the END of the field list intentionally: GoogleChatAdapterConfig
     # is a positional-args dataclass, so inserting a new field in the middle
     # would silently shift every later positional arg for existing callers.
