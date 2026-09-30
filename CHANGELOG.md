@@ -2,7 +2,7 @@
 
 ## Unreleased (4.41 wave)
 
-Work toward upstream `chat@4.41.1` parity (tracking issue #184). `UPSTREAM_PARITY` stays `4.31.0` until the wave's final PR (#203).
+Part of the upstream `4.31.0` → `4.41.1` sync wave (#184). `UPSTREAM_PARITY` stays `4.31.0` until the wave's final pin bump.
 
 - **BREAKING (security) — Telegram: webhook verification is required by default; repeated updates are deduplicated** (#224; upstream vercel/chat#858, #799, #813).
   - Telegram webhook deployments without `TELEGRAM_WEBHOOK_SECRET_TOKEN` / `secret_token` now **fail to start or return 401**: `mode="webhook"` raises `ValidationError` in the constructor, `mode="auto"` raises from `initialize()` when it resolves to webhook mode (so `Chat` initialization fails and is retried on every webhook until the config is fixed), and `handle_webhook` returns 401 `"Webhook verification required"` before reading the body. Previously the adapter logged a warning and dispatched every update, including `callback_query` button actions.
@@ -11,11 +11,39 @@ Work toward upstream `chat@4.41.1` parity (tracking issue #184). `UPSTREAM_PARIT
   - Bot identity (`getMe`) is now resolved through a shared, retrying lookup: a failed startup `getMe` is retried on the next webhook instead of leaving `bot_user_id` unset. Once resolved it is cached; a repeat `initialize()` keeps the `getMe` username instead of reverting to `Chat.user_name`.
   - `TelegramAdapterConfig.allow_unverified_webhooks` is appended as the last field, so positional construction binds the same parameters as before.
   - `secret_token` now resolves with `??` semantics: an explicit `secret_token=""` no longer falls back to `TELEGRAM_WEBHOOK_SECRET_TOKEN` (it counts as "no secret").
+- **Messenger: guard attachment downloads** (#234, **security**; port of vercel/chat 153bd964, chat@4.39.0). `Attachment.fetch_data()` used to GET whatever URL arrived in the webhook `payload.url` and follow redirects, and `fallback` / link-share attachments carry user-controlled URLs (SSRF). Downloads are now restricted to https URLs on `fbsbx.com` / `fbcdn.net` (or a subdomain), checked before any network I/O and on every redirect hop (at most 5), with a 25 MB body cap and a 30 s deadline; failures raise `NetworkError("messenger", ...)`. The check runs inside the download closure, so closures rebuilt by `rehydrate_attachment` from persisted queue/debounce state are covered too.
+  - **Consumer-visible:** `fetch_data()` for a Messenger attachment whose URL is not on a Meta CDN host (typically `fallback` / link shares) now raises `NetworkError("messenger", "Refusing to fetch an untrusted attachment URL")` instead of downloading. `attachment.url` is unchanged and still available for display.
+  - **Python-specific (divergence from upstream):** no DNS / private-IP resolution check yet (the host allowlist alone rejects IP literals and non-Meta names; tracked for #204/#239), the URL check is stricter than upstream (also rejects userinfo, non-443 ports and non-ASCII or non-DNS-label hosts), and IP-literal / unparseable URLs raise the "untrusted" message instead of upstream's "internal" message or generic download-failure wrapper. See `docs/UPSTREAM_SYNC.md`.
 - **Twilio: per-conversation locks and channels** (#235; **security**, **breaking (Twilio)**). Ports upstream `28bc7768` (vercel/chat#849, chat@4.39.0) and the Twilio part of `b7c9316b` (vercel/chat#875, chat@4.40.0). The adapter's `lock_scope` is now `"thread"`, and `twilio_channel_id` / `channel_id_from_thread_id` / `fetch_thread().channel_id` return the full `twilio:{sender}:{recipient}` thread id instead of the shared bot-side `twilio:{sender}`. Different recipients texting the same bot number no longer share a lock (previously they serialized behind each other, and under the default `drop` strategy the later one raised `LockError`), channel history or channel state.
   - **Consumer-visible:** Twilio `channel_id` (and `thread.channel.id`) now equals the thread id. Channel-scoped state and channel-history keys written under the old `twilio:{sender}` id are no longer read. Thread ids and thread history are unchanged; `channel_name` is still the sender number.
 - **Twilio: authenticated media downloads restricted to the configured API origin** (#235; **security**, **breaking (Twilio, custom `api_url` only)**). Ports upstream `d8103a10` (vercel/chat#831, chat@4.38.1). `fetch_twilio_media` gains keyword-only `api_url` / `api_base_url` and raises `TwilioApiError("Twilio media URL must match the configured Twilio API origin", status=0)` for any URL whose scheme, host or effective port differs from `api_url` → `api_base_url` → `https://api.twilio.com`. The check runs before credentials are resolved or a request is made. The adapter passes its `api_url` to every attachment download, freshly received webhook media (`MediaUrlN`) as well as rehydrated attachments, so the existing Python-only Twilio host allowlist stays in front as defence in depth (documented in `docs/UPSTREAM_SYNC.md`).
   - **Consumer-visible (custom `api_url` only):** with a non-default `api_url`, media hosted on any other origin, including inbound media on `https://api.twilio.com`, is now refused (upstream behaves the same). With a non-Twilio or `http` `api_url` (a proxy or local mock), no media URL passes both layers: `api.twilio.com` fails the origin check and the proxy origin fails the host allowlist, so attachment downloads always raise. Before this change such configs downloaded `api.twilio.com` media. The default config (`api_url` unset) is unaffected.
 - **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
+### Security
+
+- **Webhook log hygiene: raw bodies and message content no longer reach DEBUG logs** (#187; ports upstream `fc7df9c4` / vercel/chat#500 and the logging parts of `f485255b` / vercel/chat#877). Several adapters logged raw webhook bodies, or previews of them, at DEBUG. In some cases this happened before signature or JWT verification, so unauthenticated input and message content could be copied into log sinks. Webhook handlers now log only request-shape metadata:
+  - GitHub: `{bodyBytes, contentType, eventType, signaturePresent}`, under "GitHub webhook signature verification failed" or "GitHub webhook request verified", plus `jsonParseStatus: "error"` on invalid JSON.
+  - GChat, Slack (after verification only) and the Teams bridge: `"… webhook received" {bodyLength}`.
+  - Linear: the raw-body log is gone.
+  - `Chat` "Incoming message": drops `author` and adds `is_bot`, matching upstream's key set.
+- **Consumer-visible (DEBUG logs only; no routing, response or status change):**
+  - The `"GitHub/GChat/Slack/Teams/Linear/WhatsApp webhook raw body"` messages are gone. GChat, Slack and Teams now emit `"… webhook received"` with `bodyLength`, which is a UTF-8 byte count.
+  - GitHub's `"GitHub webhook event type"` is replaced by `"GitHub webhook request verified"`.
+  - `bodyPreview` becomes `bodyBytes` on the GitHub, Linear and WhatsApp invalid-JSON errors.
+  - "Incoming message" loses `author`.
+
+  Anything that parses these log lines must be updated.
+
+### Python-specific (divergence from upstream)
+
+- **WhatsApp** drops its raw-body debug log and invalid-JSON `bodyPreview` (#187). Upstream 4.41.1 still logs both.
+- **Message-content debug logs** (#187):
+  - GChat "message event" logs `{space, textLength}`.
+  - GChat "Pub/Sub parsed message" drops `text` and `author`.
+  - The `Chat`, Slack and Discord slash-command debug logs log `textLength` instead of `text`.
+
+  Upstream still logs this content. Both divergences are recorded in `docs/UPSTREAM_SYNC.md`.
 
 ## 0.4.31.3
 

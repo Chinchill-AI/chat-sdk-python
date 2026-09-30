@@ -63,6 +63,7 @@ from chat_sdk.shared.errors import (
     NetworkError,
     ValidationError,
 )
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     AdapterPostableMessage,
     Author,
@@ -752,7 +753,6 @@ class LinearAdapter:
         See: https://linear.app/developers/webhooks
         """
         body = await self._get_request_body(request)
-        self._logger.debug("Linear webhook raw body", {"body": body[:500] if body else ""})
 
         # Verify request signature (Linear-Signature header)
         signature = self._get_header(request, "linear-signature")
@@ -765,8 +765,8 @@ class LinearAdapter:
             self._logger.error(
                 "Linear webhook invalid JSON",
                 {
+                    "bodyBytes": utf8_byte_length(body),
                     "contentType": self._get_header(request, "content-type"),
-                    "bodyPreview": body[:200] if body else "",
                 },
             )
             return self._make_response("Invalid JSON", 400)
