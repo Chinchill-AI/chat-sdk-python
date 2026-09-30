@@ -25,6 +25,7 @@ from chat_sdk.ai.messages import (
 )
 from chat_sdk.ai.tools import (
     ApprovalConfig,
+    ChatApprovalToolName,
     ChatBinding,
     ChatTool,
     ChatToolName,
@@ -32,6 +33,7 @@ from chat_sdk.ai.tools import (
     ChatTools,
     ChatToolsOptions,
     ChatWriteToolName,
+    ReadScope,
     ToolOptions,
     ToolOverrides,
     add_reaction,
@@ -64,6 +66,7 @@ __all__ = [
     "AiTextPart",
     "AiUserMessage",
     "ApprovalConfig",
+    "ChatApprovalToolName",
     "ChatBinding",
     "ChatTool",
     "ChatToolName",
@@ -71,6 +74,7 @@ __all__ = [
     "ChatTools",
     "ChatToolsOptions",
     "ChatWriteToolName",
+    "ReadScope",
     "ToAiMessagesOptions",
     "ToolOptions",
     "ToolOverrides",

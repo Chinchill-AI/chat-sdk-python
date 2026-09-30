@@ -19,6 +19,7 @@ import pytest
 
 from chat_sdk.callback_url import CallbackContext, CallbackScope, ResolvedCallback
 from chat_sdk.chat import Chat
+from chat_sdk.context import active_conversation
 from chat_sdk.emoji import get_emoji
 from chat_sdk.errors import ChatError, LockError
 from chat_sdk.testing import (
@@ -542,10 +543,12 @@ class TestMessageDeduplication:
         state.set_if_not_exists = spy  # type: ignore[method-assign]
         failure = RuntimeError("Admission failed")
         calls: list[str] = []
+        conversations: list[str | None] = []
 
         @chat.on_mention
         async def handler(thread, message, context=None):
             calls.append(message.id)
+            conversations.append(active_conversation())
             if len(calls) == 1:
                 raise failure
 
@@ -562,6 +565,9 @@ class TestMessageDeduplication:
         await dispatch()
 
         assert calls == ["retry", "retry"]
+        # Python-only: the dedupe bypass still runs in the thread's conversation
+        # (upstream processMessage wraps it in runInConversation).
+        assert conversations == ["slack:C123:1234.5678", "slack:C123:1234.5678"]
         assert all(call.args[0] != "dedupe:slack:retry" for call in spy.await_args_list)
 
     # TS: "should use custom dedupeTtlMs when configured"
@@ -4171,7 +4177,6 @@ class TestLockScope:
             assert key == "telegram:C123"
 
     # TS: "should isolate queued messages across channel-scoped threads"
-    # (``activeConversation()`` assertions belong to #195 and are not ported here.)
     async def test_should_isolate_queued_messages_across_channelscoped_threads(self):
         state = create_mock_state()
         adapter = create_mock_adapter("telegram")
@@ -4191,11 +4196,13 @@ class TestLockScope:
 
         first = "telegram:C123:topic1"
         second = "telegram:C123:topic2"
+        active_conversations: list[str | None] = []
         mentions = AsyncMock(return_value=None)
         subscribed_calls: list[tuple[Any, Any, Any]] = []
 
         async def subscribed(thread, message, context=None):
             subscribed_calls.append((thread, message, context))
+            active_conversations.append(active_conversation())
             await thread.set_state({"request": message.text})
 
         chat.on_mention(mentions)
@@ -4220,6 +4227,7 @@ class TestLockScope:
         thread, message, context = subscribed_calls[0]
         assert thread.id == second
         assert message.thread_id == second
+        assert active_conversations == [second]
         assert context == MessageContext(skipped=[], total_since_last_handler=1)
         assert state.cache.get(f"thread-state:{second}") == {"request": "private request"}
         assert f"thread-state:{first}" not in state.cache
@@ -4231,7 +4239,6 @@ class TestLockScope:
         )
 
     # TS: "should isolate debounced messages across channel-scoped threads"
-    # (``activeConversation()`` assertions belong to #195 and are not ported here.)
     async def test_should_isolate_debounced_messages_across_channelscoped_threads(self, monkeypatch):
         clock = FakeClock().install(monkeypatch)
         state = create_mock_state()
@@ -4252,8 +4259,9 @@ class TestLockScope:
 
         first = "telegram:C123:topic1"
         second = "telegram:C123:topic2"
+        active_conversations: list[str | None] = []
         mentions = AsyncMock(return_value=None)
-        subscribed = AsyncMock(return_value=None)
+        subscribed = AsyncMock(side_effect=lambda *_args, **_kwargs: active_conversations.append(active_conversation()))
         chat.on_mention(mentions)
         chat.on_subscribed_message(subscribed)
         await state.subscribe(second)
@@ -4278,6 +4286,7 @@ class TestLockScope:
         thread, message, context = subscribed.await_args_list[0].args
         assert thread.id == second
         assert message.thread_id == second
+        assert active_conversations == [second]
         assert context == MessageContext(skipped=[], total_since_last_handler=1)
         assert any(
             call[0] == "message-dequeued"
