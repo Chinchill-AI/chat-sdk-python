@@ -55,6 +55,8 @@ class TestWhatsAppApiError:
             (401, 100, "AUTH_FAILED"),
             (400, 10, "PERMISSION_DENIED"),
             (400, 200, "PERMISSION_DENIED"),
+            (400, 299, "PERMISSION_DENIED"),
+            (400, 300, None),
             (403, 100, "PERMISSION_DENIED"),
             (404, 100, "NOT_FOUND"),
             (400, 131_047, None),
@@ -207,8 +209,21 @@ class TestWhatsAppApiErrorPythonSpecific:
         assert error.provider_message == ""
         assert str(error) == "WhatsApp API error: 400 "
 
-    def test_caught_by_existing_adapter_error_handlers(self):
-        with pytest.raises(AdapterError) as excinfo:
-            raise WhatsAppApiError("WhatsApp API error", 429, "{}")
+    @pytest.mark.parametrize(("length", "suffix"), [(500, ""), (501, "…")])
+    def test_non_json_body_is_truncated_past_500_characters(self, length: int, suffix: str):
+        error = WhatsAppApiError("WhatsApp API error", 502, "x" * length)
 
-        assert excinfo.value.code == "RATE_LIMITED"
+        assert str(error) == f"WhatsApp API error: 502 {'x' * 500}{suffix}"
+
+    @pytest.mark.parametrize("field", ["code", "error_subcode"])
+    def test_numeric_string_past_the_int_digit_limit_stays_typed(self, field: str):
+        # CPython refuses ``int()`` past 4300 digits; upstream's ``Number()``
+        # gives ``Infinity`` without throwing.
+        body = json.dumps({"error": {"message": "m", field: "1" * 5000}})
+
+        error = WhatsAppApiError("WhatsApp API error", 400, body)
+
+        assert error.status == 400
+        assert error.provider_message == "m"
+        assert error.error_code is None
+        assert error.subcode is None

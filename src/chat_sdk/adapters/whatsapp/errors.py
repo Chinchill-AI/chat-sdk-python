@@ -47,7 +47,13 @@ def _integer(value: Any) -> int | None:
     if isinstance(value, float):
         return int(value) if value.is_integer() else None
     if isinstance(value, str) and _INTEGER_STRING.fullmatch(value):
-        return int(value)
+        try:
+            return int(value)
+        except ValueError:
+            # CPython refuses ``int()`` past 4300 digits. Upstream's
+            # ``Number(value)`` is ``Infinity`` there, which matches no
+            # taxonomy code, so ``None`` keeps the error typed.
+            return None
     return None
 
 
@@ -100,8 +106,30 @@ def _taxonomy_code(status: int, code: int | None = None) -> str | None:
 
 def _reject_constant(name: str) -> Any:
     # JS ``JSON.parse`` rejects ``NaN``/``Infinity``; Python accepts them by
-    # default. Reject so such bodies stay text in ``raw`` as upstream.
+    # default.
     raise ValueError(f"invalid JSON constant: {name}")
+
+
+def _parse_int(literal: str) -> int | float:
+    # CPython refuses ``int()`` past 4300 digits; JS reads such a literal as a
+    # (possibly infinite) float.
+    try:
+        return int(literal)
+    except ValueError:
+        return float(literal)
+
+
+def parse_json_text(text: str) -> Any:
+    """Parse ``text`` with JS ``JSON.parse`` semantics.
+
+    Every parse failure is a ``ValueError``, including nesting deep enough to
+    exhaust CPython's recursive scanner (``RecursionError``), so callers
+    catching ``ValueError`` see every invalid body.
+    """
+    try:
+        return json.loads(text, parse_constant=_reject_constant, parse_int=_parse_int)
+    except RecursionError as error:
+        raise ValueError("JSON nesting is too deep") from error
 
 
 class WhatsAppApiError(AdapterError):
@@ -140,7 +168,7 @@ class WhatsAppApiError(AdapterError):
         raw: Any = body
         # Keep the text body for non-JSON responses such as proxy error pages.
         with contextlib.suppress(ValueError):
-            raw = json.loads(body, parse_constant=_reject_constant)
+            raw = parse_json_text(body)
 
         error = _parse_graph_error(raw)
         provider_message = error.get("message") if error is not None else None

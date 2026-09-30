@@ -567,8 +567,16 @@ the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
   `1e3` is accepted as an `int`, because `JSON.parse` yields the JS number `4`
   and `Number.isInteger(4)` holds. Numeric strings must fully match ASCII
   `-?[0-9]+` (JS `\d` has no Unicode digits, and `$` does not match before a
-  trailing newline). `NaN` / `Infinity` bodies stay text in `raw`, as
-  `JSON.parse` rejects them.
+  trailing newline). A numeric string past CPython's 4300-digit `int()` limit
+  reads as absent (upstream's `Number()` gives `Infinity`, which matches no
+  taxonomy code).
+- **JSON parsing (`parse_json_text`)** is shared by `WhatsAppApiError` and the
+  `_graph_fetch_json` success path, and follows `JSON.parse`: `NaN` /
+  `Infinity` are rejected (error bodies stay text in `raw`; success bodies
+  raise `NetworkError`), an integer literal past the `int()` digit limit reads
+  as a float like a JS number, and **Python-specific** nesting deep enough to
+  raise `RecursionError` in CPython's recursive scanner is treated as invalid
+  JSON, so it still surfaces as `WhatsAppApiError` / `NetworkError`.
 - **`_graph_fetch_json`** (upstream `graphFetchJson`) backs `_graph_api_request`
   (label `"WhatsApp API error"`) and the `download_media` metadata GET (label
   `"Failed to get media URL"`, which used to raise `RuntimeError`). The
@@ -576,8 +584,9 @@ the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
   to the shared downloader in #239.
   - **Status range:** success is any 2xx, like `response.ok`. The old port
     accepted only 200, so a 201/204 used to raise.
-  - The body is read as bytes, decoded as UTF-8 with replacement (WHATWG
-    `Response.text()`), and parsed with `json.loads`. aiohttp's
+  - The body is read as bytes, decoded like WHATWG `Response.text()` (UTF-8
+    with replacement, one leading BOM stripped: `utf-8-sig`), and parsed with
+    `parse_json_text`. aiohttp's
     `response.json()` would reject a non-`application/json` content type and
     `text()` would sniff the charset; `fetch` does neither.
   - **Python-specific:** a transport failure while reading the body

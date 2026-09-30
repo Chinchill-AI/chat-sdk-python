@@ -29,7 +29,7 @@ from chat_sdk.adapters.whatsapp.cards import (
     card_to_whatsapp,
     decode_whatsapp_callback_data,
 )
-from chat_sdk.adapters.whatsapp.errors import WhatsAppApiError
+from chat_sdk.adapters.whatsapp.errors import WhatsAppApiError, parse_json_text
 from chat_sdk.adapters.whatsapp.format_converter import WhatsAppFormatConverter
 from chat_sdk.adapters.whatsapp.types import (
     WhatsAppAdapterConfig,
@@ -1627,9 +1627,10 @@ class WhatsAppAdapter:
         try:
             async with session.request(method, url, **kwargs) as response:
                 status: int = response.status
-                # Decode as UTF-8 like WHATWG ``Response.text()``; aiohttp's
+                # Decode like WHATWG ``Response.text()`` ("UTF-8 decode": one
+                # leading BOM stripped, invalid bytes replaced); aiohttp's
                 # ``text()`` would guess the charset instead.
-                body_text = (await response.read()).decode("utf-8", errors="replace")
+                body_text = (await response.read()).decode("utf-8-sig", errors="replace")
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             # A failure while reading the body is wrapped too (upstream only
             # wraps ``fetch()``), so no raw aiohttp error escapes.
@@ -1644,7 +1645,7 @@ class WhatsAppAdapter:
             # Parse the text rather than ``response.json()``: aiohttp rejects
             # non-``application/json`` content types (Graph can answer with
             # ``text/javascript``), while WHATWG ``Response.json()`` does not.
-            return json.loads(body_text)
+            return parse_json_text(body_text)
         except ValueError as error:
             self._logger.error(label, {"status": status, **context, "error": str(error)})
             raise NetworkError("whatsapp", f"{label}: response was not valid JSON", error) from error

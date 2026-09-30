@@ -453,6 +453,14 @@ class TestSendTemplate:
             await adapter.send_template(THREAD_ID, {"name": "hello_world", "language": "en_US"})
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("messages", [[{}], [{"id": ""}]])
+    async def test_throws_when_the_first_message_has_no_id(self, messages: list[dict[str, Any]]):
+        adapter, _ = _adapter_with_session(_json_response({"messages": messages}))
+
+        with pytest.raises(RuntimeError, match="did not return a message ID for template message"):
+            await adapter.send_template(THREAD_ID, {"name": "hello_world", "language": "en_US"})
+
+    @pytest.mark.asyncio
     async def test_throws_on_invalid_thread_id(self):
         adapter, session = _adapter_with_session()
 
@@ -631,3 +639,66 @@ class TestGraphFetchJsonPythonSpecific:
         result = await adapter.post_message(THREAD_ID, "hello")
 
         assert result.id == "wamid.é"
+
+    @pytest.mark.asyncio
+    async def test_leading_bom_is_stripped_like_whatwg_utf8_decode(self):
+        body = b"\xef\xbb\xbf" + b'{"messages": [{"id": "wamid.bom"}]}'
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(200, body))
+
+        result = await adapter.post_message(THREAD_ID, "hello")
+
+        assert result.id == "wamid.bom"
+
+    @pytest.mark.asyncio
+    async def test_leading_bom_does_not_hide_the_meta_error_envelope(self):
+        body = b"\xef\xbb\xbf" + json.dumps({"error": {"message": "Invalid token", "code": 190}}).encode()
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(401, body))
+
+        with pytest.raises(WhatsAppApiError) as excinfo:
+            await adapter.post_message(THREAD_ID, "hello")
+
+        assert excinfo.value.error_code == 190
+        assert excinfo.value.provider_message == "Invalid token"
+
+    @pytest.mark.asyncio
+    async def test_json_constants_in_a_success_body_are_not_valid_json(self):
+        # JS ``Response.json()`` rejects ``NaN``; Python's ``json.loads`` accepts it by default.
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(200, '{"messages": [{"id": "wamid.x"}], "n": NaN}'))
+
+        with pytest.raises(NetworkError, match="response was not valid JSON"):
+            await adapter.post_message(THREAD_ID, "hello")
+
+    @pytest.mark.asyncio
+    async def test_huge_integer_literal_parses_like_a_js_number(self):
+        # CPython refuses ``int()`` past 4300 digits; JS reads it as ``Infinity``.
+        body = '{"messages": [{"id": "wamid.big"}], "n": ' + "1" * 5000 + "}"
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(200, body))
+
+        result = await adapter.post_message(THREAD_ID, "hello")
+
+        assert result.id == "wamid.big"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "expected"), [(200, NetworkError), (400, WhatsAppApiError)])
+    async def test_deeply_nested_body_keeps_the_typed_error(self, status: int, expected: type[Exception]):
+        # CPython's JSON scanner raises ``RecursionError`` (not ``ValueError``)
+        # on deep nesting; it must not escape the typed-error contract.
+        depth = 200_000
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(status, "[" * depth + "]" * depth))
+
+        with pytest.raises(expected):
+            await adapter.post_message(THREAD_ID, "hello")
+
+    @pytest.mark.asyncio
+    async def test_api_error_is_caught_by_a_bare_adapter_error_handler(self):
+        # The compatibility claim for existing callers: a non-2xx Graph call
+        # lands in a pre-existing ``except AdapterError`` block.
+        adapter, _ = _adapter_with_session(_json_response(_RATE_LIMIT_BODY, status=429))
+
+        caught: AdapterError | None = None
+        try:
+            await adapter.post_message(THREAD_ID, "hello")
+        except AdapterError as error:
+            caught = error
+
+        assert type(caught) is WhatsAppApiError
