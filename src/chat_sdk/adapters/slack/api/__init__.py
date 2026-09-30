@@ -62,6 +62,7 @@ __all__ = [
     "encode_slack_api_body",
     "fetch_slack_file",
     "fetch_slack_thread_replies",
+    "is_slack_auth_url",
     "is_trusted_slack_file_url",
     "open_slack_view",
     "post_slack_ephemeral",
@@ -494,22 +495,32 @@ async def fetch_slack_file(
     *,
     url: str,
     token: SlackBotToken,
+    api_url: str | None = None,
     fetch: SlackFetch | None = None,
 ) -> Any:
-    """GET a private Slack file URL with bearer auth; returns the response.
+    """GET a private Slack file URL; returns the response.
 
-    Python-specific hardening: the URL must pass
-    :func:`is_trusted_slack_file_url` — refuses to forward the bot token to
-    untrusted hosts (token-leak guard, mirrors the high-level adapter).
+    Port of upstream ``fetchSlackFile`` (``api/client.ts``, vercel/chat
+    ``7c269653`` #859): the bearer token is resolved and sent only when
+    ``url`` is on a Slack auth origin (:func:`is_slack_auth_url`, which
+    includes the ``api_url`` origin). The request goes through ``fetch``
+    unchanged, as upstream; the default fetch does not follow redirects.
+
+    Python-specific hardening: the URL must also pass
+    :func:`is_trusted_slack_file_url` (raises ``ValueError`` otherwise,
+    before the token is resolved), where upstream fetches any other URL
+    without credentials.
     """
-    if not is_trusted_slack_file_url(url):
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md (untrusted URLs
+    # are refused rather than fetched without credentials).
+    if not is_trusted_slack_file_url(url, api_url=api_url):
         raise ValueError(f"Refusing to fetch Slack file from untrusted URL: {url}")
-    resolved_token = await resolve_slack_bot_token(token)
+    resolved_token = await resolve_slack_bot_token(token) if is_slack_auth_url(url, api_url) else None
     request = fetch if fetch is not None else _default_fetch
     response = await request(
         url,
         method="GET",
-        headers={"authorization": f"Bearer {resolved_token}"},
+        headers={"authorization": f"Bearer {resolved_token}"} if resolved_token else None,
     )
     status = _response_status(response)
     if not 200 <= status < 300:
@@ -633,14 +644,71 @@ def assert_slack_ok(method: str, response: SlackApiResponse) -> None:
         )
 
 
-def is_trusted_slack_file_url(url: str) -> bool:
+# Origins that receive the bot token on file downloads (port of upstream
+# ``file.ts`` ``origins``, vercel/chat ``7c269653`` #859). Compared as exact
+# origins (scheme, host, port), never by suffix.
+_SLACK_AUTH_ORIGINS = frozenset(
+    {
+        ("https", "files.slack.com", 443),
+        ("https", "files.slack-gov.com", 443),
+        ("https", "slack-files.com", 443),
+        ("https", "slack-files-gov.com", 443),
+        ("https", "slack.com", 443),
+        ("https", "slack-gov.com", 443),
+    }
+)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Hosts a Slack file download may start from (Python-only allowlist, see
+# ``is_trusted_slack_file_url``): exact hosts, then Slack-owned suffixes.
+_SLACK_FILE_HOSTS = frozenset(
+    {"files.slack.com", "slack.com", "files.slack-gov.com", "slack-gov.com", "slack-files.com", "slack-files-gov.com"}
+)
+_SLACK_FILE_HOST_SUFFIXES = (".slack.com", ".slack-edge.com", ".slack-gov.com")
+
+
+def _url_origin(url: object) -> tuple[str, str, int | None] | None:
+    """``(scheme, host, port)`` like WHATWG ``URL.origin``; ``None`` if unparsable."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme)
+
+
+def is_slack_auth_url(url: str, api_url: str | None = None) -> bool:
+    """Return True when ``url`` may receive the Slack bot token.
+
+    Port of upstream ``isSlackAuthUrl`` (``file.ts``): the URL's origin must
+    be one of the Slack file/API origins (commercial and GovSlack) or the
+    configured ``api_url`` origin. Exact origin comparison, so lookalike
+    hosts, other ports and plain ``http`` never match.
+    """
+    origin = _url_origin(url)
+    if origin is None:
+        return False
+    return origin in _SLACK_AUTH_ORIGINS or (api_url is not None and origin == _url_origin(api_url))
+
+
+def is_trusted_slack_file_url(url: str, *, api_url: str | None = None) -> bool:
     """Gate Slack file downloads to known Slack-owned hosts.
 
     Bearer tokens must never be forwarded to an arbitrary URL — a crafted
     value could exfiltrate the workspace bot token. This is a Python-first
-    divergence: the upstream primitives do not validate the URL. See
-    ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
+    divergence: upstream fetches other URLs without credentials instead of
+    refusing them. Accepts ``https`` Slack file hosts (commercial, GovSlack
+    and ``slack-files``), Slack-owned subdomains, and the configured
+    ``api_url`` origin. See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
     """
+    if api_url is not None and _url_origin(api_url) is not None and _url_origin(url) == _url_origin(api_url):
+        return True
     try:
         parsed = urlparse(url)
     except (ValueError, TypeError):
@@ -650,11 +718,7 @@ def is_trusted_slack_file_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if not host:
         return False
-    # Exact-match hosts
-    if host in {"files.slack.com", "slack.com"}:
-        return True
-    # Suffix match for Slack-owned subdomains
-    return host.endswith(".slack.com") or host.endswith(".slack-edge.com")
+    return host in _SLACK_FILE_HOSTS or host.endswith(_SLACK_FILE_HOST_SUFFIXES)
 
 
 def _slack_message_body(
