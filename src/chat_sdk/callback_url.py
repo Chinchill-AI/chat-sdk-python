@@ -249,7 +249,9 @@ async def resolve_callback_url(
     match ``context`` (the clicked ``action_id`` and, depending on the
     stored scope, ``channel_id`` or ``thread_id``). A ``None`` context
     never matches. A matching record is deleted before returning, so each
-    token resolves at most once; a mismatch leaves the record in place.
+    token resolves at most once; a mismatch leaves the record in place. If
+    the lock lease lapsed while the record was being consumed, the result is
+    ``None`` (fail closed) so a concurrent click cannot also POST.
     """
     key = f"{CALLBACK_CACHE_KEY_PREFIX}{token}"
     # Lock keys live in their own namespace in every state backend, so
@@ -268,6 +270,13 @@ async def resolve_callback_url(
             return None
 
         await state_adapter.delete(key)
+        # Python-specific fence (divergence from upstream — see
+        # docs/UPSTREAM_SYNC.md): if a stalled state call outlived the lock
+        # lease, another click may have taken the lock and consumed the same
+        # record. `extend_lock` succeeds only while our lease never lapsed,
+        # so a lost lease fails closed instead of POSTing a second time.
+        if not await state_adapter.extend_lock(lock, CALLBACK_LOCK_TTL_MS):
+            return None
         return resolved
     finally:
         await state_adapter.release_lock(lock)

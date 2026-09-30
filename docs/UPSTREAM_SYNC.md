@@ -348,7 +348,8 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 
 ### Callback-URL tokens (chat@4.40, #194)
 
-Parity, not a divergence. The callback-token part of upstream `b7c9316b`
+Parity, except for one Python-only hardening: the lease fence in the
+non-parity table (*Callback-token lease fence*). The callback-token part of upstream `b7c9316b`
 (vercel/chat#875, chat@4.40.0) plus the button copy from `4a0b5c0c`
 (vercel/chat#895):
 
@@ -367,7 +368,8 @@ Parity, not a divergence. The callback-token part of upstream `b7c9316b`
 - **Resolve.** `resolve_callback_url(token, state, context)` acquires
   `acquire_lock("chat:callback:<token>", 10_000)` and returns `None` if the
   lock is taken. Otherwise it validates the record, requires `actionId` and
-  the scope id to match the click's `CallbackContext`, deletes the record, and
+  the scope id to match the click's `CallbackContext`, deletes the record,
+  checks with `extend_lock` that the lease never lapsed (Python-only), and
   releases the lock in `finally`. The scope id is `channel_id` for a channel
   scope and `thread_id` for a thread scope. The action's POST body carries the
   stored `actionId`.
@@ -396,7 +398,7 @@ conversation id; WhatsApp, Messenger and
 Twilio (#235): the thread id itself).
 
 Thread-scoped tokens resolve only when the adapter's click `thread_id`
-equals the thread id the card was posted or edited under. There are three
+equals the thread id the card was posted or edited under. There are four
 known mismatches. All are upstream behavior at chat@4.41.1 or are fixed by
 another wave issue, so none is a divergence here. In each case the click
 still runs `on_action` handlers with the raw `__cb:…` value, but nothing is
@@ -407,6 +409,10 @@ POSTed:
   but a click reports `slack:C…:<message_ts>`. Upstream `92530dd3`
   (vercel/chat#720, chat@4.35.0) makes the post return `slack:C…:<ts>`, and
   #209 ports it. `main` is not released mid-wave, so no consumer sees the gap.
+- **Chained channel edits (`sent = await sent.edit(...)` twice), until
+  #195.** The `SentMessage` returned by a channel edit drops the thread-id
+  override, so the second edit binds to the channel id as a thread. Upstream
+  `16ea171e` (vercel/chat#848) passes the thread id through, and #195 ports it.
 - **Google Chat channel `SentMessage.edit`.** `post_channel_message` returns
   the channel id as the thread id, upstream included, so an edited channel
   card is bound to `gchat:spaces/X` as a thread.
@@ -835,6 +841,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
+| Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
 | `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
 | `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |

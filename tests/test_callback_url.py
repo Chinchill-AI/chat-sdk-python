@@ -28,6 +28,7 @@ from chat_sdk.callback_url import (
     CALLBACK_TTL_MS,
     CallbackContext,
     CallbackScope,
+    ResolvedCallback,
     decode_callback_value,
     encode_callback_value,
     post_to_callback_url,
@@ -577,6 +578,38 @@ class TestResolveCallbackUrlLocking:
 
         assert sum(r is not None for r in results) == 1
         assert await state.get("chat:callback:race") is None
+
+    async def test_lost_lease_fails_closed_instead_of_double_consuming(self):
+        """Divergence from upstream (docs/UPSTREAM_SYNC.md): upstream returns
+        the record even when its 10 s lease lapsed mid-consume, so a second
+        click that took the expired lock also resolves and both POST.
+        """
+        state = MemoryStateAdapter()
+        await state.connect()
+        await state.set("chat:callback:stall", dict(_VALID_RECORD))
+        context = CallbackContext(action_id="approve", channel_id="slack:C1")
+        real_delete = state.delete
+        stalled = False
+        second: list[ResolvedCallback | None] = []
+
+        async def stalled_delete(key: str) -> None:
+            nonlocal stalled
+            if not stalled:
+                stalled = True
+                # The lease lapses while this delete is in flight, and a
+                # second click takes the lock and consumes the same record.
+                await state.force_release_lock(key)
+                second.append(await resolve_callback_url("stall", state, context))
+            await real_delete(key)
+
+        state.delete = stalled_delete  # type: ignore[method-assign]
+
+        first = await resolve_callback_url("stall", state, context)
+
+        assert first is None
+        assert second[0] is not None
+        assert second[0].url == "https://example.com/hook"
+        assert await state.get("chat:callback:stall") is None
 
     async def test_returns_none_without_reading_when_lock_is_held(self):
         state = create_mock_state()

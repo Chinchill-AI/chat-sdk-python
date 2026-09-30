@@ -8,7 +8,7 @@
     "matched_exact": 678,
     "matched_fuzzy": 82,
     "missing": 276,
-    "extra": 377
+    "extra": 378
   },
   "absent_ts_files": [],
   "files": {
@@ -302,7 +302,7 @@
       "matched_exact": 21,
       "matched_fuzzy": 0,
       "missing_count": 0,
-      "extra_count": 10,
+      "extra_count": 11,
       "missing": [],
       "fuzzy_matches": []
     },
