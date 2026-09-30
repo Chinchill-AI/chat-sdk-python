@@ -40,6 +40,7 @@ from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emo
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
 from chat_sdk.shared.errors import AdapterError, ValidationError
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.thread_history import ThreadHistoryCache
 from chat_sdk.types import (
     ActionEvent,
@@ -199,7 +200,9 @@ class WhatsAppAdapter:
             return self._handle_verification_challenge(request)
 
         body = await self._get_request_body(request)
-        self._logger.debug("WhatsApp webhook raw body", {"body": body[:500]})
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream still
+        # logs a raw-body preview here (before signature verification) and a
+        # body-prefix preview on invalid JSON; we log request-shape metadata only.
 
         # Verify request signature (X-Hub-Signature-256 header)
         signature = self._get_header(request, "x-hub-signature-256")
@@ -213,8 +216,8 @@ class WhatsAppAdapter:
             self._logger.error(
                 "WhatsApp webhook invalid JSON",
                 {
+                    "bodyBytes": utf8_byte_length(body),
                     "contentType": self._get_header(request, "content-type"),
-                    "bodyPreview": body[:200],
                 },
             )
             return self._make_response("Invalid JSON", 400)

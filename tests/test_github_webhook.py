@@ -14,7 +14,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,6 +25,8 @@ from chat_sdk.adapters.github.adapter import (
 from chat_sdk.adapters.github.types import GitHubThreadId
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.testing import MockLogger
+from tests._log_capture import MULTIBYTE_TEXT, assert_body_not_logged
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -270,6 +272,146 @@ class TestGitHubWebhookSignature:
         request = _make_request(body, "check_run", signature=sig)
         response = await adapter.handle_webhook(request)
         assert response["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# handleWebhook -- log hygiene (upstream fc7df9c4, vercel/chat#500)
+# ---------------------------------------------------------------------------
+
+
+def _metadata(body: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "bodyBytes": len(body.encode("utf-8")),
+        "contentType": "application/json",
+        "eventType": "issue_comment",
+        "signaturePresent": True,
+        **extra,
+    }
+
+
+class TestGitHubWebhookLogHygiene:
+    """Port of the three ``describe("handleWebhook")`` log-hygiene tests."""
+
+    # TS: "should not log raw payload content for invalid signatures"
+    @pytest.mark.asyncio
+    async def test_should_not_log_raw_payload_content_for_invalid_signatures(self):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        body = json.dumps(
+            {
+                "action": "created",
+                "access_token": "secret-access-token",
+                "authorization": "Bearer secret-token",
+                "comment": {"body": f"Authorization: Bearer secret-token {MULTIBYTE_TEXT}"},
+                "refresh_token": "secret-refresh-token",
+                "repository": {
+                    "full_name": "customer-team-slug/app",
+                    "owner": {"login": "customer-team-slug"},
+                },
+            },
+            ensure_ascii=False,
+        )
+        # Multi-byte payload: byte length must differ from code-point length.
+        assert len(body.encode("utf-8")) != len(body)
+        request = _make_request(body, "issue_comment", signature="sha256=invalid")
+
+        response = await adapter.handle_webhook(request)
+
+        assert response["status"] == 401
+        assert ("GitHub webhook signature verification failed", _metadata(body)) in logger.debug.calls
+        assert_body_not_logged(logger, body)
+
+    # Python-specific (#187 porting hazard): ``signaturePresent`` mirrors
+    # upstream's ``signature !== null`` -- an empty header is still *present*;
+    # only a missing header reports False. Truthiness would get "" wrong.
+    @pytest.mark.parametrize(
+        ("signature", "expected_present"),
+        [(None, False), ("", True)],
+        ids=["missing-header", "empty-header"],
+    )
+    @pytest.mark.asyncio
+    async def test_signature_present_reflects_header_presence_not_truthiness(
+        self, signature: str | None, expected_present: bool
+    ):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        body = json.dumps(_issue_comment_payload())
+        request = _make_request(body, "issue_comment", signature=signature)
+        assert ("x-hub-signature-256" in request.headers) is (signature is not None)
+
+        response = await adapter.handle_webhook(request)
+
+        assert response["status"] == 401
+        assert logger.debug.calls == [
+            (
+                "GitHub webhook signature verification failed",
+                _metadata(body, signaturePresent=expected_present),
+            )
+        ]
+
+    # TS: "should not log raw payload content for invalid JSON"
+    @pytest.mark.asyncio
+    async def test_should_not_log_raw_payload_content_for_invalid_json(self):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        body = (
+            "not-json secret-access-token secret-refresh-token Bearer secret-token "
+            "Authorization customer-team-slug access_token refresh_token"
+        )
+        request = _make_request(body, "issue_comment", signature=_sign(body))
+
+        response = await adapter.handle_webhook(request)
+
+        assert response["status"] == 400
+        assert (
+            "GitHub webhook invalid JSON",
+            _metadata(body, jsonParseStatus="error"),
+        ) in logger.error.calls
+        assert_body_not_logged(logger, body)
+
+    # TS: "should not log raw payload content for valid webhooks"
+    @pytest.mark.asyncio
+    async def test_should_not_log_raw_payload_content_for_valid_webhooks(self):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        # Upstream mocks ``users.getAuthenticated``; stub the REST call the
+        # eager bot-id detection makes before dispatch.
+        adapter._github_api_request = AsyncMock(return_value={"id": 777, "login": "test-bot"})
+        mock_chat = MagicMock()
+        mock_chat.process_message = MagicMock()
+        try:
+            await adapter.initialize(mock_chat)
+            base = _issue_comment_payload()
+            payload = {
+                **_issue_comment_payload(
+                    comment={
+                        **base["comment"],
+                        "body": "Authorization: Bearer secret-token secret-access-token secret-refresh-token",
+                    },
+                    repository={
+                        **base["repository"],
+                        "full_name": "customer-team-slug/app",
+                        "owner": {**base["repository"]["owner"], "login": "customer-team-slug"},
+                    },
+                ),
+                "access_token": "secret-access-token",
+                "authorization": "Bearer secret-token",
+                "refresh_token": "secret-refresh-token",
+            }
+            body = json.dumps(payload)
+            request = _make_request(body, "issue_comment", signature=_sign(body))
+
+            response = await adapter.handle_webhook(request)
+
+            assert response["status"] == 200
+            mock_chat.process_message.assert_called_once()
+            call_args = mock_chat.process_message.call_args[0]
+            assert call_args[1] == "github:customer-team-slug/app:42"
+            assert call_args[2].id == "100"
+            assert ("GitHub webhook request verified", _metadata(body)) in logger.debug.calls
+            assert_body_not_logged(logger, body)
+        finally:
+            await adapter.disconnect()
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
+from chat_sdk.adapters.slack.api import _is_trusted_slack_response_url
 from chat_sdk.adapters.slack.cards import (
     card_to_block_kit,
     card_to_fallback_text,
@@ -71,6 +72,7 @@ from chat_sdk.shared.adapter_utils import (
     maybe_render_thinking,
 )
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -136,6 +138,9 @@ SLACK_USER_ID_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SLACK_USER_ID_EXACT_PATTERN = re.compile(r"^U[A-Z0-9]+$")
 
 SLACK_MESSAGE_URL_PATTERN = re.compile(r"^https?://[^/]+\.slack\.com/archives/([A-Z0-9]+)/p(\d+)(?:\?.*)?$")
+# Bracketed URL in message text; length-bounded to keep the scan linear on
+# adversarial input (port of upstream ``BRACKETED_URL_PATTERN``, vercel/chat#779).
+_BRACKETED_URL_PATTERN = re.compile(r"<(https?://[^>]{1,2048})>")
 
 # Cache TTLs (milliseconds)
 _USER_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000  # 8 days
@@ -1265,6 +1270,29 @@ class SlackAdapter:
     # User / Channel lookup with caching
     # ==================================================================
 
+    def _installation_cache_scope(self) -> str:
+        """Scope prefix for installation-owned cache keys.
+
+        Port of upstream ``installationCacheScope`` (vercel/chat#724, #877).
+        In multi-workspace deployments user profiles, display-name indexes,
+        channel names and unfurl metadata must not be shared across
+        installations. Single-workspace mode (and code running outside a
+        webhook context) uses the unscoped key.
+
+        Read from the ContextVar at call time: event dispatch runs in a
+        ``contextvars.copy_context()`` and tasks copy the context at
+        creation, so work spawned from handlers inherits the installation.
+        Only a truthy ``installation_id`` scopes the key (upstream
+        ``installationId ? ... : ""``).
+        """
+        ctx = self._request_context.get()
+        installation_id = ctx.installation_id if ctx is not None else None
+        return f"{installation_id}:" if installation_id else ""
+
+    def _unfurl_cache_key(self, channel_id: str, message_ts: str) -> str:
+        """State key for unfurl metadata, scoped by installation and channel."""
+        return f"slack:unfurls:{self._installation_cache_scope()}{channel_id}:{message_ts}"
+
     async def _lookup_user(self, user_id: str) -> SlackUserCacheEntry:
         """Look up user info from Slack API with caching.
 
@@ -1281,7 +1309,7 @@ class SlackAdapter:
         instead. The fallback entry is **not** cached so a subsequent
         call retries the lookup.
         """
-        cache_key = f"slack:user:{user_id}"
+        cache_key = f"slack:user:{self._installation_cache_scope()}{user_id}"
 
         if self._chat:
             cached = await self._chat.get_state().get(cache_key)
@@ -1343,7 +1371,7 @@ class SlackAdapter:
                 )
                 # Reverse index: display name -> user IDs
                 normalized_name = display_name.lower()
-                reverse_key = f"slack:user-by-name:{normalized_name}"
+                reverse_key = f"slack:user-by-name:{self._installation_cache_scope()}{normalized_name}"
                 existing = await self._chat.get_state().get_list(reverse_key)
                 if user_id not in existing:
                     await self._chat.get_state().append_to_list(
@@ -1370,7 +1398,7 @@ class SlackAdapter:
 
     async def _lookup_channel(self, channel_id: str) -> str:
         """Look up channel name from Slack API with caching."""
-        cache_key = f"slack:channel:{channel_id}"
+        cache_key = f"slack:channel:{self._installation_cache_scope()}{channel_id}"
 
         if self._chat:
             cached = await self._chat.get_state().get(cache_key)
@@ -1457,8 +1485,6 @@ class SlackAdapter:
         # implementation for duck-typed framework requests.
         body: str = await read_slack_request_body(request)
 
-        self._logger.debug("Slack webhook raw body", {"body": body[:500]})
-
         # Extract headers
         headers = getattr(request, "headers", {})
 
@@ -1537,6 +1563,9 @@ class SlackAdapter:
         except Exception as exc:
             self._logger.warn("Webhook verifier rejected request", {"error": exc})
             return {"body": "Invalid signature", "status": 401}
+        # Request-shape metadata only, and only once the request is verified
+        # (upstream f485255b) — never the body or any slice of it.
+        self._logger.debug("Slack webhook received", {"bodyLength": utf8_byte_length(body)})
 
         # URL verification is special: Slack sends a JSON ``url_verification``
         # ping at app-install / event-subscription time and only expects the
@@ -1604,6 +1633,7 @@ class SlackAdapter:
                                 ctx,
                                 enterprise_id=enterprise_id,
                                 is_enterprise_install=is_enterprise_install,
+                                installation_id=installation_id,
                             )
                             tok = self._request_context.set(ctx)
                             try:
@@ -1614,6 +1644,10 @@ class SlackAdapter:
                             "Could not resolve token for slash command",
                             {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
                         )
+                    # Missing or unresolved installation: acknowledge without
+                    # dispatching, so handlers never run with no token context
+                    # (vercel/chat#877).
+                    return {"body": "", "status": 200}
                 return await self._handle_slash_command(params, options)
 
             # Interactive payload
@@ -1629,6 +1663,7 @@ class SlackAdapter:
                             ctx,
                             enterprise_id=installation_info.enterprise_id,
                             is_enterprise_install=installation_info.is_enterprise_install,
+                            installation_id=installation_info.installation_id,
                         )
                         tok = self._request_context.set(ctx)
                         try:
@@ -1636,6 +1671,9 @@ class SlackAdapter:
                         finally:
                             self._request_context.reset(tok)
                 self._logger.warn("Could not resolve token for interactive payload")
+                # Missing or unresolved installation: acknowledge without
+                # dispatching (vercel/chat#877).
+                return {"body": "", "status": 200}
             return await self._handle_interactive_payload(body, options)
 
         # JSON payload
@@ -1671,6 +1709,7 @@ class SlackAdapter:
                         ctx,
                         enterprise_id=payload.get("enterprise_id"),
                         is_enterprise_install=is_enterprise_install,
+                        installation_id=installation_id,
                     )
                     isolated = contextvars.copy_context()
                     isolated.run(self._request_context.set, ctx)
@@ -1788,9 +1827,11 @@ class SlackAdapter:
         channel_id = (params.get("channel_id") or [""])[0]
         trigger_id = (params.get("trigger_id") or [None])[0]
 
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: log the
+        # command text's length, not its content.
         self._logger.debug(
             "Processing Slack slash command",
-            {"command": command, "text": text, "userId": user_id, "channelId": channel_id},
+            {"command": command, "textLength": len(text), "userId": user_id, "channelId": channel_id},
         )
         user_info = await self._lookup_user(user_id)
         event = SlashCommandEvent(
@@ -2486,6 +2527,7 @@ class SlackAdapter:
                             {"teamId": team_id_event},
                         )
                         return
+                    ctx = replace(ctx, installation_id=team_id_event)
                     isolated = contextvars.copy_context()
                     isolated.run(self._request_context.set, ctx)
                     isolated.run(self._process_event_payload, payload, options)
@@ -2511,19 +2553,22 @@ class SlackAdapter:
             params: dict[str, list[str]] = {k: [v] for k, v in body.items() if isinstance(v, str)}
 
             async def run_slash() -> None:
-                team_id_slash = (params.get("team_id") or [None])[0]
-                if not self._is_single_workspace and team_id_slash:
-                    ctx = await self._resolve_token_for_team(team_id_slash)
-                    if ctx is None:
-                        self._logger.warn("Could not resolve token for slash command")
-                        return
-                    tok = self._request_context.set(ctx)
-                    try:
-                        await self._handle_slash_command(params, options)
-                    finally:
-                        self._request_context.reset(tok)
-                else:
+                if self._is_single_workspace:
                     await self._handle_slash_command(params, options)
+                    return
+                team_id_slash = (params.get("team_id") or [None])[0]
+                ctx = await self._resolve_token_for_team(team_id_slash) if team_id_slash else None
+                if ctx is None:
+                    # Missing or unresolved installation: already acked, do
+                    # not dispatch without a token context (vercel/chat#877).
+                    self._logger.warn("Could not resolve token for slash command")
+                    return
+                ctx = replace(ctx, installation_id=team_id_slash)
+                tok = self._request_context.set(ctx)
+                try:
+                    await self._handle_slash_command(params, options)
+                finally:
+                    self._request_context.reset(tok)
 
             wrap_async(run_slash())
             return
@@ -2532,13 +2577,20 @@ class SlackAdapter:
             try:
                 # Multi-workspace: scope token resolution to the dispatch.
                 team_ref = body.get("team")
-                team_id_interactive = team_ref.get("id") if isinstance(team_ref, dict) else body.get("team_id")
-                if not self._is_single_workspace and team_id_interactive:
-                    ctx = await self._resolve_token_for_team(team_id_interactive)
+                # Upstream ``team?.id || payload.team_id``: a ``team`` object
+                # without an id still falls back to the top-level field.
+                team_id_interactive = (team_ref.get("id") if isinstance(team_ref, dict) else None) or body.get(
+                    "team_id"
+                )
+                if not self._is_single_workspace:
+                    ctx = await self._resolve_token_for_team(team_id_interactive) if team_id_interactive else None
                     if ctx is None:
-                        self._logger.warn("Could not resolve token for interactive payload")
+                        # Missing or unresolved installation: ack without
+                        # dispatching (vercel/chat#877).
+                        self._logger.warn("Could not resolve token for socket interactive payload")
                         await ack()
                         return
+                    ctx = replace(ctx, installation_id=team_id_interactive)
                     tok = self._request_context.set(ctx)
                     try:
                         result = await self._dispatch_interactive_payload(body, options)
@@ -2854,10 +2906,11 @@ class SlackAdapter:
         user_id = user_info.get("id")
         if user_id:
             try:
-                # Fire and forget cache invalidation
-                _pin_task(
-                    asyncio.get_running_loop().create_task(self._chat.get_state().delete(f"slack:user:{user_id}"))
-                )
+                # Fire and forget cache invalidation. The key is built here,
+                # under the dispatching request context, so it names the
+                # same installation-scoped entry ``_lookup_user`` wrote.
+                cache_key = f"slack:user:{self._installation_cache_scope()}{user_id}"
+                _pin_task(asyncio.get_running_loop().create_task(self._chat.get_state().delete(cache_key)))
             except RuntimeError:
                 pass  # No running event loop
             except Exception as exc:
@@ -3028,7 +3081,7 @@ class SlackAdapter:
 
         # Look up user IDs for each mentioned name
         for name in list(mentions.keys()):
-            user_ids = await state.get_list(f"slack:user-by-name:{name}")
+            user_ids = await state.get_list(f"slack:user-by-name:{self._installation_cache_scope()}{name}")
             mentions[name] = list(set(user_ids))
 
         # Load thread participants if needed (ambiguous mentions)
@@ -3097,7 +3150,7 @@ class SlackAdapter:
                             urls.add(element["url"])
 
         if not urls and event.get("text"):
-            for match in re.finditer(r"<(https?://[^>]+)>", event["text"]):
+            for match in _BRACKETED_URL_PATTERN.finditer(event["text"]):
                 raw = match.group(1)
                 pipe_idx = raw.find("|")
                 urls.add(raw[:pipe_idx] if pipe_idx >= 0 else raw)
@@ -3202,10 +3255,15 @@ class SlackAdapter:
         if not unfurls:
             return
 
+        # Keyed by installation, channel and ts (vercel/chat#877) so unfurl
+        # metadata from one workspace/channel is never merged into another's
+        # message that happens to share the same ``ts``.
+        unfurl_key = self._unfurl_cache_key(channel, ts)
+
         async def _store() -> None:
             try:
                 await self._chat.get_state().set(  # type: ignore[union-attr]
-                    f"slack:unfurls:{ts}",
+                    unfurl_key,
                     unfurls,
                     _UNFURL_CACHE_TTL_MS,
                 )
@@ -3223,15 +3281,21 @@ class SlackAdapter:
             # No running loop (sync test context) — skip silently.
             self._logger.debug("No running loop; skipping unfurl cache write")
 
-    async def _enrich_links(self, links: list[LinkPreview], message_ts: str | None) -> list[LinkPreview]:
+    async def _enrich_links(
+        self,
+        links: list[LinkPreview],
+        channel_id: str | None,
+        message_ts: str | None,
+    ) -> list[LinkPreview]:
         """Enrich ``links`` with unfurl metadata from a ``message_changed`` cache.
 
         Polls the state cache for up to ``_UNFURL_WAIT_MS`` to give Slack
         time to deliver the cross-event ``message_changed`` payload.
         Returns the original list (untouched) when there is nothing to wait
-        for.
+        for, or when the channel or ts needed to build the scoped cache key
+        is missing.
         """
-        if not (self._chat and message_ts) or not links:
+        if not (self._chat and channel_id and message_ts) or not links:
             return links
 
         all_have_metadata = all((link.title is not None) or (link.fetch_message is not None) for link in links)
@@ -3241,9 +3305,10 @@ class SlackAdapter:
         deadline = time.monotonic() + (_UNFURL_WAIT_MS / 1000.0)
         state = self._chat.get_state()
         stored: dict[str, dict[str, str | None]] | None = None
+        unfurl_key = self._unfurl_cache_key(channel_id, message_ts)
         while True:
             try:
-                stored = await state.get(f"slack:unfurls:{message_ts}")
+                stored = await state.get(unfurl_key)
             except Exception as exc:
                 self._logger.warn(
                     "Failed to read unfurl data from state",
@@ -3383,8 +3448,35 @@ class SlackAdapter:
             # ~2s of latency to message handling worst-case (it returns
             # immediately when the cache is already populated or when
             # there are no links to enrich).
-            links=await self._enrich_links(self._extract_links(event), event.get("ts")),
+            links=await self._enrich_links(
+                self._extract_links(event),
+                self._unfurl_channel_for(event, thread_id),
+                event.get("ts"),
+            ),
         )
+
+    def _unfurl_channel_for(self, event: dict[str, Any], thread_id: str) -> str | None:
+        """Channel for the unfurl cache key of a message being parsed.
+
+        Webhook events carry ``channel``, but messages returned by
+        ``conversations.history`` / ``conversations.replies`` (``fetch_message``,
+        ``fetch_messages``, channel history, ``list_threads``) do not. Those are
+        always parsed with a ``thread_id`` built from the channel they were
+        fetched from, so fall back to it; otherwise ``_enrich_links`` would
+        return early and fetched messages would lose the unfurl metadata that
+        ``message_changed`` cached for them.
+
+        Python divergence: upstream passes ``event.channel`` only (4.40+),
+        which silently drops enrichment for fetched messages.
+        """
+        channel = event.get("channel")
+        if isinstance(channel, str) and channel:
+            return channel
+        try:
+            decoded = self.decode_thread_id(thread_id)
+        except ValidationError:
+            return None
+        return decoded.channel or None
 
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
         """Synchronous message parsing (no user lookup, falls back to user ID)."""
@@ -3747,6 +3839,10 @@ class SlackAdapter:
                 thread_id=thread_id,
                 raw={"ephemeral": True, **result},
             )
+        if message_id.startswith("ephemeral:"):
+            # Undecodable / untrusted ephemeral id: never fall through to
+            # ``chat.update`` with it (vercel/chat#876).
+            raise ValidationError("slack", "Invalid Slack ephemeral message ID")
 
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
@@ -3789,6 +3885,8 @@ class SlackAdapter:
         if ephemeral:
             await self._send_to_response_url(ephemeral["response_url"], "delete")
             return
+        if message_id.startswith("ephemeral:"):
+            raise ValidationError("slack", "Invalid Slack ephemeral message ID")
 
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
@@ -4736,6 +4834,11 @@ class SlackAdapter:
     # ==================================================================
 
     def _encode_ephemeral_message_id(self, message_ts: str, response_url: str, user_id: str) -> str:
+        # Only Slack-issued response URLs may be embedded in a message id
+        # that ``edit_message`` / ``delete_message`` later POST to
+        # (vercel/chat#876).
+        if not _is_trusted_slack_response_url(response_url):
+            raise ValidationError("slack", "Refusing to encode an untrusted Slack response_url")
         data = json.dumps({"responseUrl": response_url, "userId": user_id})
         encoded = base64.b64encode(data.encode("utf-8")).decode("ascii")
         return f"ephemeral:{message_ts}:{encoded}"
@@ -4752,14 +4855,25 @@ class SlackAdapter:
             decoded = base64.b64decode(encoded_data).decode("utf-8")
             try:
                 data = json.loads(decoded)
-                if data.get("responseUrl") and data.get("userId"):
-                    return {
-                        "message_ts": message_ts,
-                        "response_url": data["responseUrl"],
-                        "user_id": data["userId"],
-                    }
             except (json.JSONDecodeError, ValueError):
-                return {"message_ts": message_ts, "response_url": decoded, "user_id": ""}
+                # No raw-string fallback: the legacy non-JSON format carried
+                # an unvalidated URL (vercel/chat#876).
+                return None
+            if not isinstance(data, dict):
+                return None
+            response_url = data.get("responseUrl")
+            user_id = data.get("userId")
+            if (
+                isinstance(response_url, str)
+                and _is_trusted_slack_response_url(response_url)
+                and isinstance(user_id, str)
+                and user_id
+            ):
+                return {
+                    "message_ts": message_ts,
+                    "response_url": response_url,
+                    "user_id": user_id,
+                }
             return None
         except Exception:
             self._logger.warn("Failed to decode ephemeral messageId", {"messageId": message_id})
@@ -4778,12 +4892,11 @@ class SlackAdapter:
         thread_ts: str | None = None,
     ) -> dict[str, Any]:
         """Send a request to Slack's response_url to modify an ephemeral message."""
-        # Validate response_url points to Slack (prevent SSRF)
-        from urllib.parse import urlparse
-
-        parsed = urlparse(response_url)
-        if not (parsed.scheme == "https" and parsed.hostname and parsed.hostname.endswith(".slack.com")):
-            raise ValidationError("slack", f"Invalid response_url: must be https://*.slack.com, got {response_url}")
+        # Defend the fetch sink itself (vercel/chat#876): only
+        # ``hooks.slack.com`` / ``hooks.slack-gov.com`` over https, with no
+        # userinfo or explicit port. Checked before httpx is even imported.
+        if not _is_trusted_slack_response_url(response_url):
+            raise ValidationError("slack", "Refusing to send content to an untrusted Slack response_url")
 
         import httpx
 

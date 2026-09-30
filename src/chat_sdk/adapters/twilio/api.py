@@ -25,7 +25,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlsplit
 
 from chat_sdk.adapters.twilio.types import (
     ENV_ACCOUNT_SID,
@@ -424,13 +424,58 @@ async def update_twilio_call(
 # =============================================================================
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    """WHATWG-style origin tuple ``(scheme, host, effective_port)``.
+
+    Scheme and host are lowercased and the scheme's default port is filled
+    in, so ``https://API.twilio.com:443/x`` and ``https://api.twilio.com/x``
+    compare equal while ``:444`` or ``http://`` do not. Returns ``None`` for
+    unparseable URLs or URLs without a host (an opaque origin never matches).
+
+    URLs containing whitespace, ASCII control characters or a backslash are
+    also treated as opaque: ``urlsplit`` silently drops some of those
+    characters and does not treat ``\\`` as a path separator the way WHATWG
+    parsers do, so the host it sees could differ from the one the transport
+    connects to. Failing closed keeps the check free of parser differentials.
+    """
+    if any(ch <= " " or ch == "\x7f" or ch == "\\" for ch in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    return (scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme))
+
+
 async def fetch_twilio_media(
     url: str,
     *,
+    api_base_url: str | None = None,
+    api_url: str | None = None,
     credentials: TwilioCredentials | None = None,
     http_request: TwilioHttpRequest | None = None,
 ) -> bytes:
-    """Download a (private) media URL with Basic auth, returning raw bytes."""
+    """Download a (private) media URL with Basic auth, returning raw bytes.
+
+    ``url`` must share its origin (scheme, host, port) with the configured
+    Twilio API (``api_url``, else ``api_base_url``, else
+    :data:`DEFAULT_API_URL`); otherwise :class:`TwilioApiError` (``status``
+    ``0``) is raised before any credential is resolved or request is made,
+    so Basic auth is never sent off-origin. Mirrors upstream
+    ``fetchTwilioMedia`` (vercel/chat#831, chat@4.38.1).
+    """
+    base = api_url if api_url is not None else (api_base_url if api_base_url is not None else DEFAULT_API_URL)
+    media_origin = _url_origin(url)
+    if media_origin is None or media_origin != _url_origin(base):
+        raise TwilioApiError("Twilio media URL must match the configured Twilio API origin", status=0)
     creds = credentials if credentials is not None else TwilioCredentials()
     account_sid = await resolve_twilio_credential(creds.account_sid, ENV_ACCOUNT_SID)
     auth_token = await resolve_twilio_credential(creds.auth_token, ENV_AUTH_TOKEN)
