@@ -25,46 +25,18 @@ from chat_sdk.shared.base_format_converter import (
     stringify_markdown,
     table_to_ascii,
 )
-
-# Match bare @mentions (e.g. "@george") to rewrite as Slack's `<@george>`.
-# The fixed-width lookbehind excludes:
-#   - `<` (already-formatted mentions like `<@U123>`),
-#   - any word character (so email addresses like `user@example.com` are left
-#     alone), and
-#   - `/` (so a schemeless host path like `mastodon.social/@user` — which the
-#     URL matcher in `_link_bare_mentions_outside_urls` does NOT catch — is also
-#     preserved). Mirrors upstream's `(?<![<\w/])` (vercel/chat a8bf99a).
-# ``re.ASCII`` keeps `\w` ASCII-only to match upstream's JS ASCII `\w` exactly:
-# Python's `\w` is Unicode-aware by default, which would otherwise diverge on
-# non-ASCII handles/boundaries.
-BARE_MENTION_REGEX = re.compile(r"(?<![<\w/])@(\w+)", re.ASCII)
-
-# Match an `http(s)` URL up to the first whitespace or angle bracket so the span
-# can be excluded from mention linking. A bare `@handle` anywhere inside a URL
-# (path, query string, or fragment) must NOT be rewritten into a `<@handle>`
-# Slack mention, which would corrupt the link. Mirrors upstream's `URL_PATTERN`.
-URL_REGEX = re.compile(r"\bhttps?://[^\s<>]+")
+from chat_sdk.shared.mentions import replace_bare_mentions
 
 
-def _link_bare_mentions_outside_urls(text: str) -> str:
-    """Rewrite bare ``@handle`` mentions, but only outside ``http(s)`` URL spans.
+def _link_bare_mention_names(text: str) -> str:
+    """Rewrite bare ``@name`` mentions as Slack ``<@name>`` tokens.
 
-    A bare ``@handle`` anywhere inside a URL (path, query string, or fragment)
-    is preserved verbatim; mention linking is applied only to the text slices
-    between (and after) URL spans. Mirrors upstream's
-    ``linkBareMentionsOutsideUrls`` (vercel/chat a8bf99a). The schemeless host
-    path case (``mastodon.social/@user``), which ``URL_REGEX`` does not match,
-    is additionally guarded by the ``/`` in ``BARE_MENTION_REGEX``'s lookbehind.
+    Port of upstream ``linkBareMentionNames`` (``markdown.ts``). The shared
+    scanner skips inline code, fenced code, URLs (schemed and schemeless
+    host paths), existing ``<...>`` tokens and email addresses, so package
+    names like `` `@vercel/postgres` `` and ``hackmd.io/@user`` stay literal.
     """
-    result: list[str] = []
-    last_index = 0
-    for match in URL_REGEX.finditer(text):
-        start = match.start()
-        result.append(BARE_MENTION_REGEX.sub(r"<@\1>", text[last_index:start]))
-        result.append(match.group(0))
-        last_index = match.end()
-    result.append(BARE_MENTION_REGEX.sub(r"<@\1>", text[last_index:]))
-    return "".join(result)
+    return replace_bare_mentions(text, lambda _mention, name: f"<@{name}>")
 
 
 class SlackFormatConverter(BaseFormatConverter):
@@ -206,7 +178,7 @@ class SlackFormatConverter(BaseFormatConverter):
 
     def _finalize(self, text: str) -> str:
         """Rewrite bare @mentions and normalize emoji placeholders for Slack."""
-        return convert_emoji_placeholders(_link_bare_mentions_outside_urls(text), "slack")
+        return convert_emoji_placeholders(_link_bare_mention_names(text), "slack")
 
     def _ast_to_mrkdwn(self, ast: Root) -> str:
         """Render an AST to Slack's legacy mrkdwn (response_url surface only)."""
@@ -225,7 +197,7 @@ class SlackFormatConverter(BaseFormatConverter):
 
         if node_type == "text":
             value = node.get("value", "")
-            return _link_bare_mentions_outside_urls(value)
+            return _link_bare_mention_names(value)
 
         if node_type == "strong":
             content = "".join(self._node_to_mrkdwn(c) for c in children)

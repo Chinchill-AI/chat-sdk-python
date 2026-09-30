@@ -7,7 +7,7 @@ See: https://developers.facebook.com/docs/whatsapp/cloud-api
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -268,7 +268,9 @@ WhatsAppInboundMessage = TypedDict(
         "text": dict[str, str],
         # Unix timestamp string
         "timestamp": str,
-        # Message type
+        # Message type: "text" | "image" | "document" | "audio" | "video" |
+        # "voice" | "sticker" | "location" | "contacts" | "interactive" |
+        # "button" | "reaction" | "order" | "system" | "template"
         "type": str,
         # Video message content
         "video": dict[str, Any],
@@ -360,6 +362,177 @@ class WhatsAppInteractiveMessage(TypedDict, total=False):
     footer: dict[str, str]  # {"text": str}
     header: dict[str, str]  # {"text": str, "type": "text"}
     type: str  # "button" | "list"
+
+
+class WhatsAppGraphErrorData(TypedDict, total=False):
+    """Meta's ``error.error_data`` object."""
+
+    details: str
+    messaging_product: str
+
+
+class WhatsAppGraphError(TypedDict, total=False):
+    """Error object inside a failed Meta Graph API response.
+
+    See: https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes/
+    """
+
+    code: int
+    error_data: WhatsAppGraphErrorData
+    # Optional and deprecated in the Cloud API.
+    error_subcode: int
+    fbtrace_id: str
+    message: str
+    type: str
+
+
+class WhatsAppGraphErrorBody(TypedDict, total=False):
+    """Body of a failed Meta Graph API response."""
+
+    error: WhatsAppGraphError
+
+
+# =============================================================================
+# Template Messages
+# =============================================================================
+
+
+class WhatsAppTemplateTextParameter(TypedDict):
+    """Text parameter (the only kind whose emoji placeholders are converted)."""
+
+    type: Literal["text"]
+    text: str
+
+
+class WhatsAppTemplateCurrency(TypedDict):
+    """Currency value for a ``currency`` template parameter."""
+
+    amount_1000: int
+    code: str
+    fallback_value: str
+
+
+class WhatsAppTemplateCurrencyParameter(TypedDict):
+    """Currency template parameter."""
+
+    type: Literal["currency"]
+    currency: WhatsAppTemplateCurrency
+
+
+class WhatsAppTemplateDateTimeParameter(TypedDict):
+    """Date/time template parameter."""
+
+    type: Literal["date_time"]
+    date_time: dict[str, str]  # {"fallback_value": str}
+
+
+class WhatsAppTemplateMedia(TypedDict, total=False):
+    """Media reference for an image or video template parameter."""
+
+    id: str
+    link: str
+
+
+class WhatsAppTemplateDocument(TypedDict, total=False):
+    """Document reference for a document template parameter."""
+
+    filename: str
+    id: str
+    link: str
+
+
+class WhatsAppTemplateImageParameter(TypedDict):
+    """Image template parameter."""
+
+    type: Literal["image"]
+    image: WhatsAppTemplateMedia
+
+
+class WhatsAppTemplateDocumentParameter(TypedDict):
+    """Document template parameter."""
+
+    type: Literal["document"]
+    document: WhatsAppTemplateDocument
+
+
+class WhatsAppTemplateVideoParameter(TypedDict):
+    """Video template parameter."""
+
+    type: Literal["video"]
+    video: WhatsAppTemplateMedia
+
+
+# Parameter for a template header or body component.
+# See: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#parameter-object
+WhatsAppTemplateParameter = (
+    WhatsAppTemplateTextParameter
+    | WhatsAppTemplateCurrencyParameter
+    | WhatsAppTemplateDateTimeParameter
+    | WhatsAppTemplateImageParameter
+    | WhatsAppTemplateDocumentParameter
+    | WhatsAppTemplateVideoParameter
+)
+
+
+class WhatsAppTemplatePayloadParameter(TypedDict):
+    """Quick reply button payload, echoed back in the button response."""
+
+    type: Literal["payload"]
+    payload: str
+
+
+# Parameter for a template button component. URL buttons take a text
+# parameter substituted into the button's URL; quick reply buttons take a
+# payload echoed back in the button response.
+WhatsAppTemplateButtonParameter = WhatsAppTemplateTextParameter | WhatsAppTemplatePayloadParameter
+
+
+class WhatsAppTemplateHeaderComponent(TypedDict):
+    """Header component of a template message."""
+
+    type: Literal["header"]
+    parameters: list[WhatsAppTemplateParameter]
+
+
+class WhatsAppTemplateBodyComponent(TypedDict):
+    """Body component of a template message."""
+
+    type: Literal["body"]
+    parameters: list[WhatsAppTemplateParameter]
+
+
+class WhatsAppTemplateButtonComponent(TypedDict):
+    """Button component of a template message."""
+
+    type: Literal["button"]
+    sub_type: Literal["url", "quick_reply"]
+    index: int
+    parameters: list[WhatsAppTemplateButtonParameter]
+
+
+# A component of a template message carrying variable substitutions.
+WhatsAppTemplateComponent = (
+    WhatsAppTemplateHeaderComponent | WhatsAppTemplateBodyComponent | WhatsAppTemplateButtonComponent
+)
+
+
+class WhatsAppTemplateMessage(TypedDict):
+    """A pre-approved template message.
+
+    Templates are the only message type the Cloud API accepts outside the
+    24-hour customer service window, so they are required for
+    business-initiated conversations.
+
+    See: https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-message-templates
+    """
+
+    # Name of the approved template
+    name: str
+    # Template language code (e.g. "en", "en_US")
+    language: str
+    # Variable substitutions for the template's components. Omit for
+    # templates without variables.
+    components: NotRequired[list[WhatsAppTemplateComponent]]
 
 
 # =============================================================================
