@@ -830,6 +830,13 @@ class TelegramAdapter:
         # TELEGRAM_ALLOWED_USER_IDS.split(",")``, each id stringified and
         # trimmed, empties dropped. An empty result allows everyone (None).
         raw_allowed_user_ids: list[int | str] | None = config.allowed_user_ids
+        # Python-only guard: a bare string (e.g. ``"123,456"`` straight from an
+        # env var) would iterate per character; upstream's ``.map`` throws.
+        if raw_allowed_user_ids is not None and not isinstance(raw_allowed_user_ids, list | tuple | set | frozenset):
+            raise ValidationError(
+                "telegram",
+                f"allowed_user_ids must be a list of user IDs, got {type(raw_allowed_user_ids).__name__}",
+            )
         if raw_allowed_user_ids is None:
             env_allowed_user_ids = os.environ.get("TELEGRAM_ALLOWED_USER_IDS")
             if env_allowed_user_ids is not None:
@@ -3320,13 +3327,15 @@ class TelegramAdapter:
 
         ``(?![\\w-])`` rather than ``\\b`` so ``@mybot-dev`` does not mention
         ``@mybot`` (vercel/chat#621); cached per username (vercel/chat#706).
-        ``re.ASCII`` keeps ``\\w`` (and case folding) ASCII-only like JS.
+        JS ``\\w`` (no ``u`` flag) is ASCII-only, so the lookahead spells out
+        ``[A-Za-z0-9_-]``; ``re.ASCII`` is not used because JS ``/i`` still
+        case-folds non-ASCII letters (``@ботик`` matches ``@БОТИК``).
         """
         if self._mention_regex is None or self._mention_regex_username != username:
             self._mention_regex_username = username
             self._mention_regex = re.compile(
-                rf"@{self.escape_regex(username)}(?![\w-])",
-                re.IGNORECASE | re.ASCII,
+                rf"@{self.escape_regex(username)}(?![A-Za-z0-9_-])",
+                re.IGNORECASE,
             )
         return self._mention_regex
 

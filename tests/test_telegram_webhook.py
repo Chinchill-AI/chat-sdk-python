@@ -1672,6 +1672,12 @@ class TestTelegramAllowedUserIds:
         adapter = _make_adapter(allowed_user_ids=[123, 456.0, " 789 ", ""])
         assert adapter._allowed_user_ids == {"123", "456", "789"}
 
+    @pytest.mark.parametrize("value", ["123,456", 123456, {"123": True}])
+    def test_non_list_allowed_user_ids_raise(self, value: Any):
+        # A bare string would otherwise iterate per character ({"1","2",...}).
+        with pytest.raises(ValidationError, match="allowed_user_ids must be a list"):
+            _make_adapter(allowed_user_ids=value)
+
     @pytest.mark.asyncio
     async def test_rejects_disallowed_and_identityless_updates_before_dispatch(self):
         adapter = _make_adapter(user_name="mybot", allow_unverified_webhooks=True, allowed_user_ids=[456])
@@ -1707,12 +1713,25 @@ class TestTelegramAllowedUserIds:
                 },
             },
             {"update_id": 4, "channel_post": channel_post},
+            # Private ``/command`` and plain DM from a disallowed user: the gate
+            # must run before both slash dispatch and early typing.
+            {
+                "update_id": 6,
+                "message": {
+                    **_sample_message(text="/ping", entities=[{"type": "bot_command", "offset": 0, "length": 5}]),
+                    "from": disallowed_user,
+                },
+            },
+            {"update_id": 7, "message": {**_sample_message(), "from": disallowed_user}},
         ]
         for update in updates:
             adapter.process_update(update)  # type: ignore[arg-type]
         adapter.process_update({"update_id": 5, "message": group_message})  # type: ignore[typeddict-item]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
         assert chat.process_message.call_count == 1
+        adapter.telegram_fetch.assert_not_awaited()
         chat.process_slash_command.assert_not_called()
         chat.process_action.assert_not_called()
         chat.process_reaction.assert_not_called()
@@ -1926,6 +1945,14 @@ class TestTelegramMentionRegex:
     def test_mention_boundary_uses_ascii_word_characters(self, text: str, expected: bool):
         adapter = _make_adapter(user_name="mybot")
         assert adapter.is_bot_mentioned({}, text) is expected  # type: ignore[typeddict-item]
+
+    def test_mention_regex_case_folds_non_ascii_usernames_like_js_i(self):
+        # JS ``/i`` (no ``u``) still folds Cyrillic, so ``@БОТИК`` mentions
+        # ``ботик``; only the ``\w`` lookahead is ASCII-only.
+        adapter = _make_adapter(user_name="ботик")
+        assert adapter.is_bot_mentioned({}, "hi @БОТИК") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @БОТИКж") is True  # type: ignore[typeddict-item]
+        assert adapter.is_bot_mentioned({}, "hi @БОТИК_2") is False  # type: ignore[typeddict-item]
 
 
 class TestTelegramMediaIdentity:
