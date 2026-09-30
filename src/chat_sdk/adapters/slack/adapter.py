@@ -4894,6 +4894,9 @@ class SlackAdapter:
             *(errors if isinstance(errors, list) else []),
             *(messages if isinstance(messages, list) else []),
         ]
+        # Upstream parity: the serialized blocks are logged at error level on
+        # purpose (chat@4.41.1 adapter-slack/src/index.ts:173-176) so the
+        # rejected payload can be debugged. Redact via a custom ``logger``.
         self._logger.error(
             "Slack rejected blocks (invalid_blocks)",
             {"details": details, "blocks": _json_stringify(blocks)},
