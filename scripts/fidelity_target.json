@@ -8,7 +8,7 @@
     "matched_exact": 772,
     "matched_fuzzy": 77,
     "missing": 215,
-    "extra": 448
+    "extra": 452
   },
   "absent_ts_files": [],
   "files": {
@@ -202,7 +202,7 @@
       "matched_exact": 36,
       "matched_fuzzy": 0,
       "missing_count": 9,
-      "extra_count": 2,
+      "extra_count": 3,
       "missing": [
         ["toAiMessages", "uses ArrayBuffer attachment data without Buffer conversion"],
         ["toAiMessages", "keeps image-only messages that have no text"],
@@ -225,7 +225,7 @@
       "matched_exact": 44,
       "matched_fuzzy": 13,
       "missing_count": 0,
-      "extra_count": 17,
+      "extra_count": 20,
       "missing": [],
       "fuzzy_matches": [
         ["returns the full toolset when no preset is supplied", "test_returns_full_toolset_when_no_preset_supplied"],
