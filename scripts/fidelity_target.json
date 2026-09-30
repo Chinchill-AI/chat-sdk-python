@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1036,
     "each_templates": 16,
-    "matched_exact": 671,
+    "matched_exact": 679,
     "matched_fuzzy": 83,
-    "missing": 282,
-    "extra": 362
+    "missing": 274,
+    "extra": 361
   },
   "absent_ts_files": [],
   "files": {
@@ -18,10 +18,10 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 132,
+      "matched_exact": 140,
       "matched_fuzzy": 12,
-      "missing_count": 33,
-      "extra_count": 13,
+      "missing_count": 25,
+      "extra_count": 12,
       "missing": [
         ["Chat", "should call onNewMention for newline-separated GitHub bot mentions"],
         ["Chat", "should not call onNewMention for concatenated GitHub bot mention text"],
@@ -41,15 +41,7 @@
         ["thread", "passes only explicit placeholder config to adapter streaming"],
         ["getUser", "should return null when user is not found"],
         ["getUser", "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"],
-        ["concurrency: lock lifetime", "should keep the %s lock alive while a handler is running"],
-        ["concurrency: lock lifetime", "should stop renewing after maxLockLifetimeMs so a hung handler frees the thread"],
-        ["concurrency: queue", "should call onNewMention when a skipped queued message mentions the bot"],
         ["concurrency: queue", "should keep a definitive non-mention on skipped queued messages"],
-        ["concurrency: queue", "should continue to message patterns when skipped queued mention has no handler"],
-        ["concurrency: debounce", "should call onNewMention when a skipped debounced message mentions the bot"],
-        ["concurrency: burst", "should call onNewMention when a skipped burst message mentions the bot"],
-        ["lockScope", "should isolate queued messages across channel-scoped threads"],
-        ["lockScope", "should isolate debounced messages across channel-scoped threads"],
         ["Chat initialization retry (#922)", "does not restart an initialized adapter when another adapter fails"],
         ["Chat initialization retry (#922)", "does not overlap adapter initialization after a sibling fails"],
         ["Chat initialization retry (#922)", "recovers through a webhook after repeated state connection failures"],

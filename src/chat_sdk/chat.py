@@ -13,6 +13,7 @@ import contextvars
 import dataclasses
 import inspect
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -80,6 +81,7 @@ from chat_sdk.types import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_LOCK_TTL_MS = 30_000  # 30 seconds
+DEFAULT_MAX_LOCK_LIFETIME_MS = 600_000  # 10 minutes
 DEDUPE_TTL_MS = 5 * 60 * 1000  # 5 minutes
 MODAL_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
 
@@ -207,6 +209,150 @@ async def _sleep(ms: int) -> None:
     await asyncio.sleep(ms / 1000.0)
 
 
+def _now_ms() -> int:
+    """Wall-clock epoch milliseconds (``Date.now()``).
+
+    Used for everything compared against state-backend timestamps
+    (``Lock.expires_at``, ``QueueEntry.expires_at``). Module-level so tests
+    can swap in a fake clock together with :func:`_sleep`.
+    """
+    return int(time.time() * 1000)
+
+
+def _monotonic_ms() -> int:
+    """Monotonic milliseconds for measuring elapsed local durations.
+
+    Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream measures
+    the ``maxLockLifetimeMs`` cap with ``Date.now()``; a wall-clock jump
+    (NTP step) could then end renewal early or extend it indefinitely.
+    """
+    return int(time.monotonic() * 1000)
+
+
+class _LockHeartbeat:
+    """Keeps a held thread lock alive while a handler runs.
+
+    Port of upstream ``startLockHeartbeat`` (chat@4.39.0, 5b538f6f). Every
+    ``DEFAULT_LOCK_TTL_MS / 3`` it calls ``state.extend_lock``; it never
+    stacks extends (each one is awaited before the next sleep), stops
+    renewing once ``max_lock_lifetime_ms`` has elapsed (so a hung handler's
+    lock lapses at its TTL), and marks ownership lost when an extend returns
+    ``False`` or the backend stays unreachable past the last known expiry.
+
+    Use via :meth:`Chat._with_held_lock`, which always awaits :meth:`stop`
+    before ``release_lock`` so an in-flight extend cannot land after the
+    release.
+    """
+
+    def __init__(
+        self,
+        state: StateAdapter,
+        lock: Lock,
+        max_lifetime_ms: int,
+        logger: Logger,
+    ) -> None:
+        self._state = state
+        self._lock = lock
+        self._max_lifetime_ms = max_lifetime_ms
+        self._logger = logger
+        self._started_at = _monotonic_ms()
+        # Latest wall-clock instant (epoch ms) we know the lock is still ours;
+        # refreshed on each successful extend. Once it passes, the lock has
+        # lapsed on the backend.
+        self._held_until = lock.expires_at
+        self._ownership_lost = False
+        self._stopped = False
+        self._in_flight: asyncio.Task[bool] | None = None
+        self._task: asyncio.Task[None] = asyncio.get_running_loop().create_task(self._run())
+
+    @property
+    def task(self) -> asyncio.Task[None]:
+        """The renewal loop task (exposed for lifecycle assertions)."""
+        return self._task
+
+    def is_ownership_lost(self) -> bool:
+        """True once this instance can no longer assume it still owns the lock."""
+        return self._ownership_lost or _now_ms() >= self._held_until
+
+    async def _run(self) -> None:
+        # CancelledError is deliberately not caught here: ``stop()`` cancels
+        # this task and must observe the cancellation.
+        interval_ms = DEFAULT_LOCK_TTL_MS // 3
+        while True:
+            await _sleep(interval_ms)
+            if self._stopped:
+                return
+            if _monotonic_ms() - self._started_at >= self._max_lifetime_ms:
+                # Renewal cap: let the lock lapse at its TTL so a hung
+                # handler can't block the thread forever.
+                self._logger.warn(
+                    "Lock heartbeat reached max_lock_lifetime_ms — the lock will lapse at its TTL",
+                    {
+                        "thread_id": self._lock.thread_id,
+                        "token": self._lock.token,
+                        "max_lock_lifetime_ms": self._max_lifetime_ms,
+                    },
+                )
+                return
+            # Shield the extend so cancelling the loop (``stop()``) never
+            # abandons a half-finished backend call; ``stop()`` awaits it.
+            self._in_flight = asyncio.get_running_loop().create_task(self._extend_once())
+            keep_going = await asyncio.shield(self._in_flight)
+            self._in_flight = None
+            if not keep_going:
+                return
+
+    async def _extend_once(self) -> bool:
+        """Run one extend. Returns ``False`` when renewal must stop."""
+        try:
+            extended = await self._state.extend_lock(self._lock, DEFAULT_LOCK_TTL_MS)
+        except Exception as err:
+            if self._stopped:
+                return False
+            if _now_ms() >= self._held_until:
+                self._ownership_lost = True
+                self._logger.warn(
+                    "Lock lapsed while the heartbeat could not reach the state backend",
+                    {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
+                )
+                return False
+            self._logger.warn(
+                "Lock heartbeat failed",
+                {"error": err, "thread_id": self._lock.thread_id, "token": self._lock.token},
+            )
+            return True
+        if extended:
+            self._held_until = _now_ms() + DEFAULT_LOCK_TTL_MS
+            return True
+        self._ownership_lost = True
+        if not self._stopped:
+            self._logger.warn(
+                "Lock heartbeat stopped after ownership was lost",
+                {"thread_id": self._lock.thread_id, "token": self._lock.token},
+            )
+        return False
+
+    async def stop(self) -> None:
+        """Stop renewing; waits for any in-flight extend so it cannot land after release.
+
+        Idempotent. ``asyncio.wait`` (not ``gather``) is used so that if the
+        caller of ``stop()`` is itself cancelled, the in-flight extend is not
+        cancelled mid-call.
+        """
+        self._stopped = True
+        self._task.cancel()
+        pending: set[asyncio.Task[Any]] = {self._task}
+        in_flight = self._in_flight
+        if in_flight is not None:
+            pending.add(in_flight)
+        await asyncio.wait(pending)
+        # Retrieve outcomes so a finished task never logs "exception was
+        # never retrieved"; a cancelled loop task is the expected outcome.
+        for task in pending:
+            if not task.cancelled():
+                task.exception()
+
+
 def _create_task(
     coro: Any,
     active_tasks: set[asyncio.Task[Any]] | None = None,
@@ -315,6 +461,7 @@ class Chat:
             self._concurrency_max_queue_size = 10
             self._concurrency_on_queue_full: str = "drop-oldest"
             self._concurrency_queue_entry_ttl_ms = 90_000
+            self._concurrency_max_lock_lifetime_ms = DEFAULT_MAX_LOCK_LIFETIME_MS
         elif isinstance(concurrency, str):
             self._concurrency_strategy = concurrency
             self._concurrency_debounce_ms = 1500
@@ -322,6 +469,7 @@ class Chat:
             self._concurrency_max_queue_size = 10
             self._concurrency_on_queue_full = "drop-oldest"
             self._concurrency_queue_entry_ttl_ms = 90_000
+            self._concurrency_max_lock_lifetime_ms = DEFAULT_MAX_LOCK_LIFETIME_MS
         else:
             # ConcurrencyConfig dataclass
             self._concurrency_strategy = concurrency.strategy
@@ -330,6 +478,12 @@ class Chat:
             self._concurrency_max_queue_size = concurrency.max_queue_size
             self._concurrency_on_queue_full = concurrency.on_queue_full
             self._concurrency_queue_entry_ttl_ms = concurrency.queue_entry_ttl_ms
+            # ``??`` semantics: an explicit ``None`` falls back to the default.
+            self._concurrency_max_lock_lifetime_ms = (
+                concurrency.max_lock_lifetime_ms
+                if concurrency.max_lock_lifetime_ms is not None
+                else DEFAULT_MAX_LOCK_LIFETIME_MS
+            )
 
         # -- Concurrent-strategy semaphore ------------------------------------
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
@@ -2014,11 +2168,11 @@ class Chat:
                 )
 
         self._logger.debug("Lock acquired", {"thread_id": thread_id, "lock_key": lock_key, "token": lock.token})
-        try:
+
+        async def _run(_heartbeat: _LockHeartbeat) -> None:
             await self._dispatch_to_handlers(adapter, thread_id, message)
-        finally:
-            await self._state_adapter.release_lock(lock)
-            self._logger.debug("Lock released", {"thread_id": thread_id, "lock_key": lock_key})
+
+        await self._with_held_lock(lock, thread_id, lock_key, _run)
 
     async def _resolve_lock_conflict(
         self,
@@ -2079,8 +2233,10 @@ class Chat:
         lock = await self._state_adapter.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
 
         if lock is None:
-            # Lock busy -- enqueue
-            effective_max = 1 if strategy == "debounce" else max_queue_size
+            # Lock busy -- enqueue. Debounce shares the queue capacity
+            # (upstream #659): superseded messages are kept so the handler
+            # sees them in ``context.skipped``.
+            effective_max = max_queue_size
             depth = await self._state_adapter.queue_depth(lock_key)
 
             if depth >= effective_max and strategy != "debounce" and on_queue_full == "drop-newest":
@@ -2095,7 +2251,7 @@ class Chat:
                 )
                 return
 
-            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            now = _now_ms()
             entry = QueueEntry(
                 message=message,
                 enqueued_at=now,
@@ -2104,36 +2260,44 @@ class Chat:
             await self._state_adapter.enqueue(lock_key, entry, effective_max)
             self._logger.info(
                 "message-debounce-reset" if strategy == "debounce" else "message-queued",
-                {"thread_id": thread_id, "lock_key": lock_key, "message_id": message.id},
+                {
+                    "thread_id": thread_id,
+                    "lock_key": lock_key,
+                    "message_id": message.id,
+                    "queue_depth": min(depth + 1, effective_max),
+                },
             )
             return
 
         # We hold the lock
         self._logger.debug("Lock acquired", {"thread_id": thread_id, "lock_key": lock_key, "token": lock.token})
 
-        try:
+        async def _run(heartbeat: _LockHeartbeat) -> None:
             if strategy == "debounce":
-                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                # Debounce: enqueue our own message and enter the debounce loop
+                now = _now_ms()
                 await self._state_adapter.enqueue(
                     lock_key,
                     QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
-                    1,
+                    max_queue_size,
                 )
                 self._logger.info(
                     "message-debouncing",
                     {
                         "thread_id": thread_id,
+                        "lock_key": lock_key,
                         "message_id": message.id,
                         "debounce_ms": debounce_ms,
                     },
                 )
-                await self._debounce_loop(lock, adapter, thread_id, lock_key)
+                await self._debounce_loop(heartbeat, adapter, lock_key)
             elif strategy == "burst":
                 # Burst: enqueue the first message, sleep `debounce_ms` so any
                 # messages arriving during the window are queued alongside it,
                 # then drain like ``queue`` -- the latest message is dispatched
-                # with the earlier ones in ``context.skipped``.
-                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                # with the earlier ones in ``context.skipped``. The heartbeat
+                # keeps the lock alive across the window.
+                now = _now_ms()
                 await self._state_adapter.enqueue(
                     lock_key,
                     QueueEntry(message=message, enqueued_at=now, expires_at=now + queue_entry_ttl_ms),
@@ -2149,126 +2313,175 @@ class Chat:
                     },
                 )
                 await _sleep(debounce_ms)
-                extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
-                if not extended:
-                    self._logger.warn(
-                        "Lock lost during burst window, aborting",
-                        {"thread_id": thread_id, "lock_key": lock_key},
-                    )
-                    return
-                await self._drain_queue(lock, adapter, thread_id, lock_key)
+                await self._drain_queue(heartbeat, adapter, lock_key)
             else:
+                # Queue: process our message immediately, then drain any
+                # queued messages.
                 await self._dispatch_to_handlers(adapter, thread_id, message)
-                await self._drain_queue(lock, adapter, thread_id, lock_key)
+                await self._drain_queue(heartbeat, adapter, lock_key)
+
+        await self._with_held_lock(lock, thread_id, lock_key, _run)
+
+    # -- Held-lock lifecycle -------------------------------------------------
+
+    async def _with_held_lock(
+        self,
+        lock: Lock,
+        thread_id: str,
+        lock_key: str,
+        fn: Callable[[_LockHeartbeat], Awaitable[None]],
+    ) -> None:
+        """Run ``fn`` while a heartbeat keeps ``lock`` alive, then stop it and release.
+
+        Every lock-holding path goes through here so acquiring a lock is
+        never paired with a missing heartbeat. ``stop()`` is awaited before
+        ``release_lock`` so an in-flight extend cannot land after the
+        release; ``release_lock`` is a no-op for a foreign token if
+        ownership was lost meanwhile.
+        """
+        heartbeat = _LockHeartbeat(
+            self._state_adapter,
+            lock,
+            self._concurrency_max_lock_lifetime_ms,
+            self._logger,
+        )
+        try:
+            await fn(heartbeat)
         finally:
-            await self._state_adapter.release_lock(lock)
-            self._logger.debug("Lock released", {"thread_id": thread_id, "lock_key": lock_key})
+            try:
+                await heartbeat.stop()
+            finally:
+                await self._state_adapter.release_lock(lock)
+                self._logger.debug("Lock released", {"thread_id": thread_id, "lock_key": lock_key})
+
+    # -- Pending-queue collection --------------------------------------------
+
+    async def _take_pending(self, adapter: Adapter, lock_key: str) -> list[Message]:
+        """Dequeue every entry for ``lock_key``, dropping expired ones."""
+        pending: list[Message] = []
+        while True:
+            entry = await self._state_adapter.dequeue(lock_key)
+            if entry is None:
+                return pending
+            msg = self._rehydrate_message(entry.message, adapter)
+            if _now_ms() <= entry.expires_at:
+                pending.append(msg)
+            else:
+                self._logger.info(
+                    "message-expired",
+                    {"thread_id": msg.thread_id, "lock_key": lock_key, "message_id": msg.id},
+                )
 
     # -- Debounce loop -------------------------------------------------------
 
     async def _debounce_loop(
         self,
-        lock: Lock,
+        heartbeat: _LockHeartbeat,
         adapter: Adapter,
-        thread_id: str,
         lock_key: str,
     ) -> None:
+        """Wait ``debounce_ms``, fold superseded messages into ``skipped``, dispatch the last.
+
+        Loops until the queue stays empty for a whole window, so a message
+        enqueued while the handler ran is debounced and processed instead
+        of stranded until the next webhook. ``max_lock_lifetime_ms`` bounds
+        the loop: once renewal stops the lock lapses and
+        ``is_ownership_lost()`` ends it.
+        """
         debounce_ms = self._concurrency_debounce_ms
-        max_iterations = 20
-        iteration = 0
+        skipped: list[Message] = []
 
         while True:
-            iteration += 1
-            if iteration > max_iterations:
-                self._logger.warn(
-                    "Debounce loop exceeded max iterations, breaking",
-                    {"thread_id": thread_id, "lock_key": lock_key, "max_iterations": max_iterations},
-                )
-                break
-
             await _sleep(debounce_ms)
-            extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
-            if not extended:
-                self._logger.warn(
-                    "Lock lost during debounce processing, aborting", {"thread_id": thread_id, "lock_key": lock_key}
-                )
+            if heartbeat.is_ownership_lost():
+                # Another instance may hold the lock now -- leave the queue to it.
+                self._logger.warn("Stopping debounce loop after lock ownership was lost", {"lock_key": lock_key})
                 return
 
-            entry = await self._state_adapter.dequeue(lock_key)
-            if entry is None:
-                break
+            pending = await self._take_pending(adapter, lock_key)
+            if not pending:
+                return
 
-            msg = self._rehydrate_message(entry.message, adapter)
-            now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-            if now > entry.expires_at:
-                self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
-                continue
+            latest = pending[-1]
+            skipped.extend(pending[:-1])
 
+            # Check if anything new arrived during the dequeue
             depth = await self._state_adapter.queue_depth(lock_key)
             if depth > 0:
-                self._logger.info("message-superseded", {"thread_id": thread_id, "dropped_id": msg.id})
+                # Newer message superseded this one -- loop again
+                skipped.append(latest)
+                self._logger.info(
+                    "message-superseded",
+                    {"thread_id": latest.thread_id, "lock_key": lock_key, "dropped_id": latest.id},
+                )
                 continue
 
-            self._logger.info("message-dequeued", {"thread_id": thread_id, "message_id": msg.id})
-            await self._dispatch_to_handlers(adapter, thread_id, msg)
-            break
+            # Nothing new -- this is the final message in the burst. Dispatch
+            # it under ITS OWN thread id (channel-scoped locks can hold
+            # messages from several threads; upstream #832).
+            message_thread_id = latest.thread_id
+            message_skipped = [m for m in skipped if m.thread_id == message_thread_id]
+            self._logger.info(
+                "message-dequeued",
+                {"thread_id": message_thread_id, "lock_key": lock_key, "message_id": latest.id},
+            )
+            await self._dispatch_to_handlers(
+                adapter,
+                message_thread_id,
+                latest,
+                MessageContext(
+                    skipped=message_skipped,
+                    total_since_last_handler=len(message_skipped) + 1,
+                ),
+            )
+            skipped = []
+            # Loop again: a message enqueued while the handler ran must be
+            # debounced and processed, not stranded until the next webhook.
 
     # -- Drain queue ---------------------------------------------------------
 
     async def _drain_queue(
         self,
-        lock: Lock,
+        heartbeat: _LockHeartbeat,
         adapter: Adapter,
-        thread_id: str,
         lock_key: str,
     ) -> None:
+        """Dispatch the latest pending message with the rest as skipped; repeat until empty."""
         while True:
-            pending: list[tuple[Message, int]] = []
-            while True:
-                entry = await self._state_adapter.dequeue(lock_key)
-                if entry is None:
-                    break
-                msg = self._rehydrate_message(entry.message, adapter)
-                now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-                if now <= entry.expires_at:
-                    pending.append((msg, entry.expires_at))
-                else:
-                    self._logger.info("message-expired", {"thread_id": thread_id, "message_id": msg.id})
+            if heartbeat.is_ownership_lost():
+                # Another instance may hold the lock now -- leave the queue to it.
+                self._logger.warn("Stopping queue drain after lock ownership was lost", {"lock_key": lock_key})
+                return
 
+            pending = await self._take_pending(adapter, lock_key)
             if not pending:
                 return
 
-            extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
-            if not extended:
-                self._logger.warn(
-                    "Lock lost during drain processing, aborting", {"thread_id": thread_id, "lock_key": lock_key}
-                )
-                return
-
-            latest_msg, _ = pending[-1]
-            skipped = [m for m, _ in pending[:-1]]
+            # Latest message is the one we process, under ITS OWN thread id;
+            # skipped context only carries messages from that same thread
+            # (channel-scoped locks can hold several threads; upstream #832).
+            latest = pending[-1]
+            message_thread_id = latest.thread_id
+            skipped = [m for m in pending[:-1] if m.thread_id == message_thread_id]
 
             self._logger.info(
                 "message-dequeued",
                 {
-                    "thread_id": thread_id,
-                    "message_id": latest_msg.id,
+                    "thread_id": message_thread_id,
+                    "lock_key": lock_key,
+                    "message_id": latest.id,
                     "skipped_count": len(skipped),
-                    "total_since_last_handler": len(pending),
+                    "total_since_last_handler": len(skipped) + 1,
                 },
             )
 
             context = MessageContext(
                 skipped=skipped,
-                total_since_last_handler=len(pending),
+                total_since_last_handler=len(skipped) + 1,
             )
-            await self._dispatch_to_handlers(adapter, thread_id, latest_msg, context)
-
-            # After dispatch, re-extend lock before next dequeue iteration
-            extended = await self._state_adapter.extend_lock(lock, DEFAULT_LOCK_TTL_MS)
-            if not extended:
-                self._logger.warn("Lock lost after handler dispatch", {"thread_id": thread_id, "lock_key": lock_key})
-                return
+            await self._dispatch_to_handlers(adapter, message_thread_id, latest, context)
+            # After processing, check if MORE messages arrived during this
+            # handler (loop continues).
 
     # -- Concurrent strategy -------------------------------------------------
 
@@ -2314,8 +2527,10 @@ class Chat:
             for skipped_msg in context.skipped:
                 set_message_adapter(skipped_msg, adapter)
 
-        # Detect mention
-        message.is_mention = message.is_mention or self._detect_mention(adapter, message)
+        # Detect mention on the dispatched message and every skipped one
+        # (upstream #656/#659): an earlier skipped mention still routes to
+        # mention handlers.
+        has_mention = self._set_mention_flags(adapter, message, context)
 
         # Check subscription
         is_subscribed = await self._state_adapter.is_subscribed(thread_id)
@@ -2370,8 +2585,9 @@ class Chat:
             await self._run_handlers(self._subscribed_message_handlers, thread, message, context)
             return
 
-        # Mention
-        if message.is_mention:
+        # Mention -- the dispatched message itself, or a skipped message when
+        # mention handlers exist (otherwise fall through to patterns).
+        if message.is_mention or (has_mention and self._mention_handlers):
             self._logger.debug("Bot mentioned", {"thread_id": thread_id})
             await self._run_handlers(self._mention_handlers, thread, message, context)
             return
@@ -2449,6 +2665,27 @@ class Chat:
             self._mention_patterns[key] = pat
         return pat
 
+    def _set_mention_flags(
+        self,
+        adapter: Adapter,
+        message: Message,
+        context: MessageContext | None = None,
+    ) -> bool:
+        """Fill ``is_mention`` on ``message`` and each ``context.skipped`` in place.
+
+        Returns whether any of them mentions the bot. Port of upstream
+        ``setMentionFlags`` (chat@4.32/4.33). Keeps today's ``or`` semantics
+        (a falsy adapter-reported flag is re-derived from text); #192 moves
+        this to upstream's ``??`` tri-state.
+        """
+        message.is_mention = message.is_mention or self._detect_mention(adapter, message)
+        has_mention = message.is_mention is True
+        if context is not None:
+            for skipped in context.skipped:
+                skipped.is_mention = skipped.is_mention or self._detect_mention(adapter, skipped)
+                has_mention = has_mention or skipped.is_mention is True
+        return has_mention
+
     def _detect_mention(self, adapter: Adapter, message: Message) -> bool:
         bot_user_name = adapter.user_name or self._user_name
         bot_user_id = adapter.bot_user_id
@@ -2517,7 +2754,9 @@ class Chat:
                 author_raw = raw.get("author", {})
                 msg = Message(
                     id=raw.get("id", ""),
-                    thread_id=raw.get("thread_id", ""),
+                    # Drains dispatch each message under its own thread id
+                    # (#190), so accept the camelCase key too.
+                    thread_id=raw.get("thread_id") or raw.get("threadId", ""),
                     text=raw.get("text", ""),
                     formatted=raw.get("formatted", {"type": "root", "children": []}),
                     raw=raw.get("raw"),
