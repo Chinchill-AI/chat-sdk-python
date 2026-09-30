@@ -2749,7 +2749,11 @@ class TelegramAdapter:
                 )
             )
 
-        # An animation is Telegram's GIF: an MP4 without sound.
+        # An animation is Telegram's GIF: an MP4 without sound. Upstream parity
+        # (chat@4.41.1 adapter-telegram index.ts:2798-2809): always a "video"
+        # attachment, even for an ``image/gif`` mime type, so re-posting it
+        # goes through ``sendVideo`` exactly as upstream's ATTACHMENT_UPLOADS
+        # table does; no GIF-specific outbound route is added here.
         if animation:
             attachments.append(
                 self.create_attachment(
