@@ -271,6 +271,8 @@ def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddre
             return None
     host = host.lower()
     if ":" in host:
+        if "%" in host:
+            return None  # WHATWG rejects IPv6 zone identifiers
         try:
             return ipaddress.IPv6Address(host)
         except ValueError:
@@ -308,7 +310,10 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
     hostname = host if isinstance(host, str) else str(host)
     if parts.scheme.lower() != "https" or (
         hosts is not None
-        and not any(hostname == allowed.lower() or hostname.endswith(f".{allowed.lower()}") for allowed in hosts)
+        and not any(
+            hostname == allowed.lower() or (isinstance(host, str) and hostname.endswith(f".{allowed.lower()}"))
+            for allowed in hosts
+        )
     ):
         raise _untrusted(adapter)
     netloc_host = f"[{hostname}]" if isinstance(host, ipaddress.IPv6Address) else hostname
@@ -827,6 +832,9 @@ async def download_attachment(
             # close used it up), even for a transport that never suspends.
             _check_deadline(deadline, adapter)
             hop_headers = _hop_headers(headers, current, first_origin)
+            # A slow ``headers`` callback must not let a transport that
+            # starts its request synchronously run past the deadline.
+            _check_deadline(deadline, adapter)
             response: AttachmentResponse = await _within_deadline(
                 send(current, hop_headers), deadline, adapter, late=_close_late
             )

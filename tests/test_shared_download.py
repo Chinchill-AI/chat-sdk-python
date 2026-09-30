@@ -415,11 +415,26 @@ class TestHostCanonicalization:
             "https:///file",
             "https://a%2fb.example.com/file",
             "https://evil.example\\@files.example.com/file",
+            "https://[fe80::1%25eth0]/file",  # WHATWG rejects IPv6 zone ids
         ],
     )
     def test_unparseable_or_ambiguous_hosts_are_untrusted(self, url: str) -> None:
         with pytest.raises(NetworkError, match=UNTRUSTED):
             validate_attachment_url(url, "test")
+
+    @pytest.mark.parametrize(
+        ("url", "hosts"),
+        [
+            # A zone id must not smuggle an allowlisted suffix onto an address.
+            ("https://[2606:4700:4700::1111%25x.fbcdn.net]/file", ["fbcdn.net"]),
+            # IP literals match an allowlist entry exactly, never as a suffix.
+            ("https://1.2.3.4/file", ["2.3.4"]),
+        ],
+    )
+    def test_ip_literals_never_match_an_allowlist_suffix(self, url: str, hosts: list[str]) -> None:
+        with pytest.raises(NetworkError, match=UNTRUSTED):
+            validate_attachment_url(url, "test", hosts)
+        assert validate_attachment_url("https://1.2.3.4/file", "test", ["1.2.3.4"]) == "https://1.2.3.4/file"
 
     def test_public_numeric_host_is_rewritten_to_its_canonical_address(self) -> None:
         assert validate_attachment_url("https://1572395042/f?x=1", "test") == "https://93.184.216.34/f?x=1"
@@ -710,6 +725,10 @@ class TestDeadlineAndCancellation:
 
         responses = [SlowClose("", 302, {"location": "https://cdn.example.net/file"}), FakeResponse("too late")]
         calls: list[str] = []
+        header_calls: list[str] = []
+
+        def headers(url: str) -> None:
+            header_calls.append(url)
 
         def transport(url: str, headers: dict[str, str]) -> asyncio.Future[AttachmentResponse]:
             # Synchronous transport: does its work when called, never suspends.
@@ -720,9 +739,28 @@ class TestDeadlineAndCancellation:
 
         with pytest.raises(NetworkError, match=TIMED_OUT):
             await download_attachment(
-                "https://files.example.com/file", adapter="test", timeout_ms=20, transport=transport
+                "https://files.example.com/file", adapter="test", headers=headers, timeout_ms=20, transport=transport
             )
         assert calls == ["https://files.example.com/file"]
+        assert header_calls == ["https://files.example.com/file"]
+
+    async def test_a_slow_headers_callback_cannot_start_a_request_after_the_deadline(self) -> None:
+        calls: list[str] = []
+
+        def headers(url: str) -> None:
+            time.sleep(0.04)  # uses up the 10 ms deadline
+
+        def transport(url: str, headers: dict[str, str]) -> asyncio.Future[AttachmentResponse]:
+            calls.append(url)  # a synchronous transport would start I/O here
+            done: asyncio.Future[AttachmentResponse] = asyncio.get_running_loop().create_future()
+            done.set_result(FakeResponse("too late"))
+            return done
+
+        with pytest.raises(NetworkError, match=TIMED_OUT):
+            await download_attachment(
+                "https://files.example.com/file", adapter="test", headers=headers, timeout_ms=10, transport=transport
+            )
+        assert calls == []
 
     async def test_a_body_read_completing_after_the_deadline_is_refused(self) -> None:
         class BlockingBody(FakeResponse):
