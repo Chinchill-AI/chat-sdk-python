@@ -57,6 +57,7 @@ from chat_sdk.shared.errors import (
     NetworkError,
     ValidationError,
 )
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -864,7 +865,7 @@ class GoogleChatAdapter:
             else:
                 body = str(request)
 
-        self._logger.debug("GChat webhook raw body", {"body": body})
+        self._logger.debug("GChat webhook received", {"bodyLength": utf8_byte_length(body)})
 
         try:
             parsed = json.loads(body)
@@ -961,12 +962,15 @@ class GoogleChatAdapter:
         # Check for message payload in the Add-ons format
         message_payload = (event.get("chat") or {}).get("messagePayload")
         if message_payload:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream
+            # still logs the sender display name and a text prefix here; we
+            # log only the text length so message content stays out of logs.
+            message_text = (message_payload.get("message") or {}).get("text")
             self._logger.debug(
                 "message event",
                 {
                     "space": message_payload.get("space", {}).get("name"),
-                    "sender": (message_payload.get("message") or {}).get("sender", {}).get("displayName"),
-                    "text": (message_payload.get("message") or {}).get("text", "")[:50],
+                    "textLength": len(message_text) if isinstance(message_text, str) else 0,
                 },
             )
             self._handle_message_event(event, options)
@@ -1227,8 +1231,8 @@ class GoogleChatAdapter:
             {
                 "threadId": thread_id,
                 "messageId": parsed_message.id,
-                "text": parsed_message.text,
-                "author": parsed_message.author.full_name,
+                # Divergence from upstream — see docs/UPSTREAM_SYNC.md: no
+                # message text or author display name in logs.
                 "isBot": parsed_message.author.is_bot,
                 "isMe": parsed_message.author.is_me,
             },

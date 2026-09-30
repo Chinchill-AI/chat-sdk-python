@@ -470,7 +470,9 @@ class DiscordAdapter:
             "Processing Discord slash command",
             {
                 "command": command,
-                "text": text,
+                # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the
+                # command text's length, not its content.
+                "textLength": len(text),
                 "userId": user.get("id"),
                 "channelId": channel_id,
             },
