@@ -317,6 +317,14 @@ Both modules were checked against the TS sources at `chat@4.41.1` (run under Nod
 
 `ast_to_plain_text` follows upstream `toPlainText` from `5c926f19` (chat@4.34.0) and the core half of `764e4759` (chat@4.38.1). Root children are joined with `"\n\n"`. `list`, `listItem` and `blockquote` children are joined with `"\n"`. A `tableRow` joins its cells with `"\t"` and keeps empty cells. A `table` joins its rows with `"\n"` and drops rows that are empty after `trim()`. A string `value`/`alt` is returned as-is. The Python parser already kept soft line breaks inside text nodes, which was the remark half of #604. `table_to_ascii` reads cells, so its output does not change.
 
+### Slack outbound mentions (chat@4.32–4.37, #206)
+
+Slack adopts the shared scanner in both outbound passes, with no divergence: `SlackFormatConverter` (`_finalize` and mrkdwn text nodes) via `_link_bare_mention_names` (`a8c4af74`), and `SlackAdapter._resolve_outgoing_mentions` (`07c11129`, `a8c4af74`, `d4c52cad`). The old ASCII lookbehind regex (converter) and Unicode-`\w` regex (resolver) are gone. The native `stream()` path resolves mentions line by line before each `append` (`6f0d2f02`). `resolve_committed` ports `resolveCommitted`, and `last_appended` tracks the resolved buffer. Fence lines toggle state only once their newline is committed. #208 replaces this with a marker-matching tracker.
+
+Parity fix: the final native-stream delta now comes from `renderer.get_committable_text()` after `renderer.finish()`, as upstream does (4.31 and 4.37). It used to come from `finish()`'s return value, which is the `_remend`'d render. That value is not guaranteed to extend the committable prefix, so it could not share the resolved buffer's coordinate space. As a side effect, a stream that ends with an unclosed inline marker (`**bold`) no longer gets a closing marker appended on the native path. Upstream behaves the same way.
+
+Known upstream-parity edge: a segment committed after an inline-marker holdback cut is resolved without the text before the cut. So in `https://x.io/*@alice`, where the renderer cuts at the unclosed `*`, the handle is resolved. Upstream `resolveCommitted` does the same, and the adapter code has a comment noting it.
+
 ### SDK-free primitive subpaths (Teams, chat@4.31)
 
 These six runtime-free Teams primitive subpaths mirror upstream's
