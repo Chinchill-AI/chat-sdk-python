@@ -104,6 +104,9 @@ TARGET_MAPPING = {
     "packages/chat/src/agent-session.test.ts": "tests/test_agent_session.py",
     "packages/chat/src/app-context.test.ts": "tests/test_app_context.py",
     "packages/chat/src/installation-events.test.ts": "tests/test_installation_events.py",
+    # Shared guarded downloader (chat@4.39.0, #204). Outside packages/chat,
+    # so it is mapped explicitly rather than discovered as a core test file.
+    "packages/adapter-shared/src/download.test.ts": "tests/test_shared_download.py",
     # Present at the pin but with gaps (issue #78)
     "packages/chat/src/cards.test.ts": "tests/test_cards.py",
     "packages/chat/src/modals.test.ts": "tests/test_modals.py",
