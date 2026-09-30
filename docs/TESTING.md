@@ -253,6 +253,7 @@ The following modules are under 60% coverage as of the initial alpha release. Th
 These gaps exist primarily because:
 - WhatsApp and Google Chat have complex webhook payload variations that need more recorded fixtures.
 - Redis and PostgreSQL state adapters require running databases for full integration testing. The unit tests mock the database clients, which limits coverage of error paths.
+  - PostgreSQL has an opt-in live suite (`TestPostgresMigrationOwnedSchemaIntegration` in `tests/test_state_postgres.py`). It runs only when `POSTGRES_TEST_URL` points at a **disposable** database whose user can `CREATE ROLE` and `CREATE SCHEMA`. It never reads `POSTGRES_URL`. It needs `asyncpg`, which the `dev` group does not install: `POSTGRES_TEST_URL=postgres://... uv run --with asyncpg pytest tests/test_state_postgres.py -k Integration`.
 
 ## The Dispatch Key Validation Pattern
 

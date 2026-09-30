@@ -91,7 +91,14 @@ from chat_sdk.emoji import (
     resolve_emoji_from_gchat,
     resolve_emoji_from_slack,
 )
-from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError, RateLimitError, StateNotConnectedError
+from chat_sdk.errors import (
+    ChatError,
+    ChatNotImplementedError,
+    LockError,
+    RateLimitError,
+    StateNotConnectedError,
+    StateSchemaError,
+)
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import ConsoleLogger, Logger, LogLevel
 
@@ -361,6 +368,7 @@ __all__ = [
     "LockError",
     "RateLimitError",
     "StateNotConnectedError",
+    "StateSchemaError",
     # Adapter errors
     "AdapterError",
     "AdapterPermissionError",
