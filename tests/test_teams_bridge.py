@@ -13,14 +13,17 @@ Python port coverage for ``packages/adapter-teams/src/bridge-adapter.ts``
 
 from __future__ import annotations
 
+import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from microsoft_teams.apps.http.adapter import HttpServerAdapter
 
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.logger import ConsoleLogger
+from chat_sdk.testing import MockLogger
 from chat_sdk.types import WebhookOptions
+from tests._log_capture import MULTIBYTE_TEXT, assert_body_not_logged
 
 
 def _make_bridge() -> BridgeHttpAdapter:
@@ -316,16 +319,39 @@ class TestHeaderExtraction:
 
 
 # ---------------------------------------------------------------------------
-# Logger interaction (debug log of raw body)
+# Logger interaction (request-shape metadata only — upstream f485255b)
 # ---------------------------------------------------------------------------
 
 
 class TestLogging:
-    async def test_logs_raw_body_at_debug(self):
-        logger = MagicMock(debug=MagicMock(), error=MagicMock())
+    async def test_logs_body_length_not_body_at_debug(self):
+        logger = MockLogger()
         bridge = BridgeHttpAdapter(logger)
         handler = AsyncMock(return_value={"status": 200, "body": None})
         bridge.register_route("POST", "/api/messages", handler)
+        body = json.dumps(
+            {
+                "id": "m1",
+                "type": "message",
+                "text": f"Authorization: Bearer secret-token secret-access-token {MULTIBYTE_TEXT}",
+                "from": {"name": "customer-team-slug"},
+            },
+            ensure_ascii=False,
+        )
 
-        await bridge.dispatch(_FakeRequest('{"id": "m1"}'))
-        assert logger.debug.called
+        await bridge.dispatch(_FakeRequest(body))
+
+        # ``bodyLength`` is the UTF-8 byte length (``Buffer.byteLength``), not
+        # the code-point count.
+        assert len(body.encode("utf-8")) != len(body)
+        assert ("Teams webhook received", {"bodyLength": len(body.encode("utf-8"))}) in logger.debug.calls
+        assert_body_not_logged(logger, body)
+
+    async def test_empty_body_logs_zero_length(self):
+        logger = MockLogger()
+        bridge = BridgeHttpAdapter(logger)
+        bridge.register_route("POST", "/api/messages", AsyncMock(return_value={"status": 200, "body": None}))
+
+        await bridge.dispatch(_FakeRequest(""))
+
+        assert ("Teams webhook received", {"bodyLength": 0}) in logger.debug.calls

@@ -13,6 +13,31 @@ Part of the upstream `4.31.0` → `4.41.1` sync wave (#184). `UPSTREAM_PARITY` s
   - **Consumer-visible (custom `api_url` only):** with a non-default `api_url`, media hosted on any other origin, including inbound media on `https://api.twilio.com`, is now refused (upstream behaves the same). With a non-Twilio or `http` `api_url` (a proxy or local mock), no media URL passes both layers: `api.twilio.com` fails the origin check and the proxy origin fails the host allowlist, so attachment downloads always raise. Before this change such configs downloaded `api.twilio.com` media. The default config (`api_url` unset) is unaffected.
 - **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
 
+### Security
+
+- **Webhook log hygiene: raw bodies and message content no longer reach DEBUG logs** (#187; ports upstream `fc7df9c4` / vercel/chat#500 and the logging parts of `f485255b` / vercel/chat#877). Several adapters logged raw webhook bodies, or previews of them, at DEBUG. In some cases this happened before signature or JWT verification, so unauthenticated input and message content could be copied into log sinks. Webhook handlers now log only request-shape metadata:
+  - GitHub: `{bodyBytes, contentType, eventType, signaturePresent}`, under "GitHub webhook signature verification failed" or "GitHub webhook request verified", plus `jsonParseStatus: "error"` on invalid JSON.
+  - GChat, Slack (after verification only) and the Teams bridge: `"… webhook received" {bodyLength}`.
+  - Linear: the raw-body log is gone.
+  - `Chat` "Incoming message": drops `author` and adds `is_bot`, matching upstream's key set.
+- **Consumer-visible (DEBUG logs only; no routing, response or status change):**
+  - The `"GitHub/GChat/Slack/Teams/Linear/WhatsApp webhook raw body"` messages are gone. GChat, Slack and Teams now emit `"… webhook received"` with `bodyLength`, which is a UTF-8 byte count.
+  - GitHub's `"GitHub webhook event type"` is replaced by `"GitHub webhook request verified"`.
+  - `bodyPreview` becomes `bodyBytes` on the GitHub, Linear and WhatsApp invalid-JSON errors.
+  - "Incoming message" loses `author`.
+
+  Anything that parses these log lines must be updated.
+
+### Python-specific (divergence from upstream)
+
+- **WhatsApp** drops its raw-body debug log and invalid-JSON `bodyPreview` (#187). Upstream 4.41.1 still logs both.
+- **Message-content debug logs** (#187):
+  - GChat "message event" logs `{space, textLength}`.
+  - GChat "Pub/Sub parsed message" drops `text` and `author`.
+  - The `Chat`, Slack and Discord slash-command debug logs log `textLength` instead of `text`.
+
+  Upstream still logs this content. Both divergences are recorded in `docs/UPSTREAM_SYNC.md`.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.

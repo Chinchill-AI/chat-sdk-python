@@ -28,6 +28,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from chat_sdk.logger import Logger
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import WebhookOptions
 
 if TYPE_CHECKING:
@@ -99,7 +100,7 @@ class BridgeHttpAdapter:
         ``{body, status, headers}`` dict our consumers expect.
         """
         body = await self._read_body(request)
-        self._logger.debug("Teams webhook raw body", {"body": body[:500] if body else ""})
+        self._logger.debug("Teams webhook received", {"bodyLength": utf8_byte_length(body)})
 
         try:
             parsed_body: Any = json.loads(body) if body else {}
