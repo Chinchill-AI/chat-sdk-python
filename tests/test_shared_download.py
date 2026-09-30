@@ -422,6 +422,13 @@ class TestHostCanonicalization:
     def test_public_numeric_host_is_rewritten_to_its_canonical_address(self) -> None:
         assert validate_attachment_url("https://1572395042/f?x=1", "test") == "https://93.184.216.34/f?x=1"
 
+    def test_path_and_query_are_percent_encoded_keeping_existing_escapes(self) -> None:
+        url = 'https://files.example.com/a b/%2Fé?download=a%2Fb&x="y"#frag'
+
+        assert validate_attachment_url(url, "test") == (
+            "https://files.example.com/a%20b/%2F%C3%A9?download=a%2Fb&x=%22y%22"
+        )
+
     def test_unicode_host_is_converted_to_ascii(self) -> None:
         assert validate_attachment_url("https://bücher.example/x", "test") == "https://xn--bcher-kva.example/x"
 
@@ -602,6 +609,32 @@ class TestDeadlineAndCancellation:
             await task
         assert cancelled == [True]
 
+    async def test_a_hanging_async_close_does_not_outlive_the_deadline(self) -> None:
+        class SlowClose(FakeResponse):
+            def close(self) -> asyncio.Future[None]:
+                self.close_calls += 1
+                return asyncio.get_running_loop().create_future()  # never completes
+
+        hanging = SlowClose(hang=True)
+        with pytest.raises(NetworkError, match=TIMED_OUT):
+            await asyncio.wait_for(
+                download_attachment(
+                    "https://files.example.com/file", adapter="test", timeout_ms=20, transport=FakeTransport(hanging)
+                ),
+                timeout=2,
+            )
+        assert hanging.close_calls >= 1
+
+        done = SlowClose("ok")
+        result = await asyncio.wait_for(
+            download_attachment(
+                "https://files.example.com/file", adapter="test", timeout_ms=50, transport=FakeTransport(done)
+            ),
+            timeout=2,
+        )
+        assert result == b"ok"
+        assert done.close_calls == 1
+
     async def test_transport_errors_propagate_unchanged(self) -> None:
         async def transport(url: str, headers: dict[str, str]) -> AttachmentResponse:
             raise ConnectionResetError("reset")
@@ -616,6 +649,43 @@ class TestDefaultTransport:
         # before any socket is opened.
         with pytest.raises(NetworkError, match=INTERNAL):
             await download_attachment("https://localhost/file", adapter="test", timeout_ms=5_000)
+
+    async def test_default_transport_resolves_idn_hosts_by_their_ascii_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[str] = []
+
+        async def query(hostname: str, family: int) -> list[ResolvedAddress]:
+            seen.append(hostname)
+            return [ResolvedAddress("10.0.0.1", 4)]
+
+        monkeypatch.setattr(download_module, "_system_query", query)
+
+        # Reaching the (patched) resolver proves the host check accepted the
+        # punycode host; the internal answer then stops the download.
+        with pytest.raises(NetworkError, match=INTERNAL):
+            await download_attachment("https://bücher.example/x", adapter="test", timeout_ms=5_000)
+        assert seen == ["xn--bcher-kva.example"]
+
+    async def test_default_transport_sends_the_validated_url_unmodified(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import aiohttp
+
+        seen: list[tuple[Any, dict[str, Any]]] = []
+
+        async def fake_get(self: Any, url: Any, **kwargs: Any) -> Any:
+            seen.append((url, kwargs))
+            raise ConnectionResetError("stop")
+
+        monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+
+        with pytest.raises(ConnectionResetError):
+            await download_attachment("https://files.example.com/a%2Fb?sig=a%2Fb%3D&x=1", adapter="test")
+
+        url, kwargs = seen[0]
+        # Escapes are sent byte-for-byte, so signed URLs stay valid.
+        assert str(url) == "https://files.example.com/a%2Fb?sig=a%2Fb%3D&x=1"
+        assert url.raw_query_string == "sig=a%2Fb%3D&x=1"
+        assert kwargs["allow_redirects"] is False
 
     async def test_pinned_resolver_hands_aiohttp_only_vetted_addresses(self) -> None:
         async def query(hostname: str, family: int) -> list[ResolvedAddress]:

@@ -29,7 +29,7 @@ import unicodedata
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol, cast
-from urllib.parse import SplitResult, unquote, urljoin, urlsplit
+from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
 
 from chat_sdk.shared.errors import NetworkError
 
@@ -171,6 +171,10 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _OCT_DIGITS = frozenset("01234567")
 _DEC_DIGITS = frozenset("0123456789")
 _HOSTNAME = re.compile(r"[a-z0-9._-]+")
+# ``quote`` always keeps ASCII letters, digits and ``_.-~``; these add the
+# characters a valid URL may already carry (``%`` keeps existing escapes).
+_PATH_SAFE = "!$%&'()*+,/:;=?@[]^|"
+_USERINFO_SAFE = "!$%&'()*+,;=:"
 
 
 def _parse_ipv4_number(part: str) -> int | None:
@@ -289,10 +293,15 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
         raise _untrusted(adapter)
     netloc_host = f"[{hostname}]" if isinstance(host, ipaddress.IPv6Address) else hostname
     userinfo = parts.netloc.rpartition("@")[0]
-    netloc = f"{userinfo}@{netloc_host}" if "@" in parts.netloc else netloc_host
+    netloc = f"{quote(userinfo, safe=_USERINFO_SAFE)}@{netloc_host}" if "@" in parts.netloc else netloc_host
     if port is not None:
         netloc = f"{netloc}:{port}"
-    return parts._replace(scheme="https", netloc=netloc).geturl()
+    # Percent-encode what WHATWG would (spaces, quotes, non-ASCII, ...) while
+    # keeping existing escapes byte-for-byte: the transport sends the result
+    # as-is, so signatures over the escaped request target stay valid.
+    path = quote(parts.path.replace("\\", "/"), safe=_PATH_SAFE)
+    query = quote(parts.query, safe=_PATH_SAFE)
+    return SplitResult("https", netloc, path, query, "").geturl()
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +414,16 @@ def create_transport(adapter: str) -> AttachmentTransport:
     guarded = create_resolver(adapter)
 
     async def send(url: str, headers: dict[str, str]) -> AttachmentResponse:
-        # The HTTP client parses the URL again; refuse if its idea of the
-        # host is an internal literal (literals never reach the resolver).
-        target = yarl.URL(url)
-        if target.scheme != "https" or not target.host or target.host.lower() != urlsplit(url).hostname:
+        # ``encoded=True``: send the validated URL byte-for-byte (no
+        # requoting, so signed query strings survive). The HTTP client parses
+        # it again; refuse if its idea of the host differs from the validated
+        # one, or is an internal literal (literals never reach the resolver).
+        target = yarl.URL(url, encoded=True)
+        raw_host = (target.raw_host or "").lower()
+        if target.scheme != "https" or not raw_host or raw_host != urlsplit(url).hostname:
             raise _untrusted(adapter)
         with contextlib.suppress(ValueError):
-            if is_blocked_address(str(ipaddress.ip_address(target.host))):
+            if is_blocked_address(str(ipaddress.ip_address(raw_host))):
                 raise _refusal(adapter)
         connector = aiohttp.TCPConnector(resolver=resolver_class(guarded), force_close=True, use_dns_cache=False)
         session = aiohttp.ClientSession(connector=connector, auto_decompress=False, trust_env=False)
@@ -554,7 +566,9 @@ async def read_attachment_body(response: AttachmentResponse, adapter: str, limit
     try:
         return await _read_body(response, adapter, limit)
     except BaseException:
-        await _close(response)
+        # A failing close must not mask why the body was refused.
+        with contextlib.suppress(Exception):
+            await _close(response)
         raise
 
 
@@ -624,6 +638,44 @@ def _close_late(response: Any) -> None:
     if result is not None:
         _abandoned.add(result)
         result.add_done_callback(_abandoned.discard)
+
+
+def _detach(task: asyncio.Future[Any]) -> None:
+    """Let ``task`` finish in the background (kept referenced, errors retrieved)."""
+
+    def settled(done: asyncio.Future[Any]) -> None:
+        _abandoned.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    _abandoned.add(task)
+    task.add_done_callback(settled)
+
+
+async def _close_within(response: AttachmentResponse, deadline: float) -> None:
+    """Close ``response`` without letting a slow async ``close()`` outlive the deadline.
+
+    The synchronous part of ``close()`` always runs; an awaitable it returns
+    gets whatever time is left, then finishes in the background. Close
+    errors are ignored so they cannot mask the download's own outcome.
+    """
+    try:
+        result = response.close()
+    except Exception:
+        return
+    if not inspect.isawaitable(result):
+        return
+    task = asyncio.ensure_future(result)
+    remaining = deadline - asyncio.get_running_loop().time()
+    try:
+        if remaining > 0:
+            await asyncio.wait({task}, timeout=remaining)
+    finally:
+        if task.done():
+            if not task.cancelled():
+                task.exception()
+        else:
+            _detach(task)
 
 
 def _close_quietly(response: Any) -> asyncio.Task[None] | None:
@@ -761,7 +813,7 @@ async def download_attachment(
                     await _within_deadline(read_attachment_body(response, adapter, limit), deadline, adapter),
                 )
             finally:
-                await _close(response)
+                await _close_within(response, deadline)
         raise NetworkError(adapter, "Too many attachment redirects")
     except NetworkError:
         raise
