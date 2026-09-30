@@ -1133,7 +1133,12 @@ class TeamsAdapter:
                         {"threadId": thread_id, "error": str(exc)},
                     )
 
-        chained_options = WebhookOptions(wait_until=_chained_wait_until)
+        # Spread the caller's options (upstream ``{ ...baseOptions, waitUntil }``)
+        # so ``propagate_handler_errors`` / ``deduplicate`` survive the shim.
+        # ``wait_until`` receives a Task either way: the raw handler task when
+        # ``propagate_handler_errors`` is set, otherwise Chat's error-swallowing
+        # wrapper Task, which completes when the handler does.
+        chained_options = dataclasses.replace(options or WebhookOptions(), wait_until=_chained_wait_until)
 
         try:
             self._chat.process_message(self, thread_id, message, chained_options)

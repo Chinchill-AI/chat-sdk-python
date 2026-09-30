@@ -34,8 +34,10 @@ import pytest
 
 from chat_sdk.adapters.teams.adapter import TeamsAdapter
 from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
+from chat_sdk.chat import Chat
+from chat_sdk.testing import MockLogger, create_mock_state
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
-from chat_sdk.types import Message, RawMessage
+from chat_sdk.types import ChatConfig, Message, RawMessage
 
 
 def _make_adapter() -> TeamsAdapter:
@@ -722,6 +724,79 @@ class TestHandleMessageActivityLifecycle:
         # No streamer registered → fire-and-forget path.
         assert seen["registered"] is False
         assert tid not in adapter._active_streams
+
+
+class TestHandleMessageActivityWithRealChat:
+    """The DM ``processing_done`` gate driven by a real ``Chat`` (vercel/chat#943).
+
+    ``Chat.process_message`` now hands ``wait_until`` an error-swallowing
+    wrapper Task by default (the raw handler task only with
+    ``propagate_handler_errors=True``). The gate must still wait for the
+    handler either way, and the caller's options must survive the shim.
+    """
+
+    @staticmethod
+    def _wire(adapter: TeamsAdapter) -> tuple[Chat, list[str]]:
+        chat = Chat(
+            ChatConfig(
+                user_name="bot",
+                adapters={"teams": adapter},
+                state=create_mock_state(),
+                logger=MockLogger(),
+            )
+        )
+        adapter._chat = chat  # type: ignore[assignment]
+        stream_modes: list[str] = []
+
+        @chat.on_direct_message
+        async def handler(thread, message, channel=None, context=None):
+            # Yield several times so a gate that resolved early would have
+            # already closed/unregistered the streamer.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            stream_modes.append("native" if thread.id in adapter._active_streams else "fallback")
+
+            async def gen():
+                yield "hello"
+
+            await adapter.stream(thread.id, gen())
+            raise RuntimeError("handler boom")
+
+        return chat, stream_modes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("propagate", [False, True])
+    async def test_dm_gate_waits_for_handler_through_wait_until(self, propagate: bool):
+        from chat_sdk.types import WebhookOptions
+
+        adapter = _make_adapter()
+        streamer = FakeStreamer(chunk_id="id-1")
+        adapter._create_streamer = MagicMock(return_value=streamer)  # type: ignore[method-assign]
+        _chat, stream_modes = self._wire(adapter)
+        handed: list[Any] = []
+
+        await adapter._handle_message_activity(
+            _dm_activity(activity_id=f"incoming-real-{propagate}"),
+            WebhookOptions(wait_until=handed.append, propagate_handler_errors=propagate),
+        )
+
+        # The gate held the streamer open until the handler finished streaming.
+        assert stream_modes == ["native"]
+        assert streamer.emitted == ["hello"]
+        assert streamer.close_calls == 1
+        assert _dm_thread_id(adapter) not in adapter._active_streams
+
+        # The caller's wait_until got a finished Task; the option spread through
+        # the shim decides whether it carries the handler error.
+        assert len(handed) == 1
+        background = handed[0]
+        assert isinstance(background, asyncio.Task)
+        assert background.done()
+        if propagate:
+            with pytest.raises(RuntimeError, match="handler boom"):
+                background.result()
+        else:
+            assert background.result() is None
 
 
 # ---------------------------------------------------------------------------

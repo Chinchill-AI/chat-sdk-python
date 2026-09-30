@@ -1160,6 +1160,16 @@ class WebhookOptions:
     """Options for webhook handling."""
 
     wait_until: Callable[[Awaitable[Any]], None] | None = None
+    # Opt in to exposing message, action, and slash command handler errors
+    # through ``wait_until``. By default ``wait_until`` receives a task that
+    # completes normally when the handler fails (errors are still logged, and
+    # the task returned by ``process_*`` still raises). ``True`` hands
+    # ``wait_until`` the raw handler task instead.
+    propagate_handler_errors: bool = False
+    # ``False`` skips chat-level message deduplication in ``process_message``
+    # for transports that own redelivery (e.g. polling that retries a failed
+    # update). ``None`` (default) / ``True`` dedupe as usual.
+    deduplicate: bool | None = None
 
 
 # =============================================================================
@@ -1720,8 +1730,9 @@ class ChatConfig:
     # Pass a strategy name ("drop", "queue", "debounce", "burst", "concurrent")
     # or a full ConcurrencyConfig for fine-grained control.
     concurrency: ConcurrencyStrategy | ConcurrencyConfig | None = None
-    # Milliseconds to remember a message ID for deduplication (default 5 min).
-    dedupe_ttl_ms: int = 300000
+    # Milliseconds to remember a message ID for deduplication. ``None`` uses
+    # the default (10 min, ``chat.DEDUPE_TTL_MS``); ``0`` is passed through.
+    dedupe_ttl_ms: int | None = None
     fallback_streaming_placeholder_text: str | None = "..."
     # Resolves a stable cross-platform user key from inbound messages.
     #
@@ -1777,9 +1788,9 @@ class ChatInstance(Protocol):
         options: WebhookOptions | None = None,
     ) -> asyncio.Task[None] | None: ...
     async def handle_incoming_message(self, adapter: Adapter, thread_id: str, message: Message) -> None: ...
-    def process_action(self, event: Any, options: WebhookOptions | None = None) -> None: ...
-    def process_reaction(self, event: Any, options: WebhookOptions | None = None) -> None: ...
-    def process_slash_command(self, event: Any, options: WebhookOptions | None = None) -> None: ...
+    def process_action(self, event: Any, options: WebhookOptions | None = None) -> asyncio.Task[None] | None: ...
+    def process_reaction(self, event: Any, options: WebhookOptions | None = None) -> asyncio.Task[None] | None: ...
+    def process_slash_command(self, event: Any, options: WebhookOptions | None = None) -> asyncio.Task[None] | None: ...
     def process_modal_submit(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
     ) -> Awaitable[ModalResponse | None]: ...

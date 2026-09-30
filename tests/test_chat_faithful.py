@@ -507,9 +507,11 @@ class TestMessageDeduplication:
         assert len(calls) == 1
         assert calls[0] == "msg-1"
 
-    # TS: "should use default dedupe TTL of 5 minutes"
-    async def test_should_use_default_dedupe_ttl_of_5_minutes(self):
+    # TS: "should use default dedupe TTL of 10 minutes"
+    async def test_should_use_default_dedupe_ttl_of_10_minutes(self):
         chat, adapter, state = await _init_chat()
+        spy = AsyncMock(wraps=state.set_if_not_exists)
+        state.set_if_not_exists = spy  # type: ignore[method-assign]
 
         @chat.on_mention
         async def handler(thread, message, context=None):
@@ -518,9 +520,48 @@ class TestMessageDeduplication:
         msg = create_test_message("msg-1", "Hey @slack-bot help")
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
 
-        # set_if_not_exists should have been called with 300_000ms TTL
-        assert "dedupe:slack:msg-1" in state.cache
-        # The default dedupe TTL is 5 minutes = 300_000ms
+        spy.assert_any_await("dedupe:slack:msg-1", True, 600_000)
+
+    # Python-specific: an explicit 0 is honoured, not replaced by the default
+    # (the old ``dedupe_ttl_ms or DEDUPE_TTL_MS`` truthiness trap).
+    async def test_dedupe_ttl_ms_zero_is_honoured(self):
+        chat, adapter, state = await _init_chat(dedupe_ttl_ms=0)
+        spy = AsyncMock(wraps=state.set_if_not_exists)
+        state.set_if_not_exists = spy  # type: ignore[method-assign]
+
+        msg = create_test_message("msg-zero", "Hey @slack-bot help")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        spy.assert_any_await("dedupe:slack:msg-zero", True, 0)
+
+    # TS: "lets transports own deduplication when retrying admission"
+    async def test_lets_transports_own_deduplication_when_retrying_admission(self):
+        chat, adapter, state = await _init_chat()
+        spy = AsyncMock(wraps=state.set_if_not_exists)
+        state.set_if_not_exists = spy  # type: ignore[method-assign]
+        failure = RuntimeError("Admission failed")
+        calls: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            calls.append(message.id)
+            if len(calls) == 1:
+                raise failure
+
+        message = create_test_message("retry", "Hey @slack-bot help")
+
+        def dispatch() -> asyncio.Task[None]:
+            task = chat.process_message(adapter, "slack:C123:1234.5678", message, WebhookOptions(deduplicate=False))
+            assert task is not None
+            return task
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await dispatch()
+        assert exc_info.value is failure
+        await dispatch()
+
+        assert calls == ["retry", "retry"]
+        assert all(call.args[0] != "dedupe:slack:retry" for call in spy.await_args_list)
 
     # TS: "should use custom dedupeTtlMs when configured"
     async def test_should_use_custom_dedupettlms_when_configured(self):
@@ -4444,6 +4485,135 @@ class TestProcessMessageAwaitable:
         assert task.done()
 
 
+class TestWaitUntilHandlerErrors:
+    """vercel/chat#943 + #942: ``wait_until`` swallows handler errors unless
+    ``WebhookOptions.propagate_handler_errors`` is set; the returned task
+    always raises."""
+
+    # TS: "should optionally propagate handler errors through waitUntil"
+    async def test_should_optionally_propagate_handler_errors_through_waituntil(self):
+        chat, adapter, _state = await _init_chat()
+        logger = chat._logger
+        assert isinstance(logger, MockLogger)
+        handler_error = RuntimeError("handler failed")
+
+        async def fail(*_args: Any, **_kwargs: Any) -> None:
+            raise handler_error
+
+        chat.on_mention(fail)
+        chat.on_action("fail", fail)
+        chat.on_slash_command("/fail", fail)
+
+        dispatches: list[tuple[str, str, Any, Any]] = [
+            (
+                "message",
+                "Message processing error",
+                lambda suffix: {"thread_id": f"slack:C123:{suffix}", "error": str(handler_error)},
+                lambda options, suffix: chat.process_message(
+                    adapter,
+                    f"slack:C123:{suffix}",
+                    create_test_message(f"msg-{suffix}", "Hey @slack-bot fail"),
+                    options,
+                ),
+            ),
+            (
+                "action",
+                "Action processing error",
+                lambda suffix: {"error": str(handler_error), "action_id": "fail", "message_id": suffix},
+                lambda options, suffix: chat.process_action(
+                    _make_action_event(adapter, action_id="fail", message_id=suffix, thread_id=f"slack:C123:{suffix}"),
+                    options,
+                ),
+            ),
+            (
+                "command",
+                "Slash command processing error",
+                lambda suffix: {"error": str(handler_error), "command": "/fail", "text": suffix},
+                lambda options, suffix: chat.process_slash_command(
+                    _make_slash_event(adapter, command="/fail", text=suffix, channel_id="slack:C123"),
+                    options,
+                ),
+            ),
+        ]
+
+        for kind, log_message, metadata, dispatch in dispatches:
+            for propagate in (False, True):
+                logger.error.calls.clear()
+                tasks: list[Any] = []
+                suffix = f"{kind}-{propagate}"
+                returned = dispatch(WebhookOptions(wait_until=tasks.append, propagate_handler_errors=propagate), suffix)
+                assert isinstance(returned, asyncio.Task)
+                direct, *_ = await asyncio.gather(returned, return_exceptions=True)
+                assert len(tasks) == 1
+                (background,) = await asyncio.gather(tasks[0], return_exceptions=True)
+
+                assert direct is handler_error
+                if propagate:
+                    assert tasks[0] is returned
+                    assert background is handler_error
+                else:
+                    assert tasks[0] is not returned
+                    assert background is None
+                assert (log_message, metadata(suffix)) in logger.error.calls
+
+    # Python-specific: the swallowing wrapper handed to wait_until shields the
+    # handler, so cancelling it (host bookkeeping) never cancels the handler.
+    async def test_cancelling_wait_until_wrapper_leaves_handler_running(self):
+        chat, adapter, _state = await _init_chat()
+        release = asyncio.Event()
+        finished: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            await release.wait()
+            finished.append(message.id)
+
+        tasks: list[Any] = []
+        returned = chat.process_message(
+            adapter,
+            "slack:C123:wrap.1",
+            create_test_message("msg-wrap", "Hey @slack-bot hi"),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        assert returned is not None
+        (wrapper,) = tasks
+        await asyncio.sleep(0)
+        wrapper.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wrapper
+        assert not returned.done()
+
+        release.set()
+        await returned
+        assert finished == ["msg-wrap"]
+
+    # Python-specific: shutdown() cancels both the handler and its wrapper.
+    async def test_shutdown_cancels_handler_and_wait_until_wrapper(self):
+        chat, adapter, _state = await _init_chat()
+        started = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            started.set()
+            await asyncio.Event().wait()
+
+        tasks: list[Any] = []
+        returned = chat.process_message(
+            adapter,
+            "slack:C123:wrap.2",
+            create_test_message("msg-shutdown", "Hey @slack-bot hi"),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        assert returned is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await chat.shutdown()
+
+        assert returned.cancelled()
+        assert tasks[0] is not returned
+        assert tasks[0].done()
+
+
 # ============================================================================
 # 22. queue/burst subject rehydration after a JSON roundtrip (vercel/chat#459
 #     + #495). Gated on message.subject (PR #131): the skipif below evaluates
@@ -5199,3 +5369,233 @@ class TestSubjectBinding:
         # arrivals folded into ``context.skipped`` in order. All three must
         # resolve to their adapter-fetched subjects.
         assert all_subjects == [fetched["msg-burst-3"], fetched["msg-burst-1"], fetched["msg-burst-2"]]
+
+
+# ============================================================================
+# Chat initialization retry (vercel/chat#924, TS describe "Chat initialization
+# retry (#922)")
+# ============================================================================
+
+
+def _retry_chat(adapters: dict[str, MockAdapter], state: MockStateAdapter) -> Chat:
+    return Chat(ChatConfig(user_name="testbot", adapters=adapters, state=state, logger=MockLogger()))
+
+
+async def _settle() -> None:
+    """Let caller tasks start and the shared attempt task reach ``connect()``."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+class TestChatInitializationRetry:
+    # TS: "does not restart an initialized adapter when another adapter fails"
+    async def test_does_not_restart_an_initialized_adapter_when_another_adapter_fails(self):
+        ready = create_mock_adapter("ready")
+        failing = create_mock_adapter("failing")
+        state = create_mock_state()
+        state.connect = AsyncMock()  # type: ignore[method-assign]
+        failed = RuntimeError("Adapter unavailable")
+        active = 0
+
+        async def ready_init(_chat: Any) -> None:
+            nonlocal active
+            active += 1
+
+        async def ready_disconnect() -> None:
+            nonlocal active
+            active -= 1
+
+        ready.initialize = AsyncMock(side_effect=ready_init)  # type: ignore[method-assign]
+        ready.disconnect = AsyncMock(side_effect=ready_disconnect)  # type: ignore[method-assign]
+        ready.handle_webhook = AsyncMock(return_value="ok")  # type: ignore[method-assign]
+        failing.initialize = AsyncMock(side_effect=[failed, None])  # type: ignore[method-assign]
+        chat = _retry_chat({"ready": ready, "failing": failing}, state)
+
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                await chat.initialize()
+            assert exc_info.value is failed
+            results = await asyncio.gather(chat.initialize(), chat.webhooks["ready"]("request"), return_exceptions=True)
+
+            assert ready.initialize.await_count == 1
+            assert failing.initialize.await_count == 1
+            assert state.connect.await_count == 1
+            ready.handle_webhook.assert_not_awaited()
+            assert results[0] is failed
+            assert results[1] is failed
+        finally:
+            await chat.shutdown()
+        assert active == 0
+        await chat.initialize()
+        assert ready.initialize.await_count == 2
+        await chat.shutdown()
+        assert active == 0
+
+    # TS: "does not overlap adapter initialization after a sibling fails"
+    async def test_does_not_overlap_adapter_initialization_after_a_sibling_fails(self):
+        slow = create_mock_adapter("slow")
+        failing = create_mock_adapter("failing")
+        state = create_mock_state()
+        failed = RuntimeError("Adapter unavailable")
+        release = asyncio.Event()
+
+        async def slow_init(_chat: Any) -> None:
+            await release.wait()
+
+        slow.initialize = AsyncMock(side_effect=slow_init)  # type: ignore[method-assign]
+        failing.initialize = AsyncMock(side_effect=[failed, None])  # type: ignore[method-assign]
+        chat = _retry_chat({"slow": slow, "failing": failing}, state)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await chat.initialize()
+        assert exc_info.value is failed
+        retry = asyncio.ensure_future(asyncio.gather(chat.initialize(), return_exceptions=True))
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert slow.initialize.call_count == 1
+            assert failing.initialize.call_count == 1
+        finally:
+            release.set()
+            await retry
+            await chat.shutdown()
+        (result,) = retry.result()
+        assert result is failed
+
+    # TS: "recovers through a webhook after repeated state connection failures"
+    async def test_recovers_through_a_webhook_after_repeated_state_connection_failures(self):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        failed = RuntimeError("State unavailable")
+        state.connect = AsyncMock(side_effect=[failed, failed, None])  # type: ignore[method-assign]
+        adapter.initialize = AsyncMock()  # type: ignore[method-assign]
+        adapter.handle_webhook = AsyncMock(return_value="ok")  # type: ignore[method-assign]
+        chat = _retry_chat({"slack": adapter}, state)
+
+        with pytest.raises(RuntimeError) as first:
+            await chat.initialize()
+        assert first.value is failed
+        with pytest.raises(RuntimeError) as second:
+            await chat.webhooks["slack"]("request")
+        assert second.value is failed
+        adapter.initialize.assert_not_awaited()
+        adapter.handle_webhook.assert_not_awaited()
+
+        response = await chat.webhooks["slack"]("request")
+        assert response == "ok"
+        await chat.initialize()
+        assert state.connect.await_count == 3
+        assert adapter.initialize.await_count == 1
+        assert adapter.handle_webhook.await_count == 1
+        await chat.shutdown()
+
+    # TS: "keeps a newer attempt when a pre-shutdown state connection rejects"
+    async def test_keeps_a_newer_attempt_when_a_preshutdown_state_connection_rejects(self):
+        state = create_mock_state()
+        loop = asyncio.get_running_loop()
+        previous: asyncio.Future[None] = loop.create_future()
+        current: asyncio.Future[None] = loop.create_future()
+        connections = iter([previous])
+
+        async def connect() -> None:
+            await next(connections, current)
+
+        state.connect = AsyncMock(side_effect=connect)  # type: ignore[method-assign]
+        chat = _retry_chat({}, state)
+        failed = RuntimeError("Old connection failed")
+
+        first = asyncio.ensure_future(chat.initialize())
+        await _settle()
+        await chat.shutdown()
+        second = asyncio.ensure_future(chat.initialize())
+        await _settle()
+        previous.set_exception(failed)
+        with pytest.raises(RuntimeError) as exc_info:
+            await first
+        assert exc_info.value is failed
+        third = asyncio.ensure_future(chat.initialize())
+        await _settle()
+        assert state.connect.call_count == 2
+        current.set_result(None)
+        await asyncio.gather(second, third)
+        await chat.shutdown()
+
+    # TS: "retries initialization after a failed attempt once the state recovers"
+    async def test_retries_initialization_after_a_failed_attempt_once_the_state_recovers(self):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        refused = ConnectionRefusedError("connect ECONNREFUSED")
+        state.connect = AsyncMock(side_effect=[refused, None])  # type: ignore[method-assign]
+        adapter.initialize = AsyncMock()  # type: ignore[method-assign]
+        chat = _retry_chat({"slack": adapter}, state)
+
+        with pytest.raises(ConnectionRefusedError) as exc_info:
+            await chat.initialize()
+        assert exc_info.value is refused
+        # The adapters were never reached by the failed attempt.
+        adapter.initialize.assert_not_awaited()
+
+        # The state is back: the next call must try again.
+        await chat.initialize()
+        assert state.connect.await_count == 2
+        assert adapter.initialize.await_count == 1
+
+        # Once initialized, further calls are no-ops.
+        await chat.initialize()
+        assert state.connect.await_count == 2
+
+    # TS: "still shares one attempt between concurrent callers, including a failing one"
+    async def test_still_shares_one_attempt_between_concurrent_callers_including_a_failing_one(self):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        connect_gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        connect_calls = 0
+
+        async def connect() -> None:
+            nonlocal connect_calls
+            connect_calls += 1
+            if connect_calls == 1:
+                await connect_gate
+
+        state.connect = AsyncMock(side_effect=connect)  # type: ignore[method-assign]
+        chat = _retry_chat({"slack": adapter}, state)
+
+        first = asyncio.ensure_future(chat.initialize())
+        second = asyncio.ensure_future(chat.initialize())
+        await _settle()
+        assert connect_calls == 1
+
+        refused = ConnectionRefusedError("connect ECONNREFUSED")
+        connect_gate.set_exception(refused)
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert results[0] is refused
+        assert results[1] is refused
+
+        await chat.initialize()
+        assert connect_calls == 2
+
+    # Python-specific: cancelling one caller (e.g. an aborted webhook request)
+    # must not cancel the attempt that concurrent callers share.
+    async def test_cancelled_caller_does_not_cancel_shared_attempt(self):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        connect_gate = asyncio.Event()
+
+        async def connect() -> None:
+            await connect_gate.wait()
+
+        state.connect = AsyncMock(side_effect=connect)  # type: ignore[method-assign]
+        adapter.initialize = AsyncMock()  # type: ignore[method-assign]
+        chat = _retry_chat({"slack": adapter}, state)
+
+        cancelled = asyncio.ensure_future(chat.initialize())
+        survivor = asyncio.ensure_future(chat.initialize())
+        await _settle()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+
+        connect_gate.set()
+        await survivor
+        assert state.connect.await_count == 1
+        assert adapter.initialize.await_count == 1
