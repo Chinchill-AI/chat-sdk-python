@@ -332,6 +332,113 @@ class TestFetchTwilioMedia:
         assert body is None
 
     @pytest.mark.asyncio
+    async def test_fetches_media_from_the_configured_regional_api_origin(self):
+        request = AsyncMock(return_value=TwilioHttpResponse(status=200, body=b"photo"))
+
+        media = await fetch_twilio_media(
+            "https://api.dublin.ie1.twilio.com/2010-04-01/media/photo",
+            api_url="https://api.dublin.ie1.twilio.com",
+            credentials=_credentials(),
+            http_request=request,
+        )
+
+        assert media == b"photo"
+        assert _request_of(request)[1] == "https://api.dublin.ie1.twilio.com/2010-04-01/media/photo"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://api.twilio.com.attacker.example/media/photo",
+            "http://api.twilio.com/media/photo",
+            "https://api.twilio.com:444/media/photo",
+        ],
+    )
+    async def test_rejects_media_outside_the_configured_api_origin(self, url: str):
+        account_sid = AsyncMock(return_value="AC123")
+        auth_token = AsyncMock(return_value="token")
+        request = AsyncMock(return_value=TwilioHttpResponse(status=200, body=b"photo"))
+
+        with pytest.raises(TwilioApiError, match="configured Twilio API origin") as exc_info:
+            await fetch_twilio_media(
+                url,
+                credentials=TwilioCredentials(account_sid=account_sid, auth_token=auth_token),
+                http_request=request,
+            )
+
+        assert exc_info.value.status == 0
+        account_sid.assert_not_awaited()
+        auth_token.assert_not_awaited()
+        request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("url", "api_url", "api_base_url"),
+        [
+            # Default port spelled out and a mixed-case host are the same origin.
+            ("https://API.Twilio.com:443/media/photo", None, None),
+            # ``api_url`` wins over ``api_base_url`` (``??`` precedence).
+            ("https://api.dublin.ie1.twilio.com/m", "https://api.dublin.ie1.twilio.com", "https://api.twilio.com"),
+            ("https://api.sydney.au1.twilio.com/m", None, "https://api.sydney.au1.twilio.com/2010-04-01"),
+        ],
+    )
+    async def test_media_origin_normalizes_default_ports_case_and_base_precedence(
+        self, url: str, api_url: str | None, api_base_url: str | None
+    ):
+        request = AsyncMock(return_value=TwilioHttpResponse(status=200, body=b"photo"))
+
+        media = await fetch_twilio_media(
+            url,
+            api_base_url=api_base_url,
+            api_url=api_url,
+            credentials=_credentials(),
+            http_request=request,
+        )
+
+        assert media == b"photo"
+        assert _request_of(request)[1] == url
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("url", "api_url", "api_base_url"),
+        [
+            # ``api_url`` wins, so a URL on ``api_base_url``'s origin is refused.
+            ("https://api.twilio.com/m", "https://api.dublin.ie1.twilio.com", "https://api.twilio.com"),
+            # An empty ``api_url`` is used as-is (``is not None``) and matches nothing.
+            ("https://api.twilio.com/m", "", None),
+            # Userinfo cannot smuggle a different host past the check.
+            ("https://api.twilio.com@attacker.example/m", None, None),
+            # Opaque / malformed inputs fail closed rather than risk a parser differential.
+            ("https://api.twilio.com\\@attacker.example/m", None, None),
+            ("https://api.twilio.com\t/m", None, None),
+            ("https://api.twilio.com:99999/m", None, None),
+            ("/2010-04-01/media/photo", None, None),
+            ("", None, None),
+            # The scheme is part of the origin: ``http`` on ``https``'s port 443 is refused.
+            ("http://api.twilio.com:443/m", None, None),
+            # Both sides opaque must not compare equal (two ``None`` / host-less origins).
+            ("/2010-04-01/media/photo", "api.dublin.ie1.twilio.com", None),
+            ("", "", None),
+            ("/m", "/base", None),
+        ],
+    )
+    async def test_media_origin_rejects_mismatched_and_malformed_urls(
+        self, url: str, api_url: str | None, api_base_url: str | None
+    ):
+        request = AsyncMock(return_value=TwilioHttpResponse(status=200, body=b"photo"))
+
+        with pytest.raises(TwilioApiError, match="configured Twilio API origin"):
+            await fetch_twilio_media(
+                url,
+                api_base_url=api_base_url,
+                api_url=api_url,
+                credentials=_credentials(),
+                http_request=request,
+            )
+
+        request.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_raises_typed_errors_for_failed_media_downloads(self):
         request = AsyncMock(return_value=TwilioHttpResponse(status=404, body=b""))
         with pytest.raises(ResourceNotFoundError):
