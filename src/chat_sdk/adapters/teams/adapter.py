@@ -1082,8 +1082,8 @@ class TeamsAdapter:
         processing_done: asyncio.Future[None] = loop.create_future()
 
         def _resolve_processing(task: Awaitable[Any]) -> None:
-            # ``WebhookOptions.wait_until`` receives the chat task; we hook
-            # done so we can release ``processing_done`` regardless of
+            # Hook the handler task's completion so we can release
+            # ``processing_done`` regardless of
             # success/failure (mirrors the upstream ``task.then(resolve,
             # resolve)`` pattern).
             if isinstance(task, asyncio.Task):
@@ -1100,22 +1100,19 @@ class TeamsAdapter:
                 processing_done.set_result(None)
 
         upstream_wait_until = options.wait_until if options is not None else None
-        # Track whether the chained wait_until fired synchronously during
-        # ``process_message``. Used below to detect deduped/dropped
-        # messages where no chat task was scheduled and we'd otherwise
-        # hang on ``await processing_done``.
-        wait_until_invoked = False
+        # The task the chained wait_until received during ``process_message``
+        # (``None`` if it never fired). Used below as the gate fallback when
+        # ``process_message`` returns no Task.
+        handed_task: Awaitable[Any] | None = None
 
         def _chained_wait_until(task: Awaitable[Any]) -> None:
-            nonlocal wait_until_invoked
-            wait_until_invoked = True
-            # Resolve our own gate FIRST, before invoking the upstream
-            # ``wait_until`` callback. This way, even if the upstream
-            # callback raises, blocks, or never fires, ``processing_done``
-            # is still wired up — making the deadlock-immunity argument
-            # trivially obvious: the await on ``processing_done`` below
-            # cannot starve due to a misbehaving caller-supplied hook.
-            _resolve_processing(task)
+            nonlocal handed_task
+            # Record the task for the gate BEFORE invoking the caller's
+            # ``wait_until``: even if that callback raises, blocks, or never
+            # fires, the gate below is still wired up, so the await on
+            # ``processing_done`` cannot starve due to a misbehaving
+            # caller-supplied hook.
+            handed_task = task
             if upstream_wait_until is not None:
                 # Catch synchronous failures in the caller's hook. If we
                 # let it escape, ``Chat.process_message`` propagates the
@@ -1133,21 +1130,32 @@ class TeamsAdapter:
                         {"threadId": thread_id, "error": str(exc)},
                     )
 
-        chained_options = WebhookOptions(wait_until=_chained_wait_until)
+        # Spread the caller's options (upstream ``{ ...baseOptions, waitUntil }``)
+        # so ``propagate_handler_errors`` / ``deduplicate`` survive the shim.
+        # ``wait_until`` receives the raw handler task when
+        # ``propagate_handler_errors`` is set, otherwise Chat's error-swallowing
+        # wrapper Task.
+        chained_options = dataclasses.replace(options or WebhookOptions(), wait_until=_chained_wait_until)
 
         try:
-            self._chat.process_message(self, thread_id, message, chained_options)
-            # If ``process_message`` returned without invoking
-            # ``wait_until`` synchronously, no chat task was scheduled
-            # (deduped, dropped by the concurrency strategy, or the
-            # message wasn't admitted for handling). Resolve the gate
+            handler_task = self._chat.process_message(self, thread_id, message, chained_options)
+            # Gate on the handler task ``process_message`` returns rather than
+            # on the Task handed to ``wait_until``: by default that is Chat's
+            # error-swallowing wrapper, which a host may cancel (e.g. a
+            # background-task timeout) while the shielded handler keeps
+            # streaming. Upstream's ``.catch`` promise cannot be cancelled, so
+            # there it always settles with the handler. The handed task is the
+            # fallback for a ``process_message`` that returns no Task.
+            if isinstance(handler_task, asyncio.Task):
+                _resolve_processing(handler_task)
+            elif handed_task is not None:
+                _resolve_processing(handed_task)
+            # If ``process_message`` returned no task and never invoked
+            # ``wait_until``, no chat task was scheduled (deduped, dropped by the concurrency strategy, or
+            # the message wasn't admitted for handling). Resolve the gate
             # immediately so ``await processing_done`` doesn't hang
             # forever — there is no in-flight handler to wait on.
-            # Note: we check ``wait_until_invoked`` rather than
-            # ``processing_done.done()`` because the latter is set via
-            # an ``add_done_callback`` on task COMPLETION; the task is
-            # scheduled but has not run yet at this point.
-            if not wait_until_invoked and not processing_done.done():
+            elif not processing_done.done():
                 processing_done.set_result(None)
             await processing_done
         finally:
