@@ -26,8 +26,10 @@ to the upstream version this release is synced to.
 Step-by-step procedure for porting a new upstream release (e.g., `4.26.0`):
 
 ```bash
-# 1. Update the TS repo and check what changed
-cd /tmp/vercel-chat && git fetch origin
+# 1. Update the full TS clone (for reading diffs; see "How to Diff Upstream
+#    Changes") and check what changed. Keep it separate from /tmp/vercel-chat,
+#    the pinned checkout the fidelity script verifies (step 5).
+cd /tmp/vercel-chat-full && git fetch origin --tags
 git log --oneline chat@4.25.0..chat@4.26.0 -- packages/
 
 # 2. For each commit, read the diff
@@ -45,11 +47,13 @@ git checkout -b sync/upstream-v4.26.0
 uv run ruff check src/ tests/ scripts/
 uv run ruff format --check src/ tests/ scripts/
 uv run python scripts/audit_test_quality.py
-# TS_ROOT must be a checkout of the tag in scripts/upstream_pin.json; a full
-# clone sitting at another commit (like the one in step 1) fails the SHA check.
+# TS_ROOT (default /tmp/vercel-chat) must be a clean checkout of the tag in
+# scripts/upstream_pin.json; the full clone from step 1 sits at another
+# commit and fails the SHA check. If /tmp/vercel-chat is at an older pin,
+# delete it first (git refuses to clone into a non-empty directory).
 git clone --depth 1 --branch "$(jq -r .pin.tag scripts/upstream_pin.json)" \
-  https://github.com/vercel/chat.git /tmp/vercel-chat-pin
-TS_ROOT=/tmp/vercel-chat-pin uv run python scripts/verify_test_fidelity.py
+  https://github.com/vercel/chat.git /tmp/vercel-chat
+TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict
 uv run pytest tests/ --tb=short -q
 
 # 6. Update version
@@ -157,13 +161,24 @@ Infra guardrails:
   It also fails if the cloned HEAD differs from `pin.sha` (a moved tag),
   and it writes the resolved SHA to the job summary.
 - The script fails if `TS_ROOT` is a git checkout whose HEAD differs from
-  the expected SHA (`pin.sha`, or `target.sha` for `--report-target`). A
-  plain export without `.git` cannot be verified and only warns.
+  the expected SHA (`pin.sha`, or `target.sha` for `--report-target`), if
+  tracked files under `packages/chat/src` have local edits, or if
+  `TS_ROOT/.git` exists but git cannot read it (e.g. a "dubious ownership"
+  refusal). A plain export without `.git` cannot be verified and only warns.
 - The script fails with exit 1 if any mapped TS file is missing under
   `TS_ROOT` (defense in depth against silent skips).
-- `--check-docs` (a separate CI step) fails if a `--branch chat@X` or
-  `pinned to [vercel/]chat@X` phrase in `CLAUDE.md` or this file
-  disagrees with `pin.tag`. The phrase may wrap across lines.
+- `--strict` and `--report-target` fail if any upstream test cannot be
+  extracted (a non-literal title, an unknown call form such as `it.todo`,
+  an unreadable `.each` table) — an unextracted test would otherwise go
+  uncounted. Understood forms: `it`/`test` (any quote style), modifier
+  chains (`it.skip`, `it.only`, `it.concurrent`, …), `.each` / `.for`
+  (with optional `<T>` type arguments), and `.skipIf(c)` / `.runIf(c)`.
+  Baseline mode only warns.
+- `--check-docs` (a separate CI step) fails if a clone snippet
+  (`--branch chat@X`, `--branch=chat@X`, `-b chat@X`) or a `pinned to
+  [the] [vercel/]chat@X` phrase in `CLAUDE.md` or this file disagrees with
+  `pin.tag`. Matching is case-insensitive, tolerates markdown decoration
+  and line continuations, and the phrase may wrap across lines.
 
 Workflows:
 
@@ -235,17 +250,18 @@ the rules below before adding one.
 ## How to Diff Upstream Changes
 
 ```bash
-# Clone or update the TS repo
-git clone https://github.com/vercel/chat.git /tmp/vercel-chat
-cd /tmp/vercel-chat
+# Clone or update a full TS clone. Use its own path: /tmp/vercel-chat is
+# the pinned shallow checkout the fidelity script verifies by SHA.
+git clone https://github.com/vercel/chat.git /tmp/vercel-chat-full
+cd /tmp/vercel-chat-full
 git log --oneline -20  # see recent commits
 
 # Compare a specific adapter
-diff -u /tmp/vercel-chat/packages/adapter-slack/src/index.ts \
+diff -u /tmp/vercel-chat-full/packages/adapter-slack/src/index.ts \
         /tmp/chat-sdk-python/src/chat_sdk/adapters/slack/adapter.py
 
 # Compare core types
-diff -u /tmp/vercel-chat/packages/core/src/types.ts \
+diff -u /tmp/vercel-chat-full/packages/core/src/types.ts \
         /tmp/chat-sdk-python/src/chat_sdk/types.py
 ```
 

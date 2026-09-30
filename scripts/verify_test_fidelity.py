@@ -19,13 +19,15 @@ the strict CI tag (with its commit SHA) and ``target`` is the tag an
 in-flight sync wave is porting towards. ``TS_ROOT`` (default
 ``/tmp/vercel-chat``) must be a checkout of the pin tag — or of the target
 tag for ``--report-target``. When ``TS_ROOT`` is a git checkout its HEAD is
-compared against the recorded SHA and a mismatch fails; a plain export
-(no ``.git``) only produces a warning.
+compared against the recorded SHA and a mismatch fails, as do local edits
+under ``packages/chat/src`` and a ``.git`` that git cannot read; a plain
+export (no ``.git``) only produces a warning.
 
 ``--strict`` is the CI contract (see ``.github/workflows/lint.yml``): the
 baseline is ignored and any missing translation — or a missing upstream
-checkout — fails the build. The ``MAPPING`` dict below is the strict scope;
-``TARGET_MAPPING`` adds rows that are only checked by ``--report-target``
+checkout, or an upstream test the extractor cannot read — fails the build.
+The ``MAPPING`` dict below is the strict scope; ``TARGET_MAPPING`` adds
+rows that are only checked by ``--report-target``
 (files that do not exist at the pin, or whose Python counterpart still has
 gaps); ``UNMAPPED`` records every core test file we deliberately skip, with
 the reason. Every ``packages/chat/src/**/*.test.ts(x)`` must appear in one of
@@ -177,7 +179,18 @@ def strip_each_placeholders(template: str) -> str:
 _DESCRIBE_RE = re.compile(r'describe\("([^"]+)"')
 # ``(?<![\w.$])`` keeps ``regex.test("…")`` / ``foo.it("…")`` from counting.
 _PLAIN_TEST_RE = re.compile(r'(?<![\w.$])(?:it|test)\("([^"]+)"')
-_EACH_RE = re.compile(r"(?<![\w.$])(it|test|describe)\.each\s*[(`]")
+# An ``it``/``test``/``describe`` call: either ``name(`` directly, or with a
+# ``.a.b`` chain (``it.each``, ``it.skip.each``, ``it.skipIf(c)``, …) before
+# ``(`` / ``<`` / a backtick. ``group(2)`` is the chain (None for a plain
+# call); the match ends just before the opener. A plain call needs the ``(``
+# right after the name so prose such as "make it (optional)" in a comment
+# is not a call.
+_TEST_CALL_RE = re.compile(r"(?<![\w.$])(it|test|describe)(?:((?:\.[A-Za-z_$][\w$]*)+)\s*(?=[(<`])|(?=\())")
+_WS_RE = re.compile(r"\s*")
+# Chain links that change how a test runs but not what it is.
+_MODIFIERS = frozenset({"skip", "only", "concurrent", "sequential", "fails", "shuffle"})
+_TEMPLATE_LINKS = frozenset({"each", "for"})  # X.each(table)("title") / X.for(table)("title")
+_CONDITION_LINKS = frozenset({"skipIf", "runIf"})  # X.skipIf(cond)("title")
 _CALL_OPEN_RE = re.compile(r"\s*\(\s*")
 _CLOSERS = {"(": ")", "[": "]", "{": "}"}
 
@@ -256,6 +269,16 @@ def _read_each_template(src: str, table_start: int) -> str | None:
     end = _skip_string(src, table_start) if tagged else _match_balanced(src, table_start)
     if end < 0:
         return None
+    return _read_call_title(src, end)
+
+
+def _read_call_title(src: str, end: int) -> str | None:
+    """Return the string-literal first argument of the call opening at ``src[end:]``.
+
+    ``src[end:]`` must start (after whitespace) with ``(``. Returns None when
+    the first argument is not a string literal, or is a template literal
+    with ``${…}`` interpolation.
+    """
     m = _CALL_OPEN_RE.match(src, end)
     if not m:
         return None
@@ -271,13 +294,44 @@ def _read_each_template(src: str, table_start: int) -> str | None:
     return re.sub(r"\\(.)", r"\1", raw)
 
 
+def _skip_type_args(src: str, i: int) -> int:
+    """``src[i]`` is ``<``; return the index just past the matching ``>``, or -1.
+
+    For TS generic arguments such as ``it.each<[string, () => void]>(…)``:
+    nests on ``<``/``>``, ignores the ``>`` of ``=>`` and skips string literals.
+    """
+    depth = 0
+    while i < len(src):
+        c = src[i]
+        if c in "\"'`":
+            i = _skip_string(src, i)
+            if i < 0:
+                return -1
+            continue
+        if c == "<":
+            depth += 1
+        elif c == ">" and src[i - 1] != "=":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
 def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[TsTest]:
     """Extract one ``TsTest`` per ``it``/``test`` call and per ``.each`` template.
 
     ``describe`` is the most recent ``describe("…")`` / ``describe.each``
-    title seen (flat, not scoped). A ``.each`` template counts as one
-    logical test: its placeholders are stripped before deriving the Python
-    name, while ``ts_name`` keeps the raw template for reporting.
+    title seen (flat, not scoped). A ``.each`` / ``.for`` template counts as
+    one logical test: its placeholders are stripped before deriving the
+    Python name, while ``ts_name`` keeps the raw template for reporting.
+
+    Also understood: modifier chains (``it.skip``, ``it.only``,
+    ``it.concurrent.each``, …), generic type arguments (``it.each<T>(…)``)
+    and ``it.skipIf(cond)("…")`` / ``it.runIf``. Any other ``it``/``test``/
+    ``describe`` call form, and any title that is not a readable string
+    literal, is appended to ``warnings`` — never dropped silently. At most
+    one test is taken per line.
     """
     with open(ts_path, encoding="utf-8") as f:
         content = f.read()
@@ -285,6 +339,10 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
     tests: list[TsTest] = []
     current_describe = ""
     offset = 0
+
+    def warn(lineno: int, message: str) -> None:
+        if warnings is not None:
+            warnings.append(f"{ts_path}:{lineno}: {message}")
 
     for lineno, line in enumerate(content.split("\n"), start=1):
         line_start = offset
@@ -294,29 +352,57 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
         if desc_match:
             current_describe = desc_match.group(1)
 
-        each_match = _EACH_RE.search(line)
-        if each_match:
-            kind = each_match.group(1)
-            template = _read_each_template(content, line_start + each_match.end() - 1)
-            if template is None:
-                if warnings is not None:
-                    warnings.append(f"{ts_path}:{lineno}: could not extract {kind}.each title")
-            elif kind == "describe":
-                current_describe = template
+        for call in _TEST_CALL_RE.finditer(line):
+            fn, chain = call.group(1), call.group(2) or ""
+            if fn == "describe" and not chain:
+                continue  # plain describe("…") is handled above
+            links = chain.split(".")[1:]
+            label = fn + chain
+            pos = line_start + call.end()
+            if links and links[-1] in _TEMPLATE_LINKS:
+                kind, modifiers = "template", links[:-1]
+            elif links and links[-1] in _CONDITION_LINKS:
+                kind, modifiers = "condition", links[:-1]
             else:
-                py_name = ts_name_to_python(strip_each_placeholders(template))
-                if py_name:
-                    tests.append(TsTest(current_describe, template, py_name, each=True))
-                elif warnings is not None:
-                    warnings.append(f"{ts_path}:{lineno}: {kind}.each title {template!r} is only placeholders")
-            continue
+                kind, modifiers = "plain", links
+            if any(m not in _MODIFIERS for m in modifiers) or (content[pos] == "<" and kind != "template"):
+                warn(lineno, f"unrecognized test call form {label!r}")
+                break
+            if content[pos] == "<":
+                pos = _skip_type_args(content, pos)
+                pos = _WS_RE.match(content, pos).end() if pos >= 0 else -1
+                if pos < 0 or pos >= len(content) or content[pos] not in "(`":
+                    warn(lineno, f"could not read the type arguments of {label}")
+                    break
 
-        it_match = _PLAIN_TEST_RE.search(line)
-        if it_match:
-            ts_name = it_match.group(1)
-            py_name = ts_name_to_python(ts_name)
-            if py_name:  # skip names that reduce to empty (e.g. "\\n")
-                tests.append(TsTest(current_describe, ts_name, py_name))
+            if kind == "template":
+                title = _read_each_template(content, pos)
+            elif kind == "condition":
+                if content[pos] != "(":
+                    warn(lineno, f"unrecognized test call form {label!r}")
+                    break
+                end = _match_balanced(content, pos)
+                title = _read_call_title(content, end) if end >= 0 else None
+            elif fn != "describe" and not chain and (plain := _PLAIN_TEST_RE.match(line, call.start())):
+                title = plain.group(1)  # the common case, kept byte-for-byte as before
+            else:
+                title = _read_call_title(content, pos)
+
+            if title is None:
+                warn(lineno, f"could not extract {label} title")
+            elif fn == "describe":
+                current_describe = title
+            elif kind == "template":
+                py_name = ts_name_to_python(strip_each_placeholders(title))
+                if py_name:
+                    tests.append(TsTest(current_describe, title, py_name, each=True))
+                else:
+                    warn(lineno, f"{label} title {title!r} is only placeholders")
+            else:
+                py_name = ts_name_to_python(title)
+                if py_name:  # skip names that reduce to empty (e.g. "\\n")
+                    tests.append(TsTest(current_describe, title, py_name))
+            break
 
     return tests
 
@@ -416,15 +502,25 @@ def check_fidelity(
         else:
             unmatched_ts.append(test)
 
-    # Pass 2: fuzzy matches for remainder
+    # Pass 2: fuzzy matches for the remainder — plain tests first, then
+    # ``.each`` templates. A template's name is short once its placeholders
+    # are stripped ("should not treat %s as a mention" -> 4 words), so it
+    # clears the fuzzy threshold against many candidates; matched in file
+    # order it could claim the translation of a later plain test, reporting
+    # that ported test as missing and hiding the template's own gap.
+    fuzzy_hits: dict[int, str] = {}
     remaining_set = set(remaining_py.keys())
-    for test in unmatched_ts:
-        m = fuzzy_match(test.py_name, remaining_set)
+    for idx in sorted(range(len(unmatched_ts)), key=lambda i: unmatched_ts[i].each):
+        m = fuzzy_match(unmatched_ts[idx].py_name, remaining_set)
         if m and consume(m):
-            result.fuzzy += 1
-            result.fuzzy_pairs.append((test.ts_name, m))
+            fuzzy_hits[idx] = m
             if remaining_py.get(m, 0) == 0:
                 remaining_set.discard(m)
+    # Report in file order.
+    for idx, test in enumerate(unmatched_ts):
+        if idx in fuzzy_hits:
+            result.fuzzy += 1
+            result.fuzzy_pairs.append((test.ts_name, fuzzy_hits[idx]))
         else:
             result.missing.append(test)
 
@@ -565,46 +661,75 @@ def check_pin_parity(pin_tag: str, parity: str | None) -> str | None:
     return None
 
 
+def _run_git(ts_root: str, *args: str) -> tuple[str | None, str]:
+    """Run ``git -C ts_root …``; return (stdout, or None on any failure; stderr)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", ts_root, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    return (proc.stdout.strip() if proc.returncode == 0 else None), proc.stderr.strip()
+
+
 def resolve_checkout_sha(ts_root: str) -> str | None:
     """Return HEAD of ``ts_root`` if it is the top level of a git checkout, else None.
 
     A plain export nested inside some other repository is treated as "not a
     checkout" (its enclosing repo's HEAD says nothing about the export).
+    None is also returned when git itself fails; ``verify_checkout_sha``
+    tells the two apart by whether ``ts_root/.git`` exists.
     """
-    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
-
-    def git(*args: str) -> str | None:
-        try:
-            proc = subprocess.run(
-                ["git", "-C", ts_root, *args],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-                env=env,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return proc.stdout.strip() if proc.returncode == 0 else None
-
     if not os.path.isdir(ts_root):
         return None
-    top = git("rev-parse", "--show-toplevel")
+    top, _ = _run_git(ts_root, "rev-parse", "--show-toplevel")
     if top is None or Path(top).resolve() != Path(ts_root).resolve():
         return None
-    return git("rev-parse", "HEAD")
+    return _run_git(ts_root, "rev-parse", "HEAD")[0]
+
+
+def _fresh_clone_hint(ts_root: str, tag: str) -> str:
+    # A sibling of TS_ROOT named for the tag: an existing directory (like
+    # TS_ROOT itself) makes `git clone` fail with "already exists".
+    fresh = str(Path(ts_root).parent / f"vercel-chat-{tag.removeprefix('chat@')}")
+    if Path(fresh).resolve() == Path(ts_root).resolve():
+        fresh = f"{ts_root.rstrip('/')}-fresh"
+    if Path(fresh).exists():
+        return f"{fresh} already exists — if it is a clean checkout of {tag}, re-run with TS_ROOT={fresh}."
+    return (
+        "Clone the pinned tag into a fresh directory and point TS_ROOT at it:\n"
+        f"  git clone --depth 1 --branch {tag} https://github.com/vercel/chat.git {fresh}\n"
+        f"  TS_ROOT={fresh} …\n"
+        f"(or delete {ts_root} first and clone into it)."
+    )
 
 
 def verify_checkout_sha(ts_root: str, expected: dict[str, str], head: str | None = None) -> str | None:
-    """Return an error if the ``ts_root`` checkout is at the wrong commit.
+    """Return an error unless the ``ts_root`` checkout is a clean tree at the pinned commit.
 
-    Prints the resolved SHA (or a warning when ``ts_root`` is not a git
-    checkout, which cannot be verified and is allowed).
+    Prints the resolved SHA. A plain export (no ``ts_root/.git``) cannot be
+    verified and only warns; a ``.git`` that git cannot read is an error
+    (fail closed), and so are local edits to tracked files under
+    ``packages/chat/src`` (a pruned test file would otherwise pass as
+    "verified").
     """
     if head is None:
         head = resolve_checkout_sha(ts_root)
     tag, sha = expected["tag"], expected["sha"]
+    has_git_dir = (Path(ts_root) / ".git").exists()
     if head is None:
+        if has_git_dir:
+            _, stderr = _run_git(ts_root, "rev-parse", "HEAD")
+            return (
+                f"TS_ROOT={ts_root!r} has a .git but git could not read its HEAD, so it cannot be "
+                f"verified as {tag} ({sha}): {stderr or 'git failed'}"
+            )
         print(
             f"warning: TS_ROOT={ts_root!r} is not a git checkout; cannot verify it is {tag} ({sha}).",
             file=sys.stderr,
@@ -613,17 +738,35 @@ def verify_checkout_sha(ts_root: str, expected: dict[str, str], head: str | None
     if head != sha:
         return (
             f"TS_ROOT={ts_root!r} is at {head}, but {tag} is pinned to {sha} in "
-            f"scripts/upstream_pin.json. Re-clone with:\n"
-            f"  git clone --depth 1 --branch {tag} https://github.com/vercel/chat.git {ts_root}"
+            f"scripts/upstream_pin.json. {_fresh_clone_hint(ts_root, tag)}"
         )
+    if has_git_dir:
+        status, stderr = _run_git(ts_root, "status", "--porcelain", "--untracked-files=no", "--", CORE_TEST_DIR)
+        if status is None:
+            return f"TS_ROOT={ts_root!r}: git status failed, cannot verify the working tree: {stderr or 'git failed'}"
+        if status:
+            changed = status.splitlines()
+            listing = "\n".join(f"  {line}" for line in changed[:10])
+            more = f"\n  … and {len(changed) - 10} more" if len(changed) > 10 else ""
+            return (
+                f"TS_ROOT={ts_root!r} is at {tag} but has local changes under {CORE_TEST_DIR}:\n"
+                f"{listing}{more}\nRestore them (git -C {ts_root} checkout -- {CORE_TEST_DIR}) or re-clone."
+            )
     print(f"  upstream: {tag} @ {sha} (TS_ROOT HEAD verified)")
     return None
 
 
 _VERSION = r"(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)"
-# ``--branch chat@X`` (clone snippets) and ``pinned to [`][vercel/]chat@X``
-# (prose; the phrase may wrap across lines).
-_DOC_PIN_RE = re.compile(rf"--branch\s+[`\"']?chat@{_VERSION}|pinned\s+to\s+`?(?:vercel/)?chat@{_VERSION}")
+# Clone snippets: ``--branch chat@X`` / ``--branch=chat@X`` / ``-b chat@X``,
+# optionally quoted and optionally after a ``\`` line continuation. Prose:
+# ``pinned to [the] chat@X`` with optional ``vercel/`` and markdown
+# decoration (``**``, ``_``, backticks, ``[`` of a link); the phrase may wrap
+# across lines. Case-insensitive ("Pinned to …" at a sentence start).
+_DOC_PIN_RE = re.compile(
+    rf"(?:--branch(?:=|\s+)|(?<![\w-])-b\s+)(?:\\\s+)?[`\"']?chat@{_VERSION}"
+    rf"|pinned\s+to\s+(?:the\s+)?[*_`\[]*(?:vercel/)?chat@{_VERSION}",
+    re.IGNORECASE,
+)
 
 
 def check_docs(pin_tag: str, repo_root: Path | None = None, files: tuple[str, ...] = PIN_DOC_FILES) -> list[str]:
@@ -842,7 +985,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _print_file_result(ts_rel: str, py_rel: str, r: FileResult, absorbers: int, new_keys: set) -> None:
+def _print_file_result(ts_rel: str, py_rel: str, r: FileResult, absorbers: int, new_keys: set | None = None) -> None:
+    """Print one file's summary. ``new_keys`` (baseline modes) marks each miss
+    NEW or baselined; pass None when no baseline applies (``--report-target``)."""
     absorber_note = f" ({absorbers} absorbers)" if absorbers else ""
     each_note = f" (incl. {r.each_templates} .each)" if r.each_templates else ""
     status = "OK" if not r.missing else f"GAPS ({len(r.missing)})"
@@ -854,10 +999,28 @@ def _print_file_result(ts_rel: str, py_rel: str, r: FileResult, absorbers: int, 
         f"{absorber_note} | Missing: {len(r.missing)} | Extra: {len(r.extra)} | {status}"
     )
     for t in r.missing[:5]:
-        marker = "NEW" if (t.describe, t.ts_name) in new_keys else "baselined"
-        print(f"    MISSING ({marker}): [{t.describe}] {t.ts_name}")
+        marker = ""
+        if new_keys is not None:
+            marker = " (NEW)" if (t.describe, t.ts_name) in new_keys else " (baselined)"
+        print(f"    MISSING{marker}: [{t.describe}] {t.ts_name}")
     if len(r.missing) > 5:
         print(f"    ... and {len(r.missing) - 5} more")
+
+
+def _report_extraction_errors(warnings: list[str]) -> bool:
+    """Print extraction problems as errors; return True if there were any.
+
+    A test the extractor cannot read is not counted, so it would never show
+    up as missing — ``--strict`` and ``--report-target`` fail closed on it.
+    """
+    for w in warnings:
+        print(f"error: {w}", file=sys.stderr)
+    if warnings:
+        print(
+            f"\n{len(warnings)} upstream test(s) could not be extracted (see stderr) and would go "
+            "uncounted. Teach extract_ts_tests the new form, or map the file differently."
+        )
+    return bool(warnings)
 
 
 def run_check_docs(pin: dict[str, dict[str, str]]) -> int:
@@ -907,10 +1070,11 @@ def run_report_target(pin: dict[str, dict[str, str]]) -> int:
             absent.append(ts_rel)
             continue
         results[ts_rel] = (py_rel, tier, r)
-        _print_file_result(ts_rel, f"{py_rel} [{tier}]", r, 0, set())
+        _print_file_result(ts_rel, f"{py_rel} [{tier}]", r, 0)
 
-    for w in warnings:
-        print(f"warning: {w}", file=sys.stderr)
+    if _report_extraction_errors(warnings):
+        print(f"\nReport not written: {TARGET_REPORT_PATH.name} would undercount the missing tests.")
+        return 1
 
     report = build_target_report(target, results, absent)
     previous = None
@@ -1038,8 +1202,9 @@ def main(argv: list[str] | None = None) -> int:
                     f.write(stubs)
                 print(f"  -> Created {py_rel} with {len(r.missing)} stubs")
 
-    for w in warnings:
-        print(f"warning: {w}", file=sys.stderr)
+    if not strict_mode:
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
 
     real_total = total_matched - total_absorbers
     pct = total_matched * 100 // max(total_ts, 1)
@@ -1068,6 +1233,9 @@ def main(argv: list[str] | None = None) -> int:
             "https://github.com/vercel/chat.git /tmp/vercel-chat\n"
             "then re-run with TS_ROOT=/tmp/vercel-chat."
         )
+        return 1
+
+    if strict_mode and _report_extraction_errors(warnings):
         return 1
 
     if update_baseline:

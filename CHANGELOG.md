@@ -12,6 +12,9 @@ Sync wave from `chat@4.31.0` to `chat@4.41.1` (tracking #184). `UPSTREAM_PARITY`
   - Scope is two-tier. `MAPPING` stays strict. New `TARGET_MAPPING` rows are checked only by the new `--report-target` mode. New `UNMAPPED` lists deliberate skips with reasons, and every core `*.test.ts(x)` must be classified in one of the three.
   - Per-file output now shows exact vs fuzzy match counts.
   - Fuzzy-match ties now resolve the same way in every run. They used to depend on the per-process string hash seed, so the target total could flip between 282 and 283 missing.
+  - The fuzzy pass matches plain tests before `.each` templates. A template's placeholder-stripped title is short enough to claim a later plain test's translation, which reported `chat.test.ts` "should not match GitHub-style logins as Slack ids (case sensitivity)" as missing while hiding the real `isMention` template gap.
+  - Fails closed instead of silently undercounting: `--strict` and `--report-target` fail when an upstream test cannot be extracted (baseline mode only warns). The extractor now also reads modifier chains (`it.skip`, `it.concurrent.each`, …), `.for`, `<T>` type arguments, `.skipIf(c)` / `.runIf(c)` and single-quoted or wrapped titles, and reports any other call form (`it.todo`, `it.extend`, …). The checkout check also fails on local edits under `packages/chat/src`, and when `TS_ROOT/.git` exists but git cannot read it.
+  - `--check-docs` is case-insensitive and also catches `--branch=`, `-b`, line-continued and markdown-decorated pins.
   - `scripts/fidelity_target.json` is committed as the authoritative wave-wide missing list at `chat@4.41.1`: 282 missing of 1036 (130 in strict-tier files, 152 in target-tier files), including 16 `.each` templates.
 
 ## 0.4.31.3

@@ -237,9 +237,114 @@ def test_each_table_brackets_inside_strings_and_comments_do_not_confuse_scanner(
     assert warnings == []
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('it.each<[string]>([["a"]])("handles %s input", () => {});', ("handles %s input", "test_handles_input", True)),
+        (
+            'it.each<{ a: Array<string>; f: () => void }>([])("typed %s", () => {});',
+            ("typed %s", "test_typed", True),
+        ),
+        ('it.concurrent.each([[1]])("runs %s at once", () => {});', ("runs %s at once", "test_runs_at_once", True)),
+        ('it.skip.each([[1]])("skips %s", () => {});', ("skips %s", "test_skips", True)),
+        ('test.only.each([[1]])("focuses %s", () => {});', ("focuses %s", "test_focuses", True)),
+        ('it.for([[1]])("iterates %s", () => {});', ("iterates %s", "test_iterates", True)),
+        ('it.skipIf(process.env.CI)("handles input", () => {});', ("handles input", "test_handles_input", False)),
+        (
+            'it.runIf(check(a, b))("runs when enabled", () => {});',
+            ("runs when enabled", "test_runs_when_enabled", False),
+        ),
+        ('it.skip("is skipped for now", () => {});', ("is skipped for now", "test_is_skipped_for_now", False)),
+        ("it('uses single quotes', () => {});", ("uses single quotes", "test_uses_single_quotes", False)),
+        ('it(\n  "wraps its title", () => {});', ("wraps its title", "test_wraps_its_title", False)),
+    ],
+    ids=[
+        "each-generic",
+        "each-nested-generic",
+        "concurrent-each",
+        "skip-each",
+        "test-only-each",
+        "for",
+        "skipIf",
+        "runIf",
+        "skip-plain",
+        "single-quoted",
+        "title-on-next-line",
+    ],
+)
+def test_vitest_call_variants_are_extracted(vtf, tmp_path, source, expected):
+    warnings: list[str] = []
+    tests = _extract(vtf, tmp_path, source + "\n", warnings)
+    assert [(t.ts_name, t.py_name, t.each) for t in tests] == [expected]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("source", "warning"),
+    [
+        ('it.todo("port later");', "unrecognized test call form 'it.todo'"),
+        ('it.extend({ db })("uses a fixture", () => {});', "unrecognized test call form 'it.extend'"),
+        ("it(caseName, () => {});", "could not extract it title"),
+        ('it.skipIf`x`("never", () => {});', "unrecognized test call form 'it.skipIf'"),
+    ],
+    ids=["todo", "extend", "non-literal-title", "skipIf-without-parens"],
+)
+def test_unknown_test_call_forms_warn_instead_of_vanishing(vtf, tmp_path, source, warning):
+    warnings: list[str] = []
+    assert _extract(vtf, tmp_path, source + "\n", warnings) == []
+    assert len(warnings) == 1 and warnings[0].endswith(f":1: {warning}")
+
+
+def test_prose_and_strings_are_not_test_calls(vtf, tmp_path):
+    source = """// make it (optional) and test `x` here
+expect(email).toBe("user@test.com");
+const it2 = describe.name;
+"""
+    warnings: list[str] = []
+    assert _extract(vtf, tmp_path, source, warnings) == []
+    assert warnings == []
+
+
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------
+
+
+def test_fuzzy_pass_matches_plain_tests_before_each_templates(vtf, tmp_path):
+    # chat@4.41.1 chat.test.ts: the template comes first in the file, and
+    # stripped of placeholders ("should not treat mention") it clears the
+    # fuzzy threshold against the later plain test's translation.
+    _write(
+        tmp_path / "ts" / "a.test.ts",
+        """describe("isMention property", () => {
+  it.each([["jane@slack-bot.com", "an email"]])("should not treat %s as a mention (%s)", () => {});
+});
+describe("getUser", () => {
+  it("should not match GitHub-style logins as Slack ids (case sensitivity)", () => {});
+  it("returns null for unknown users", () => {});
+});
+""",
+    )
+    _write(tmp_path / "py" / "test_a.py", "def test_should_not_match_github_style_logins_as_slack_ids():\n    pass\n")
+    r = vtf.check_fidelity("a.test.ts", "test_a.py", ts_root=str(tmp_path / "ts"), py_root=str(tmp_path / "py"))
+    assert r.fuzzy_pairs == [
+        (
+            "should not match GitHub-style logins as Slack ids (case sensitivity)",
+            "test_should_not_match_github_style_logins_as_slack_ids",
+        )
+    ]
+    # Missing stays in file order: the template first, then the later plain test.
+    assert [t.ts_name for t in r.missing] == ["should not treat %s as a mention (%s)", "returns null for unknown users"]
+
+
+def test_committed_target_report_credits_the_plain_github_login_test(vtf):
+    report = json.loads((_SCRIPT.parent / "fidelity_target.json").read_text(encoding="utf-8"))
+    chat = report["files"]["packages/chat/src/chat.test.ts"]
+    assert ["isMention property", "should not treat %s as a mention (%s)"] in chat["missing"]
+    assert [
+        "should not match GitHub-style logins as Slack ids (case sensitivity)",
+        "test_should_not_match_github_style_logins_as_slack_ids",
+    ] in chat["fuzzy_matches"]
 
 
 def test_check_fidelity_reports_exact_fuzzy_and_missing(vtf, tmp_path):
@@ -357,6 +462,44 @@ def test_resolve_checkout_sha_reads_head_only_at_checkout_top_level(vtf, tmp_pat
     assert vtf.resolve_checkout_sha(str(nested)) is None
 
 
+def test_sha_mismatch_hint_clones_into_a_fresh_directory(vtf, tmp_path):
+    ts_root = tmp_path / "vercel-chat"
+    ts_root.mkdir()
+    expected = {"tag": "chat@4.31.0", "sha": _PIN_SHA}
+    error = vtf.verify_checkout_sha(str(ts_root), expected, head=_TARGET_SHA)
+    # git refuses to clone into the existing TS_ROOT, so the hint must not target it.
+    fresh = tmp_path / "vercel-chat-4.31.0"
+    assert f"--branch chat@4.31.0 https://github.com/vercel/chat.git {fresh}\n" in error
+    fresh.mkdir()
+    error = vtf.verify_checkout_sha(str(ts_root), expected, head=_TARGET_SHA)
+    assert "git clone" not in error and f"re-run with TS_ROOT={fresh}" in error
+
+
+def test_sha_check_fails_closed_when_git_cannot_read_an_existing_dot_git(vtf, tmp_path, capsys):
+    ts_root = tmp_path / "checkout"
+    _write(ts_root / ".git", f"gitdir: {tmp_path / 'nowhere'}\n")
+    error = vtf.verify_checkout_sha(str(ts_root), {"tag": "chat@4.31.0", "sha": _PIN_SHA})
+    assert error is not None and "has a .git but git could not read its HEAD" in error
+    assert "is not a git checkout" not in capsys.readouterr().err
+
+
+def test_sha_check_rejects_local_edits_to_upstream_test_files(vtf, tmp_path):
+    repo = tmp_path / "repo"
+    test_file = _write(repo / "packages/chat/src/chat.test.ts", 'it("real upstream test", () => {});\n')
+    _write(repo / "README.md", "upstream\n")
+    _git(repo, "init", "-q")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    expected = {"tag": "chat@4.31.0", "sha": _git(repo, "rev-parse", "HEAD")}
+    assert vtf.verify_checkout_sha(str(repo), expected) is None
+    # Edits outside packages/chat/src do not affect the fidelity count.
+    _write(repo / "README.md", "edited\n")
+    assert vtf.verify_checkout_sha(str(repo), expected) is None
+    test_file.write_text("// pruned\n", encoding="utf-8")
+    error = vtf.verify_checkout_sha(str(repo), expected)
+    assert error is not None and "local changes" in error and "packages/chat/src/chat.test.ts" in error
+
+
 def test_doc_drift_flags_stale_branch_and_wrapped_pinned_phrase(vtf, tmp_path):
     _write(
         tmp_path / "CLAUDE.md",
@@ -374,6 +517,28 @@ def test_doc_drift_passes_when_docs_name_the_pin(vtf, tmp_path):
     _write(tmp_path / "CLAUDE.md", "pinned to `chat@4.31.0` (matches).\n--branch chat@4.31.0\n")
     _write(tmp_path / "docs" / "UPSTREAM_SYNC.md", 'git clone --branch "$(jq -r .pin.tag pin.json)"\n')
     assert vtf.check_docs("chat@4.31.0", repo_root=tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [
+        "Pinned to chat@4.30.0.",
+        "PINNED TO chat@4.30.0.",
+        "git clone --branch=chat@4.30.0 https://github.com/vercel/chat.git",
+        "git clone -b chat@4.30.0 https://github.com/vercel/chat.git",
+        "git clone --depth 1 --branch \\\n  chat@4.30.0 https://github.com/vercel/chat.git",
+        "pinned to **chat@4.30.0**",
+        "pinned to [chat@4.30.0](https://github.com/vercel/chat/releases)",
+        "pinned to the `chat@4.30.0` tag",
+        "--branch 'chat@4.30.0'",
+        "pinned to vercel/chat@4.30.0",
+    ],
+)
+def test_doc_drift_catches_stale_pin_variants(vtf, tmp_path, stale):
+    _write(tmp_path / "CLAUDE.md", f"Intro.\n{stale}\n")
+    _write(tmp_path / "docs" / "UPSTREAM_SYNC.md", "git checkout -b chat-fix\n")
+    errors = vtf.check_docs("chat@4.31.0", repo_root=tmp_path)
+    assert len(errors) == 1 and errors[0].startswith("CLAUDE.md:2:") and "chat@4.30.0" in errors[0]
 
 
 def test_completeness_flags_unlisted_core_test_file(vtf, tmp_path):
@@ -477,3 +642,95 @@ def test_strict_fails_when_checkout_sha_differs_from_pin(vtf, fake_upstream, mon
 def test_report_target_rejects_combined_modes(vtf, fake_upstream):
     assert vtf.main(["--report-target", "--strict"]) == 2
     assert vtf.main(["--check-docs", "--fix"]) == 2
+
+
+def test_report_target_lists_missing_without_a_baseline_marker(vtf, fake_upstream, capsys):
+    assert vtf.main(["--report-target"]) == 0
+    out = capsys.readouterr().out
+    assert "    MISSING: [A] handles %s\n" in out
+    assert "baselined" not in out
+
+
+@pytest.mark.parametrize(
+    ("head", "code"),
+    [(_TARGET_SHA, 0), (_PIN_SHA, 1), ("0" * 40, 1)],
+    ids=["target-sha", "pin-sha", "other-sha"],
+)
+def test_report_target_verifies_checkout_against_target_sha(vtf, fake_upstream, monkeypatch, head, code):
+    monkeypatch.setattr(vtf, "resolve_checkout_sha", lambda _root: head)
+    assert vtf.main(["--report-target"]) == code
+    assert (fake_upstream / "fidelity_target.json").exists() is (code == 0)
+
+
+def test_report_target_rejects_file_in_both_tiers(vtf, fake_upstream, monkeypatch):
+    monkeypatch.setattr(vtf, "TARGET_MAPPING", {**vtf.TARGET_MAPPING, **vtf.MAPPING})
+    assert vtf.main(["--report-target"]) == 1
+    assert not (fake_upstream / "fidelity_target.json").exists()
+
+
+def test_report_target_prints_total_and_per_file_delta(vtf, fake_upstream, capsys):
+    assert vtf.main(["--report-target"]) == 0
+    _write(fake_upstream / "py/tests/test_a.py", "def test_works():\n    pass\n\ndef test_handles():\n    pass\n")
+    capsys.readouterr()
+    assert vtf.main(["--report-target"]) == 0
+    out = capsys.readouterr().out
+    assert "Delta vs committed report: missing 2 -> 1 (-1)" in out
+    assert "  packages/chat/src/a.test.ts: 1 -> 0 (-1)\n" in out
+    assert "packages/chat/src/b.test.ts: 1 -> 1" not in out
+
+
+def test_strict_fails_when_pin_and_upstream_parity_disagree(vtf, fake_upstream, monkeypatch):
+    _write(fake_upstream / "py/tests/test_a.py", "def test_works():\n    pass\n\ndef test_handles():\n    pass\n")
+    assert vtf.main(["--strict"]) == 0
+    monkeypatch.setattr(vtf, "_read_upstream_parity", lambda: "4.41.0")
+    assert vtf.main(["--strict"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("claude_md", "code"),
+    [
+        ("--branch chat@4.31.0\n", 0),  # the pin
+        ("--branch chat@4.30.0\n", 1),  # stale
+        ("--branch chat@4.41.1\n", 1),  # the target is not the pin
+    ],
+    ids=["pin", "stale", "target"],
+)
+def test_check_docs_cli_compares_docs_against_the_pin(vtf, tmp_path, monkeypatch, claude_md, code):
+    _write(tmp_path / "CLAUDE.md", claude_md)
+    _write(tmp_path / "docs" / "UPSTREAM_SYNC.md", "pinned to `chat@4.31.0`\n")
+    monkeypatch.setattr(vtf, "REPO_ROOT", tmp_path)
+    assert vtf.main(["--check-docs"]) == code
+
+
+# An upstream file with three tests the extractor cannot read, next to one it can.
+_UNEXTRACTABLE = """describe("A", () => {
+  it("works", () => {});
+  it.each([[/[a-z/, "x"]])("rejects bad pattern %s", () => {});
+  it.each([[1]])(`handles ${kind} input %s`, () => {});
+  it.each([["a"]])("%s", () => {});
+});
+"""
+
+
+def test_strict_fails_closed_on_unextractable_upstream_tests(vtf, fake_upstream, capsys):
+    _write(fake_upstream / "ts/packages/chat/src/a.test.ts", _UNEXTRACTABLE)
+    assert vtf.main(["--strict"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.count("error: ") == 3 and "a.test.ts:3: could not extract it.each title" in captured.err
+    assert "3 upstream test(s) could not be extracted" in captured.out
+    assert "All TS tests have Python equivalents." not in captured.out
+
+
+def test_report_target_fails_closed_on_unextractable_upstream_tests(vtf, fake_upstream):
+    _write(fake_upstream / "ts/packages/chat/src/a.test.ts", _UNEXTRACTABLE)
+    assert vtf.main(["--report-target"]) == 1
+    assert not (fake_upstream / "fidelity_target.json").exists()
+
+
+def test_baseline_mode_only_warns_on_unextractable_upstream_tests(vtf, fake_upstream, monkeypatch, capsys):
+    _write(fake_upstream / "ts/packages/chat/src/a.test.ts", _UNEXTRACTABLE)
+    monkeypatch.setattr(vtf, "BASELINE_PATH", fake_upstream / "no_baseline.json")
+    assert vtf.main([]) == 0
+    err_lines = capsys.readouterr().err.splitlines()
+    assert sum(1 for line in err_lines if line.startswith("warning: ") and "a.test.ts:" in line) == 3
+    assert not any(line.startswith("error: ") for line in err_lines)
