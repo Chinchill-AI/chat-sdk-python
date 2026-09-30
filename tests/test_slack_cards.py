@@ -5,13 +5,21 @@ Port of packages/adapter-slack/src/cards.test.ts.
 
 from __future__ import annotations
 
+import json
+from decimal import Decimal
+from typing import Any
+
+import pytest
+
 from chat_sdk.adapters.slack.cards import card_to_block_kit
+from chat_sdk.adapters.slack.cards import card_to_fallback_text as slack_card_to_fallback_text
 from chat_sdk.cards import (
     Actions,
     Button,
     Card,
     CardLink,
     CardText,
+    Chart,
     Divider,
     Field,
     Fields,
@@ -624,7 +632,7 @@ class TestCardLink:
 
 
 class TestTable:
-    def test_table_to_block_kit(self):
+    def test_converts_a_card_with_table_element_to_a_block_kit_data_table(self):
         blocks = card_to_block_kit(
             Card(
                 children=[
@@ -633,7 +641,9 @@ class TestTable:
             )
         )
         assert len(blocks) == 1
-        assert blocks[0]["type"] == "table"
+        assert blocks[0]["type"] == "data_table"
+        assert blocks[0]["caption"] == "Table"
+        assert "page_size" not in blocks[0]
         assert blocks[0]["rows"] == [
             [{"type": "raw_text", "text": "Name"}, {"type": "raw_text", "text": "Age"}],
             [{"type": "raw_text", "text": "Alice"}, {"type": "raw_text", "text": "30"}],
@@ -650,6 +660,374 @@ class TestTable:
             )
         )
         assert len(blocks) == 2
-        assert blocks[0]["type"] == "table"
+        assert blocks[0]["type"] == "data_table"
         assert blocks[1]["type"] == "section"
         assert "```" in blocks[1]["text"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Data tables (upstream describe("cardToBlockKit with data tables"))
+# ---------------------------------------------------------------------------
+
+
+class TestCardToBlockKitWithDataTables:
+    def test_passes_caption_and_clamped_page_size_through(self):
+        blocks = card_to_block_kit(
+            Card(children=[Table(headers=["Name"], rows=[["Ada"]], caption="People", page_size=250)])
+        )
+        assert blocks[0]["type"] == "data_table"
+        assert blocks[0]["caption"] == "People"
+        assert blocks[0]["page_size"] == 100
+
+    def test_floors_fractional_page_size_and_defaults_an_empty_caption(self):
+        # Upstream ``Math.floor(pageSize)`` and ``caption || "Table"``.
+        block = card_to_block_kit(Card(children=[Table(headers=["Name"], rows=[["Ada"]], caption="", page_size=2.7)]))[
+            0
+        ]
+        assert block["caption"] == "Table"
+        assert block["page_size"] == 2
+
+    def test_renders_header_only_tables_as_a_plain_table_block(self):
+        blocks = card_to_block_kit(Card(children=[Table(headers=["Name", "Age"], rows=[])]))
+        assert blocks[0] == {
+            "type": "table",
+            "rows": [[{"type": "raw_text", "text": "Name"}, {"type": "raw_text", "text": "Age"}]],
+        }
+
+    def test_falls_back_to_ascii_when_combined_cells_exceed_10000_characters(self):
+        big_cell = "x" * 5001
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[[big_cell], [big_cell]])]))
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"].startswith("```\nA")
+
+    def test_keeps_a_native_table_at_exactly_10000_characters(self):
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[["x" * 4999], ["x" * 5000]])]))
+        assert blocks[0]["type"] == "data_table"
+
+    def test_counts_table_characters_in_code_points(self):
+        # Divergence from upstream (docs/UPSTREAM_SYNC.md): 1 + 9,999 code points is
+        # within the limit here; upstream counts 1 + 19,998 UTF-16 units and falls back.
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[["\U0001f600" * 9999]])]))
+        assert blocks[0]["type"] == "data_table"
+
+    def test_truncates_ascii_fallback_to_slacks_3000_char_section_limit(self):
+        big_cell = "x" * 5001
+        text = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[[big_cell], [big_cell]])]))[0]["text"][
+            "text"
+        ]
+        assert len(text) == 3000
+        # Closing code fence survives truncation, after the ellipsis marker
+        assert text.endswith("…\n```")
+
+
+# ---------------------------------------------------------------------------
+# Charts (upstream describe("cardToBlockKit with charts"))
+# ---------------------------------------------------------------------------
+
+
+def _pie(title: str, value: float = 1) -> Any:
+    return Chart(title=title, chart={"type": "pie", "segments": [{"label": "A", "value": value}]})
+
+
+class TestCardToBlockKitWithCharts:
+    def test_converts_a_pie_chart_to_a_data_visualization_block(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Candy Bars",
+                        chart={
+                            "type": "pie",
+                            "segments": [{"label": "Kit Kat", "value": 45}, {"label": "Twix", "value": 28}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks == [
+            {
+                "type": "data_visualization",
+                "title": "Candy Bars",
+                "chart": {
+                    "type": "pie",
+                    "segments": [{"label": "Kit Kat", "value": 45}, {"label": "Twix", "value": 28}],
+                },
+            }
+        ]
+
+    def test_converts_a_bar_chart_with_axis_config_and_normalizes_point_order(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="DAU",
+                        chart={
+                            "type": "bar",
+                            "categories": ["Mon", "Tue"],
+                            "x_label": "Day",
+                            "y_label": "Users",
+                            "series": [
+                                {
+                                    "name": "Mobile",
+                                    "data": [{"label": "Tue", "value": 60}, {"label": "Mon", "value": 50}],
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0] == {
+            "type": "data_visualization",
+            "title": "DAU",
+            "chart": {
+                "type": "bar",
+                "series": [{"name": "Mobile", "data": [{"label": "Mon", "value": 50}, {"label": "Tue", "value": 60}]}],
+                "axis_config": {"categories": ["Mon", "Tue"], "x_label": "Day", "y_label": "Users"},
+            },
+        }
+
+    def test_omits_axis_labels_that_are_not_provided(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Sales",
+                        chart={
+                            "type": "line",
+                            "categories": ["W1"],
+                            "series": [{"name": "A", "data": [{"label": "W1", "value": 1}]}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["chart"] == {
+            "type": "line",
+            "series": [{"name": "A", "data": [{"label": "W1", "value": 1}]}],
+            "axis_config": {"categories": ["W1"]},
+        }
+
+    def test_falls_back_to_text_when_a_pie_segment_value_is_not_positive(self):
+        blocks = card_to_block_kit(Card(children=[_pie("Bad Pie", value=0)]))
+        assert blocks[0]["type"] == "section"
+        assert "Bad Pie" in blocks[0]["text"]["text"]
+        assert "```" in blocks[0]["text"]["text"]
+
+    def test_falls_back_to_text_when_a_series_misses_a_category(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Gaps",
+                        chart={
+                            "type": "area",
+                            "categories": ["Mon", "Tue"],
+                            "series": [{"name": "A", "data": [{"label": "Mon", "value": 1}]}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+        assert "```" in blocks[0]["text"]["text"]
+
+    def test_falls_back_when_same_length_series_repeats_a_label_instead_of_covering_a_category(self):
+        # Point count matches the categories, but "Tue" is missing: a partial chart is never sent.
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Dupes",
+                        chart={
+                            "type": "bar",
+                            "categories": ["Mon", "Tue"],
+                            "series": [
+                                {"name": "A", "data": [{"label": "Mon", "value": 1}, {"label": "Mon", "value": 2}]}
+                            ],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+
+    def test_falls_back_to_text_when_the_title_exceeds_50_characters(self):
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 51)]))
+        assert blocks[0]["type"] == "section"
+
+    def test_validates_the_title_length_after_emoji_conversion(self):
+        # ``{{emoji:x}}`` (11 chars) converts to ``:x:`` (3 chars): 48 + 3 = 51 > 50.
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 48 + "{{emoji:x}}")]))
+        assert blocks[0]["type"] == "section"
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 47 + "{{emoji:x}}")]))
+        assert blocks[0] == {
+            "type": "data_visualization",
+            "title": "t" * 47 + ":x:",
+            "chart": {"type": "pie", "segments": [{"label": "A", "value": 1}]},
+        }
+
+    def test_falls_back_to_text_when_there_are_more_than_12_segments(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Too Many",
+                        chart={"type": "pie", "segments": [{"label": f"S{i}", "value": i + 1} for i in range(13)]},
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+
+    def test_falls_back_to_text_from_the_third_chart_in_one_message(self):
+        blocks = card_to_block_kit(Card(children=[_pie("One"), _pie("Two"), _pie("Three")]))
+        assert [b["type"] for b in blocks] == ["data_visualization", "data_visualization", "section"]
+        assert "Three" in blocks[2]["text"]["text"]
+
+    def test_an_invalid_chart_does_not_use_up_the_per_message_chart_budget(self):
+        blocks = card_to_block_kit(Card(children=[_pie("Bad", value=0), _pie("One"), _pie("Two")]))
+        assert [b["type"] for b in blocks] == ["section", "data_visualization", "data_visualization"]
+
+    def test_includes_chart_data_in_card_fallback_text(self):
+        text = slack_card_to_fallback_text(
+            Card(
+                title="Report",
+                children=[
+                    Chart(title="Candy Bars", chart={"type": "pie", "segments": [{"label": "Kit Kat", "value": 45}]})
+                ],
+            )
+        )
+        assert "Candy Bars" in text
+        assert "Kit Kat" in text
+
+
+# ---------------------------------------------------------------------------
+# Slack constraint edges (each case breaks exactly one constraint)
+# ---------------------------------------------------------------------------
+
+
+def _series_chart(
+    *,
+    title: str = "Sales",
+    categories: list[str] | None = None,
+    series: list[dict[str, Any]] | None = None,
+    **axis: str,
+) -> Any:
+    cats = categories if categories is not None else ["Mon", "Tue"]
+    default_series = [{"name": "A", "data": [{"label": c, "value": 1} for c in cats]}]
+    return Chart(
+        title=title,
+        chart={"type": "bar", "categories": cats, "series": series if series is not None else default_series, **axis},
+    )
+
+
+def _points(categories: list[str]) -> list[dict[str, Any]]:
+    return [{"label": c, "value": 1} for c in categories]
+
+
+class TestSlackChartAndTableConstraintEdges:
+    def test_renders_charts_and_tables_natively_at_every_limit(self):
+        cats = [f"c{i:0>19}" for i in range(20)]  # 20 unique 20-char categories
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    _series_chart(
+                        categories=cats,
+                        series=[{"name": f"s{i:0>19}", "data": _points(cats)} for i in range(12)],
+                        x_label="x" * 50,
+                        y_label="y" * 50,
+                    ),
+                    Table(headers=["N"], rows=[[str(i)] for i in range(100)]),
+                ]
+            )
+        )
+        assert [b["type"] for b in blocks] == ["data_visualization", "data_table"]
+        assert len(blocks[0]["chart"]["series"]) == 12
+        assert len(blocks[1]["rows"]) == 101
+
+    @pytest.mark.parametrize(
+        "chart",
+        [
+            pytest.param(_series_chart(title=""), id="empty-title"),
+            pytest.param(_series_chart(categories=[""]), id="empty-category-label"),
+            pytest.param(_series_chart(categories=["c" * 21]), id="21-char-category-label"),
+            pytest.param(
+                _series_chart(series=[{"name": "n" * 21, "data": _points(["Mon", "Tue"])}]), id="21-char-series-name"
+            ),
+            pytest.param(_series_chart(categories=["Mon", "Mon"]), id="duplicate-category"),
+            pytest.param(
+                _series_chart(series=[{"name": "A", "data": _points(["Mon", "Tue"])}] * 2), id="duplicate-series-name"
+            ),
+            pytest.param(
+                _series_chart(series=[{"name": f"S{i}", "data": _points(["Mon", "Tue"])} for i in range(13)]),
+                id="13-series",
+            ),
+            pytest.param(_series_chart(categories=[f"C{i}" for i in range(21)]), id="21-categories"),
+            pytest.param(_series_chart(x_label="x" * 51), id="51-char-x-label"),
+            pytest.param(_series_chart(y_label="y" * 51), id="51-char-y-label"),
+            pytest.param(
+                _series_chart(categories=["Mon"], series=[{"name": "A", "data": _points(["Mon", "Tue"])}]),
+                id="extra-point",
+            ),
+            pytest.param(
+                Chart(title="Pie", chart={"type": "pie", "segments": [{"label": "l" * 21, "value": 1}]}),
+                id="21-char-segment-label",
+            ),
+        ],
+    )
+    def test_falls_back_to_text_when_a_chart_breaks_one_slack_constraint(self, chart: Any):
+        blocks = card_to_block_kit(Card(children=[chart]))
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"].startswith("```\n")
+
+    def test_falls_back_to_ascii_for_more_than_100_data_rows(self):
+        blocks = card_to_block_kit(Card(children=[Table(headers=["N"], rows=[[str(i)] for i in range(101)])]))
+        assert blocks[0]["type"] == "section"
+
+    def test_clamps_page_size_up_to_1_and_converts_emoji_in_the_caption(self):
+        block = card_to_block_kit(
+            Card(children=[Table(headers=["N"], rows=[["1"]], caption="{{emoji:wave}} Hi", page_size=0)])
+        )[0]
+        assert block["page_size"] == 1
+        assert block["caption"] == ":wave: Hi"
+
+    def test_sends_non_float_numeric_chart_values_as_json_numbers(self):
+        # Decimal (Postgres NUMERIC) is not JSON-serializable; slack_sdk would raise TypeError.
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(title="Pie", chart={"type": "pie", "segments": [{"label": "EU", "value": Decimal("12.50")}]}),
+                    _series_chart(
+                        series=[
+                            {
+                                "name": "A",
+                                "data": [
+                                    {"label": "Mon", "value": Decimal("3")},
+                                    {"label": "Tue", "value": Decimal("4.25")},
+                                ],
+                            }
+                        ]
+                    ),
+                ]
+            )
+        )
+        assert blocks[0]["chart"]["segments"] == [{"label": "EU", "value": 12.5}]
+        assert blocks[1]["chart"]["series"][0]["data"] == [
+            {"label": "Mon", "value": 3.0},
+            {"label": "Tue", "value": 4.25},
+        ]
+        assert json.loads(json.dumps(blocks)) == blocks
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), Decimal("NaN"), True, "5"])
+    def test_falls_back_to_text_for_values_that_are_not_finite_json_numbers(self, value: Any):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    _series_chart(
+                        categories=["Mon"], series=[{"name": "A", "data": [{"label": "Mon", "value": value}]}]
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"

@@ -8,13 +8,15 @@ Port of cards.ts from the Vercel Chat SDK Slack adapter.
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from typing import Any, TypedDict
 
 from chat_sdk.cards import (
     ActionsElement,
     ButtonElement,
     CardChild,
     CardElement,
+    ChartElement,
     DividerElement,
     FieldsElement,
     ImageElement,
@@ -23,7 +25,9 @@ from chat_sdk.cards import (
     SectionElement,
     TableElement,
     TextElement,
+    _chart_value_to_json_number,
     card_child_to_fallback_text,
+    chart_element_to_fallback_text,
     table_element_to_ascii,
 )
 from chat_sdk.modals import SelectElement
@@ -89,9 +93,9 @@ def card_to_block_kit(card: CardElement) -> list[SlackBlock]:
             }
         )
 
-    # Convert children -- track whether native table block has been used
-    # (Slack allows at most one table block per message)
-    state = {"used_native_table": False}
+    # Convert children -- track native table/chart block usage (Slack allows
+    # at most one table block and two data_visualization blocks per message)
+    state: _CardRenderState = {"used_native_table": False, "chart_count": 0}
     for child in card.get("children", []):
         child_blocks = _convert_child_to_blocks(child, state)
         blocks.extend(child_blocks)
@@ -99,7 +103,14 @@ def card_to_block_kit(card: CardElement) -> list[SlackBlock]:
     return blocks
 
 
-def _convert_child_to_blocks(child: CardChild, state: dict[str, bool]) -> list[SlackBlock]:
+class _CardRenderState(TypedDict):
+    """Per-message rendering state for Slack's native block usage limits."""
+
+    chart_count: int
+    used_native_table: bool
+
+
+def _convert_child_to_blocks(child: CardChild, state: _CardRenderState) -> list[SlackBlock]:
     """Convert a card child element to Slack blocks."""
     child_type = child.get("type", "")
 
@@ -119,6 +130,8 @@ def _convert_child_to_blocks(child: CardChild, state: dict[str, bool]) -> list[S
         return [_convert_link_to_block(child)]  # type: ignore[arg-type]
     if child_type == "table":
         return _convert_table_to_blocks(child, state)  # type: ignore[arg-type]
+    if child_type == "chart":
+        return [_convert_chart_to_block(child, state)]  # type: ignore[arg-type]
 
     # Unknown type -- try fallback
     text = card_child_to_fallback_text(child)
@@ -311,32 +324,70 @@ def _convert_radio_select_to_element(radio_select: Any) -> SlackRadioSelectEleme
     return element
 
 
-def _convert_table_to_blocks(element: TableElement, state: dict[str, bool]) -> list[SlackBlock]:
+# Slack's section text object limit
+_SECTION_TEXT_MAX_CHARS = 3000
+
+
+def _ascii_fallback_block(content: str) -> SlackBlock:
+    """Wrap ASCII fallback content in a fenced code block inside a section.
+
+    Truncates the content so the section text stays within Slack's
+    3,000-character limit while keeping the closing fence intact. Lengths are
+    counted in code points; upstream counts UTF-16 code units (see
+    docs/UPSTREAM_SYNC.md).
+    """
+
+    def fence(body: str) -> str:
+        return f"```\n{body}\n```"
+
+    budget = _SECTION_TEXT_MAX_CHARS - len(fence(""))
+    text = fence(f"{content[: budget - 1]}…") if len(content) > budget else fence(content)
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
+_DATA_TABLE_MAX_ROWS = 100
+_DATA_TABLE_MAX_COLS = 20
+# A single table (all cells combined) can't exceed 10,000 characters
+_DATA_TABLE_MAX_CHARS = 10_000
+_DATA_TABLE_MIN_PAGE_SIZE = 1
+_DATA_TABLE_MAX_PAGE_SIZE = 100
+
+
+def _clamp_page_size(page_size: float) -> int:
+    """Upstream ``Math.min(100, Math.max(1, Math.floor(pageSize)))``.
+
+    Clamps before flooring, which gives the same result for every finite value
+    (the bounds are integers) and keeps ``inf`` / ``nan`` from raising in
+    ``math.floor``.
+    """
+    return math.floor(max(_DATA_TABLE_MIN_PAGE_SIZE, min(_DATA_TABLE_MAX_PAGE_SIZE, page_size)))
+
+
+def _convert_table_to_blocks(element: TableElement, state: _CardRenderState) -> list[SlackBlock]:
     """Convert a table element to Slack Block Kit blocks.
 
-    Uses the native table block with first-row-as-headers schema.
-    Falls back to code block for tables exceeding Slack limits (100 rows, 20 columns)
-    or when a native table block has already been used in this message.
+    Uses the data table block (paginated + sortable) with first-row-as-headers
+    schema when the table has at least one data row. Falls back to the plain
+    table block for header-only tables, and to an ASCII code block for tables
+    exceeding Slack limits (100 data rows, 20 columns, 10,000 characters) or
+    when a native table block has already been used in this message.
 
-    @see https://docs.slack.dev/reference/block-kit/blocks/table-block/
+    @see https://docs.slack.dev/reference/block-kit/blocks/data-table-block/
     """
-    MAX_ROWS = 100
-    MAX_COLS = 20
-
     headers = element.get("headers", [])
     rows = element.get("rows", [])
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md: counts code points,
+    # where upstream's ``.length`` counts UTF-16 code units.
+    cell_char_count = sum(len(cell) for cell in headers) + sum(len(cell) for row in rows for cell in row)
 
-    if state["used_native_table"] or len(rows) > MAX_ROWS or len(headers) > MAX_COLS:
+    if (
+        state["used_native_table"]
+        or len(rows) > _DATA_TABLE_MAX_ROWS
+        or len(headers) > _DATA_TABLE_MAX_COLS
+        or cell_char_count > _DATA_TABLE_MAX_CHARS
+    ):
         # Fall back to ASCII table in a code block
-        return [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"```\n{table_element_to_ascii(headers, rows)}\n```",
-                },
-            }
-        ]
+        return [_ascii_fallback_block(table_element_to_ascii(headers, rows))]
 
     state["used_native_table"] = True
 
@@ -344,15 +395,140 @@ def _convert_table_to_blocks(element: TableElement, state: dict[str, bool]) -> l
     header_row = [{"type": "raw_text", "text": convert_emoji(h) or " "} for h in headers]
     data_rows = [[{"type": "raw_text", "text": convert_emoji(cell) or " "} for cell in row] for row in rows]
 
-    return [
-        {
-            "type": "table",
-            "rows": [header_row, *data_rows],
+    # Upstream parity: rows are emitted as given, not padded to the header
+    # width (chat@4.41.1 adapter-slack/src/cards.ts:433-453 maps cells 1:1).
+    # Ragged rows pass through unchanged, as upstream; no Python-only padding.
+    # The data table block requires a header row plus at least one data row
+    if len(data_rows) == 0:
+        return [{"type": "table", "rows": [header_row]}]
+
+    block: SlackBlock = {
+        "type": "data_table",
+        # Upstream ``caption || "Table"``: an empty caption also gets the default.
+        "caption": convert_emoji(element.get("caption") or "Table"),
+        "rows": [header_row, *data_rows],
+    }
+    page_size = element.get("page_size")
+    if page_size is not None:
+        block["page_size"] = _clamp_page_size(page_size)
+    return [block]
+
+
+_CHART_MAX_TITLE_CHARS = 50
+_CHART_MAX_LABEL_CHARS = 20
+_CHART_MAX_SEGMENTS = 12
+_CHART_MAX_SERIES = 12
+_CHART_MAX_DATA_POINTS = 20
+# Slack rejects messages with more than 2 data_visualization blocks
+# (undocumented; enforced by the API as of July 2026)
+_CHART_MAX_PER_MESSAGE = 2
+
+
+def _convert_chart_to_block(element: ChartElement, state: _CardRenderState) -> SlackBlock:
+    """Convert a chart element to a Slack data visualization block.
+
+    Falls back to the chart's data rendered as an ASCII table in a code block
+    when the chart violates Slack constraints (label lengths, series counts,
+    category/data-point mismatches, more than 2 charts per message), since
+    Slack rejects invalid charts outright rather than truncating them.
+
+    @see https://docs.slack.dev/reference/block-kit/blocks/data-visualization-block/
+    """
+    block = _chart_to_data_visualization(element) if state["chart_count"] < _CHART_MAX_PER_MESSAGE else None
+    if block is not None:
+        state["chart_count"] += 1
+        return block
+    return _ascii_fallback_block(chart_element_to_fallback_text(element))
+
+
+def _chart_to_data_visualization(element: ChartElement) -> SlackBlock | None:
+    """Build a data_visualization block, or return ``None`` if the chart violates Slack constraints."""
+    title = convert_emoji(element.get("title", ""))
+    if len(title) == 0 or len(title) > _CHART_MAX_TITLE_CHARS:
+        return None
+
+    chart: Any = element.get("chart", {})
+
+    if chart.get("type") == "pie":
+        segments = chart.get("segments", [])
+        # JSON-safe values: see ``_chart_value_to_json_number``.
+        values = [_chart_value_to_json_number(segment["value"]) for segment in segments]
+        valid_segments = 1 <= len(segments) <= _CHART_MAX_SEGMENTS and all(
+            _is_valid_chart_label(segment["label"]) and value is not None and value > 0
+            for segment, value in zip(segments, values, strict=True)
+        )
+        if not valid_segments:
+            return None
+        return {
+            "type": "data_visualization",
+            "title": title,
+            "chart": {
+                "type": "pie",
+                "segments": [
+                    {"label": segment["label"], "value": value} for segment, value in zip(segments, values, strict=True)
+                ],
+            },
         }
-    ]
+
+    categories = chart.get("categories", [])
+    series = chart.get("series", [])
+    x_label = chart.get("x_label")
+    y_label = chart.get("y_label")
+    valid_shape = (
+        1 <= len(categories) <= _CHART_MAX_DATA_POINTS
+        and all(_is_valid_chart_label(category) for category in categories)
+        and len(set(categories)) == len(categories)
+        and 1 <= len(series) <= _CHART_MAX_SERIES
+        and all(_is_valid_chart_label(s["name"]) for s in series)
+        and len({s["name"] for s in series}) == len(series)
+        and (x_label is None or len(x_label) <= _CHART_MAX_TITLE_CHARS)
+        and (y_label is None or len(y_label) <= _CHART_MAX_TITLE_CHARS)
+    )
+    if not valid_shape:
+        return None
+
+    # Each series needs exactly one data point per category; normalize
+    # point order to the category order Slack expects.
+    normalized_series: list[dict[str, Any]] = []
+    for s in series:
+        points = s["data"]
+        if len(points) != len(categories):
+            return None
+        # A later duplicate label wins, as with upstream's ``new Map(...)``.
+        by_label = {point["label"]: point for point in points}
+        data: list[dict[str, Any]] = []
+        for category in categories:
+            point = by_label.get(category)
+            if point is None:
+                return None
+            value = _chart_value_to_json_number(point["value"])
+            if value is None:
+                return None
+            data.append({"label": category, "value": value})
+        normalized_series.append({"name": s["name"], "data": data})
+
+    axis_config: dict[str, Any] = {"categories": categories}
+    if x_label is not None:
+        axis_config["x_label"] = x_label
+    if y_label is not None:
+        axis_config["y_label"] = y_label
+
+    return {
+        "type": "data_visualization",
+        "title": title,
+        "chart": {
+            "type": chart.get("type"),
+            "series": normalized_series,
+            "axis_config": axis_config,
+        },
+    }
 
 
-def _convert_section_to_blocks(element: SectionElement, state: dict[str, bool]) -> list[SlackBlock]:
+def _is_valid_chart_label(label: str) -> bool:
+    return 1 <= len(label) <= _CHART_MAX_LABEL_CHARS
+
+
+def _convert_section_to_blocks(element: SectionElement, state: _CardRenderState) -> list[SlackBlock]:
     """Convert a SectionElement by flattening its children into blocks."""
     blocks: list[SlackBlock] = []
     for child in element.get("children", []):

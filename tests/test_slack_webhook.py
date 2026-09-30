@@ -448,6 +448,89 @@ class TestInteractivePayloads:
         response = await adapter.handle_webhook(req)
         assert response["status"] == 200
 
+    async def _submit_values(self, state_values: dict[str, Any]) -> dict[str, str]:
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        chat.process_modal_submit = AsyncMock(return_value=None)
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "view_submission",
+                "trigger_id": "trigger123",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "view": {"id": "V123", "callback_id": "renewal_form", "state": {"values": state_values}},
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+        chat.process_modal_submit.assert_awaited_once()
+        event = chat.process_modal_submit.await_args.args[0]
+        assert event.callback_id == "renewal_form"
+        return event.values
+
+    @pytest.mark.asyncio
+    async def test_flattens_datepicker_and_number_input_state_into_submitted_values(self):
+        values = await self._submit_values(
+            {
+                "renewal_date": {"renewal_date": {"type": "datepicker", "selected_date": "2026-08-01"}},
+                "quantity": {"quantity": {"type": "number_input", "value": "3"}},
+            }
+        )
+        assert values == {"renewal_date": "2026-08-01", "quantity": "3"}
+
+    @pytest.mark.asyncio
+    async def test_submits_empty_and_unset_inputs_with_nullish_fallbacks(self):
+        # Upstream ``value ?? selected_date ?? selected_option?.value ?? ""``: a cleared
+        # text input keeps its "" rather than falling through to the next key.
+        values = await self._submit_values(
+            {
+                "note": {"note": {"type": "plain_text_input", "value": "", "selected_date": "2026-08-01"}},
+                "date": {"date": {"type": "datepicker", "selected_date": None}},
+                "plan": {"plan": {"type": "static_select", "selected_option": {"value": "pro"}}},
+                "none": {"none": {"type": "static_select", "selected_option": None}},
+            }
+        )
+        assert values == {"note": "", "date": "", "plan": "pro", "none": ""}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selected", ["team", ""])
+    async def test_dispatch_action_select_in_a_modal_reaches_on_action_with_the_selected_value(self, selected):
+        # A ``dispatch_action`` select inside a modal sends ``block_actions`` from a
+        # ``view`` container with no channel; it must still reach process_action.
+        adapter = _make_adapter()
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+
+        req = self._make_interactive_req(
+            {
+                "type": "block_actions",
+                "trigger_id": "trigger123",
+                "user": {"id": "U123", "username": "testuser", "name": "Test User"},
+                "container": {"type": "view", "view_id": "V123"},
+                "view": {"id": "V123", "callback_id": "permissions"},
+                "actions": [
+                    {
+                        "type": "static_select",
+                        "action_id": "scope",
+                        "block_id": "scope",
+                        "selected_option": {"text": {"type": "plain_text", "text": "Team"}, "value": selected},
+                        "value": "stale",
+                    }
+                ],
+            }
+        )
+        response = await adapter.handle_webhook(req)
+        assert response["status"] == 200
+
+        chat.process_action.assert_called_once()
+        action_event = chat.process_action.call_args.args[0]
+        assert action_event.action_id == "scope"
+        # ``selected_option?.value ?? value``: an empty option value is kept, not replaced.
+        assert action_event.value == selected
+        assert action_event.trigger_id == "trigger123"
+        assert action_event.thread_id == ""
+
     @pytest.mark.asyncio
     async def test_handles_view_closed(self):
         adapter = _make_adapter()

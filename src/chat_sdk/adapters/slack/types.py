@@ -476,6 +476,7 @@ class SlackViewStateInput(TypedDict, total=False):
     """A single input value in a view submission."""
 
     value: str
+    selected_date: str
     selected_option: dict[str, str]  # {"value": "..."}
 
 
