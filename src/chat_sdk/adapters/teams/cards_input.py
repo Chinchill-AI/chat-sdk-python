@@ -63,7 +63,7 @@ TEAMS_INPUT_ACTION_PREFIX = "input:"
 TEAMS_FREEFORM_ACTION_ID = "input-freeform"
 
 _ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
-_ADAPTIVE_CARD_VERSION = "1.4"
+_ADAPTIVE_CARD_VERSION = "1.5"
 
 
 class TeamsInputOption(TypedDict):

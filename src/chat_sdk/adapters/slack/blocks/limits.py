@@ -21,6 +21,12 @@ class _Limits:
     button_text: int
     button_url: int
     button_value: int
+    chart_data_points: int
+    chart_label: int
+    charts_per_message: int
+    chart_segments: int
+    chart_series: int
+    chart_title: int
     fields: int
     field_text: int
     header_text: int
@@ -33,7 +39,9 @@ class _Limits:
     placeholder: int
     radio_options: int
     section_text: int
+    table_chars: int
     table_columns: int
+    table_page_size: int
     table_rows: int
     text_object: int
 
@@ -46,6 +54,13 @@ LIMITS: Final = _Limits(
     button_text=75,
     button_url=3000,
     button_value=2000,
+    chart_data_points=20,
+    chart_label=20,
+    # Undocumented: Slack rejects messages with >2 data_visualization blocks
+    charts_per_message=2,
+    chart_segments=12,
+    chart_series=12,
+    chart_title=50,
     fields=10,
     field_text=2000,
     header_text=150,
@@ -58,7 +73,9 @@ LIMITS: Final = _Limits(
     placeholder=150,
     radio_options=10,
     section_text=3000,
+    table_chars=10_000,
     table_columns=20,
+    table_page_size=100,
     table_rows=100,
     text_object=3000,
 )

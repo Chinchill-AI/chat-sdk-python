@@ -42,7 +42,9 @@ Repository = "https://github.com/Chinchill-AI/chat-sdk-python"
 Issues = "https://github.com/Chinchill-AI/chat-sdk-python/issues"
 
 [project.optional-dependencies]
-slack = ["slack-sdk>=3.27.0"]
+# aiohttp: slack_sdk's AsyncWebClient (every adapter Web API call) and the
+# guarded file downloader's default transport (#213) both need it at runtime.
+slack = ["slack-sdk>=3.27.0", "aiohttp>=3.9"]
 # Slack Socket Mode (xapp-* WebSocket transport). slack_sdk's
 # SocketModeClient ships with the slack-sdk wheel, but the aiohttp variant
 # we use needs aiohttp at runtime.

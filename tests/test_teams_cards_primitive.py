@@ -221,7 +221,7 @@ class TestParseEdgeCases:
         card = input_request_to_teams_adaptive_card({"prompt": "Hi", "request_id": "x"})
         assert card["$schema"] == "http://adaptivecards.io/schemas/adaptive-card.json"
         assert card["type"] == "AdaptiveCard"
-        assert card["version"] == "1.4"
+        assert card["version"] == "1.5"
         # Empty options + no freeform → only the prompt TextBlock, no actions.
         assert card["body"] == [{"text": "Hi", "type": "TextBlock", "wrap": True}]
         assert card["actions"] == []
