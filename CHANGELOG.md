@@ -11,6 +11,7 @@ Sync wave from `chat@4.31.0` to `chat@4.41.1` (tracking #184). `UPSTREAM_PARITY`
   - `it.each` / `test.each` templates now count as one logical test each, with placeholders stripped. `test("…")` also counts, and `describe.each` titles are used for reporting. The strict count at the pin is now **733/733** (was 732): `thread.test.ts`'s existing `$label` template is now checked.
   - Scope is two-tier. `MAPPING` stays strict. New `TARGET_MAPPING` rows are checked only by the new `--report-target` mode. New `UNMAPPED` lists deliberate skips with reasons, and every core `*.test.ts(x)` must be classified in one of the three.
   - Per-file output now shows exact vs fuzzy match counts.
+  - Fuzzy-match ties now resolve the same way in every run. They used to depend on the per-process string hash seed, so the target total could flip between 282 and 283 missing.
   - `scripts/fidelity_target.json` is committed as the authoritative wave-wide missing list at `chat@4.41.1`: 282 missing of 1036 (130 in strict-tier files, 152 in target-tier files), including 16 `.each` templates.
 
 ## 0.4.31.3
