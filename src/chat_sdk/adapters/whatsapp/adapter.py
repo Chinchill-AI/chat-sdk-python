@@ -29,6 +29,7 @@ from chat_sdk.adapters.whatsapp.cards import (
     card_to_whatsapp,
     decode_whatsapp_callback_data,
 )
+from chat_sdk.adapters.whatsapp.errors import WhatsAppApiError
 from chat_sdk.adapters.whatsapp.format_converter import WhatsAppFormatConverter
 from chat_sdk.adapters.whatsapp.types import (
     WhatsAppAdapterConfig,
@@ -36,6 +37,8 @@ from chat_sdk.adapters.whatsapp.types import (
     WhatsAppInboundMessage,
     WhatsAppInteractiveMessage,
     WhatsAppRawMessage,
+    WhatsAppTemplateComponent,
+    WhatsAppTemplateMessage,
     WhatsAppThreadId,
     WhatsAppWebhookPayload,
     WhatsAppWebhookValue,
@@ -43,7 +46,7 @@ from chat_sdk.adapters.whatsapp.types import (
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
-from chat_sdk.shared.errors import AdapterError, ValidationError
+from chat_sdk.shared.errors import AdapterError, NetworkError, ValidationError
 from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.thread_history import ThreadHistoryCache
 from chat_sdk.types import (
@@ -136,6 +139,25 @@ def _metadata_phone_number_id(value: Any) -> str:
     """
     phone_number_id = _as_dict(_as_dict(value).get("metadata")).get("phone_number_id")
     return phone_number_id if isinstance(phone_number_id, str) else ""
+
+
+def _convert_template_component_emoji(component: WhatsAppTemplateComponent) -> WhatsAppTemplateComponent:
+    """Convert emoji placeholders in a template component's text parameters.
+
+    Only ``type == "text"`` parameters are converted; payloads, URLs and media
+    references must stay literal. Returns new dicts and leaves the caller's
+    component untouched.
+    """
+    # pyrefly does not narrow the TypedDict union on the ``type`` tag, so the
+    # parameters are handled as plain dicts.
+    source: list[dict[str, Any]] = cast(list[dict[str, Any]], component["parameters"])
+    parameters = [
+        {**parameter, "text": convert_emoji_placeholders(parameter["text"], "whatsapp")}
+        if parameter.get("type") == "text"
+        else parameter
+        for parameter in source
+    ]
+    return cast(WhatsAppTemplateComponent, {**component, "parameters": parameters})
 
 
 def split_message(text: str) -> list[str]:
@@ -1050,26 +1072,14 @@ class WhatsAppAdapter:
         1. GET the media metadata to obtain the download URL
         2. GET the actual binary data from the download URL
         """
-        session = await self._get_http_session()
-
         # Step 1: Get the media URL
-        async with session.get(
+        media_info = await self._graph_fetch_json(
+            "GET",
             f"{self._graph_api_url}/{media_id}",
             headers={"Authorization": f"Bearer {self._access_token}"},
-        ) as meta_response:
-            if meta_response.status != 200:
-                error_body = await meta_response.text()
-                self._logger.error(
-                    "Failed to get media URL",
-                    {
-                        "status": meta_response.status,
-                        "body": error_body,
-                        "mediaId": media_id,
-                    },
-                )
-                raise RuntimeError(f"Failed to get media URL: {meta_response.status} {error_body}")
-
-            media_info = await meta_response.json()
+            label="Failed to get media URL",
+            context={"mediaId": media_id},
+        )
 
         # Validate the download URL to prevent SSRF
         download_url = media_info["url"]
@@ -1098,6 +1108,7 @@ class WhatsAppAdapter:
         # The WhatsApp Cloud API requires the Bearer token for media downloads
         # (the URL is not pre-signed). The SSRF domain validation above ensures
         # we only send the token to legitimate Meta/WhatsApp domains.
+        session = await self._get_http_session()
         async with session.get(
             download_url,
             headers={"Authorization": f"Bearer {self._access_token}"},
@@ -1245,6 +1256,75 @@ class WhatsAppAdapter:
                     "from": self._phone_number_id,
                     "timestamp": str(int(time.time())),
                     "type": "interactive",
+                },
+                "phone_number_id": self._phone_number_id,
+            },
+        )
+
+    async def send_template(self, thread_id: str, template: WhatsAppTemplateMessage) -> RawMessage:
+        """Send a pre-approved template message via the Cloud API.
+
+        Templates are the only message type WhatsApp accepts outside the
+        24-hour customer service window, making them the way to start
+        business-initiated conversations. The adapter does not auto-substitute
+        templates for outbound text posts -- callers must opt in explicitly
+        when they detect the window is closed.
+
+        Example::
+
+            await adapter.send_template(thread_id, {
+                "name": "appointment_reminder",
+                "language": "en",
+                "components": [
+                    {"type": "body", "parameters": [{"type": "text", "text": "Tomorrow at 2pm"}]},
+                ],
+            })
+
+        See: https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-message-templates
+        """
+        user_wa_id = self.decode_thread_id(thread_id).user_wa_id
+
+        # Convert emoji placeholders in text parameters only; payloads, URLs,
+        # and media references must stay literal.
+        source_components = template.get("components")
+        components = (
+            [_convert_template_component_emoji(component) for component in source_components]
+            if source_components
+            else None
+        )
+
+        template_payload: dict[str, Any] = {
+            "name": template["name"],
+            "language": {"code": template["language"]},
+        }
+        if components is not None:
+            template_payload["components"] = components
+
+        response = await self._graph_api_request(
+            f"/{self._phone_number_id}/messages",
+            {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                **(await self._recipient(thread_id, user_wa_id)),
+                "type": "template",
+                "template": template_payload,
+            },
+        )
+
+        messages = response.get("messages") or []
+        if not messages or not messages[0].get("id"):
+            raise RuntimeError("WhatsApp API did not return a message ID for template message")
+
+        message_id = messages[0]["id"]
+        return RawMessage(
+            id=message_id,
+            thread_id=thread_id,
+            raw={
+                "message": {
+                    "id": message_id,
+                    "from": self._phone_number_id,
+                    "timestamp": str(int(time.time())),
+                    "type": "template",
                 },
                 "phone_number_id": self._phone_number_id,
             },
@@ -1414,7 +1494,13 @@ class WhatsAppAdapter:
         return True
 
     async def open_dm(self, user_id: str) -> str:
-        """Open a DM with a user. Returns the thread ID."""
+        """Open a DM with a user. Returns the thread ID for the conversation.
+
+        For WhatsApp, this simply constructs the thread ID since all
+        conversations are inherently DMs. Note: you can only message users
+        who have messaged you first (within the 24-hour window) or via
+        approved template messages (see :meth:`send_template`).
+        """
         return self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=self._phone_number_id,
@@ -1500,31 +1586,68 @@ class WhatsAppAdapter:
 
     async def _graph_api_request(self, path: str, body: Any) -> Any:
         """Make a request to the Meta Graph API."""
-        session = await self._get_http_session()
-        async with session.post(
+        return await self._graph_fetch_json(
+            "POST",
             f"{self._graph_api_url}{path}",
             headers={
                 "Authorization": f"Bearer {self._access_token}",
                 "Content-Type": "application/json",
             },
-            json=body,
-        ) as response:
-            if response.status != 200:
-                error_body = await response.text()
-                self._logger.error(
-                    "WhatsApp API error",
-                    {
-                        "status": response.status,
-                        "body": error_body,
-                        "path": path,
-                    },
-                )
-                raise AdapterError(
-                    f"WhatsApp API error: {response.status} {error_body}",
-                    "whatsapp",
-                )
+            json_body=body,
+            label="WhatsApp API error",
+            context={"path": path},
+        )
 
-            return await response.json()
+    async def _graph_fetch_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        label: str,
+        context: dict[str, Any],
+        headers: dict[str, str],
+        json_body: Any = None,
+        data: Any = None,
+    ) -> Any:
+        """Fetch a Graph API endpoint and parse its JSON body.
+
+        Transport failures and unparseable bodies become ``NetworkError``; a
+        non-2xx response becomes a ``WhatsAppApiError`` carrying Meta's error
+        envelope. ``label`` prefixes the error message and log line, and
+        ``context`` is attached to the log line.
+        """
+        import aiohttp
+
+        session = await self._get_http_session()
+        kwargs: dict[str, Any] = {"headers": headers}
+        if json_body is not None:
+            kwargs["json"] = json_body
+        if data is not None:
+            kwargs["data"] = data
+        try:
+            async with session.request(method, url, **kwargs) as response:
+                status: int = response.status
+                # Decode as UTF-8 like WHATWG ``Response.text()``; aiohttp's
+                # ``text()`` would guess the charset instead.
+                body_text = (await response.read()).decode("utf-8", errors="replace")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            # A failure while reading the body is wrapped too (upstream only
+            # wraps ``fetch()``), so no raw aiohttp error escapes.
+            self._logger.error(label, {**context, "error": str(error)})
+            raise NetworkError("whatsapp", f"{label}: request failed", error) from error
+
+        if not 200 <= status < 300:
+            self._logger.error(label, {"status": status, "body": body_text, **context})
+            raise WhatsAppApiError(label, status, body_text)
+
+        try:
+            # Parse the text rather than ``response.json()``: aiohttp rejects
+            # non-``application/json`` content types (Graph can answer with
+            # ``text/javascript``), while WHATWG ``Response.json()`` does not.
+            return json.loads(body_text)
+        except ValueError as error:
+            self._logger.error(label, {"status": status, **context, "error": str(error)})
+            raise NetworkError("whatsapp", f"{label}: response was not valid JSON", error) from error
 
     def _resolve_emoji(self, emoji: EmojiValue | str) -> str:
         """Resolve an emoji value to a unicode string."""

@@ -502,9 +502,10 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
   `TestBusinessScopedUserIdsMalformedPayloads`.
 - **Casing:** upstream's `WhatsAppRawMessage.userId` is `user_id` here,
   matching the existing snake_case raw key `phone_number_id`.
-- **Not yet ported here:** the `recipient()` calls in upstream `sendTemplate`
-  (#237), media sends (#238) and `reply` (#239), because those send paths do
-  not exist in the Python adapter yet. `mark_as_read` and typing indicators
+- **Not yet ported here:** the `recipient()` calls in upstream media sends
+  (#238) and `reply` (#239), because those send paths do not exist in the
+  Python adapter yet. `send_template` (#237) resolves its recipient the same
+  way `post_message` does. `mark_as_read` and typing indicators
   address a `message_id` only, so they need no recipient.
 - **Known limitations kept at parity** (upstream behaves the same at
   chat@4.41.1; revisit if upstream changes them):
@@ -536,6 +537,57 @@ Regression coverage: `tests/test_whatsapp_webhook.py`
 (`TestHandleWebhookBusinessScopedUserIds`, `TestParseMessageBusinessScopedUserIds`,
 `TestPostMessageBusinessScopedRecipients`, `TestBusinessScopedUserIdsPythonSpecific`,
 `TestBusinessScopedUserIdsMalformedPayloads`, `TestBusinessScopedUserIdsIdentityInvariants`).
+
+### WhatsApp templates and typed Graph API errors (chat@4.34–4.40, #237)
+
+Ports upstream `2338a665` (vercel/chat#588, chat@4.34.0; `sendTemplate`, with
+the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
+(vercel/chat#896, chat@4.40.0; `errors.ts`, `graphFetchJson`).
+
+- **`send_template(thread_id, template)`** posts `type: "template"` with
+  `template: {name, language: {code}, components?}`. `components` is sent only
+  when non-empty (`if template.get("components")`, like `components?.length`).
+  Emoji placeholders are converted only in `type == "text"` parameters of
+  every component; payloads, URLs and media references stay literal. New dicts
+  are built, so the caller's template is not mutated. The template TypedDicts
+  (`WhatsAppTemplateMessage`, `WhatsAppTemplateComponent`,
+  `WhatsAppTemplateParameter`, `WhatsAppTemplateButtonParameter`) are
+  snake_case wire shapes, as upstream's are.
+- **`WhatsAppApiError(message, status, body)`** subclasses
+  `AdapterError(message, "whatsapp", code)`, so existing `except AdapterError`
+  handlers still catch it. **Casing:** upstream's camelCase fields
+  `errorCode`, `providerMessage`, `traceId` are `error_code`,
+  `provider_message`, `trace_id` here; `status`, `type`, `details`, `subcode`
+  and `raw` keep their names. The message is `"{label}: {status}
+  {error.message ?? body}"` (a body without a Meta message is cut to 500
+  characters plus `…`; `raw` keeps it whole). `code` maps onto the shared
+  taxonomy exactly as upstream `taxonomyCode` does.
+- **`_integer` and JS numbers:** `bool` is rejected (it subclasses `int`;
+  JSON `true` is not a JS number). An integral float such as JSON `4.0` or
+  `1e3` is accepted as an `int`, because `JSON.parse` yields the JS number `4`
+  and `Number.isInteger(4)` holds. Numeric strings must fully match ASCII
+  `-?[0-9]+` (JS `\d` has no Unicode digits, and `$` does not match before a
+  trailing newline). `NaN` / `Infinity` bodies stay text in `raw`, as
+  `JSON.parse` rejects them.
+- **`_graph_fetch_json`** (upstream `graphFetchJson`) backs `_graph_api_request`
+  (label `"WhatsApp API error"`) and the `download_media` metadata GET (label
+  `"Failed to get media URL"`, which used to raise `RuntimeError`). The
+  multipart upload call site lands with #238; the binary download step moves
+  to the shared downloader in #239.
+  - **Status range:** success is any 2xx, like `response.ok`. The old port
+    accepted only 200, so a 201/204 used to raise.
+  - The body is read as bytes, decoded as UTF-8 with replacement (WHATWG
+    `Response.text()`), and parsed with `json.loads`. aiohttp's
+    `response.json()` would reject a non-`application/json` content type and
+    `text()` would sniff the charset; `fetch` does neither.
+  - **Python-specific:** a transport failure while reading the body
+    (`aiohttp.ClientPayloadError`, a timeout) is also wrapped as
+    `NetworkError("{label}: request failed")`. Upstream wraps only the
+    `fetch()` call, so a body-read failure there escapes as a raw `TypeError`.
+
+Regression coverage: `tests/test_whatsapp_errors.py`,
+`tests/test_whatsapp_api.py` (`TestSendTemplate`, `TestGraphApiErrors`,
+`TestGraphFetchJsonPythonSpecific`).
 
 ### Postgres state: expired claims and migration-owned schemas (chat@4.35–4.41, #240)
 
