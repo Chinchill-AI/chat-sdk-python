@@ -5,6 +5,8 @@ Tests for markdown parsing, AST building, and format conversion utilities.
 
 from __future__ import annotations
 
+import re
+
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -101,6 +103,9 @@ def _is_table_row_node(node: Content) -> bool:
 
 def _is_table_cell_node(node: Content) -> bool:
     return node.get("type") == "tableCell"
+
+
+BOT_MENTION_WITH_WHITESPACE_REGEX = re.compile(r"@test-bot\s+hi there")
 
 
 def _markdown_to_plain_text(md: str) -> str:
@@ -584,10 +589,64 @@ class TestToPlainText:
         result = ast_to_plain_text(ast)
         assert result == "link text"
 
+    def test_preserves_soft_line_breaks_as_whitespace(self):
+        ast = parse_markdown("@test-bot\nhi there")
+        result = ast_to_plain_text(ast)
+        assert result == "@test-bot\nhi there"
+
+    def test_preserves_paragraph_boundaries_as_whitespace(self):
+        ast = parse_markdown("@test-bot\n\nhi there")
+        result = ast_to_plain_text(ast)
+        assert result == "@test-bot\n\nhi there"
+
+    def test_separates_list_items_with_whitespace(self):
+        ast = parse_markdown("- one\n- two")
+        result = ast_to_plain_text(ast)
+        assert result == "one\ntwo"
+
+    def test_separates_table_cells_and_rows_with_structural_whitespace(self):
+        ast = parse_markdown("| Name | Role |\n| --- | --- |\n| **Ada** Lovelace | Engineer |")
+        result = ast_to_plain_text(ast)
+        assert result == "Name\tRole\nAda Lovelace\tEngineer"
+
+    def test_keeps_empty_table_cells_so_columns_stay_aligned(self):
+        ast = parse_markdown("| Name | Middle | Units |\n| --- | --- | --- |\n| Samsung |  | 3 |")
+        result = ast_to_plain_text(ast)
+        assert result == "Name\tMiddle\tUnits\nSamsung\t\t3"
+
+    def test_drops_table_rows_with_no_content(self):
+        ast = parse_markdown("|  |  |\n| --- | --- |\n| Samsung | 3 |")
+        result = ast_to_plain_text(ast)
+        assert result == "Samsung\t3"
+
     def test_toplaintext_handles_empty_ast(self):
         ast = make_root([])
         result = ast_to_plain_text(ast)
         assert result == ""
+
+    # --- Python-specific structural-whitespace sweeps (issue #193) ---
+
+    def test_list_item_with_multiple_paragraphs_uses_newlines(self):
+        # Previously joined list-item blocks with a space ("a b\nc").
+        assert ast_to_plain_text(parse_markdown("- a\n\n  b\n- c")) == "a\nb\nc"
+
+    def test_blockquote_children_are_newline_separated(self):
+        assert ast_to_plain_text(parse_markdown("a\n\n> q1\n>\n> q2")) == "a\n\nq1\nq2"
+
+    def test_thematic_break_does_not_add_an_extra_blank_line(self):
+        assert ast_to_plain_text(parse_markdown("a\n\n---\n\nb")) == "a\n\nb"
+
+    def test_image_alt_and_hard_break(self):
+        assert ast_to_plain_text(parse_markdown("![logo](https://x.test/a.png) x  \ny")) == "logo x\ny"
+
+    def test_table_row_emptiness_uses_js_trim_whitespace(self):
+        # JS ``trim()`` strips U+FEFF but keeps U+001C; Python ``strip()`` is
+        # the other way round.
+        def row(value: str) -> Content:
+            return {"type": "tableRow", "children": [{"type": "tableCell", "children": [make_text(value)]}]}
+
+        table: Content = {"type": "table", "children": [row("\ufeff"), row("\x1c"), row("a")]}
+        assert ast_to_plain_text(table) == "\x1c\na"
 
 
 # ============================================================================
@@ -604,8 +663,15 @@ class TestMarkdownToPlainText:
 
     def test_handles_complex_markdown(self):
         result = _markdown_to_plain_text("# Heading\n\nParagraph with `code`.")
-        assert "Heading" in result
-        assert "Paragraph with code" in result
+        assert result == "Heading\n\nParagraph with code."
+
+    def test_preserves_whitespace_after_a_newline_separated_mention(self):
+        result = _markdown_to_plain_text("@test-bot\nhi there")
+        assert BOT_MENTION_WITH_WHITESPACE_REGEX.search(result) is not None
+
+    def test_preserves_whitespace_after_a_paragraph_separated_mention(self):
+        result = _markdown_to_plain_text("@test-bot\n\nhi there")
+        assert BOT_MENTION_WITH_WHITESPACE_REGEX.search(result) is not None
 
 
 # ============================================================================
@@ -1116,6 +1182,13 @@ class TestTableToAscii:
     def test_handles_empty_table(self):
         table = {"type": "table", "children": []}
         assert table_to_ascii(table) == ""
+
+    def test_cell_text_is_unaffected_by_table_plain_text_separators(self):
+        # table_to_ascii reads each cell through ast_to_plain_text; the
+        # tab/newline table separators from #193 must not leak into cells.
+        md = "| **Ada** Lovelace | Middle |\n|---|---|\n| x |  |\n| `c` | [l](https://e.x) |"
+        table = parse_markdown(md)["children"][0]
+        assert table_to_ascii(table) == "Ada Lovelace | Middle\n-------------|-------\nx            |\nc            | l"
 
 
 class TestTableElementToAscii:

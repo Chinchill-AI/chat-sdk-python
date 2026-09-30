@@ -385,6 +385,55 @@ class TestMentionHandling:
         assert len(calls) == 1
         assert calls[0] == "msg-1"
 
+    # TS: "should call onNewMention for newline-separated GitHub bot mentions"
+    async def test_should_call_onnewmention_for_newline_separated_github_bot_mentions(self):
+        github = create_mock_adapter("github")
+        github.user_name = "test-bot"
+        chat = Chat(
+            ChatConfig(
+                user_name="fallback-bot",
+                adapters={"github": github},
+                state=create_mock_state(),
+                logger=MockLogger(),
+            )
+        )
+        await chat.webhooks["github"]("request")
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        msg = create_test_message("msg-1", "@test-bot\nhi there")
+        await chat.handle_incoming_message(github, "github:acme/app:42", msg)
+
+        assert len(received) == 1
+        assert received[0].is_mention is True
+
+    # TS: "should not call onNewMention for concatenated GitHub bot mention text"
+    async def test_should_not_call_onnewmention_for_concatenated_github_bot_mention_text(self):
+        github = create_mock_adapter("github")
+        github.user_name = "test-bot"
+        chat = Chat(
+            ChatConfig(
+                user_name="fallback-bot",
+                adapters={"github": github},
+                state=create_mock_state(),
+                logger=MockLogger(),
+            )
+        )
+        await chat.webhooks["github"]("request")
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        msg = create_test_message("msg-1", "@test-bothi there")
+        await chat.handle_incoming_message(github, "github:acme/app:42", msg)
+
+        assert received == []
+
     # TS: "should call onSubscribedMessage handler for subscribed threads"
     async def test_should_call_onsubscribedmessage_handler_for_subscribed_threads(self):
         chat, adapter, state = await _init_chat()
