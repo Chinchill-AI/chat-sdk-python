@@ -95,8 +95,9 @@ from chat_sdk.types import (
 # SSRF / credential-exfiltration guard for authenticated media downloads.
 # Twilio media lives on api.twilio.com (redirecting to the Twilio CDN);
 # Basic auth must never be forwarded to an arbitrary host rehydrated from
-# persisted state. Divergence from upstream — see docs/UPSTREAM_SYNC.md
-# (`rehydrate_attachment` URL allowlist rows; upstream fetches blindly).
+# persisted state. Python-only layer kept in front of upstream's exact-origin
+# check in ``fetch_twilio_media`` (vercel/chat#831) as defence in depth — see
+# docs/UPSTREAM_SYNC.md (`rehydrate_attachment` URL allowlist rows).
 _TRUSTED_MEDIA_HOSTS = frozenset({"twilio.com", "api.twilio.com"})
 _TRUSTED_MEDIA_HOST_SUFFIXES = (".twilio.com", ".twiliocdn.com")
 

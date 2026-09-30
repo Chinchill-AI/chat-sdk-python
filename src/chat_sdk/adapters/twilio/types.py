@@ -131,8 +131,9 @@ class TwilioAdapterConfig:
     # TWILIO_ACCOUNT_SID at API-call time.
     account_sid: TwilioCredential | None = None
     # Override the REST API base URL (default https://api.twilio.com). Also the
-    # trusted origin for authenticated media downloads: rehydrated media URLs
-    # on any other origin are refused before credentials are resolved.
+    # trusted origin for authenticated media downloads: media URLs (fresh
+    # webhook MediaUrlN and rehydrated attachments alike) on any other origin
+    # are refused before credentials are resolved.
     api_url: str | None = None
     # Auth token credential (string or resolver). Lazy env fallback:
     # TWILIO_AUTH_TOKEN at API-call time. Also the webhook signing key.
