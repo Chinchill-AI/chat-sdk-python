@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+- **Twilio: per-conversation locks and channels** (#235; **security**, **breaking (Twilio)**). Ports upstream `28bc7768` (vercel/chat#849, chat@4.39.0) and the Twilio part of `b7c9316b` (vercel/chat#875, chat@4.40.0). The adapter's `lock_scope` is now `"thread"`, and `twilio_channel_id` / `channel_id_from_thread_id` / `fetch_thread().channel_id` return the full `twilio:{sender}:{recipient}` thread id instead of the shared bot-side `twilio:{sender}`. Different recipients texting the same bot number no longer share a lock (previously they serialized behind each other, and under the default `drop` strategy the later one raised `LockError`), channel history or channel state.
+  - **Consumer-visible:** Twilio `channel_id` (and `thread.channel.id`) now equals the thread id. Channel-scoped state and channel-history keys written under the old `twilio:{sender}` id are no longer read. Thread ids and thread history are unchanged; `channel_name` is still the sender number.
+- **Twilio: authenticated media downloads restricted to the configured API origin** (#235; **security**). Ports upstream `d8103a10` (vercel/chat#831, chat@4.38.1). `fetch_twilio_media` gains keyword-only `api_url` / `api_base_url` and raises `TwilioApiError("Twilio media URL must match the configured Twilio API origin", status=0)` for any URL whose scheme, host or effective port differs from `api_url` → `api_base_url` → `https://api.twilio.com`. The check runs before credentials are resolved or a request is made. The adapter passes its `api_url`, so a configured regional API origin constrains rehydrated media; the existing Python-only Twilio host allowlist stays in front as defence in depth (documented in `docs/UPSTREAM_SYNC.md`).
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.

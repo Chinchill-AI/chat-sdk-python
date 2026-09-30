@@ -129,7 +129,11 @@ class TwilioAdapter:
         resolved = config if config is not None else TwilioAdapterConfig()
 
         self._name = "twilio"
-        self._lock_scope: LockScope = "channel"
+        # Thread-scoped: each (sender, recipient) conversation gets its own
+        # lock, so recipients texting the same bot number never serialize
+        # behind (or, under ``drop``, get dropped by) each other. Mirrors
+        # upstream vercel/chat#849 (chat@4.39.0).
+        self._lock_scope: LockScope = "thread"
         self._persist_thread_history = True
 
         self._account_sid: TwilioCredential | None = resolved.account_sid
@@ -436,7 +440,7 @@ class TwilioAdapter:
         return thread_id.startswith("twilio:")
 
     def channel_id_from_thread_id(self, thread_id: str) -> str:
-        """Channel = the bot-side sender address."""
+        """Channel = the full DM thread ID (one channel per conversation)."""
         return twilio_channel_id(thread_id)
 
     def encode_thread_id(self, platform_data: TwilioThreadId) -> str:
@@ -486,6 +490,10 @@ class TwilioAdapter:
         """
 
         async def _download() -> bytes:
+            # Two layers: this Python-only host allowlist runs first, then
+            # ``fetch_twilio_media`` enforces upstream's exact-origin check
+            # against ``api_url`` (vercel/chat#831) before resolving
+            # credentials. Both must pass for Basic auth to be sent.
             if not _is_trusted_twilio_media_url(url):
                 # Divergence from upstream — see docs/UPSTREAM_SYNC.md
                 # (SSRF guard: never forward Basic auth off-platform).
@@ -495,6 +503,7 @@ class TwilioAdapter:
                 )
             return await fetch_twilio_media(
                 url,
+                api_url=self._api_url,
                 credentials=self._credentials(),
                 http_request=self._http_request(),
             )

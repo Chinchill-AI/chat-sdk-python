@@ -39,6 +39,16 @@ def decode_twilio_thread_id(thread_id: str) -> TwilioThreadId:
 
 
 def twilio_channel_id(thread_id: str) -> str:
-    """Channel ID for a thread: ``twilio:{encodeURIComponent(sender)}``."""
-    thread = decode_twilio_thread_id(thread_id)
-    return f"twilio:{encode_uri_component(thread.sender)}"
+    """Channel ID for a thread: the full DM thread ID, unchanged.
+
+    Every Twilio conversation is a 1:1 DM between the bot-side sender and
+    one recipient, so the channel is the conversation itself. Deriving it
+    from the sender alone (pre-4.40 behavior) made every recipient texting
+    the same bot number share one channel's history and state. Mirrors
+    upstream ``twilioChannelId`` (vercel/chat#875, chat@4.40.0).
+
+    Raises :class:`ValidationError` for malformed thread IDs (the decode is
+    kept for its validation side effect).
+    """
+    decode_twilio_thread_id(thread_id)
+    return thread_id

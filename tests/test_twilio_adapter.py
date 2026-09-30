@@ -15,6 +15,7 @@ mocks here speak that shape.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,14 +24,17 @@ from urllib.parse import parse_qsl, urlencode
 
 import pytest
 
+from chat_sdk import Chat
 from chat_sdk.adapters.twilio import (
     TwilioAdapter,
     TwilioMessageResource,
     create_twilio_adapter,
 )
+from chat_sdk.adapters.twilio.api import TwilioApiError
 from chat_sdk.adapters.twilio.types import TwilioHttpResponse, TwilioThreadId
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.mock_adapter import create_mock_state, create_test_message, mock_logger
 from chat_sdk.types import Attachment, Author, FetchOptions, Message, PostableMarkdown
 
 BASIC_AUTH = "Basic QUMxMjM6dG9rZW4="  # base64("AC123:token")
@@ -93,7 +97,70 @@ class TestThreadIds:
 
         assert thread_id == "twilio:whatsapp%3A%2B15550000001:whatsapp%3A%2B15550000002"
         assert adapter.decode_thread_id(thread_id) == thread
-        assert adapter.channel_id_from_thread_id(thread_id) == "twilio:whatsapp%3A%2B15550000001"
+
+    def test_uses_the_full_dm_thread_id_as_its_channel_id(self):
+        adapter = create_twilio_adapter()
+        assert (
+            adapter.channel_id_from_thread_id("twilio:whatsapp%3A%2B15550000001:whatsapp%3A%2B15550000002")
+            == "twilio:whatsapp%3A%2B15550000001:whatsapp%3A%2B15550000002"
+        )
+
+    def test_channel_id_rejects_malformed_thread_ids(self):
+        adapter = create_twilio_adapter()
+        with pytest.raises(ValidationError, match="Invalid Twilio thread ID"):
+            adapter.channel_id_from_thread_id("twilio:%2B15550000001")
+
+    @pytest.mark.asyncio
+    async def test_isolates_concurrent_recipients_with_thread_scoped_locks(self):
+        state = create_mock_state()
+        adapter = create_twilio_adapter()
+        chat = Chat(adapters={"twilio": adapter}, logger=mock_logger, state=state, user_name="bot")
+        first = "twilio:%2B15550000001:%2B15550000002"
+        second = "twilio:%2B15550000001:%2B15550000003"
+        hold = asyncio.Event()
+        started = asyncio.Event()
+        handled: list[str] = []
+
+        async def handler(_thread: Any, message: Message, _channel: Any, _context: Any = None) -> None:
+            handled.append(message.id)
+            if message.id == "SM1":
+                started.set()
+                await hold.wait()
+
+        chat.on_direct_message(handler)
+
+        task = asyncio.ensure_future(
+            chat.handle_incoming_message(adapter, first, create_test_message("SM1", "first", thread_id=first))
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        try:
+            # Completes while SM1's handler is still parked on ``hold``: the
+            # second recipient neither waits on nor is dropped by the first.
+            assert (
+                await chat.handle_incoming_message(
+                    adapter, second, create_test_message("SM2", "second", thread_id=second)
+                )
+                is None
+            )
+            assert task.done() is False
+            assert handled == ["SM1", "SM2"]
+        finally:
+            hold.set()
+            await task
+
+        assert adapter.channel_id_from_thread_id(first) == first
+        assert adapter.channel_id_from_thread_id(second) == second
+        assert adapter.channel_id_from_thread_id(first) != adapter.channel_id_from_thread_id(second)
+        lock_keys = [key for key, _ttl in state._acquire_lock_calls]
+        assert first in lock_keys
+        assert second in lock_keys
+        assert handled == ["SM1", "SM2"]
+        # Python-specific: persisted history stays per conversation, with no
+        # shared per-bot-number channel list.
+        assert [entry["id"] for entry in state.cache[f"msg-history:{first}"]] == ["SM1"]
+        assert [entry["id"] for entry in state.cache[f"msg-history:{second}"]] == ["SM2"]
+        assert "msg-history:twilio:%2B15550000001" not in state.cache
 
     def test_is_dm_is_true_for_twilio_thread_ids(self):
         adapter = create_twilio_adapter()
@@ -198,20 +265,62 @@ class TestRehydrateAttachment:
         assert adapter.rehydrate_attachment(original) is original
 
     @pytest.mark.asyncio
-    async def test_media_downloader_refuses_untrusted_hosts(self):
-        # Divergence from upstream: the SSRF guard fails closed rather than
-        # forwarding Basic auth to an arbitrary host rehydrated from state.
+    @pytest.mark.parametrize(
+        ("media_url", "error", "match"),
+        [
+            # Non-Twilio host: the Python-only suffix allowlist (a documented
+            # divergence kept as defence in depth) fails closed first.
+            ("https://attacker.example/media/photo", ValidationError, "untrusted URL"),
+            # Twilio-owned hosts that pass the suffix allowlist but are not the
+            # configured API origin: upstream's origin check (#831) rejects them.
+            ("https://media.twiliocdn.com/media/photo", TwilioApiError, "configured Twilio API origin"),
+            ("https://api.twilio.com:444/media/photo", TwilioApiError, "configured Twilio API origin"),
+        ],
+    )
+    async def test_rejects_rehydrated_media_from_an_untrusted_origin(
+        self, media_url: str, error: type[Exception], match: str
+    ):
         http = _mock_http("photo")
         adapter = create_twilio_adapter(account_sid="AC123", auth_token="token", http_request=http)
 
         attachment = adapter.rehydrate_attachment(
-            Attachment(type="image", fetch_metadata={"twilioMediaUrl": "https://evil.example/steal"})
+            Attachment(type="image", fetch_metadata={"twilioMediaUrl": media_url})
         )
 
         assert attachment.fetch_data is not None
-        with pytest.raises(ValidationError, match="untrusted URL"):
+        with pytest.raises(error, match=match):
             await attachment.fetch_data()
         http.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_media_is_constrained_to_the_configured_api_url(self):
+        # The adapter passes its ``api_url`` to the primitive, so a regional
+        # API origin is accepted and the default ``api.twilio.com`` is not.
+        http = _mock_http("photo")
+        adapter = create_twilio_adapter(
+            account_sid="AC123",
+            api_url="https://api.dublin.ie1.twilio.com",
+            auth_token="token",
+            http_request=http,
+        )
+
+        regional = adapter.rehydrate_attachment(
+            Attachment(
+                type="image",
+                fetch_metadata={"twilioMediaUrl": "https://api.dublin.ie1.twilio.com/2010-04-01/media/photo"},
+            )
+        )
+        default = adapter.rehydrate_attachment(
+            Attachment(type="image", fetch_metadata={"twilioMediaUrl": "https://api.twilio.com/2010-04-01/media/photo"})
+        )
+
+        assert regional.fetch_data is not None
+        assert default.fetch_data is not None
+        assert await regional.fetch_data() == b"photo"
+        assert http.await_args.args[1] == "https://api.dublin.ie1.twilio.com/2010-04-01/media/photo"
+        with pytest.raises(TwilioApiError, match="configured Twilio API origin"):
+            await default.fetch_data()
+        assert http.await_count == 1
 
 
 class TestPostMessage:
@@ -429,7 +538,7 @@ class TestAdapterProperties:
     def test_exposes_twilio_adapter_metadata(self):
         adapter = create_twilio_adapter()
         assert adapter.name == "twilio"
-        assert adapter.lock_scope == "channel"
+        assert adapter.lock_scope == "thread"
         assert adapter.persist_thread_history is True
         assert adapter.user_name == "bot"
         assert adapter.bot_user_id is None
@@ -593,7 +702,7 @@ class TestFetchThreadAndUser:
         adapter = create_twilio_adapter()
         info = await adapter.fetch_thread("twilio:%2B15550000001:%2B15550000002")
         assert info.is_dm is True
-        assert info.channel_id == "twilio:%2B15550000001"
+        assert info.channel_id == "twilio:%2B15550000001:%2B15550000002"
         assert info.channel_name == "+15550000001"
         assert info.metadata == {"recipient": "+15550000002", "sender": "+15550000001"}
 
