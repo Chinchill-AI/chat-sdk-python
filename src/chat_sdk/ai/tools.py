@@ -1037,7 +1037,10 @@ def get_user(chat: ChatBinding, needs_approval: bool = True) -> ChatTool:
 def _resolve_approval(tool_name: str, config: ApprovalConfig) -> bool:
     if isinstance(config, bool):
         return config
-    return config.get(tool_name, True)
+    # Upstream ``config[toolName] ?? true``: an explicit ``None`` (e.g. a map
+    # loaded from JSON/YAML) still requires approval, never ungates the tool.
+    value = config.get(tool_name)
+    return value if value is not None else True
 
 
 def _resolve_preset_tools(preset: ChatToolPreset | list[ChatToolPreset]) -> set[str]:

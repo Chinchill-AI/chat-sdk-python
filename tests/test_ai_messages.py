@@ -292,6 +292,26 @@ class TestLinkPreviews:
         )
 
     @pytest.mark.asyncio
+    async def test_link_url_description_and_site_bounds_and_url_is_not_escaped(self):
+        # Python-specific: pins every fence bound (url 2048, description 1000,
+        # site 100) and that the URL is whitespace-normalized but not escaped.
+        url = "  https://example.com/?a=1&b=<x>" + "u" * 3000
+        messages = [
+            create_test_message(
+                "1",
+                "Check this",
+                links=[LinkPreview(url=url, description="d" * 1500, site_name="s" * 150)],
+            ),
+        ]
+        result = await to_ai_messages(messages)
+        lines = str(result[0]["content"]).split("\n")
+        url_line = lines[lines.index("Links:") + 1]
+        assert url_line == url.strip()[:2048]
+        assert url_line.startswith("https://example.com/?a=1&b=<x>")
+        assert "Description: " + "d" * 1000 in lines
+        assert "Site: " + "s" * 100 in lines
+
+    @pytest.mark.asyncio
     async def test_link_metadata_bounds_count_code_points_not_utf16_units(self):
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md: JS ``slice``
         # would keep 150 of these astral characters (300 UTF-16 units) and

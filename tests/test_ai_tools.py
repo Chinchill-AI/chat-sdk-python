@@ -227,6 +227,17 @@ class TestRequireApproval:
         assert tools["editMessage"].needs_approval is True
         assert tools["unsubscribeThread"].needs_approval is True
 
+    async def test_explicit_none_approval_override_still_requires_approval(self, harness: _Harness):
+        # Python-specific: upstream ``config[toolName] ?? true`` treats null as
+        # unset, so a ``None`` entry (e.g. from JSON/YAML config) must not
+        # ungate a tool -- ``None`` is the "no gate" value on ChatTool.
+        tools = create_chat_tools(
+            chat=harness.chat,
+            require_approval={"getUser": None, "postMessage": None},  # type: ignore[dict-item]
+        )
+        assert tools["getUser"].needs_approval is True
+        assert tools["postMessage"].needs_approval is True
+
 
 # ---------------------------------------------------------------------------
 # Override semantics
@@ -1190,6 +1201,12 @@ class TestScopeOptOutAndContext:
         # Opting out is deliberate, so it does not warn.
         assert logger.warn.calls == []
 
+    async def test_strict_thread_scope_allows_the_scoped_thread_itself(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD, strict_scope=True)
+        await tools["fetchMessages"].execute({"threadId": _CALLER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+
     async def test_create_chat_tools_options_carries_scope_fields(self, harness: _Harness):
         opts = ChatToolsOptions(chat=harness.chat)
         assert opts.scope is None
@@ -1284,7 +1301,11 @@ class TestScopeOptOutAndContext:
                 ModalSubmitEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb", values={}),
                 "ctx",
             )
-        with patch.object(chat, "_retrieve_modal_context", AsyncMock(return_value={})):
+        with patch.object(
+            chat,
+            "_retrieve_modal_context",
+            AsyncMock(return_value={"related_channel": chat.channel("slack:C6")}),
+        ):
             tasks.clear()
             chat.process_modal_close(
                 ModalCloseEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb"),
@@ -1299,6 +1320,40 @@ class TestScopeOptOutAndContext:
             "assistant_context": "slack:D3:3.3",
             "app_home": "slack:D4",
             "modal_submit": "slack:C5",
-            "modal_close": None,
+            "modal_close": "slack:C6",
         }
+        assert active_conversation() is None
+
+    async def test_modal_handlers_prefer_related_thread_then_run_bare(self, harness: _Harness):
+        # Upstream ``relatedThread?.id ?? relatedChannel?.id`` (chat.ts): the
+        # thread wins when both are present; neither runs the handler bare.
+        chat = harness.chat
+        seen: dict[str, list[str | None]] = {"submit": [], "close": []}
+
+        async def _submit(*_args: Any, **_kwargs: Any) -> None:
+            seen["submit"].append(active_conversation())
+
+        async def _close(*_args: Any, **_kwargs: Any) -> None:
+            seen["close"].append(active_conversation())
+
+        chat.on_modal_submit(_submit)
+        chat.on_modal_close(_close)
+        tasks: list[Any] = []
+        opts = WebhookOptions(wait_until=tasks.append)
+        both = {"related_thread": chat.thread("slack:C5:5.5"), "related_channel": chat.channel("slack:C6")}
+        for context in (both, {}):
+            with patch.object(chat, "_retrieve_modal_context", AsyncMock(return_value=context)):
+                await chat.process_modal_submit(
+                    ModalSubmitEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb", values={}),
+                    "ctx",
+                )
+                tasks.clear()
+                chat.process_modal_close(
+                    ModalCloseEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb"),
+                    "ctx",
+                    opts,
+                )
+                await _drain(tasks)
+
+        assert seen == {"submit": ["slack:C5:5.5", None], "close": ["slack:C5:5.5", None]}
         assert active_conversation() is None
