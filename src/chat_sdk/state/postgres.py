@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Any
 
-from chat_sdk.errors import StateNotConnectedError
+from chat_sdk.errors import StateNotConnectedError, StateSchemaError
 from chat_sdk.types import Lock, QueueEntry
 
 _logger = logging.getLogger(__name__)
@@ -39,72 +39,130 @@ def _now_ms() -> int:
 # Schema DDL
 # ---------------------------------------------------------------------------
 
-_SCHEMA_STATEMENTS: list[str] = [
-    """
-    CREATE TABLE IF NOT EXISTS chat_state_subscriptions (
-        key_prefix text NOT NULL,
-        thread_id text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now(),
-        PRIMARY KEY (key_prefix, thread_id)
+#: Complete adapter schema, in execution order. ``connect()`` runs these with
+#: ``auto_create_schema=True``; migration-owned deployments can run them from
+#: their own tooling. Table and index names are unqualified and resolve
+#: against the connection's ``search_path``. The README's "Migration-owned
+#: schema" SQL block is kept identical by a unit test.
+POSTGRES_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """CREATE TABLE IF NOT EXISTS chat_state_subscriptions (
+    key_prefix text NOT NULL,
+    thread_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_prefix, thread_id)
+  )""",
+    """CREATE TABLE IF NOT EXISTS chat_state_locks (
+    key_prefix text NOT NULL,
+    thread_id text NOT NULL,
+    token text NOT NULL,
+    expires_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_prefix, thread_id)
+  )""",
+    """CREATE TABLE IF NOT EXISTS chat_state_cache (
+    key_prefix text NOT NULL,
+    cache_key text NOT NULL,
+    value text NOT NULL,
+    expires_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_prefix, cache_key)
+  )""",
+    """CREATE INDEX IF NOT EXISTS chat_state_locks_expires_idx
+    ON chat_state_locks (expires_at)""",
+    """CREATE INDEX IF NOT EXISTS chat_state_cache_expires_idx
+    ON chat_state_cache (expires_at)""",
+    """CREATE TABLE IF NOT EXISTS chat_state_lists (
+    key_prefix text NOT NULL,
+    list_key text NOT NULL,
+    seq bigserial NOT NULL,
+    value text NOT NULL,
+    expires_at timestamptz,
+    PRIMARY KEY (key_prefix, list_key, seq)
+  )""",
+    """CREATE INDEX IF NOT EXISTS chat_state_lists_expires_idx
+    ON chat_state_lists (expires_at)""",
+    """CREATE TABLE IF NOT EXISTS chat_state_queues (
+    key_prefix text NOT NULL,
+    thread_id text NOT NULL,
+    seq bigserial NOT NULL,
+    value text NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (key_prefix, thread_id, seq)
+  )""",
+    """CREATE INDEX IF NOT EXISTS chat_state_queues_expires_idx
+    ON chat_state_queues (expires_at)""",
+)
+
+# ---------------------------------------------------------------------------
+# Schema probe (auto_create_schema=False)
+# ---------------------------------------------------------------------------
+
+# Column privileges each table needs, derived from the SQL in this module (the
+# same map as upstream). DELETE is checked per table because every table is
+# deleted from. Subscriptions and queues are never updated: subscribe() uses
+# ON CONFLICT DO NOTHING, which needs INSERT only. Conflict targets, WHERE
+# clauses and RETURNING lists need SELECT on the columns they read.
+_TABLE_PRIVILEGES: dict[str, dict[str, tuple[str, ...]]] = {
+    "chat_state_subscriptions": {
+        "SELECT": ("key_prefix", "thread_id"),
+        "INSERT": ("key_prefix", "thread_id"),
+    },
+    "chat_state_locks": {
+        "SELECT": ("key_prefix", "thread_id", "token", "expires_at"),
+        "INSERT": ("key_prefix", "thread_id", "token", "expires_at"),
+        "UPDATE": ("token", "expires_at", "updated_at"),
+    },
+    "chat_state_cache": {
+        "SELECT": ("key_prefix", "cache_key", "value", "expires_at"),
+        "INSERT": ("key_prefix", "cache_key", "value", "expires_at"),
+        "UPDATE": ("value", "expires_at", "updated_at"),
+    },
+    "chat_state_lists": {
+        "SELECT": ("key_prefix", "list_key", "seq", "value", "expires_at"),
+        "INSERT": ("key_prefix", "list_key", "value", "expires_at"),
+        "UPDATE": ("expires_at",),
+    },
+    "chat_state_queues": {
+        "SELECT": ("key_prefix", "thread_id", "seq", "value", "expires_at"),
+        "INSERT": ("key_prefix", "thread_id", "value", "expires_at"),
+    },
+}
+
+# Tables whose ``seq bigserial`` column draws from a sequence on INSERT.
+_SEQUENCE_TABLES: tuple[str, ...] = ("chat_state_lists", "chat_state_queues")
+
+
+def _table_privilege_check(table: str, privileges: dict[str, tuple[str, ...]]) -> str:
+    checks = [f"has_table_privilege('{table}', 'DELETE')"]
+    for privilege, columns in privileges.items():
+        checks.extend(f"has_column_privilege('{table}', '{column}', '{privilege}')" for column in columns)
+    return " AND ".join(checks)
+
+
+def _sequence_privilege_check(table: str) -> str:
+    # nextval() is allowed by either USAGE or UPDATE on the sequence, and
+    # identity columns skip the sequence permission check entirely.
+    # pg_get_serial_sequence returns NULL (skipped) when seq owns no sequence.
+    return (
+        f"(SELECT attidentity <> '' FROM pg_catalog.pg_attribute "
+        f"WHERE attrelid = '{table}'::regclass AND attname = 'seq')"
+        f" OR has_sequence_privilege(pg_get_serial_sequence('{table}', 'seq'), 'USAGE, UPDATE')"
     )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS chat_state_locks (
-        key_prefix text NOT NULL,
-        thread_id text NOT NULL,
-        token text NOT NULL,
-        expires_at timestamptz NOT NULL,
-        updated_at timestamptz NOT NULL DEFAULT now(),
-        PRIMARY KEY (key_prefix, thread_id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS chat_state_cache (
-        key_prefix text NOT NULL,
-        cache_key text NOT NULL,
-        value text NOT NULL,
-        expires_at timestamptz,
-        updated_at timestamptz NOT NULL DEFAULT now(),
-        PRIMARY KEY (key_prefix, cache_key)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS chat_state_locks_expires_idx
-        ON chat_state_locks (expires_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS chat_state_cache_expires_idx
-        ON chat_state_cache (expires_at)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS chat_state_lists (
-        key_prefix text NOT NULL,
-        list_key text NOT NULL,
-        seq bigserial NOT NULL,
-        value text NOT NULL,
-        expires_at timestamptz,
-        PRIMARY KEY (key_prefix, list_key, seq)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS chat_state_lists_expires_idx
-        ON chat_state_lists (expires_at)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS chat_state_queues (
-        key_prefix text NOT NULL,
-        thread_id text NOT NULL,
-        seq bigserial NOT NULL,
-        value text NOT NULL,
-        expires_at timestamptz NOT NULL,
-        PRIMARY KEY (key_prefix, thread_id, seq)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS chat_state_queues_expires_idx
-        ON chat_state_queues (expires_at)
-    """,
-]
+
+
+# One round trip, no DDL rights needed. A missing table raises (SQLSTATE
+# 42P01); a missing grant yields false. Every interpolated name is a constant
+# above, never caller input.
+_SCHEMA_PROBE = "SELECT " + ",\n  ".join(
+    [f"{_table_privilege_check(table, privs)} AS {table}" for table, privs in _TABLE_PRIVILEGES.items()]
+    + [f"{_sequence_privilege_check(table)} AS {table}_seq" for table in _SEQUENCE_TABLES]
+)
+
+_SCHEMA_ERROR_PREFIX = "PostgreSQL state schema is not ready"
+_SCHEMA_ERROR_HINT = (
+    "Run the adapter migration on this database and search_path, grant the runtime role access, "
+    "or set auto_create_schema=True."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +174,11 @@ class PostgresStateAdapter:
     """PostgreSQL state adapter for production use.
 
     Provides persistent subscriptions and row-level locking.
-    Auto-creates required tables on first ``connect()``.
+    By default creates the required tables and indexes on ``connect()``
+    (:data:`POSTGRES_SCHEMA_STATEMENTS`). With ``auto_create_schema=False``,
+    ``connect()`` runs no DDL: it probes that the migration-owned tables exist
+    and that the current role holds the privileges the adapter uses, and raises
+    :class:`~chat_sdk.errors.StateSchemaError` naming anything missing.
 
     Implements the full :class:`~chat_sdk.types.StateAdapter` protocol.
     """
@@ -127,8 +189,10 @@ class PostgresStateAdapter:
         url: str | None = None,
         pool: Any | None = None,
         key_prefix: str = "chat-sdk",
+        auto_create_schema: bool = True,
     ) -> None:
         self._key_prefix = key_prefix
+        self._auto_create_schema = auto_create_schema
         self._connected = False
         self._connect_lock = asyncio.Lock()
         self._owns_pool = pool is None
@@ -151,6 +215,10 @@ class PostgresStateAdapter:
         if self._connected:
             return
 
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream shares
+        # one in-flight connect promise, so concurrent callers all see the
+        # same failure; here connects are serialized, so a caller queued
+        # behind a failed attempt retries it.
         async with self._connect_lock:
             if self._connected:
                 return
@@ -163,7 +231,10 @@ class PostgresStateAdapter:
 
                 # Verify connectivity
                 await self._pool.fetchval("SELECT 1")
-                await self._ensure_schema()
+                if self._auto_create_schema:
+                    await self._ensure_schema()
+                else:
+                    await self._verify_schema()
                 self._connected = True
             except Exception:
                 _logger.exception("Postgres connect failed")
@@ -336,17 +407,28 @@ class PostgresStateAdapter:
         serialized = json.dumps(value)
         expires_at = _pg_timestamp_from_ms(ttl_ms) if ttl_ms else None
 
-        result = await self._pool.execute(
+        # An expired row is reclaimed in the same statement (upstream #636), so
+        # a stale claim never blocks a new one until get() happens to clean it
+        # up. Permanent rows (expires_at IS NULL) and live rows are never
+        # overwritten. RETURNING yields the key only when this call inserted or
+        # reclaimed the row; a conflict whose WHERE rejects the update returns
+        # no row.
+        claimed = await self._pool.fetchval(
             """INSERT INTO chat_state_cache (key_prefix, cache_key, value, expires_at)
                VALUES ($1, $2, $3, $4)
-               ON CONFLICT (key_prefix, cache_key) DO NOTHING""",
+               ON CONFLICT (key_prefix, cache_key) DO UPDATE
+                 SET value = EXCLUDED.value,
+                     expires_at = EXCLUDED.expires_at,
+                     updated_at = now()
+                 WHERE chat_state_cache.expires_at IS NOT NULL
+                   AND chat_state_cache.expires_at <= now()
+               RETURNING cache_key""",
             self._key_prefix,
             key,
             serialized,
             expires_at,
         )
-        # asyncpg returns "INSERT 0 1" on success, "INSERT 0 0" on conflict
-        return result is not None and result.endswith("1")
+        return claimed is not None
 
     async def delete(self, key: str) -> None:
         self._ensure_connected()
@@ -575,8 +657,27 @@ class PostgresStateAdapter:
 
     async def _ensure_schema(self) -> None:
         """Create required tables and indexes if they do not exist."""
-        for stmt in _SCHEMA_STATEMENTS:
+        for stmt in POSTGRES_SCHEMA_STATEMENTS:
             await self._pool.execute(stmt)
+
+    async def _verify_schema(self) -> None:
+        """Fail fast when a migration-owned schema is missing tables or grants.
+
+        Surfaces a wrong ``search_path`` or a forgotten grant at ``connect()``
+        instead of inside the first message. One read-only query; no DDL.
+        """
+        try:
+            row = await self._pool.fetchrow(_SCHEMA_PROBE)
+        except Exception as err:
+            raise StateSchemaError(f"{_SCHEMA_ERROR_PREFIX}: {err}. {_SCHEMA_ERROR_HINT}") from err
+
+        # NULL (e.g. a seq column that owns no sequence) is skipped, as upstream.
+        missing = [name for name, granted in (dict(row) if row is not None else {}).items() if granted is False]
+        if missing:
+            raise StateSchemaError(
+                f"{_SCHEMA_ERROR_PREFIX}: the current role lacks privileges on {', '.join(missing)}. "
+                f"{_SCHEMA_ERROR_HINT}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -604,10 +705,13 @@ def create_postgres_state(
     url: str | None = None,
     pool: Any | None = None,
     key_prefix: str = "chat-sdk",
+    auto_create_schema: bool = True,
 ) -> PostgresStateAdapter:
     """Create a new PostgreSQL state adapter.
 
     Either provide a ``url`` or an existing asyncpg ``pool``.  If neither is
     given, the ``POSTGRES_URL`` / ``DATABASE_URL`` environment variable is used.
+    Pass ``auto_create_schema=False`` when migrations own the schema (see
+    :data:`POSTGRES_SCHEMA_STATEMENTS`).
     """
-    return PostgresStateAdapter(url=url, pool=pool, key_prefix=key_prefix)
+    return PostgresStateAdapter(url=url, pool=pool, key_prefix=key_prefix, auto_create_schema=auto_create_schema)
