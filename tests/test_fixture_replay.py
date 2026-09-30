@@ -788,11 +788,20 @@ class TestTelegramFixtureReplay:
 
     def _make_adapter(self, fixture: dict[str, Any]) -> TelegramAdapter:
         """Create a TelegramAdapter configured from fixture metadata."""
+        # Matches upstream replay-telegram.test.ts: webhook mode with an
+        # explicit unverified-webhook opt-out (verification is required by
+        # default since chat@4.39, vercel/chat#858).
         config = TelegramAdapterConfig(
             bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-            # No secret_token = skip verification (matches TS behavior)
+            mode="webhook",
+            allow_unverified_webhooks=True,
         )
-        return TelegramAdapter(config)
+        adapter = TelegramAdapter(config)
+        bot_user = fixture.get("botUserId") or 999
+        adapter.telegram_fetch = AsyncMock(  # type: ignore[method-assign]
+            return_value={"id": bot_user, "is_bot": True, "first_name": "Bot", "username": fixture.get("botName")}
+        )
+        return adapter
 
     async def _send_and_assert_message(
         self,
@@ -803,6 +812,8 @@ class TestTelegramFixtureReplay:
         """Send a fixture payload and assert process_message was called."""
         adapter = self._make_adapter(fixture)
         mock_chat = _make_mock_chat()
+        # handle_webhook claims each update_id before dispatch (vercel/chat#799).
+        mock_chat.get_state.return_value.set_if_not_exists = AsyncMock(return_value=True)
         await adapter.initialize(mock_chat)
 
         body = json.dumps(fixture[payload_key])
