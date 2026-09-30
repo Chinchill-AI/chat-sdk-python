@@ -1890,6 +1890,20 @@ class TestTelegramTypingOnReceipt:
         )
         assert adapter._typing_tasks == set()
 
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_pending_typing_so_the_session_is_not_reopened(self):
+        adapter, _chat = _slash_adapter_and_chat()
+        adapter.start_typing = AsyncMock()  # type: ignore[method-assign]
+        adapter.process_update({"update_id": 1, "message": _sample_message()})  # type: ignore[typeddict-item]
+        (typing_task,) = adapter._typing_tasks
+
+        await adapter.disconnect()
+        await asyncio.sleep(0)
+
+        assert typing_task.cancelled()
+        adapter.start_typing.assert_not_awaited()
+        assert adapter._typing_tasks == set()
+
 
 class TestTelegramMentionRegex:
     """Ports of vercel/chat#621 / #706 (mention boundary + caching)."""

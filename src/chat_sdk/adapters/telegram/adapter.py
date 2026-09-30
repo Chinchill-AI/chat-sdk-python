@@ -1192,6 +1192,13 @@ class TelegramAdapter:
     async def disconnect(self) -> None:
         """Disconnect the adapter, stop polling, and close the shared HTTP session."""
         await self.stop_polling()
+        # Python-only: a pending receipt-typing task would otherwise reopen the
+        # shared aiohttp session via ``_get_http_session`` after it is closed.
+        typing_tasks = [task for task in self._typing_tasks if not task.done()]
+        for task in typing_tasks:
+            task.cancel()
+        if typing_tasks:
+            await asyncio.gather(*typing_tasks, return_exceptions=True)
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
             self._http_session = None
