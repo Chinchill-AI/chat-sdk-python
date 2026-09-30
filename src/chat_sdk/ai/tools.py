@@ -1161,6 +1161,9 @@ def create_chat_tools(
 
     # Write tools take the same guard as reads so a thread/channel id the
     # model supplies that resolves outside the scoped conversation is rejected.
+    # Upstream parity (chat@4.41.1 ``ai/tools/messages.ts``/``reactions.ts``):
+    # only the thread id is guarded; which conversation a ``messageId``
+    # belongs to is left to the adapter.
     def _guarded_approval(name: str) -> ToolOptions:
         return ToolOptions(needs_approval=_resolve_approval(name, require_approval), guard=guard)
 

@@ -34,6 +34,14 @@ ReadScope = str | _HasId
 ScopeGuard = Callable[[str], None]
 
 
+# Upstream parity (chat@4.41.1 ``ai/scope.ts`` ``channelOf``): the channel is
+# derived from the id's text via ``adapter.channel_id_from_thread_id``, which
+# may raise for ids it cannot decode (e.g. GitHub for a bare ``github:o/r``
+# channel id, as upstream ``decodeThreadId`` throws). The guard does not ask
+# the platform whether a composite id's parts really belong together (Discord
+# thread-parent checks are #229/#230) and checks the supplied id, not the
+# adapter's effective target (a thread id passed as ``channelId`` is judged as
+# that thread).
 def _channel_of(chat: Chat, id: str) -> str:
     prefix = id.split(":")[0]
     adapter: Any = chat.get_adapter(prefix) if prefix else None

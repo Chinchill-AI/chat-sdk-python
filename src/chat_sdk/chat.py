@@ -1419,6 +1419,10 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         async def _task() -> None:
+            # Upstream parity (chat.ts processAppHomeOpened /
+            # processMemberJoinedChannel): the adapter's event channel id is
+            # used as-is (Slack reports App Home's raw ``D…`` id and
+            # member-joined as ``slack:C…:``, upstream too).
             with conversation(event.channel_id):
                 for h in self._app_home_opened_handlers:
                     await self._invoke_handler(h, event)
