@@ -150,9 +150,12 @@ it can be audited.
 It checks `MAPPING` + `TARGET_MAPPING` at the target SHA and never fails
 on missing tests. It rewrites `scripts/fidelity_target.json` with the tag,
 SHA, totals, and per-file missing `[describe, it]` pairs, extra counts and
-fuzzy pairs, and prints the delta against the committed report. The
+fuzzy pairs, and prints the delta against the report committed at `HEAD`
+(read with `git show`, so re-running before committing still compares
+against the committed baseline, not the previous run's output). The
 committed report is the authoritative wave-wide list. Every wave PR
-regenerates it and quotes the delta in its description.
+regenerates it and quotes the delta in its description, taken before
+the regenerated report is committed.
 
 Infra guardrails:
 

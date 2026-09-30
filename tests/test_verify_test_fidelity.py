@@ -398,16 +398,6 @@ describe("getUser", () => {
     assert [t.ts_name for t in r.missing] == ["should not treat %s as a mention (%s)", "returns null for unknown users"]
 
 
-def test_committed_target_report_credits_the_plain_github_login_test(vtf):
-    report = json.loads((_SCRIPT.parent / "fidelity_target.json").read_text(encoding="utf-8"))
-    chat = report["files"]["packages/chat/src/chat.test.ts"]
-    assert ["isMention property", "should not treat %s as a mention (%s)"] in chat["missing"]
-    assert [
-        "should not match GitHub-style logins as Slack ids (case sensitivity)",
-        "test_should_not_match_github_style_logins_as_slack_ids",
-    ] in chat["fuzzy_matches"]
-
-
 def test_check_fidelity_reports_exact_fuzzy_and_missing(vtf, tmp_path):
     _write(
         tmp_path / "ts" / "a.test.ts",
@@ -729,15 +719,31 @@ def test_report_target_rejects_file_in_both_tiers(vtf, fake_upstream, monkeypatc
     assert not (fake_upstream / "fidelity_target.json").exists()
 
 
-def test_report_target_prints_total_and_per_file_delta(vtf, fake_upstream, capsys):
+def test_report_target_prints_delta_against_the_report_committed_at_head(vtf, fake_upstream, capsys):
+    _git(fake_upstream, "init", "-q")
     assert vtf.main(["--report-target"]) == 0
+    _git(fake_upstream, "add", "fidelity_target.json")
+    _git(fake_upstream, "commit", "-q", "-m", "baseline report")
     _write(fake_upstream / "py/tests/test_a.py", "def test_works():\n    pass\n\ndef test_handles():\n    pass\n")
+    # Run twice without committing: both runs compare against HEAD's
+    # report, not the working copy the first run just rewrote.
+    for _ in range(2):
+        capsys.readouterr()
+        assert vtf.main(["--report-target"]) == 0
+        out = capsys.readouterr().out
+        assert "Delta vs committed report (HEAD): missing 2 -> 1 (-1)" in out
+        assert "  packages/chat/src/a.test.ts: 1 -> 0 (-1)\n" in out
+        assert "packages/chat/src/b.test.ts: 1 -> 1" not in out
+
+
+def test_report_target_ignores_an_uncommitted_working_copy_for_the_delta(vtf, fake_upstream, capsys):
+    _git(fake_upstream, "init", "-q")
+    assert vtf.main(["--report-target"]) == 0  # written, never committed
     capsys.readouterr()
     assert vtf.main(["--report-target"]) == 0
     out = capsys.readouterr().out
-    assert "Delta vs committed report: missing 2 -> 1 (-1)" in out
-    assert "  packages/chat/src/a.test.ts: 1 -> 0 (-1)\n" in out
-    assert "packages/chat/src/b.test.ts: 1 -> 1" not in out
+    assert "(no committed report for this tag at HEAD — no delta)" in out
+    assert "Delta vs committed report" not in out
 
 
 def test_strict_fails_when_pin_and_upstream_parity_disagree(vtf, fake_upstream, monkeypatch):

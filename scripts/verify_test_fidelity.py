@@ -1069,14 +1069,42 @@ def dump_target_report(report: dict) -> str:
     return _TWO_STRING_ARRAY_RE.sub(r"[\1, \2]", text) + "\n"
 
 
+def load_committed_report(path: Path) -> dict | None:
+    """Return the report as committed at ``HEAD`` (not the working copy), or None.
+
+    The delta a wave PR quotes must be measured against the committed
+    baseline: comparing with the working copy would make a second
+    ``--report-target`` run compare against the first run's output and
+    print ``+0``. None when git is unavailable, ``path`` is not in a git
+    work tree, or the file is not committed at ``HEAD``.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path.parent), "show", f"HEAD:./{path.name}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        report = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return report if isinstance(report, dict) else None
+
+
 def print_report_delta(previous: dict | None, report: dict) -> None:
-    """Print the change in missing counts versus a previously committed report."""
+    """Print the change in missing counts versus the report committed at ``HEAD``."""
     if not previous or previous.get("tag") != report["tag"]:
-        print("\n(no previous report for this tag — no delta)")
+        print("\n(no committed report for this tag at HEAD — no delta)")
         return
     prev_total = previous.get("totals", {}).get("missing", 0)
     now_total = report["totals"]["missing"]
-    print(f"\nDelta vs committed report: missing {prev_total} -> {now_total} ({now_total - prev_total:+d})")
+    print(f"\nDelta vs committed report (HEAD): missing {prev_total} -> {now_total} ({now_total - prev_total:+d})")
     prev_files = previous.get("files", {})
     for ts_rel in sorted(set(prev_files) | set(report["files"])):
         before = prev_files.get(ts_rel, {}).get("missing_count", 0)
@@ -1192,12 +1220,7 @@ def run_report_target(pin: dict[str, dict[str, str]]) -> int:
         return 1
 
     report = build_target_report(target, results, absent)
-    previous = None
-    if TARGET_REPORT_PATH.exists():
-        try:
-            previous = json.loads(TARGET_REPORT_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            previous = None
+    previous = load_committed_report(TARGET_REPORT_PATH)
     t = report["totals"]
     print(f"\n{'=' * 70}")
     print(
