@@ -78,7 +78,7 @@ from chat_sdk.adapters.slack.format import markdown_bold_to_slack_mrkdwn
 # JS ``String(number)`` formatting for chart fallback values. ``chat_sdk.cards``
 # is pure data + formatting (stdlib only) and is already loaded by the
 # ``chat_sdk`` package import, so this adds no runtime dependency.
-from chat_sdk.cards import _js_number_to_string
+from chat_sdk.cards import _chart_value_to_json_number, _js_number_to_string
 
 __all__ = [
     "LIMITS",
@@ -536,14 +536,19 @@ def _chart_to_data_visualization(element: SlackChartElement, convert_emoji: _Emo
 
     if chart["type"] == "pie":
         segments = chart["segments"]
+        # JSON-safe values: see ``_chart_value_to_json_number``.
+        values = [_chart_value_to_json_number(segment["value"]) for segment in segments]
         valid_segments = 1 <= len(segments) <= LIMITS.chart_segments and all(
-            _is_valid_chart_label(segment["label"]) and segment["value"] > 0 for segment in segments
+            _is_valid_chart_label(segment["label"]) and value is not None and value > 0
+            for segment, value in zip(segments, values, strict=True)
         )
         if not valid_segments:
             return None
         return {
             "chart": {
-                "segments": [{"label": segment["label"], "value": segment["value"]} for segment in segments],
+                "segments": [
+                    {"label": segment["label"], "value": value} for segment, value in zip(segments, values, strict=True)
+                ],
                 "type": "pie",
             },
             "title": title,
@@ -580,7 +585,10 @@ def _chart_to_data_visualization(element: SlackChartElement, convert_emoji: _Emo
             point = by_label.get(category)
             if point is None:
                 return None
-            data.append({"label": category, "value": point["value"]})
+            value = _chart_value_to_json_number(point["value"])
+            if value is None:
+                return None
+            data.append({"label": category, "value": value})
         normalized_series.append({"data": data, "name": s["name"]})
 
     return {

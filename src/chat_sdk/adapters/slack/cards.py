@@ -25,6 +25,7 @@ from chat_sdk.cards import (
     SectionElement,
     TableElement,
     TextElement,
+    _chart_value_to_json_number,
     card_child_to_fallback_text,
     chart_element_to_fallback_text,
     table_element_to_ascii,
@@ -447,8 +448,11 @@ def _chart_to_data_visualization(element: ChartElement) -> SlackBlock | None:
 
     if chart.get("type") == "pie":
         segments = chart.get("segments", [])
+        # JSON-safe values: see ``_chart_value_to_json_number``.
+        values = [_chart_value_to_json_number(segment["value"]) for segment in segments]
         valid_segments = 1 <= len(segments) <= _CHART_MAX_SEGMENTS and all(
-            _is_valid_chart_label(segment["label"]) and segment["value"] > 0 for segment in segments
+            _is_valid_chart_label(segment["label"]) and value is not None and value > 0
+            for segment, value in zip(segments, values, strict=True)
         )
         if not valid_segments:
             return None
@@ -457,7 +461,9 @@ def _chart_to_data_visualization(element: ChartElement) -> SlackBlock | None:
             "title": title,
             "chart": {
                 "type": "pie",
-                "segments": [{"label": segment["label"], "value": segment["value"]} for segment in segments],
+                "segments": [
+                    {"label": segment["label"], "value": value} for segment, value in zip(segments, values, strict=True)
+                ],
             },
         }
 
@@ -492,7 +498,10 @@ def _chart_to_data_visualization(element: ChartElement) -> SlackBlock | None:
             point = by_label.get(category)
             if point is None:
                 return None
-            data.append({"label": category, "value": point["value"]})
+            value = _chart_value_to_json_number(point["value"])
+            if value is None:
+                return None
+            data.append({"label": category, "value": value})
         normalized_series.append({"name": s["name"], "data": data})
 
     axis_config: dict[str, Any] = {"categories": categories}

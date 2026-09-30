@@ -9,9 +9,13 @@ port convention; emitted Block Kit dicts keep Slack's API field names.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from decimal import Decimal
 from typing import Any
+
+import pytest
 
 from chat_sdk.adapters.slack.blocks import (
     LIMITS,
@@ -785,6 +789,152 @@ class TestSlackBlockKitPrimitives:
         assert view["private_metadata"] == "raw-token"
         # With no prompt/title, the title falls back to the default.
         assert view["title"] == {"text": "Your answer", "type": "plain_text"}
+
+
+def _bar(
+    *,
+    title: str = "Sales",
+    categories: list[str] | None = None,
+    series: list[dict[str, Any]] | None = None,
+    **axis: str,
+) -> dict[str, Any]:
+    cats = categories if categories is not None else ["Mon", "Tue"]
+    return {
+        "chart": {
+            "categories": cats,
+            "series": series if series is not None else [{"data": _pts(cats), "name": "A"}],
+            "type": "bar",
+            **axis,
+        },
+        "title": title,
+        "type": "chart",
+    }
+
+
+def _pts(categories: list[str]) -> list[dict[str, Any]]:
+    return [{"label": c, "value": 1} for c in categories]
+
+
+class TestSlackBlocksChartAndTableLimits:
+    def test_keeps_native_blocks_at_every_chart_and_table_limit(self) -> None:
+        cats = [f"c{i:0>19}" for i in range(20)]
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    _bar(
+                        title="t" * 50,
+                        categories=cats,
+                        series=[{"data": _pts(cats), "name": f"s{i:0>19}"} for i in range(12)],
+                        x_label="x" * 50,
+                        y_label="y" * 50,
+                    ),
+                    {
+                        "chart": {
+                            "segments": [{"label": f"g{i}", "value": 1} for i in range(12)],
+                            "type": "pie",
+                        },
+                        "title": "Pie",
+                        "type": "chart",
+                    },
+                ]
+            )
+        )
+
+        assert [b["type"] for b in blocks] == ["data_visualization", "data_visualization"]
+        assert len(blocks[0]["chart"]["series"]) == 12
+        assert len(blocks[1]["chart"]["segments"]) == 12
+
+    @pytest.mark.parametrize(
+        "chart",
+        [
+            pytest.param(_bar(title="t" * 48 + "{{emoji:x}}"), id="51-char-title-after-emoji"),
+            pytest.param(_bar(categories=[""]), id="empty-category-label"),
+            pytest.param(_bar(categories=["c" * 21]), id="21-char-category-label"),
+            pytest.param(_bar(categories=["Mon", "Mon"]), id="duplicate-category"),
+            pytest.param(_bar(series=[{"data": _pts(["Mon", "Tue"]), "name": "A"}] * 2), id="duplicate-series-name"),
+            pytest.param(
+                _bar(series=[{"data": _pts(["Mon", "Tue"]), "name": f"S{i}"} for i in range(13)]), id="13-series"
+            ),
+            pytest.param(_bar(categories=[f"C{i}" for i in range(21)]), id="21-categories"),
+            pytest.param(_bar(x_label="x" * 51), id="51-char-x-label"),
+            pytest.param(_bar(y_label="y" * 51), id="51-char-y-label"),
+            pytest.param(
+                _bar(categories=["Mon"], series=[{"data": _pts(["Mon", "Tue"]), "name": "A"}]), id="extra-point"
+            ),
+            pytest.param(
+                {
+                    "chart": {"segments": [{"label": f"g{i}", "value": 1} for i in range(13)], "type": "pie"},
+                    "title": "Pie",
+                    "type": "chart",
+                },
+                id="13-segments",
+            ),
+            pytest.param(
+                _bar(categories=["Mon"], series=[{"data": [{"label": "Mon", "value": float("nan")}], "name": "A"}]),
+                id="nan-value",
+            ),
+        ],
+    )
+    def test_renders_a_fenced_text_section_for_a_chart_slack_would_reject(self, chart: dict[str, Any]) -> None:
+        blocks = card_to_slack_blocks(_card([chart]))
+
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"].startswith("```\n")
+
+    def test_validates_the_chart_title_after_emoji_conversion(self) -> None:
+        # ``{{emoji:x}}`` (11 chars) becomes ``:x:`` (3 chars): 47 + 3 = 50 is within the limit.
+        blocks = card_to_slack_blocks(_card([_bar(title="t" * 47 + "{{emoji:x}}")]))
+
+        assert blocks[0]["type"] == "data_visualization"
+        assert blocks[0]["title"] == "t" * 47 + ":x:"
+
+    def test_clamps_page_size_down_to_100_and_defaults_an_empty_caption(self) -> None:
+        blocks = card_to_slack_blocks(
+            _card([{"caption": "", "headers": ["N"], "page_size": 250, "rows": [["1"]], "type": "table"}])
+        )
+
+        assert blocks[0]["caption"] == "Table"
+        assert blocks[0]["page_size"] == 100
+
+    def test_converts_emoji_in_the_table_caption(self) -> None:
+        blocks = card_to_slack_blocks(
+            _card([{"caption": "{{emoji:wave}} Hi", "headers": ["N"], "rows": [["1"]], "type": "table"}])
+        )
+
+        assert blocks[0]["caption"] == ":wave: Hi"
+
+    def test_chart_fallback_text_uses_the_first_point_for_a_repeated_label(self) -> None:
+        text = card_to_slack_fallback_text(
+            _card(
+                [
+                    _bar(
+                        categories=["Mon"],
+                        series=[{"data": [{"label": "Mon", "value": 1}, {"label": "Mon", "value": 2}], "name": "A"}],
+                    )
+                ]
+            )
+        )
+
+        # Upstream ``data.find(...)``: the first matching point wins.
+        assert text == "Sales\n    | A\nMon | 1"
+
+    def test_sends_decimal_chart_values_as_json_numbers(self) -> None:
+        blocks = card_to_slack_blocks(
+            _card(
+                [
+                    {
+                        "chart": {"segments": [{"label": "EU", "value": Decimal("12.50")}], "type": "pie"},
+                        "title": "Pie",
+                        "type": "chart",
+                    },
+                    _bar(categories=["Mon"], series=[{"data": [{"label": "Mon", "value": Decimal("3")}], "name": "A"}]),
+                ]
+            )
+        )
+
+        assert blocks[0]["chart"]["segments"] == [{"label": "EU", "value": 12.5}]
+        assert blocks[1]["chart"]["series"][0]["data"] == [{"label": "Mon", "value": 3.0}]
+        assert json.loads(json.dumps(blocks)) == blocks
 
 
 class TestBlocksImportBoundary:

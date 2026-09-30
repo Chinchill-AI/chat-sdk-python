@@ -682,6 +682,11 @@ Slack half of upstream `4717a384` (chat@4.34.0), `0153a39f` (chat@4.36.0) and
   invalid chart does not use up the two-chart budget. Series points are
   reordered to category order. `slack.blocks` formats fallback values with
   `cards._js_number_to_string` (JS `String(n)`), like the core fallback.
+  Values go into the block through `cards._chart_value_to_json_number`:
+  `Decimal`, `Fraction` and NumPy scalars become `int` / `float` (JS numbers
+  always serialize; these raise `TypeError` in `json.dumps`), and a value that
+  is not a finite number makes the chart fall back to text (upstream would
+  send `null` for `NaN`, which Slack rejects).
 - **Modals.** `DateInput` → `datepicker`: an `initial_value` that is not a
   real `YYYY-MM-DD` date is dropped with a `logging` warning (the module
   logger `chat_sdk.adapters.slack.modals`), since Slack fails the whole
