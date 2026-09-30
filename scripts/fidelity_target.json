@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1036,
     "each_templates": 16,
-    "matched_exact": 678,
-    "matched_fuzzy": 85,
+    "matched_exact": 681,
+    "matched_fuzzy": 82,
     "missing": 273,
-    "extra": 368
+    "extra": 371
   },
   "absent_ts_files": [],
   "files": {
@@ -18,8 +18,8 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 133,
-      "matched_fuzzy": 13,
+      "matched_exact": 134,
+      "matched_fuzzy": 12,
       "missing_count": 31,
       "extra_count": 13,
       "missing": [
@@ -57,7 +57,6 @@
       ],
       "fuzzy_matches": [
         ["should return adapter by name", "test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals"],
-        ["should call onNewMention for newline-separated GitHub bot mentions", "test_should_call_onnewmention_for_newline_separated_github_bot_mentions"],
         ["should use default dedupe TTL of 10 minutes", "test_should_use_default_dedupe_ttl_of_5_minutes"],
         ["should not trigger onNewMention when a bot with a hyphen-suffixed name is mentioned", "test_should_return_none_when_user_is_not_found"],
         ["should not trigger onNewMention when a hyphen-suffixed user ID is mentioned", "test_should_throw_when_adapter_does_not_support_get_user"],
@@ -134,15 +133,13 @@
       "python_exists": true,
       "ts_tests": 130,
       "each_templates": 0,
-      "matched_exact": 123,
-      "matched_fuzzy": 7,
+      "matched_exact": 125,
+      "matched_fuzzy": 5,
       "missing_count": 0,
-      "extra_count": 83,
+      "extra_count": 86,
       "missing": [],
       "fuzzy_matches": [
         ["handles empty AST", "test_fromast_handles_empty_ast"],
-        ["preserves whitespace after a newline-separated mention", "test_preserves_whitespace_after_a_newline_separated_mention"],
-        ["preserves whitespace after a paragraph-separated mention", "test_preserves_whitespace_after_a_paragraph_separated_mention"],
         ["handles empty AST", "test_toplaintext_handles_empty_ast"],
         ["handles empty string", "test_text_handles_empty_string"],
         ["handles empty AST", "test_walkast_handles_empty_ast"],
