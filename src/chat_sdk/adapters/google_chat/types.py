@@ -5,7 +5,7 @@ Python port of TypeScript interfaces from the Google Chat adapter.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
 # =============================================================================
@@ -295,7 +295,12 @@ class GoogleChatAdapterConfig:
     credentials: ServiceAccountCredentials | None = None
     use_application_default_credentials: bool = False
 
-    # HTTP endpoint URL for button click actions
+    # HTTP endpoint URL. Used for button-click action routing on cards AND as
+    # an accepted JWT audience for direct-webhook verification when the Chat
+    # app's "Authentication audience" setting is "HTTP endpoint URL" (always
+    # the case for Workspace Add-on Chat apps). Must match the URL registered
+    # in the Chat API console exactly. Counts as a direct-webhook verifier for
+    # the constructor's fail-closed check.
     endpoint_url: str | None = None
 
     # Google Cloud project number for verifying direct webhook JWTs
@@ -307,7 +312,9 @@ class GoogleChatAdapterConfig:
     # Logger instance
     logger: Any = None  # Logger protocol
 
-    # Pub/Sub audience for JWT verification
+    # Pub/Sub audience for JWT verification. Pub/Sub pushes additionally
+    # require ``pubsub_service_account_email`` (the audience is public, so it
+    # does not identify the caller).
     pubsub_audience: str | None = None
 
     # Pub/Sub topic for receiving all messages
@@ -317,14 +324,44 @@ class GoogleChatAdapterConfig:
     user_name: str | None = None
 
     # Explicit opt-in to disable webhook signature verification. Required to
-    # construct the adapter when neither google_chat_project_number nor
-    # pubsub_audience is configured. Without this flag the constructor raises
+    # construct the adapter when none of google_chat_project_number,
+    # endpoint_url or pubsub_audience is configured. Without this flag the constructor raises
     # ValidationError -- fail-closed by default. Only enable in development or
     # when an upstream layer (e.g. authenticated Cloud Run invocations) provides
     # equivalent guarantees. Falls back to the
     # GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION env var when left unset (None).
     #
+    # The opt-out only covers a transport with no verifier configured: a set
+    # google_chat_project_number or endpoint_url still verifies direct
+    # webhooks, and a set pubsub_audience still verifies Pub/Sub pushes. So
+    # setting endpoint_url (even only for button routing) means direct
+    # webhooks are verified despite this flag.
+    #
     # Kept at the END of the field list intentionally: GoogleChatAdapterConfig
     # is a positional-args dataclass, so inserting a new field in the middle
     # would silently shift every later positional arg for existing callers.
     disable_signature_verification: bool | None = None
+
+    # ---- Keyword-only fields -------------------------------------------------
+    # Fields below are ``kw_only`` so they never shift the positional order
+    # above (existing positional callers keep working). Add new fields here.
+    # Divergence from upstream -- see docs/UPSTREAM_SYNC.md
+
+    # Exact service-account identity of this app's Workspace Add-on, in the
+    # form ``service-{projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com``
+    # (your OWN project number). Workspace Add-on Chat apps sign endpoint-URL
+    # webhooks with this identity instead of ``chat@system.gserviceaccount.com``.
+    # Every add-on project shares that email shape, so the identity is only
+    # meaningful compared exactly: when unset, add-on tokens are rejected
+    # (401) rather than trusted by shape. Ordinary Chat apps are unaffected.
+    # Falls back to the GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL env
+    # var when left unset (None).
+    workspace_add_on_service_account_email: str | None = field(default=None, kw_only=True)
+
+    # Service account the Pub/Sub push subscription authenticates as (the
+    # identity in the subscription's push auth settings). Required to accept
+    # Pub/Sub pushes: the token's ``email`` claim must equal it exactly and
+    # ``email_verified`` must be true, otherwise the push is rejected (401).
+    # Falls back to the GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL env var when
+    # left unset (None).
+    pubsub_service_account_email: str | None = field(default=None, kw_only=True)
