@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from chat_sdk.callback_url import decode_callback_value
+from chat_sdk.callback_url import CallbackScope, decode_callback_value
 from chat_sdk.cards import Actions, Button, Card
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter, derive_channel_id
 from chat_sdk.errors import ChatNotImplementedError
@@ -1446,6 +1446,7 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{decoded.callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/hook"
+        assert stored["scope"] == {"id": "slack:C123", "type": "channel"}
 
     # it("should encode callbackUrl when posting via postEphemeral")
     @pytest.mark.asyncio
@@ -1483,6 +1484,59 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/eph"
+
+    # it("should bind fallback DM callbacks to the DM channel")
+    @pytest.mark.asyncio
+    async def test_should_bind_fallback_dm_callbacks_to_the_dm_channel(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        channel = _make_channel(adapter, state)
+
+        await channel.post_ephemeral(
+            "U1",
+            Card(
+                children=[
+                    Actions(
+                        [
+                            Button(
+                                id="ack",
+                                label="Ack",
+                                callback_url="https://example.com/dm",
+                            )
+                        ]
+                    ),
+                ]
+            ),
+            PostEphemeralOptions(fallback_to_dm=True),
+        )
+
+        dm_thread_id, sent_card = adapter._post_calls[0]
+        assert dm_thread_id == "slack:DU1:"
+        button = sent_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["scope"] == {"id": "slack:DU1", "type": "channel"}
+        assert len(self._callback_keys(state)) == 1
+
+    # Python-specific: tokens are minted per delivery path, so a channel
+    # ephemeral with no native path and no DM fallback mints nothing.
+    @pytest.mark.asyncio
+    async def test_post_ephemeral_without_delivery_path_mints_no_callback_token(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        state.set = AsyncMock(wraps=state.set)  # type: ignore[method-assign]
+        channel = _make_channel(adapter, state)
+
+        result = await channel.post_ephemeral(
+            "U1",
+            Card(children=[Actions([Button(id="ack", label="Ack", callback_url="https://example.com/none")])]),
+            PostEphemeralOptions(fallback_to_dm=False),
+        )
+
+        assert result is None
+        state.set.assert_not_awaited()
+        assert self._callback_keys(state) == []
 
     # it("should encode callbackUrl when scheduling")
     @pytest.mark.asyncio
@@ -1554,6 +1608,135 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/edit"
+
+    # Python-specific divergence (docs/UPSTREAM_SYNC.md): an edited channel
+    # card binds its tokens to the channel, not to the reported thread id.
+    # Round trip with the real Slack id functions and the real block_actions
+    # click, both for the synthetic `slack:C…:` post id Python reports today
+    # and for the `slack:C…:<ts>` id upstream 92530dd3 reports (#209). A DM
+    # click reports no ts, so a thread scope would miss it either way.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("channel_id", "post_thread_id"),
+        [
+            ("slack:C123", "slack:C123:"),
+            ("slack:C123", "slack:C123:1700.1"),
+            ("slack:D123", "slack:D123:"),
+            ("slack:D123", "slack:D123:1700.1"),
+        ],
+    )
+    async def test_edited_slack_channel_card_resolves_for_the_real_click(self, channel_id: str, post_thread_id: str):
+        from chat_sdk.adapters.slack.adapter import SlackAdapter
+        from chat_sdk.adapters.slack.types import SlackAdapterConfig
+        from chat_sdk.callback_url import CallbackContext, resolve_callback_url
+
+        adapter = SlackAdapter(SlackAdapterConfig(bot_token="xoxb-test", signing_secret="s"))
+        clicks: list[Any] = []
+
+        class _ClickSink:
+            def process_action(self, event: Any, options: Any = None) -> None:
+                clicks.append(event)
+
+        adapter._chat = _ClickSink()  # type: ignore[assignment]
+        adapter.post_channel_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="1700.1", thread_id=post_thread_id, raw={})
+        )
+        adapter.edit_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        state = create_mock_state()
+        channel = ChannelImpl(_ChannelImplConfigWithAdapter(id=channel_id, adapter=adapter, state_adapter=state))
+
+        sent = await channel.post("Hello")
+        await sent.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edit_thread_id, _, edited_card = adapter.edit_message.await_args.args
+        assert edit_thread_id == post_thread_id
+        token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        assert token is not None
+
+        raw_channel = channel_id.split(":")[1]
+        adapter._handle_block_actions(
+            {
+                "type": "block_actions",
+                "channel": {"id": raw_channel},
+                "container": {"type": "message", "channel_id": raw_channel, "message_ts": "1700.1"},
+                "message": {"ts": "1700.1"},
+                "user": {"id": "U1", "username": "u"},
+                "actions": [{"action_id": "redo", "value": f"__cb:{token}"}],
+            }
+        )
+        click = clicks[0]
+        resolved = await resolve_callback_url(
+            token,
+            state,
+            CallbackContext(
+                action_id=click.action_id,
+                channel_id=adapter.channel_id_from_thread_id(click.thread_id),
+                thread_id=click.thread_id,
+            ),
+        )
+        assert resolved is not None
+        assert resolved.scope == CallbackScope(id=channel_id, type="channel")
+
+    # Python-specific divergence (docs/UPSTREAM_SYNC.md): when the adapter
+    # reports the channel id as the post's thread id (Teams, Google Chat),
+    # upstream's `{channel_id, "thread"}` edit scope can never match a click.
+    # Round trip with the real Teams id functions and the replayed click shape.
+    @pytest.mark.asyncio
+    async def test_edited_teams_channel_card_resolves_for_a_click_in_that_channel(self):
+        pytest.importorskip("microsoft_teams")
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
+        from chat_sdk.callback_url import CallbackContext, resolve_callback_url
+
+        adapter = TeamsAdapter(TeamsAdapterConfig(app_id="test-app-id", app_password="test-password"))
+        service_url = "https://smba.trafficmanager.net/teams/"
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=service_url)
+        )
+        # Real `post_channel_message` returns `thread_id=channel_id`.
+        adapter.post_channel_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="1767297849909", thread_id=channel_id, raw={})
+        )
+        adapter.edit_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        state = create_mock_state()
+        channel = ChannelImpl(_ChannelImplConfigWithAdapter(id=channel_id, adapter=adapter, state_adapter=state))
+
+        sent = await channel.post("Hello")
+        await sent.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edited_card = adapter.edit_message.await_args.args[2]
+        token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        assert token is not None
+        # A Teams card click reports the message's thread (`;messageid=`).
+        click_thread_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2;messageid=1767297849909", service_url=service_url)
+        )
+        resolved = await resolve_callback_url(
+            token,
+            state,
+            CallbackContext(
+                action_id="redo",
+                channel_id=adapter.channel_id_from_thread_id(click_thread_id),
+                thread_id=click_thread_id,
+            ),
+        )
+        assert resolved is not None
+        assert resolved.scope.type == "channel"
+        assert resolved.scope.id == channel_id
+
+    @pytest.mark.asyncio
+    async def test_chained_edit_keeps_callback_tokens_resolvable(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        sent = await channel.post("Hello")
+        edited = await sent.edit("First edit")
+        await edited.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edited_card = adapter._edit_calls[1][2]
+        token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        stored = await state.get(f"chat:callback:{token}")
+        assert stored is not None
+        assert stored["scope"] == {"id": "slack:C123", "type": "channel"}
 
     # it("should pass plain string posts through unchanged")
     @pytest.mark.asyncio

@@ -3808,6 +3808,7 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/post-hook"
+        assert stored["scope"] == {"id": "slack:C123:1234.5678", "type": "thread"}
 
     # it("should encode callbackUrl when posting via postEphemeral with native support")
     @pytest.mark.asyncio
@@ -3839,6 +3840,46 @@ class TestCallbackUrlProcessing:
         stored = await state.get(f"chat:callback:{callback_token}")
         assert stored is not None
         assert stored["url"] == "https://example.com/eph"
+
+    # it("should bind fallback DM callbacks to the DM channel")
+    @pytest.mark.asyncio
+    async def test_should_bind_fallback_dm_callbacks_to_the_dm_channel(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        thread = _make_thread(adapter, state)
+
+        await thread.post_ephemeral(
+            "U456",
+            _make_card_with_callback("https://example.com/dm"),
+            PostEphemeralOptions(fallback_to_dm=True),
+        )
+
+        dm_thread_id, sent_card = adapter._post_calls[0]
+        assert dm_thread_id == "slack:DU456:"
+        button = sent_card["children"][0]["children"][0]
+        callback_token = decode_callback_value(button["value"]).callback_token
+        stored = await state.get(f"chat:callback:{callback_token}")
+        assert stored is not None
+        assert stored["scope"] == {"id": "slack:DU456", "type": "channel"}
+
+    # Python-specific: with no native ephemeral and no DM fallback, nothing
+    # is delivered, so no callback token may be minted.
+    @pytest.mark.asyncio
+    async def test_post_ephemeral_without_delivery_path_mints_no_callback_token(self):
+        adapter = create_mock_adapter()
+        state = create_mock_state()
+        state.set = AsyncMock(wraps=state.set)  # type: ignore[method-assign]
+        thread = _make_thread(adapter, state)
+
+        result = await thread.post_ephemeral(
+            "U456",
+            _make_card_with_callback("https://example.com/none"),
+            PostEphemeralOptions(fallback_to_dm=False),
+        )
+
+        assert result is None
+        state.set.assert_not_awaited()
+        assert self._callback_keys(state) == []
 
     # it("should encode callbackUrl when scheduling a card")
     @pytest.mark.asyncio
