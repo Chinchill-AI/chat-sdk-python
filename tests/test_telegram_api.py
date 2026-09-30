@@ -10,6 +10,7 @@ Mocks telegram_fetch to intercept all Bot API calls without network access.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -74,8 +75,11 @@ def _init_adapter(adapter: TelegramAdapter) -> MagicMock:
     chat.process_message = MagicMock()
     chat.process_action = MagicMock()
     chat.process_reaction = MagicMock()
+    # handle_webhook claims each update_id before dispatch (vercel/chat#799).
+    chat.get_state.return_value.set_if_not_exists = AsyncMock(return_value=True)
     adapter._chat = chat
     adapter._bot_user_id = "999"
+    adapter._webhook_scope = hashlib.sha256(b"999").hexdigest()
     return chat
 
 
@@ -810,7 +814,7 @@ class TestHandleWebhook:
     @pytest.mark.asyncio
     async def test_webhook_accepts_valid_secret(self):
         adapter = _make_adapter(secret_token="my-secret")
-        _init_adapter(adapter)
+        chat = _init_adapter(adapter)
 
         class FakeReq:
             headers = {"x-telegram-bot-api-secret-token": "my-secret"}
@@ -825,24 +829,33 @@ class TestHandleWebhook:
 
         result = await adapter.handle_webhook(FakeReq())
         assert result["status"] == 200
+        chat.process_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_webhook_warns_no_verification(self):
-        adapter = _make_adapter()  # no secret_token
-        _init_adapter(adapter)
+    async def test_webhook_rejects_before_reading_body_without_verification(self, monkeypatch: pytest.MonkeyPatch):
+        # Fail closed (vercel/chat#858): with neither a secret nor the explicit
+        # opt-out, the request is rejected before its body is even read. Clear
+        # the env fallbacks so an exported opt-out/secret cannot mask this.
+        monkeypatch.delenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", raising=False)
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        adapter = _make_adapter()  # auto mode, no secret_token, no opt-out
+        chat = _init_adapter(adapter)
+        read_body = AsyncMock(return_value='{"update_id": 1}')
 
         class FakeReq:
             headers = {}
-
-            async def text(self):
-                return '{"update_id": 1}'
+            text = read_body
 
         result = await adapter.handle_webhook(FakeReq())
-        assert result["status"] == 200
+        assert result["status"] == 401
+        assert result["body"] == "Webhook verification required"
+        read_body.assert_not_awaited()
+        chat.process_message.assert_not_called()
+        chat.get_state.return_value.set_if_not_exists.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_webhook_invalid_json(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(allow_unverified_webhooks=True)
         _init_adapter(adapter)
 
         class FakeReq:
@@ -856,7 +869,7 @@ class TestHandleWebhook:
 
     @pytest.mark.asyncio
     async def test_webhook_no_chat_instance(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(allow_unverified_webhooks=True)
         # _chat is None (not initialized)
 
         class FakeReq:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import inspect
 import json
@@ -104,6 +105,14 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"  # pragma: allowlist secret
+TELEGRAM_WEBHOOK_VERIFICATION_ERROR = (
+    "secret_token is required in webhook mode. Set TELEGRAM_WEBHOOK_SECRET_TOKEN or provide "
+    "secret_token. To accept unverified webhooks, set allow_unverified_webhooks=True or "
+    "TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true."
+)
+# Claimed ``update_id`` keys live for 24h — Telegram stops redelivering a
+# failed webhook update well within that window (vercel/chat#799).
+TELEGRAM_WEBHOOK_UPDATE_TTL_MS = 24 * 60 * 60 * 1000
 MESSAGE_ID_PATTERN = re.compile(r"^([^:]+):(\d+)$")
 TELEGRAM_MARKDOWN_PARSE_MODE = "MarkdownV2"
 MESSAGE_SEQUENCE_PATTERN = re.compile(r":(\d+)$")
@@ -571,6 +580,23 @@ def _trim_trailing_slashes(url: str) -> str:
     return url[:end]
 
 
+def _integral_update_id(value: Any) -> int | None:
+    """Return ``value`` as an ``int`` when JS ``Number.isInteger`` would accept it.
+
+    ``json.loads`` keeps ``7.0`` / ``7e0`` as floats, but in JS they are the
+    number 7 and render as ``"7"`` in the claim key, so they are normalised to
+    ``int`` here. ``bool`` (an ``int`` subclass) and non-finite or fractional
+    floats are rejected.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 def _escape_markdown_in_entity(text: str) -> str:
     """Escape markdown-special characters inside entity text."""
     return re.sub(r"([\[\]()\\])", r"\\\1", text)
@@ -665,7 +691,27 @@ class TelegramAdapter:
         self._api_base_url: str = _trim_trailing_slashes(
             config.api_base_url or os.environ.get("TELEGRAM_API_BASE_URL") or TELEGRAM_API_BASE
         )
-        self._secret_token: str | None = config.secret_token or os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        # ``??`` semantics (vercel/chat#858): an explicit empty-string secret is
+        # kept (and is falsy, so verification is still required) rather than
+        # silently falling back to the env var.
+        self._secret_token: str | None = (
+            config.secret_token if config.secret_token is not None else os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        )
+        # Only the exact env string "true" opts out; an explicit config value
+        # (including False) always wins over the env var.
+        # A non-bool value (e.g. the string "false" copied from a settings
+        # file) is rejected rather than coerced with ``bool()``, which would
+        # silently fail open on this security flag.
+        if config.allow_unverified_webhooks is not None and not isinstance(config.allow_unverified_webhooks, bool):
+            raise ValidationError(
+                "telegram",
+                f"allow_unverified_webhooks must be a bool, got {type(config.allow_unverified_webhooks).__name__}",
+            )
+        self._allow_unverified_webhooks: bool = (
+            config.allow_unverified_webhooks
+            if config.allow_unverified_webhooks is not None
+            else os.environ.get("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS") == "true"
+        )
         self._warned_no_verification: bool = False
         self._logger: Logger = config.logger or ConsoleLogger("info").child("telegram")
         self._format_converter: TelegramFormatConverter = TelegramFormatConverter()
@@ -673,6 +719,15 @@ class TelegramAdapter:
 
         self._chat: ChatInstance | None = None
         self._bot_user_id: str | None = None
+        # Shared in-flight ``getMe`` (vercel/chat#813) and the stable
+        # ``sha256(bot_user_id)`` scope used to key webhook update claims.
+        self._bot_identity_task: asyncio.Task[None] | None = None
+        self._webhook_scope: str | None = None
+        # Username reported by ``getMe``. ``_ensure_bot_identity`` short-circuits
+        # once the scope is cached, so a re-``initialize`` (``Chat.shutdown`` then
+        # ``Chat.initialize``) must restore it here after applying the Chat-level
+        # name, or ``@real_bot`` mentions / ``/cmd@real_bot`` stop routing.
+        self._resolved_user_name: str | None = None
 
         explicit_user_name = config.user_name or os.environ.get("TELEGRAM_BOT_USERNAME")
         self._user_name: str = self.normalize_user_name(explicit_user_name or "bot")
@@ -708,6 +763,8 @@ class TelegramAdapter:
                 "telegram",
                 f'Invalid mode: {self._mode}. Expected "auto", "webhook", or "polling".',
             )
+        if self._mode == "webhook" and not self._webhook_verification_configured():
+            raise ValidationError("telegram", TELEGRAM_WEBHOOK_VERIFICATION_ERROR)
 
     # -- Properties ----------------------------------------------------------
 
@@ -741,6 +798,57 @@ class TelegramAdapter:
 
     # -- Lifecycle -----------------------------------------------------------
 
+    def _webhook_verification_configured(self) -> bool:
+        """Whether webhook requests are verified or explicitly allowed unverified."""
+        return bool(self._secret_token) or self._allow_unverified_webhooks
+
+    async def _ensure_bot_identity(self) -> None:
+        """Resolve the bot identity via ``getMe`` once, sharing any in-flight call.
+
+        On success sets ``bot_user_id``, refines the username (unless one was
+        configured explicitly) and derives the webhook dedupe scope from
+        ``sha256(bot_user_id)`` — not the token, so claims survive token
+        rotation. The pending task is cleared on success *and* failure so a
+        failed lookup is retried on the next call.
+
+        Port of upstream ``ensureBotIdentity`` (vercel/chat#813).
+        """
+        if self._webhook_scope:
+            return
+        task = self._bot_identity_task
+        # A finished task here can only be a failed/cancelled lookup whose
+        # clearing callback has not run yet (success sets the scope above):
+        # start a fresh lookup rather than re-raising the stale failure.
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(self._fetch_bot_identity())
+            self._bot_identity_task = task
+
+            def _clear(done: asyncio.Task[None]) -> None:
+                if self._bot_identity_task is done:
+                    self._bot_identity_task = None
+                # Mark the exception retrieved so a failure nobody else awaits
+                # does not log "Task exception was never retrieved".
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(_clear)
+        # Shield so cancelling one waiter (e.g. a timed-out webhook request)
+        # does not cancel the shared lookup for the others.
+        await asyncio.shield(task)
+
+    async def _fetch_bot_identity(self) -> None:
+        me: TelegramUser = await self.telegram_fetch("getMe")
+        bot_user_id = str(me.get("id", ""))
+        self._bot_user_id = bot_user_id
+        self._webhook_scope = hashlib.sha256(bot_user_id.encode("utf-8")).hexdigest()
+        if not self._has_explicit_user_name and me.get("username"):
+            self._resolved_user_name = self.normalize_user_name(me["username"])
+            self._user_name = self._resolved_user_name
+        self._logger.info(
+            "Telegram bot identity resolved",
+            {"botUserId": self._bot_user_id, "userName": self._user_name},
+        )
+
     async def initialize(self, chat: ChatInstance) -> None:
         """Initialize the adapter and fetch bot identity via ``getMe``."""
         self._chat = chat
@@ -751,17 +859,13 @@ class TelegramAdapter:
                 resolved = chat_user_name()
                 if isinstance(resolved, str) and resolved.strip():
                     self._user_name = self.normalize_user_name(resolved)
+            # ``getMe`` refines the Chat-level name; when the identity is
+            # already cached the lookup below is skipped, so reapply it here.
+            if self._resolved_user_name:
+                self._user_name = self._resolved_user_name
 
         try:
-            me: TelegramUser = await self.telegram_fetch("getMe")
-            self._bot_user_id = str(me.get("id", ""))
-            if not self._has_explicit_user_name and me.get("username"):
-                self._user_name = self.normalize_user_name(me["username"])
-
-            self._logger.info(
-                "Telegram adapter initialized",
-                {"botUserId": self._bot_user_id, "userName": self._user_name},
-            )
+            await self._ensure_bot_identity()
         except Exception as error:
             self._logger.warn(
                 "Failed to fetch Telegram bot identity",
@@ -770,6 +874,11 @@ class TelegramAdapter:
 
         runtime_mode = await self.resolve_runtime_mode()
         self._runtime_mode = runtime_mode
+
+        # Fail closed (vercel/chat#858): auto mode that resolves to webhook
+        # needs a secret or an explicit opt-out, same as ``mode="webhook"``.
+        if runtime_mode == "webhook" and not self._webhook_verification_configured():
+            raise ValidationError("telegram", TELEGRAM_WEBHOOK_VERIFICATION_ERROR)
 
         if runtime_mode == "polling":
             polling_config = self._long_polling
@@ -833,9 +942,16 @@ class TelegramAdapter:
     ) -> Any:
         """Handle an incoming Telegram webhook request.
 
-        Validates the secret token header, parses the JSON update, and
-        dispatches it to ``processUpdate``.
+        Validates the secret token header, parses the JSON update, claims its
+        ``update_id`` so redeliveries are dispatched once, and dispatches it to
+        ``process_update``.
         """
+        # Fail closed before reading the body (vercel/chat#858).
+        if not self._webhook_verification_configured():
+            self._logger.warn(
+                "Telegram webhook rejected because verification is not configured",
+            )
+            return self._make_response("Webhook verification required", 401)
         if self._secret_token:
             header_token = self._get_header(request, TELEGRAM_SECRET_TOKEN_HEADER)
             valid = False
@@ -851,10 +967,7 @@ class TelegramAdapter:
                 return self._make_response("Invalid secret token", 401)
         elif not self._warned_no_verification:
             self._warned_no_verification = True
-            self._logger.warn(
-                "Telegram webhook verification is disabled. "
-                "Set TELEGRAM_WEBHOOK_SECRET_TOKEN or secretToken to verify incoming requests.",
-            )
+            self._logger.warn("Telegram webhook verification is explicitly disabled")
 
         try:
             body = await self._get_request_body(request)
@@ -868,12 +981,56 @@ class TelegramAdapter:
             )
             return self._make_response("OK", 200)
 
+        # Deduplicate redeliveries by ``update_id`` (vercel/chat#799). Core
+        # message dedupe does not cover callback queries, so without this a
+        # Telegram retry could run a button action twice. Only integral ids are
+        # claimed, mirroring ``Number.isInteger``: an integral JSON float
+        # (``7.0`` / ``7e0``) is the JS number 7 and shares the ``...:7`` key;
+        # ``bool`` is excluded (an ``int`` subclass in Python). Anything else is
+        # dispatched unclaimed, matching upstream.
+        raw_update_id = update.get("update_id") if isinstance(update, dict) else None
+        update_id = _integral_update_id(raw_update_id)
+        if update_id is not None:
+            webhook_scope = self._webhook_scope
+            if not webhook_scope:
+                try:
+                    await self._ensure_bot_identity()
+                    webhook_scope = self._webhook_scope
+                except Exception as error:
+                    self._logger.warn(
+                        "Telegram webhook update could not resolve bot identity",
+                        {"error": str(error)},
+                    )
+                    return self._make_response("Service unavailable", 503)
+            if not webhook_scope:
+                return self._make_response("Service unavailable", 503)
+            try:
+                claimed = await self._chat.get_state().set_if_not_exists(
+                    f"{self._name}:webhook-update:{webhook_scope}:{update_id}",
+                    True,
+                    TELEGRAM_WEBHOOK_UPDATE_TTL_MS,
+                )
+            except Exception as error:
+                self._logger.warn(
+                    "Failed to claim Telegram webhook update",
+                    {"error": str(error), "updateId": update_id},
+                )
+                return self._make_response("Service unavailable", 503)
+            if not claimed:
+                self._logger.debug(
+                    "Ignoring duplicate Telegram webhook update",
+                    {"updateId": update_id},
+                )
+                return self._make_response("OK", 200)
+
         try:
             self.process_update(update, options)
         except Exception as error:
             self._logger.warn(
                 "Failed to process Telegram webhook update",
-                {"error": str(error), "updateId": update.get("update_id")},
+                # Not ``update.get(...)``: an authenticated non-object body
+                # (e.g. ``[1]``) lands here and must not raise from the log.
+                {"error": str(error), "updateId": raw_update_id},
             )
 
         return self._make_response("OK", 200)

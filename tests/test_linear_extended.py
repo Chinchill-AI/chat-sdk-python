@@ -26,6 +26,7 @@ from chat_sdk.adapters.linear.types import (
     LinearAdapterOAuthConfig,
 )
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.types import FetchOptions
 
 WEBHOOK_SECRET = "test-webhook-secret"
 
@@ -439,6 +440,49 @@ class TestStartTyping:
 # ============================================================================
 
 
+def _thread_comment(comment_id: str, body: str, *, issue_id: str | None = None) -> dict:
+    """A ``Comment`` GraphQL node; ``issue_id`` adds the scalar ``issueId`` field."""
+    node = {
+        "id": comment_id,
+        "body": body,
+        "createdAt": "2025-06-01T10:00:00.000Z",
+        "updatedAt": "2025-06-01T10:00:00.000Z",
+        "url": f"https://linear.app/comment/{comment_id}",
+        "user": {"id": "user-1", "displayName": "Bob", "name": "Bob Jones"},
+    }
+    if issue_id is not None:
+        node["issueId"] = issue_id
+    return node
+
+
+class _FakeLinearResponse:
+    def __init__(self, body: dict) -> None:
+        self.ok = True
+        self.status = 200
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+class _FakeLinearHttp:
+    """Stands in for the aiohttp session under the REAL ``_graphql_query``."""
+
+    def __init__(self, *bodies: dict) -> None:
+        self._bodies = list(bodies)
+        self.requests: list[dict] = []
+
+    def post(self, url, *, headers, json):
+        self.requests.append(json)
+        return _FakeLinearResponse(self._bodies.pop(0))
+
+
 class TestFetchMessages:
     @pytest.mark.asyncio
     async def test_fetches_issue_level_comments(self):
@@ -492,63 +536,156 @@ class TestFetchMessages:
         assert result.next_cursor is None
 
     @pytest.mark.asyncio
-    async def test_fetches_comment_thread(self):
+    @pytest.mark.parametrize(
+        ("options", "expected_page"),
+        [
+            (FetchOptions(direction="forward", limit=10), {"first": 10, "last": None}),
+            (FetchOptions(direction="backward", limit=10), {"first": None, "last": 10}),
+            # Default (no direction) pages from the END with ``last`` -- both with
+            # no options at all and with ``Thread.refresh``'s ``FetchOptions(limit=50)``.
+            (None, {"first": None, "last": 50}),
+            (FetchOptions(limit=50), {"first": None, "last": 50}),
+        ],
+        ids=["forward", "backward", "default-no-options", "default-no-direction"],
+    )
+    async def test_fetches_same_issue_comment_thread_in_order(self, options, expected_page):
+        # Ported: it.each("should fetch a same-issue comment thread in %s order")
+        # (chat@4.41.1, replaces "should fetch comment thread (root + children)").
         adapter = _make_webhook_adapter()
-        # First call: fetch root comment, second call: fetch children
         adapter._graphql_query = AsyncMock(
-            return_value={
-                "data": {
-                    "comment": {
-                        "id": "root-comment",
-                        "body": "Root comment",
-                        "createdAt": "2025-06-01T10:00:00.000Z",
-                        "updatedAt": "2025-06-01T10:00:00.000Z",
-                        "url": "https://linear.app/comment/root",
-                        "user": {
-                            "id": "user-1",
-                            "displayName": "Bob",
-                            "name": "Bob Jones",
-                        },
-                        "children": {
-                            "nodes": [
-                                {
-                                    "id": "child-1",
-                                    "body": "Reply",
-                                    "createdAt": "2025-06-01T11:00:00.000Z",
-                                    "updatedAt": "2025-06-01T11:00:00.000Z",
-                                    "url": "https://linear.app/comment/child-1",
-                                    "user": {
-                                        "id": "user-1",
-                                        "displayName": "Bob",
-                                        "name": "Bob Jones",
-                                    },
-                                }
-                            ],
-                            "pageInfo": {
-                                "hasNextPage": False,
-                                "endCursor": None,
-                            },
-                        },
+            side_effect=[
+                {"data": {"comment": _thread_comment("root-comment", "Root comment", issue_id="issue-abc")}},
+                {
+                    "data": {
+                        "comment": {
+                            "children": {
+                                "nodes": [_thread_comment("child-1", "Reply")],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "next-page"},
+                            }
+                        }
                     }
-                }
-            }
+                },
+            ]
         )
 
-        result = await adapter.fetch_messages("linear:issue-abc:c:root-comment")
+        result = await adapter.fetch_messages("linear:issue-abc:c:root-comment", options)
 
-        # Root + 1 child
-        assert len(result.messages) == 2
-        assert result.messages[0].text == "Root comment"
-        assert result.messages[1].text == "Reply"
+        # Root first (validated), then the children — ``forward`` pages with
+        # ``first``; ``backward`` and the default with ``last``.
+        root_query, root_vars = adapter._graphql_query.call_args_list[0][0]
+        assert "issueId" in root_query
+        assert root_vars == {"commentId": "root-comment"}
+        _, children_vars = adapter._graphql_query.call_args_list[1][0]
+        assert children_vars == {"commentId": "root-comment", **expected_page}
+        # Root comment + 1 child
+        assert [m.text for m in result.messages] == ["Root comment", "Reply"]
+        # Python keeps the fixed (requested) thread id for comment-thread fetches.
+        assert [m.thread_id for m in result.messages] == [
+            "linear:issue-abc:c:root-comment",
+            "linear:issue-abc:c:root-comment",
+        ]
+        assert [m.raw["comment"]["issueId"] for m in result.messages] == ["issue-abc", "issue-abc"]
+        assert result.next_cursor == "next-page"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "issue",
+        [{"issueId": "issue-private"}, {}, {"issueId": None}, {"issueId": ""}],
+        ids=["issue-private", "undefined", "null", "empty"],
+    )
+    async def test_rejects_comment_thread_with_unverified_issue_id(self, issue):
+        # Ported: it.each("rejects a comment thread with an unverified issueId: %s").
+        adapter = _make_webhook_adapter()
+        adapter._graphql_query = AsyncMock(
+            side_effect=[
+                {"data": {"comment": {**_thread_comment("private-comment", "Private issue content"), **issue}}},
+                AssertionError("children query must not run for a foreign comment"),
+            ]
+        )
+        adapter._comment_node_to_message = MagicMock(side_effect=AssertionError("must not parse"))
+
+        with pytest.raises(ValidationError) as exc_info:
+            await adapter.fetch_messages("linear:issue-public:c:private-comment")
+
+        assert str(exc_info.value) == "Comment does not belong to this issue"
+        assert exc_info.value.adapter == "linear"
+        # Only the root lookup ran; nothing was parsed.
+        assert adapter._graphql_query.await_count == 1
+        assert adapter._graphql_query.call_args_list[0][0][1] == {"commentId": "private-comment"}
+        adapter._comment_node_to_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_comment_thread_when_root_and_thread_issue_ids_are_both_empty(self):
+        """``"" == ""`` is not ownership: the ``not root_issue_id`` term rejects an
+        empty root issue id even against a (degenerate, directly passed) empty
+        thread issue id. Dropping that term would let equality pass and fetch
+        the replies.
+        """
+        adapter = _make_webhook_adapter()
+        adapter._graphql_query = AsyncMock(
+            side_effect=[
+                {"data": {"comment": _thread_comment("root-comment", "Root comment", issue_id="")}},
+                AssertionError("children query must not run for an unverified comment"),
+            ]
+        )
+
+        with pytest.raises(ValidationError) as exc_info:
+            await adapter._fetch_comment_thread("linear::c:root-comment", "", "root-comment", 50)
+
+        assert str(exc_info.value) == "Comment does not belong to this issue"
+        assert adapter._graphql_query.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("issue_id", ["issue-private", None, "issue-public"])
+    async def test_validates_comment_ownership_through_the_transport(self, issue_id):
+        # Ported: it.each("validates comment ownership through the Linear SDK: %s").
+        # Upstream stubs ``fetch`` beneath the SDK; here the aiohttp session is
+        # stubbed beneath the REAL ``_graphql_query``.
+        adapter = _make_webhook_adapter()
+        http = _FakeLinearHttp(
+            {
+                "data": {
+                    "comment": {
+                        **_thread_comment("comment-1", "Comment content"),
+                        "issueId": issue_id,
+                    }
+                }
+            },
+            {"data": {"comment": {"children": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}},
+        )
+        adapter._get_http_session = AsyncMock(return_value=http)
+
+        if issue_id == "issue-public":
+            result = await adapter.fetch_messages("linear:issue-public:c:comment-1")
+            assert [(m.text, m.thread_id) for m in result.messages] == [
+                ("Comment content", "linear:issue-public:c:comment-1")
+            ]
+            assert len(http.requests) == 2
+        else:
+            with pytest.raises(ValidationError) as exc_info:
+                await adapter.fetch_messages("linear:issue-public:c:comment-1")
+            assert str(exc_info.value) == "Comment does not belong to this issue"
+            assert len(http.requests) == 1
+        # The first request selects the root comment's scalar ``issueId``
+        # (upstream: ``fetch.mock.calls[0][1]?.body`` contains "issueId").
+        assert "issueId" in http.requests[0]["query"]
+        assert http.requests[0]["variables"] == {"commentId": "comment-1"}
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_comment_not_found(self):
         adapter = _make_webhook_adapter()
-        adapter._graphql_query = AsyncMock(return_value={"data": {"comment": None}})
+        adapter._graphql_query = AsyncMock(
+            side_effect=[
+                {"data": {"comment": None}},
+                AssertionError("children query must not run without a root comment"),
+            ]
+        )
 
         result = await adapter.fetch_messages("linear:issue-abc:c:nonexistent")
 
         assert len(result.messages) == 0
+        # Only the root lookup ran (upstream: ``comments`` not called).
+        assert adapter._graphql_query.await_count == 1
 
     @pytest.mark.asyncio
     async def test_passes_limit_option(self):

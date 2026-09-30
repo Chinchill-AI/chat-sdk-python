@@ -224,37 +224,55 @@ class TestSlackApiPrimitives:
                 fetch=request,
             )
 
-    async def test_sends_response_url_json_payloads(self) -> None:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://hooks.slack.com/actions/T/1/abc",
+            # Python-specific: GovSlack response URLs are trusted too (#205).
+            "https://hooks.slack-gov.com/actions/T/1/abc",
+        ],
+    )
+    async def test_sends_response_url_json_payloads(self, url: str) -> None:
         request = AsyncMock(return_value=_json_response(None, status=200))
 
         await send_slack_response_url(
-            "https://hooks.slack.com/actions/T/1/abc",
+            url,
             replace_original=True,
             text="updated",
             fetch=request,
         )
 
         call = request.await_args
-        assert _url(call) == "https://hooks.slack.com/actions/T/1/abc"
+        assert _url(call) == url
         assert json.loads(call.kwargs["body"]) == {
             "replace_original": True,
             "text": "updated",
         }
 
-    async def test_rejects_non_slack_response_urls(self) -> None:
-        """Python-specific SSRF guard: response_url must be https://*.slack.com.
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example/steal",
+            # Pre-#205 the primitive accepted any ``*.slack.com`` host; only
+            # Slack's response-url hosts are trusted now.
+            "https://files.slack.com/respond",
+            "https://hooks.slack.com.attacker.example/respond",
+            "http://hooks.slack.com/respond",
+            "https://user@hooks.slack.com/respond",
+            "https://hooks.slack.com:444/respond",
+        ],
+    )
+    async def test_rejects_non_slack_response_urls(self, url: str) -> None:
+        """Python-specific SSRF guard: response_url must be a Slack hooks host.
 
-        Diverges from upstream, which POSTs to any response_url. See
-        ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
+        Diverges from upstream, whose SDK-free ``sendResponseUrl`` POSTs to
+        any response_url (the upstream *adapter* validates since
+        vercel/chat#876). See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
         """
         request = AsyncMock()
 
-        with pytest.raises(ValueError, match="https://\\*.slack.com"):
-            await send_slack_response_url(
-                "https://evil.example/steal",
-                text="x",
-                fetch=request,
-            )
+        with pytest.raises(ValueError, match="hooks.slack.com or https://hooks.slack-gov.com"):
+            await send_slack_response_url(url, text="x", fetch=request)
 
         request.assert_not_awaited()
 

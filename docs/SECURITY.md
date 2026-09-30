@@ -49,7 +49,8 @@ The Teams adapter implements its own JWT validation rather than using the Micros
 - **Method**: Secret token comparison
 - **Header**: `X-Telegram-Bot-Api-Secret-Token`
 - **Comparison**: Timing-safe via `hmac.compare_digest()`
-- **Caveat**: If `secret_token` is not configured, webhook verification is silently skipped. See "Known Limitations" below.
+- **Required in webhook mode** (since the 4.41 wave; upstream chat@4.39, vercel/chat#858): a webhook-mode adapter without `secret_token` / `TELEGRAM_WEBHOOK_SECRET_TOKEN` fails to construct (`mode="webhook"`) or to initialize (`mode="auto"` resolving to webhook), and `handle_webhook` returns 401 before reading the body. The only way to accept unverified webhooks is the explicit opt-out `allow_unverified_webhooks=True` or `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true` (exact string). Polling mode needs neither.
+- **Redelivery dedupe**: each accepted update's integer `update_id` is claimed in the state adapter (`telegram:webhook-update:{sha256(bot_user_id)}:{update_id}`, 24h TTL) before dispatch, so a Telegram retry (including a `callback_query` button action) is dispatched once. A state or bot-identity failure returns 503 without dispatch so Telegram retries later.
 
 ### WhatsApp (Meta Cloud API)
 
@@ -106,9 +107,10 @@ When downloading media attachments from WhatsApp messages, the adapter validates
 
 ### Slack `response_url` Validation
 
-Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's domains:
+Slack's `response_url` (used for responding to slash commands and interactive messages) is validated to ensure it points to Slack's response-URL hosts (port of upstream `isTrustedSlackResponseUrl`, vercel/chat#876). The check runs when an ephemeral message id is encoded, when it is decoded, and again right before the request is sent, and the SDK-free `send_slack_response_url` primitive applies the same check:
 
-- `https://hooks.slack.com/`
+- scheme `https`, no userinfo, no explicit port
+- host exactly `hooks.slack.com` or `hooks.slack-gov.com` (exact match, never a suffix match)
 
 ## Crypto: AES-256-GCM for Slack Token Encryption
 
@@ -167,13 +169,13 @@ Lock tokens serve as proof of ownership. A holder must present the correct token
 
 ## Known Limitations
 
-### Telegram: Silent Skip When No `secret_token`
+### Telegram: Explicitly Unverified Webhooks
 
-If the `TelegramAdapterConfig` does not include a `secret_token`, the Telegram adapter processes webhooks without any authentication. This is because Telegram does not require webhook verification -- it is optional.
+Telegram itself does not require webhook verification, but the adapter now fails closed: without `secret_token` it refuses webhook mode unless `allow_unverified_webhooks=True` (or `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true`) is set, and logs a one-time warning when that opt-out is in effect.
 
-**Risk**: Anyone who discovers the webhook URL can send fake updates.
+**Risk**: With the opt-out enabled, anyone who discovers the webhook URL can send fake updates.
 
-**Mitigation**: Always configure `secret_token` in production. The adapter should log a warning when operating without verification, but this is not currently implemented.
+**Mitigation**: Always configure `secret_token` in production; reserve the opt-out for local development or deployments that authenticate the request upstream of the adapter.
 
 ### Teams: JWKS Key Rotation Window
 
@@ -201,7 +203,7 @@ Card element content (titles, text, button labels) is passed through to platform
 
 2. **Encryption key is set** for Slack multi-workspace OAuth if bot tokens are persisted (Redis/Postgres state backends).
 
-3. **Telegram `secret_token` is set**. Without it, anyone can submit fake updates to your webhook endpoint.
+3. **Telegram `secret_token` is set** (required in webhook mode) and `allow_unverified_webhooks` / `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS` is **not** enabled. With the opt-out, anyone can submit fake updates to your webhook endpoint.
 
 4. **State backend is production-grade**. `MemoryStateAdapter` emits a warning in production environments but does not prevent usage. Use Redis or PostgreSQL.
 

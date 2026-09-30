@@ -8,10 +8,13 @@ omitted; this file covers the *remaining* TypeScript tests.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,8 +23,10 @@ from chat_sdk.adapters.telegram.adapter import (
     apply_telegram_entities,
     create_telegram_adapter,
 )
+from chat_sdk.adapters.telegram.cards import encode_telegram_callback_data
 from chat_sdk.adapters.telegram.types import TelegramAdapterConfig, TelegramThreadId
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.errors import NetworkError, ValidationError
+from chat_sdk.shared.mock_adapter import MockStateAdapter, create_mock_state
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +73,12 @@ class _FakeRequest:
         return self._body
 
 
+def _clear_telegram_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in list(os.environ):
+        if key.startswith("TELEGRAM_"):
+            monkeypatch.delenv(key)
+
+
 def _make_request(body: str, *, secret_token: str | None = None) -> _FakeRequest:
     headers: dict[str, str] = {"content-type": "application/json"}
     if secret_token is not None:
@@ -109,6 +120,26 @@ class TestCreateTelegramAdapterExtended:
                 os.environ.pop("TELEGRAM_BOT_TOKEN", None)
             else:
                 os.environ["TELEGRAM_BOT_TOKEN"] = old
+
+    def test_requires_verification_in_webhook_mode(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            create_telegram_adapter(
+                TelegramAdapterConfig(allow_unverified_webhooks=False, bot_token="token", mode="webhook")
+            )
+
+    def test_allows_explicit_unverified_webhook_mode(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        adapter = create_telegram_adapter(
+            TelegramAdapterConfig(allow_unverified_webhooks=True, bot_token="token", mode="webhook")
+        )
+        assert isinstance(adapter, TelegramAdapter)
+
+    def test_allows_polling_mode_without_webhook_verification(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", raising=False)
+        adapter = create_telegram_adapter(TelegramAdapterConfig(bot_token="token", mode="polling"))
+        assert isinstance(adapter, TelegramAdapter)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +205,47 @@ class TestTelegramConstructorEnvVars:
             else:
                 os.environ["TELEGRAM_BOT_TOKEN"] = old
 
+    def test_should_resolve_allow_unverified_webhooks_from_telegram_allow_unverified_webhooks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _clear_telegram_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-bot-token")
+        monkeypatch.setenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", "true")
+        adapter = TelegramAdapter(TelegramAdapterConfig(mode="webhook"))
+        assert isinstance(adapter, TelegramAdapter)
+
+    def test_should_reject_telegram_allow_unverified_webhooks_false_in_webhook_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _clear_telegram_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-bot-token")
+        monkeypatch.setenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", "false")
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            TelegramAdapter(TelegramAdapterConfig(mode="webhook"))
+
+    # -- Python-specific: ``??`` / exact-"true" resolution edges ------------
+
+    @pytest.mark.parametrize("env_value", ["1", "True", "TRUE", "yes", " true", ""])
+    def test_only_the_exact_string_true_opts_out_of_verification(self, monkeypatch: pytest.MonkeyPatch, env_value: str):
+        _clear_telegram_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", env_value)
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            TelegramAdapter(TelegramAdapterConfig(bot_token="token", mode="webhook"))
+
+    def test_explicit_false_config_wins_over_env_opt_out(self, monkeypatch: pytest.MonkeyPatch):
+        _clear_telegram_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", "true")
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            TelegramAdapter(TelegramAdapterConfig(allow_unverified_webhooks=False, bot_token="token", mode="webhook"))
+
+    def test_explicit_empty_secret_does_not_fall_back_to_env_secret(self, monkeypatch: pytest.MonkeyPatch):
+        # ``config.secretToken ?? env``: an explicit "" is kept (and is falsy),
+        # so it neither verifies requests nor silently picks up the env secret.
+        _clear_telegram_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", "env-secret")
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            TelegramAdapter(TelegramAdapterConfig(bot_token="token", mode="webhook", secret_token=""))
+
 
 # ---------------------------------------------------------------------------
 # Thread ID encode / decode
@@ -212,7 +284,7 @@ class TestTelegramWebhook:
 
     @pytest.mark.asyncio
     async def test_returns_400_for_invalid_json(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(allow_unverified_webhooks=True)
         request = _make_request("{invalid-json")
         response = await adapter.handle_webhook(request)
         assert response["status"] == 400
@@ -232,13 +304,18 @@ def _slash_adapter_and_chat() -> tuple[TelegramAdapter, Any]:
     ``AsyncMock`` would hand the adapter an unawaited coroutine that never
     reflects the real (sync) call.
     """
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
 
-    adapter = _make_adapter(user_name="mybot")
+    adapter = _make_adapter(user_name="mybot", allow_unverified_webhooks=True)
     chat = MagicMock()
     chat.process_slash_command = MagicMock()
     chat.process_message = MagicMock()
+    # handle_webhook claims each update_id before dispatch (vercel/chat#799);
+    # the claim itself is async, so the state method must be an AsyncMock.
+    chat.get_state.return_value.set_if_not_exists = AsyncMock(return_value=True)
     adapter._chat = chat
+    adapter._bot_user_id = "999"
+    adapter._webhook_scope = hashlib.sha256(b"999").hexdigest()
     return adapter, chat
 
 
@@ -1119,3 +1196,417 @@ class TestApplyTelegramEntitiesExtended:
             [{"type": "text_link", "offset": 6, "length": 6, "url": "https://example.com"}],
         )
         assert result == "click [\\[here\\]](https://example.com)"
+
+
+# ---------------------------------------------------------------------------
+# Webhook verification by default + update_id deduplication
+# (vercel/chat#799, #813, #858)
+# ---------------------------------------------------------------------------
+
+_BOT_ME = {"id": 999, "is_bot": True, "first_name": "Bot", "username": "mybot"}
+_SCOPE_999 = hashlib.sha256(b"999").hexdigest()
+
+
+def _spy_state() -> MockStateAdapter:
+    """In-memory state whose ``set_if_not_exists`` records calls."""
+    state = create_mock_state()
+    state.set_if_not_exists = AsyncMock(side_effect=state.set_if_not_exists)  # type: ignore[method-assign]
+    return state
+
+
+def _mock_chat(state: MockStateAdapter) -> MagicMock:
+    chat = MagicMock()
+    chat.process_message = MagicMock()
+    chat.process_action = MagicMock()
+    chat.get_state = MagicMock(return_value=state)
+    chat.get_user_name = MagicMock(return_value="mybot")
+    return chat
+
+
+def _dedupe_adapter(*, get_me: Any = None, **overrides: Any) -> TelegramAdapter:
+    config: dict[str, Any] = {
+        "bot_token": "token",
+        "mode": "webhook",
+        "secret_token": "secret",
+        "user_name": "mybot",
+    }
+    config.update(overrides)
+    adapter = TelegramAdapter(TelegramAdapterConfig(**config))
+    adapter.telegram_fetch = get_me if get_me is not None else AsyncMock(return_value=dict(_BOT_ME))  # type: ignore[method-assign]
+    return adapter
+
+
+def _update_request(update: dict[str, Any], *, secret_token: str | None = "secret") -> _FakeRequest:
+    return _make_request(json.dumps(update), secret_token=secret_token)
+
+
+class TestTelegramWebhookUpdateDeduplication:
+    """Ports of the upstream webhook verification / dedupe cases."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Adapters here resolve secret/opt-out from TELEGRAM_* when a config
+        # value is None; keep a developer's exported vars out of the result.
+        _clear_telegram_env(monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_sequential_and_concurrent_webhook_updates(self):
+        state = _spy_state()
+        adapters = [_dedupe_adapter(), _dedupe_adapter()]
+        chats = [_mock_chat(state), _mock_chat(state)]
+        await asyncio.gather(*(a.initialize(c) for a, c in zip(adapters, chats, strict=True)))
+
+        def dispatch_count() -> int:
+            return sum(c.process_message.call_count for c in chats)
+
+        first = await adapters[0].handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}))
+        duplicate = await adapters[1].handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}))
+        assert first["status"] == 200
+        assert duplicate["status"] == 200
+        assert dispatch_count() == 1
+
+        concurrent = await asyncio.gather(
+            *(a.handle_webhook(_update_request({"update_id": 2, "message": _sample_message()})) for a in adapters)
+        )
+        assert [r["status"] for r in concurrent] == [200, 200]
+        assert dispatch_count() == 2
+
+    @pytest.mark.asyncio
+    async def test_dispatches_distinct_and_missing_webhook_update_ids(self):
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        updates = [
+            {"update_id": 1, "message": _sample_message()},
+            {"update_id": 2, "message": _sample_message()},
+            {"message": _sample_message()},
+        ]
+        await asyncio.gather(*(adapter.handle_webhook(_update_request(u)) for u in updates))
+
+        assert chat.process_message.call_count == 3
+        assert state.set_if_not_exists.await_count == 2
+        state.set_if_not_exists.assert_any_await(f"telegram:webhook-update:{_SCOPE_999}:1", True, 86_400_000)
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_explicitly_allowed_unverified_updates(self):
+        state = _spy_state()
+        chat = _mock_chat(state)
+        adapter = _dedupe_adapter(secret_token=None, allow_unverified_webhooks=True)
+        await adapter.initialize(chat)
+
+        await adapter.handle_webhook(_update_request({"update_id": 1}, secret_token=None))
+        await adapter.handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}, secret_token=None))
+
+        chat.process_message.assert_not_called()
+        assert state.set_if_not_exists.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_scopes_webhook_update_claims_by_bot_identity(self):
+        state = _spy_state()
+        adapters = [
+            _dedupe_adapter(bot_token="token-a", get_me=AsyncMock(return_value={**_BOT_ME, "id": 100})),
+            _dedupe_adapter(bot_token="token-b", get_me=AsyncMock(return_value={**_BOT_ME, "id": 200})),
+        ]
+        chats = [_mock_chat(state), _mock_chat(state)]
+        await asyncio.gather(*(a.initialize(c) for a, c in zip(adapters, chats, strict=True)))
+
+        await asyncio.gather(
+            *(a.handle_webhook(_update_request({"update_id": 1, "message": _sample_message()})) for a in adapters)
+        )
+
+        assert sum(c.process_message.call_count for c in chats) == 2
+        keys = {call.args[0] for call in state.set_if_not_exists.await_args_list}
+        assert keys == {
+            f"telegram:webhook-update:{hashlib.sha256(b'100').hexdigest()}:1",
+            f"telegram:webhook-update:{hashlib.sha256(b'200').hexdigest()}:1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_returns_503_without_dispatch_when_the_deduplication_state_fails(self):
+        state = create_mock_state()
+        state.set_if_not_exists = AsyncMock(side_effect=RuntimeError("state unavailable"))  # type: ignore[method-assign]
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}))
+
+        assert response["status"] == 503
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_unverified_callback_queries_before_dispatch(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        adapter = _dedupe_adapter(allow_unverified_webhooks=False, mode="auto", secret_token=None)
+        chat = _mock_chat(_spy_state())
+        adapter._chat = chat
+
+        response = await adapter.handle_webhook(
+            _update_request(
+                {
+                    "update_id": 2,
+                    "callback_query": {
+                        "id": "callback-1",
+                        "from": {"id": 456, "is_bot": False, "first_name": "User", "username": "user"},
+                        "message": _sample_message(),
+                        "chat_instance": "ci_1",
+                        "data": encode_telegram_callback_data("eve_input", "request-123"),
+                    },
+                },
+                secret_token=None,
+            )
+        )
+
+        assert response["status"] == 401
+        chat.process_action.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_mode_requires_verification_when_a_webhook_is_registered(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        responses = {
+            "getMe": dict(_BOT_ME),
+            "getWebhookInfo": {
+                "allowed_updates": [],
+                "has_custom_certificate": False,
+                "pending_update_count": 0,
+                "url": "https://example.com/webhook/telegram",
+            },
+        }
+        get_me = AsyncMock(side_effect=lambda method, *args, **kwargs: responses[method])
+        adapter = _dedupe_adapter(get_me=get_me, allow_unverified_webhooks=False, mode="auto", secret_token=None)
+
+        with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
+            await adapter.initialize(_mock_chat(_spy_state()))
+        assert [c.args[0] for c in get_me.await_args_list] == ["getMe", "getWebhookInfo"]
+        assert adapter.is_polling is False
+
+    # -- describe("bot token resolver"): scope assertions, static tokens ----
+
+    @pytest.mark.asyncio
+    async def test_scopes_webhook_deduplication_with_the_stable_bot_identity(self):
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        await adapter.initialize(_mock_chat(state))
+
+        await adapter.handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}))
+
+        state.set_if_not_exists.assert_awaited_once_with(f"telegram:webhook-update:{_SCOPE_999}:1", True, 86_400_000)
+
+    @pytest.mark.asyncio
+    async def test_keeps_the_webhook_scope_stable_across_token_rotation_and_instances(self):
+        state = _spy_state()
+        adapters = [_dedupe_adapter(bot_token=token) for token in ("rotated-token-a", "rotated-token-b")]
+        chats = [_mock_chat(state) for _ in adapters]
+        await asyncio.gather(*(a.initialize(c) for a, c in zip(adapters, chats, strict=True)))
+
+        await asyncio.gather(*(a.handle_webhook(_update_request({"update_id": 1})) for a in adapters))
+
+        keys = [call.args[0] for call in state.set_if_not_exists.await_args_list]
+        assert len(keys) == 2
+        assert set(keys) == {f"telegram:webhook-update:{_SCOPE_999}:1"}
+
+    @pytest.mark.asyncio
+    async def test_retries_bot_identity_resolution_on_a_later_webhook(self):
+        get_me = AsyncMock(side_effect=[NetworkError("telegram", "temporary getMe failure"), dict(_BOT_ME)])
+        state = _spy_state()
+        adapter = _dedupe_adapter(get_me=get_me)
+        await adapter.initialize(_mock_chat(state))
+        assert adapter.bot_user_id is None
+
+        assert (await adapter.handle_webhook(_update_request({"update_id": 1})))["status"] == 200
+        assert (await adapter.handle_webhook(_update_request({"update_id": 2})))["status"] == 200
+
+        state.set_if_not_exists.assert_any_await(f"telegram:webhook-update:{_SCOPE_999}:1", True, 86_400_000)
+        assert get_me.await_count == 2
+        assert adapter.bot_user_id == "999"
+
+
+class TestTelegramWebhookDeduplicationPythonEdges:
+    """Python-specific edges of the upstream dedupe port."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Adapters here resolve secret/opt-out from TELEGRAM_* when a config
+        # value is None; keep a developer's exported vars out of the result.
+        _clear_telegram_env(monkeypatch)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("update_id", [True, False, "1", 1.5, None])
+    async def test_non_integer_update_ids_are_dispatched_without_a_claim(self, update_id: Any):
+        # ``Number.isInteger`` parity: ``bool`` is an ``int`` subclass in Python
+        # but must not be claimed; strings/fractional floats/null skip the claim too.
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_update_request({"update_id": update_id, "message": _sample_message()}))
+
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+        state.set_if_not_exists.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_integral_float_update_ids_share_the_integer_claim_key(self):
+        # ``Number.isInteger(7.0)`` is true in JS and ``${7.0}`` renders "7", so
+        # upstream dedupes ``7`` / ``7.0`` / ``7e0`` as one update. ``json.loads``
+        # keeps the latter two as floats; they must normalise to the same key.
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+        message = json.dumps(_sample_message())
+
+        statuses = [
+            (
+                await adapter.handle_webhook(
+                    _make_request(f'{{"update_id": {raw}, "message": {message}}}', secret_token="secret")
+                )
+            )["status"]
+            for raw in ("7", "7.0", "7e0")
+        ]
+
+        assert statuses == [200, 200, 200]
+        assert chat.process_message.call_count == 1
+        key = f"telegram:webhook-update:{_SCOPE_999}:7"
+        assert [c.args[0] for c in state.set_if_not_exists.await_args_list] == [key, key, key]
+
+    @pytest.mark.asyncio
+    async def test_authenticated_non_object_body_is_acknowledged_without_raising(self):
+        # A verified body that parses to a JSON array has no ``update_id`` and
+        # makes ``process_update`` fail; the failure log must not itself raise
+        # (``list.get``) — upstream reads ``update.update_id`` as undefined.
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_make_request("[1]", secret_token="secret"))
+
+        assert response["status"] == 200
+        chat.process_message.assert_not_called()
+        state.set_if_not_exists.assert_not_awaited()
+
+    @pytest.mark.parametrize("value", ["false", "true", 0, 1])
+    def test_non_bool_allow_unverified_webhooks_is_rejected(self, value: Any):
+        # ``bool("false")`` is True: coercing would silently disable
+        # verification, so a non-bool opt-out fails loudly instead.
+        with pytest.raises(ValidationError, match="allow_unverified_webhooks must be a bool"):
+            TelegramAdapter(
+                TelegramAdapterConfig(bot_token="t", mode="webhook", secret_token=None, allow_unverified_webhooks=value)
+            )
+
+    @pytest.mark.asyncio
+    async def test_returns_503_without_dispatch_when_bot_identity_cannot_be_resolved(self):
+        get_me = AsyncMock(side_effect=NetworkError("telegram", "getMe unavailable"))
+        state = _spy_state()
+        adapter = _dedupe_adapter(get_me=get_me)
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_update_request({"update_id": 1, "message": _sample_message()}))
+
+        assert response["status"] == 503
+        chat.process_message.assert_not_called()
+        state.set_if_not_exists.assert_not_awaited()
+        # initialize + the webhook each attempted getMe: a failure is not cached.
+        assert get_me.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_identity_waiters_share_one_get_me_call(self):
+        release = asyncio.Event()
+
+        async def slow_get_me(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            await release.wait()
+            return dict(_BOT_ME)
+
+        get_me = AsyncMock(side_effect=slow_get_me)
+        adapter = _dedupe_adapter(get_me=get_me)
+        waiters = [asyncio.get_running_loop().create_task(adapter._ensure_bot_identity()) for _ in range(3)]
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(*waiters)
+
+        assert get_me.await_count == 1
+        assert adapter._webhook_scope == _SCOPE_999
+        assert adapter._bot_identity_task is None
+
+    @pytest.mark.asyncio
+    async def test_cancelling_one_identity_waiter_leaves_the_other_resolved(self):
+        release = asyncio.Event()
+
+        async def slow_get_me(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            await release.wait()
+            return dict(_BOT_ME)
+
+        get_me = AsyncMock(side_effect=slow_get_me)
+        adapter = _dedupe_adapter(get_me=get_me)
+        cancelled = asyncio.get_running_loop().create_task(adapter._ensure_bot_identity())
+        survivor = asyncio.get_running_loop().create_task(adapter._ensure_bot_identity())
+        await asyncio.sleep(0)
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        release.set()
+        await survivor
+
+        assert get_me.await_count == 1
+        assert adapter.bot_user_id == "999"
+        assert adapter._webhook_scope == _SCOPE_999
+
+    @pytest.mark.asyncio
+    async def test_reinitialize_keeps_the_get_me_username_over_the_chat_name(self):
+        # The cached identity skips ``getMe`` on a second ``initialize``
+        # (``Chat.shutdown`` + ``Chat.initialize``); the Telegram username must
+        # still win over ``Chat.user_name`` so ``/ping@real_bot`` keeps routing.
+        get_me = AsyncMock(return_value={**_BOT_ME, "username": "real_bot"})
+        adapter = _dedupe_adapter(get_me=get_me, user_name=None)
+        chat = _mock_chat(_spy_state())
+        chat.get_user_name = MagicMock(return_value="chat_level_name")
+
+        await adapter.initialize(chat)
+        await adapter.initialize(chat)
+
+        assert get_me.await_count == 1
+        assert adapter.user_name == "real_bot"
+        await adapter.handle_webhook(
+            _update_request(
+                {
+                    "update_id": 1,
+                    "message": _sample_message(
+                        text="/ping@real_bot hi",
+                        entities=[{"type": "bot_command", "offset": 0, "length": 14}],
+                    ),
+                }
+            )
+        )
+        chat.process_slash_command.assert_called_once()
+        assert chat.process_slash_command.call_args.args[0].command == "/ping"
+
+    def test_positional_config_arguments_keep_their_pre_opt_out_binding(self):
+        # ``allow_unverified_webhooks`` is appended last so existing positional
+        # callers (api_base_url, bot_token, logger, long_polling, mode, ...)
+        # are not shifted by the new field.
+        config = TelegramAdapterConfig(None, "token", None, None, "polling", "secret", "named_bot")
+
+        assert config.api_base_url is None
+        assert config.bot_token == "token"
+        assert config.mode == "polling"
+        assert config.secret_token == "secret"
+        assert config.user_name == "named_bot"
+        assert config.allow_unverified_webhooks is None
+
+    @pytest.mark.asyncio
+    async def test_polling_mode_initialize_does_not_require_verification(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", raising=False)
+        adapter = _dedupe_adapter(mode="polling", secret_token=None)
+        adapter.start_polling = AsyncMock()  # type: ignore[method-assign]
+
+        await adapter.initialize(_mock_chat(_spy_state()))
+
+        assert adapter.runtime_mode == "polling"
+        adapter.start_polling.assert_awaited_once()
