@@ -153,9 +153,21 @@ class TestTeamsPublicApiSurvivesLazyInit:
         assert teams_pkg.__all__ == [
             "TeamsAdapter",
             "TeamsAdapterConfig",
+            "TeamsAppIdResolver",
             "TeamsAuthCertificate",
+            "TeamsTokenFactory",
+            "TeamsWebhookVerifier",
             "create_teams_adapter",
         ]
+
+    def test_auth_extension_aliases_resolve_from_package_root(self) -> None:
+        # Upstream exports ``TeamsWebhookVerifier`` from the package entry point
+        # (chat@4.41.0); the token-factory / app-id-resolver aliases ride along.
+        import chat_sdk.adapters.teams as teams_pkg
+        from chat_sdk.adapters.teams import types as teams_types
+
+        for name in ("TeamsAppIdResolver", "TeamsTokenFactory", "TeamsWebhookVerifier"):
+            assert getattr(teams_pkg, name) is getattr(teams_types, name)
 
     def test_unknown_attribute_raises_attribute_error(self) -> None:
         import chat_sdk.adapters.teams as teams_pkg

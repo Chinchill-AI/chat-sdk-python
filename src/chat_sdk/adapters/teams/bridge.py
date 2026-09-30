@@ -18,6 +18,11 @@ inbound event handler can recover the ``WebhookOptions`` (e.g. ``wait_until``)
 that belong to *its* activity without sharing mutable state across concurrent
 webhooks. Options are keyed by the activity ``id`` for the duration of a single
 dispatch and removed in the ``finally`` block.
+
+An optional ``webhook_verifier`` (upstream ``TeamsWebhookVerifier``, chat@4.41.0)
+replaces the SDK's JWT validation: it is called with the request and the exact
+raw body **before** the body is parsed, and a falsy result or a raise answers
+``401`` without reaching the SDK handler.
 """
 
 from __future__ import annotations
@@ -52,9 +57,13 @@ class BridgeHttpAdapter:
     def __init__(
         self,
         logger: Logger,
+        webhook_verifier: Callable[[Any, str], Any] | None = None,
         reject_before_auth: Callable[[dict[str, str]], bool] | None = None,
     ) -> None:
         """Create the bridge.
+
+        ``webhook_verifier`` (upstream ``TeamsWebhookVerifier``) replaces the
+        SDK's JWT validation; see the module docstring.
 
         ``reject_before_auth`` (Python-only, #250) is called with the request
         headers before the SDK route handler runs. When it returns ``True`` the
@@ -65,6 +74,7 @@ class BridgeHttpAdapter:
         self._handler: HttpRouteHandler | None = None
         self._webhook_options: dict[str, WebhookOptions] = {}
         self._logger = logger
+        self._webhook_verifier = webhook_verifier
         self._reject_before_auth = reject_before_auth
 
     # ------------------------------------------------------------------
@@ -106,17 +116,23 @@ class BridgeHttpAdapter:
         """Dispatch a framework-agnostic webhook request through the SDK.
 
         Extracts the raw body + headers from ``request`` (duck-typed across
-        web frameworks), parses the JSON activity, records ``options`` keyed
-        by the activity ``id``, then invokes the captured SDK route handler.
-        The SDK handler performs JWT validation and activity routing; its
-        ``{status, body}`` result is translated back into the
-        ``{body, status, headers}`` dict our consumers expect.
+        web frameworks), runs the optional ``webhook_verifier`` on the exact
+        raw body, parses the JSON activity, records ``options`` keyed by the
+        activity ``id``, then invokes the captured SDK route handler. The SDK
+        handler performs JWT validation (unless a verifier replaced it) and
+        activity routing; its ``{status, body}`` result is translated back
+        into the ``{body, status, headers}`` dict our consumers expect.
         """
         body = await self._read_body(request)
         self._logger.debug("Teams webhook received", {"bodyLength": utf8_byte_length(body)})
 
+        if self._webhook_verifier is not None and not await self._verify(request, body):
+            return _make_response("Unauthorized", 401, content_type="text/plain")
+
         try:
-            parsed_body: Any = json.loads(body) if body else {}
+            # No empty-body fallback: like upstream's ``JSON.parse(body)``, an
+            # empty body is invalid JSON (``400``) rather than an empty activity.
+            parsed_body: Any = json.loads(body)
         except (json.JSONDecodeError, ValueError) as exc:
             self._logger.error("Failed to parse request body", {"error": str(exc)})
             return _make_response("Invalid JSON", 400, content_type="text/plain")
@@ -167,6 +183,20 @@ class BridgeHttpAdapter:
         finally:
             if activity_id:
                 self._webhook_options.pop(activity_id, None)
+
+    async def _verify(self, request: Any, body: str) -> bool:
+        """Run the configured verifier; any raise (sync or async) rejects."""
+        verifier = self._webhook_verifier
+        if verifier is None:  # pragma: no cover - dispatch checks first
+            return True
+        try:
+            result = verifier(request, body)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as error:
+            self._logger.debug("Teams webhook verifier rejected the request", {"error": str(error)})
+            return False
+        return bool(result)
 
     def get_webhook_options(self, activity_id: str | None) -> WebhookOptions | None:
         """Recover the ``WebhookOptions`` recorded for ``activity_id``.

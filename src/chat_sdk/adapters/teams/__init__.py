@@ -21,7 +21,10 @@ if TYPE_CHECKING:
     from chat_sdk.adapters.teams.adapter import TeamsAdapter as TeamsAdapter
     from chat_sdk.adapters.teams.adapter import create_teams_adapter as create_teams_adapter
     from chat_sdk.adapters.teams.types import TeamsAdapterConfig as TeamsAdapterConfig
+    from chat_sdk.adapters.teams.types import TeamsAppIdResolver as TeamsAppIdResolver
     from chat_sdk.adapters.teams.types import TeamsAuthCertificate as TeamsAuthCertificate
+    from chat_sdk.adapters.teams.types import TeamsTokenFactory as TeamsTokenFactory
+    from chat_sdk.adapters.teams.types import TeamsWebhookVerifier as TeamsWebhookVerifier
 
 # Maps each public export to the module that defines it. Resolving lazily
 # keeps the primitive subpaths free of the adapter/SDK runtime.
@@ -30,12 +33,20 @@ _EXPORT_MODULES: dict[str, str] = {
     "create_teams_adapter": "chat_sdk.adapters.teams.adapter",
     "TeamsAdapterConfig": "chat_sdk.adapters.teams.types",
     "TeamsAuthCertificate": "chat_sdk.adapters.teams.types",
+    # Auth extension-point aliases (upstream exports ``TeamsWebhookVerifier``
+    # from the package entry point since chat@4.41.0).
+    "TeamsAppIdResolver": "chat_sdk.adapters.teams.types",
+    "TeamsTokenFactory": "chat_sdk.adapters.teams.types",
+    "TeamsWebhookVerifier": "chat_sdk.adapters.teams.types",
 }
 
 __all__ = [
     "TeamsAdapter",
     "TeamsAdapterConfig",
+    "TeamsAppIdResolver",
     "TeamsAuthCertificate",
+    "TeamsTokenFactory",
+    "TeamsWebhookVerifier",
     "create_teams_adapter",
 ]
 
