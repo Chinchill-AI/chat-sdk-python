@@ -1524,7 +1524,7 @@ class TestTelegramWebhookDeduplicationPythonEdges:
 
         get_me = AsyncMock(side_effect=slow_get_me)
         adapter = _dedupe_adapter(get_me=get_me)
-        waiters = [asyncio.ensure_future(adapter._ensure_bot_identity()) for _ in range(3)]
+        waiters = [asyncio.get_running_loop().create_task(adapter._ensure_bot_identity()) for _ in range(3)]
         await asyncio.sleep(0)
         release.set()
         await asyncio.gather(*waiters)
@@ -1543,8 +1543,8 @@ class TestTelegramWebhookDeduplicationPythonEdges:
 
         get_me = AsyncMock(side_effect=slow_get_me)
         adapter = _dedupe_adapter(get_me=get_me)
-        cancelled = asyncio.ensure_future(adapter._ensure_bot_identity())
-        survivor = asyncio.ensure_future(adapter._ensure_bot_identity())
+        cancelled = asyncio.get_running_loop().create_task(adapter._ensure_bot_identity())
+        survivor = asyncio.get_running_loop().create_task(adapter._ensure_bot_identity())
         await asyncio.sleep(0)
 
         cancelled.cancel()

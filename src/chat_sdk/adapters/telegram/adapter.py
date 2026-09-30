@@ -820,7 +820,7 @@ class TelegramAdapter:
         # clearing callback has not run yet (success sets the scope above):
         # start a fresh lookup rather than re-raising the stale failure.
         if task is None or task.done():
-            task = asyncio.ensure_future(self._fetch_bot_identity())
+            task = asyncio.get_running_loop().create_task(self._fetch_bot_identity())
             self._bot_identity_task = task
 
             def _clear(done: asyncio.Task[None]) -> None:
