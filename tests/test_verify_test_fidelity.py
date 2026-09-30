@@ -351,6 +351,60 @@ it("after division", () => {});
 
 
 @pytest.mark.parametrize(
+    "stmt",
+    ["if (enabled) /`/.test(value);", "while (next()) /`/.exec(s);", "for (;;) /`/g.test(v);", "} /`/.test(v);"],
+    ids=["if", "while", "for", "after-block"],
+)
+def test_regex_after_control_flow_parens_does_not_mask_later_tests(vtf, tmp_path, stmt):
+    # After ``if (…)`` a ``/`` starts a regex, not a division; lexing it as
+    # division would open a template at the backtick and hide the test.
+    source = f'{stmt}\nit("after the regex", () => {{}});\nconst t = `x`;\n'
+    warnings: list[str] = []
+    assert [t.ts_name for t in _extract(vtf, tmp_path, source, warnings)] == ["after the regex"]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("source", "warning"),
+    [
+        ('it("a", () => {});\nconst s = `never closed;\nit("b", () => {});\n', ":2: could not lex the file"),
+        ('it("a", () => {});\n/* never closed\nit("b", () => {});\n', ":2: could not lex the file"),
+        ('it("a", () => {});\nconst s = `${x;\nit("b", () => {});\n', ":2: could not lex the file"),
+    ],
+    ids=["template", "block-comment", "interpolation"],
+)
+def test_unterminated_literal_fails_closed_instead_of_masking_the_rest(vtf, tmp_path, source, warning):
+    warnings: list[str] = []
+    tests = _extract(vtf, tmp_path, source, warnings)
+    assert [t.ts_name for t in tests] == ["a", "b"]  # scanned as code, as before the lexer
+    assert len(warnings) == 1 and warning in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("source", "label"),
+    [
+        ('it.each([[1]])("rejects " + kind + " %s", () => {});', "it.each"),
+        ('it("rejects " + kind, () => {});', "it"),
+        ("test('rejects ' + kind, () => {});", "test"),
+        ('it.skipIf(c)("rejects " + kind, () => {});', "it.skipIf"),
+    ],
+    ids=["each", "plain", "single-quoted", "skipIf"],
+)
+def test_computed_title_is_unextractable_not_its_literal_prefix(vtf, tmp_path, source, label):
+    warnings: list[str] = []
+    assert _extract(vtf, tmp_path, source + "\n", warnings) == []
+    assert len(warnings) == 1 and warnings[0].endswith(f":1: could not extract {label} title")
+
+
+def test_literal_title_followed_by_whitespace_or_paren_still_extracted(vtf, tmp_path):
+    source = 'it("spaced" , () => {});\ntest("no callback");\nit.each([[1]])("each %s"\n  , () => {});\n'
+    warnings: list[str] = []
+    tests = _extract(vtf, tmp_path, source, warnings)
+    assert [t.ts_name for t in tests] == ["spaced", "no callback", "each %s"]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
     "source",
     [
         'describe.only("suite", () => { it("works", () => {}); });',

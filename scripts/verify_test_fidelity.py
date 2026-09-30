@@ -276,8 +276,9 @@ def _read_call_title(src: str, end: int) -> str | None:
     """Return the string-literal first argument of the call opening at ``src[end:]``.
 
     ``src[end:]`` must start (after whitespace) with ``(``. Returns None when
-    the first argument is not a string literal, or is a template literal
-    with ``${…}`` interpolation.
+    the first argument is not a string literal, is a template literal with
+    ``${…}`` interpolation, or is computed from one (``"rejects " + kind``):
+    the literal must be followed by ``,`` or ``)``.
     """
     m = _CALL_OPEN_RE.match(src, end)
     if not m:
@@ -288,10 +289,18 @@ def _read_call_title(src: str, end: int) -> str | None:
     close = _skip_string(src, j)
     if close < 0:
         return None
+    if not _ends_argument(src, close):
+        return None
     raw = src[j + 1 : close - 1]
     if src[j] == "`" and "${" in raw:
         return None
     return re.sub(r"\\(.)", r"\1", raw)
+
+
+def _ends_argument(src: str, i: int) -> bool:
+    """True if ``src[i:]`` (after whitespace) closes a call argument: ``,`` or ``)``."""
+    j = _WS_RE.match(src, i).end()
+    return j < len(src) and src[j] in ",)"
 
 
 def _skip_type_args(src: str, i: int) -> int:
@@ -319,12 +328,23 @@ def _skip_type_args(src: str, i: int) -> int:
 
 
 # A ``/`` after one of these (or at the start of the file) opens a regex
-# literal; after an identifier, number, ``)`` or ``]`` it is division.
+# literal; after an identifier, number, ``]`` or an expression's ``)`` it
+# is division. The ``)`` closing ``if (…)`` / ``while (…)`` / ``for (…)`` /
+# ``with (…)`` starts a statement, so a ``/`` after it opens a regex.
 _REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%<>~^")
+_CONTROL_KEYWORDS = frozenset({"if", "while", "for", "with"})
 _REGEX_KEYWORDS = frozenset(
     {"return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "yield", "await"}
 )
 _WORD_RE = re.compile(r"[A-Za-z_$][\w$]*|\d[\w.]*")
+
+
+class LexError(ValueError):
+    """``code_mask`` could not lex the source; ``pos`` is where the bad construct starts."""
+
+    def __init__(self, message: str, pos: int) -> None:
+        super().__init__(message)
+        self.pos = pos
 
 
 def code_mask(src: str) -> bytearray:
@@ -336,13 +356,17 @@ def code_mask(src: str) -> bytearray:
     ``'test("x")'`` fixture string or a commented-out ``// it.each(…)`` is
     neither counted nor reported as unextractable. Single-line strings and
     regex literals end at a newline at the latest, so a mis-lexed quote
-    can mask at most the rest of its line.
+    can mask at most the rest of its line. A template literal, ``${…}`` or
+    block comment still open at end of file raises ``LexError`` rather than
+    silently masking everything after it.
     """
     n = len(src)
     mask = bytearray(b"\x01") * n
     depths = [0]  # ``{`` depth per code context; one extra entry per open ``${``
+    parens: list[bool] = []  # per open ``(``: does it follow ``if``/``while``/``for``/``with``?
     prev = ""  # last code token: a punctuator character or a whole word
     in_template = False
+    template_start = 0
     i = 0
     while i < n:
         if in_template:
@@ -361,6 +385,8 @@ def code_mask(src: str) -> bytearray:
                     break
                 else:
                     i += 1
+            if i >= n and in_template:
+                raise LexError("unterminated template literal", template_start)
             i = min(i, n)
             mask[start:i] = bytes(i - start)
             continue
@@ -377,13 +403,16 @@ def code_mask(src: str) -> bytearray:
             prev = ")"
         elif c == "`":
             in_template = True
+            template_start = i
             i += 1
         elif src.startswith("//", i):
             nl = src.find("\n", i)
             i = n if nl < 0 else nl
         elif src.startswith("/*", i):
             end = src.find("*/", i + 2)
-            i = n if end < 0 else end + 2
+            if end < 0:
+                raise LexError("unterminated block comment", i)
+            i = end + 2
         elif c == "/" and (prev == "" or prev in _REGEX_PRECEDERS or prev in _REGEX_KEYWORDS):
             i += 1
             in_class = False
@@ -409,7 +438,13 @@ def code_mask(src: str) -> bytearray:
                 prev = word.group()
                 i = word.end()
                 continue
-            if c == "{":
+            if c == "(":
+                parens.append(prev in _CONTROL_KEYWORDS)
+            elif c == ")" and parens and parens.pop():
+                prev = "{"  # end of ``if (…)`` etc.: a statement starts here
+                i += 1
+                continue
+            elif c == "{":
                 depths[-1] += 1
             elif c == "}":
                 if depths[-1] == 0 and len(depths) > 1:
@@ -423,6 +458,8 @@ def code_mask(src: str) -> bytearray:
             i += 1
             continue
         mask[start:i] = bytes(i - start)
+    if len(depths) > 1:
+        raise LexError("unterminated template literal", template_start)
     return mask
 
 
@@ -446,15 +483,22 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
     """
     with open(ts_path, encoding="utf-8") as f:
         content = f.read()
-    mask = code_mask(content)
-
-    tests: list[TsTest] = []
-    current_describe = ""
-    offset = 0
 
     def warn(lineno: int, message: str) -> None:
         if warnings is not None:
             warnings.append(f"{ts_path}:{lineno}: {message}")
+
+    try:
+        mask = code_mask(content)
+    except LexError as exc:
+        # Fail closed: strict/report modes treat the warning as an error.
+        # Scanning everything as code keeps the pre-lexer behavior.
+        warn(content.count("\n", 0, exc.pos) + 1, f"could not lex the file ({exc})")
+        mask = bytearray(b"\x01") * len(content)
+
+    tests: list[TsTest] = []
+    current_describe = ""
+    offset = 0
 
     for lineno, line in enumerate(content.split("\n"), start=1):
         line_start = offset
@@ -497,7 +541,12 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
                     break
                 end = _match_balanced(content, pos)
                 title = _read_call_title(content, end) if end >= 0 else None
-            elif fn != "describe" and not chain and (plain := _PLAIN_TEST_RE.match(line, call.start())):
+            elif (
+                fn != "describe"
+                and not chain
+                and (plain := _PLAIN_TEST_RE.match(line, call.start()))
+                and _ends_argument(content, line_start + plain.end())
+            ):
                 title = plain.group(1)  # the common case, kept byte-for-byte as before
             else:
                 title = _read_call_title(content, pos)

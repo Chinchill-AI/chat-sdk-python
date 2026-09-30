@@ -179,6 +179,9 @@ Infra guardrails:
   Baseline mode only warns. Calls inside comments and string, template or
   regex literals (fixture source, commented-out examples) are ignored, and
   a `describe.only("s", () => { it("t") })` one-liner still yields its test.
+  A template literal or block comment still open at end of file, and a
+  computed title such as `"rejects " + kind`, are extraction errors (so
+  they fail `--strict`) rather than hiding tests or matching a prefix.
 - `--check-docs` (a separate CI step) fails if a clone snippet
   (`--branch chat@X`, `--branch=chat@X`, `-b chat@X`) or a `pinned to
   [the] [vercel/]chat@X` phrase in `CLAUDE.md` or this file disagrees with
