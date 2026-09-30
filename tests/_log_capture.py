@@ -34,6 +34,15 @@ MULTIBYTE_TEXT = "café ☃ 🚀"
 
 _LEVELS = ("debug", "info", "warn", "error")
 
+# Width of the leading / trailing body slices ``assert_body_not_logged``
+# checks. Any ``body[:N]`` preview (the pattern #187 removes) with
+# ``N >= BODY_SLICE_WINDOW`` contains the leading slice, so it is caught even
+# when the payload's first sentinel sits further in; likewise ``body[-N:]``.
+# Mid-body excerpts are caught by the sentinels spread through each payload.
+# (A full sliding window is not used: short JSON fragments legitimately
+# collide with logged identifiers, e.g. a Pub/Sub ``ce-type`` value.)
+BODY_SLICE_WINDOW = 24
+
 
 def _recorded_calls(logger: Any) -> list[Any]:
     mock_calls = getattr(logger, "mock_calls", None)
@@ -63,16 +72,22 @@ def find_logged_sentinels(logger: Any, sentinels: tuple[str, ...] = WEBHOOK_LOG_
     return [s for s in sentinels if s in logged]
 
 
-def assert_body_not_logged(logger: Any, body: str) -> None:
-    """Assert neither the raw body nor any sentinel reached the logger.
+def _escaped(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)[1:-1]
 
-    Checks the body both verbatim and in its JSON-escaped form: a JSON body
+
+def assert_body_not_logged(logger: Any, body: str) -> None:
+    """Assert no sentinel, no raw body and no body preview reached the logger.
+
+    Checks the whole body plus its leading and trailing ``BODY_SLICE_WINDOW``
+    characters, both verbatim and in JSON-escaped form: a JSON body
     stringified inside the serialized calls has its quotes escaped, so a bare
     substring check alone would pass vacuously.
     """
     logged = stringify_logger_calls(logger)
     assert find_logged_sentinels(logger) == []
-    assert body not in logged
-    assert json.dumps(body, ensure_ascii=False)[1:-1] not in logged
+    for fragment in (body, body[:BODY_SLICE_WINDOW], body[-BODY_SLICE_WINDOW:]):
+        assert fragment not in logged, f"body fragment logged: {fragment!r}"
+        assert _escaped(fragment) not in logged, f"body fragment logged (JSON-escaped): {fragment!r}"
     assert "bodyPreview" not in logged
     assert "raw body" not in logged

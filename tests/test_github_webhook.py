@@ -321,6 +321,34 @@ class TestGitHubWebhookLogHygiene:
         assert ("GitHub webhook signature verification failed", _metadata(body)) in logger.debug.calls
         assert_body_not_logged(logger, body)
 
+    # Python-specific (#187 porting hazard): ``signaturePresent`` mirrors
+    # upstream's ``signature !== null`` -- an empty header is still *present*;
+    # only a missing header reports False. Truthiness would get "" wrong.
+    @pytest.mark.parametrize(
+        ("signature", "expected_present"),
+        [(None, False), ("", True)],
+        ids=["missing-header", "empty-header"],
+    )
+    @pytest.mark.asyncio
+    async def test_signature_present_reflects_header_presence_not_truthiness(
+        self, signature: str | None, expected_present: bool
+    ):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        body = json.dumps(_issue_comment_payload())
+        request = _make_request(body, "issue_comment", signature=signature)
+        assert ("x-hub-signature-256" in request.headers) is (signature is not None)
+
+        response = await adapter.handle_webhook(request)
+
+        assert response["status"] == 401
+        assert logger.debug.calls == [
+            (
+                "GitHub webhook signature verification failed",
+                _metadata(body, signaturePresent=expected_present),
+            )
+        ]
+
     # TS: "should not log raw payload content for invalid JSON"
     @pytest.mark.asyncio
     async def test_should_not_log_raw_payload_content_for_invalid_json(self):

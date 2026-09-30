@@ -169,6 +169,43 @@ class TestGoogleChatLogHygiene:
         assert_body_not_logged(logger, body)
 
     @pytest.mark.asyncio
+    async def test_message_event_without_text_logs_zero_text_length(self):
+        # Attachment-only messages carry no ``text`` key; the log line must
+        # not raise (``len(None)``) and turn a valid webhook into a 500.
+        logger = MockLogger()
+        adapter = _make_gchat_adapter(logger)
+        chat = _make_gchat_chat()
+        await adapter.initialize(chat)
+        body = json.dumps(
+            {
+                "chat": {
+                    "messagePayload": {
+                        "space": {"name": "spaces/A", "type": "ROOM"},
+                        "message": {
+                            "name": "spaces/A/messages/msg2",
+                            "sender": {"name": "users/100", "displayName": SENTINEL_NAME, "type": "HUMAN"},
+                            "attachment": [
+                                {
+                                    "name": "spaces/A/messages/msg2/attachments/a1",
+                                    "contentName": "photo.png",
+                                    "contentType": "image/png",
+                                }
+                            ],
+                            "createTime": "2024-01-01T00:00:00Z",
+                        },
+                    },
+                },
+            }
+        )
+
+        response = await adapter.handle_webhook(_TextRequest(body))
+
+        assert response["status"] == 200
+        assert logged_contexts(logger.debug, "message event") == [{"space": "spaces/A", "textLength": 0}]
+        chat.process_message.assert_called_once()
+        assert_body_not_logged(logger, body)
+
+    @pytest.mark.asyncio
     async def test_pubsub_parsed_message_log_has_no_text_or_author(self):
         logger = MockLogger()
         adapter = _make_gchat_adapter(logger)
