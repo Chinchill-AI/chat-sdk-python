@@ -213,6 +213,23 @@ class TestConnectWebhookDispatch:
             "value": "",
         }
 
+    async def test_verifier_replaces_the_bot_framework_issuer_precheck(self) -> None:
+        # Python-only interaction with #250: the issuer pre-check guards the
+        # SDK's JWT validator, which a verifier replaces (skip-auth App). A
+        # verified request carrying a non-Bot-Framework bearer token (here an
+        # Entra-style issuer) must still route, as it does upstream.
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+        claims = {"iss": "https://login.microsoftonline.com/attacker-tenant/v2.0", "exp": int(time.time()) + 3600}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+        adapter = _make_adapter(webhook_verifier=lambda _request, _body: True)
+        chat = _make_chat()
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_Request(headers={"authorization": f"Bearer {header}.{payload}."}))
+
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Lazy Teams identity

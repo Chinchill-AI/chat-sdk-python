@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from urllib.parse import quote, urlparse
 
 if TYPE_CHECKING:
+    from microsoft_teams.api import ConversationReference
     from microsoft_teams.apps import StreamerProtocol
 
 from chat_sdk.adapters.teams.api import _is_loopback_emulator_url
@@ -208,7 +209,7 @@ def _token_precedence_app_class() -> type:
     """Return (building once) the SDK ``App`` subclass that lets ``token`` win.
 
     Divergence from upstream — see docs/UPSTREAM_SYNC.md. The Python Teams SDK's
-    ``App._init_credentials`` (``microsoft-teams-apps`` 2.0.13 – 2.0.16) reads
+    ``App._init_credentials`` (``microsoft-teams-apps`` 2.0.13 – 2.1.x) reads
     ``options.client_secret or os.getenv("CLIENT_SECRET")`` and checks
     ``client_id and client_secret`` *before* ``client_id and token``, so a
     stray ``CLIENT_SECRET`` in the environment would silently beat a configured
@@ -242,7 +243,7 @@ def _sdk_skip_auth_option() -> str:
     ``microsoft-teams-apps`` 2.0.14+ renamed ``skip_auth`` to
     ``dangerously_allow_unauthenticated_requests`` (the old name still works
     but emits a ``DeprecationWarning``); feature-detect so both ends of the
-    supported ``>=2.0.13,<2.1`` range get the right key.
+    supported ``>=2.0.13,<2.2`` range get the right key.
     """
     from microsoft_teams.apps.options import AppOptions
 
@@ -430,7 +431,11 @@ class TeamsAdapter:
         # it reaches the SDK handler, and the App is built with the SDK's
         # skip-auth flag. With a callable ``app_id`` the App is built in
         # ``initialize()`` once the id is resolved (upstream ``createApp``).
-        self._bridge = BridgeHttpAdapter(self._logger, webhook_verifier=config.webhook_verifier)
+        self._bridge = BridgeHttpAdapter(
+            self._logger,
+            webhook_verifier=config.webhook_verifier,
+            reject_before_auth=self._rejects_before_auth,
+        )
         self._app_instance: Any | None = None
         if not callable(config.app_id):
             self._app_instance = self._build_app(config)
@@ -699,6 +704,9 @@ class TeamsAdapter:
         the HTTP response. Card actions (``invoke``) return the Bot Framework
         invoke acknowledgement; everything else returns ``200`` with no body.
         """
+        if not self._is_bot_framework_token(getattr(event, "token", None)):
+            return {"status": 401, "body": {"error": "Unauthorized"}}
+
         activity = self._activity_to_dict(event)
         activity_type = activity.get("type", "")
         self._logger.debug("Teams activity received", {"type": activity_type})
@@ -735,6 +743,92 @@ class TeamsAdapter:
                 }
 
         return {"status": 200, "body": None}
+
+    def _rejects_before_auth(self, headers: dict[str, str]) -> bool:
+        """Return ``True`` to answer 401 before the SDK's JWT validator runs.
+
+        ``microsoft-teams-apps`` 2.0.x validates inbound activities against the
+        Bot Framework issuer only (``TokenValidator.for_service``). 2.1.x
+        switched to ``InboundActivityTokenValidator``, which picks its branch
+        from the token's *unverified* ``iss``. An Entra-looking issuer
+        (``login.microsoftonline.com/...`` or ``sts.windows.net/...``) sends it
+        down the Agent 365 "Agent ID" branch: it builds a per-``tid`` Entra
+        validator and fetches that tenant's JWKS (a blocking HTTP call), and it
+        accepts any tenant's Entra token whose audience is our app id, without
+        the Bot Framework ``serviceurl`` claim check. This adapter does not
+        support Agent ID activities, so lifting the ``<2.1`` cap (#250) must
+        not widen who can deliver activities, nor let an unauthenticated
+        request pick which JWKS the bot fetches.
+
+        We therefore read the Bearer token's unverified ``iss`` here and reject
+        anything but the cloud's Bot Framework issuer. A token that passes still
+        goes through the SDK's full validation (signature, audience, expiry,
+        ``serviceurl``), so this only narrows. On 2.0.x the SDK would reject
+        the same tokens after fetching the fixed Bot Framework JWKS.
+
+        Requests without a ``Bearer`` Authorization header, and every request
+        in ``dangerously_allow_unauthenticated_requests`` mode (where the SDK
+        ignores the header), are left to the SDK unchanged. That includes a
+        configured ``webhook_verifier``: the App is then built with that flag
+        and the bridge has already run the verifier, which replaces the SDK's
+        JWT validation (and so this pre-check) entirely.
+        """
+        if self._auth_disabled():
+            return False
+        authorization = headers.get("authorization") or headers.get("Authorization") or ""
+        if not authorization.startswith("Bearer "):
+            return False
+        import jwt
+
+        try:
+            claims = jwt.decode(authorization.removeprefix("Bearer "), options={"verify_signature": False})
+        except jwt.InvalidTokenError:
+            # Unreadable token: the SDK would reject it too. Its issuer is not
+            # the Bot Framework's, so reject here without touching the SDK.
+            claims = {}
+        return not self._is_bot_framework_issuer(claims.get("iss"))
+
+    def _auth_disabled(self) -> bool:
+        """Whether the SDK App skips inbound JWT validation.
+
+        ``dangerously_allow_unauthenticated_requests`` on 2.0.14+ (set from the
+        option or the SDK's env var), ``skip_auth`` on 2.0.13.
+        """
+        options = self._app.options
+        allow = getattr(options, "dangerously_allow_unauthenticated_requests", None)
+        if allow is None:
+            allow = getattr(options, "skip_auth", False)
+        return bool(allow)
+
+    def _is_bot_framework_token(self, token: Any) -> bool:
+        """Return ``False`` for a validated inbound token not issued by the Bot Framework.
+
+        Defence in depth behind :meth:`_rejects_before_auth`, which already
+        turns such tokens away before validation: the same issuer rule, applied
+        to the token the SDK validated, in case a request ever reaches
+        :meth:`_dispatch_activity` without passing the bridge's pre-check.
+
+        Only a ``JsonWebToken`` is checked: the SDK wraps every token it
+        validated in one. In ``dangerously_allow_unauthenticated_requests``
+        mode the SDK passes a placeholder token instead, and that mode is left
+        as the SDK defines it.
+        """
+        from microsoft_teams.api import JsonWebToken
+
+        if not isinstance(token, JsonWebToken):
+            return True
+        return self._is_bot_framework_issuer(token.issuer)
+
+    def _is_bot_framework_issuer(self, issuer: Any) -> bool:
+        """Whether ``issuer`` is this cloud's Bot Framework token issuer; logs a rejection."""
+        expected = self._app.cloud.token_issuer
+        if issuer == expected:
+            return True
+        self._logger.warn(
+            "Teams activity rejected: inbound token was not issued by the Bot Framework",
+            {"issuer": issuer, "expectedIssuer": expected},
+        )
+        return False
 
     @staticmethod
     def _activity_to_dict(event: Any) -> dict[str, Any]:
@@ -1088,12 +1182,24 @@ class TeamsAdapter:
 
         Builds the :class:`ConversationReference` the streamer needs from the
         inbound activity (``recipient`` → bot account, ``conversation``,
-        ``channelId``, ``serviceUrl``) and hands it to the SDK's
-        ``ActivitySender.create_stream`` — the same call the SDK's own
-        ``ActivityContext`` makes to expose ``ctx.stream``. The returned
-        ``HttpStream`` owns the Bot Framework streaming wire format
+        ``channelId``, ``serviceUrl``) and builds the stream the same way the
+        installed SDK's own ``ActivityContext`` builds ``ctx.stream``. The
+        returned ``HttpStream`` owns the Bot Framework streaming wire format
         (``streamType``/``streamSequence``/``streamId``), the per-flush
         throttle, and 429 retry/backoff. We never poke its internals.
+
+        Supports both SDK lines by feature detection (not version sniffing):
+
+        * ``microsoft-teams-apps`` 2.0.x exposes ``App.activity_sender``;
+          ``ActivitySender.create_stream(ref)`` builds a fresh ``ApiClient``
+          on ``ref.service_url``.
+        * 2.1.x removed ``ActivitySender``. ``ActivityContext.stream`` now
+          calls ``HttpStream(app.api, ref)`` directly, and ``HttpStream``
+          scopes its own client with ``api.from_service_url(ref.service_url)``.
+
+        Either way the stream gets its own client pinned to the inbound
+        activity's service URL, so a later :meth:`_point_app_api_at` (which
+        retargets the shared ``App.api`` in place) cannot move it.
 
         Returns ``None`` when the activity lacks the fields the SDK ref
         requires (``serviceUrl``), so the caller can fall back to
@@ -1107,13 +1213,39 @@ class TeamsAdapter:
         try:
             _validate_service_url(service_url)
             ref = build_conversation_reference(activity, bot_app_id=self._app_id)
-            return self._app.activity_sender.create_stream(ref)
+            activity_sender = getattr(self._app, "activity_sender", None)
+            if activity_sender is not None:
+                # microsoft-teams-apps 2.0.x
+                return activity_sender.create_stream(ref)
+            # microsoft-teams-apps 2.1+: no ActivitySender.
+            return self._new_http_stream(ref)
         except Exception as exc:
             self._logger.warn(
                 "Failed to create Teams streamer; falling back to buffered post",
                 {"threadId": thread_id, "error": str(exc)},
             )
             return None
+
+    def _new_http_stream(self, ref: ConversationReference) -> StreamerProtocol:
+        """Build an ``HttpStream`` for ``ref`` on SDKs without ``ActivitySender`` (2.1+).
+
+        Mirrors 2.1's ``ActivityContext.stream`` (``HttpStream(self.api, ref)``),
+        except that we hand ``HttpStream`` a client already scoped with
+        ``App.api.from_service_url(ref.service_url)`` rather than the shared
+        ``App.api``. 2.1's ``HttpStream`` scopes the client again itself, so
+        this costs one extra lightweight clone (the HTTP connection is shared).
+        It keeps the stream off the shared client even if a future
+        ``HttpStream`` stops scoping, because ``_point_app_api_at`` retargets
+        ``App.api`` in place for outbound calls.
+
+        An SDK whose ``ApiClient`` has no ``from_service_url`` raises
+        ``AttributeError`` here, which :meth:`_create_streamer` turns into the
+        buffered-post fallback.
+        """
+        from microsoft_teams.apps import HttpStream
+
+        scoped_api = self._app.api.from_service_url(ref.service_url)
+        return HttpStream(scoped_api, ref)
 
     # Keys injected by the SDK's card renderer or Teams transport — not user input.
     _ACTION_TRANSPORT_KEYS = frozenset({"actionId", "msteams"})
@@ -1589,6 +1721,12 @@ class TeamsAdapter:
         that replace ``self._app.api`` with a mock lacking those attributes —
         an ``AttributeError`` there is harmless because the mock ignores the
         service URL anyway.
+
+        Works on both ``microsoft-teams-apps`` 2.0.x and 2.1.x. On 2.1 the
+        activity methods gained optional ``service_url=`` / ``agentic_identity=``
+        keywords; we pass neither, so they fall back to the client's own (just
+        retargeted) ``service_url``, and ``app.send`` sees
+        ``ref.service_url == api.service_url`` and sends on ``App.api`` itself.
         """
         _validate_service_url(service_url)
         normalized = service_url.rstrip("/")

@@ -58,11 +58,24 @@ class BridgeHttpAdapter:
         self,
         logger: Logger,
         webhook_verifier: Callable[[Any, str], Any] | None = None,
+        reject_before_auth: Callable[[dict[str, str]], bool] | None = None,
     ) -> None:
+        """Create the bridge.
+
+        ``webhook_verifier`` (upstream ``TeamsWebhookVerifier``) replaces the
+        SDK's JWT validation; see the module docstring.
+
+        ``reject_before_auth`` (Python-only, #250) is called with the request
+        headers before the SDK route handler runs. When it returns ``True`` the
+        request is answered ``401`` without reaching the SDK's JWT validator,
+        so an unauthenticated request cannot steer which JWKS the validator
+        fetches. ``None`` keeps upstream's behavior (everything goes to the SDK).
+        """
         self._handler: HttpRouteHandler | None = None
         self._webhook_options: dict[str, WebhookOptions] = {}
         self._logger = logger
         self._webhook_verifier = webhook_verifier
+        self._reject_before_auth = reject_before_auth
 
     # ------------------------------------------------------------------
     # HttpServerAdapter protocol
@@ -137,6 +150,13 @@ class BridgeHttpAdapter:
             )
 
         headers = self._read_headers(request)
+
+        if self._reject_before_auth is not None and self._reject_before_auth(headers):
+            return _make_response(
+                json.dumps({"error": "Unauthorized"}),
+                401,
+                content_type="application/json",
+            )
 
         activity_id = parsed_body.get("id")
         if activity_id and options is not None:
