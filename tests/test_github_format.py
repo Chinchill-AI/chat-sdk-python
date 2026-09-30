@@ -125,6 +125,10 @@ class TestGitHubExtractPlainText:
         assert "@user" in result
         assert "thanks" in result
 
+    def test_should_preserve_whitespace_after_newline_separated_mentions(self):
+        result = converter.extract_plain_text("@test-bot\nhi there")
+        assert result == "@test-bot\nhi there"
+
     def test_extracts_from_code_blocks(self):
         result = converter.extract_plain_text("```\ncode\n```")
         assert "code" in result

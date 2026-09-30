@@ -18,6 +18,8 @@ import copy
 import re
 from typing import Any
 
+from chat_sdk.shared._js_compat import JS_WHITESPACE
+
 # ---------------------------------------------------------------------------
 # Type aliases (mdast-compatible dicts)
 # ---------------------------------------------------------------------------
@@ -1080,38 +1082,61 @@ def walk_ast(node: Content, visitor: Any) -> Content:
 # ---------------------------------------------------------------------------
 
 
-def ast_to_plain_text(node: Content) -> str:
-    """Extract plain text from an AST node, stripping all formatting."""
+def _node_value(node: Content) -> str | None:
+    value = node.get("value")
+    if isinstance(value, str):
+        return value
+    alt = node.get("alt")
+    if isinstance(alt, str):
+        return alt
+    return None
+
+
+def _plain_text_node(node: Content) -> str:
+    # One Python frame per nesting level: the child walk is an explicit loop
+    # in this function (no helper, no comprehension), so extraction never
+    # overflows the stack before ``parse_markdown`` itself would. Deeply
+    # nested blockquotes/lists arrive in ordinary inbound messages.
+    value = _node_value(node)
+    if value is not None:
+        return value
+
     node_type = node.get("type")
-
-    if node_type == "text":
-        return node.get("value", "")
-
-    if node_type in ("inlineCode", "code"):
-        return node.get("value", "")
-
     if node_type == "break":
         return "\n"
-
     if node_type == "thematicBreak":
         return ""
 
-    if node_type == "image":
-        return node.get("alt", "")
+    children = node.get("children")
+    texts: list[str] = []
+    if isinstance(children, list):
+        for child in children:
+            texts.append(_plain_text_node(child))
 
-    children = node.get("children", [])
-    if children:
-        parts = [ast_to_plain_text(c) for c in children]
-        # Block-level nodes get newline separation
-        if node_type in ("root", "blockquote"):
-            return "\n".join(p for p in parts if p)
-        if node_type == "list":
-            return "\n".join(p for p in parts if p)
-        if node_type == "listItem":
-            return " ".join(p for p in parts if p)
-        return "".join(parts)
+    if node_type == "root":
+        return "\n\n".join(text for text in texts if text)
+    if node_type in ("list", "listItem", "blockquote"):
+        return "\n".join(text for text in texts if text)
+    if node_type == "table":
+        # Drop rows with no content (e.g. a placeholder header row) but keep
+        # rows that have any populated cell. JS ``trim()`` whitespace set.
+        return "\n".join(row for row in texts if row.strip(JS_WHITESPACE))
+    if node_type == "tableRow":
+        # Keep empty cells so columns stay aligned in the tab-separated output
+        return "\t".join(texts)
+    return "".join(text for text in texts if text)
 
-    return node.get("value", "")
+
+def ast_to_plain_text(node: Content) -> str:
+    """Extract plain text from an AST node, stripping all formatting.
+
+    Port of upstream ``toPlainText`` (chat@4.34.0+): structural whitespace is
+    preserved -- paragraphs (root children) are separated by a blank line,
+    list items / list-item blocks / blockquote children by ``\\n``, table
+    cells by ``\\t`` (empty cells kept) and table rows by ``\\n`` (empty rows
+    dropped).
+    """
+    return _plain_text_node(node)
 
 
 # ---------------------------------------------------------------------------

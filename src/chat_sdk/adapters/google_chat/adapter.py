@@ -28,6 +28,7 @@ from chat_sdk.adapters.google_chat.thread_utils import (
     decode_thread_id,
     encode_thread_id,
     is_dm_thread,
+    parse_message_name,
 )
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
@@ -166,7 +167,17 @@ class GoogleChatAdapter:
         self._persist_message_history: bool | None = None
         self._logger: Logger = config.logger or ConsoleLogger("info").child("gchat")
         self._user_name = config.user_name or "bot"
-        self._bot_user_id: str | None = None
+        # Explicit identity only (upstream f485255b): config wins over the env
+        # var (``??`` semantics). Never learned from mentions or restored from
+        # state -- a learned id let another bot become "self". An empty string
+        # is treated as unset, and the unset warning is logged once.
+        # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (bot identity
+        # edge cases).
+        configured_bot_user_id = (
+            config.bot_user_id if config.bot_user_id is not None else os.environ.get("GOOGLE_CHAT_BOT_USER_ID")
+        )
+        self._bot_user_id: str | None = configured_bot_user_id or None
+        self._warned_no_bot_user_id = False
         self._chat: ChatInstance | None = None
         self._state: StateAdapter | None = None
         self._format_converter = GoogleChatFormatConverter()
@@ -555,15 +566,16 @@ class GoogleChatAdapter:
         # Update user info cache to use the state adapter for persistence
         self._user_info_cache = UserInfoCache(self._state, self._logger)
 
-        # Restore persisted bot user ID from state (for serverless environments)
-        if not self._bot_user_id:
-            saved_bot_user_id = await self._state.get("gchat:botUserId")
-            if saved_bot_user_id:
-                self._bot_user_id = saved_bot_user_id
-                self._logger.debug(
-                    "Restored bot user ID from state",
-                    {"botUserId": self._bot_user_id},
-                )
+        # The bot identity comes only from config / GOOGLE_CHAT_BOT_USER_ID
+        # (upstream f485255b). The legacy learned ``gchat:botUserId`` state key
+        # is deliberately never read: it may hold another bot's id.
+        if not self._bot_user_id and not self._warned_no_bot_user_id:
+            self._warned_no_bot_user_id = True
+            self._logger.warn(
+                "Google Chat botUserId is not configured. BOT senders will be "
+                "treated as self to prevent reply loops, and bot mentions cannot "
+                "be normalized. Set bot_user_id or GOOGLE_CHAT_BOT_USER_ID."
+            )
 
         self._logger.info("Google Chat adapter initialized")
 
@@ -1928,6 +1940,7 @@ class GoogleChatAdapter:
         message: AdapterPostableMessage,
     ) -> RawMessage:
         """Edit an existing message."""
+        self._assert_message_in_space(thread_id, message_id)
         try:
             card = extract_card(message)
 
@@ -1997,6 +2010,7 @@ class GoogleChatAdapter:
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
         """Delete a message."""
+        self._assert_message_in_space(thread_id, message_id)
         try:
             self._logger.debug("GChat API: spaces.messages.delete", {"messageId": message_id})
 
@@ -2036,6 +2050,7 @@ class GoogleChatAdapter:
         emoji: EmojiValue | str,
     ) -> None:
         """Add a reaction to a message."""
+        self._assert_message_in_space(thread_id, message_id)
         gchat_emoji = emoji_to_gchat(emoji)
 
         try:
@@ -2064,6 +2079,7 @@ class GoogleChatAdapter:
         emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a message."""
+        self._assert_message_in_space(thread_id, message_id)
         gchat_emoji = emoji_to_gchat(emoji)
 
         try:
@@ -2317,70 +2333,57 @@ class GoogleChatAdapter:
         cursor: str | None,
         use_impersonation: bool = False,
     ) -> FetchResult:
-        """Fetch messages in forward direction (oldest first)."""
+        """Fetch messages in forward direction (oldest first).
+
+        Google Chat supports ascending creation time with native page tokens
+        (upstream f485255b). The API token is the opaque Chat SDK cursor, so
+        each call fetches one bounded page and a deleted message cannot reset
+        iteration to page one. Cursors from earlier releases (message names)
+        are not page tokens and are rejected by the API.
+        """
+        page_size = min(max(limit, 1), 1000)
         self._logger.debug(
             "GChat API: spaces.messages.list (forward)",
             {
                 "spaceName": space_name,
                 "filter": filter_str,
-                "limit": limit,
+                "pageSize": page_size,
                 "cursor": cursor,
             },
         )
 
-        # Fetch all messages (GChat defaults to createTime ASC = oldest first)
-        all_raw_messages: list[dict[str, Any]] = []
-        page_token: str | None = None
+        params: dict[str, str] = {
+            "pageSize": str(page_size),
+            "orderBy": "createTime asc",
+        }
+        if cursor is not None:
+            params["pageToken"] = cursor
+        if filter_str:
+            params["filter"] = filter_str
 
-        while True:
-            params: dict[str, str] = {"pageSize": "1000"}
-            if page_token:
-                params["pageToken"] = page_token
-            if filter_str:
-                params["filter"] = filter_str
-
-            response = await self._gchat_api_request(
-                "GET",
-                f"{space_name}/messages",
-                params=params,
-                use_impersonation=use_impersonation,
-            )
-
-            page_messages = response.get("messages") or []
-            all_raw_messages.extend(page_messages)
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-
-        self._logger.debug(
-            "GChat API: fetched all messages for forward pagination",
-            {"totalCount": len(all_raw_messages)},
+        response = await self._gchat_api_request(
+            "GET",
+            f"{space_name}/messages",
+            params=params,
+            use_impersonation=use_impersonation,
         )
 
-        # Find starting position based on cursor
-        start_index = 0
-        if cursor:
-            for i, msg in enumerate(all_raw_messages):
-                if msg.get("name") == cursor:
-                    start_index = i + 1
-                    break
+        raw_messages = response.get("messages") or []
 
-        # Get the requested slice
-        selected_messages = all_raw_messages[start_index : start_index + limit]
+        self._logger.debug(
+            "GChat API: spaces.messages.list response (forward)",
+            {
+                "messageCount": len(raw_messages),
+                "hasNextPageToken": bool(response.get("nextPageToken")),
+            },
+        )
 
         messages = []
-        for msg in selected_messages:
+        for msg in raw_messages:
             parsed = await self._parse_gchat_list_message(msg, space_name, thread_id)
             messages.append(parsed)
 
-        # Determine nextCursor
-        next_cursor: str | None = None
-        if start_index + limit < len(all_raw_messages) and selected_messages:
-            last_msg = selected_messages[-1]
-            if last_msg.get("name"):
-                next_cursor = last_msg["name"]
-
-        return FetchResult(messages=messages, next_cursor=next_cursor)
+        return FetchResult(messages=messages, next_cursor=response.get("nextPageToken") or None)
 
     async def _parse_gchat_list_message(
         self,
@@ -2888,6 +2891,51 @@ class GoogleChatAdapter:
         """Check if a thread is a direct message conversation."""
         return is_dm_thread(thread_id)
 
+    def _assert_message_in_space(self, thread_id: str, message_id: str) -> None:
+        """Reject a message id that does not live in the thread's space.
+
+        Google Chat message ids are full resource names
+        (``spaces/{space}/messages/{message}``) that identify a message on
+        their own, so the edit, delete, and reaction calls never consult the
+        thread. Check that the message lives in the thread's space, so a caller
+        cannot pair a permitted thread id with a message from another space
+        (upstream d6343460). Raises ``ValidationError``.
+        """
+        space_name = self.decode_thread_id(thread_id).space_name
+        message = parse_message_name(message_id)
+        if message.space_name != space_name:
+            raise ValidationError(
+                "gchat",
+                f'Message "{message_id}" does not belong to space "{space_name}" of thread "{thread_id}"',
+            )
+
+    async def fetch_message(self, thread_id: str, message_id: str) -> Message | None:
+        """Fetch a single message by resource name.
+
+        The returned message carries the thread id Google reports for it
+        (``message["thread"]["name"]``), not the one supplied, so callers can
+        confirm which thread a message really belongs to before acting on it.
+        Returns ``None`` when the message does not exist (404).
+
+        Reads with the app's own credentials even when ``impersonate_user`` is
+        configured, as upstream does (``this.chatApi``, not
+        ``impersonatedChatApi``). Unlike history listing, a single-message
+        read is used to confirm a message before acting on it as the app, so
+        it must only see what the app itself can see; a message visible only to
+        the delegated user reads as a 403/404 rather than via the user's
+        broader access.
+        """
+        self._assert_message_in_space(thread_id, message_id)
+        space_name = self.decode_thread_id(thread_id).space_name
+        try:
+            self._logger.debug("GChat API: spaces.messages.get", {"messageId": message_id})
+            response = await self._gchat_api_request("GET", message_id)
+            return await self._parse_gchat_list_message(response, space_name, thread_id)
+        except Exception as error:
+            if getattr(error, "code", None) == 404:
+                return None
+            self._handle_google_chat_error(error, "fetchMessage")
+
     # =========================================================================
     # Message parsing / rendering
     # =========================================================================
@@ -2918,14 +2966,22 @@ class GoogleChatAdapter:
     # =========================================================================
 
     def _normalize_bot_mentions(self, message: dict[str, Any]) -> str:
-        """Normalize bot mentions in message text.
+        """Normalize this app's mentions in message text.
 
         Google Chat uses the bot's display name (e.g., "@Chat SDK Demo") but the
-        Chat SDK expects "@{userName}" format. This replaces bot mentions with
-        the adapter's userName so mention detection works properly.
-        Also learns the bot's user ID from annotations for isMe detection.
+        Chat SDK expects "@{userName}" format. This replaces mentions of THIS
+        app with the adapter's userName so mention detection works properly.
+        Only annotations whose ``userMention.user.name`` equals the configured
+        ``bot_user_id`` are rewritten -- none when it is unset. The id is never
+        learned from annotations (upstream f485255b).
         """
         text = message.get("text", "")
+        bot_user_id = self._bot_user_id
+        # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (bot identity
+        # edge cases): with no id, nothing is rewritten, even an annotation
+        # that lacks ``user.name``.
+        if not bot_user_id:
+            return text
 
         annotations = message.get("annotations") or []
         # Process in reverse order (highest startIndex first) to avoid index drift
@@ -2937,30 +2993,9 @@ class GoogleChatAdapter:
                 and (annotation.get("userMention") or {}).get("user", {}).get("type") == "BOT"
             ):
                 bot_user = annotation["userMention"]["user"]
+                if bot_user.get("name") != bot_user_id:
+                    continue
                 bot_display_name = bot_user.get("displayName")
-
-                # Learn our bot's user ID from mentions and persist to state
-                if bot_user.get("name") and not self._bot_user_id:
-                    self._bot_user_id = bot_user["name"]
-                    self._logger.info(
-                        "Learned bot user ID from mention",
-                        {"botUserId": self._bot_user_id},
-                    )
-                    # Persist to state for serverless environments
-                    if self._state:
-                        import asyncio
-
-                        try:
-                            loop = asyncio.get_running_loop()
-                            _pin_task(
-                                loop.create_task(
-                                    self._state.set(
-                                        "gchat:botUserId", self._bot_user_id, ttl_ms=30 * 24 * 60 * 60 * 1000
-                                    )
-                                )
-                            )
-                        except RuntimeError:
-                            pass
 
                 # Replace the bot mention with @{userName}
                 start_index = annotation.get("startIndex")
@@ -2986,22 +3021,25 @@ class GoogleChatAdapter:
     def _is_message_from_self(self, message: dict[str, Any]) -> bool:
         """Check if a message is from this bot.
 
-        Bot user ID is learned dynamically from message annotations when the bot
-        is @mentioned. Until we learn the ID, we cannot reliably determine isMe.
+        A configured ``bot_user_id`` permits exact matching in multi-bot
+        spaces. Without it, fail closed for ``BOT`` senders to prevent
+        self-reply loops (upstream f485255b).
         """
-        sender_id = (message.get("sender") or {}).get("name")
+        sender = message.get("sender") or {}
+        sender_id = sender.get("name")
 
         # Use exact match when we know our bot ID
         if self._bot_user_id and sender_id:
             return sender_id == self._bot_user_id
 
-        # If we don't know our bot ID yet, we can't reliably determine isMe
-        if not self._bot_user_id and (message.get("sender") or {}).get("type") == "BOT":
+        # Fail closed when identity is unavailable: processing an unknown BOT
+        # sender could reprocess this app's own replies indefinitely.
+        if not self._bot_user_id and sender.get("type") == "BOT":
             self._logger.debug(
-                "Cannot determine isMe - bot user ID not yet learned. "
-                "Bot ID is learned from @mentions. Assuming message is not from self.",
+                "Cannot distinguish BOT sender without botUserId; treating it as self.",
                 {"senderId": sender_id},
             )
+            return True
 
         return False
 
@@ -3026,9 +3064,12 @@ class GoogleChatAdapter:
         if url:
             fetch_meta["url"] = url
 
+        # ``downloadUri`` is display-only (upstream 32687038): attachment bytes
+        # come solely from the media API by ``resourceName``, so no request
+        # ever carries the service-account token to a URL taken from the event.
         fetch_data: Callable[[], Awaitable[bytes]] | None = None
-        if resource_name or url:
-            fetch_data = self._build_gchat_fetch_data(resource_name, url)
+        if resource_name:
+            fetch_data = self._build_gchat_fetch_data(resource_name)
 
         return Attachment(
             type=att_type,  # type: ignore[arg-type]
@@ -3039,111 +3080,60 @@ class GoogleChatAdapter:
             fetch_metadata=fetch_meta or None,
         )
 
-    @staticmethod
-    def _is_trusted_gchat_download_url(url: str) -> bool:
-        """Gate Google Chat attachment downloads to Google-owned hosts.
+    def _build_gchat_fetch_data(self, resource_name: str) -> Callable[[], Awaitable[bytes]]:
+        """Build a lazy ``fetch_data`` closure for a Google Chat attachment.
 
-        After ``rehydrate_attachment`` reconstructs the fetch closure
-        from serialized ``fetch_metadata``, the URL may have been
-        tampered with in the state store.  We refuse to forward the
-        OAuth access token unless the host is a known Google-owned host.
-
-        This is a Python-first divergence: upstream Google Chat adapter
-        does not validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known
-        Non-Parity.
+        Downloads via the Chat media API (``media.download`` with
+        ``alt=media``) only. API errors go through
+        ``_handle_google_chat_error`` so a 429 surfaces as
+        ``AdapterRateLimitError``.
         """
-        try:
-            parsed = urlparse(url)
-        except (ValueError, TypeError):
-            return False
-        if parsed.scheme != "https":
-            return False
-        host = (parsed.hostname or "").lower()
-        if not host:
-            return False
-        allowed_suffixes = (
-            ".googleapis.com",
-            ".googleusercontent.com",
-            ".google.com",
-        )
-        if host.endswith(allowed_suffixes):
-            return True
-        return host in {"chat.googleapis.com", "googleapis.com"}
-
-    def _build_gchat_fetch_data(
-        self,
-        resource_name: str | None,
-        url: str | None,
-    ) -> Callable[[], Awaitable[bytes]]:
-        """Build a lazy ``fetch_data`` closure for a Google Chat attachment."""
         adapter = self
 
         async def _fetch_data() -> bytes:
-            # Prefer media.download API
-            if resource_name:
+            # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (media
+            # resourceName validation). Checked before a token is minted.
+            _validate_media_resource_name(resource_name)
+            try:
                 token = await adapter._get_access_token()
-                download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
+                download_url = f"{GCHAT_API_BASE}/media/{resource_name}?alt=media"
                 session = await adapter._get_http_session()
                 async with session.get(
                     download_url,
                     headers={"Authorization": f"Bearer {token}"},
                 ) as response:
                     if response.status >= 400:
-                        raise NetworkError(
-                            "gchat",
-                            f"Failed to download media: {response.status}",
+                        raise _GoogleApiError(
+                            message=f"Failed to download media: {response.status}",
+                            code=response.status,
                         )
                     return await response.read()
-
-            # Fallback to direct URL fetch (downloadUri).  Validate the
-            # host before forwarding the OAuth token — the URL may have
-            # been rebuilt from serialized metadata and tampered with.
-            if url:
-                if not adapter._is_trusted_gchat_download_url(url):
-                    raise ValidationError(
-                        "gchat",
-                        f"Refusing to fetch Google Chat file from untrusted URL: {url}",
-                    )
-                token = await adapter._get_access_token()
-                session = await adapter._get_http_session()
-                async with session.get(
-                    url,
-                    headers={"Authorization": f"Bearer {token}"},
-                ) as response:
-                    if response.status >= 400:
-                        raise NetworkError(
-                            "gchat",
-                            f"Failed to fetch file: {response.status}",
-                        )
-                    return await response.read()
-
-            raise AuthenticationError("gchat", "Cannot fetch file: no URL or resource name")
+            except Exception as error:
+                adapter._handle_google_chat_error(error, "fetchAttachmentData")
 
         return _fetch_data
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on a deserialized Google Chat attachment.
 
-        Pulls ``resourceName`` (preferred, used with media.download API) and
-        ``url`` (fallback) from ``fetch_metadata``.  Returns the attachment
-        unchanged when neither identifier is present.
+        Uses only ``fetch_metadata["resourceName"]`` (media API). Returns the
+        attachment unchanged when it is absent -- a serialized download URL is
+        never turned back into a fetch (upstream 32687038).
         """
         meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
         resource_name = meta.get("resourceName")
-        meta_url = meta.get("url")
-        url = meta_url if meta_url is not None else attachment.url
-        if resource_name is None and url is None:
+        if not resource_name:
             return attachment
         return Attachment(
             type=attachment.type,
-            url=url,
+            url=attachment.url,
             name=attachment.name,
             mime_type=attachment.mime_type,
             size=attachment.size,
             width=attachment.width,
             height=attachment.height,
             data=attachment.data,
-            fetch_data=self._build_gchat_fetch_data(resource_name, url),
+            fetch_data=self._build_gchat_fetch_data(resource_name),
             fetch_metadata=attachment.fetch_metadata,
         )
 
@@ -3214,6 +3204,39 @@ class _GoogleApiError(Exception):
         super().__init__(message)
         self.code = code
         self.errors = errors
+
+
+# Characters that must never appear in a media ``resourceName``: they would
+# change what the ``/v1/media/{resourceName}`` URL addresses (query, fragment,
+# percent-decoding) or how it is split. Anything outside printable ASCII
+# (whitespace, control and non-ASCII characters) is rejected separately.
+_MEDIA_RESOURCE_NAME_FORBIDDEN_CHARS = frozenset("?#%\\")
+
+
+def _validate_media_resource_name(resource_name: Any) -> None:
+    """Reject a media ``resourceName`` that could escape ``/v1/media/``.
+
+    Divergence from upstream -- see docs/UPSTREAM_SYNC.md. Upstream passes the
+    value to the googleapis client, which encodes it; here it is interpolated
+    into the request path, and it can come from serialized ``fetch_metadata``
+    (``rehydrate_attachment``). ``resourceName`` is otherwise opaque, so this is
+    a denylist: a non-string or empty value, ``?``, ``#``, ``%``, backslash,
+    anything outside printable ASCII (``!``..``~``, so whitespace, control and
+    non-ASCII characters), and ``.`` / ``..`` path segments (which the URL
+    layer would normalize away) raise ``ValidationError`` before any token is
+    minted.
+    """
+    valid = (
+        isinstance(resource_name, str)
+        and resource_name != ""
+        and all("!" <= ch <= "~" and ch not in _MEDIA_RESOURCE_NAME_FORBIDDEN_CHARS for ch in resource_name)
+        and not any(segment in {".", ".."} for segment in resource_name.split("/"))
+    )
+    if not valid:
+        raise ValidationError(
+            "gchat",
+            f"Invalid Google Chat attachment resource name: {json.dumps(resource_name, default=repr)}",
+        )
 
 
 def _exceeds_max_token_lifetime(payload: dict[str, Any]) -> bool:

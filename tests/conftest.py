@@ -22,6 +22,33 @@ def anyio_backend():
     return "asyncio"
 
 
+# Env vars that change adapter behaviour when merely present in the shell.
+# Cleared for every test so a developer or CI environment configured for a
+# real deployment (for example GOOGLE_CHAT_BOT_USER_ID, which the Google Chat
+# docs tell users to export) cannot flip "identity not configured" tests.
+# Tests that need a value set it explicitly with ``monkeypatch.setenv``.
+_AMBIENT_IDENTITY_ENV_KEYS = ("GOOGLE_CHAT_BOT_USER_ID",)
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_identity_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _AMBIENT_IDENTITY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_github_bot_user_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``GITHUB_BOT_USER_ID`` out of every test unless it sets it.
+
+    ``GitHubAdapter`` reads it at construction (``config.botUserId ??
+    GITHUB_BOT_USER_ID``), which skips auto-detection. A developer shell or CI
+    job that exports it would otherwise break every test that expects
+    detection to run. Mirrors the upstream ``beforeEach`` in
+    ``describe("createGitHubAdapter")``. Tests that need it call ``setenv``.
+    """
+    monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

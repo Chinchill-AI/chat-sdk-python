@@ -818,9 +818,8 @@ class TestStreaming:
         text_stream = _create_text_stream(["hello.", "\n\n", "how are you?"])
         result = await thread.post(text_stream)
 
-        # Markdown is parsed to AST; double newlines create separate paragraphs
-        # which are joined with single newlines in plain text extraction
-        assert result.text == "hello.\nhow are you?"
+        # Plain text extraction preserves paragraph boundaries from parsed markdown.
+        assert result.text == "hello.\n\nhow are you?"
         assert captured_chunks == ["hello.", "\n\n", "how are you?"]
 
     # it("should concatenate multi-step text without separator (demonstrates bug)")
