@@ -2,7 +2,39 @@
 
 ## Unreleased (4.41 wave)
 
+Part of the upstream `4.31.0` → `4.41.1` sync wave (#184). `UPSTREAM_PARITY` stays `4.31.0` until the wave's final pin bump.
+
+- **Messenger: guard attachment downloads** (#234, **security**; port of vercel/chat 153bd964, chat@4.39.0). `Attachment.fetch_data()` used to GET whatever URL arrived in the webhook `payload.url` and follow redirects, and `fallback` / link-share attachments carry user-controlled URLs (SSRF). Downloads are now restricted to https URLs on `fbsbx.com` / `fbcdn.net` (or a subdomain), checked before any network I/O and on every redirect hop (at most 5), with a 25 MB body cap and a 30 s deadline; failures raise `NetworkError("messenger", ...)`. The check runs inside the download closure, so closures rebuilt by `rehydrate_attachment` from persisted queue/debounce state are covered too.
+  - **Consumer-visible:** `fetch_data()` for a Messenger attachment whose URL is not on a Meta CDN host (typically `fallback` / link shares) now raises `NetworkError("messenger", "Refusing to fetch an untrusted attachment URL")` instead of downloading. `attachment.url` is unchanged and still available for display.
+  - **Python-specific (divergence from upstream):** no DNS / private-IP resolution check yet (the host allowlist alone rejects IP literals and non-Meta names; tracked for #204/#239), the URL check is stricter than upstream (also rejects userinfo, non-443 ports and non-ASCII or non-DNS-label hosts), and IP-literal / unparseable URLs raise the "untrusted" message instead of upstream's "internal" message or generic download-failure wrapper. See `docs/UPSTREAM_SYNC.md`.
+- **Twilio: per-conversation locks and channels** (#235; **security**, **breaking (Twilio)**). Ports upstream `28bc7768` (vercel/chat#849, chat@4.39.0) and the Twilio part of `b7c9316b` (vercel/chat#875, chat@4.40.0). The adapter's `lock_scope` is now `"thread"`, and `twilio_channel_id` / `channel_id_from_thread_id` / `fetch_thread().channel_id` return the full `twilio:{sender}:{recipient}` thread id instead of the shared bot-side `twilio:{sender}`. Different recipients texting the same bot number no longer share a lock (previously they serialized behind each other, and under the default `drop` strategy the later one raised `LockError`), channel history or channel state.
+  - **Consumer-visible:** Twilio `channel_id` (and `thread.channel.id`) now equals the thread id. Channel-scoped state and channel-history keys written under the old `twilio:{sender}` id are no longer read. Thread ids and thread history are unchanged; `channel_name` is still the sender number.
+- **Twilio: authenticated media downloads restricted to the configured API origin** (#235; **security**, **breaking (Twilio, custom `api_url` only)**). Ports upstream `d8103a10` (vercel/chat#831, chat@4.38.1). `fetch_twilio_media` gains keyword-only `api_url` / `api_base_url` and raises `TwilioApiError("Twilio media URL must match the configured Twilio API origin", status=0)` for any URL whose scheme, host or effective port differs from `api_url` → `api_base_url` → `https://api.twilio.com`. The check runs before credentials are resolved or a request is made. The adapter passes its `api_url` to every attachment download, freshly received webhook media (`MediaUrlN`) as well as rehydrated attachments, so the existing Python-only Twilio host allowlist stays in front as defence in depth (documented in `docs/UPSTREAM_SYNC.md`).
+  - **Consumer-visible (custom `api_url` only):** with a non-default `api_url`, media hosted on any other origin, including inbound media on `https://api.twilio.com`, is now refused (upstream behaves the same). With a non-Twilio or `http` `api_url` (a proxy or local mock), no media URL passes both layers: `api.twilio.com` fails the origin check and the proxy origin fails the host allowlist, so attachment downloads always raise. Before this change such configs downloaded `api.twilio.com` media. The default config (`api_url` unset) is unaffected.
 - **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
+
+### Google Chat: webhook JWT verification bound to configured identities (#222, security)
+
+Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) and `c3b5a08e` (#797, chat@4.37.0). Before this change, Google Chat webhook verification checked only a Google signature and the `aud` claim. The audiences in play (project number, endpoint URL, Pub/Sub push URL) are not secrets, so that check did not identify the caller. Every transport is now bound to a configured identity:
+
+- **Project-number tokens (direct webhooks)** are verified against the Chat service account's own X.509 certificates (`service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com`, cached 1 hour) with issuer `chat@system.gserviceaccount.com`. **This makes project-number verification work.** The previous code checked these tokens against Google's OIDC key set, which never holds the Chat issuer's keys, so every genuine project-number webhook was rejected with 401. (We confirmed on 2026-09-29 that the two published key sets share no key ids. We did not capture a real token for this check.)
+- **`endpoint_url` is now a direct-webhook verifier.** It covers Chat apps whose "Authentication audience" is "HTTP endpoint URL", which includes every Workspace Add-on Chat app. The token must be a Google OIDC ID token (`iss` of `accounts.google.com` or `https://accounts.google.com`) whose `aud` is exactly the configured URL, with `email_verified` exactly `true` and `email` equal to `chat@system.gserviceaccount.com` or the configured add-on identity. `endpoint_url` alone now satisfies the constructor's fail-closed check. When both verifiers are configured, the endpoint-URL token is tried first and the project number second.
+- **Pub/Sub pushes** need `email_verified` to be `true` and `email` to equal the configured push identity.
+- **Google's OIDC keys are fetched asynchronously and cached.** The old `PyJWKClient` did blocking network I/O on the event loop.
+
+#### Breaking (Google Chat)
+
+- **Pub/Sub deployments must set `pubsub_service_account_email`** (env `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`) to the service account in the subscription's push auth settings. Without it, every Pub/Sub push is rejected with 401 and a warning.
+- **Workspace Add-on Chat apps must set `workspace_add_on_service_account_email`** (env `GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL`) to their own `service-{projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com` identity, and must set `endpoint_url`. Add-on tokens are compared exactly. Without the setting they are rejected with 401 and a warning. Standalone Chat apps are unaffected.
+- **Button-click endpoint inference changed.** When `endpoint_url` is not configured, the adapter still infers a routing URL from `request.url`, but only from a *direct* webhook that passed verification (or ran with verification explicitly disabled). Before, the first request of any kind set it before verification ran, including Pub/Sub pushes and requests that were later rejected. The inferred value now lives in its own field (`_inferred_endpoint_url`) and never overwrites `endpoint_url`. The Python port never used the inferred URL as a verification audience, so audience checks are unchanged.
+- **Setting `endpoint_url` now turns on direct-webhook verification, even when `disable_signature_verification` is set.** A configured verifier takes precedence over the opt-out (same branch order as upstream). Before, a deployment with `endpoint_url` set (for button routing), no project number and `disable_signature_verification=True` accepted direct webhooks unverified. Such deployments are common, because project-number verification never worked before this change. After upgrading, each direct webhook that does not carry an endpoint-URL-audience Chat token gets a 401. Fix it in one of three ways: set `google_chat_project_number` if the Chat app uses the "Project number" authentication audience; switch the app to the "HTTP endpoint URL" audience with exactly the configured URL; or unset `endpoint_url` and let button routing use the inferred URL. The constructor now logs a warning when `endpoint_url` and `disable_signature_verification` are both set.
+- Upgrading also fixes project-number deployments, which were rejecting genuine webhooks (see above). No config change is needed for them.
+
+#### Python-specific (divergence from upstream)
+
+- The two new `GoogleChatAdapterConfig` fields are keyword-only (`field(kw_only=True)`). The dataclass is positional, so adding them positionally would shift existing callers' arguments.
+- Verification uses PyJWT with a fixed 1-hour async key cache, not google-auth-library's `verifyIdToken` / `verifySignedJwtWithCertsAsync`. The time checks are ported by hand to match google-auth-library: `exp` and `iat` are required, with 300 s of clock skew, and a token whose `exp` is 24 hours or more in the future is rejected (PyJWT has no such limit). The issuer is compared exactly by hand on both paths, not through PyJWT's `issuer=`, because PyJWT 2.10.0 matched it as a substring (CVE-2024-53861).
+- The constructor warning when `endpoint_url` and `disable_signature_verification` are both set is Python-only. Upstream has the same precedence but does not log it.
 
 ### Security
 
@@ -11,11 +43,32 @@
   - Multi-workspace slash commands and interactive payloads (HTTP and socket mode) whose installation is missing or cannot be resolved are now acknowledged with an empty 200 (or a bare socket ack) and **not dispatched**. Before, they reached handlers with no token context.
   - `response_url` is trusted only over `https`, with no userinfo and no explicit port, on exactly `hooks.slack.com` or `hooks.slack-gov.com` (GovSlack is now accepted; other `*.slack.com` hosts are not). It is checked when an ephemeral message id is encoded and decoded, and again before the request. The legacy non-JSON ephemeral-id format is no longer decoded, and `edit_message` / `delete_message` raise `ValidationError("Invalid Slack ephemeral message ID")` for an undecodable `ephemeral:` id instead of passing it to `chat.update` / `chat.delete`. The SDK-free `send_slack_response_url` primitive uses the same check.
   - The bracketed-link fallback in message text is length-bounded (2048 chars), which keeps the scan linear on adversarial input.
+  - **Consumer-visible:**
+    - Multi-workspace apps no longer run slash-command or interactive handlers for unknown installations.
+    - Cache key shapes change: `slack:user:{installation}:{user}`, `slack:user-by-name:{installation}:{name}`, `slack:channel:{installation}:{channel}`, and `slack:unfurls:{installation}:{channel}:{ts}`. The installation segment is omitted in single-workspace mode, but the unfurl key gains the channel there too. Expect a one-time cache miss after upgrading; nothing needs migrating.
+    - `response_url` is limited to `hooks.slack.com` / `hooks.slack-gov.com`.
+- **Webhook log hygiene: raw bodies and message content no longer reach DEBUG logs** (#187; ports upstream `fc7df9c4` / vercel/chat#500 and the logging parts of `f485255b` / vercel/chat#877). Several adapters logged raw webhook bodies, or previews of them, at DEBUG. In some cases this happened before signature or JWT verification, so unauthenticated input and message content could be copied into log sinks. Webhook handlers now log only request-shape metadata:
+  - GitHub: `{bodyBytes, contentType, eventType, signaturePresent}`, under "GitHub webhook signature verification failed" or "GitHub webhook request verified", plus `jsonParseStatus: "error"` on invalid JSON.
+  - GChat, Slack (after verification only) and the Teams bridge: `"… webhook received" {bodyLength}`.
+  - Linear: the raw-body log is gone.
+  - `Chat` "Incoming message": drops `author` and adds `is_bot`, matching upstream's key set.
+- **Consumer-visible (DEBUG logs only; no routing, response or status change):**
+  - The `"GitHub/GChat/Slack/Teams/Linear/WhatsApp webhook raw body"` messages are gone. GChat, Slack and Teams now emit `"… webhook received"` with `bodyLength`, which is a UTF-8 byte count.
+  - GitHub's `"GitHub webhook event type"` is replaced by `"GitHub webhook request verified"`.
+  - `bodyPreview` becomes `bodyBytes` on the GitHub, Linear and WhatsApp invalid-JSON errors.
+  - "Incoming message" loses `author`.
 
-**Consumer-visible changes:**
-- Multi-workspace apps no longer run slash-command or interactive handlers for unknown installations.
-- Cache key shapes change: `slack:user:{installation}:{user}`, `slack:user-by-name:{installation}:{name}`, `slack:channel:{installation}:{channel}`, and `slack:unfurls:{installation}:{channel}:{ts}`. The installation segment is omitted in single-workspace mode, but the unfurl key gains the channel there too. Expect a one-time cache miss after upgrading; nothing needs migrating.
-- `response_url` is limited to `hooks.slack.com` / `hooks.slack-gov.com`.
+  Anything that parses these log lines must be updated.
+
+### Python-specific (divergence from upstream)
+
+- **WhatsApp** drops its raw-body debug log and invalid-JSON `bodyPreview` (#187). Upstream 4.41.1 still logs both.
+- **Message-content debug logs** (#187):
+  - GChat "message event" logs `{space, textLength}`.
+  - GChat "Pub/Sub parsed message" drops `text` and `author`.
+  - The `Chat`, Slack and Discord slash-command debug logs log `textLength` instead of `text`.
+
+  Upstream still logs this content. Both divergences are recorded in `docs/UPSTREAM_SYNC.md`.
 
 ## 0.4.31.3
 
