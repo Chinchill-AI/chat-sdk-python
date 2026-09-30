@@ -2,7 +2,8 @@
 
 The faithful upstream ports live in ``tests/test_chat_faithful.py``
 (``TestConcurrencyLockLifetime`` and friends). These tests cover what the
-upstream suite cannot see: the asyncio translation of ``stop()`` (waits for
+upstream suite cannot see: the ``setInterval`` tick schedule (fixed rate on
+a monotonic clock), the asyncio translation of ``stop()`` (waits for
 an in-flight extend before ``release_lock``, does not cancel it, does not
 yield when idle), the extend-error ownership rule, the ``drop`` strategy's
 heartbeat, the client-side ``held_until`` seed (the one behavioral
@@ -179,6 +180,42 @@ class TestHeartbeatCadence:
         await clock.advance(3 * (DEFAULT_LOCK_TTL_MS // 3) + 1)
 
         assert extend_starts == [DEFAULT_LOCK_TTL_MS // 3, 3 * (DEFAULT_LOCK_TTL_MS // 3)]
+
+        release.set()
+        await task
+
+    async def test_wall_clock_step_back_does_not_delay_the_next_tick(self, monkeypatch):
+        # setInterval runs on a monotonic timer. Scheduling ticks on the epoch
+        # clock would push the next extend 60s out after an NTP step back, and
+        # the backend (on its own clock) would expire the lock at 50s.
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        started = clock.now
+        extend_starts: list[int] = []
+        real_extend = state.extend_lock
+
+        async def recording_extend(lock: Lock, ttl_ms: int) -> bool:
+            extend_starts.append(clock.now - started)
+            return await real_extend(lock, ttl_ms)
+
+        state.extend_lock = recording_extend  # type: ignore[method-assign]
+        chat, adapter, _ = await _make_chat(state)
+        release = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            await release.wait()
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("step-1", "Hey @slack-bot"))
+        )
+        tick = DEFAULT_LOCK_TTL_MS // 3
+        await clock.advance(tick + tick // 2)
+        clock.step_wall_clock(-60_000)
+        await clock.advance(3 * tick)
+
+        assert extend_starts == [tick, 2 * tick, 3 * tick, 4 * tick]
 
         release.set()
         await task

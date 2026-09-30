@@ -218,6 +218,17 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _monotonic_ms() -> int:
+    """Monotonic milliseconds for scheduling heartbeat ticks.
+
+    ``setInterval`` fires on a monotonic timer, so a wall-clock step must not
+    move the tick schedule. Epoch time (:func:`_now_ms`) still backs the
+    lifetime cap and ``held_until``, as upstream's ``Date.now()`` does.
+    Module-level so tests can swap in a fake clock.
+    """
+    return int(time.monotonic() * 1000)
+
+
 class _LockHeartbeat:
     """Keeps a held thread lock alive while a handler runs.
 
@@ -229,8 +240,8 @@ class _LockHeartbeat:
 
     asyncio translation of ``setInterval`` + ``inFlight``:
 
-    * Ticks are fixed-rate (``started_at + k * TTL/3``), as with
-      ``setInterval``. The loop awaits each extend, and ticks that came due
+    * Ticks are fixed-rate on a monotonic clock (``start + k * TTL/3``), as
+      with ``setInterval``. The loop awaits each extend, and ticks that came due
       while it was in flight are skipped (upstream's "don't stack extends"
       rule), so a slow extend never pushes later ticks back.
     * The extend runs as its own task awaited through ``asyncio.shield``:
@@ -273,12 +284,13 @@ class _LockHeartbeat:
     async def _run(self) -> None:
         # CancelledError is deliberately not caught: ``stop()`` cancels this task.
         interval = DEFAULT_LOCK_TTL_MS // 3
-        next_tick = self._started_at + interval
+        next_tick = _monotonic_ms() + interval
         try:
             while True:
-                # Fixed rate, like ``setInterval``: sleep to the next tick
-                # deadline, not a full interval after the previous extend.
-                await _sleep(max(0, next_tick - _now_ms()))
+                # Fixed rate on a monotonic clock, like ``setInterval``: sleep
+                # to the next tick deadline, not a full interval after the
+                # previous extend, and ignore wall-clock steps.
+                await _sleep(max(0, next_tick - _monotonic_ms()))
                 next_tick += interval
                 if self._stopped:
                     return
@@ -301,7 +313,7 @@ class _LockHeartbeat:
                     return
                 # Ticks that came due while the extend was in flight are
                 # skipped (upstream: ``if (inFlight) return``).
-                now = _now_ms()
+                now = _monotonic_ms()
                 while next_tick <= now:
                     next_tick += interval
         except Exception as err:

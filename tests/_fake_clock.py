@@ -3,7 +3,7 @@
 Python stand-in for upstream's ``vi.useFakeTimers()`` and the
 ``installTokenLockMock`` helper in ``packages/chat/src/chat.test.ts``
 (chat@4.39.0, 5b538f6f). ``FakeClock.install`` swaps the two time helpers
-in ``chat_sdk.chat`` (``_sleep`` and ``_now_ms``), so the lock heartbeat,
+in ``chat_sdk.chat`` (``_sleep``, ``_now_ms`` and ``_monotonic_ms``), so the lock heartbeat,
 debounce/burst windows and queue-entry expiry all run on virtual time: a
 90-second scenario completes without a real sleep.
 """
@@ -32,13 +32,20 @@ class FakeClock:
     """Virtual clock with vitest-style timer advancement."""
 
     def __init__(self) -> None:
+        # Timer time: timers fire on it and it only moves forward. The app's
+        # epoch clock (``now_ms``) is ``now + wall_offset``, so a test can step
+        # the wall clock without moving timers (``setInterval`` is monotonic).
         self.now = int(time.time() * 1000)
+        self.wall_offset = 0
         self._timers: list[tuple[int, int, asyncio.Future[None]]] = []
         self._seq = itertools.count()
 
     # -- the helpers patched into chat_sdk.chat --------------------------------
 
     def now_ms(self) -> int:
+        return self.now + self.wall_offset
+
+    def monotonic_ms(self) -> int:
         return self.now
 
     async def sleep(self, ms: int) -> None:
@@ -49,9 +56,14 @@ class FakeClock:
     def install(self, monkeypatch: pytest.MonkeyPatch) -> FakeClock:
         monkeypatch.setattr("chat_sdk.chat._sleep", self.sleep)
         monkeypatch.setattr("chat_sdk.chat._now_ms", self.now_ms)
+        monkeypatch.setattr("chat_sdk.chat._monotonic_ms", self.monotonic_ms)
         return self
 
     # -- test controls -----------------------------------------------------------
+
+    def step_wall_clock(self, delta_ms: int) -> None:
+        """Step the app's epoch clock (NTP correction) without moving timers."""
+        self.wall_offset += int(delta_ms)
 
     def pending_timers(self) -> int:
         """Timers still waiting to fire (``vi.getTimerCount()``)."""
