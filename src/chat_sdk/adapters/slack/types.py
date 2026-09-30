@@ -514,3 +514,8 @@ class RequestContext:
     enterprise_id: str | None = None
     # Whether this request came from an Enterprise Grid org-wide install
     is_enterprise_install: bool | None = None
+    # The resolved installation this request runs under (``team_id``, or the
+    # ``enterprise_id`` for org-wide installs). Scopes installation-owned
+    # cache keys (user profiles, display-name index, channel names, unfurl
+    # metadata) so one workspace's data is never served to another.
+    installation_id: str | None = None

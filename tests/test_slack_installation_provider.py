@@ -246,17 +246,20 @@ class TestInstallationProviderEvents:
         provider = _make_provider(SlackInstallation(bot_token="xoxb-ctx-token", bot_user_id="U_BOT_CTX"))
         adapter, chat, _ = await _make_provider_adapter(provider)
 
-        seen_tokens: list[str] = []
+        seen: list[tuple[str, str | None]] = []
 
         def capture(adapter_arg: Any, thread_id: str, factory: Any, options: Any = None) -> None:
-            seen_tokens.append(adapter_arg._get_token())
+            ctx = adapter_arg._request_context.get()
+            seen.append((adapter_arg._get_token(), ctx.installation_id if ctx else None))
 
         chat.process_message = MagicMock(side_effect=capture)
 
         req = _make_signed_request(_event_body(team_id="T_CTX"))
         await adapter.handle_webhook(req)
 
-        assert seen_tokens == ["xoxb-ctx-token"]
+        # The resolved installation id rides along so installation-owned
+        # cache keys are scoped to it (vercel/chat#724/#877).
+        assert seen == [("xoxb-ctx-token", "T_CTX")]
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +310,42 @@ class TestInstallationProviderSlashCommands:
 
         provider.get_installation.assert_called_once_with("E_ENT_ORG", True)
 
+    @pytest.mark.asyncio
+    async def test_drops_slash_commands_when_no_installation_is_found(self):
+        provider = _make_provider(None)
+        adapter, chat, _ = await _make_provider_adapter(provider)
+
+        body = _slash_body(
+            {
+                "command": "/test",
+                "team_id": "T_UNKNOWN",
+                "channel_id": "C_SLASH",
+                "user_id": "U_SLASHER",
+            }
+        )
+        req = _make_signed_request(body, content_type="application/x-www-form-urlencoded")
+        response = await adapter.handle_webhook(req)
+
+        assert response == {"body": "", "status": 200}
+        provider.get_installation.assert_called_once_with("T_UNKNOWN", False)
+        chat.process_slash_command.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drops_slash_commands_without_an_installation_id(self):
+        """Python-specific: a multi-workspace slash command that carries no
+        ``team_id`` at all is acknowledged without dispatch (upstream
+        ``runSlashCommand`` returns the same empty 200 for this branch)."""
+        provider = _make_provider(SlackInstallation(bot_token="xoxb-unused", bot_user_id="U_BOT"))
+        adapter, chat, _ = await _make_provider_adapter(provider)
+
+        body = _slash_body({"command": "/test", "channel_id": "C_SLASH", "user_id": "U_SLASHER"})
+        req = _make_signed_request(body, content_type="application/x-www-form-urlencoded")
+        response = await adapter.handle_webhook(req)
+
+        assert response == {"body": "", "status": 200}
+        provider.get_installation.assert_not_awaited()
+        chat.process_slash_command.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Interactive payloads
@@ -345,6 +384,19 @@ class TestInstallationProviderInteractive:
 
         assert response["status"] == 200
         provider.get_installation.assert_called_once_with("E_ENT_INTER_ORG", True)
+
+    @pytest.mark.asyncio
+    async def test_drops_interactive_payloads_when_no_installation_is_found(self):
+        provider = _make_provider(None)
+        adapter, chat, _ = await _make_provider_adapter(provider)
+
+        body = _interactive_body(_block_actions_payload(team={"id": "T_UNKNOWN"}))
+        req = _make_signed_request(body, content_type="application/x-www-form-urlencoded")
+        response = await adapter.handle_webhook(req)
+
+        assert response == {"body": "", "status": 200}
+        provider.get_installation.assert_called_once_with("T_UNKNOWN", False)
+        chat.process_action.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

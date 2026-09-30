@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+### Security
+
+- **Slack: installation-scoped caches, unresolved installs dropped, strict `response_url`** (#205, security). Ports the Slack parts of vercel/chat#877 (webhook tenant isolation), the cache part of #724 (Enterprise Grid), #876 (external request targets) and the Slack half of #779 (bounded URL parsing).
+  - In multi-workspace mode, installation-owned cache entries were keyed globally, so data resolved with one workspace's token could be served to another. `RequestContext` now carries `installation_id`, set wherever a context is built from a resolved installation (HTTP and socket events, slash commands and interactive payloads). User profiles, the display-name reverse index, channel names, and unfurl metadata are keyed by it, and unfurl metadata is also keyed by channel. `user_change` invalidates the scoped entry. `_enrich_links` now takes `(links, channel_id, message_ts)`.
+  - Multi-workspace slash commands and interactive payloads (HTTP and socket mode) whose installation is missing or cannot be resolved are now acknowledged with an empty 200 (or a bare socket ack) and **not dispatched**. Before, they reached handlers with no token context.
+  - `response_url` is trusted only over `https`, with no userinfo and no explicit port, on exactly `hooks.slack.com` or `hooks.slack-gov.com` (GovSlack is now accepted; other `*.slack.com` hosts are not). It is checked when an ephemeral message id is encoded and decoded, and again before the request. The legacy non-JSON ephemeral-id format is no longer decoded, and `edit_message` / `delete_message` raise `ValidationError("Invalid Slack ephemeral message ID")` for an undecodable `ephemeral:` id instead of passing it to `chat.update` / `chat.delete`. The SDK-free `send_slack_response_url` primitive uses the same check.
+  - The bracketed-link fallback in message text is length-bounded (2048 chars), which keeps the scan linear on adversarial input.
+
+**Consumer-visible changes:**
+- Multi-workspace apps no longer run slash-command or interactive handlers for unknown installations.
+- Cache key shapes change: `slack:user:{installation}:{user}`, `slack:user-by-name:{installation}:{name}`, `slack:channel:{installation}:{channel}`, and `slack:unfurls:{installation}:{channel}:{ts}`. The installation segment is omitted in single-workspace mode, but the unfurl key gains the channel there too. Expect a one-time cache miss after upgrading; nothing needs migrating.
+- `response_url` is limited to `hooks.slack.com` / `hooks.slack-gov.com`.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.

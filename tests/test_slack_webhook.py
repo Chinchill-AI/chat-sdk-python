@@ -1087,7 +1087,8 @@ class TestUnfurlMetadata:
       ``title``/``text``/``image_url``/``service_name`` into the link
       preview.
     - ``_handle_message_changed`` must store unfurl metadata in state
-      keyed by ``slack:unfurls:{ts}``.
+      keyed by ``slack:unfurls:{installation_scope}{channel}:{ts}``
+      (vercel/chat#877; the scope is empty in single-workspace mode).
     - ``_enrich_links`` must read that key and merge it into the links.
     - Trailing-slash mismatch between ``url`` and the attachment's
       ``from_url`` must be tolerated in both directions.
@@ -1208,7 +1209,7 @@ class TestUnfurlMetadata:
 
         # Give the spawned task a chance to run.
         await asyncio.sleep(0)
-        cached = state._cache.get("slack:unfurls:1234567890.111111")
+        cached = state._cache.get("slack:unfurls:C_CHAN:1234567890.111111")
         assert cached is not None
         assert cached["https://example.com"]["title"] == "Cached Title"
         # And process_message must NOT be called for message_changed.
@@ -1252,7 +1253,7 @@ class TestUnfurlMetadata:
         await adapter.initialize(chat)
 
         # Pre-seed the cache as if message_changed had already landed.
-        state._cache["slack:unfurls:1234567890.111111"] = {
+        state._cache["slack:unfurls:C1:1234567890.111111"] = {
             "https://example.com": {
                 "title": "From Cache",
                 "description": "Cached body",
@@ -1262,7 +1263,7 @@ class TestUnfurlMetadata:
         }
 
         original = [_LinkPreview(url="https://example.com")]
-        enriched = await adapter._enrich_links(original, "1234567890.111111")
+        enriched = await adapter._enrich_links(original, "C1", "1234567890.111111")
         assert len(enriched) == 1
         assert enriched[0].title == "From Cache"
         assert enriched[0].description == "Cached body"
@@ -1278,11 +1279,11 @@ class TestUnfurlMetadata:
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
 
-        state._cache["slack:unfurls:t1"] = {
+        state._cache["slack:unfurls:C1:t1"] = {
             "https://example.com": {"title": "From Cache", "description": None},
         }
         original = [_LinkPreview(url="https://example.com", title="User Title")]
-        enriched = await adapter._enrich_links(original, "t1")
+        enriched = await adapter._enrich_links(original, "C1", "t1")
         assert enriched[0].title == "User Title"
 
     @pytest.mark.asyncio
@@ -1292,7 +1293,7 @@ class TestUnfurlMetadata:
 
         adapter = _make_adapter()
         original = [_LinkPreview(url="https://example.com")]
-        enriched = await adapter._enrich_links(original, "ts1")
+        enriched = await adapter._enrich_links(original, "C1", "ts1")
         assert enriched is original
 
     @pytest.mark.asyncio
@@ -1317,7 +1318,7 @@ class TestUnfurlMetadata:
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
 
-        state._cache["slack:unfurls:t-override"] = {
+        state._cache["slack:unfurls:C1:t-override"] = {
             "https://example.com": {
                 "title": None,  # title not present → no short-circuit clobber
                 "description": "new",
@@ -1334,7 +1335,7 @@ class TestUnfurlMetadata:
                 site_name="OldSite",
             )
         ]
-        enriched = await adapter._enrich_links(original, "t-override")
+        enriched = await adapter._enrich_links(original, "C1", "t-override")
         assert enriched[0].description == "new"
         assert enriched[0].image_url == "https://example.com/new.png"
         assert enriched[0].site_name == "Example"
@@ -1384,7 +1385,7 @@ class TestUnfurlMetadata:
         # First edit caches a single unfurl for URL_A.
         await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://a.example.com", "First")))
         await asyncio.sleep(0)
-        first = state._cache.get("slack:unfurls:1234567890.111111")
+        first = state._cache.get("slack:unfurls:C_CHAN:1234567890.111111")
         assert first is not None
         # Use ``.get`` for explicit dict-key membership — avoids tripping
         # CodeQL's URL-substring-sanitization heuristic which fires on
@@ -1396,7 +1397,7 @@ class TestUnfurlMetadata:
         # If the implementation merged, URL_A would still be in the cache.
         await adapter.handle_webhook(_make_signed_request(_make_changed_body("https://b.example.com", "Second")))
         await asyncio.sleep(0)
-        second = state._cache.get("slack:unfurls:1234567890.111111")
+        second = state._cache.get("slack:unfurls:C_CHAN:1234567890.111111")
         assert second is not None
         assert second.get("https://b.example.com") is not None
         assert second.get("https://a.example.com") is None, "second message_changed must overwrite, not merge"
@@ -1406,8 +1407,9 @@ class TestUnfurlMetadata:
         """A URL containing ``(`` (unbalanced open paren) is preserved.
 
         Slack delivers URLs in angle brackets — ``<URL>`` — which the
-        adapter parses with ``re.finditer(r"<(https?://[^>]+)>", ...)``.
-        The character class ``[^>]+`` accepts ``(`` so a URL such as
+        adapter parses with ``_BRACKETED_URL_PATTERN``
+        (``<(https?://[^>]{1,2048})>``). The character class accepts ``(``
+        so a URL such as
         ``https://en.wikipedia.org/wiki/Pi_(letter)`` makes it through
         intact. The other URL extraction path (rich_text blocks) gets
         the URL as a struct field, so parens are also fine there.
@@ -1422,3 +1424,229 @@ class TestUnfurlMetadata:
         links = adapter._extract_links(event)
         assert len(links) == 1
         assert links[0].url == url_with_paren
+
+    def test_parses_bracketed_links_from_text_and_bounds_their_length(self):
+        """Port of upstream ``parses bracketed links from text and bounds
+        their length`` (vercel/chat#779).
+
+        What to fix if this fails: ``_BRACKETED_URL_PATTERN`` in
+        ``src/chat_sdk/adapters/slack/adapter.py`` must stay
+        ``<(https?://[^>]{1,2048})>`` — bounded so the fallback scan stays
+        linear on adversarial text, while ordinary links still parse.
+        """
+        adapter = _make_adapter()
+        over_long = f"https://example.com/{'a' * 4000}"
+        event = {
+            "type": "message",
+            "channel": "C123",
+            "ts": "1234567890.123456",
+            "text": f"ok <https://example.com/x> and <{over_long}>",
+            "user": "U_USER",
+        }
+
+        urls = [link.url for link in adapter._extract_links(event)]
+
+        assert urls == ["https://example.com/x"]
+
+
+# ---------------------------------------------------------------------------
+# Installation-scoped caches (vercel/chat#724 cache part, #877)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallationScopedCaches:
+    """Port of upstream ``describe("installation-scoped caches")``.
+
+    In multi-workspace mode, installation-owned state (user profiles, the
+    display-name reverse index, channel names, unfurl metadata) is keyed by
+    the resolved installation so data fetched with one workspace's token is
+    never served to another. Single-workspace mode keeps unscoped keys.
+
+    The two ``withBotToken`` cases belong to #213 (they need
+    ``with_bot_token(..., installation_id=...)``).
+
+    What to fix if this fails: ``_installation_cache_scope`` /
+    ``_unfurl_cache_key`` in ``src/chat_sdk/adapters/slack/adapter.py``
+    and every key site that uses them.
+    """
+
+    @staticmethod
+    def _users_info_mock() -> AsyncMock:
+        return AsyncMock(
+            return_value={
+                "user": {
+                    "name": "alice",
+                    "profile": {"display_name": "Alice", "real_name": "Alice Example"},
+                    "real_name": "Alice Example",
+                }
+            }
+        )
+
+    async def _make_cache_adapter(self) -> tuple[SlackAdapter, Any, MagicMock]:
+        from chat_sdk.state.memory import MemoryStateAdapter
+
+        state = MemoryStateAdapter()
+        await state.connect()
+        # No bot_token: multi-workspace mode.
+        adapter = SlackAdapter(SlackAdapterConfig(signing_secret="test-signing-secret"))
+        await adapter.initialize(_make_mock_chat(state))  # type: ignore[arg-type]
+        client = MagicMock()
+        client.users_info = self._users_info_mock()
+        client.conversations_info = AsyncMock(return_value={"channel": {"name": "general"}})
+        adapter._get_client = lambda token=None: client  # type: ignore[method-assign]
+        return adapter, state, client
+
+    @staticmethod
+    async def _run_as(adapter: SlackAdapter, installation_id: str, fn: Any) -> Any:
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        tok = adapter._request_context.set(
+            RequestContext(token=f"xoxb-{installation_id}", installation_id=installation_id)
+        )
+        try:
+            result = fn()
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        finally:
+            adapter._request_context.reset(tok)
+
+    @staticmethod
+    async def _wait_for(predicate: Any) -> None:
+        # Cache writes / invalidations are fire-and-forget tasks; give them
+        # a bounded number of loop turns to land.
+        for _ in range(20):
+            if await predicate():
+                return
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_scopes_the_user_profile_cache_by_installation(self):
+        adapter, state, client = await self._make_cache_adapter()
+
+        await self._run_as(adapter, "T_A", lambda: adapter._lookup_user("U1"))
+        await self._run_as(adapter, "T_B", lambda: adapter._lookup_user("U1"))
+
+        # Each installation fetched and cached independently
+        assert client.users_info.await_count == 2
+        assert (await state.get("slack:user:T_A:U1"))["display_name"] == "Alice"
+        assert (await state.get("slack:user:T_B:U1"))["display_name"] == "Alice"
+        assert await state.get("slack:user:U1") is None
+
+    @pytest.mark.asyncio
+    async def test_scopes_the_channel_name_cache_by_installation(self):
+        adapter, state, client = await self._make_cache_adapter()
+        client.conversations_info = AsyncMock(
+            side_effect=[
+                {"channel": {"name": "team-a-private"}},
+                {"channel": {"name": "team-b-general"}},
+            ]
+        )
+
+        assert await self._run_as(adapter, "T_A", lambda: adapter._lookup_channel("C1")) == "team-a-private"
+        assert await self._run_as(adapter, "T_B", lambda: adapter._lookup_channel("C1")) == "team-b-general"
+
+        assert client.conversations_info.await_count == 2
+        assert await state.get("slack:channel:T_A:C1") == {"name": "team-a-private"}
+        assert await state.get("slack:channel:T_B:C1") == {"name": "team-b-general"}
+        assert await state.get("slack:channel:C1") is None
+
+    @pytest.mark.asyncio
+    async def test_uses_unscoped_keys_without_a_request_context_single_workspace(self):
+        from chat_sdk.state.memory import MemoryStateAdapter
+
+        state = MemoryStateAdapter()
+        await state.connect()
+        adapter = _make_adapter(bot_user_id="U_BOT", bot_token="xoxb-single-token")
+        await adapter.initialize(_make_mock_chat(state))  # type: ignore[arg-type]
+        client = MagicMock()
+        client.users_info = self._users_info_mock()
+        adapter._get_client = lambda token=None: client  # type: ignore[method-assign]
+
+        await adapter._lookup_user("U1")
+
+        assert (await state.get("slack:user:U1"))["display_name"] == "Alice"
+        assert await state.get_list("slack:user-by-name:alice") == ["U1"]
+
+    @pytest.mark.asyncio
+    async def test_scopes_the_display_name_reverse_index_by_installation(self):
+        adapter, state, _ = await self._make_cache_adapter()
+
+        await self._run_as(adapter, "T_A", lambda: adapter._lookup_user("U1"))
+
+        assert await state.get_list("slack:user-by-name:T_A:alice") == ["U1"]
+        assert await state.get_list("slack:user-by-name:alice") == []
+
+    @pytest.mark.asyncio
+    async def test_scopes_unfurl_metadata_by_installation_and_channel(self):
+        from chat_sdk.types import LinkPreview as _LinkPreview
+
+        adapter, state, _ = await self._make_cache_adapter()
+
+        def changed(channel: str, title: str) -> dict[str, Any]:
+            return {
+                "type": "message",
+                "subtype": "message_changed",
+                "hidden": True,
+                "channel": channel,
+                "ts": "1234567890.123456",
+                "message": {
+                    "type": "message",
+                    "channel": channel,
+                    "ts": "1111111111.111111",
+                    "attachments": [{"from_url": "https://example.com/shared", "title": title}],
+                },
+            }
+
+        await self._run_as(adapter, "T_A", lambda: adapter._handle_message_changed(changed("C1", "Team A")))
+        await self._run_as(adapter, "T_B", lambda: adapter._handle_message_changed(changed("C2", "Team B")))
+
+        async def both_written() -> bool:
+            a = await state.get("slack:unfurls:T_A:C1:1111111111.111111")
+            b = await state.get("slack:unfurls:T_B:C2:1111111111.111111")
+            return a is not None and b is not None
+
+        await self._wait_for(both_written)
+        assert await both_written()
+        assert await state.get("slack:unfurls:1111111111.111111") is None
+
+        enriched_a = await self._run_as(
+            adapter,
+            "T_A",
+            lambda: adapter._enrich_links([_LinkPreview(url="https://example.com/shared")], "C1", "1111111111.111111"),
+        )
+        enriched_b = await self._run_as(
+            adapter,
+            "T_B",
+            lambda: adapter._enrich_links([_LinkPreview(url="https://example.com/shared")], "C2", "1111111111.111111"),
+        )
+        assert [link.title for link in enriched_a] == ["Team A"]
+        assert [link.title for link in enriched_b] == ["Team B"]
+
+    @pytest.mark.asyncio
+    async def test_resolves_outgoing_mentions_from_the_installation_scoped_index(self):
+        adapter, state, _ = await self._make_cache_adapter()
+        await state.append_to_list("slack:user-by-name:T_A:alice", "U_ALICE_A")
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_GLOBAL")
+
+        resolved = await self._run_as(
+            adapter, "T_A", lambda: adapter._resolve_outgoing_mentions("hi @alice", "slack:C1:1.1")
+        )
+
+        assert resolved == "hi <@U_ALICE_A>"
+
+    @pytest.mark.asyncio
+    async def test_invalidates_the_scoped_cache_entry_on_user_change(self):
+        adapter, state, _ = await self._make_cache_adapter()
+        await self._run_as(adapter, "T_A", lambda: adapter._lookup_user("U1"))
+        assert (await state.get("slack:user:T_A:U1"))["display_name"] == "Alice"
+
+        await self._run_as(
+            adapter, "T_A", lambda: adapter._handle_user_change({"type": "user_change", "user": {"id": "U1"}})
+        )
+
+        async def invalidated() -> bool:
+            return await state.get("slack:user:T_A:U1") is None
+
+        await self._wait_for(invalidated)
+        assert await invalidated()
