@@ -3,12 +3,12 @@
   "tag": "chat@4.41.1",
   "sha": "f690af3c26a3bd7649387cccad12d215463ed22c",
   "totals": {
-    "ts_tests": 1036,
-    "each_templates": 16,
-    "matched_exact": 714,
+    "ts_tests": 1064,
+    "each_templates": 21,
+    "matched_exact": 734,
     "matched_fuzzy": 80,
-    "missing": 242,
-    "extra": 394
+    "missing": 250,
+    "extra": 442
   },
   "absent_ts_files": [],
   "files": {
@@ -18,10 +18,10 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 142,
+      "matched_exact": 134,
       "matched_fuzzy": 12,
-      "missing_count": 23,
-      "extra_count": 15,
+      "missing_count": 31,
+      "extra_count": 16,
       "missing": [
         ["Chat", "should optionally propagate handler errors through waitUntil"],
         ["Chat", "aborts an active thread signal from another Chat instance"],
@@ -39,7 +39,15 @@
         ["thread", "passes only explicit placeholder config to adapter streaming"],
         ["getUser", "should return null when user is not found"],
         ["getUser", "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"],
+        ["concurrency: lock lifetime", "should keep the %s lock alive while a handler is running"],
+        ["concurrency: lock lifetime", "should stop renewing after maxLockLifetimeMs so a hung handler frees the thread"],
+        ["concurrency: queue", "should call onNewMention when a skipped queued message mentions the bot"],
         ["concurrency: queue", "should keep a definitive non-mention on skipped queued messages"],
+        ["concurrency: queue", "should continue to message patterns when skipped queued mention has no handler"],
+        ["concurrency: debounce", "should call onNewMention when a skipped debounced message mentions the bot"],
+        ["concurrency: burst", "should call onNewMention when a skipped burst message mentions the bot"],
+        ["lockScope", "should isolate queued messages across channel-scoped threads"],
+        ["lockScope", "should isolate debounced messages across channel-scoped threads"],
         ["Chat initialization retry (#922)", "does not restart an initialized adapter when another adapter fails"],
         ["Chat initialization retry (#922)", "does not overlap adapter initialization after a sibling fails"],
         ["Chat initialization retry (#922)", "recovers through a webhook after repeated state connection failures"],
@@ -496,6 +504,19 @@
         ["on%s", "logs handler errors and resolves the background task"],
         ["on%s", "does nothing without handlers and runs without waitUntil"]
       ],
+      "fuzzy_matches": []
+    },
+    "packages/adapter-shared/src/download.test.ts": {
+      "python": "tests/test_shared_download.py",
+      "tier": "target",
+      "python_exists": true,
+      "ts_tests": 28,
+      "each_templates": 5,
+      "matched_exact": 28,
+      "matched_fuzzy": 0,
+      "missing_count": 0,
+      "extra_count": 47,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/cards.test.ts": {
