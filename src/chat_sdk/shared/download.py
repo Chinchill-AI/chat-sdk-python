@@ -692,6 +692,9 @@ async def _close_within(response: AttachmentResponse, deadline: float) -> None:
         return
     task = asyncio.ensure_future(result)
     remaining = deadline - asyncio.get_running_loop().time()
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        remaining = 0  # the caller cancelled us: never hold cancellation up for cleanup
     try:
         if remaining > 0:
             await asyncio.wait({task}, timeout=remaining)

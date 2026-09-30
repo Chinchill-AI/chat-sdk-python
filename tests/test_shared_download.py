@@ -635,6 +635,25 @@ class TestDeadlineAndCancellation:
         # The body read runs in its own task; it is cancelled, not orphaned.
         assert hanging.read_cancelled is True
 
+    async def test_outer_cancellation_is_not_held_up_by_a_hanging_async_close(self) -> None:
+        class SlowClose(FakeResponse):
+            def close(self) -> asyncio.Future[None]:
+                self.close_calls += 1
+                return asyncio.get_running_loop().create_future()  # never completes
+
+        hanging = SlowClose(hang=True)
+        task = asyncio.create_task(
+            download_attachment("https://files.example.com/file", adapter="test", transport=FakeTransport(hanging))
+        )
+        await asyncio.wait_for(hanging.reading.wait(), timeout=1)
+
+        task.cancel()
+        # Default 30 s deadline: cleanup must not wait it out after a cancel.
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done
+        assert task.cancelled()
+        assert hanging.close_calls >= 1
+
     async def test_outer_cancellation_cancels_a_pending_transport_call(self) -> None:
         started = asyncio.Event()
         cancelled: list[bool] = []
