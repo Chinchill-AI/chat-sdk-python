@@ -38,6 +38,11 @@ Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) an
 
 ### Security
 
+- **Linear: comment-thread and agent-session history are now bound to the thread's issue** (#231, security; ports vercel/chat#965 `d7aa75b1` and #974 `2d2b933a`, chat@4.41.1). Linear thread ids carry an issue id plus a comment id or agent session id, and `fetch_messages` trusted the second segment without checking it against the first, so a caller naming issue A could read comment or session history from issue B. Anything that authorizes by issue id was affected, for example conversation-scoped AI tools.
+  - `linear:{issue}:c:{comment}` loads the root comment first, together with its `issueId`. It raises `ValidationError("linear", "Comment does not belong to this issue")` when that id is missing or different, before any replies query. Messages are built with the validated issue id.
+  - `linear:{issue}:s:{session}` and `linear:{issue}:c:{comment}:s:{session}` raise `ValidationError("linear", "Agent session does not belong to this issue")` when the session's issue is missing or different, before the root comment or replies are read.
+  - **Behavior change:** a session or comment whose issue can't be resolved now raises `ValidationError` instead of falling back to the thread's issue id. Before, a session with no issue fell back to the thread's issue, and one with no issue at all raised `AdapterError("... missing issueId")`. `ValidationError` is a subclass of `AdapterError`, so existing `except AdapterError` handlers still catch it. The error messages never include either issue id.
+  - **Behavior change:** comment-thread fetches now respect `FetchOptions.direction`, as upstream always has. `forward` returns the first `limit` replies; `backward` (and the default) return the last `limit`. Before, they always returned the first `limit`.
 - **Slack: installation-scoped caches, unresolved installs dropped, strict `response_url`** (#205, security). Ports the Slack parts of vercel/chat#877 (webhook tenant isolation), the cache part of #724 (Enterprise Grid), #876 (external request targets) and the Slack half of #779 (bounded URL parsing).
   - In multi-workspace mode, installation-owned cache entries were keyed globally, so data resolved with one workspace's token could be served to another. `RequestContext` now carries `installation_id`, set wherever a context is built from a resolved installation (HTTP and socket events, slash commands and interactive payloads). User profiles, the display-name reverse index, channel names, and unfurl metadata are keyed by it, and unfurl metadata is also keyed by channel. `user_change` invalidates the scoped entry. `_enrich_links` now takes `(links, channel_id, message_ts)`; messages returned by `fetch_message` / `fetch_messages` / channel history carry no `channel` field, so the channel is taken from their thread id and they keep cached unfurl metadata (upstream drops it; documented divergence).
   - Multi-workspace slash commands and interactive payloads (HTTP and socket mode) whose installation is missing or cannot be resolved are now acknowledged with an empty 200 (or a bare socket ack) and **not dispatched**. Before, they reached handlers with no token context.
@@ -62,6 +67,7 @@ Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) an
 
 ### Python-specific (divergence from upstream)
 
+- **Linear comment-thread replies query** (#231). Upstream fetches replies through the root `comments(filter: {parent: {id: {eq}}})` connection. The port keeps its existing `comment(id) { children(first, last) }` selection, which returns the same replies with the same pagination. It is documented in `docs/UPSTREAM_SYNC.md`.
 - **WhatsApp** drops its raw-body debug log and invalid-JSON `bodyPreview` (#187). Upstream 4.41.1 still logs both.
 - **Message-content debug logs** (#187):
   - GChat "message event" logs `{space, textLength}`.
