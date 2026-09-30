@@ -262,7 +262,14 @@ class TestDateAndNumberInputs:
     def test_marks_an_optional_date_input_as_not_required(self) -> None:
         # Empty placeholder / initialValue are omitted (upstream truthy spreads).
         assert self._render(
-            {"id": "renewal_date", "initialValue": "", "label": "Renewal Date", "optional": True, "type": "date_input"}
+            {
+                "id": "renewal_date",
+                "initialValue": "",
+                "label": "Renewal Date",
+                "optional": True,
+                "placeholder": "",
+                "type": "date_input",
+            }
         ) == {"id": "renewal_date", "isRequired": False, "label": "Renewal Date", "type": "Input.Date"}
 
     def test_renders_a_number_input_as_input_number_with_numeric_bounds(self) -> None:
@@ -289,11 +296,15 @@ class TestDateAndNumberInputs:
 
     def test_number_input_keeps_zero_bounds_and_value_and_omits_unset_ones(self) -> None:
         # Python-specific guard: ``0`` is a valid bound / value (upstream
-        # ``=== undefined`` checks), so a truthiness check would drop it.
-        assert self._render({"id": "n", "initialValue": 0, "label": "N", "min": 0, "type": "number_input"}) == {
+        # ``=== undefined`` checks), so a truthiness check would drop it. An
+        # empty placeholder is still omitted (upstream truthy spread).
+        assert self._render(
+            {"id": "n", "initialValue": 0, "label": "N", "max": 0, "min": 0, "placeholder": "", "type": "number_input"}
+        ) == {
             "id": "n",
             "isRequired": True,
             "label": "N",
+            "max": 0,
             "min": 0,
             "type": "Input.Number",
             "value": 0,
@@ -314,21 +325,30 @@ class TestDateAndNumberInputs:
     def test_python_numeric_submit_values_format_as_js_string(self) -> None:
         # Python-specific: JSON ``5.0`` parses to a float, which must read
         # "5" as JS ``String(5)`` does, not "5.0"; ``False`` is a bool, not a
-        # number; NaN / infinities (Python's ``json`` accepts them, JSON.parse
-        # never produces them) are dropped rather than stringified.
+        # number. JSON ``1e400`` is a float infinity in Python and
+        # ``Infinity`` after JSON.parse, as is an over-long int literal once
+        # JS holds it as a double: all render as JS ``String(Infinity)``.
         parsed = parse_teams_dialog_submit_values(
             {
                 "a": 5.0,
                 "b": 2.5,
                 "c": 1e21,
                 "d": False,
-                "e": float("nan"),
+                "e": float("-inf"),
                 "f": float("inf"),
                 "g": None,
                 "h": [1],
+                "i": 10**400,
             }
         )
-        assert parsed["values"] == {"a": "5", "b": "2.5", "c": "1e+21"}
+        assert parsed["values"] == {
+            "a": "5",
+            "b": "2.5",
+            "c": "1e+21",
+            "e": "-Infinity",
+            "f": "Infinity",
+            "i": "Infinity",
+        }
 
 
 class TestModalsImportBoundary:

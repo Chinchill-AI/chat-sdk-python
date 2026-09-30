@@ -464,10 +464,20 @@ class TestCardToAdaptiveCardWithTeamsSpecificHints:
         assert actions[1]["tooltip"] == "Opens the docs"
 
     def test_leaves_tooltip_unset_when_none_is_given(self):
-        card = Card(children=[Actions([Button(id="ok", label="OK"), LinkButton(url="https://e.com", label="L")])])
+        # An empty tooltip is omitted too (upstream ``if (button.tooltip)``).
+        card = Card(
+            children=[
+                Actions(
+                    [
+                        Button(id="ok", label="OK"),
+                        LinkButton(url="https://e.com", label="L"),
+                        Button(id="empty", label="E", tooltip=""),
+                    ]
+                )
+            ]
+        )
         actions = card_to_adaptive_card(card)["actions"]
-        assert "tooltip" not in actions[0]
-        assert "tooltip" not in actions[1]
+        assert ["tooltip" in action for action in actions] == [False, False, False]
 
 
 def _render_table(**options: Any) -> dict[str, Any]:
@@ -535,8 +545,8 @@ class TestCardToAdaptiveCardWithTable:
         # Python-specific: ``bool`` is an ``int`` subclass but not a number
         # upstream, and JS ``Number.isInteger(2.0)`` is true — emitted as the
         # int ``2`` so the wire JSON reads ``2`` as it does upstream.
-        table = _render_table(headers=["A", "B", "C", "D"], rows=[], widths=[True, 2.0, float("inf"), "3"])
-        assert table["columns"] == [{"width": 1}, {"width": 2}, {"width": 1}, {"width": 1}]
+        table = _render_table(headers=["A", "B", "C", "D", "E"], rows=[], widths=[True, 2.0, float("inf"), "3", -2.0])
+        assert table["columns"] == [{"width": 1}, {"width": 2}, {"width": 1}, {"width": 1}, {"width": 1}]
         assert type(table["columns"][1]["width"]) is int
 
     def test_maps_per_column_align_onto_the_column_definitions(self):

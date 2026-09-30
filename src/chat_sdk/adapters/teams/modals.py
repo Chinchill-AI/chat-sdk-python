@@ -47,9 +47,12 @@ Wire-key fidelity (HAZARDS):
   ``typeof value === "string"`` / ``typeof value === "number"`` branches).
 
 Truthiness mirrors upstream intentionally: optional emit guards
-(``maxLength`` / ``placeholder`` / ``initialValue`` / ``initialOption`` /
-``contextId``) use truthiness so an empty string / ``maxLength: 0`` is omitted,
-byte-for-byte with the upstream ``...(x ? { ... } : {})`` spreads. The
+(``maxLength`` / ``placeholder`` / text and date ``initialValue`` /
+``initialOption`` / ``contextId``) use truthiness so an empty string /
+``maxLength: 0`` is omitted, byte-for-byte with the upstream
+``...(x ? { ... } : {})`` spreads. The ``number_input`` ``max`` / ``min`` /
+``initialValue`` guards use ``is not None`` instead, mirroring upstream's
+``=== undefined`` checks, so ``0`` is emitted. The
 nullish-coalescing reads (``callbackId`` fallback, ``submitLabel`` default,
 ``multiline`` / ``optional`` defaults) use ``is not None`` so an explicit empty
 string survives, matching upstream's ``??``.
@@ -57,7 +60,6 @@ string survives, matching upstream's ``??``.
 
 from __future__ import annotations
 
-import math
 from typing import Any, Literal, NotRequired, TypedDict
 
 from chat_sdk.adapters.teams.cards_input import TeamsFieldElement
@@ -298,9 +300,8 @@ def parse_teams_dialog_submit_values(
     when string-typed. Every other key is copied into ``values`` when its
     value is a string, or stringified when it is a number (``Input.Number``
     submits a JSON number), formatted as JS ``String(value)`` does so ``5.0``
-    becomes ``"5"``. ``bool`` is not a number upstream and is dropped, as is
-    any other type. NaN and infinities (which Python's ``json`` accepts but
-    ``JSON.parse`` never produces) are dropped too.
+    becomes ``"5"`` and infinities become ``"Infinity"`` / ``"-Infinity"``.
+    ``bool`` is not a number upstream and is dropped, as is any other type.
     """
     if not data:
         return {"callbackId": None, "contextId": None, "values": {}}
@@ -314,8 +315,10 @@ def parse_teams_dialog_submit_values(
         elif isinstance(value, bool):
             # ``True`` is an ``int`` in Python but not a number upstream.
             continue
-        elif isinstance(value, int) or (isinstance(value, float) and math.isfinite(value)):
-            # Input.Number submits a JSON number
+        elif isinstance(value, (int, float)):
+            # Input.Number submits a JSON number. Every number is kept, as
+            # upstream's ``typeof value === "number"`` does: ``JSON.parse``
+            # yields ``Infinity`` for ``1e400``, rendered as "Infinity".
             values[key] = _js_number_to_string(value)
 
     raw_callback_id = data.get("__callbackId")
