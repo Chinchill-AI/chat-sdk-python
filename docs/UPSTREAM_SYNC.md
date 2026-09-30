@@ -26,8 +26,10 @@ to the upstream version this release is synced to.
 Step-by-step procedure for porting a new upstream release (e.g., `4.26.0`):
 
 ```bash
-# 1. Update the TS repo and check what changed
-cd /tmp/vercel-chat && git fetch origin
+# 1. Update the full TS clone (for reading diffs; see "How to Diff Upstream
+#    Changes") and check what changed. Keep it separate from /tmp/vercel-chat,
+#    the pinned checkout the fidelity script verifies (step 5).
+cd /tmp/vercel-chat-full && git fetch origin --tags
 git log --oneline chat@4.25.0..chat@4.26.0 -- packages/
 
 # 2. For each commit, read the diff
@@ -45,7 +47,13 @@ git checkout -b sync/upstream-v4.26.0
 uv run ruff check src/ tests/ scripts/
 uv run ruff format --check src/ tests/ scripts/
 uv run python scripts/audit_test_quality.py
-uv run python scripts/verify_test_fidelity.py
+# TS_ROOT (default /tmp/vercel-chat) must be a clean checkout of the tag in
+# scripts/upstream_pin.json; the full clone from step 1 sits at another
+# commit and fails the SHA check. If /tmp/vercel-chat is at an older pin,
+# delete it first (git refuses to clone into a non-empty directory).
+git clone --depth 1 --branch "$(jq -r .pin.tag scripts/upstream_pin.json)" \
+  https://github.com/vercel/chat.git /tmp/vercel-chat
+TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict
 uv run pytest tests/ --tb=short -q
 
 # 6. Update version
@@ -79,21 +87,111 @@ tests. If upstream tests lock in inconsistent behavior, choose one of:
 
 ### Test fidelity (strict mode)
 
-`scripts/verify_test_fidelity.py` runs in CI (`.github/workflows/lint.yml`) pinned
-to `vercel/chat@4.30.0` (matches the `UPSTREAM_PARITY` constant in
-`src/chat_sdk/__init__.py`). **CI runs `--strict`** — the repo ships at 0
-missing *for mapped core files* as of `0.4.30`. Scope is defined by the
-`MAPPING` dict in the script (extending to the remaining unmapped
-`packages/chat/src/*.test.ts` files is tracked as issue #78). Unmapped
-files are not checked — tightening scope requires editing `MAPPING` and
-re-running `--strict`.
+`scripts/verify_test_fidelity.py` runs in CI (`.github/workflows/lint.yml`)
+pinned to `vercel/chat@4.31.0`. **CI runs `--strict`** — the repo ships at 0
+missing *for mapped core files* (733/733 at the pin, counting each `it.each`
+template as one test).
+
+**Single pin source: `scripts/upstream_pin.json`.** It holds
+`pin: {tag, sha}` (the strict CI tag and its full commit SHA) and
+`target: {tag, sha}` (the tag an in-flight sync wave is porting towards;
+`chat@4.41.1` for the 4.41 wave, #184). The script and `lint.yml` (via
+`jq`) read it; no other file hard-codes the tag. Resolve SHAs with
+`git rev-parse <tag>^{commit}`. The major.minor of `pin.tag` must equal
+the major.minor of `UPSTREAM_PARITY` in `src/chat_sdk/__init__.py`
+(exact equality is not required: `UPSTREAM_PARITY = "4.41.0"` may pin
+`chat@4.41.1`). Only the pin-bump PR changes `pin` (#203 for this wave).
+
+Clone the pinned checkout locally with:
+
+```bash
+git clone --depth 1 --branch "$(jq -r .pin.tag scripts/upstream_pin.json)" \
+  https://github.com/vercel/chat.git /tmp/vercel-chat
+```
+
+**Scope is two-tier, plus explicit skips** (all dicts in the script):
+
+- `MAPPING` — the strict set. CI fails on any missing test here.
+- `TARGET_MAPPING` — rows checked only by `--report-target` (together with
+  `MAPPING`): files that do not exist at the pin (`history/*`,
+  `agent-session`, `app-context`, `installation-events`), plus files whose
+  Python counterpart still has gaps at the pin (`cards`, `modals`, `emoji`,
+  `message`; issue #78). A row moves to `MAPPING` once it is at 0 missing
+  at the pin. A Python file that does not exist yet reports every TS test
+  as missing.
+- `UNMAPPED` — core test files deliberately not checked, with the reason:
+
+| TS file(s) | Reason |
+|---|---|
+| `ai/tanstack/messages.test.ts`, `ai/tanstack/tools.test.ts` | JS-only TanStack AI adapter (chat@4.41.0); no Python equivalent. Non-parity row lands in #203. |
+| `workflow/approval.test.ts` | Vercel Workflow SDK integration (chat@4.35.0); no Python equivalent. |
+| `jsx-react.test.tsx`, `jsx-runtime.test.ts`, `jsx-runtime.test.tsx` | Covered by the "JSX Card/Modal elements" non-parity row. |
+| `adapters/index.test.ts` | Covered by the "`chat/adapters` static adapter catalog" non-parity row. |
+| `errors.test.ts`, `logger.test.ts`, `chat-singleton.test.ts` | #78 pending: no Python counterpart identified yet (0 exact name matches). |
+
+Every `packages/chat/src/**/*.test.ts(x)` must appear in exactly one of
+the three. An unlisted file is a warning at the pin and an error in
+`--report-target`.
+
+**Name extraction.** `it("…")` and `test("…")` each count as one test
+(`regex.test("…")` does not). Each `it.each` / `test.each` template counts
+as **one** logical test, which corresponds to one `@pytest.mark.parametrize`
+test in Python. Its placeholders (`%s %d %i %f %j %o %O %c %p %# %$ %%`,
+`$name`, `$a.b`) are stripped before the snake_case conversion. Placeholders
+are stripped only in `.each` titles; a literal `%` or `$` in a plain `it`
+title stays part of the name. `describe.each` titles are used only for
+reporting. The script reports exact and fuzzy match counts per file,
+because the word-overlap fuzzy matcher can claim an unrelated leftover
+Python test and hide a gap. The target report lists every fuzzy pair so
+it can be audited.
+
+**Target report.** Run
+`TS_ROOT=<checkout of target.tag> uv run python scripts/verify_test_fidelity.py --report-target`.
+It checks `MAPPING` + `TARGET_MAPPING` at the target SHA and never fails
+on missing tests. It rewrites `scripts/fidelity_target.json` with the tag,
+SHA, totals, and per-file missing `[describe, it]` pairs, extra counts and
+fuzzy pairs, and prints the delta against the report committed at `HEAD`
+(read with `git show`, so re-running before committing still compares
+against the committed baseline, not the previous run's output). The
+committed report is the authoritative wave-wide list. Every wave PR
+regenerates it and quotes the delta in its description, taken before
+the regenerated report is committed.
 
 Infra guardrails:
 
 - The workflow's `Clone upstream vercel/chat at pinned parity tag` step does
   **not** use `continue-on-error` — a failed clone aborts the job loudly.
-- The script itself fails with exit 1 if any mapped TS file is missing under
+  It also fails if the cloned HEAD differs from `pin.sha` (a moved tag),
+  and it writes the resolved SHA to the job summary.
+- The script fails if `TS_ROOT` is a git checkout whose HEAD differs from
+  the expected SHA (`pin.sha`, or `target.sha` for `--report-target`), if
+  tracked files under `packages/chat/src` have local edits, or if
+  `TS_ROOT/.git` exists but git cannot read it (e.g. a "dubious ownership"
+  refusal). A plain export without `.git` cannot be verified and only warns.
+- The script fails with exit 1 if any mapped TS file is missing under
   `TS_ROOT` (defense in depth against silent skips).
+- `--report-target` records a mapped file as absent only when a verified
+  git checkout's HEAD commit lacks it. It fails without writing the report
+  if a core test file in the commit is missing on disk (a sparse or partial
+  checkout, which passes the clean-tree check), or if any mapped file is
+  absent from a plain export, where absence cannot be verified.
+- `--strict` and `--report-target` fail if any upstream test cannot be
+  extracted (a non-literal title, an unknown call form such as `it.todo`,
+  an unreadable `.each` table) — an unextracted test would otherwise go
+  uncounted. Understood forms: `it`/`test` (any quote style), modifier
+  chains (`it.skip`, `it.only`, `it.concurrent`, …), `.each` / `.for`
+  (with optional `<T>` type arguments), and `.skipIf(c)` / `.runIf(c)`.
+  Baseline mode only warns. Calls inside comments and string, template or
+  regex literals (fixture source, commented-out examples) are ignored, and
+  a `describe.only("s", () => { it("t") })` one-liner still yields its test.
+  A template literal or block comment still open at end of file, and a
+  computed title such as `"rejects " + kind`, are extraction errors (so
+  they fail `--strict`) rather than hiding tests or matching a prefix.
+- `--check-docs` (a separate CI step) fails if a clone snippet
+  (`--branch chat@X`, `--branch=chat@X`, `-b chat@X`) or a `pinned to
+  [the] [vercel/]chat@X` phrase in `CLAUDE.md` or this file disagrees with
+  `pin.tag`. Matching is case-insensitive, tolerates markdown decoration
+  and line continuations, and the phrase may wrap across lines.
 
 Workflows:
 
@@ -101,7 +199,8 @@ Workflows:
 |------|---------|
 | Port a missing test | Write the Python test and land it; CI rejects anything that re-introduces a gap |
 | Add a Python-only divergence (intentional skip) | Document in [Known Non-Parity](#known-non-parity-with-typescript-sdk), then `--update-baseline` and switch the workflow back to non-strict default for that file if truly unavoidable |
-| Upstream sync | After pulling new upstream, run `--strict` — newly-added TS tests appear as missing and CI fails until ported |
+| Sync-wave progress | `TS_ROOT=<target checkout> uv run python scripts/verify_test_fidelity.py --report-target`, commit `scripts/fidelity_target.json`, and quote the delta in the PR |
+| Bump the pin | Update `pin.tag` + `pin.sha` in `scripts/upstream_pin.json` together with `UPSTREAM_PARITY`, then run `--strict` and `--check-docs` |
 | Final parity check | Same as CI: `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict` |
 
 Baseline mode (the default without `--strict`) is retained for local
@@ -164,17 +263,18 @@ the rules below before adding one.
 ## How to Diff Upstream Changes
 
 ```bash
-# Clone or update the TS repo
-git clone https://github.com/vercel/chat.git /tmp/vercel-chat
-cd /tmp/vercel-chat
+# Clone or update a full TS clone. Use its own path: /tmp/vercel-chat is
+# the pinned shallow checkout the fidelity script verifies by SHA.
+git clone https://github.com/vercel/chat.git /tmp/vercel-chat-full
+cd /tmp/vercel-chat-full
 git log --oneline -20  # see recent commits
 
 # Compare a specific adapter
-diff -u /tmp/vercel-chat/packages/adapter-slack/src/index.ts \
+diff -u /tmp/vercel-chat-full/packages/adapter-slack/src/index.ts \
         /tmp/chat-sdk-python/src/chat_sdk/adapters/slack/adapter.py
 
 # Compare core types
-diff -u /tmp/vercel-chat/packages/core/src/types.ts \
+diff -u /tmp/vercel-chat-full/packages/core/src/types.ts \
         /tmp/chat-sdk-python/src/chat_sdk/types.py
 ```
 

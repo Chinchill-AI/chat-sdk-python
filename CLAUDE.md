@@ -113,23 +113,38 @@ async mock bugs, and cross-file duplicates. PRs that introduce hard failures
 will not pass CI.
 
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
-`it("...")` in the mapped core files has a matching Python `def test_*()`,
-pinned to `chat@4.31.0` (matches `UPSTREAM_PARITY`; upstream never tagged
-`chat@4.27.0`/`chat@4.28.0`). The `MAPPING` dict in that script is the
-authoritative scope list — extending it to the remaining unmapped
-`packages/chat/src/*.test.ts` files is tracked as issue #78.
+`it("...")` / `test("...")` in the mapped core files — plus one logical
+test per `it.each` template — has a matching Python `def test_*()`,
+pinned to `chat@4.31.0` (major.minor must match `UPSTREAM_PARITY`).
+The pin lives in **`scripts/upstream_pin.json`** (`pin` = strict CI tag +
+commit SHA, `target` = the sync wave's tag); nothing else hard-codes it.
+Scope is two-tier: `MAPPING` is the strict set; `TARGET_MAPPING` rows are
+only checked by `--report-target`; `UNMAPPED` lists deliberate skips with
+reasons. Every `packages/chat/src/**/*.test.ts(x)` must be in one of the
+three (remaining unmapped work: issue #78).
 **CI runs `--strict`** (see `.github/workflows/lint.yml`):
-any missing translation in a mapped file fails the build, and a missing
-upstream checkout also fails (the script exits non-zero when any mapped
-TS file isn't found). Baseline mode (the default without `--strict`) is
-retained for local workflows where a few ports land in flight —
-regenerate via `--update-baseline` after documenting intentional
-divergence in `docs/UPSTREAM_SYNC.md`.
+any missing translation in a mapped file fails the build, a missing
+upstream checkout fails, and a checkout whose HEAD differs from the pinned
+SHA fails (a plain export without `.git` only warns). CI also runs
+`--check-docs`, which fails if a `--branch chat@X` / "pinned to chat@X"
+phrase in this file or `docs/UPSTREAM_SYNC.md` disagrees with the pin.
+Baseline mode (the default without `--strict`) is retained for local
+workflows where a few ports land in flight — regenerate via
+`--update-baseline` after documenting intentional divergence in
+`docs/UPSTREAM_SYNC.md`.
 
 Before the fidelity check can run locally, clone the pinned upstream
 checkout (same command CI uses in `lint.yml`):
 ```bash
-git clone --depth 1 --branch chat@4.31.0 \
+git clone --depth 1 --branch "$(jq -r .pin.tag scripts/upstream_pin.json)" \
   https://github.com/vercel/chat.git /tmp/vercel-chat
 ```
 Then `TS_ROOT=/tmp/vercel-chat uv run python scripts/verify_test_fidelity.py --strict`.
+
+**Sync-wave target report:** with a checkout of the target tag
+(`jq -r .target.tag scripts/upstream_pin.json`),
+`TS_ROOT=<that checkout> uv run python scripts/verify_test_fidelity.py --report-target`
+checks `MAPPING` + `TARGET_MAPPING`, never fails on missing tests, and
+rewrites `scripts/fidelity_target.json` (the committed wave-wide missing
+list, with exact vs fuzzy match counts). Wave PRs regenerate it and quote
+the printed delta.

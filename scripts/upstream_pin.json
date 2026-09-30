@@ -1,0 +1,11 @@
+{
+  "_comment": "Single source of truth for the upstream vercel/chat checkout used by scripts/verify_test_fidelity.py and .github/workflows/lint.yml. 'pin' is the strict CI tag (must share major.minor with UPSTREAM_PARITY in src/chat_sdk/__init__.py); 'target' is the sync-wave tag that --report-target measures against. Record full commit SHAs from `git rev-parse <tag>^{commit}`. Only the pin-bump PR changes 'pin'.",
+  "pin": {
+    "tag": "chat@4.31.0",
+    "sha": "2a553aa948e0605d5a93f4c30994ccca72a495f0"
+  },
+  "target": {
+    "tag": "chat@4.41.1",
+    "sha": "f690af3c26a3bd7649387cccad12d215463ed22c"
+  }
+}

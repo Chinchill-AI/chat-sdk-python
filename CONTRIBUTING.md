@@ -81,10 +81,11 @@ Vercel Chat version. See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md#version-mappin
    uv run ruff check src/ tests/ scripts/
    uv run ruff format --check src/ tests/ scripts/
    uv run python scripts/audit_test_quality.py
-   # verify_test_fidelity.py needs the upstream TS repo at $TS_ROOT (default
-   # /tmp/vercel-chat). Without it, the script silently skips checks and exits
-   # 0, so releases can ship unverified. Clone once:
-   #   git clone https://github.com/vercel/chat.git /tmp/vercel-chat
+   # verify_test_fidelity.py needs a checkout of the pinned upstream tag at
+   # $TS_ROOT (default /tmp/vercel-chat). It fails if the checkout is missing
+   # or its HEAD differs from the SHA in scripts/upstream_pin.json. Clone once:
+   #   git clone --depth 1 --branch "$(jq -r .pin.tag scripts/upstream_pin.json)" \
+   #     https://github.com/vercel/chat.git /tmp/vercel-chat
    uv run python scripts/verify_test_fidelity.py
    uv run pytest tests/ --tb=short -q
    ```

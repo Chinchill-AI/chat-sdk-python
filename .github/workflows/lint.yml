@@ -8,6 +8,9 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'
+      - 'scripts/upstream_pin.json'
+      - 'CLAUDE.md'
+      - 'docs/UPSTREAM_SYNC.md'
       - '.github/workflows/lint.yml'
   pull_request:
     branches: [main]
@@ -17,6 +20,9 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'
+      - 'scripts/upstream_pin.json'
+      - 'CLAUDE.md'
+      - 'docs/UPSTREAM_SYNC.md'
       - '.github/workflows/lint.yml'
   workflow_dispatch:
 
@@ -57,11 +63,27 @@ jobs:
         continue-on-error: true
         run: uv run python scripts/audit_test_quality.py
 
+      - name: Pin / doc drift check
+        id: pin_docs
+        continue-on-error: true
+        run: uv run python scripts/verify_test_fidelity.py --check-docs
+
+      # Tag and commit SHA come from scripts/upstream_pin.json (the single
+      # source of truth). No continue-on-error: a failed clone or a tag that
+      # no longer resolves to the pinned SHA aborts the job loudly.
       - name: Clone upstream vercel/chat at pinned parity tag
         id: clone_upstream
         run: |
-          git clone --depth 1 --branch chat@4.31.0 \
+          PIN_TAG="$(jq -r .pin.tag scripts/upstream_pin.json)"
+          PIN_SHA="$(jq -r .pin.sha scripts/upstream_pin.json)"
+          git clone --depth 1 --branch "$PIN_TAG" \
             https://github.com/vercel/chat.git /tmp/vercel-chat
+          HEAD_SHA="$(git -C /tmp/vercel-chat rev-parse HEAD)"
+          echo "Upstream vercel/chat: \`$PIN_TAG\` @ \`$HEAD_SHA\` (pinned \`$PIN_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$HEAD_SHA" != "$PIN_SHA" ]; then
+            echo "::error::$PIN_TAG resolved to $HEAD_SHA, but scripts/upstream_pin.json pins $PIN_SHA"
+            exit 1
+          fi
 
       - name: Test fidelity check (strict — zero missing in mapped core files)
         id: fidelity
@@ -88,6 +110,7 @@ jobs:
           echo "| Ruff check | ${{ steps.ruff_check.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Ruff format | ${{ steps.ruff_format.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test audit | ${{ steps.audit.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pin / doc drift | ${{ steps.pin_docs.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test fidelity | ${{ steps.fidelity.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Pyrefly | ${{ steps.pyrefly.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -103,11 +126,12 @@ jobs:
           RUFF_CHECK: ${{ steps.ruff_check.outcome }}
           RUFF_FORMAT: ${{ steps.ruff_format.outcome }}
           AUDIT: ${{ steps.audit.outcome }}
+          PIN_DOCS: ${{ steps.pin_docs.outcome }}
           FIDELITY: ${{ steps.fidelity.outcome }}
           PYREFLY: ${{ steps.pyrefly.outcome }}
         run: |
           failures=0
-          for var in RUFF_CHECK RUFF_FORMAT AUDIT FIDELITY PYREFLY; do
+          for var in RUFF_CHECK RUFF_FORMAT AUDIT PIN_DOCS FIDELITY PYREFLY; do
             outcome="${!var}"
             if [ "$outcome" != "success" ]; then
               echo "$var failed (outcome: $outcome)"
