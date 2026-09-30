@@ -178,7 +178,7 @@ class PostgresStateAdapter:
     (:data:`POSTGRES_SCHEMA_STATEMENTS`). With ``auto_create_schema=False``,
     ``connect()`` runs no DDL: it probes that the migration-owned tables exist
     and that the current role holds the privileges the adapter uses, and raises
-    :class:`~chat_sdk.errors.StateSchemaError` naming anything missing.
+    :class:`~chat_sdk.errors.StateSchemaError` naming the problem.
 
     Implements the full :class:`~chat_sdk.types.StateAdapter` protocol.
     """
@@ -189,10 +189,11 @@ class PostgresStateAdapter:
         url: str | None = None,
         pool: Any | None = None,
         key_prefix: str = "chat-sdk",
-        auto_create_schema: bool = True,
+        auto_create_schema: bool | None = True,
     ) -> None:
         self._key_prefix = key_prefix
-        self._auto_create_schema = auto_create_schema
+        # ``autoCreateSchema ?? true`` upstream: None keeps the default.
+        self._auto_create_schema = auto_create_schema if auto_create_schema is not None else True
         self._connected = False
         self._connect_lock = asyncio.Lock()
         self._owns_pool = pool is None
@@ -223,11 +224,12 @@ class PostgresStateAdapter:
             if self._connected:
                 return
 
+            created_pool: Any | None = None
             try:
                 if self._pool is None:
                     import asyncpg
 
-                    self._pool = await asyncpg.create_pool(dsn=self._url)
+                    self._pool = created_pool = await asyncpg.create_pool(dsn=self._url)
 
                 # Verify connectivity
                 await self._pool.fetchval("SELECT 1")
@@ -239,6 +241,20 @@ class PostgresStateAdapter:
             except Exception:
                 _logger.exception("Postgres connect failed")
                 raise
+            finally:
+                if created_pool is not None and not self._connected:
+                    await self._discard_failed_pool(created_pool)
+
+    async def _discard_failed_pool(self, pool: Any) -> None:
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. asyncpg opens
+        # min_size connections eagerly (pg.Pool is lazy), and disconnect() is
+        # a no-op until connect() succeeds, so a pool this attempt created is
+        # closed here; the next connect() builds a fresh one.
+        self._pool = None
+        try:
+            await pool.close()
+        except Exception:
+            _logger.warning("Failed to close Postgres pool after failed connect", exc_info=True)
 
     async def disconnect(self) -> None:
         if not self._connected:
@@ -705,7 +721,7 @@ def create_postgres_state(
     url: str | None = None,
     pool: Any | None = None,
     key_prefix: str = "chat-sdk",
-    auto_create_schema: bool = True,
+    auto_create_schema: bool | None = True,
 ) -> PostgresStateAdapter:
     """Create a new PostgreSQL state adapter.
 

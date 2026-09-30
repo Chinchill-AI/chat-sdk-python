@@ -206,11 +206,14 @@ tables, and `nextval` on the list and queue sequences (`USAGE` or `UPDATE`;
 identity `seq` columns need no sequence grant). Column-level `SELECT` /
 `INSERT` / `UPDATE` grants on the columns the adapter uses are accepted too.
 If anything is missing, `connect()` raises `chat_sdk.StateSchemaError`
-("PostgreSQL state schema is not ready: ...") naming every missing table or
-grant, so a wrong `search_path` or a forgotten grant fails at startup instead
-of on the first message. Your migrations also own future adapter schema
-changes; the CHANGELOG lists them. A pool you pass in stays open after
-`disconnect()`; a pool the adapter created from a URL is closed.
+("PostgreSQL state schema is not ready: ...") naming the problem, so a wrong
+`search_path` or a forgotten grant fails at startup instead of on the first
+message. A missing table is reported as the first relation PostgreSQL cannot
+resolve; missing grants are all named together. Your migrations also own
+future adapter schema changes; the CHANGELOG lists them. A pool you pass in
+stays open after `disconnect()`; a pool the adapter created from a URL is
+closed, and is also closed as soon as a `connect()` attempt fails, so
+retrying does not pile up open connections.
 
 ## Compared to Alternatives
 

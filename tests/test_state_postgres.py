@@ -591,7 +591,12 @@ class TestPostgresStateSchemaInitialization:
     """``auto_create_schema`` and the migration-owned schema probe."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("kwargs", [{}, {"auto_create_schema": True}], ids=["omitted", "true"])
+    # None mirrors upstream's `autoCreateSchema ?? true`: it keeps the default.
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{}, {"auto_create_schema": True}, {"auto_create_schema": None}],
+        ids=["omitted", "true", "none"],
+    )
     async def test_creates_every_table_and_index_when_auto_create_schema_is(
         self, mock_pool: MockAsyncpgPool, kwargs: dict[str, Any]
     ):
@@ -633,6 +638,41 @@ class TestPostgresStateSchemaInitialization:
         adapter = PostgresStateAdapter(pool=mock_pool, auto_create_schema=False)
         await adapter.connect()
         probe = mock_pool.calls[1][1]
+        # Upstream's tablePrivileges map, column by column: every WHERE,
+        # conflict target, RETURNING, SET and INSERT column the adapter uses.
+        expected = {
+            "chat_state_subscriptions": {
+                "SELECT": ("key_prefix", "thread_id"),
+                "INSERT": ("key_prefix", "thread_id"),
+            },
+            "chat_state_locks": {
+                "SELECT": ("key_prefix", "thread_id", "token", "expires_at"),
+                "INSERT": ("key_prefix", "thread_id", "token", "expires_at"),
+                "UPDATE": ("token", "expires_at", "updated_at"),
+            },
+            "chat_state_cache": {
+                "SELECT": ("key_prefix", "cache_key", "value", "expires_at"),
+                "INSERT": ("key_prefix", "cache_key", "value", "expires_at"),
+                "UPDATE": ("value", "expires_at", "updated_at"),
+            },
+            "chat_state_lists": {
+                "SELECT": ("key_prefix", "list_key", "seq", "value", "expires_at"),
+                "INSERT": ("key_prefix", "list_key", "value", "expires_at"),
+                "UPDATE": ("expires_at",),
+            },
+            "chat_state_queues": {
+                "SELECT": ("key_prefix", "thread_id", "seq", "value", "expires_at"),
+                "INSERT": ("key_prefix", "thread_id", "value", "expires_at"),
+            },
+        }
+        column_checks = re.findall(r"has_column_privilege\('(\w+)', '(\w+)', '(\w+)'\)", probe)
+        assert len(column_checks) == len(set(column_checks))
+        assert set(column_checks) == {
+            (table, column, privilege)
+            for table, privileges in expected.items()
+            for privilege, columns in privileges.items()
+            for column in columns
+        }
         for table in ("chat_state_subscriptions", "chat_state_queues"):
             assert f"has_table_privilege('{table}', 'DELETE')" in probe
             assert f"has_table_privilege('{table}', 'UPDATE')" not in probe
@@ -661,6 +701,9 @@ class TestPostgresStateSchemaInitialization:
             'PostgreSQL state schema is not ready: relation "chat_state_locks" does not exist. ' + _SCHEMA_ERROR_HINT
         )
         assert exc_info.value.__cause__ is error
+        # A caller-supplied pool is never closed, even after a failed connect.
+        assert mock_pool.close_calls == 0
+        assert adapter.get_pool() is mock_pool
         assert isinstance(exc_info.value, ChatError)
         assert chat_sdk.StateSchemaError is StateSchemaError
         assert ("execute", "ddl") not in _call_summary(mock_pool)
@@ -719,6 +762,46 @@ class TestPostgresStateSchemaInitialization:
         assert _call_summary(pool) == [("fetchval", "SELECT 1"), ("fetchrow", "probe")]
         await adapter.disconnect()
         assert pool.close_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["schema", "connectivity", "cancelled"])
+    async def test_closes_the_owned_pool_when_connect_fails(self, monkeypatch: pytest.MonkeyPatch, failure: str):
+        """Python divergence (see docs/UPSTREAM_SYNC.md): asyncpg opens its
+        connections eagerly and ``disconnect()`` is a no-op until ``connect()``
+        succeeds, so a pool the failed attempt created is closed at once and
+        the next attempt builds a fresh one.
+        """
+        url = "postgres://localhost:5432/test"
+        failed_pool, fresh_pool = MockAsyncpgPool(), MockAsyncpgPool()
+        expected: type[BaseException]
+        if failure == "schema":
+            failed_pool.probe_error = _UndefinedTableError('relation "chat_state_cache" does not exist')
+            expected = StateSchemaError
+        elif failure == "connectivity":
+            failed_pool.select_one_errors.append(ConnectionRefusedError("connection refused"))
+            expected = ConnectionRefusedError
+        else:
+            failed_pool.probe_error = asyncio.CancelledError()
+            expected = asyncio.CancelledError
+        create_pool = AsyncMock(side_effect=[failed_pool, fresh_pool])
+        # asyncpg is an optional extra; connect() imports it lazily.
+        monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(create_pool=create_pool))
+        adapter = create_postgres_state(url=url, auto_create_schema=False)
+
+        with pytest.raises(expected):
+            await adapter.connect()
+
+        assert failed_pool.close_calls == 1
+        assert adapter.get_pool() is None
+        await adapter.disconnect()
+        assert failed_pool.close_calls == 1
+
+        await adapter.connect()
+        assert create_pool.await_count == 2
+        assert adapter.get_pool() is fresh_pool
+        assert _call_summary(fresh_pool) == [("fetchval", "SELECT 1"), ("fetchrow", "probe")]
+        await adapter.disconnect()
+        assert (failed_pool.close_calls, fresh_pool.close_calls) == (1, 1)
 
     @pytest.mark.asyncio
     async def test_retries_a_failed_connectivity_check_without_ddl(
@@ -1577,6 +1660,7 @@ class TestPostgresMigrationOwnedSchemaIntegration:
 
         for grant in (
             "SELECT (cache_key) ON chat_state_cache",
+            "SELECT (token) ON chat_state_locks",
             "INSERT (value) ON chat_state_cache",
             "UPDATE (updated_at) ON chat_state_cache",
             "DELETE ON chat_state_cache",

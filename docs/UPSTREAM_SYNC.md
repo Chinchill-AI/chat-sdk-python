@@ -371,8 +371,11 @@ Parity with upstream `d88789c9` (vercel/chat#636, chat@4.35.0) and `ea025af7`
   lists need column `SELECT`; `set` / `set_if_not_exists` / `acquire_lock` /
   `extend_lock` / list-TTL refresh need the listed `UPDATE` columns; every
   table is deleted from). The flag flows through the `url` argument, the
-  `POSTGRES_URL` / `DATABASE_URL` fallbacks and an injected `pool`. An
+  `POSTGRES_URL` / `DATABASE_URL` fallbacks and an injected `pool`, and
+  `None` means `True` (upstream `autoCreateSchema ?? true`). An
   adapter-created pool is closed on `disconnect()`, an injected one never is.
+  `test_probes_only_the_privileges_each_table_needs` pins every
+  `has_column_privilege` term against a literal copy of upstream's map.
 - `POSTGRES_SCHEMA_STATEMENTS` (a `tuple[str, ...]`, exported from
   `chat_sdk.state.postgres` and `chat_sdk.state`) mirrors
   `postgresSchemaStatements`: the same nine statements, in the same order. The
@@ -384,13 +387,14 @@ Parity with upstream `d88789c9` (vercel/chat#636, chat@4.35.0) and `ea025af7`
   needs `asyncpg` installed, which the `dev` group does not include (e.g.
   `uv run --with asyncpg pytest ...`).
 
-Two Python-surface adaptations, both listed under
+Three Python-surface adaptations, all listed under
 [Known Non-Parity](#known-non-parity-with-typescript-sdk):
 
 1. **Error type.** Upstream throws a plain `Error`. Python raises
    `chat_sdk.StateSchemaError(ChatError)`. The message is the same
-   (`"PostgreSQL state schema is not ready: …"` naming every missing object,
-   then the hint), except that the hint names the Python option
+   (`"PostgreSQL state schema is not ready: …"` naming the first relation
+   PostgreSQL cannot resolve, or every object whose grants are missing, then
+   the hint), except that the hint names the Python option
    (`auto_create_schema=True`). A probe failure, such as a missing table, is
    chained as `__cause__` (upstream `{ cause }`).
 2. **Concurrent `connect()`.** Upstream shares one in-flight promise, so
@@ -401,6 +405,15 @@ Two Python-surface adaptations, both listed under
    sequential retry, and
    `test_concurrent_connect_retries_after_a_failed_connectivity_check` pins
    the Python behavior.
+3. **Owned pool closed on a failed `connect()`.** Upstream's lazy `pg.Pool`
+   keeps at most one idle client, which times out, and its `disconnect()` is
+   a no-op until `connect()` succeeds. asyncpg's `create_pool` opens
+   `min_size` (10) connections eagerly and keeps them, so the same shape
+   leaked a full pool per failed attempt (for example `StateSchemaError` in a
+   startup retry loop). When `connect()` fails, including by cancellation,
+   Python closes a pool that attempt created and resets it, so the next
+   attempt builds a fresh one. An injected pool is never closed. Pinned by
+   `test_closes_the_owned_pool_when_connect_fails`.
 
 ## What to Port vs What to Adapt
 
@@ -848,6 +861,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams file attachment URL source (`_create_attachment`) | For a `application/vnd.microsoft.teams.file.download.info` attachment, prefers the nested `content.downloadUrl` (a short-lived pre-signed link) over the top-level `contentUrl`. Every other attachment type keeps the upstream `contentUrl`-first path (with `content.downloadUrl` only as a fallback when `contentUrl` is missing/falsy). | Reads `att.contentUrl` only — `createAttachment(att)`'s param type doesn't even include `content` (`adapter-teams/src/index.ts:833`, `const url = att.contentUrl`) | **Hard-UX-failure divergence.** A SharePoint/OneDrive file shared in a personal or group chat arrives as a `file.download.info` attachment that carries BOTH a top-level `contentUrl` (the SharePoint/OneDrive item, e.g. `https://contoso.sharepoint.com/.../file.txt`, which returns **403** to an anonymous GET because it needs a SharePoint auth context) AND a nested `content.downloadUrl` — a pre-authenticated link the [Bot Framework docs](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/bots-filesv4#message-activity-with-file-attachment-example) explicitly say to issue an `HTTP GET` against. Upstream (and our pre-fix adapter) read `contentUrl` only, so the attachment is **undownloadable** (`fetch_data` 403s). We prefer `content.downloadUrl` for this attachment type so the download actually works. The resulting URL still flows through the unchanged `_build_teams_fetch_data` / `rehydrate_attachment` SSRF allowlist (download hosts are SharePoint/OneDrive for Business → already covered by `*.sharepoint.com` / `*.onedrive.com` in the row above — no host added). To be filed as an upstream issue against vercel/chat. Supersedes stale PR #136. Regression coverage: `tests/test_teams_adapter.py::TestFileDownloadInfoAttachment`. |
 | `_rehydrate_message` with `Message` input | Falls through to the `rehydrate_attachment` pass even when the dequeued entry is already a `Message` instance | Early-returns on `raw instanceof Message` before rehydration | The Python port's Redis + Postgres `dequeue()` upgrade raw JSON to `Message.from_json(...)` before returning (upstream's dequeue returns the raw JSON.parse'd dict). Upstream's `instanceof Message` shortcut therefore only fires for in-memory state, but ours would fire for persistent backends too, leaving `fetch_data` stripped forever. The rehydrate pass still skips any attachment that already has `fetch_data`, so in-memory callers pay no cost. |
 | Postgres state schema error type (#240) | `PostgresStateAdapter.connect()` with `auto_create_schema=False` raises `chat_sdk.StateSchemaError` (a `ChatError`); the message matches upstream except that the hint names `auto_create_schema=True`; a probe failure is chained as `__cause__` | Plain `Error` with `{ cause }`; the hint names `autoCreateSchema: true` | Python-surface adaptation: callers can catch a dedicated exception type instead of matching message text. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_rejects_connect_when_a_migration_owned_table_is_missing`. |
+| Postgres state owned pool on a failed `connect()` (#240) | A pool the adapter created from a URL / env var is closed and reset as soon as that `connect()` attempt fails (or is cancelled); the next attempt creates a fresh pool. An injected pool is never closed | `disconnect()` is a no-op before a successful `connect()`; the lazy `pg.Pool` holds at most one idle client that times out | asyncpg opens `min_size` connections eagerly, so without this a startup retry loop leaked 10 connections per failed attempt. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_closes_the_owned_pool_when_connect_fails`. |
 | Postgres state concurrent `connect()` (#240) | Serialized on an `asyncio.Lock`: a caller queued behind a failed attempt retries it (and may succeed) | Concurrent callers share one in-flight promise and all reject with the same error | Predates #240 and kept: a queued caller retrying is harmless, and `connect()` stays idempotent. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_concurrent_connect_retries_after_a_failed_connectivity_check`; see [Postgres state: expired claims and migration-owned schemas](#postgres-state-expired-claims-and-migration-owned-schemas-chat435441-240). |
 | Slack Socket Mode reconnect loop | Outer reconnect loop on top of `slack_sdk.socket_mode.aiohttp.SocketModeClient` (which itself has `auto_reconnect_enabled=True`). Exponential backoff (1s → 30s) with explicit shutdown signaling and a tracked `asyncio.Task` so `disconnect()` can cancel cleanly | Single `SocketModeClient` instance from `@slack/socket-mode`; relies entirely on the package's internal reconnect | Hazard #5 (async task lifecycle): a long-lived WebSocket needs an explicit shutdown path so `disconnect()` doesn't leak the loop, and a guarded outer reconnect path so the adapter survives `connect()` itself raising (which the inner client doesn't retry). Inner auto-reconnect still runs; the outer loop is belt-and-suspenders, not a divergence in observable behavior. |
 | Slack Socket Mode listener serverless variant | Not ported | `startSocketModeListener()` / `runSocketModeListener()` open a transient socket for `durationMs` and forward events via HTTP POST | Vercel-specific pattern (cron-triggered ephemeral listener with `waitUntil`). The forwarded-event receiver (`x-slack-socket-token` handling in `handle_webhook`) is ported so a separate Python process can run the long-lived listener; the deployment glue itself isn't part of the SDK. |
