@@ -5703,3 +5703,28 @@ class TestChatInitializationRetry:
         # The next call still retries the (now failing) connection.
         with pytest.raises(ConnectionRefusedError):
             await chat.initialize()
+
+    # Python-specific: under ``asyncio.eager_task_factory`` a synchronously
+    # failing ``connect()`` must not finish the attempt before it is recorded
+    # as current (upstream's ``.catch`` always runs after the assignment), or
+    # the failure would be cached and never retried.
+    async def test_retries_state_connection_under_eager_task_factory(self):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        refused = ConnectionRefusedError("connect ECONNREFUSED")
+        state.connect = AsyncMock(side_effect=[refused, None])  # type: ignore[method-assign]
+        adapter.initialize = AsyncMock()  # type: ignore[method-assign]
+        chat = _retry_chat({"slack": adapter}, state)
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            with pytest.raises(ConnectionRefusedError) as exc_info:
+                await chat.initialize()
+            assert exc_info.value is refused
+            await chat.initialize()
+        finally:
+            loop.set_task_factory(previous_factory)
+
+        assert state.connect.await_count == 2
+        assert adapter.initialize.await_count == 1

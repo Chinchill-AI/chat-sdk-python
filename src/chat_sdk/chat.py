@@ -722,7 +722,12 @@ class Chat:
         attempt = self._init_promise
         if attempt is None:
             self._logger.info("Initializing chat instance...")
-            attempt = asyncio.get_running_loop().create_task(self._run_init_attempt())
+            # Construct the Task directly (never eagerly started) rather than
+            # via ``loop.create_task``: an eager task factory would run a
+            # synchronously failing ``connect()`` before ``_init_promise`` is
+            # assigned, and the failure would then be cached. Upstream's
+            # ``.catch`` always runs after the assignment.
+            attempt = asyncio.Task(self._run_init_attempt(), loop=asyncio.get_running_loop())
             # Mark the failure observed: if every caller was cancelled, the
             # shield drops its callback and nobody retrieves the exception
             # ("Task exception was never retrieved"). Awaiting callers still
@@ -791,6 +796,10 @@ class Chat:
                 self._logger.error("Adapter disconnect failed", str(r))
         await self._state_adapter.disconnect()
         self._initialized = False
+        # Upstream parity (chat.ts ``shutdown``): an in-flight initialization
+        # attempt is forgotten, not cancelled. It settles for its own callers,
+        # as in upstream where the attempt promise cannot be cancelled (pinned
+        # by test_keeps_a_newer_attempt_when_a_preshutdown_state_connection_rejects).
         self._init_promise = None
         self._logger.info("Chat instance shut down")
 

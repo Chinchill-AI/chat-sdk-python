@@ -786,17 +786,42 @@ class TestHandleMessageActivityWithRealChat:
         assert streamer.close_calls == 1
         assert _dm_thread_id(adapter) not in adapter._active_streams
 
-        # The caller's wait_until got a finished Task; the option spread through
-        # the shim decides whether it carries the handler error.
+        # The caller's wait_until got a Task; the option spread through the
+        # shim decides whether it carries the handler error.
         assert len(handed) == 1
         background = handed[0]
         assert isinstance(background, asyncio.Task)
-        assert background.done()
+        (outcome,) = await asyncio.gather(background, return_exceptions=True)
         if propagate:
-            with pytest.raises(RuntimeError, match="handler boom"):
-                background.result()
+            assert isinstance(outcome, RuntimeError)
+            assert str(outcome) == "handler boom"
         else:
-            assert background.result() is None
+            assert outcome is None
+
+    # Python-specific: a host that cancels the default wait_until wrapper
+    # (e.g. a background-task timeout) must not release the gate while the
+    # shielded handler is still streaming.
+    @pytest.mark.asyncio
+    async def test_cancelled_wait_until_wrapper_keeps_dm_streamer_open(self):
+        from chat_sdk.types import WebhookOptions
+
+        adapter = _make_adapter()
+        streamer = FakeStreamer(chunk_id="id-1")
+        adapter._create_streamer = MagicMock(return_value=streamer)  # type: ignore[method-assign]
+        _chat, stream_modes = self._wire(adapter)
+
+        def cancel_wrapper(task: Any) -> None:
+            task.cancel()
+
+        await adapter._handle_message_activity(
+            _dm_activity(activity_id="incoming-real-cancelled-wrapper"),
+            WebhookOptions(wait_until=cancel_wrapper),
+        )
+
+        assert stream_modes == ["native"]
+        assert streamer.emitted == ["hello"]
+        assert streamer.close_calls == 1
+        assert _dm_thread_id(adapter) not in adapter._active_streams
 
 
 # ---------------------------------------------------------------------------
