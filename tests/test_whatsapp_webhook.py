@@ -1453,6 +1453,25 @@ class TestBusinessScopedUserIdsPythonSpecific:
         assert await state.get(f"whatsapp:identity:route:123456789:{PHONE}") == {"bsuid": "US.ALICE", "phone": PHONE}
         assert await state.get(f"whatsapp:identity:route:123456789:{NEW_PHONE}") == {"phone": NEW_PHONE}
 
+    async def test_system_message_does_not_take_an_unmatched_contact(self):
+        """Divergence from upstream (see docs/UPSTREAM_SYNC.md): a
+        ``user_changed_user_id`` system message (no message-level ``from*``)
+        batched with Alice's contact must not merge Alice's phone into Bob."""
+        adapter, _, state, _ = await _bsuid_env()
+        alice = {"profile": {"name": "Alice"}, "wa_id": PHONE, "user_id": "US.ALICE"}
+        bob_rotation = {
+            "id": "wamid.system",
+            "timestamp": "1700000002",
+            "type": "system",
+            "system": {"body": "User changed", "user_id": "US.BOB", "type": "user_changed_user_id"},
+        }
+
+        await _deliver(adapter, _notification([_inbound({"from": PHONE}), bob_rotation], [alice]))
+
+        assert await state.get("whatsapp:identity:alias:123456789:US.BOB") == "US.BOB"
+        assert await state.get("whatsapp:identity:route:123456789:US.BOB") == {"bsuid": "US.BOB"}
+        assert await state.get(f"whatsapp:identity:route:123456789:{PHONE}") == {"bsuid": "US.ALICE", "phone": PHONE}
+
     async def test_uses_the_only_contact_when_the_message_has_no_sender_ids(self):
         """The single-contact fallback survives for messages that carry no
         sender identifier of their own."""
