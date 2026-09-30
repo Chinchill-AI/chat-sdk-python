@@ -21,10 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._slack_file_transport import FakeFileTransport
+
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import SlackAdapterConfig, SlackInstallation
-    from chat_sdk.shared.errors import AuthenticationError
+    from chat_sdk.shared.errors import AuthenticationError, ValidationError
     from chat_sdk.types import Attachment
 
     _SLACK_AVAILABLE = True
@@ -490,7 +492,8 @@ class TestInstallationProviderRehydrate:
     async def test_rehydrate_attachment_uses_provider_for_token_resolution(self):
         provider = _make_provider(SlackInstallation(bot_token="xoxb-rehydrate-token", bot_user_id="U_BOT_REHYDRATE"))
         adapter, _, _ = await _make_provider_adapter(provider)
-        adapter._fetch_slack_file = AsyncMock(return_value=b"\x00" * 8)  # type: ignore[method-assign]
+        transport = FakeFileTransport()
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -504,10 +507,36 @@ class TestInstallationProviderRehydrate:
         )
 
         assert rehydrated.fetch_data is not None
-        await rehydrated.fetch_data()
+        assert await rehydrated.fetch_data() == b"file-bytes"
 
         provider.get_installation.assert_called_once_with("T_REHYDRATE", False)
-        adapter._fetch_slack_file.assert_awaited_once_with("https://files.slack.com/img.png", "xoxb-rehydrate-token")
+        assert [url for url, _ in transport.calls] == ["https://files.slack.com/img.png"]
+        assert transport.authorizations == ["Bearer xoxb-rehydrate-token"]
+
+    @pytest.mark.asyncio
+    async def test_rehydrate_attachment_does_not_send_installation_tokens_off_slack(self):
+        # Port of upstream "rehydrateAttachment does not send installation
+        # tokens off Slack". Upstream fetches the URL without credentials;
+        # Python refuses it outright (divergence, docs/UPSTREAM_SYNC.md). In
+        # both, the installation token is never looked up.
+        provider = _make_provider(SlackInstallation(bot_token="xoxb-rehydrate-token", bot_user_id="U_BOT_REHYDRATE"))
+        adapter, _, _ = await _make_provider_adapter(provider)
+        transport = FakeFileTransport()
+        adapter._file_transport = transport
+
+        rehydrated = adapter.rehydrate_attachment(
+            Attachment(
+                type="file",
+                url="https://attacker.example/file.txt",
+                fetch_metadata={"url": "https://attacker.example/file.txt", "teamId": "T_REHYDRATE"},
+            )
+        )
+
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(ValidationError, match="untrusted URL"):
+            await rehydrated.fetch_data()
+        provider.get_installation.assert_not_called()
+        assert transport.calls == []
 
     @pytest.mark.asyncio
     async def test_rehydrate_attachment_uses_enterprise_id_when_enterprise_install(self):
@@ -515,7 +544,8 @@ class TestInstallationProviderRehydrate:
             SlackInstallation(bot_token="xoxb-ent-rehydrate-token", bot_user_id="U_BOT_ENT_REHYDRATE")
         )
         adapter, _, _ = await _make_provider_adapter(provider)
-        adapter._fetch_slack_file = AsyncMock(return_value=b"\x00" * 8)  # type: ignore[method-assign]
+        transport = FakeFileTransport()
+        adapter._file_transport = transport
 
         rehydrated = adapter.rehydrate_attachment(
             Attachment(
@@ -534,9 +564,8 @@ class TestInstallationProviderRehydrate:
         await rehydrated.fetch_data()
 
         provider.get_installation.assert_called_once_with("E_ORG", True)
-        adapter._fetch_slack_file.assert_awaited_once_with(
-            "https://files.slack.com/img.png", "xoxb-ent-rehydrate-token"
-        )
+        assert [url for url, _ in transport.calls] == ["https://files.slack.com/img.png"]
+        assert transport.authorizations == ["Bearer xoxb-ent-rehydrate-token"]
 
     @pytest.mark.asyncio
     async def test_rehydrate_attachment_raises_when_provider_returns_none(self):
