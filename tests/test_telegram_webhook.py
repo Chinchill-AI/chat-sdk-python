@@ -1558,6 +1558,48 @@ class TestTelegramWebhookDeduplicationPythonEdges:
         assert adapter._webhook_scope == _SCOPE_999
 
     @pytest.mark.asyncio
+    async def test_reinitialize_keeps_the_get_me_username_over_the_chat_name(self):
+        # The cached identity skips ``getMe`` on a second ``initialize``
+        # (``Chat.shutdown`` + ``Chat.initialize``); the Telegram username must
+        # still win over ``Chat.user_name`` so ``/ping@real_bot`` keeps routing.
+        get_me = AsyncMock(return_value={**_BOT_ME, "username": "real_bot"})
+        adapter = _dedupe_adapter(get_me=get_me, user_name=None)
+        chat = _mock_chat(_spy_state())
+        chat.get_user_name = MagicMock(return_value="chat_level_name")
+
+        await adapter.initialize(chat)
+        await adapter.initialize(chat)
+
+        assert get_me.await_count == 1
+        assert adapter.user_name == "real_bot"
+        await adapter.handle_webhook(
+            _update_request(
+                {
+                    "update_id": 1,
+                    "message": _sample_message(
+                        text="/ping@real_bot hi",
+                        entities=[{"type": "bot_command", "offset": 0, "length": 14}],
+                    ),
+                }
+            )
+        )
+        chat.process_slash_command.assert_called_once()
+        assert chat.process_slash_command.call_args.args[0].command == "/ping"
+
+    def test_positional_config_arguments_keep_their_pre_opt_out_binding(self):
+        # ``allow_unverified_webhooks`` is appended last so existing positional
+        # callers (api_base_url, bot_token, logger, long_polling, mode, ...)
+        # are not shifted by the new field.
+        config = TelegramAdapterConfig(None, "token", None, None, "polling", "secret", "named_bot")
+
+        assert config.api_base_url is None
+        assert config.bot_token == "token"
+        assert config.mode == "polling"
+        assert config.secret_token == "secret"
+        assert config.user_name == "named_bot"
+        assert config.allow_unverified_webhooks is None
+
+    @pytest.mark.asyncio
     async def test_polling_mode_initialize_does_not_require_verification(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
         monkeypatch.delenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", raising=False)

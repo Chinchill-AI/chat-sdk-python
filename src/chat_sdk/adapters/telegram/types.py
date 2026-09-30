@@ -47,14 +47,6 @@ class TelegramLongPollingConfig:
 class TelegramAdapterConfig:
     """Telegram adapter configuration."""
 
-    allow_unverified_webhooks: bool | None = None
-    """Explicitly accept webhook requests without secret-token verification.
-
-    Webhook mode requires ``secret_token`` unless this is ``True``. Defaults to
-    the ``TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS`` env var, where only the exact
-    string ``"true"`` opts out. An explicit ``False`` here wins over the env var.
-    """
-
     api_base_url: str | None = None
     """Optional custom API base URL (defaults to https://api.telegram.org).
     Defaults to TELEGRAM_API_BASE_URL env var.
@@ -84,6 +76,17 @@ class TelegramAdapterConfig:
 
     user_name: str | None = None
     """Override bot username (optional). Defaults to TELEGRAM_BOT_USERNAME env var."""
+
+    # Appended after the pre-existing fields (not alphabetical) so positional
+    # construction such as ``TelegramAdapterConfig(None, "token")`` keeps
+    # binding the same parameters as before this field existed.
+    allow_unverified_webhooks: bool | None = None
+    """Explicitly accept webhook requests without secret-token verification.
+
+    Webhook mode requires ``secret_token`` unless this is ``True``. Defaults to
+    the ``TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS`` env var, where only the exact
+    string ``"true"`` opts out. An explicit ``False`` here wins over the env var.
+    """
 
 
 # =============================================================================

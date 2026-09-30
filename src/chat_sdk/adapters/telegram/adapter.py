@@ -723,6 +723,11 @@ class TelegramAdapter:
         # ``sha256(bot_user_id)`` scope used to key webhook update claims.
         self._bot_identity_task: asyncio.Task[None] | None = None
         self._webhook_scope: str | None = None
+        # Username reported by ``getMe``. ``_ensure_bot_identity`` short-circuits
+        # once the scope is cached, so a re-``initialize`` (``Chat.shutdown`` then
+        # ``Chat.initialize``) must restore it here after applying the Chat-level
+        # name, or ``@real_bot`` mentions / ``/cmd@real_bot`` stop routing.
+        self._resolved_user_name: str | None = None
 
         explicit_user_name = config.user_name or os.environ.get("TELEGRAM_BOT_USERNAME")
         self._user_name: str = self.normalize_user_name(explicit_user_name or "bot")
@@ -837,7 +842,8 @@ class TelegramAdapter:
         self._bot_user_id = bot_user_id
         self._webhook_scope = hashlib.sha256(bot_user_id.encode("utf-8")).hexdigest()
         if not self._has_explicit_user_name and me.get("username"):
-            self._user_name = self.normalize_user_name(me["username"])
+            self._resolved_user_name = self.normalize_user_name(me["username"])
+            self._user_name = self._resolved_user_name
         self._logger.info(
             "Telegram bot identity resolved",
             {"botUserId": self._bot_user_id, "userName": self._user_name},
@@ -853,6 +859,10 @@ class TelegramAdapter:
                 resolved = chat_user_name()
                 if isinstance(resolved, str) and resolved.strip():
                     self._user_name = self.normalize_user_name(resolved)
+            # ``getMe`` refines the Chat-level name; when the identity is
+            # already cached the lookup below is skipped, so reapply it here.
+            if self._resolved_user_name:
+                self._user_name = self._resolved_user_name
 
         try:
             await self._ensure_bot_identity()
