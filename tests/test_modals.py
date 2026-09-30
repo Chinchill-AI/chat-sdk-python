@@ -201,6 +201,26 @@ class TestNumberInput:
         assert number_input["max"] == 0
         assert number_input["decimal"] is False
 
+    # Python-specific: every set-but-falsy option survives (``is not None``).
+    def test_falsy_optional_and_placeholder_are_kept(self):
+        date_input = DateInput(id="d1", label="Due", placeholder="", initial_value="", optional=False)
+        number_input = NumberInput(id="n1", label="Qty", placeholder="", optional=False)
+        assert date_input == {
+            "type": "date_input",
+            "id": "d1",
+            "label": "Due",
+            "placeholder": "",
+            "initial_value": "",
+            "optional": False,
+        }
+        assert number_input == {
+            "type": "number_input",
+            "id": "n1",
+            "label": "Qty",
+            "placeholder": "",
+            "optional": False,
+        }
+
 
 # ---------------------------------------------------------------------------
 # SelectOption builder

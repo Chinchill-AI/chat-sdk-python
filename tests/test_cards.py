@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
@@ -291,6 +293,13 @@ class TestTable:
         assert table["caption"] == "Scores"
         assert table["page_size"] == 25
 
+    # Python-specific: falsy but set values are kept, not dropped by truthiness.
+    def test_keeps_empty_caption_and_zero_page_size(self):
+        table = Table(headers=["A"], rows=[["1"]], caption="", page_size=0, widths=[])
+        assert table["caption"] == ""
+        assert table["page_size"] == 0
+        assert table["widths"] == []
+
     def test_leaves_caption_and_pagesize_undefined_when_omitted(self):
         table = Table(headers=["A"], rows=[["1"]])
         assert "caption" not in table
@@ -412,6 +421,9 @@ class TestChartFallbackText:
             (10**21, "1e+21"),
             (math.nan, "NaN"),
             (math.inf, "Infinity"),
+            (Decimal("45.00"), "45"),
+            (Decimal("-0.50"), "-0.5"),
+            (Fraction(1, 2), "0.5"),
         ],
     )
     def test_chart_values_render_like_js_string(self, value, expected):

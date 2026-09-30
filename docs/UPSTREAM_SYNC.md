@@ -373,20 +373,33 @@ separately (Slack #212, Teams #220); other adapters ignore the new fields.
   digits: `45.0` → `"45"`, `0.00001` → `"0.00001"`, `1e21` → `"1e+21"`,
   `-0.0` → `"0"`, NaN → `"NaN"`. It was checked against Node's `String()`
   on 80,000 random doubles with no mismatch. `int` values below `1e21` render
-  exactly (JS would round above 2**53); `bool` renders `"true"` / `"false"`.
+  exactly (JS would round above 2**53); other numeric types (`Decimal` from
+  Postgres `NUMERIC`, `Fraction`, NumPy scalars) are converted to `int` /
+  `float` first, so `Decimal("45.00")` → `"45"`; `bool` renders
+  `"true"` / `"false"`.
   A series point is found by category label, and a missing point is an empty
   cell.
 - **`chart` fallback wiring.** `card_child_to_fallback_text` (and therefore
   `card_to_fallback_text`, `BaseFormatConverter.render_postable`, and each
   adapter's unknown-child fallback) and `shared/card_utils.py` render a chart
-  as its title plus an ASCII table. This matches upstream, where every adapter
-  without native charts falls through to `cardChildToFallbackText`.
+  as its title plus an ASCII table. Adapters whose unknown-child branch uses
+  the core card fallback (Slack, Teams, Google Chat, Discord, GitHub, Linear,
+  Twilio) therefore post a chart as text. Messenger and WhatsApp drop chart
+  children silently, as upstream does (their `cards.ts` `default` branch
+  returns `[]`).
 - **Interim Slack gaps (until #212).** `modal_to_slack_view` raises
   `ValueError("Unknown modal child type: date_input")` (or `number_input`) for
-  the new modal children; the SDK-free `slack.blocks` primitive raises
+  the new modal children; the SDK-free `slack.blocks` primitives
+  (`card_to_slack_blocks` and `card_to_slack_fallback_text`) raise
   `SlackBlockError` for a `chart` child; the Slack adapter posts a chart as a
   mrkdwn section holding the fallback text; and `dispatch_action`, `caption`
   and `page_size` are ignored.
+- **Interim callback-URL gap (until #194).** When a `Button(callback_url=…)`
+  is posted, `callback_url.py` swaps the URL for a token and rebuilds the
+  button from a fixed key list, so its `tooltip` is dropped. Upstream
+  `4a0b5c0c` changed that copy to keep every field except `callbackUrl`; that
+  half of the commit is owned by #194 (PR #256). No adapter renders `tooltip`
+  until #220, so nothing visible is lost today.
 - **Not ported (JSX):** `fromReactElement` / `fromReactModalElement` handling of
   `Chart`, `DateInput`, `NumberInput`, `tooltip`, `width` and `dispatchAction`,
   and `929878b5` (chat@4.39.0, link-button ids in JSX). See the jsx-runtime row

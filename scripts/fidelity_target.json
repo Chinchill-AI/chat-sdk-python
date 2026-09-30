@@ -8,7 +8,7 @@
     "matched_exact": 689,
     "matched_fuzzy": 82,
     "missing": 265,
-    "extra": 365
+    "extra": 367
   },
   "absent_ts_files": [],
   "files": {
@@ -534,7 +534,7 @@
       "matched_exact": 11,
       "matched_fuzzy": 8,
       "missing_count": 20,
-      "extra_count": 28,
+      "extra_count": 29,
       "missing": [
         ["Card", "creates a card with all options"],
         ["Card", "creates an empty card"],
@@ -577,7 +577,7 @@
       "matched_exact": 7,
       "matched_fuzzy": 3,
       "missing_count": 28,
-      "extra_count": 42,
+      "extra_count": 43,
       "missing": [
         ["Modal", "should accept children"],
         ["Select", "should throw with empty options"],

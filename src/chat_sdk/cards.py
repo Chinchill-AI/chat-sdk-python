@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 from decimal import Decimal
 from typing import Any, Literal, TypedDict
 
@@ -281,6 +282,16 @@ def _js_number_to_string(value: Any) -> str:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
+    # Other numeric types (``Decimal`` from Postgres NUMERIC columns,
+    # ``Fraction``, NumPy scalars) are numbers to JS too: normalise them to
+    # the ``int`` / ``float`` the branches below format.
+    if isinstance(value, numbers.Integral) and not isinstance(value, int):
+        value = int(value)
+    elif isinstance(value, (Decimal, numbers.Real)) and not isinstance(value, (int, float)):
+        try:
+            value = float(value)
+        except (ValueError, OverflowError):
+            return str(value)  # e.g. Decimal("sNaN"); JS has no such value
     if isinstance(value, int):
         if abs(value) < 10**21:
             return str(value)
