@@ -1243,6 +1243,12 @@ def _update_request(update: dict[str, Any], *, secret_token: str | None = "secre
 class TestTelegramWebhookUpdateDeduplication:
     """Ports of the upstream webhook verification / dedupe cases."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Adapters here resolve secret/opt-out from TELEGRAM_* when a config
+        # value is None; keep a developer's exported vars out of the result.
+        _clear_telegram_env(monkeypatch)
+
     @pytest.mark.asyncio
     async def test_deduplicates_sequential_and_concurrent_webhook_updates(self):
         state = _spy_state()
@@ -1420,11 +1426,17 @@ class TestTelegramWebhookUpdateDeduplication:
 class TestTelegramWebhookDeduplicationPythonEdges:
     """Python-specific edges of the upstream dedupe port."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Adapters here resolve secret/opt-out from TELEGRAM_* when a config
+        # value is None; keep a developer's exported vars out of the result.
+        _clear_telegram_env(monkeypatch)
+
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("update_id", [True, False, "1", 1.0, None])
+    @pytest.mark.parametrize("update_id", [True, False, "1", 1.5, None])
     async def test_non_integer_update_ids_are_dispatched_without_a_claim(self, update_id: Any):
         # ``Number.isInteger`` parity: ``bool`` is an ``int`` subclass in Python
-        # but must not be claimed; strings/floats/null skip the claim too.
+        # but must not be claimed; strings/fractional floats/null skip the claim too.
         state = _spy_state()
         adapter = _dedupe_adapter()
         chat = _mock_chat(state)
@@ -1435,6 +1447,56 @@ class TestTelegramWebhookDeduplicationPythonEdges:
         assert response["status"] == 200
         chat.process_message.assert_called_once()
         state.set_if_not_exists.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_integral_float_update_ids_share_the_integer_claim_key(self):
+        # ``Number.isInteger(7.0)`` is true in JS and ``${7.0}`` renders "7", so
+        # upstream dedupes ``7`` / ``7.0`` / ``7e0`` as one update. ``json.loads``
+        # keeps the latter two as floats; they must normalise to the same key.
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+        message = json.dumps(_sample_message())
+
+        statuses = [
+            (
+                await adapter.handle_webhook(
+                    _make_request(f'{{"update_id": {raw}, "message": {message}}}', secret_token="secret")
+                )
+            )["status"]
+            for raw in ("7", "7.0", "7e0")
+        ]
+
+        assert statuses == [200, 200, 200]
+        assert chat.process_message.call_count == 1
+        key = f"telegram:webhook-update:{_SCOPE_999}:7"
+        assert [c.args[0] for c in state.set_if_not_exists.await_args_list] == [key, key, key]
+
+    @pytest.mark.asyncio
+    async def test_authenticated_non_object_body_is_acknowledged_without_raising(self):
+        # A verified body that parses to a JSON array has no ``update_id`` and
+        # makes ``process_update`` fail; the failure log must not itself raise
+        # (``list.get``) — upstream reads ``update.update_id`` as undefined.
+        state = _spy_state()
+        adapter = _dedupe_adapter()
+        chat = _mock_chat(state)
+        await adapter.initialize(chat)
+
+        response = await adapter.handle_webhook(_make_request("[1]", secret_token="secret"))
+
+        assert response["status"] == 200
+        chat.process_message.assert_not_called()
+        state.set_if_not_exists.assert_not_awaited()
+
+    @pytest.mark.parametrize("value", ["false", "true", 0, 1])
+    def test_non_bool_allow_unverified_webhooks_is_rejected(self, value: Any):
+        # ``bool("false")`` is True: coercing would silently disable
+        # verification, so a non-bool opt-out fails loudly instead.
+        with pytest.raises(ValidationError, match="allow_unverified_webhooks must be a bool"):
+            TelegramAdapter(
+                TelegramAdapterConfig(bot_token="t", mode="webhook", secret_token=None, allow_unverified_webhooks=value)
+            )
 
     @pytest.mark.asyncio
     async def test_returns_503_without_dispatch_when_bot_identity_cannot_be_resolved(self):

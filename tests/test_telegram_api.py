@@ -832,9 +832,12 @@ class TestHandleWebhook:
         chat.process_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_webhook_rejects_before_reading_body_without_verification(self):
+    async def test_webhook_rejects_before_reading_body_without_verification(self, monkeypatch: pytest.MonkeyPatch):
         # Fail closed (vercel/chat#858): with neither a secret nor the explicit
-        # opt-out, the request is rejected before its body is even read.
+        # opt-out, the request is rejected before its body is even read. Clear
+        # the env fallbacks so an exported opt-out/secret cannot mask this.
+        monkeypatch.delenv("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS", raising=False)
+        monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
         adapter = _make_adapter()  # auto mode, no secret_token, no opt-out
         chat = _init_adapter(adapter)
         read_body = AsyncMock(return_value='{"update_id": 1}')

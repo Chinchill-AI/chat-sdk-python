@@ -580,6 +580,23 @@ def _trim_trailing_slashes(url: str) -> str:
     return url[:end]
 
 
+def _integral_update_id(value: Any) -> int | None:
+    """Return ``value`` as an ``int`` when JS ``Number.isInteger`` would accept it.
+
+    ``json.loads`` keeps ``7.0`` / ``7e0`` as floats, but in JS they are the
+    number 7 and render as ``"7"`` in the claim key, so they are normalised to
+    ``int`` here. ``bool`` (an ``int`` subclass) and non-finite or fractional
+    floats are rejected.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 def _escape_markdown_in_entity(text: str) -> str:
     """Escape markdown-special characters inside entity text."""
     return re.sub(r"([\[\]()\\])", r"\\\1", text)
@@ -682,8 +699,16 @@ class TelegramAdapter:
         )
         # Only the exact env string "true" opts out; an explicit config value
         # (including False) always wins over the env var.
+        # A non-bool value (e.g. the string "false" copied from a settings
+        # file) is rejected rather than coerced with ``bool()``, which would
+        # silently fail open on this security flag.
+        if config.allow_unverified_webhooks is not None and not isinstance(config.allow_unverified_webhooks, bool):
+            raise ValidationError(
+                "telegram",
+                f"allow_unverified_webhooks must be a bool, got {type(config.allow_unverified_webhooks).__name__}",
+            )
         self._allow_unverified_webhooks: bool = (
-            bool(config.allow_unverified_webhooks)
+            config.allow_unverified_webhooks
             if config.allow_unverified_webhooks is not None
             else os.environ.get("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS") == "true"
         )
@@ -948,11 +973,14 @@ class TelegramAdapter:
 
         # Deduplicate redeliveries by ``update_id`` (vercel/chat#799). Core
         # message dedupe does not cover callback queries, so without this a
-        # Telegram retry could run a button action twice. Only integer ids are
-        # claimed (``bool`` is excluded — it is an ``int`` subclass in Python);
-        # anything else is dispatched unclaimed, matching upstream.
-        update_id = update.get("update_id") if isinstance(update, dict) else None
-        if isinstance(update_id, int) and not isinstance(update_id, bool):
+        # Telegram retry could run a button action twice. Only integral ids are
+        # claimed, mirroring ``Number.isInteger``: an integral JSON float
+        # (``7.0`` / ``7e0``) is the JS number 7 and shares the ``...:7`` key;
+        # ``bool`` is excluded (an ``int`` subclass in Python). Anything else is
+        # dispatched unclaimed, matching upstream.
+        raw_update_id = update.get("update_id") if isinstance(update, dict) else None
+        update_id = _integral_update_id(raw_update_id)
+        if update_id is not None:
             webhook_scope = self._webhook_scope
             if not webhook_scope:
                 try:
@@ -990,7 +1018,9 @@ class TelegramAdapter:
         except Exception as error:
             self._logger.warn(
                 "Failed to process Telegram webhook update",
-                {"error": str(error), "updateId": update.get("update_id")},
+                # Not ``update.get(...)``: an authenticated non-object body
+                # (e.g. ``[1]``) lands here and must not raise from the log.
+                {"error": str(error), "updateId": raw_update_id},
             )
 
         return self._make_response("OK", 200)
