@@ -10,6 +10,7 @@ Work toward upstream `chat@4.41.1` parity (tracking issue #184). `UPSTREAM_PARIT
   - Each accepted webhook update's integer `update_id` (an integral float such as `7.0` counts as `7`, as in JS) is claimed via the state adapter's `set_if_not_exists` (`telegram:webhook-update:{sha256(bot_user_id)}:{update_id}`, 24h TTL) before dispatch, so a Telegram redelivery runs handlers once. Duplicates return 200 without dispatch; a state or bot-identity failure returns 503 without dispatch (Telegram retries later). The scope is derived from the bot's user id, not its token, so it survives token rotation.
   - Bot identity (`getMe`) is now resolved through a shared, retrying lookup: a failed startup `getMe` is retried on the next webhook instead of leaving `bot_user_id` unset.
   - `secret_token` now resolves with `??` semantics: an explicit `secret_token=""` no longer falls back to `TELEGRAM_WEBHOOK_SECRET_TOKEN` (it counts as "no secret").
+- **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
 
 ## 0.4.31.3
 
