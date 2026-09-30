@@ -996,3 +996,93 @@ class TestHeartbeatDeadlines:
         finally:
             never.set()
             await hb.stop()
+
+
+def _queued_ids(state: MockStateAdapter, lock_key: str) -> list[str]:
+    return [entry.message.id for entry in state._queues.get(lock_key, [])]
+
+
+class TestHandBackOnOwnershipLoss:
+    """Dequeued-but-undispatched messages go back on the queue when ownership is lost."""
+
+    async def test_lock_lost_during_a_slow_dequeue_hands_the_batch_back(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        state.extend_lock = AsyncMock(side_effect=ConnectionError("backend down"))  # type: ignore[method-assign]
+        real_dequeue = state.dequeue
+        stalled = False
+
+        async def slow_dequeue(lock_key: str) -> QueueEntry | None:
+            nonlocal stalled
+            if not stalled:
+                stalled = True
+                await clock.sleep(DEFAULT_LOCK_TTL_MS + 5_000)
+            return await real_dequeue(lock_key)
+
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "slow-dq-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("slow-dq-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["slow-dq-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("slow-dq-2", "Hey @slack-bot two"))
+        state.dequeue = slow_dequeue  # type: ignore[method-assign]
+        release.set()
+        await clock.advance(DEFAULT_LOCK_TTL_MS + 6_000)
+        await first
+
+        assert handled == ["slow-dq-1"]
+        assert "Stopping queue drain after lock ownership was lost" in _warn_messages(logger)
+        assert _queued_ids(state, THREAD) == ["slow-dq-2"]
+
+    async def test_debounce_hands_back_superseded_messages_after_a_takeover(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        chat, adapter, logger = await _make_chat(
+            state, concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=1500)
+        )
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+
+        real_depth = state.queue_depth
+        injected = False
+
+        async def depth_with_takeover(lock_key: str) -> int:
+            nonlocal injected
+            if not injected:
+                # A newer message lands and another worker force-takes the lock.
+                injected = True
+                newer = create_test_message("deb-take-2", "Hey @slack-bot newer")
+                await state.enqueue(
+                    lock_key, QueueEntry(message=newer, enqueued_at=clock.now, expires_at=clock.now + 90_000), 10
+                )
+                await state.force_release_lock(lock_key)
+                await state.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+            return await real_depth(lock_key)
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("deb-take-1", "Hey @slack-bot"))
+        )
+        await clock.settle()
+        state.queue_depth = depth_with_takeover  # type: ignore[method-assign]
+        await clock.advance(1500)
+        await clock.advance(1500)
+        await task
+
+        assert handled == []
+        assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
+        # The superseded message is not lost: it is back on the queue for the new holder.
+        assert sorted(_queued_ids(state, THREAD)) == ["deb-take-1", "deb-take-2"]

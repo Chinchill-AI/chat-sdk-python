@@ -2497,21 +2497,44 @@ class Chat:
 
     # -- Pending-queue collection --------------------------------------------
 
-    async def _take_pending(self, adapter: Adapter, lock_key: str) -> list[Message]:
-        """Dequeue every entry for ``lock_key``, dropping expired ones."""
-        pending: list[Message] = []
+    async def _take_pending(self, adapter: Adapter, lock_key: str) -> list[tuple[Message, QueueEntry]]:
+        """Dequeue every entry for ``lock_key``, dropping expired ones.
+
+        Returns ``(rehydrated message, original entry)`` pairs; the entry is
+        kept so :meth:`_hand_back` can re-enqueue it unchanged.
+        """
+        pending: list[tuple[Message, QueueEntry]] = []
         while True:
             entry = await self._state_adapter.dequeue(lock_key)
             if entry is None:
                 return pending
             msg = self._rehydrate_message(entry.message, adapter)
             if _now_ms() <= entry.expires_at:
-                pending.append(msg)
+                pending.append((msg, entry))
             else:
                 self._logger.info(
                     "message-expired",
                     {"thread_id": msg.thread_id, "lock_key": lock_key, "message_id": msg.id},
                 )
+
+    async def _hand_back(self, lock_key: str, taken: list[tuple[Message, QueueEntry]], loop_name: str) -> None:
+        """Ownership was lost with messages dequeued but not dispatched: re-enqueue them.
+
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream checks
+        ownership only before collecting, so a lock lost while a dequeue was
+        slow still dispatches the batch under another holder's lock, and a
+        debounce loop that stops drops its accumulated superseded messages.
+        Here they go back on the queue, in their original order, for the
+        next holder.
+        """
+        self._logger.warn(f"Stopping {loop_name} after lock ownership was lost", {"lock_key": lock_key})
+        for _, entry in taken:
+            await self._state_adapter.enqueue(lock_key, entry, self._concurrency_max_queue_size)
+        if taken:
+            self._logger.info(
+                "messages-requeued",
+                {"lock_key": lock_key, "message_ids": [msg.id for msg, _ in taken]},
+            )
 
     # -- Debounce loop -------------------------------------------------------
 
@@ -2530,13 +2553,14 @@ class Chat:
         ends (see :meth:`_LockHeartbeat.confirm_ownership`).
         """
         debounce_ms = self._concurrency_debounce_ms
-        skipped: list[Message] = []
+        # Dequeued but not yet dispatched (superseded), with their entries.
+        skipped: list[tuple[Message, QueueEntry]] = []
 
         while True:
             await _sleep(debounce_ms)
             if not await heartbeat.confirm_ownership():
                 # Another instance may hold the lock now -- leave the queue to it.
-                self._logger.warn("Stopping debounce loop after lock ownership was lost", {"lock_key": lock_key})
+                await self._hand_back(lock_key, skipped, "debounce loop")
                 return
 
             pending = await self._take_pending(adapter, lock_key)
@@ -2545,15 +2569,20 @@ class Chat:
                     # We yielded: a message may have enqueued meanwhile.
                     continue
                 return
+            if heartbeat.is_ownership_lost():
+                # Lost while collecting (a slow dequeue during an outage).
+                await self._hand_back(lock_key, skipped + pending, "debounce loop")
+                return
 
-            latest = pending[-1]
+            latest_pair = pending[-1]
+            latest = latest_pair[0]
             skipped.extend(pending[:-1])
 
             # Check if anything new arrived during the dequeue
             depth = await self._state_adapter.queue_depth(lock_key)
             if depth > 0:
                 # Newer message superseded this one -- loop again
-                skipped.append(latest)
+                skipped.append(latest_pair)
                 self._logger.info(
                     "message-superseded",
                     {"thread_id": latest.thread_id, "lock_key": lock_key, "dropped_id": latest.id},
@@ -2564,7 +2593,7 @@ class Chat:
             # it under ITS OWN thread id (channel-scoped locks can hold
             # messages from several threads; upstream #832).
             message_thread_id = latest.thread_id
-            message_skipped = [m for m in skipped if m.thread_id == message_thread_id]
+            message_skipped = [m for m, _ in skipped if m.thread_id == message_thread_id]
             self._logger.info(
                 "message-dequeued",
                 {"thread_id": message_thread_id, "lock_key": lock_key, "message_id": latest.id},
@@ -2594,7 +2623,7 @@ class Chat:
         while True:
             if not await heartbeat.confirm_ownership():
                 # Another instance may hold the lock now -- leave the queue to it.
-                self._logger.warn("Stopping queue drain after lock ownership was lost", {"lock_key": lock_key})
+                await self._hand_back(lock_key, [], "queue drain")
                 return
 
             pending = await self._take_pending(adapter, lock_key)
@@ -2603,13 +2632,17 @@ class Chat:
                     # We yielded: a message may have enqueued meanwhile.
                     continue
                 return
+            if heartbeat.is_ownership_lost():
+                # Lost while collecting (a slow dequeue during an outage).
+                await self._hand_back(lock_key, pending, "queue drain")
+                return
 
             # Latest message is the one we process, under ITS OWN thread id;
             # skipped context only carries messages from that same thread
             # (channel-scoped locks can hold several threads; upstream #832).
-            latest = pending[-1]
+            latest = pending[-1][0]
             message_thread_id = latest.thread_id
-            skipped = [m for m in pending[:-1] if m.thread_id == message_thread_id]
+            skipped = [m for m, _ in pending[:-1] if m.thread_id == message_thread_id]
 
             self._logger.info(
                 "message-dequeued",
