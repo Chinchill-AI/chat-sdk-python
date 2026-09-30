@@ -85,6 +85,13 @@ class SlackAdapterConfig:
     # still validates every hop URL, limits redirects, sends the bot token
     # only on hops to Slack origins, enforces the 30 s deadline and caps the
     # decoded body at 25 MB. A subclass ``_create_file_transport()`` wins.
+    #
+    # The default transport ignores ``HTTPS_PROXY`` / ``HTTP_PROXY`` (aiohttp
+    # ``trust_env=False``: a proxy would resolve hosts itself and bypass the
+    # pinned-address check). Before this, downloads used ``httpx.AsyncClient()``,
+    # which honored those env vars, so a deployment whose only egress is an
+    # env-configured proxy must now set ``file_transport`` (Python-only
+    # change; upstream's Node transport never read env proxies).
     file_transport: AttachmentTransport | None = None
     # Factory for the ``httpx.AsyncClient`` used for ``response_url`` posts
     # (ephemeral replace/delete). Python counterpart of upstream ``fetch``

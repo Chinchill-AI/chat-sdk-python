@@ -275,6 +275,27 @@ class TestSlackFileDownloads:
         else:
             assert await attachment.fetch_data() == b"file"
 
+    async def test_enforces_the_30_second_download_deadline_when_the_body_stalls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The "stalls the body" case of upstream "enforces the download
+        # deadline when a signal-ignoring transport %s": the response arrives
+        # at once but its body never yields, and the loop clock is moved past
+        # the 30 s default while the body read is pending.
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        offset = [0.0]
+        monkeypatch.setattr(loop, "time", lambda: real_time() + offset[0])
+        stalled = FakeFileResponse(hang=True)
+        attachment = _file_attachment(_adapter(file_transport=FakeFileTransport(stalled)))
+        assert attachment.fetch_data is not None
+        fetch = asyncio.ensure_future(attachment.fetch_data())
+        await asyncio.wait_for(stalled.reading.wait(), timeout=5)
+        offset[0] += 30.0
+        with pytest.raises(NetworkError, match="Timed out fetching the attachment"):
+            await asyncio.wait_for(fetch, timeout=5)
+        assert stalled.closed
+
 
 class _RecordingHttpResponse:
     def __init__(self, status: int = 200, text: str = "ok") -> None:

@@ -33,8 +33,10 @@ class FakeFileResponse:
         self._body = body
         self._hang = hang
         self.closed = False
+        self.reading = asyncio.Event()
 
     async def _iterate(self) -> AsyncIterator[bytes]:
+        self.reading.set()
         if self._hang:
             await asyncio.get_running_loop().create_future()
         yield self._body

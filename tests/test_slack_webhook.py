@@ -740,6 +740,11 @@ class TestRehydrateAttachment:
         ):
             assert SlackAdapter._is_trusted_slack_download_url(url), url
         assert not SlackAdapter._is_trusted_slack_download_url("https://slack-files.com.attacker.tld/x")
+        # GovSlack subdomains are downloadable (the ``*.slack.com`` analogue)
+        # but are not auth origins, so they never receive the token.
+        assert SlackAdapter._is_trusted_slack_download_url("https://edge.slack-gov.com/x")
+        assert not SlackAdapter._is_slack_auth_url("https://edge.slack-gov.com/x")
+        assert not SlackAdapter._is_trusted_slack_download_url("https://slack-gov.com.attacker.tld/x")
         # The configured api_url origin, exactly (scheme, host and port)
         api_url = "https://slack-proxy.example:8443/api/"
         assert SlackAdapter._is_trusted_slack_download_url("https://slack-proxy.example:8443/files/f.png", api_url)
