@@ -24,10 +24,12 @@ import sys
 import time
 import tracemalloc
 import types
+import zlib
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import pytest
+from multidict import CIMultiDict
 
 from chat_sdk.shared import download as download_module
 from chat_sdk.shared.download import (
@@ -63,7 +65,7 @@ class FakeResponse:
         payload = body.encode() if isinstance(body, str) else body
         self.status = status
         self.reason = reason
-        self.headers: Mapping[str, str] = dict(headers or {})
+        self.headers: Mapping[str, str] = headers if headers is not None else {}
         self._chunks = chunks if chunks is not None else [payload]
         self._hang = hang
         self.close_calls = 0
@@ -597,11 +599,31 @@ class TestBodyDecoding:
 
         assert await read_attachment_body(message, "test") == b"first second"
 
-    async def test_trailing_bytes_after_a_gzip_member_are_ignored(self) -> None:
+    async def test_zero_padding_after_a_gzip_member_is_ignored(self) -> None:
+        # Node's gunzip stops at a zero byte after a member and ignores the rest.
         body = gzip.compress(b"payload") + b"\x00\x00garbage"
         message = FakeResponse(headers={"content-encoding": "gzip"}, chunks=[body, b"more"])
 
         assert await read_attachment_body(message, "test") == b"payload"
+
+    @pytest.mark.parametrize(
+        ("trailer", "error"),
+        [(b"garbage", "incorrect header check"), (b"\x1f\x8b", "unexpected end of file")],
+    )
+    async def test_other_bytes_after_a_gzip_member_must_form_a_valid_member(self, trailer: bytes, error: str) -> None:
+        message = FakeResponse(headers={"content-encoding": "gzip"}, chunks=[gzip.compress(b"first") + trailer])
+
+        with pytest.raises(zlib.error, match=error):
+            await read_attachment_body(message, "test")
+
+    async def test_repeated_content_encoding_fields_are_combined(self) -> None:
+        # Doubly gzipped: decoding only one layer would return compressed bytes.
+        body = gzip.compress(gzip.compress(bytes(10_000)))
+        headers = CIMultiDict([("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")])
+        transport = FakeTransport(FakeResponse(body, 200, headers))
+
+        with pytest.raises(NetworkError, match="Unsupported attachment encoding: gzip, gzip"):
+            await download_attachment("https://files.example.com/file", adapter="test", limit=100, transport=transport)
 
     async def test_truncated_gzip_body_is_an_error(self) -> None:
         body = gzip.compress(b"file contents" * 100)
@@ -628,7 +650,6 @@ class TestBodyDecoding:
         assert peak < 1024 * 1024
 
     async def test_deflate_bodies_are_decoded(self) -> None:
-        import zlib
 
         message = FakeResponse(headers={"content-encoding": "deflate"}, chunks=[zlib.compress(b"deflated")])
 

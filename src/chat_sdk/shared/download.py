@@ -491,9 +491,10 @@ class _ZlibDecoder:
                 rest = self._stream.unused_data
                 if not rest:
                     return
-                if self._wbits != _GZIP_WBITS or not rest.startswith(b"\x1f"):
-                    # Data after the end of the stream is ignored, as Node's
-                    # zlib does unless it starts another gzip member.
+                if self._wbits != _GZIP_WBITS or rest[0] == 0:
+                    # As Node's zlib: data after a deflate stream, and zero
+                    # padding after a gzip member, are ignored. Any other
+                    # byte starts a new gzip member (invalid ones raise).
                     self._trailing = True
                     return
                 # Concatenated gzip members decode as one body (as Node does).
@@ -563,6 +564,19 @@ def _accept_encoding() -> str:
     return "gzip, deflate, br" if _brotli_module() is not None else "gzip, deflate"
 
 
+def _combined_header(headers: Mapping[str, str], name: str) -> str | None:
+    """All values of a possibly repeated field, joined with ``", "``.
+
+    Multi-value mappings (aiohttp's ``CIMultiDictProxy``) expose ``getall``;
+    a plain mapping holds one value per key.
+    """
+    getall = getattr(headers, "getall", None)
+    if callable(getall):
+        values = [str(v) for v in getall(name, [])]
+        return ", ".join(values) if values else None
+    return _header(headers, name)
+
+
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     value = headers.get(name)
     if value is not None:
@@ -605,11 +619,13 @@ async def read_attachment_body(response: AttachmentResponse, adapter: str, limit
 
 
 async def _read_body(response: AttachmentResponse, adapter: str, limit: int) -> bytes:
-    encoding = (_header(response.headers, "content-encoding") or "").strip().lower() or "identity"
+    # Repeated fields are combined (as Node does), so a second encoding
+    # layer is seen and refused rather than silently left undecoded.
+    encoding = (_combined_header(response.headers, "content-encoding") or "").strip().lower() or "identity"
     decoder = None if encoding == "identity" else _decoder_for(encoding)
     if encoding != "identity" and decoder is None:
         raise NetworkError(adapter, f"Unsupported attachment encoding: {encoding}")
-    declared = None if decoder is not None else _declared_length(_header(response.headers, "content-length"))
+    declared = None if decoder is not None else _declared_length(_combined_header(response.headers, "content-length"))
     if declared is not None and declared > limit:
         raise NetworkError(adapter, _OVER_LIMIT)
 
