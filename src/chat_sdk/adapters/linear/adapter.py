@@ -192,12 +192,15 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
 # Comment-thread ROOT query (``fetchCommentThread`` step 1, chat@4.41.1 /
 # vercel/chat#965). Upstream loads ``linear.comment({ id })`` FIRST and checks
 # ``rootComment.issueId`` against the thread's issue before fetching replies.
-# ``Comment`` has no scalar ``issueId`` in the published schema — only the
-# nullable ``issue: Issue`` relation — so select ``issue { id }``.
+# Unlike ``AgentSession``, ``Comment`` DOES expose the nullable scalar
+# ``issueId: String`` in the published schema (``linear/packages/sdk/src/
+# schema.graphql`` @ master, alongside the ``issue: Issue`` relation), so select
+# the scalar exactly as the SDK's ``comment`` document does.
 _COMMENT_THREAD_ROOT_QUERY = """
 query CommentThreadRoot($commentId: String!) {
     comment(id: $commentId) {
         id
+        issueId
         body
         createdAt
         updatedAt
@@ -206,9 +209,6 @@ query CommentThreadRoot($commentId: String!) {
             id
             displayName
             name
-        }
-        issue {
-            id
         }
     }
 }
@@ -1881,7 +1881,7 @@ class LinearAdapter:
         Port of upstream ``fetchCommentThread`` (chat@4.41.1, vercel/chat#965):
 
         1. Load the ROOT comment first (``_COMMENT_THREAD_ROOT_QUERY``, which
-           selects ``issue { id }``) and raise ``ValidationError("linear",
+           selects the scalar ``issueId``) and raise ``ValidationError("linear",
            "Comment does not belong to this issue")`` when the root's issue id is
            missing or differs from the thread's ``issue_id``. A thread id naming
            issue A therefore can never read a comment thread on issue B.
@@ -1904,12 +1904,11 @@ class LinearAdapter:
             return FetchResult(messages=[])
 
         # Ownership check — upstream ``if (!rootComment.issueId ||
-        # rootComment.issueId !== issueId)``. The schema exposes the comment's
-        # issue only via the nullable ``issue`` relation (no scalar ``issueId``),
-        # so read ``issue { id }``. Missing (``None``/``""``) and mismatched are
-        # the SAME failure, so truthiness mirrors upstream's ``!issueId``. The
-        # message is upstream's verbatim text and echoes neither issue id.
-        root_issue_id = (root_comment.get("issue") or {}).get("id")
+        # rootComment.issueId !== issueId)``, reading the same nullable scalar
+        # ``issueId`` the SDK selects. Missing (``None``/``""``) and mismatched
+        # are the SAME failure, so truthiness mirrors upstream's ``!issueId``.
+        # The message is upstream's verbatim text and echoes neither issue id.
+        root_issue_id = root_comment.get("issueId")
         if not root_issue_id or root_issue_id != issue_id:
             raise ValidationError("linear", "Comment does not belong to this issue")
 

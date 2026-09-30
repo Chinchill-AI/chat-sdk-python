@@ -766,7 +766,7 @@ class TestCommentPathFetchUnchanged:
                             "updatedAt": "2025-06-01T12:00:00.000Z",
                             "url": "https://linear.app/comment/comment-root",
                             "user": {"id": "u1", "displayName": "u", "name": "User"},
-                            "issue": {"id": "issue-123"},
+                            "issueId": "issue-123",
                         }
                     }
                 },

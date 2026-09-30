@@ -26,6 +26,7 @@ from chat_sdk.adapters.linear.types import (
     LinearAdapterOAuthConfig,
 )
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.types import FetchOptions
 
 WEBHOOK_SECRET = "test-webhook-secret"
 
@@ -440,7 +441,7 @@ class TestStartTyping:
 
 
 def _thread_comment(comment_id: str, body: str, *, issue_id: str | None = None) -> dict:
-    """A ``Comment`` GraphQL node; ``issue_id`` adds the ``issue { id }`` relation."""
+    """A ``Comment`` GraphQL node; ``issue_id`` adds the scalar ``issueId`` field."""
     node = {
         "id": comment_id,
         "body": body,
@@ -450,7 +451,7 @@ def _thread_comment(comment_id: str, body: str, *, issue_id: str | None = None) 
         "user": {"id": "user-1", "displayName": "Bob", "name": "Bob Jones"},
     }
     if issue_id is not None:
-        node["issue"] = {"id": issue_id}
+        node["issueId"] = issue_id
     return node
 
 
@@ -535,8 +536,19 @@ class TestFetchMessages:
         assert result.next_cursor is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("direction", ["forward", "backward"])
-    async def test_fetches_same_issue_comment_thread_in_order(self, direction):
+    @pytest.mark.parametrize(
+        ("options", "expected_page"),
+        [
+            (FetchOptions(direction="forward", limit=10), {"first": 10, "last": None}),
+            (FetchOptions(direction="backward", limit=10), {"first": None, "last": 10}),
+            # Default (no direction) pages from the END with ``last`` -- both with
+            # no options at all and with ``Thread.refresh``'s ``FetchOptions(limit=50)``.
+            (None, {"first": None, "last": 50}),
+            (FetchOptions(limit=50), {"first": None, "last": 50}),
+        ],
+        ids=["forward", "backward", "default-no-options", "default-no-direction"],
+    )
+    async def test_fetches_same_issue_comment_thread_in_order(self, options, expected_page):
         # Ported: it.each("should fetch a same-issue comment thread in %s order")
         # (chat@4.41.1, replaces "should fetch comment thread (root + children)").
         adapter = _make_webhook_adapter()
@@ -556,20 +568,14 @@ class TestFetchMessages:
             ]
         )
 
-        from chat_sdk.types import FetchOptions
-
-        result = await adapter.fetch_messages(
-            "linear:issue-abc:c:root-comment",
-            FetchOptions(direction=direction, limit=10),
-        )
+        result = await adapter.fetch_messages("linear:issue-abc:c:root-comment", options)
 
         # Root first (validated), then the children — ``forward`` pages with
-        # ``first``, ``backward`` with ``last``.
+        # ``first``; ``backward`` and the default with ``last``.
         root_query, root_vars = adapter._graphql_query.call_args_list[0][0]
-        assert "issue {" in root_query
+        assert "issueId" in root_query
         assert root_vars == {"commentId": "root-comment"}
         _, children_vars = adapter._graphql_query.call_args_list[1][0]
-        expected_page = {"first": 10, "last": None} if direction == "forward" else {"first": None, "last": 10}
         assert children_vars == {"commentId": "root-comment", **expected_page}
         # Root comment + 1 child
         assert [m.text for m in result.messages] == ["Root comment", "Reply"]
@@ -584,7 +590,7 @@ class TestFetchMessages:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "issue",
-        [{"issue": {"id": "issue-private"}}, {}, {"issue": None}, {"issue": {"id": ""}}],
+        [{"issueId": "issue-private"}, {}, {"issueId": None}, {"issueId": ""}],
         ids=["issue-private", "undefined", "null", "empty"],
     )
     async def test_rejects_comment_thread_with_unverified_issue_id(self, issue):
@@ -641,7 +647,7 @@ class TestFetchMessages:
                 "data": {
                     "comment": {
                         **_thread_comment("comment-1", "Comment content"),
-                        "issue": {"id": issue_id} if issue_id else None,
+                        "issueId": issue_id,
                     }
                 }
             },
@@ -660,8 +666,9 @@ class TestFetchMessages:
                 await adapter.fetch_messages("linear:issue-public:c:comment-1")
             assert str(exc_info.value) == "Comment does not belong to this issue"
             assert len(http.requests) == 1
-        # The first request selects the root comment's issue id.
-        assert "issue {" in http.requests[0]["query"]
+        # The first request selects the root comment's scalar ``issueId``
+        # (upstream: ``fetch.mock.calls[0][1]?.body`` contains "issueId").
+        assert "issueId" in http.requests[0]["query"]
         assert http.requests[0]["variables"] == {"commentId": "comment-1"}
 
     @pytest.mark.asyncio
