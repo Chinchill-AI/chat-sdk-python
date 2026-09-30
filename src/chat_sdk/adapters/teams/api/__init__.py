@@ -107,15 +107,19 @@ _LEADING_SLASH_PATTERN = re.compile(r"^/+")
 # ``smba.infra.{gcc,gov,dod}.teams.microsoft.*`` and
 # ``msteams.botframework.azure.cn``; the ``*.botframework.com/.us`` and
 # ``*.teams.microsoft.com/.us`` wildcards are kept so no existing deployment
-# regresses. Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+# regresses. Divergence from upstream — see docs/UPSTREAM_SYNC.md. Scheme and
+# host compare case-insensitively (upstream lowercases ``url.hostname``);
+# ``re.ASCII`` keeps ``[a-z]`` from folding non-ASCII letters such as the
+# Kelvin sign (U+212A) or long s (U+017F).
+_SERVICE_URL_FLAGS = re.IGNORECASE | re.ASCII
 _ALLOWED_SERVICE_URL_PATTERNS = [
-    re.compile(r"^https://smba\.trafficmanager\.net/"),
-    re.compile(r"^https://msteams\.botframework\.azure\.cn/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/"),
-    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/"),
+    re.compile(r"^https://smba\.trafficmanager\.net/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://msteams\.botframework\.azure\.cn/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/", _SERVICE_URL_FLAGS),
 ]
 
 # Plain-``http`` loopback hosts accepted for the local Bot Framework Emulator

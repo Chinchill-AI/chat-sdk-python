@@ -105,13 +105,18 @@ class TestConnectWebhookDispatch:
         verifier.assert_awaited_once_with(incoming, " invalid json ")
         chat.process_message.assert_not_called()
 
-    async def test_returns_400_for_verified_invalid_json(self) -> None:
+    @pytest.mark.parametrize("body", ["invalid json", ""])
+    async def test_returns_400_for_verified_invalid_json(self, body: str) -> None:
         adapter = _make_adapter(webhook_verifier=lambda _request, _body: True)
-        await adapter.initialize(_make_chat())
+        chat = _make_chat()
+        await adapter.initialize(chat)
 
-        response = await adapter.handle_webhook(_Request("invalid json"))
+        response = await adapter.handle_webhook(_Request(body))
 
+        # An empty body is invalid JSON too (upstream ``JSON.parse("")``); the
+        # verifier skipped the SDK's JWT check, so it must not route as ``{}``.
         assert response["status"] == 400
+        chat.process_message.assert_not_called()
 
     async def test_rejects_asynchronously_failed_verification_before_activity_processing(self) -> None:
         async def verifier(_request: Any, _body: str) -> bool:
@@ -195,9 +200,7 @@ class TestConnectWebhookDispatch:
                 **_ACTIVITY,
                 "type": "invoke",
                 "name": "adaptiveCard/action",
-                # Python acks card actions that carry an ``actionId`` (the
-                # adapter's own buttons); upstream's fixture sends ``data: {}``.
-                "value": {"action": {"type": "Action.Execute", "verb": "test", "data": {"actionId": "test"}}},
+                "value": {"action": {"type": "Action.Execute", "verb": "test", "data": {}}},
             }
         )
 
@@ -421,6 +424,40 @@ class TestCustomTokenPrecedence:
             ("https://graph.microsoft.com/.default", "tenant-1"),
             ("https://graph.microsoft.com/.default", "tenant-1"),
         ]
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            # MultiTenant omits the tenant from the SDK credentials, so the SDK
+            # falls back to the cloud login tenant (Bot Framework) and
+            # ``common`` (Graph); the hand-rolled paths must agree.
+            (
+                {"app_type": "MultiTenant", "app_tenant_id": "cust-tenant"},
+                ("botframework.com", "common"),
+            ),
+            ({"app_type": "SingleTenant", "app_tenant_id": "cust-tenant"}, ("cust-tenant", "cust-tenant")),
+        ],
+    )
+    async def test_hand_rolled_factory_tenant_matches_the_sdk(
+        self, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any], expected: tuple[str, str]
+    ) -> None:
+        monkeypatch.delenv("TENANT_ID", raising=False)
+        monkeypatch.delenv("TEAMS_APP_TENANT_ID", raising=False)
+        calls: list[tuple[Any, Any]] = []
+
+        def token(scope: Any, tenant_id: Any) -> str:
+            calls.append((scope, tenant_id))
+            return _unsigned_jwt()
+
+        adapter = _make_adapter(token=token, **overrides)
+        await adapter._app._get_bot_token()
+        await adapter._get_access_token()
+        await adapter._app._get_graph_token()
+        await adapter._get_graph_token()
+
+        sdk_bot, ours_bot, sdk_graph, ours_graph = (tenant for _scope, tenant in calls)
+        assert (sdk_bot, sdk_graph) == expected
+        assert (ours_bot, ours_graph) == (sdk_bot, sdk_graph)
 
     @pytest.mark.parametrize("result", ["", None, 42])
     async def test_factory_without_a_token_raises_authentication_error(self, result: Any) -> None:

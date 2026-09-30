@@ -95,18 +95,24 @@ CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
 # existing deployment regresses. Divergence from upstream — see
 # docs/UPSTREAM_SYNC.md. Plain-``http`` loopback (the local Bot Framework
 # Emulator) is accepted separately by ``_validate_service_url``.
+# Scheme and host compare case-insensitively (upstream lowercases
+# ``url.hostname``); ``re.ASCII`` keeps ``[a-z]`` from folding non-ASCII
+# letters such as the Kelvin sign (U+212A) or long s (U+017F).
+_SERVICE_URL_FLAGS = re.IGNORECASE | re.ASCII
 ALLOWED_SERVICE_URL_PATTERNS = [
-    re.compile(r"^https://smba\.trafficmanager\.net/"),
-    re.compile(r"^https://msteams\.botframework\.azure\.cn/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/"),
-    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/"),
+    re.compile(r"^https://smba\.trafficmanager\.net/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://msteams\.botframework\.azure\.cn/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/", _SERVICE_URL_FLAGS),
 ]
 
 _BOT_FRAMEWORK_SCOPE = "https://api.botframework.com/.default"
 _GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+# ``microsoft_teams.apps.token_manager.DEFAULT_TENANT_FOR_GRAPH_TOKEN``.
+_GRAPH_DEFAULT_TENANT = "common"
 _APP_ID_UNRESOLVED_MESSAGE = "appId has not been resolved. Ensure chat.initialize() has completed."
 
 
@@ -708,10 +714,17 @@ class TeamsAdapter:
         elif activity_type == "messageReaction":
             self._handle_reaction_activity(activity, options)
         elif activity_type == "invoke":
-            # Adaptive card actions (Action.Execute → invoke).
+            # Adaptive card actions (Action.Execute → invoke). Upstream's
+            # ``card.action`` handler acknowledges every ``adaptiveCard/action``
+            # invoke and only routes the ones carrying an ``actionId``.
             action_data = (activity.get("value") or {}).get("action", {}).get("data", {})
-            if isinstance(action_data, dict) and action_data.get("actionId"):
+            has_action_id = isinstance(action_data, dict) and bool(action_data.get("actionId"))
+            is_card_action = activity.get("name") == "adaptiveCard/action"
+            if has_action_id:
                 await self._handle_adaptive_card_action(activity, action_data, options)
+            elif is_card_action:
+                self._logger.debug("Adaptive card action missing actionId", {"value": activity.get("value")})
+            if has_action_id or is_card_action:
                 return {
                     "status": 200,
                     "body": {
@@ -2515,7 +2528,10 @@ class TeamsAdapter:
         if tenant_id:
             payload["channelData"]["tenant"] = {"id": tenant_id}
 
-        url = f"{service_url}v3/conversations"
+        # Join on a single ``/``: an Emulator serviceUrl (``http://localhost:N``)
+        # has no trailing slash, so plain concatenation would yield
+        # ``http://localhost:Nv3/conversations``.
+        url = f"{service_url.rstrip('/')}/v3/conversations"
 
         session = await self._get_http_session()
         async with session.post(
@@ -3040,21 +3056,40 @@ class TeamsAdapter:
                     exc,
                 ) from exc
 
+    def _factory_tenant_id(self, scope: str) -> str:
+        """Tenant passed to the ``token`` factory, resolved exactly as the SDK does.
+
+        Mirrors ``TokenManager._resolve_tenant_id`` in ``microsoft-teams-apps``:
+        the tenant the SDK ``App`` was given (``credentials.tenant_id`` — unset
+        for ``app_type="MultiTenant"``, which omits it), else the cloud's login
+        tenant (``botframework.com`` on the public cloud) for the Bot Framework
+        scope and ``common`` for the Graph scope. Using the same rule keeps a
+        factory that routes or allow-lists by tenant from seeing one scope under
+        two tenants depending on whether the SDK or a hand-rolled path asked.
+        """
+        app = self._app
+        credentials_tenant = getattr(getattr(app, "credentials", None), "tenant_id", None)
+        if isinstance(credentials_tenant, str) and credentials_tenant:
+            return credentials_tenant
+        if scope == _GRAPH_SCOPE:
+            return _GRAPH_DEFAULT_TENANT
+        login_tenant = getattr(getattr(app, "cloud", None), "login_tenant", None)
+        return login_tenant if isinstance(login_tenant, str) and login_tenant else "botframework.com"
+
     async def _token_from_factory(self, scope: str) -> str:
         """Mint a token through the configured ``token`` factory.
 
         Called as ``token(scope, tenant_id)`` — the same contract the Teams SDK
-        uses for ``AppOptions.token`` — with the tenant the hand-rolled
-        client-credentials path would use (``app_tenant_id``, else
-        ``botframework.com``). The result is not cached: the factory owns
-        token lifetime, as it does for the SDK's own calls. A non-string or
-        empty result, or a raising factory, becomes an
+        uses for ``AppOptions.token`` — with the tenant the SDK itself would
+        pass for that scope (see :meth:`_factory_tenant_id`). The result is not
+        cached: the factory owns token lifetime, as it does for the SDK's own
+        calls. A non-string or empty result, or a raising factory, becomes an
         :class:`AuthenticationError`.
         """
         factory = self._config.token
         if factory is None:  # pragma: no cover - callers check first
             raise AuthenticationError("teams", "No custom token factory is configured")
-        tenant_id = self._app_tenant_id or "botframework.com"
+        tenant_id = self._factory_tenant_id(scope)
         try:
             result: Any = factory(scope, tenant_id)
             if inspect.isawaitable(result):

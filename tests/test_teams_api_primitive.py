@@ -339,6 +339,21 @@ class TestTeamsApiPrimitives:
 
 
 class TestTeamsApiSsrfDivergence:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://SMBA.trafficmanager.net/teams/",
+            "HTTPS://MSTEAMS.BOTFRAMEWORK.AZURE.CN/teams/",
+        ],
+    )
+    def test_trusted_hosts_match_case_insensitively(self, url: str) -> None:
+        # Upstream compares ``url.hostname.toLowerCase()``.
+        assert is_trusted_teams_service_url(url) is True
+
+    def test_non_ascii_case_folds_are_not_trusted(self) -> None:
+        # Kelvin sign (U+212A) folds to ``k`` under a Unicode IGNORECASE.
+        assert is_trusted_teams_service_url("https://smba.traffic\u212amanager.net/teams/") is False
+
     """SSRF / token-leak gate. Upstream validates too since chat@4.40.0
     (vercel/chat#876); this port's host list is a superset (see
     docs/UPSTREAM_SYNC.md)."""

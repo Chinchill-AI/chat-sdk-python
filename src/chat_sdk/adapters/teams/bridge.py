@@ -117,7 +117,9 @@ class BridgeHttpAdapter:
             return _make_response("Unauthorized", 401, content_type="text/plain")
 
         try:
-            parsed_body: Any = json.loads(body) if body else {}
+            # No empty-body fallback: like upstream's ``JSON.parse(body)``, an
+            # empty body is invalid JSON (``400``) rather than an empty activity.
+            parsed_body: Any = json.loads(body)
         except (json.JSONDecodeError, ValueError) as exc:
             self._logger.error("Failed to parse request body", {"error": str(exc)})
             return _make_response("Invalid JSON", 400, content_type="text/plain")

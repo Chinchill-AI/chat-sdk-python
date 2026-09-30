@@ -150,16 +150,17 @@ class TestDispatch:
         assert result["status"] == 500
         assert "No handler registered" in result["body"]
 
-    async def test_empty_body_parses_to_object_and_calls_handler(self):
-        # An empty body parses to ``{}`` (a dict), so the handler is invoked.
+    async def test_empty_body_is_invalid_json(self):
+        # Upstream runs ``JSON.parse(body)`` unconditionally, so an empty body
+        # is a 400 and never reaches the SDK handler as an empty activity.
         bridge = _make_bridge()
         handler = AsyncMock(return_value={"status": 200, "body": None})
         bridge.register_route("POST", "/api/messages", handler)
 
         result = await bridge.dispatch(_FakeRequest(""))
-        assert result["status"] == 200
-        handler.assert_awaited_once()
-        assert handler.await_args.args[0]["body"] == {}
+        assert result["status"] == 400
+        assert result["body"] == "Invalid JSON"
+        handler.assert_not_called()
 
     async def test_dispatch_handler_exception_returns_500(self):
         bridge = _make_bridge()
