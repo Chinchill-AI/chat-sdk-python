@@ -87,6 +87,31 @@ Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) an
 - Verification uses PyJWT with a fixed 1-hour async key cache, not google-auth-library's `verifyIdToken` / `verifySignedJwtWithCertsAsync`. The time checks are ported by hand to match google-auth-library: `exp` and `iat` are required, with 300 s of clock skew, and a token whose `exp` is 24 hours or more in the future is rejected (PyJWT has no such limit). The issuer is compared exactly by hand on both paths, not through PyJWT's `issuer=`, because PyJWT 2.10.0 matched it as a substring (CVE-2024-53861).
 - The constructor warning when `endpoint_url` and `disable_signature_verification` are both set is Python-only. Upstream has the same precedence but does not log it.
 
+### Google Chat: explicit bot identity, media-API downloads, same-space message ids, native forward pagination (#223, security)
+
+Ports upstream `32687038` (vercel/chat#830, chat@4.38.1), the Google Chat part of `f485255b` (vercel/chat#877, chat@4.40.0) and `d6343460` (vercel/chat#938, chat@4.41.0). `2f40a322` (vercel/chat#801, `alt=media`) was already in place; only its test is ported.
+
+- **Bot identity comes only from config.** New `GoogleChatAdapterConfig.bot_user_id` (keyword-only; env `GOOGLE_CHAT_BOT_USER_ID`, config wins) is the app's canonical `users/...` resource name. The adapter no longer learns its id from the first BOT mention, and never reads or writes the `gchat:botUserId` state key. Before, any bot mentioned first became "self" for 30 days, so its messages were silently dropped as the app's own. `initialize()` logs a warning once when the id is unset.
+- **Self-detection fails closed.** With `bot_user_id` set, `is_me` is an exact sender match. Without it, every `BOT` sender counts as self, so the app never replies to itself in a loop.
+- **Only this app's mentions are normalized.** `_normalize_bot_mentions` rewrites an annotation to `@{user_name}` only when its `userMention.user.name` equals `bot_user_id`; mentions of other bots stay as written.
+- **Attachment bytes come only from the media API.** `fetch_data` exists only when the attachment has `attachmentDataRef.resourceName` and downloads `/v1/media/{resourceName}?alt=media`. The service-account token is no longer sent to `downloadUri` (as a fallback after a media error, or for URL-only attachments). `rehydrate_attachment` without a `resourceName` returns the attachment unchanged. Media errors go through the adapter's error handler, so a 429 raises `AdapterRateLimitError`; other failures raise the adapter's Google API error with the HTTP status as `code` (was `NetworkError`). The `_is_trusted_gchat_download_url` host allowlist is removed, since no URL is fetched any more.
+- **Message ids must belong to the thread's space.** `edit_message`, `delete_message`, `add_reaction` and `remove_reaction` require a full `spaces/{space}/messages/{message}` name in the thread's space and raise `ValidationError` before any API call otherwise ("Invalid Google Chat message id" for a malformed name, "does not belong to space" for another space). New `thread_utils.parse_message_name()` returns a `GoogleChatMessageName(space_name, message_id)`.
+- **New `GoogleChatAdapter.fetch_message(thread_id, message_id)`** returns the message with the thread id Google reports for it (`message.thread.name`), or `None` on 404, after the same space check.
+- **Forward history is one bounded page.** `fetch_messages(direction="forward")` makes one `messages.list` call (`pageSize = min(max(limit, 1), 1000)`, `orderBy = "createTime asc"`, `pageToken = cursor`) and returns `nextPageToken` as `next_cursor`. Before, it downloaded the whole thread on every call and sliced it by a message-name cursor.
+
+#### Breaking (Google Chat)
+
+- **Set `bot_user_id` (or `GOOGLE_CHAT_BOT_USER_ID`)** to the `sender.name` of a message your app posted, such as `users/123456789`. Without it, other bots' messages are ignored (every BOT sender is treated as self) and `@`-mentions of your app are no longer rewritten to `@{user_name}`, so default mention detection may stop matching. The id learned by earlier releases (`gchat:botUserId` in state) is not reused; the stale key expires on its own.
+- **Persisted forward cursors are invalid.** Forward `next_cursor` is now an opaque Google page token, not a message name. Passing a cursor saved by an earlier release fails with an API error; restart iteration without a cursor. Backward cursors are unchanged.
+- **Attachments without `attachmentDataRef.resourceName` have no `fetch_data`** (`url` still carries `downloadUri` for display). Rehydrated attachments whose `fetch_metadata` has only a `url` also get none.
+- **Bare message ids are rejected.** Callers passing `msg1`-style ids, or ids from another space, to edit/delete/reaction calls now get `ValidationError`. Ids returned by the adapter (`SentMessage.id`, `Message.id`) are already full names.
+
+#### Python-specific (divergence from upstream)
+
+- A media `resourceName` is validated before it is put into the request path: an empty value, `?`, `#`, `%`, backslash, anything outside printable ASCII (whitespace, control or non-ASCII characters), or a `.` / `..` segment raise `ValidationError` before a token is minted. Upstream hands the value to the googleapis client, which encodes it.
+- An empty `bot_user_id` counts as unset, no mention is rewritten when the id is unset (upstream would still rewrite a BOT annotation with no `user.name`), and the "not configured" warning is logged once per adapter rather than on every `initialize()`.
+- Forward `fetch_messages` with `limit=0` sends `pageSize=1` and returns at most one message. The limit resolves with `is not None`, so `0` is not replaced by the default; upstream's `options.limit || 100` requests 100.
+
 ### Security
 
 - **Linear: comment-thread and agent-session history are now bound to the thread's issue** (#231, security; ports vercel/chat#965 `d7aa75b1` and #974 `2d2b933a`, chat@4.41.1). Linear thread ids carry an issue id plus a comment id or agent session id, and `fetch_messages` trusted the second segment without checking it against the first, so a caller naming issue A could read comment or session history from issue B. Anything that authorizes by issue id was affected, for example conversation-scoped AI tools.
