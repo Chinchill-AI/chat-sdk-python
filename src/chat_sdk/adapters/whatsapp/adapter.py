@@ -567,17 +567,28 @@ class WhatsAppAdapter:
         inbound: WhatsAppInboundMessage,
         contacts: list[WhatsAppContact],
     ) -> WhatsAppContact | None:
-        """Find the contact for a message by BSUID or phone, else the first one."""
+        """Find the contact for a message by BSUID, parent BSUID or phone.
+
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream also
+        matches only ``user_id`` / ``wa_id`` and otherwise falls back to
+        ``contacts[0]``. In a batched webhook that first contact can belong to
+        another sender, and ``_fields`` would then borrow its phone/BSUID and
+        alias this sender to the wrong user. We also match ``parent_user_id``
+        and fall back only when the payload has exactly one contact.
+        """
         from_user_id = inbound.get("from_user_id")
+        from_parent_user_id = inbound.get("from_parent_user_id")
         from_phone = inbound.get("from")
         for item in contacts:
             if not isinstance(item, dict):
                 continue
-            if (from_user_id and item.get("user_id") == from_user_id) or (
-                from_phone and item.get("wa_id") == from_phone
+            if (
+                (from_user_id and item.get("user_id") == from_user_id)
+                or (from_parent_user_id and item.get("parent_user_id") == from_parent_user_id)
+                or (from_phone and item.get("wa_id") == from_phone)
             ):
                 return item
-        return contacts[0] if contacts else None
+        return contacts[0] if len(contacts) == 1 else None
 
     def _author(self, identity: _WhatsAppIdentity, contact: WhatsAppContact | None = None) -> Author:
         """Build the message author for an identity.

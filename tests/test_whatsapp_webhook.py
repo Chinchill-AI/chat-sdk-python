@@ -1401,6 +1401,35 @@ class TestBusinessScopedUserIdsPythonSpecific:
         names = [call[0][2].author.full_name for call in chat.process_message.call_args_list]
         assert names == ["Alice", "Bob"]
 
+    async def test_does_not_borrow_identity_from_an_unrelated_contact(self):
+        """Divergence from upstream (see docs/UPSTREAM_SYNC.md): upstream falls
+        back to ``contacts[0]`` and would key both messages by Alice's phone."""
+        adapter, chat, state, _ = await _bsuid_env()
+        contacts = [
+            {"profile": {"name": "Alice"}, "wa_id": PHONE, "user_id": "US.ALICE"},
+            {"profile": {"name": "Bob"}, "user_id": "US.BOB", "parent_user_id": PARENT_BSUID},
+        ]
+
+        await _deliver(
+            adapter,
+            _notification(
+                [
+                    # Matched to Bob by parent BSUID alone.
+                    _inbound({"from_parent_user_id": PARENT_BSUID}),
+                    # Matches no contact in a multi-contact batch.
+                    _inbound({"id": "wamid.2", "from_parent_user_id": "US.ENT.OTHER"}),
+                ],
+                contacts,
+            ),
+        )
+
+        dispatched = [(call[0][1], call[0][2].author.full_name) for call in chat.process_message.call_args_list]
+        assert dispatched == [
+            ("whatsapp:123456789:US.BOB", "Bob"),
+            ("whatsapp:123456789:US.ENT.OTHER", "US.ENT.OTHER"),
+        ]
+        assert await state.get(f"whatsapp:identity:alias:123456789:{PHONE}") is None
+
     async def test_forwarded_context_without_id_parses(self):
         adapter, chat, _, logger = await _bsuid_env()
 

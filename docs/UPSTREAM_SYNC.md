@@ -348,7 +348,9 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 
 ### WhatsApp business-scoped user IDs (chat@4.37–4.39, #236)
 
-Parity, not a divergence. Ports upstream `3e6e866a` (vercel/chat#818,
+Parity apart from one divergence: contact matching (see the
+[Known Non-Parity](#known-non-parity-with-typescript-sdk) row "WhatsApp contact
+matching"). Ports upstream `3e6e866a` (vercel/chat#818,
 chat@4.39.0) and the type-only context variants of `16879fdc` (vercel/chat#723,
 chat@4.37.0). Meta can now deliver username-only / BSUID-only webhooks whose
 messages carry `from_user_id` / `from_parent_user_id` and no `from`; before
@@ -380,6 +382,24 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
   (#237), media sends (#238) and `reply` (#239), because those send paths do
   not exist in the Python adapter yet. `mark_as_read` and typing indicators
   address a `message_id` only, so they need no recipient.
+- **Known limitations kept at parity** (upstream behaves the same at
+  chat@4.41.1; revisit if upstream changes them):
+  - Identity resolution runs before `process_message`, outside the Chat lock,
+    and `_link` is read-then-write. Two first-contact webhooks for the same
+    user delivered concurrently (one with phone and BSUID, one with the BSUID
+    only) can pick different canonical ids and split into two threads. Closing
+    this needs an atomic claim on alias keys.
+  - Route writes carry no ordering. A Meta redelivery of an older message,
+    processed after a `user_id_update`, can write the retired phone/BSUID back
+    into the route. Core dedupe does not help because `_resolve` runs before
+    dispatch.
+  - System messages use Meta's documented shapes (upstream
+    `packages/adapter-whatsapp/sample-messages.md`). `user_changed_number`
+    carries the old number in `from` and the new `wa_id` / `user_id` in
+    `system`. `user_changed_user_id` has no `from`: its old-to-new mapping
+    arrives in the separate `user_id_update` webhook. The adapter does not
+    special-case undocumented shapes, such as a message-level `from_user_id`
+    on a system message or a `from` without `system.wa_id`.
 
 Regression coverage: `tests/test_whatsapp_webhook.py`
 (`TestHandleWebhookBusinessScopedUserIds`, `TestParseMessageBusinessScopedUserIds`,
@@ -860,6 +880,7 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat webhook JWT verification mechanics (#222; upstream `270b1c25` / `7a192235` / `c3b5a08e`) | OIDC tokens (endpoint-URL and Pub/Sub) are decoded with PyJWT against Google's JWKS (`oauth2/v3/certs`): RS256, strict `aud` equality, `exp`/`iat`/`iss` required, 300 s leeway. `iss` is then checked by hand against {`accounts.google.com`, `https://accounts.google.com`}. Project-number tokens are decoded against the Chat issuer's X.509 certs with the same PyJWT options, and `iss` is then compared by hand with `chat@system.gserviceaccount.com` (not PyJWT's `issuer=`, which PyJWT 2.10.0 matched as a substring, CVE-2024-53861). On both paths, a token whose `exp` is 24 h or more ahead of the wall clock is rejected by hand, because PyJWT has no maximum-lifetime check. Both key sets are fetched with the shared aiohttp session and cached as `(fetched_at, {kid: key})` for a fixed 1 hour on an injectable monotonic clock. A failed or empty fetch is never cached, and an unknown `kid` is rejected without a refetch | `OAuth2Client.verifyIdToken` (federated certs, cached per `Cache-Control`) and `verifySignedJwtWithCertsAsync` with the Chat certs, cached for 1 hour | No maintained async google-auth equivalent exists, and the old `PyJWKClient` did blocking I/O on the event loop. The claim checks are ported to match google-auth-library, including its `exp >= now + 86400` rejection (`DEFAULT_MAX_TOKEN_LIFETIME_SECS_`), and `email_verified` checked by identity (`is True`) and add-on emails compared with `==` and shape-tested with `re.fullmatch`. Google's keys are published hours before use (`max-age` is about 6 h), so a 1-hour TTL does not miss rotations. Pinned by `TestEndpointUrlVerification`, `TestProjectNumberVerification`, `TestDirectTokenTimeClaims` and `TestVerificationKeyCache` |
 | WhatsApp webhook raw-body logging (#187) | `handle_webhook` logs no body: the pre-verification `"WhatsApp webhook raw body"` debug log is removed, and `"WhatsApp webhook invalid JSON"` logs `{bodyBytes, contentType}` | Upstream `adapter-whatsapp/src/index.ts` (still at chat@4.41.1) logs `body.substring(0, 500)` **before** signature verification and `bodyPreview: body.substring(0, 200)` on invalid JSON | Log hygiene. The body arrives before authentication and carries message content and phone numbers, and DEBUG is commonly on in dev/staging. It is the same weakness class upstream fixed for GitHub (`fc7df9c4`) and GChat/Slack/Teams (`f485255b`). Regression tests: `tests/test_webhook_log_hygiene.py::TestWhatsAppLogHygiene`. Delete this row once upstream drops the logs. |
 | Message-content debug logs (#187) | GChat `"message event"` logs `{space, textLength}` (no `sender` display name, no `text` prefix). GChat `"Pub/Sub parsed message"` drops `text` and `author`. The slash-command debug logs (`Chat` `"Incoming slash command"`, Slack `"Processing Slack slash command"`, Discord `"Processing Discord slash command"`) log `textLength` instead of `text`. `textLength` counts characters (code points). | Upstream (chat@4.41.1) still logs the GChat sender display name + `text.slice(0, 50)`, the full Pub/Sub message `text` + author `fullName`, and slash-command `text` | Upstream's `f485255b` removed message text from `chat.ts` "Incoming message", and these are the same class of log. User-authored message text is kept out of DEBUG sinks. Action/reaction logs that still carry `user`/`user_name` stay at parity. Regression tests: `tests/test_webhook_log_hygiene.py` (`TestGoogleChatLogHygiene`, `TestSlackLogHygiene::test_slash_command_log_has_text_length_not_text`, `TestDiscordLogHygiene`, `TestChatLogHygiene::test_slash_command_log_has_text_length_not_text`). |
+| WhatsApp contact matching (#236) | `_match_contact` matches a message's contact by `user_id`, `parent_user_id` or `wa_id`, and falls back to `contacts[0]` only when the payload has exactly one contact | Upstream `3e6e866a` (chat@4.39.0, unchanged at chat@4.41.1) matches `user_id` / `wa_id` only and otherwise falls back to `contacts[0]` | In a batched webhook the first contact can belong to another sender. `fields()` fills a message's missing phone/BSUID from its contact, so upstream can key a parent-BSUID-only (or unmatched) message by another user's phone and persist an alias to that user, which routes their messages and replies into the wrong thread. Regression test: `tests/test_whatsapp_webhook.py::TestBusinessScopedUserIdsPythonSpecific::test_does_not_borrow_identity_from_an_unrelated_contact`. |
 
 ### Platform-specific gaps
 
