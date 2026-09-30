@@ -148,6 +148,42 @@ class TestDropStrategyHeartbeat:
         assert extended_tokens == ["test-token-2"]
 
 
+class TestHeartbeatCadence:
+    async def test_slow_extend_keeps_the_fixed_rate_tick_schedule(self, monkeypatch):
+        # Upstream's setInterval ticks at 10s/20s/30s and skips a tick while an
+        # extend is in flight. An extend started at 10s that returns at 26s must
+        # be followed by one at 30s (fixed rate), not 36s (sleeping 10s after
+        # the slow call), or a second slow call misses the lock's 40s expiry.
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        started = clock.now
+        extend_starts: list[int] = []
+
+        async def slow_first_extend(lock: Lock, ttl_ms: int) -> bool:
+            extend_starts.append(clock.now - started)
+            if len(extend_starts) == 1:
+                await clock.sleep(16_000)
+            return True
+
+        state.extend_lock = AsyncMock(side_effect=slow_first_extend)  # type: ignore[method-assign]
+        chat, adapter, _ = await _make_chat(state)
+        release = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            await release.wait()
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("cadence-1", "Hey @slack-bot"))
+        )
+        await clock.advance(3 * (DEFAULT_LOCK_TTL_MS // 3) + 1)
+
+        assert extend_starts == [DEFAULT_LOCK_TTL_MS // 3, 3 * (DEFAULT_LOCK_TTL_MS // 3)]
+
+        release.set()
+        await task
+
+
 class TestHeartbeatStop:
     """asyncio translation of ``stopped = true; clearInterval(); await inFlight``."""
 

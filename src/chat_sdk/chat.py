@@ -229,8 +229,10 @@ class _LockHeartbeat:
 
     asyncio translation of ``setInterval`` + ``inFlight``:
 
-    * The loop awaits each extend before its next sleep, which is upstream's
-      "don't stack extends" tick skip.
+    * Ticks are fixed-rate (``started_at + k * TTL/3``), as with
+      ``setInterval``. The loop awaits each extend, and ticks that came due
+      while it was in flight are skipped (upstream's "don't stack extends"
+      rule), so a slow extend never pushes later ticks back.
     * The extend runs as its own task awaited through ``asyncio.shield``:
       cancelling a task cancels the I/O it awaits (a JS promise cannot be
       cancelled), and ``stop()`` must not interrupt a backend call mid-command.
@@ -270,9 +272,14 @@ class _LockHeartbeat:
 
     async def _run(self) -> None:
         # CancelledError is deliberately not caught: ``stop()`` cancels this task.
+        interval = DEFAULT_LOCK_TTL_MS // 3
+        next_tick = self._started_at + interval
         try:
             while True:
-                await _sleep(DEFAULT_LOCK_TTL_MS // 3)
+                # Fixed rate, like ``setInterval``: sleep to the next tick
+                # deadline, not a full interval after the previous extend.
+                await _sleep(max(0, next_tick - _now_ms()))
+                next_tick += interval
                 if self._stopped:
                     return
                 if _now_ms() - self._started_at >= self._max_lifetime_ms:
@@ -292,6 +299,11 @@ class _LockHeartbeat:
                 self._in_flight = None
                 if self._ownership_lost:
                     return
+                # Ticks that came due while the extend was in flight are
+                # skipped (upstream: ``if (inFlight) return``).
+                now = _now_ms()
+                while next_tick <= now:
+                    next_tick += interval
         except Exception as err:
             # Port of the interval callback's ``.catch``: an exception in an
             # un-awaited task would otherwise surface only at GC.
