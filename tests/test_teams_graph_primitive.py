@@ -285,13 +285,16 @@ class TestTeamsGraphTextExtraction:
 
 
 class TestTeamsGraphSsrfDivergence:
-    """Python-first SSRF / token-leak guard (no upstream counterpart)."""
+    """SSRF / token-leak guard. Upstream validates the same host set since
+    chat@4.40.0 (vercel/chat#876); the remaining deltas (``ValueError`` instead
+    of ``TeamsApiError``, parse-based routing) are in docs/UPSTREAM_SYNC.md."""
 
     @pytest.mark.asyncio
-    async def test_rejects_an_attacker_next_link_host_before_attaching_the_token(self) -> None:
+    async def test_rejects_untrusted_pagination_urls_before_acquiring_a_token(self) -> None:
+        # Port of upstream graph/index.test.ts (chat@4.40.0).
         request = _fetch(_json_response(_TOKEN_BODY))
 
-        with pytest.raises(ValueError, match="untrusted host"):
+        with pytest.raises(ValueError, match="untrusted URL"):
             await paginate_teams_graph(_ATTACKER_NEXT_LINK, _opts("paginate", fetch=request))
 
         # Critically: the gate fires BEFORE any token is fetched — the injected
@@ -302,7 +305,7 @@ class TestTeamsGraphSsrfDivergence:
     async def test_call_with_an_absolute_attacker_url_is_rejected(self) -> None:
         request = _fetch(_json_response(_TOKEN_BODY))
 
-        with pytest.raises(ValueError, match="untrusted host"):
+        with pytest.raises(ValueError, match="untrusted URL"):
             # A list-helper limit path is relative; but a caller can pass an
             # absolute hostile URL through ``paginate_teams_graph``. Assert the
             # http(s)-prefixed branch is what's gated.
@@ -322,7 +325,7 @@ class TestTeamsGraphSsrfDivergence:
             "//evil.example/x",
         ):
             request = _fetch(_json_response(_TOKEN_BODY))
-            with pytest.raises(ValueError, match="untrusted host"):
+            with pytest.raises(ValueError, match="untrusted URL"):
                 await paginate_teams_graph(hostile, _opts("p", fetch=request))
             request.assert_not_awaited()
 
@@ -332,7 +335,7 @@ class TestTeamsGraphSsrfDivergence:
         # fail closed — treat it as absolute and reject via the allowlist — never join
         # it or fetch a token for it.
         request = _fetch(_json_response(_TOKEN_BODY))
-        with pytest.raises(ValueError, match="untrusted host"):
+        with pytest.raises(ValueError, match="untrusted URL"):
             await paginate_teams_graph("https://[oops", _opts("p", fetch=request))
         request.assert_not_awaited()
 
@@ -350,8 +353,41 @@ class TestTeamsGraphSsrfDivergence:
         assert _headers(request.await_args_list[1])["authorization"] == "Bearer graph-token"
         assert result == {"id": "x"}
 
+    @pytest.mark.asyncio
+    async def test_untrusted_graph_url_base_is_rejected_for_relative_paths(self) -> None:
+        # A caller-supplied ``graph_url`` is validated like an absolute URL:
+        # joining a relative path onto an untrusted base must not attach the
+        # Graph token (upstream validates the resolved URL too).
+        request = _fetch(_json_response(_TOKEN_BODY))
+        with pytest.raises(ValueError, match="untrusted URL"):
+            await paginate_teams_graph("me/chats", _opts("p", fetch=request, graph_url="https://proxy.example/v1.0/"))
+        request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_national_cloud_graph_url_base_is_used(self) -> None:
+        request = _fetch(_json_response(_TOKEN_BODY), _json_response({"id": "x"}))
+        await paginate_teams_graph("me/chats", _opts("p", fetch=request, graph_url="https://graph.microsoft.us/v1.0/"))
+        assert _url(request.await_args_list[1]) == "https://graph.microsoft.us/v1.0/me/chats"
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "graph.microsoft.com",
+            "graph.microsoft.us",
+            "dod-graph.microsoft.us",
+            "graph.microsoft.de",
+            "microsoftgraph.chinacloudapi.cn",
+            "GRAPH.MICROSOFT.US",
+        ],
+    )
+    def test_is_trusted_graph_url_accepts_national_cloud_hosts(self, host: str) -> None:
+        assert is_trusted_graph_url(f"https://{host}/v1.0/next") is True
+
     def test_is_trusted_graph_url_allowlist(self) -> None:
         assert is_trusted_graph_url("https://graph.microsoft.com/v1.0/next") is True
+        # Sub- and sibling domains of the national-cloud hosts stay untrusted.
+        assert is_trusted_graph_url("https://x.graph.microsoft.us/v1.0/next") is False
+        assert is_trusted_graph_url("https://graph.microsoft.us.attacker.example/x") is False
         # Wrong scheme, lookalike suffix, foreign host, and parse junk all fail.
         assert is_trusted_graph_url("http://graph.microsoft.com/v1.0/next") is False
         assert is_trusted_graph_url("https://graph.microsoft.com.attacker.example/x") is False
