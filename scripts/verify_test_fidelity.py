@@ -318,6 +318,114 @@ def _skip_type_args(src: str, i: int) -> int:
     return -1
 
 
+# A ``/`` after one of these (or at the start of the file) opens a regex
+# literal; after an identifier, number, ``)`` or ``]`` it is division.
+_REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%<>~^")
+_REGEX_KEYWORDS = frozenset(
+    {"return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "yield", "await"}
+)
+_WORD_RE = re.compile(r"[A-Za-z_$][\w$]*|\d[\w.]*")
+
+
+def code_mask(src: str) -> bytearray:
+    """Return one byte per character of ``src``: 1 for code, 0 for non-code.
+
+    Non-code is a ``//`` / ``/* */`` comment or a string, template or regex
+    literal (delimiters included); code inside a template's ``${…}`` is
+    code again. Test calls are only discovered where the mask is 1, so a
+    ``'test("x")'`` fixture string or a commented-out ``// it.each(…)`` is
+    neither counted nor reported as unextractable. Single-line strings and
+    regex literals end at a newline at the latest, so a mis-lexed quote
+    can mask at most the rest of its line.
+    """
+    n = len(src)
+    mask = bytearray(b"\x01") * n
+    depths = [0]  # ``{`` depth per code context; one extra entry per open ``${``
+    prev = ""  # last code token: a punctuator character or a whole word
+    in_template = False
+    i = 0
+    while i < n:
+        if in_template:
+            start = i
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                elif src[i] == "`":
+                    i += 1
+                    in_template, prev = False, ")"
+                    break
+                elif src.startswith("${", i):
+                    i += 2
+                    in_template, prev = False, "{"
+                    depths.append(0)
+                    break
+                else:
+                    i += 1
+            i = min(i, n)
+            mask[start:i] = bytes(i - start)
+            continue
+        c = src[i]
+        if c.isspace():
+            i += 1
+            continue
+        start = i
+        if c in "\"'":
+            i += 1
+            while i < n and src[i] not in (c, "\n"):
+                i += 2 if src[i] == "\\" else 1
+            i = min(i + 1, n)
+            prev = ")"
+        elif c == "`":
+            in_template = True
+            i += 1
+        elif src.startswith("//", i):
+            nl = src.find("\n", i)
+            i = n if nl < 0 else nl
+        elif src.startswith("/*", i):
+            end = src.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        elif c == "/" and (prev == "" or prev in _REGEX_PRECEDERS or prev in _REGEX_KEYWORDS):
+            i += 1
+            in_class = False
+            while i < n and src[i] != "\n":
+                d = src[i]
+                if d == "\\":
+                    i += 2
+                    continue
+                i += 1
+                if d == "[":
+                    in_class = True
+                elif d == "]":
+                    in_class = False
+                elif d == "/" and not in_class:
+                    break
+            i = min(i, n)
+            while i < n and (src[i].isalnum() or src[i] == "_"):  # flags
+                i += 1
+            prev = ")"
+        else:
+            word = _WORD_RE.match(src, i)
+            if word:
+                prev = word.group()
+                i = word.end()
+                continue
+            if c == "{":
+                depths[-1] += 1
+            elif c == "}":
+                if depths[-1] == 0 and len(depths) > 1:
+                    depths.pop()  # end of a ``${…}``: back inside the template
+                    mask[i] = 0
+                    i += 1
+                    in_template = True
+                    continue
+                depths[-1] = max(0, depths[-1] - 1)
+            prev = c
+            i += 1
+            continue
+        mask[start:i] = bytes(i - start)
+    return mask
+
+
 def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[TsTest]:
     """Extract one ``TsTest`` per ``it``/``test`` call and per ``.each`` template.
 
@@ -331,10 +439,14 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
     and ``it.skipIf(cond)("…")`` / ``it.runIf``. Any other ``it``/``test``/
     ``describe`` call form, and any title that is not a readable string
     literal, is appended to ``warnings`` — never dropped silently. At most
-    one test is taken per line.
+    one test is taken per line; a ``describe`` call on the same line does
+    not use up that slot (``describe.only("s", () => { it("t") })``).
+    Calls inside comments and string/template/regex literals are ignored
+    (see ``code_mask``).
     """
     with open(ts_path, encoding="utf-8") as f:
         content = f.read()
+    mask = code_mask(content)
 
     tests: list[TsTest] = []
     current_describe = ""
@@ -348,11 +460,13 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
         line_start = offset
         offset += len(line) + 1
 
-        desc_match = _DESCRIBE_RE.search(line)
+        desc_match = next((d for d in _DESCRIBE_RE.finditer(line) if mask[line_start + d.start()]), None)
         if desc_match:
             current_describe = desc_match.group(1)
 
         for call in _TEST_CALL_RE.finditer(line):
+            if not mask[line_start + call.start()]:
+                continue  # inside a comment or a string/template/regex literal
             fn, chain = call.group(1), call.group(2) or ""
             if fn == "describe" and not chain:
                 continue  # plain describe("…") is handled above
@@ -392,6 +506,7 @@ def extract_ts_tests(ts_path: str, warnings: list[str] | None = None) -> list[Ts
                 warn(lineno, f"could not extract {label} title")
             elif fn == "describe":
                 current_describe = title
+                continue  # a test may follow on the same line
             elif kind == "template":
                 py_name = ts_name_to_python(strip_each_placeholders(title))
                 if py_name:

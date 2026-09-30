@@ -305,6 +305,67 @@ const it2 = describe.name;
     assert warnings == []
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const source = 'test(\"example\", () => {});';",
+        'const source = "it(\\"example\\", () => {});";',
+        'const source = `it("example", () => {});`;',
+        "// it.each(cases)(caseName, handler);",
+        '// it("commented out", () => {});',
+        '/* it("block comment", () => {}); */',
+        "/*\n  it.each(cases)(caseName, handler);\n*/",
+        'const re = /it("example")/;',
+    ],
+    ids=[
+        "single-quoted-fixture",
+        "double-quoted-fixture",
+        "template-fixture",
+        "commented-each",
+        "commented-it",
+        "block-comment",
+        "multiline-block-comment",
+        "regex-literal",
+    ],
+)
+def test_calls_inside_strings_comments_and_regexes_are_ignored(vtf, tmp_path, source):
+    warnings: list[str] = []
+    assert _extract(vtf, tmp_path, source + "\n", warnings) == []
+    assert warnings == []
+
+
+def test_real_tests_around_literals_are_still_extracted(vtf, tmp_path):
+    # A regex literal holding a quote, a template with a nested ``${…}``
+    # call and a division must not leave the lexer inside a literal.
+    source = """const re = /"/;
+it("after a regex with a quote", () => {});
+const s = `a ${fn("x", `inner ${y}`)} b`;
+it("after a nested template", () => {});
+const half = total / 2; const r = /x/g;
+it("after division", () => {});
+"""
+    warnings: list[str] = []
+    tests = _extract(vtf, tmp_path, source, warnings)
+    assert [t.ts_name for t in tests] == ["after a regex with a quote", "after a nested template", "after division"]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'describe.only("suite", () => { it("works", () => {}); });',
+        'describe.skip("suite", () => { test("works", () => {}); });',
+        'describe.each([1])("suite", () => { it("works", () => {}); });',
+    ],
+    ids=["describe-only", "describe-skip", "describe-each"],
+)
+def test_describe_call_does_not_consume_the_line_test(vtf, tmp_path, source):
+    warnings: list[str] = []
+    tests = _extract(vtf, tmp_path, source + "\n", warnings)
+    assert [(t.describe, t.ts_name, t.py_name) for t in tests] == [("suite", "works", "test_works")]
+    assert warnings == []
+
+
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------

@@ -173,7 +173,9 @@ Infra guardrails:
   uncounted. Understood forms: `it`/`test` (any quote style), modifier
   chains (`it.skip`, `it.only`, `it.concurrent`, …), `.each` / `.for`
   (with optional `<T>` type arguments), and `.skipIf(c)` / `.runIf(c)`.
-  Baseline mode only warns.
+  Baseline mode only warns. Calls inside comments and string, template or
+  regex literals (fixture source, commented-out examples) are ignored, and
+  a `describe.only("s", () => { it("t") })` one-liner still yields its test.
 - `--check-docs` (a separate CI step) fails if a clone snippet
   (`--branch chat@X`, `--branch=chat@X`, `-b chat@X`) or a `pinned to
   [the] [vercel/]chat@X` phrase in `CLAUDE.md` or this file disagrees with
