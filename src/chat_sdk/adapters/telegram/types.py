@@ -88,6 +88,15 @@ class TelegramAdapterConfig:
     string ``"true"`` opts out. An explicit ``False`` here wins over the env var.
     """
 
+    allowed_user_ids: list[int | str] | None = None
+    """Telegram user IDs allowed to trigger the adapter.
+
+    Defaults to the ``TELEGRAM_ALLOWED_USER_IDS`` env var (comma-separated).
+    IDs are compared as trimmed strings; empty entries are dropped. All users
+    are allowed when omitted or empty. With an allowlist set, updates that
+    carry no acting user (e.g. anonymous channel posts) are dropped.
+    """
+
 
 # =============================================================================
 # Thread ID
@@ -305,6 +314,75 @@ class TelegramStickerFile(TypedDict, total=False):
     file_size: int
     file_unique_id: str
     emoji: str
+    height: int
+    is_animated: bool
+    is_video: bool
+    set_name: str
+    width: int
+
+
+class TelegramVenue(TypedDict, total=False):
+    """Telegram venue. See https://core.telegram.org/bots/api#venue"""
+
+    address: str  # required
+    location: TelegramLocation  # required
+    title: str  # required
+
+
+class TelegramContact(TypedDict, total=False):
+    """Telegram shared contact. See https://core.telegram.org/bots/api#contact"""
+
+    first_name: str  # required
+    last_name: str
+    phone_number: str  # required
+    user_id: int
+    vcard: str
+
+
+class TelegramPollOption(TypedDict, total=False):
+    """Telegram poll option. See https://core.telegram.org/bots/api#polloption"""
+
+    text: str  # required
+    voter_count: int
+
+
+class TelegramPoll(TypedDict, total=False):
+    """Telegram poll. See https://core.telegram.org/bots/api#poll"""
+
+    id: str  # required
+    options: list[TelegramPollOption]
+    question: str  # required
+    type: str
+
+
+class TelegramDice(TypedDict):
+    """Telegram dice roll. See https://core.telegram.org/bots/api#dice"""
+
+    emoji: str
+    value: int
+
+
+class TelegramGame(TypedDict, total=False):
+    """Telegram game. See https://core.telegram.org/bots/api#game"""
+
+    description: str
+    title: str  # required
+
+
+class TelegramInvoice(TypedDict, total=False):
+    """Telegram invoice. See https://core.telegram.org/bots/api#invoice"""
+
+    currency: str  # required
+    description: str
+    title: str  # required
+    total_amount: int  # required, in the currency's smallest unit
+
+
+class TelegramStory(TypedDict, total=False):
+    """Telegram forwarded story. See https://core.telegram.org/bots/api#story"""
+
+    chat: TelegramChat
+    id: int
 
 
 class TelegramVideoNoteFile(TypedDict, total=False):
@@ -709,24 +787,33 @@ class TelegramMessage(TypedDict, total=False):
     JSON: ``raw.get("from_user") or raw.get("from")``.
     """
 
+    animation: TelegramAnimation
     audio: TelegramAudioFile
     caption: str
     caption_entities: list[TelegramMessageEntity]
     chat: TelegramChat  # required
+    contact: TelegramContact
     date: int  # required
+    dice: TelegramDice
     document: TelegramDocumentFile
     edit_date: int
     entities: list[TelegramMessageEntity]
     # Telegram API sends "from" but that is a Python reserved word.
     # The adapter reads both keys: raw.get("from_user") or raw.get("from").
     from_user: TelegramUser
+    game: TelegramGame
+    invoice: TelegramInvoice
+    location: TelegramLocation
     message_id: int  # required
     message_thread_id: int
     photo: list[TelegramPhotoSize]
+    poll: TelegramPoll
     rich_message: TelegramRichMessage
     sender_chat: TelegramChat
     sticker: TelegramStickerFile
+    story: TelegramStory
     text: str
+    venue: TelegramVenue
     video: TelegramVideo
     video_note: TelegramVideoNoteFile
     voice: TelegramVoiceFile

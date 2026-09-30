@@ -208,7 +208,7 @@ def test_extracts_media_and_picks_largest_photo() -> None:
     message: TelegramRichMessage = {"blocks": [list_block]}
 
     media = rich_message_media(message)
-    assert media == [RichMedia(file=large, type="image", height=200, width=300)]
+    assert media == [RichMedia(file=large, type="image", height=200, mime_type="image/jpeg", width=300)]
 
 
 def test_animation_image_mime_maps_to_image_type() -> None:
