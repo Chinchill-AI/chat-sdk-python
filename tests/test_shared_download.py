@@ -21,7 +21,6 @@ import gzip
 import importlib
 import socket
 import sys
-import time
 import tracemalloc
 import types
 import zlib
@@ -109,6 +108,19 @@ class FakeTransport:
 
 def redirect(location: str | None, status: int = 302) -> FakeResponse:
     return FakeResponse("", status, {"location": location} if location is not None else {})
+
+
+class FakeClock:
+    """Moves the running loop's clock forward on demand (no real sleeping)."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        loop = asyncio.get_running_loop()
+        real = loop.time
+        self.offset = 0.0
+        monkeypatch.setattr(loop, "time", lambda: real() + self.offset)
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +428,14 @@ class TestHostCanonicalization:
             "https://[::1/file",
             "https:///file",
             "https://a%2fb.example.com/file",
-            "https://evil.example\\@files.example.com/file",
             "https://[fe80::1%25eth0]/file",  # WHATWG rejects IPv6 zone ids
+            "https://[v1.fbsbx.com]/file",  # IPvFuture: brackets hold IPv6 only
+            "https://2606%3a4700%3a%3a1/file",  # a decoded ":" is forbidden
+            "https://%3a%3a1/file",
+            "https://xn--zz.example/file",  # invalid Punycode
+            "https://xn--a-ecp.ru/file",  # decodes to a disallowed code point
+            "https://xn--bcher-kva-.example/file",  # decodes to ASCII
+            "https://evil.example @files.example.com/file",  # space in the authority
         ],
     )
     def test_unparseable_or_ambiguous_hosts_are_untrusted(self, url: str) -> None:
@@ -441,12 +459,54 @@ class TestHostCanonicalization:
     def test_public_numeric_host_is_rewritten_to_its_canonical_address(self) -> None:
         assert validate_attachment_url("https://1572395042/f?x=1", "test") == "https://93.184.216.34/f?x=1"
 
-    def test_path_and_query_are_percent_encoded_keeping_existing_escapes(self) -> None:
-        url = 'https://files.example.com/a b/%2Fé?download=a%2Fb&x="y"#frag'
+    @pytest.mark.parametrize(
+        "url",
+        ["https://xn--bcher-kva.example/x", "https://XN--BCHER-KVA.example/x", "https://xn--i-7iq.ws/x"],
+    )
+    def test_valid_punycode_hosts_are_accepted(self, url: str) -> None:
+        assert validate_attachment_url(url, "test") == url.lower()
 
-        assert validate_attachment_url(url, "test") == (
-            "https://files.example.com/a%20b/%2F%C3%A9?download=a%2Fb&x=%22y%22"
-        )
+    def test_hosts_must_not_be_a_bare_string(self) -> None:
+        # A str is a Sequence[str] of characters, which would allow "x.c".
+        with pytest.raises(TypeError, match="not a single string"):
+            validate_attachment_url("https://x.c/file", "test", "fbsbx.com")
+
+    # Expected values are Node's ``new URL(url).href`` minus the fragment.
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (
+                'https://files.example.com/a b/%2Fé?download=a%2Fb&x="y"#frag',
+                "https://files.example.com/a%20b/%2F%C3%A9?download=a%2Fb&x=%22y%22",
+            ),
+            # WHATWG path and special-query encode sets differ.
+            (
+                "https://files.example.com/p^{1}`|?q='x'&z={1}^`|",
+                "https://files.example.com/p%5E%7B1%7D%60|?q=%27x%27&z={1}^`|",
+            ),
+            ("https://files.example.com/a/../b/./c", "https://files.example.com/b/c"),
+            ("https://files.example.com/a/%2E%2e/b/%2e", "https://files.example.com/b/"),
+            ("https://files.example.com/../../x/..", "https://files.example.com/"),
+            ("https://files.example.com/a\\b\\..\\c?q=\\x", "https://files.example.com/a/c?q=\\x"),
+            ("https://files.example.com", "https://files.example.com/"),
+            ("https://files.example.com/x?", "https://files.example.com/x?"),
+            ("HTTPS://files.example.com:443/x", "https://files.example.com/x"),
+            ("https://u%20r:p;w@files.example.com/x", "https://u%20r:p%3Bw@files.example.com/x"),
+            ("https://a@b:c:d@files.example.com/x", "https://a%40b:c%3Ad@files.example.com/x"),
+            ("https://:@files.example.com/x", "https://files.example.com/x"),
+            ("  https://files.example.com/x\t\n  ", "https://files.example.com/x"),
+        ],
+    )
+    def test_url_is_serialized_as_whatwg_does(self, url: str, expected: str) -> None:
+        assert validate_attachment_url(url, "test") == expected
+
+    def test_backslash_ends_the_authority_as_in_whatwg(self) -> None:
+        url = "https://evil.example\\@files.example.com/file"
+
+        # WHATWG reads the host as evil.example, and so does the allowlist.
+        assert validate_attachment_url(url, "test") == "https://evil.example/@files.example.com/file"
+        with pytest.raises(NetworkError, match=UNTRUSTED):
+            validate_attachment_url(url, "test", ["files.example.com"])
 
     @pytest.mark.parametrize(
         ("url", "expected"),
@@ -484,6 +544,24 @@ class TestHostCanonicalization:
     def test_is_blocked_address_uses_upstream_ranges(self, address: str, blocked: bool) -> None:
         assert is_blocked_address(address) is blocked
 
+    @pytest.mark.parametrize(
+        ("location", "expected"),
+        [
+            # Values from Node's ``new URL(location, base).href``.
+            ("/\\cdn.example.net/x", "https://cdn.example.net/x"),
+            ("\\\\cdn.example.net/x", "https://cdn.example.net/x"),
+            ("https:\\\\cdn.example.net/x", "https://cdn.example.net/x"),
+            (" https://cdn.example.net/x ", "https://cdn.example.net/x"),
+            ("../c/./d", "https://files.example.com/c/d"),
+        ],
+    )
+    async def test_redirect_location_is_resolved_as_whatwg_does(self, location: str, expected: str) -> None:
+        transport = FakeTransport(redirect(location), FakeResponse("ok"))
+
+        await download_attachment("https://files.example.com/a/b", adapter="test", transport=transport)
+
+        assert transport.calls[1][0] == expected
+
     async def test_invalid_redirect_location_is_untrusted(self) -> None:
         transport = FakeTransport(redirect("https://[::1/file"))
 
@@ -495,19 +573,24 @@ class TestHostCanonicalization:
 class TestStaticHeaderCredentials:
     """Divergence: a static mapping's credentials stay on the first origin."""
 
-    async def test_static_mapping_credentials_are_dropped_on_cross_origin_hop(self) -> None:
-        transport = FakeTransport(redirect("https://cdn.example.net/file"), FakeResponse("ok"))
+    @pytest.mark.parametrize(
+        "target",
+        ["https://cdn.example.net/file", "https://files.example.com:8443/file"],  # other host, other port
+    )
+    async def test_static_mapping_credentials_are_dropped_on_cross_origin_hop(self, target: str) -> None:
+        transport = FakeTransport(redirect(target), FakeResponse("ok"))
+        credentials = {"Authorization": "Bearer secret", "Cookie": "a=b", "Proxy-Authorization": "Basic x"}
 
         await download_attachment(
             "https://files.example.com/file",
             adapter="test",
-            headers={"Authorization": "Bearer secret", "Cookie": "a=b", "x-trace": "1"},
+            headers={**credentials, "x-trace": "1"},
             transport=transport,
         )
 
         first, second = (call[1] for call in transport.calls)
-        assert first["Authorization"] == "Bearer secret"
-        assert first["Cookie"] == "a=b"
+        assert {k: first[k] for k in credentials} == credentials
+        assert transport.calls[1][0] == target
         assert {k.lower() for k in second} == {"accept-encoding", "user-agent", "x-trace"}
 
     async def test_static_mapping_credentials_follow_same_origin_hop(self) -> None:
@@ -583,6 +666,18 @@ class TestBrotli:
         with pytest.raises(NetworkError, match="Attachment exceeds the download limit"):
             await download_attachment("https://files.example.com/file", adapter="test", limit=1024, transport=transport)
 
+    @pytest.mark.parametrize("split", [False, True])
+    async def test_data_after_the_end_of_a_br_stream_raises_however_it_is_chunked(self, split: bool) -> None:
+        brotli = pytest.importorskip("brotli")
+        body = brotli.compress(b"a")
+        chunks = [body, b"zz"] if split else [body + b"zz"]
+
+        with pytest.raises(brotli.error):
+            await read_attachment_body(FakeResponse(headers={"content-encoding": "br"}, chunks=chunks), "test")
+        # An empty chunk after the end is not data.
+        message = FakeResponse(headers={"content-encoding": "br"}, chunks=[body, b""])
+        assert await read_attachment_body(message, "test") == b"a"
+
     async def test_truncated_br_body_is_an_error(self) -> None:
         brotli = pytest.importorskip("brotli")
         body = brotli.compress(bytes(range(256)) * 400)
@@ -648,6 +743,24 @@ class TestBodyDecoding:
         assert result == b"x" * 50_000
         # One object per member (the naive approach) peaks well above 1 MB.
         assert peak < 1024 * 1024
+
+    @pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+    def test_one_small_chunk_is_decoded_in_bounded_steps(self, encoding: str) -> None:
+        payload = bytes(4 * 1024 * 1024)
+        if encoding == "br":
+            body = pytest.importorskip("brotli").compress(payload)
+        else:
+            body = gzip.compress(payload) if encoding == "gzip" else zlib.compress(payload)
+        decoder = download_module._decoder_for(encoding)
+        assert decoder is not None
+
+        pieces = [len(piece) for piece in decoder.feed(body)]
+
+        # The cap is checked per piece, so no piece may be a whole bomb.
+        # Brotli rounds a step up to its next output block (under 2x).
+        bound = download_module._DECODE_STEP * (2 if encoding == "br" else 1)
+        assert sum(pieces) == len(payload)
+        assert max(pieces) <= bound
 
     async def test_deflate_bodies_are_decoded(self) -> None:
 
@@ -765,11 +878,14 @@ class TestDeadlineAndCancellation:
         assert calls == ["https://files.example.com/file"]
         assert header_calls == ["https://files.example.com/file"]
 
-    async def test_a_slow_headers_callback_cannot_start_a_request_after_the_deadline(self) -> None:
+    async def test_a_slow_headers_callback_cannot_start_a_request_after_the_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = FakeClock(monkeypatch)
         calls: list[str] = []
 
         def headers(url: str) -> None:
-            time.sleep(0.04)  # uses up the 10 ms deadline
+            clock.advance(0.04)  # uses up the 10 ms deadline
 
         def transport(url: str, headers: dict[str, str]) -> asyncio.Future[AttachmentResponse]:
             calls.append(url)  # a synchronous transport would start I/O here
@@ -783,10 +899,12 @@ class TestDeadlineAndCancellation:
             )
         assert calls == []
 
-    async def test_a_body_read_completing_after_the_deadline_is_refused(self) -> None:
+    async def test_a_body_read_completing_after_the_deadline_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = FakeClock(monkeypatch)
+
         class BlockingBody(FakeResponse):
             async def _iterate(self) -> AsyncIterator[bytes]:
-                time.sleep(0.05)  # blocking work past the 20 ms deadline, no suspension
+                clock.advance(0.05)  # work past the 20 ms deadline, no suspension
                 yield b"too late"
 
         late = BlockingBody()
@@ -796,6 +914,25 @@ class TestDeadlineAndCancellation:
                 "https://files.example.com/file", adapter="test", timeout_ms=20, transport=FakeTransport(late)
             )
         assert late.close_calls >= 1
+
+    async def test_an_error_raised_after_the_deadline_is_reported_as_a_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = FakeClock(monkeypatch)
+        boom = ValueError("boom")
+
+        def on_response(response: AttachmentResponse) -> None:
+            clock.advance(60)
+            raise boom
+
+        with pytest.raises(NetworkError, match=TIMED_OUT) as caught:
+            await download_attachment(
+                "https://files.example.com/file",
+                adapter="test",
+                on_response=on_response,
+                transport=FakeTransport(FakeResponse("ok")),
+            )
+        assert caught.value.original_error is boom
 
     async def test_transport_errors_propagate_unchanged(self) -> None:
         async def transport(url: str, headers: dict[str, str]) -> AttachmentResponse:
@@ -833,12 +970,25 @@ class TestDefaultTransport:
         import aiohttp
 
         seen: list[tuple[Any, dict[str, Any]]] = []
+        built: dict[str, dict[str, Any]] = {}
 
         async def fake_get(self: Any, url: Any, **kwargs: Any) -> Any:
             seen.append((url, kwargs))
             raise ConnectionResetError("stop")
 
         monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+        real_session, real_connector = aiohttp.ClientSession, aiohttp.TCPConnector
+
+        def session(**kwargs: Any) -> Any:
+            built["session"] = kwargs
+            return real_session(**kwargs)
+
+        def connector(**kwargs: Any) -> Any:
+            built["connector"] = kwargs
+            return real_connector(**kwargs)
+
+        monkeypatch.setattr(aiohttp, "ClientSession", session)
+        monkeypatch.setattr(aiohttp, "TCPConnector", connector)
 
         with pytest.raises(ConnectionResetError):
             await download_attachment("https://files.example.com/a%2Fb?sig=a%2Fb%3D&x=1", adapter="test")
@@ -848,6 +998,13 @@ class TestDefaultTransport:
         assert str(url) == "https://files.example.com/a%2Fb?sig=a%2Fb%3D&x=1"
         assert url.raw_query_string == "sig=a%2Fb%3D&x=1"
         assert kwargs["allow_redirects"] is False
+        # No proxy from the environment, no transparent decoding, and a fresh
+        # connection that must go through the pinned resolver.
+        assert built["session"]["trust_env"] is False
+        assert built["session"]["auto_decompress"] is False
+        options = built["connector"]
+        assert (options["force_close"], options["use_dns_cache"]) == (True, False)
+        assert type(options["resolver"]).__name__ == "PinnedResolver"
 
     async def test_pinned_resolver_hands_aiohttp_only_vetted_addresses(self) -> None:
         async def query(hostname: str, family: int) -> list[ResolvedAddress]:
@@ -871,6 +1028,36 @@ class TestDefaultTransport:
 
         with pytest.raises(NetworkError, match=INTERNAL):
             await send("https://[::1]/file", {})
+
+    async def test_default_transport_refuses_when_the_client_parses_another_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import aiohttp
+        import yarl
+
+        sent: list[Any] = []
+
+        async def fake_get(self: Any, url: Any, **kwargs: Any) -> Any:
+            sent.append(url)
+            raise ConnectionResetError("stop")
+
+        def disagreeing_url(url: str, encoded: bool) -> Any:
+            # Stand-in for a client URL parser that reads another host.
+            return types.SimpleNamespace(scheme="https", raw_host="evil.example")
+
+        monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+        monkeypatch.setattr(yarl, "URL", disagreeing_url)
+
+        with pytest.raises(NetworkError, match=UNTRUSTED):
+            await create_transport("test")("https://files.example.com/file", {})
+        assert sent == []
+
+    async def test_resolver_refuses_answers_of_an_unknown_family(self) -> None:
+        async def query(hostname: str, family: int) -> list[ResolvedAddress]:
+            return [ResolvedAddress("93.184.216.34", 0)]
+
+        with pytest.raises(NetworkError, match=INTERNAL):
+            await create_resolver("test", query)("files.example.com")
 
 
 def test_module_imports_without_aiohttp(monkeypatch: pytest.MonkeyPatch) -> None:

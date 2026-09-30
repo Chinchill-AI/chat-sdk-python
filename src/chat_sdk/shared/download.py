@@ -25,10 +25,11 @@ import inspect
 import ipaddress
 import re
 import socket
+import unicodedata
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol, cast
-from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
+from urllib.parse import SplitResult, unquote, urljoin, urlsplit
 
 from chat_sdk.shared.errors import NetworkError
 
@@ -73,6 +74,8 @@ _USER_AGENT = "Vercel.ChatSDK"
 _CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
 # Upper bound on decoded bytes produced per decompression step, so one small
 # compressed chunk cannot expand far past ``limit`` before the cap applies.
+# (Brotli rounds a step up to its next output block, so its steps can reach
+# just under twice this.)
 _DECODE_STEP = 64 * 1024
 _READ_CHUNK = 64 * 1024
 
@@ -170,10 +173,15 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _OCT_DIGITS = frozenset("01234567")
 _DEC_DIGITS = frozenset("0123456789")
 _HOSTNAME = re.compile(r"[a-z0-9._-]+")
-# ``quote`` always keeps ASCII letters, digits and ``_.-~``; these add the
-# characters a valid URL may already carry (``%`` keeps existing escapes).
-_PATH_SAFE = "!$%&'()*+,/:;=?@[]^|"
-_USERINFO_SAFE = "!$%&'()*+,;=:"
+# WHATWG percent-encode sets, on top of C0 controls, space and non-ASCII
+# (which every set encodes). ``%`` is never encoded: existing escapes stay.
+_QUERY_SET = frozenset("\"#<>'")  # the "special-query" set (https)
+_PATH_SET = frozenset('"#<>?^`{}')
+_USERINFO_SET = _PATH_SET | frozenset("/:;=@[\\]|")
+# WHATWG strips these from both ends of a URL and ASCII tab/newline anywhere.
+_C0_OR_SPACE = "".join(chr(code) for code in range(0x21))
+_SINGLE_DOT = frozenset({".", "%2e"})
+_DOUBLE_DOT = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
 
 
 def _parse_ipv4_number(part: str) -> int | None:
@@ -245,6 +253,29 @@ def _domain_to_ascii(host: str) -> str | None:
         return None
 
 
+def _valid_ace_label(label: str) -> bool:
+    """WHATWG's check of an ASCII ``xn--`` label: it must decode to a valid label.
+
+    The Punycode must decode to a non-empty, non-ASCII, NFC label whose code
+    points UTS46 leaves unchanged (valid or deviation). Without the ``idna``
+    package only the Punycode itself is checked.
+    """
+    try:
+        decoded = label[4:].encode("ascii").decode("punycode")
+    except (UnicodeError, ValueError):
+        return False
+    if not decoded or decoded.isascii() or not unicodedata.is_normalized("NFC", decoded):
+        return False
+    try:
+        import idna
+    except ImportError:
+        return True
+    try:
+        return idna.uts46_remap(decoded, std3_rules=False, transitional=False) == decoded
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return False
+
+
 def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """Canonicalize the URL host the way a WHATWG ``URL`` would.
 
@@ -259,7 +290,17 @@ def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddre
     # The raw host, before ``urlsplit``'s ``str.lower()``: UTS46 does its
     # own case mapping, which differs for a few code points (e.g. U+1E9E).
     host = parts.netloc.rpartition("@")[2]
-    host = host[1 : host.index("]")] if host.startswith("[") else host.partition(":")[0]
+    if host.startswith("["):
+        # Brackets hold an IPv6 address and nothing else: WHATWG rejects
+        # IPvFuture (``[v1.x]``), zone ids and percent-encoding in them.
+        inner = host[1 : host.index("]")]
+        if "%" in inner:
+            return None
+        try:
+            return ipaddress.IPv6Address(inner)
+        except ValueError:
+            return None
+    host = host.partition(":")[0]
     if "%" in host:
         try:
             host = unquote(host, errors="strict")
@@ -270,18 +311,63 @@ def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddre
         if host is None:
             return None
     host = host.lower()
-    if ":" in host:
-        if "%" in host:
-            return None  # WHATWG rejects IPv6 zone identifiers
-        try:
-            return ipaddress.IPv6Address(host)
-        except ValueError:
-            return None
+    # Anything beyond DNS-label characters (e.g. a decoded ":", "/" or "@",
+    # all forbidden domain code points) would change which host the rebuilt
+    # URL names; refuse it.
+    if not _HOSTNAME.fullmatch(host):
+        return None
     if _ends_in_number(host):
         return _parse_ipv4(host)
-    # Anything beyond DNS-label characters (e.g. a decoded "/" or "@") would
-    # change which host the rebuilt URL names; refuse it.
-    return host if _HOSTNAME.fullmatch(host) else None
+    if any(label.startswith("xn--") and not _valid_ace_label(label) for label in host.split(".")):
+        return None
+    return host
+
+
+def _prepare_reference(url: str) -> str:
+    """Apply WHATWG's pre-parse clean-up that ``urllib.parse`` does not.
+
+    Strips C0 controls and spaces from both ends, drops ASCII tab and
+    newline, and turns ``\\`` into ``/`` before the query or fragment (WHATWG
+    treats them alike for ``https``). Used for URLs and for redirect
+    ``Location`` values before they are resolved.
+    """
+    url = url.strip(_C0_OR_SPACE).replace("\t", "").replace("\n", "").replace("\r", "")
+    cut = min((i for i in (url.find("?"), url.find("#")) if i >= 0), default=len(url))
+    return url[:cut].replace("\\", "/") + url[cut:]
+
+
+def _percent_encode(text: str, encode_set: frozenset[str]) -> str:
+    """Percent-encode ``text`` with a WHATWG encode set (UTF-8, uppercase hex)."""
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if code <= 0x20 or code >= 0x7F or ch in encode_set:
+            if 0xD800 <= code <= 0xDFFF:
+                ch = "\ufffd"  # a lone surrogate is not a scalar value
+            out.append("".join(f"%{byte:02X}" for byte in ch.encode("utf-8")))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _serialize_path(path: str) -> str:
+    """WHATWG path parsing for ``https``: encode segments, resolve dot segments."""
+    segments = path[1:].split("/") if path.startswith("/") else path.split("/")
+    out: list[str] = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        lowered = segment.lower()
+        if lowered in _DOUBLE_DOT:
+            if out:
+                out.pop()
+            if last:
+                out.append("")
+        elif lowered in _SINGLE_DOT:
+            if last:
+                out.append("")
+        else:
+            out.append(_percent_encode(segment, _PATH_SET))
+    return "/" + "/".join(out)
 
 
 def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None = None) -> str:
@@ -294,6 +380,11 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
     URL whose host cannot be parsed. The returned URL carries the canonical
     host, so the transport connects to exactly the host that was checked.
     """
+    if isinstance(hosts, (str, bytes)):
+        # A bare string is a Sequence[str] of characters: it would allow any
+        # one-letter host. TypeScript's ``readonly string[]`` rejects it.
+        raise TypeError("hosts must be a sequence of host names, not a single string")
+    url = _prepare_reference(url)
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -301,9 +392,9 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
     except ValueError:
         # WHATWG ``new URL`` throws on these; fail closed with a NetworkError.
         raise _untrusted(adapter) from None
-    # A backslash, space or control character in the authority is where
-    # WHATWG and ``urlsplit`` disagree about the host; fail closed.
-    if host is None or any(ch == "\\" or ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in parts.netloc):
+    # A space or control character left in the authority is where WHATWG and
+    # ``urlsplit`` disagree about the host; fail closed.
+    if host is None or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in parts.netloc):
         raise _untrusted(adapter)
     if not isinstance(host, str) and is_blocked_address(str(host)):
         raise _refusal(adapter)
@@ -316,17 +407,20 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
         )
     ):
         raise _untrusted(adapter)
-    netloc_host = f"[{hostname}]" if isinstance(host, ipaddress.IPv6Address) else hostname
-    userinfo = parts.netloc.rpartition("@")[0]
-    netloc = f"{quote(userinfo, safe=_USERINFO_SAFE)}@{netloc_host}" if "@" in parts.netloc else netloc_host
-    if port is not None:
+    # Serialize as WHATWG ``URL.href`` does (minus the fragment, which is
+    # never sent), keeping existing escapes byte-for-byte: the transport sends
+    # the result as-is, so signatures over the escaped request target hold.
+    netloc = f"[{hostname}]" if isinstance(host, ipaddress.IPv6Address) else hostname
+    if port is not None and port != 443:
         netloc = f"{netloc}:{port}"
-    # Percent-encode what WHATWG would (spaces, quotes, non-ASCII, ...) while
-    # keeping existing escapes byte-for-byte: the transport sends the result
-    # as-is, so signatures over the escaped request target stay valid.
-    path = quote(parts.path.replace("\\", "/"), safe=_PATH_SAFE)
-    query = quote(parts.query, safe=_PATH_SAFE)
-    return SplitResult("https", netloc, path, query, "").geturl()
+    username, _, password = parts.netloc.rpartition("@")[0].partition(":")
+    credentials = _percent_encode(username, _USERINFO_SET)
+    if password:
+        credentials = f"{credentials}:{_percent_encode(password, _USERINFO_SET)}"
+    if credentials:
+        netloc = f"{credentials}@{netloc}"
+    query = f"?{_percent_encode(parts.query, _QUERY_SET)}" if "?" in url.partition("#")[0] else ""
+    return f"https://{netloc}{_serialize_path(parts.path)}{query}"
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +610,15 @@ class _BrotliDecoder:
         self._error = module.error
 
     def feed(self, data: bytes) -> Iterator[bytes]:
+        if not data:
+            return
         if self._stream.is_finished():
-            return  # data after the end of the stream is ignored
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md: Node
+            # ignores bytes after the end of a br stream. The binding cannot
+            # say how much input a step consumed, so trailing bytes sharing a
+            # chunk with the end always raise; bytes in a later chunk raise
+            # too, so the outcome does not depend on how the body was split.
+            raise self._error("brotli: data after the end of the stream")
         out = self._stream.process(data, output_buffer_limit=_DECODE_STEP)
         # Output can stay buffered even when ``can_accept_more_data()`` is
         # true, so drain with empty input until a step produces nothing.
@@ -863,7 +964,9 @@ async def download_attachment(
                     if hop == redirects:
                         raise NetworkError(adapter, "Too many attachment redirects")
                     try:
-                        target = urljoin(current, location)
+                        # Cleaned up first, so ``/\\host/x`` resolves to
+                        # another host (as WHATWG does), then re-validated.
+                        target = urljoin(current, _prepare_reference(location))
                     except ValueError:
                         raise _untrusted(adapter) from None
                     current = validate_attachment_url(target, adapter, hosts)
