@@ -5,8 +5,9 @@ input helpers from #559), exposed upstream as ``@chat-adapter/slack/blocks``.
 Converts Chat SDK-style card objects into Slack Block Kit blocks (and a
 Markdown fallback), with docs-backed Slack size limits and emoji-placeholder
 conversion — without importing the full Slack adapter, ``slack_sdk``, or the
-chat runtime. The only cross-module dependency is the sibling ``format``
-subpath (``markdown_bold_to_slack_mrkdwn``), which is itself runtime-free.
+chat runtime. The only cross-module dependencies are the sibling ``format``
+subpath (``markdown_bold_to_slack_mrkdwn``), which is itself runtime-free, and
+``chat_sdk.cards._js_number_to_string`` (stdlib-only number formatting).
 
 Compatibility aliases ``card_to_block_kit`` / ``card_to_fallback_text`` mirror
 upstream's ``cardToBlockKit`` / ``cardToFallbackText`` re-exports.
@@ -14,10 +15,11 @@ upstream's ``cardToBlockKit`` / ``cardToFallbackText`` re-exports.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from chat_sdk.adapters.slack.blocks.errors import SlackBlockError
 from chat_sdk.adapters.slack.blocks.input import (
@@ -48,16 +50,23 @@ from chat_sdk.adapters.slack.blocks.types import (
     SlackButtonStyle,
     SlackCardChild,
     SlackCardElement,
+    SlackChartDataPoint,
+    SlackChartDefinition,
+    SlackChartElement,
+    SlackChartSegment,
+    SlackChartSeries,
     SlackDividerElement,
     SlackFieldElement,
     SlackFieldsElement,
     SlackImageElement,
     SlackLinkButtonElement,
     SlackLinkElement,
+    SlackPieChartDefinition,
     SlackRadioSelectElement,
     SlackSectionElement,
     SlackSelectElement,
     SlackSelectOptionElement,
+    SlackSeriesChartDefinition,
     SlackTableAlignment,
     SlackTableElement,
     SlackTextElement,
@@ -65,6 +74,11 @@ from chat_sdk.adapters.slack.blocks.types import (
     SlackTextStyle,
 )
 from chat_sdk.adapters.slack.format import markdown_bold_to_slack_mrkdwn
+
+# JS ``String(number)`` formatting for chart fallback values. ``chat_sdk.cards``
+# is pure data + formatting (stdlib only) and is already loaded by the
+# ``chat_sdk`` package import, so this adds no runtime dependency.
+from chat_sdk.cards import _js_number_to_string
 
 __all__ = [
     "LIMITS",
@@ -82,6 +96,11 @@ __all__ = [
     "SlackButtonStyle",
     "SlackCardChild",
     "SlackCardElement",
+    "SlackChartDataPoint",
+    "SlackChartDefinition",
+    "SlackChartElement",
+    "SlackChartSegment",
+    "SlackChartSeries",
     "SlackDividerElement",
     "SlackFieldElement",
     "SlackFieldsElement",
@@ -94,10 +113,12 @@ __all__ = [
     "SlackInputResponse",
     "SlackLinkButtonElement",
     "SlackLinkElement",
+    "SlackPieChartDefinition",
     "SlackRadioSelectElement",
     "SlackSectionElement",
     "SlackSelectElement",
     "SlackSelectOptionElement",
+    "SlackSeriesChartDefinition",
     "SlackTableAlignment",
     "SlackTableElement",
     "SlackTextElement",
@@ -126,6 +147,7 @@ _EmojiConverter = Callable[[str], str]
 class _State:
     convert_emoji: _EmojiConverter
     max_blocks: int
+    chart_count: int = 0
     used_table: bool = False
 
 
@@ -215,6 +237,8 @@ def _card_child_to_slack_blocks(child: SlackCardChild, state: _State) -> list[Sl
     kind = child.get("type")
     if kind == "actions":
         return [_actions_to_block(child, state.convert_emoji)]  # type: ignore[arg-type]
+    if kind == "chart":
+        return [_chart_to_block(child, state)]  # type: ignore[arg-type]
     if kind == "divider":
         return [{"type": "divider"}]
     if kind == "fields":
@@ -406,40 +430,209 @@ def _fields_to_block(element: SlackFieldsElement, convert_emoji: _EmojiConverter
 
 
 def _table_to_blocks(element: SlackTableElement, state: _State) -> list[SlackBlock]:
+    # Divergence from upstream — see docs/UPSTREAM_SYNC.md: counts code points,
+    # where upstream's ``.length`` counts UTF-16 code units.
+    cell_char_count = sum(len(header) for header in element["headers"]) + sum(
+        len(cell) for row in element["rows"] for cell in row
+    )
     if (
         state.used_table
         or len(element["rows"]) + 1 > LIMITS.table_rows
         or len(element["headers"]) > LIMITS.table_columns
+        or cell_char_count > LIMITS.table_chars
     ):
         return [
             {
-                "text": _mrkdwn(
-                    f"```\n{_table_to_ascii(element)}\n```",
-                    _identity,
-                    LIMITS.section_text,
-                ),
+                "text": _fenced_fallback_text(_table_to_ascii(element)),
                 "type": "section",
             }
         ]
     state.used_table = True
-    align = element.get("align")
-    column_settings = (
-        [({"align": value} if value else None) for value in align[: LIMITS.table_columns]]
-        if align is not None
-        else None
-    )
+    rows = [
+        [_raw_text(header, state.convert_emoji) for header in element["headers"]],
+        *[[_raw_text(cell, state.convert_emoji) for cell in row] for row in element["rows"]],
+    ]
+    # The data table block requires a header row plus at least one data row;
+    # fall back to the plain table block for header-only tables.
+    if len(element["rows"]) == 0:
+        align = element.get("align")
+        column_settings = (
+            [({"align": value} if value else None) for value in align[: LIMITS.table_columns]]
+            if align is not None
+            else None
+        )
+        return [
+            _compact(
+                {
+                    "column_settings": column_settings,
+                    "rows": rows,
+                    "type": "table",
+                }
+            )
+        ]
+    page_size = element.get("page_size")
     return [
         _compact(
             {
-                "column_settings": column_settings,
-                "rows": [
-                    [_raw_text(header, state.convert_emoji) for header in element["headers"]],
-                    *[[_raw_text(cell, state.convert_emoji) for cell in row] for row in element["rows"]],
-                ],
-                "type": "table",
+                # Upstream ``caption || "Table"``: an empty caption also gets the default.
+                "caption": state.convert_emoji(element.get("caption") or "Table"),
+                "page_size": None if page_size is None else _clamp_page_size(page_size),
+                "rows": rows,
+                "type": "data_table",
             }
         )
     ]
+
+
+def _clamp_page_size(page_size: float) -> int:
+    """Upstream ``Math.min(LIMITS.tablePageSize, Math.max(1, Math.floor(pageSize)))``.
+
+    Clamps before flooring, which gives the same result for every finite value
+    (the bounds are integers) and keeps ``inf`` / ``nan`` from raising in
+    ``math.floor``.
+    """
+    return math.floor(max(1, min(LIMITS.table_page_size, page_size)))
+
+
+def _chart_to_block(element: SlackChartElement, state: _State) -> SlackBlock:
+    block = (
+        _chart_to_data_visualization(element, state.convert_emoji)
+        if state.chart_count < LIMITS.charts_per_message
+        else None
+    )
+    if block is not None:
+        state.chart_count += 1
+        return block
+    # Slack rejects invalid charts (and >2 charts per message) outright
+    # rather than truncating them, so render the underlying data as text.
+    return {
+        "text": _fenced_fallback_text(_chart_to_ascii(element)),
+        "type": "section",
+    }
+
+
+def _fenced_fallback_text(content: str) -> SlackTextObject:
+    """Wrap ASCII fallback content in a fenced code block.
+
+    Truncates the content so the section text stays within Slack's limit while
+    keeping the closing fence intact. Lengths are counted in code points;
+    upstream counts UTF-16 code units (see docs/UPSTREAM_SYNC.md).
+    """
+
+    def fence(body: str) -> str:
+        return f"```\n{body}\n```"
+
+    budget = LIMITS.section_text - len(fence(""))
+    text = fence(f"{content[: budget - 1]}…") if len(content) > budget else fence(content)
+    return {"text": text, "type": "mrkdwn"}
+
+
+def _chart_to_data_visualization(element: SlackChartElement, convert_emoji: _EmojiConverter) -> SlackBlock | None:
+    title = convert_emoji(element["title"])
+    if len(title) == 0 or len(title) > LIMITS.chart_title:
+        return None
+
+    chart: Any = element["chart"]
+
+    if chart["type"] == "pie":
+        segments = chart["segments"]
+        valid_segments = 1 <= len(segments) <= LIMITS.chart_segments and all(
+            _is_valid_chart_label(segment["label"]) and segment["value"] > 0 for segment in segments
+        )
+        if not valid_segments:
+            return None
+        return {
+            "chart": {
+                "segments": [{"label": segment["label"], "value": segment["value"]} for segment in segments],
+                "type": "pie",
+            },
+            "title": title,
+            "type": "data_visualization",
+        }
+
+    categories = chart["categories"]
+    series = chart["series"]
+    x_label = chart.get("x_label")
+    y_label = chart.get("y_label")
+    valid_shape = (
+        1 <= len(categories) <= LIMITS.chart_data_points
+        and all(_is_valid_chart_label(category) for category in categories)
+        and len(set(categories)) == len(categories)
+        and 1 <= len(series) <= LIMITS.chart_series
+        and all(_is_valid_chart_label(s["name"]) for s in series)
+        and len({s["name"] for s in series}) == len(series)
+        and (x_label is None or len(x_label) <= LIMITS.chart_title)
+        and (y_label is None or len(y_label) <= LIMITS.chart_title)
+    )
+    if not valid_shape:
+        return None
+
+    # Each series needs exactly one data point per category; normalize
+    # point order to the category order Slack expects.
+    normalized_series: list[dict[str, object]] = []
+    for s in series:
+        if len(s["data"]) != len(categories):
+            return None
+        # A later duplicate label wins, as with upstream's ``new Map(...)``.
+        by_label = {point["label"]: point for point in s["data"]}
+        data: list[dict[str, object]] = []
+        for category in categories:
+            point = by_label.get(category)
+            if point is None:
+                return None
+            data.append({"label": category, "value": point["value"]})
+        normalized_series.append({"data": data, "name": s["name"]})
+
+    return {
+        "chart": {
+            "axis_config": _compact(
+                {
+                    "categories": categories,
+                    "x_label": x_label,
+                    "y_label": y_label,
+                }
+            ),
+            "series": normalized_series,
+            "type": chart["type"],
+        },
+        "title": title,
+        "type": "data_visualization",
+    }
+
+
+def _is_valid_chart_label(label: str) -> bool:
+    return 1 <= len(label) <= LIMITS.chart_label
+
+
+def _chart_to_ascii(element: SlackChartElement) -> str:
+    chart: Any = element["chart"]
+    title = element["title"]
+    if chart["type"] == "pie":
+        table = _table_to_ascii(
+            {
+                "headers": ["Label", "Value"],
+                "rows": [[segment["label"], _js_number_to_string(segment["value"])] for segment in chart["segments"]],
+                "type": "table",
+            }
+        )
+        return f"{title}\n{table}"
+    x_label = chart.get("x_label")
+    rows: list[list[str]] = []
+    for category in chart["categories"]:
+        row = [category]
+        for s in chart["series"]:
+            # First matching point, as with upstream's ``data.find(...)``.
+            point = next((p for p in s["data"] if p["label"] == category), None)
+            row.append(_js_number_to_string(point["value"]) if point is not None else "")
+        rows.append(row)
+    table = _table_to_ascii(
+        {
+            "headers": [x_label if x_label is not None else "", *(s["name"] for s in chart["series"])],
+            "rows": rows,
+            "type": "table",
+        }
+    )
+    return f"{title}\n{table}"
 
 
 def _card_child_to_fallback_text(child: SlackCardChild, convert_emoji: _EmojiConverter) -> str | None:
@@ -448,6 +641,8 @@ def _card_child_to_fallback_text(child: SlackCardChild, convert_emoji: _EmojiCon
     kind = child.get("type")
     if kind == "actions":
         return None
+    if kind == "chart":
+        return _chart_to_ascii(cast(SlackChartElement, child))
     if kind == "divider":
         return "---"
     if kind == "fields":

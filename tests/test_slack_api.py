@@ -27,7 +27,8 @@ import pytest
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import SlackAdapterConfig
-    from chat_sdk.shared.errors import AdapterRateLimitError, ValidationError
+    from chat_sdk.cards import Card, Table
+    from chat_sdk.shared.errors import AdapterError, AdapterRateLimitError, ValidationError
     from chat_sdk.types import (
         FetchOptions,
         ListThreadsOptions,
@@ -253,6 +254,56 @@ class TestPostMessage:
         # no crash occurs. We test the text fallback path here.
         result = await adapter.post_message("slack:C123:1234567890.000000", "Simple text")
         assert result.id == "1234567890.111111"
+
+    @pytest.mark.asyncio
+    async def test_surfaces_slack_block_details_on_invalid_blocks_errors(self):
+        """Port of upstream ``enrichInvalidBlocksError``: Slack's per-block details
+        are logged and put in the raised error, with the original as ``__cause__``."""
+        logger = MagicMock()
+        adapter, client, _ = await _init_adapter(logger=logger)
+        original = _FakeSlackApiError(
+            "invalid_blocks",
+            {
+                "ok": False,
+                "error": "invalid_blocks",
+                "errors": ["invalid additional property: page_size [json-pointer:/blocks/0]"],
+                "response_metadata": {"messages": ["[ERROR] too many data_visualization blocks"]},
+            },
+        )
+        client.set_response("chat_postMessage", original)
+        card = Card(children=[Table(headers=["A"], rows=[["1"]])])
+
+        with pytest.raises(AdapterError) as exc_info:
+            await adapter.post_message("slack:C123:1234567890.000000", card)
+
+        assert str(exc_info.value) == (
+            "Slack rejected blocks (invalid_blocks): "
+            '["invalid additional property: page_size [json-pointer:/blocks/0]",'
+            '"[ERROR] too many data_visualization blocks"]'
+        )
+        assert exc_info.value.code == "invalid_blocks"
+        assert exc_info.value.__cause__ is original
+        logger.error.assert_called_once()
+        message, context = logger.error.call_args.args
+        assert message == "Slack rejected blocks (invalid_blocks)"
+        assert context["details"] == [
+            "invalid additional property: page_size [json-pointer:/blocks/0]",
+            "[ERROR] too many data_visualization blocks",
+        ]
+        assert json.loads(context["blocks"]) == client.get_calls("chat_postMessage")[0]["kwargs"]["blocks"]
+
+    @pytest.mark.asyncio
+    async def test_other_card_post_errors_propagate_unchanged(self):
+        logger = MagicMock()
+        adapter, client, _ = await _init_adapter(logger=logger)
+        original = _FakeSlackApiError("channel_not_found", {"ok": False, "error": "channel_not_found"})
+        client.set_response("chat_postMessage", original)
+
+        with pytest.raises(_FakeSlackApiError) as exc_info:
+            await adapter.post_message("slack:C123:1234567890.000000", Card(children=[]))
+
+        assert exc_info.value is original
+        logger.error.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_file_only_post_returns_file_id(self):

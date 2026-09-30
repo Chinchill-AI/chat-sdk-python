@@ -71,7 +71,7 @@ from chat_sdk.shared.adapter_utils import (
     is_thinking_chunk,
     maybe_render_thinking,
 )
-from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
+from chat_sdk.shared.errors import AdapterError, AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     ActionEvent,
@@ -236,6 +236,11 @@ class _InstallationInfo:
     installation_id: str
     is_enterprise_install: bool
     enterprise_id: str | None = None
+
+
+def _json_stringify(value: Any) -> str:
+    """Compact, non-ASCII-preserving JSON like JS ``JSON.stringify`` (for log and error text)."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _find_next_mention(text: str) -> int:
@@ -1901,7 +1906,11 @@ class SlackAdapter:
             message_id = message_ts or ""
 
         for action in payload.get("actions", []):
-            action_value = (action.get("selected_option") or {}).get("value") or action.get("value")
+            # Upstream ``selected_option?.value ?? value``: a selected option
+            # whose value is "" reports "", not the action's ``value``.
+            action_value = (action.get("selected_option") or {}).get("value")
+            if action_value is None:
+                action_value = action.get("value")
             action_event = ActionEvent(
                 action_id=action.get("action_id", ""),
                 value=action_value,
@@ -2100,13 +2109,18 @@ class SlackAdapter:
         view = payload.get("view", {})
         state_values = view.get("state", {}).get("values", {})
 
-        # Flatten values
+        # Flatten values. Upstream ``value ?? selected_date ??
+        # selected_option?.value ?? ""``: a cleared text input submits ``""``
+        # (not the next fallback); a datepicker reports ``selected_date``.
         values: dict[str, str] = {}
         for block_values in state_values.values():
             for action_id, input_val in block_values.items():
-                values[action_id] = (
-                    input_val.get("value") or (input_val.get("selected_option") or {}).get("value") or ""
-                )
+                submitted = input_val.get("value")
+                if submitted is None:
+                    submitted = input_val.get("selected_date")
+                if submitted is None:
+                    submitted = (input_val.get("selected_option") or {}).get("value")
+                values[action_id] = submitted if submitted is not None else ""
 
         meta = decode_modal_metadata(view.get("private_metadata") or None)
         user_ref = payload.get("user", {})
@@ -3751,14 +3765,20 @@ class SlackAdapter:
                     "Slack API: chat.postMessage (blocks)",
                     {"channel": channel, "threadTs": thread_ts, "blockCount": len(blocks)},
                 )
-                result = await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    text=fallback_text,
-                    blocks=blocks,
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
+                try:
+                    result = await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts or None,
+                        text=fallback_text,
+                        blocks=blocks,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as error:
+                    enriched = self._enrich_invalid_blocks_error(error, blocks)
+                    if enriched is None:
+                        raise
+                    raise enriched from error
                 return RawMessage(
                     id=result.get("ts", ""),
                     thread_id=thread_id,
@@ -4785,6 +4805,42 @@ class SlackAdapter:
     # ==================================================================
     # Error handling
     # ==================================================================
+
+    def _enrich_invalid_blocks_error(self, error: Exception, blocks: list[Any]) -> AdapterError | None:
+        """Surface Slack's per-block validation details on ``invalid_blocks`` errors.
+
+        Port of upstream ``enrichInvalidBlocksError``. The Slack error alone
+        just says ``invalid_blocks``; the actionable details (which block,
+        which field) live in the response's ``errors`` and
+        ``response_metadata.messages``. Returns ``None`` for any other error.
+        Upstream throws a plain ``Error`` with the original as ``cause``; the
+        port raises :class:`AdapterError` (code ``"invalid_blocks"``) with the
+        original as ``__cause__``.
+        """
+        resp = getattr(error, "response", None)
+        data: Any = None
+        if resp is not None and isinstance(getattr(resp, "data", None), dict):
+            data = resp.data
+        elif isinstance(resp, dict):
+            data = resp
+        if not isinstance(data, dict) or data.get("error") != "invalid_blocks":
+            return None
+        errors = data.get("errors")
+        metadata = data.get("response_metadata")
+        messages = metadata.get("messages") if isinstance(metadata, dict) else None
+        details = [
+            *(errors if isinstance(errors, list) else []),
+            *(messages if isinstance(messages, list) else []),
+        ]
+        self._logger.error(
+            "Slack rejected blocks (invalid_blocks)",
+            {"details": details, "blocks": _json_stringify(blocks)},
+        )
+        return AdapterError(
+            f"Slack rejected blocks (invalid_blocks): {_json_stringify(details)}",
+            "slack",
+            "invalid_blocks",
+        )
 
     def _handle_slack_error(self, error: Any) -> NoReturn:
         """Re-raise Slack errors with appropriate SDK error types.

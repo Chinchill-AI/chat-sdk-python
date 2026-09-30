@@ -5,13 +5,17 @@ Port of packages/adapter-slack/src/cards.test.ts.
 
 from __future__ import annotations
 
+from typing import Any
+
 from chat_sdk.adapters.slack.cards import card_to_block_kit
+from chat_sdk.adapters.slack.cards import card_to_fallback_text as slack_card_to_fallback_text
 from chat_sdk.cards import (
     Actions,
     Button,
     Card,
     CardLink,
     CardText,
+    Chart,
     Divider,
     Field,
     Fields,
@@ -624,7 +628,7 @@ class TestCardLink:
 
 
 class TestTable:
-    def test_table_to_block_kit(self):
+    def test_converts_a_card_with_table_element_to_a_block_kit_data_table(self):
         blocks = card_to_block_kit(
             Card(
                 children=[
@@ -633,7 +637,9 @@ class TestTable:
             )
         )
         assert len(blocks) == 1
-        assert blocks[0]["type"] == "table"
+        assert blocks[0]["type"] == "data_table"
+        assert blocks[0]["caption"] == "Table"
+        assert "page_size" not in blocks[0]
         assert blocks[0]["rows"] == [
             [{"type": "raw_text", "text": "Name"}, {"type": "raw_text", "text": "Age"}],
             [{"type": "raw_text", "text": "Alice"}, {"type": "raw_text", "text": "30"}],
@@ -650,6 +656,243 @@ class TestTable:
             )
         )
         assert len(blocks) == 2
-        assert blocks[0]["type"] == "table"
+        assert blocks[0]["type"] == "data_table"
         assert blocks[1]["type"] == "section"
         assert "```" in blocks[1]["text"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Data tables (upstream describe("cardToBlockKit with data tables"))
+# ---------------------------------------------------------------------------
+
+
+class TestCardToBlockKitWithDataTables:
+    def test_passes_caption_and_clamped_page_size_through(self):
+        blocks = card_to_block_kit(
+            Card(children=[Table(headers=["Name"], rows=[["Ada"]], caption="People", page_size=250)])
+        )
+        assert blocks[0]["type"] == "data_table"
+        assert blocks[0]["caption"] == "People"
+        assert blocks[0]["page_size"] == 100
+
+    def test_floors_fractional_page_size_and_defaults_an_empty_caption(self):
+        # Upstream ``Math.floor(pageSize)`` and ``caption || "Table"``.
+        block = card_to_block_kit(Card(children=[Table(headers=["Name"], rows=[["Ada"]], caption="", page_size=2.7)]))[
+            0
+        ]
+        assert block["caption"] == "Table"
+        assert block["page_size"] == 2
+
+    def test_renders_header_only_tables_as_a_plain_table_block(self):
+        blocks = card_to_block_kit(Card(children=[Table(headers=["Name", "Age"], rows=[])]))
+        assert blocks[0] == {
+            "type": "table",
+            "rows": [[{"type": "raw_text", "text": "Name"}, {"type": "raw_text", "text": "Age"}]],
+        }
+
+    def test_falls_back_to_ascii_when_combined_cells_exceed_10000_characters(self):
+        big_cell = "x" * 5001
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[[big_cell], [big_cell]])]))
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"].startswith("```\nA")
+
+    def test_keeps_a_native_table_at_exactly_10000_characters(self):
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[["x" * 4999], ["x" * 5000]])]))
+        assert blocks[0]["type"] == "data_table"
+
+    def test_counts_table_characters_in_code_points(self):
+        # Divergence from upstream (docs/UPSTREAM_SYNC.md): 1 + 9,999 code points is
+        # within the limit here; upstream counts 1 + 19,998 UTF-16 units and falls back.
+        blocks = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[["\U0001f600" * 9999]])]))
+        assert blocks[0]["type"] == "data_table"
+
+    def test_truncates_ascii_fallback_to_slacks_3000_char_section_limit(self):
+        big_cell = "x" * 5001
+        text = card_to_block_kit(Card(children=[Table(headers=["A"], rows=[[big_cell], [big_cell]])]))[0]["text"][
+            "text"
+        ]
+        assert len(text) == 3000
+        # Closing code fence survives truncation, after the ellipsis marker
+        assert text.endswith("…\n```")
+
+
+# ---------------------------------------------------------------------------
+# Charts (upstream describe("cardToBlockKit with charts"))
+# ---------------------------------------------------------------------------
+
+
+def _pie(title: str, value: float = 1) -> Any:
+    return Chart(title=title, chart={"type": "pie", "segments": [{"label": "A", "value": value}]})
+
+
+class TestCardToBlockKitWithCharts:
+    def test_converts_a_pie_chart_to_a_data_visualization_block(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Candy Bars",
+                        chart={
+                            "type": "pie",
+                            "segments": [{"label": "Kit Kat", "value": 45}, {"label": "Twix", "value": 28}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks == [
+            {
+                "type": "data_visualization",
+                "title": "Candy Bars",
+                "chart": {
+                    "type": "pie",
+                    "segments": [{"label": "Kit Kat", "value": 45}, {"label": "Twix", "value": 28}],
+                },
+            }
+        ]
+
+    def test_converts_a_bar_chart_with_axis_config_and_normalizes_point_order(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="DAU",
+                        chart={
+                            "type": "bar",
+                            "categories": ["Mon", "Tue"],
+                            "x_label": "Day",
+                            "y_label": "Users",
+                            "series": [
+                                {
+                                    "name": "Mobile",
+                                    "data": [{"label": "Tue", "value": 60}, {"label": "Mon", "value": 50}],
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0] == {
+            "type": "data_visualization",
+            "title": "DAU",
+            "chart": {
+                "type": "bar",
+                "series": [{"name": "Mobile", "data": [{"label": "Mon", "value": 50}, {"label": "Tue", "value": 60}]}],
+                "axis_config": {"categories": ["Mon", "Tue"], "x_label": "Day", "y_label": "Users"},
+            },
+        }
+
+    def test_omits_axis_labels_that_are_not_provided(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Sales",
+                        chart={
+                            "type": "line",
+                            "categories": ["W1"],
+                            "series": [{"name": "A", "data": [{"label": "W1", "value": 1}]}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["chart"] == {
+            "type": "line",
+            "series": [{"name": "A", "data": [{"label": "W1", "value": 1}]}],
+            "axis_config": {"categories": ["W1"]},
+        }
+
+    def test_falls_back_to_text_when_a_pie_segment_value_is_not_positive(self):
+        blocks = card_to_block_kit(Card(children=[_pie("Bad Pie", value=0)]))
+        assert blocks[0]["type"] == "section"
+        assert "Bad Pie" in blocks[0]["text"]["text"]
+        assert "```" in blocks[0]["text"]["text"]
+
+    def test_falls_back_to_text_when_a_series_misses_a_category(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Gaps",
+                        chart={
+                            "type": "area",
+                            "categories": ["Mon", "Tue"],
+                            "series": [{"name": "A", "data": [{"label": "Mon", "value": 1}]}],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+        assert "```" in blocks[0]["text"]["text"]
+
+    def test_falls_back_when_same_length_series_repeats_a_label_instead_of_covering_a_category(self):
+        # Point count matches the categories, but "Tue" is missing: a partial chart is never sent.
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Dupes",
+                        chart={
+                            "type": "bar",
+                            "categories": ["Mon", "Tue"],
+                            "series": [
+                                {"name": "A", "data": [{"label": "Mon", "value": 1}, {"label": "Mon", "value": 2}]}
+                            ],
+                        },
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+
+    def test_falls_back_to_text_when_the_title_exceeds_50_characters(self):
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 51)]))
+        assert blocks[0]["type"] == "section"
+
+    def test_validates_the_title_length_after_emoji_conversion(self):
+        # ``{{emoji:x}}`` (11 chars) converts to ``:x:`` (3 chars): 48 + 3 = 51 > 50.
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 48 + "{{emoji:x}}")]))
+        assert blocks[0]["type"] == "section"
+        blocks = card_to_block_kit(Card(children=[_pie("t" * 47 + "{{emoji:x}}")]))
+        assert blocks[0] == {
+            "type": "data_visualization",
+            "title": "t" * 47 + ":x:",
+            "chart": {"type": "pie", "segments": [{"label": "A", "value": 1}]},
+        }
+
+    def test_falls_back_to_text_when_there_are_more_than_12_segments(self):
+        blocks = card_to_block_kit(
+            Card(
+                children=[
+                    Chart(
+                        title="Too Many",
+                        chart={"type": "pie", "segments": [{"label": f"S{i}", "value": i + 1} for i in range(13)]},
+                    )
+                ]
+            )
+        )
+        assert blocks[0]["type"] == "section"
+
+    def test_falls_back_to_text_from_the_third_chart_in_one_message(self):
+        blocks = card_to_block_kit(Card(children=[_pie("One"), _pie("Two"), _pie("Three")]))
+        assert [b["type"] for b in blocks] == ["data_visualization", "data_visualization", "section"]
+        assert "Three" in blocks[2]["text"]["text"]
+
+    def test_an_invalid_chart_does_not_use_up_the_per_message_chart_budget(self):
+        blocks = card_to_block_kit(Card(children=[_pie("Bad", value=0), _pie("One"), _pie("Two")]))
+        assert [b["type"] for b in blocks] == ["section", "data_visualization", "data_visualization"]
+
+    def test_includes_chart_data_in_card_fallback_text(self):
+        text = slack_card_to_fallback_text(
+            Card(
+                title="Report",
+                children=[
+                    Chart(title="Candy Bars", chart={"type": "pie", "segments": [{"label": "Kit Kat", "value": 45}]})
+                ],
+            )
+        )
+        assert "Candy Bars" in text
+        assert "Kit Kat" in text

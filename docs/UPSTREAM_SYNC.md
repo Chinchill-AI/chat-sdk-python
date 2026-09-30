@@ -647,13 +647,8 @@ separately (Slack #212, Teams #220); other adapters ignore the new fields.
   Twilio) therefore post a chart as text. Messenger and WhatsApp drop chart
   children silently, as upstream does (their `cards.ts` `default` branch
   returns `[]`).
-- **Interim Slack gaps (until #212).** `modal_to_slack_view` raises
-  `ValueError("Unknown modal child type: date_input")` (or `number_input`) for
-  the new modal children; the SDK-free `slack.blocks` primitives
-  (`card_to_slack_blocks` and `card_to_slack_fallback_text`) raise
-  `SlackBlockError` for a `chart` child; the Slack adapter posts a chart as a
-  mrkdwn section holding the fallback text; and `dispatch_action`, `caption`
-  and `page_size` are ignored.
+- **Slack rendering** landed in #212 (see *Slack data tables, charts and modal
+  inputs* below).
 - **Callback-URL button copy (#194).** Upstream `4a0b5c0c` also changed the
   callback-token swap to keep every button field except `callbackUrl`. That
   half of the commit is ported by #194, so a `Button(callback_url=…)` keeps
@@ -662,6 +657,56 @@ separately (Slack #212, Teams #220); other adapters ignore the new fields.
   `Chart`, `DateInput`, `NumberInput`, `tooltip`, `width` and `dispatchAction`,
   and `929878b5` (chat@4.39.0, link-button ids in JSX). See the jsx-runtime row
   in the non-parity table.
+
+### Slack data tables, charts and modal inputs (chat@4.34–4.41, #212)
+
+Parity, apart from the length-counting row in the non-parity table. Ports the
+Slack half of upstream `4717a384` (chat@4.34.0), `0153a39f` (chat@4.36.0) and
+`ad904325` (chat@4.41.0) into `slack/cards.py`, `slack/modals.py`,
+`slack/adapter.py` and the SDK-free `slack/blocks` subpath.
+
+- **Tables.** A card `Table()` with at least one data row renders as a
+  paginated, sortable `data_table` block (`caption` defaults to `"Table"`,
+  also for `caption=""` as with upstream's `||`; `page_size` is sent only when
+  set, floored and clamped to 1–100). A header-only table keeps the plain
+  `table` block. More than 100 rows, 20 columns or 10,000 combined cell
+  characters, or a second table in the message, falls back to an ASCII code
+  block, now cut to Slack's 3,000-character section limit with a `…` and the
+  closing fence kept. In `slack.blocks`, `column_settings` (from `align`) is
+  kept only on the header-only `table` block; `data_table` has no such field.
+- **Charts.** `Chart()` renders as a `data_visualization` block. A chart that
+  breaks a Slack constraint (title 1–50 chars after emoji conversion, labels
+  1–20, 1–12 segments or series, 1–20 unique categories, one point per
+  category, positive pie values, axis labels ≤ 50) or is the third valid chart
+  in a message falls back to the chart's fallback text in a code block. An
+  invalid chart does not use up the two-chart budget. Series points are
+  reordered to category order. `slack.blocks` formats fallback values with
+  `cards._js_number_to_string` (JS `String(n)`), like the core fallback.
+- **Modals.** `DateInput` → `datepicker`: an `initial_value` that is not a
+  real `YYYY-MM-DD` date is dropped with a `logging` warning (the module
+  logger `chat_sdk.adapters.slack.modals`), since Slack fails the whole
+  `views.open`. The check is `re.fullmatch("[0-9]{4}-[0-9]{2}-[0-9]{2}")` plus
+  a `date.fromisoformat` round trip, so impossible dates raise instead of
+  rolling over as JS `Date` does. `NumberInput` → `number_input`:
+  `is_decimal_allowed` is always sent (default `False`), and
+  `initial_value` / `min_value` / `max_value` are sent as JS `String(n)`
+  strings (`1.0` → `"1"`, `0` kept). `Select` / `RadioSelect` input blocks carry
+  `dispatch_action` only when it is not `None` (`False` is sent). The existing
+  `block_actions` path for `view` containers delivers the selection change to
+  `on_action`.
+- **View submission** values resolve `value` → `selected_date` →
+  `selected_option.value` → `""` with `is not None` checks (upstream `??`). A
+  cleared text input now submits `""` instead of falling through to another
+  key. A `block_actions` value is likewise `selected_option.value` → `value`
+  with `is not None` (upstream `selected_option?.value ?? value`).
+- **`invalid_blocks`.** When `chat.postMessage` for a card fails with
+  `invalid_blocks`, `post_message` logs `"Slack rejected blocks
+  (invalid_blocks)"` at error level with Slack's `errors` and
+  `response_metadata.messages` and the blocks, then raises
+  `AdapterError("Slack rejected blocks (invalid_blocks): [...]", "slack",
+  "invalid_blocks")` with the original error as `__cause__`. Upstream throws a
+  plain `Error` with `cause`; `AdapterError` is this SDK's adapter error base.
+  Only the card path of `post_message` is wrapped, as upstream.
 
 ## What to Port vs What to Adapt
 
@@ -1145,6 +1190,7 @@ stay explicit instead of being rediscovered in code review.
 | Slack unfurl-cache channel for fetched messages (vercel/chat#877 port, #205) | `_parse_slack_message` passes `_unfurl_channel_for(event, thread_id)` to `_enrich_links`: `event["channel"]` when present, otherwise the channel decoded from the `thread_id` the message is parsed under | Upstream `parseSlackMessage` passes `event.channel` only. Messages from `conversations.history` / `conversations.replies` have no `channel` field, so upstream's `enrichLinks` returns early for every fetched message (`fetchMessage`, `fetchMessages`, channel history, `listThreads`) | Avoids a regression from pre-#205 Python, where the ts-only unfurl key let fetched messages pick up `message_changed` unfurl metadata. The fetch paths always build `thread_id` from the channel they queried, so the fallback names the same channel the `message_changed` writer keyed by; the installation scope still comes from the request ContextVar, so nothing crosses installations. Regression coverage: `tests/test_slack_api.py::TestFetchedMessagesKeepCachedUnfurls`. |
 | Slack `api` primitives `fetch_slack_file` host allowlist (vercel/chat#548) | `fetch_slack_file` (`slack/api/__init__.py`) gates `url` through `is_trusted_slack_file_url` before forwarding the bot token, raising `ValueError` for untrusted hosts | Upstream `api/client.ts` `fetchFile` GETs the supplied URL with `Authorization: Bearer <token>` unconditionally | Token-leak guard. `fetch_slack_file` attaches the workspace bot token; a crafted `url_private` from a parsed file object could otherwise exfiltrate that token to an arbitrary host. `is_trusted_slack_file_url` requires scheme `https` and host in `{files.slack.com, slack.com, *.slack.com, *.slack-edge.com}` — the same allowlist the high-level adapter's `rehydrate_attachment` row uses for Slack. Enforces `CLAUDE.md`'s SSRF/URL-validation rule. |
 | Slack `web_client_options` → slack_sdk `WebClient` kwargs (vercel/chat#8336a3e, chat@4.31) | `SlackAdapterConfig.web_client_options: dict[str, Any] \| None` is spread (gated on `is not None`, so an explicit `{}` still spreads as a no-op) into **both** WebClient construction sites — the default `AsyncWebClient` (`_get_client`) and the per-token sync `WebClient` (`_get_web_client_for_token`). The keys are **slack_sdk** `WebClient` constructor kwargs: `timeout` (int seconds), `retry_handlers` (a list of `slack_sdk.http_retry.RetryHandler`), `headers`, etc. Any nested `headers` dict is **deep-copied per client** (`_web_client_kwargs`) so cached per-token clients never share a mutable dict and the caller's input is never mutated. | Upstream `webClientOptions?: Omit<WebClientOptions, "slackApiUrl">` forwards to `@slack/web-api`'s axios-backed `WebClient`; its headline keys are `retryConfig` (a `retryPolicies.*` policy), `rejectRateLimitedCalls`, and `timeout` (ms). | No 1:1 mapping: `slack_sdk` has no `retryConfig`/`rejectRateLimitedCalls` (retry behavior is configured via `retry_handlers`) and its `timeout` is seconds, not ms. So the option bag maps to slack_sdk `WebClient` kwargs rather than axios options. Same intent (tune the underlying HTTP client the adapter doesn't otherwise expose) and same per-client header isolation. Documented inline in `slack/types.py` (`web_client_options` docstring) and `slack/adapter.py` (`_web_client_kwargs`). Regression coverage: `tests/test_adapter_api_url_config.py::TestSlackWebClientOptions`. |
+| Slack card/modal length limits and date check (#212; upstream `4717a384`, `0153a39f`) | The `data_table` 10,000-character cell budget, the 3,000-character ASCII fallback cut, and the chart title/label/axis-label limits count Python code points (`len`, slicing). A `DateInput` `initial_value` of `0000-MM-DD` is dropped with a warning (`datetime.date` has no year 0). | Counts UTF-16 code units (`.length`, `.slice`), so a character outside the BMP (most emoji) counts as 2; `new Date("0000-01-01T00:00:00Z")` round-trips, so year 0 is kept. | Near a limit, a table or chart with astral characters can render natively in Python where upstream falls back, or be cut a few characters later; Python's cut never splits a surrogate pair (upstream's can). Counting UTF-16 units would need a Python-only helper on every limit check. Slack's own datepicker cannot pick year 0. Breadcrumbs in `slack/cards.py` (`_convert_table_to_blocks`), `slack/blocks/__init__.py` (`_table_to_blocks`) and `slack/modals.py` (`_to_initial_date`). Regression tests: `tests/test_slack_cards.py::TestCardToBlockKitWithDataTables::test_counts_table_characters_in_code_points` and `tests/test_slack_modals.py::TestDateAndNumberInputs::test_drops_a_year_zero_initial_date`. |
 | Teams service-URL allowlist host list (`call_teams_connector_api` + adapter `_validate_service_url`; vercel/chat#876 / `7609d8f6`, chat@4.40.0) | Both lists accept `https` on `smba.trafficmanager.net`, `msteams.botframework.azure.cn`, `smba.infra.(gcc\|gov\|dod).teams.microsoft.(com\|us)` **and the wildcards `*.botframework.com`, `*.botframework.us`, `*.teams.microsoft.com`, `*.teams.microsoft.us`**, matched case-insensitively on scheme and host (`re.IGNORECASE | re.ASCII`, like upstream's `url.hostname.toLowerCase()`; `re.ASCII` stops non-ASCII case folds such as the Kelvin sign), plus plain-`http` loopback for the local Emulator (`localhost` / `127.x.x.x` / `::1`, matched with `fullmatch` on the *parsed* hostname; userinfo, an invalid port, whitespace, control characters and `\` are refused). `call_teams_connector_api` also refuses a resolved URL whose origin differs from `service_url` (upstream parity). Both checks run before any token request. A refusal raises `ValueError` with upstream's message text (`Refusing to send a Teams bot token to an untrusted Connector serviceUrl` / `... outside the Connector serviceUrl origin`). | Upstream `getTrustedConnectorUrl` (`api/client.ts`) accepts only the exact hosts `msteams.botframework.azure.cn`, `smba.infra.{dod,gov}.teams.microsoft.us`, `smba.infra.gcc.teams.microsoft.com`, `smba.trafficmanager.net` over `https`, plus `http` loopback (`/^(?:localhost\|127(?:\.\d{1,3}){3}\|\[::1\])$/i`), and throws `TeamsApiError`. The high-level adapter delegates outbound calls to the Teams SDK with no host check of its own | **Remaining delta = the four wildcards + the exception type.** The wildcards pre-date upstream's list (Python-first hardening from the 4.31 port, when upstream validated nothing) and cover regional Bot Framework hosts such as `smba.uk.botframework.com`; dropping them could break a deployment that receives such a `serviceUrl`, so they stay (4.41 wave, #221). `ValueError` is kept so existing `except ValueError` callers do not change. Regression coverage: `tests/test_teams_api_primitive.py::TestTeamsApiSsrfDivergence` (incl. the upstream `it.each` `test_rejects_untrusted_service_url_before_acquiring_a_token`, origin and loopback cases) and `tests/test_teams_coverage.py::TestValidateServiceUrl`. |
 | Teams `graph` primitives `call_teams_graph_api` host gate (vercel/chat#876 / `7609d8f6`, chat@4.40.0) | `call_teams_graph_api` (`teams/graph/__init__.py`) validates the **final** request URL (an absolute `path_or_url`, an `@odata.nextLink` followed by `paginate_teams_graph`, or a relative path joined onto a caller-supplied `graph_url`) through `is_trusted_graph_url` **before** resolving/attaching the `Bearer` token: `https` and a host exactly in `{graph.microsoft.com, graph.microsoft.us, dod-graph.microsoft.us, graph.microsoft.de, microsoftgraph.chinacloudapi.cn}` (the same set as upstream). Absolute-vs-relative routing uses `urlparse` (scheme or netloc ⇒ absolute), so `HTTPS://evil` and `//evil` are gated too. A refusal raises `ValueError("Refusing to send a Microsoft Graph token to an untrusted URL: ...")` | Upstream `getTrustedGraphUrl` (`graph/client.ts`) resolves `pathOrUrl` (absolute when it `startsWith("http")`, else joined onto `graphUrl`) and requires `https` plus a host in `TRUSTED_GRAPH_HOSTS` (same five hosts), throwing `TeamsApiError("Refusing to send a Microsoft Graph token to an untrusted URL")` | **Host list is parity** (4.41 wave, #221; previously Python pinned to `graph.microsoft.com` only and did not check a relative path joined onto `graph_url`). Remaining delta: `ValueError` instead of `TeamsApiError` (kept for existing callers) and the parse-based absolute/relative routing (both end in the same host check on the resolved URL). Regression coverage: `tests/test_teams_graph_primitive.py::TestTeamsGraphSsrfDivergence`. |
 | Teams custom `token` factory vs `CLIENT_SECRET` (vercel/chat#732 / `e06b4b60`, chat@4.35.0) | `TeamsAdapterConfig.token` is forwarded to the SDK `AppOptions.token` and no `client_secret` is emitted (neither `app_password` nor `TEAMS_APP_PASSWORD`). The adapter builds the SDK `App` from a thin subclass whose `_init_credentials` returns `TokenCredentials` whenever a `token` factory and a client id are present, so a stray `CLIENT_SECRET` env var cannot win. The hand-rolled Bot Framework / Graph token paths (`open_dm`, `get_user`, `fetch_channel_info`, Graph reads) call `token(scope, tenant_id)` directly, uncached, and never read `app_password`; `tenant_id` follows the SDK's own rule (`TokenManager._resolve_tenant_id`): the tenant the SDK `App` was given (`credentials.tenant_id`, unset for `app_type="MultiTenant"`), else the cloud login tenant (`botframework.com`) for the Bot Framework scope and `common` for the Graph scope, so a tenant-routing factory sees the same tenant whether the SDK or a hand-rolled path asks. The Bot Framework scope is the SDK `App`'s `cloud.bot_scope` (e.g. `https://api.botframework.us/.default` under `CLOUD=USGov`); the Graph scope stays `https://graph.microsoft.com/.default` because the hand-rolled Graph reads always target `graph.microsoft.com` | `toAppOptions` passes `clientSecret: ""` next to `token` to suppress the SDK's generic `CLIENT_SECRET` env fallback (the JS SDK treats `""` as set), and every outbound call goes through the SDK App | The Python SDK (`microsoft-teams-apps` 2.0.13 – 2.0.16, `App._init_credentials`) reads `options.client_secret or os.getenv("CLIENT_SECRET")` and checks `client_id and client_secret` **before** `client_id and token`, so upstream's empty-string trick does not carry over. The subclass restores upstream's documented precedence ("takes precedence over appPassword, federated credentials, and client-secret environment variables, including CLIENT_SECRET"); without a factory it defers to the SDK unchanged. Regression coverage: `tests/test_teams_connect.py::TestCustomTokenPrecedence` (fails if the subclass is dropped: `test_token_factory_beats_client_secret_env_alone`; tenant rule: `test_hand_rolled_factory_tenant_matches_the_sdk`). |
