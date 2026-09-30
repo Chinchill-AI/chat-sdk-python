@@ -29,7 +29,7 @@ import unicodedata
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol, cast
-from urllib.parse import SplitResult, unquote, urljoin, urlsplit
+from urllib.parse import SplitResult, unquote, urlsplit
 
 from chat_sdk.shared.errors import NetworkError
 
@@ -182,6 +182,8 @@ _USERINFO_SET = _PATH_SET | frozenset("/:;=@[\\]|")
 _C0_OR_SPACE = "".join(chr(code) for code in range(0x21))
 _SINGLE_DOT = frozenset({".", "%2e"})
 _DOUBLE_DOT = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+_HTTPS_SLASHES = re.compile(r"^https:/*", re.IGNORECASE)
 
 
 def _parse_ipv4_number(part: str) -> int | None:
@@ -336,6 +338,34 @@ def _prepare_reference(url: str) -> str:
     return url[:cut].replace("\\", "/") + url[cut:]
 
 
+def _resolve_reference(base: str, reference: str) -> str:
+    """Resolve a redirect ``Location`` against ``base`` as WHATWG ``new URL`` does.
+
+    ``base`` is a URL :func:`validate_attachment_url` returned (``https``,
+    no fragment). ``urljoin`` is not used: it collapses empty path segments
+    (``a//b``) and ignores an empty query (``?``), which would request a
+    different object. Dot segments are resolved when the result is validated.
+    """
+    reference = _prepare_reference(reference)
+    scheme = _SCHEME.match(reference)
+    if scheme is not None:
+        rest = reference[scheme.end() :]
+        if scheme.group(0)[:-1].lower() != "https" or rest.startswith("//"):
+            return reference  # absolute; validation refuses other schemes
+        reference = rest  # "https:x" is relative to an https base
+    if reference.startswith("//"):
+        return f"https:{reference}"
+    split = base.index("/", len("https://"))
+    origin, path = base[:split], base[split:].partition("?")[0]
+    if reference.startswith("/"):
+        return origin + reference
+    if reference.startswith("?"):
+        return origin + path + reference
+    if not reference or reference.startswith("#"):
+        return base
+    return origin + path[: path.rfind("/") + 1] + reference
+
+
 def _percent_encode(text: str, encode_set: frozenset[str]) -> str:
     """Percent-encode ``text`` with a WHATWG encode set (UTF-8, uppercase hex)."""
     out: list[str] = []
@@ -384,7 +414,9 @@ def validate_attachment_url(url: str, adapter: str, hosts: Sequence[str] | None 
         # A bare string is a Sequence[str] of characters: it would allow any
         # one-letter host. TypeScript's ``readonly string[]`` rejects it.
         raise TypeError("hosts must be a sequence of host names, not a single string")
-    url = _prepare_reference(url)
+    # WHATWG reads the host after any number of slashes (even none) that
+    # follow ``https:``; ``urlsplit`` needs exactly two.
+    url = _HTTPS_SLASHES.sub("https://", _prepare_reference(url), count=1)
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -963,13 +995,7 @@ async def download_attachment(
                         raise NetworkError(adapter, "Attachment redirect has no location")
                     if hop == redirects:
                         raise NetworkError(adapter, "Too many attachment redirects")
-                    try:
-                        # Cleaned up first, so ``/\\host/x`` resolves to
-                        # another host (as WHATWG does), then re-validated.
-                        target = urljoin(current, _prepare_reference(location))
-                    except ValueError:
-                        raise _untrusted(adapter) from None
-                    current = validate_attachment_url(target, adapter, hosts)
+                    current = validate_attachment_url(_resolve_reference(current, location), adapter, hosts)
                     continue
                 if status < 200 or status >= 300:
                     reason = response.reason if response.reason is not None else ""

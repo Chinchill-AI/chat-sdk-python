@@ -426,7 +426,6 @@ class TestHostCanonicalization:
             "https://256.1.1.1/file",
             "https://09.1.1.1/file",
             "https://[::1/file",
-            "https:///file",
             "https://a%2fb.example.com/file",
             "https://[fe80::1%25eth0]/file",  # WHATWG rejects IPv6 zone ids
             "https://[v1.fbsbx.com]/file",  # IPvFuture: brackets hold IPv6 only
@@ -489,6 +488,8 @@ class TestHostCanonicalization:
             ("https://files.example.com/../../x/..", "https://files.example.com/"),
             ("https://files.example.com/a\\b\\..\\c?q=\\x", "https://files.example.com/a/c?q=\\x"),
             ("https://files.example.com", "https://files.example.com/"),
+            ("https:files.example.com/x", "https://files.example.com/x"),
+            ("HTTPS:///files.example.com/x", "https://files.example.com/x"),
             ("https://files.example.com/x?", "https://files.example.com/x?"),
             ("HTTPS://files.example.com:443/x", "https://files.example.com/x"),
             ("https://u%20r:p;w@files.example.com/x", "https://u%20r:p%3Bw@files.example.com/x"),
@@ -553,12 +554,17 @@ class TestHostCanonicalization:
             ("https:\\\\cdn.example.net/x", "https://cdn.example.net/x"),
             (" https://cdn.example.net/x ", "https://cdn.example.net/x"),
             ("../c/./d", "https://files.example.com/c/d"),
+            # ``urljoin`` would collapse "//" and keep the old query for "?".
+            ("file//name.jpg?sig=abc", "https://files.example.com/a/file//name.jpg?sig=abc"),
+            ("?", "https://files.example.com/a/b?"),
+            ("https:c", "https://files.example.com/a/c"),
+            ("///cdn.example.net/x", "https://cdn.example.net/x"),
         ],
     )
     async def test_redirect_location_is_resolved_as_whatwg_does(self, location: str, expected: str) -> None:
         transport = FakeTransport(redirect(location), FakeResponse("ok"))
 
-        await download_attachment("https://files.example.com/a/b", adapter="test", transport=transport)
+        await download_attachment("https://files.example.com/a/b?old=1", adapter="test", transport=transport)
 
         assert transport.calls[1][0] == expected
 
