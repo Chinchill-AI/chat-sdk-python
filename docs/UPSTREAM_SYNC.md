@@ -395,6 +395,27 @@ Teams: the thread id re-encoded with `;messageid=…` stripped from the
 conversation id; WhatsApp, Messenger and
 Twilio (#235): the thread id itself).
 
+Thread-scoped tokens resolve only when the adapter's click `thread_id`
+equals the thread id the card was posted or edited under. There are three
+known mismatches. All are upstream behavior at chat@4.41.1 or are fixed by
+another wave issue, so none is a divergence here. In each case the click
+still runs `on_action` handlers with the raw `__cb:…` value, but nothing is
+POSTed:
+
+- **Slack channel `SentMessage.edit`, until #209.** Python's
+  `post_channel_message` still returns the synthetic `slack:C…:` thread id,
+  but a click reports `slack:C…:<message_ts>`. Upstream `92530dd3`
+  (vercel/chat#720, chat@4.35.0) makes the post return `slack:C…:<ts>`, and
+  #209 ports it. `main` is not released mid-wave, so no consumer sees the gap.
+- **Google Chat channel `SentMessage.edit`.** `post_channel_message` returns
+  the channel id as the thread id, upstream included, so an edited channel
+  card is bound to `gchat:spaces/X` as a thread.
+- **Google Chat cards posted to a DM thread** (`gchat:spaces/X:dm`) by
+  `thread.post`. `_handle_card_click` encodes the clicked message's thread
+  name without the `:dm` suffix, as upstream `handleCardClick` does. The
+  `post_ephemeral` DM fallback is unaffected, because it binds to the DM
+  *channel*, which both ids share.
+
 **Breaking for `callback_url` users:** tokens minted before the upgrade stop
 resolving, a repeat click no longer POSTs, tokens expire after 7 days, and the
 POST's `actionId` is the minted button's id. The record is deleted before the
