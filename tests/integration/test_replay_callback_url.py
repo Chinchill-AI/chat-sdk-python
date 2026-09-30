@@ -153,7 +153,12 @@ class TestSlackButtonClickWithCallbackToken:
                 # done at post time.
                 await ctx.state.set(
                     f"chat:callback:{CALLBACK_TOKEN}",
-                    {"url": CALLBACK_BUTTON_URL, "originalValue": "order-99"},
+                    {
+                        "actionId": "approve",
+                        "url": CALLBACK_BUTTON_URL,
+                        "originalValue": "order-99",
+                        "scope": {"id": "slack:C00FAKECHAN1", "type": "channel"},
+                    },
                 )
 
                 # Synthesize a block_actions payload with the SDK's encoded

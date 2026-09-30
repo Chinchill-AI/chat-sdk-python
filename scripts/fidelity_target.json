@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1036,
     "each_templates": 16,
-    "matched_exact": 697,
-    "matched_fuzzy": 82,
-    "missing": 257,
-    "extra": 366
+    "matched_exact": 714,
+    "matched_fuzzy": 80,
+    "missing": 242,
+    "extra": 394
   },
   "absent_ts_files": [],
   "files": {
@@ -18,13 +18,11 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 140,
+      "matched_exact": 142,
       "matched_fuzzy": 12,
-      "missing_count": 25,
-      "extra_count": 12,
+      "missing_count": 23,
+      "extra_count": 15,
       "missing": [
-        ["Chat", "should call onNewMention for newline-separated GitHub bot mentions"],
-        ["Chat", "should not call onNewMention for concatenated GitHub bot mention text"],
         ["Chat", "should optionally propagate handler errors through waitUntil"],
         ["Chat", "aborts an active thread signal from another Chat instance"],
         ["Chat", "should dispatch message updates without normal message routing"],
@@ -70,10 +68,10 @@
       "python_exists": true,
       "ts_tests": 159,
       "each_templates": 1,
-      "matched_exact": 133,
+      "matched_exact": 134,
       "matched_fuzzy": 8,
-      "missing_count": 18,
-      "extra_count": 28,
+      "missing_count": 17,
+      "extra_count": 29,
       "missing": [
         ["post with Plan", "should auto-complete all in_progress tasks when switching back to default addTask"],
         ["post with Plan", "should target the most recent in_progress task when updating without id"],
@@ -91,8 +89,7 @@
         ["reply()", "converts JSX cards before delegating"],
         ["reply()", "buffers streams into one markdown reply"],
         ["reply()", "resolves a message id against messages the thread knows"],
-        ["reply()", "leaves replyTo undefined for an unknown message id"],
-        ["callbackUrl processing", "should bind fallback DM callbacks to the DM channel"]
+        ["reply()", "leaves replyTo undefined for an unknown message id"]
       ],
       "fuzzy_matches": [
         ["should pass stream options from Slack current message context via $label", "test_should_pass_stream_options_from_current_message_context"],
@@ -111,14 +108,13 @@
       "python_exists": true,
       "ts_tests": 67,
       "each_templates": 0,
-      "matched_exact": 65,
-      "matched_fuzzy": 2,
+      "matched_exact": 66,
+      "matched_fuzzy": 1,
       "missing_count": 0,
-      "extra_count": 4,
+      "extra_count": 9,
       "missing": [],
       "fuzzy_matches": [
-        ["should resolve a JSX Card and its children before scheduling", "test_should_convert_jsx_card_elements_to_cardelement"],
-        ["should bind fallback DM callbacks to the DM channel", "test_should_leave_channel_unchanged_when_chat_rebind_lookup_fails"]
+        ["should resolve a JSX Card and its children before scheduling", "test_should_convert_jsx_card_elements_to_cardelement"]
       ]
     },
     "packages/chat/src/markdown.test.ts": {
@@ -127,21 +123,12 @@
       "python_exists": true,
       "ts_tests": 130,
       "each_templates": 0,
-      "matched_exact": 117,
-      "matched_fuzzy": 6,
-      "missing_count": 7,
-      "extra_count": 77,
-      "missing": [
-        ["toPlainText", "preserves soft line breaks as whitespace"],
-        ["toPlainText", "separates list items with whitespace"],
-        ["toPlainText", "separates table cells and rows with structural whitespace"],
-        ["toPlainText", "keeps empty table cells so columns stay aligned"],
-        ["toPlainText", "drops table rows with no content"],
-        ["markdownToPlainText", "preserves whitespace after a newline-separated mention"],
-        ["markdownToPlainText", "preserves whitespace after a paragraph-separated mention"]
-      ],
+      "matched_exact": 125,
+      "matched_fuzzy": 5,
+      "missing_count": 0,
+      "extra_count": 86,
+      "missing": [],
       "fuzzy_matches": [
-        ["preserves paragraph boundaries as whitespace", "test_roundtrip_preserves_escaped_block_markers_at_paragraph_start"],
         ["handles empty AST", "test_fromast_handles_empty_ast"],
         ["handles empty AST", "test_toplaintext_handles_empty_ast"],
         ["handles empty string", "test_text_handles_empty_string"],
@@ -293,17 +280,11 @@
       "python_exists": true,
       "ts_tests": 21,
       "each_templates": 0,
-      "matched_exact": 16,
+      "matched_exact": 21,
       "matched_fuzzy": 0,
-      "missing_count": 5,
-      "extra_count": 1,
-      "missing": [
-        ["processCardCallbackUrls", "keeps every other button field when replacing the callback URL"],
-        ["resolveCallbackUrl", "rejects legacy unbound callback records"],
-        ["resolveCallbackUrl", "allows a callback token to be consumed only once"],
-        ["resolveCallbackUrl", "rejects callback tokens outside their action and thread"],
-        ["resolveCallbackUrl", "rejects callback tokens outside their channel"]
-      ],
+      "missing_count": 0,
+      "extra_count": 11,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/thread-history.test.ts": {

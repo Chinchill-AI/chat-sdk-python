@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from chat_sdk.callback_url import CallbackContext, CallbackScope, ResolvedCallback
 from chat_sdk.chat import Chat
 from chat_sdk.emoji import get_emoji
 from chat_sdk.errors import ChatError, LockError
@@ -385,6 +386,55 @@ class TestMentionHandling:
 
         assert len(calls) == 1
         assert calls[0] == "msg-1"
+
+    # TS: "should call onNewMention for newline-separated GitHub bot mentions"
+    async def test_should_call_onnewmention_for_newlineseparated_github_bot_mentions(self):
+        github = create_mock_adapter("github")
+        github.user_name = "test-bot"
+        chat = Chat(
+            ChatConfig(
+                user_name="fallback-bot",
+                adapters={"github": github},
+                state=create_mock_state(),
+                logger=MockLogger(),
+            )
+        )
+        await chat.webhooks["github"]("request")
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        msg = create_test_message("msg-1", "@test-bot\nhi there")
+        await chat.handle_incoming_message(github, "github:acme/app:42", msg)
+
+        assert len(received) == 1
+        assert received[0].is_mention is True
+
+    # TS: "should not call onNewMention for concatenated GitHub bot mention text"
+    async def test_should_not_call_onnewmention_for_concatenated_github_bot_mention_text(self):
+        github = create_mock_adapter("github")
+        github.user_name = "test-bot"
+        chat = Chat(
+            ChatConfig(
+                user_name="fallback-bot",
+                adapters={"github": github},
+                state=create_mock_state(),
+                logger=MockLogger(),
+            )
+        )
+        await chat.webhooks["github"]("request")
+        received: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            received.append(message)
+
+        msg = create_test_message("msg-1", "@test-bothi there")
+        await chat.handle_incoming_message(github, "github:acme/app:42", msg)
+
+        assert received == []
 
     # TS: "should call onSubscribedMessage handler for subscribed threads"
     async def test_should_call_onsubscribedmessage_handler_for_subscribed_threads(self):
@@ -4561,8 +4611,10 @@ class TestActionsCallbackUrl:
         chat.on_action("approve", _handler)
 
         state.cache["chat:callback:testtoken123"] = {
+            "actionId": "approve",
             "url": "https://example.com/webhook/hook1",
             "originalValue": "order-789",
+            "scope": {"id": "slack:C123", "type": "channel"},
         }
 
         event = _make_action_event(adapter, action_id="approve", value="__cb:testtoken123")
@@ -4595,7 +4647,11 @@ class TestActionsCallbackUrl:
 
         chat.on_action(lambda event: received.append(event))
 
-        state.cache["chat:callback:tok999"] = {"url": "https://example.com/webhook/hook2"}
+        state.cache["chat:callback:tok999"] = {
+            "actionId": "deny",
+            "url": "https://example.com/webhook/hook2",
+            "scope": {"id": "slack:C123:1234.5678", "type": "thread"},
+        }
 
         event = _make_action_event(adapter, action_id="deny", value="__cb:tok999")
 
@@ -4640,7 +4696,11 @@ class TestActionsCallbackUrl:
 
         chat.on_action("approve", _specific)
 
-        state.cache["chat:callback:tok555"] = {"url": "https://example.com/webhook/hook3"}
+        state.cache["chat:callback:tok555"] = {
+            "actionId": "approve",
+            "url": "https://example.com/webhook/hook3",
+            "scope": {"id": "slack:C123:1234.5678", "type": "thread"},
+        }
 
         event = _make_action_event(adapter, action_id="approve", value="__cb:tok555")
 
@@ -4650,6 +4710,75 @@ class TestActionsCallbackUrl:
         assert len(catch_all_calls) == 1
         assert len(specific_calls) == 1
         assert mock_fetch.await_count == 1
+
+
+class TestActionsCallbackTokenBinding:
+    """Python-specific: token binding and consumption through process_action."""
+
+    async def test_resolves_with_click_context_and_posts_the_stored_action_id(self):
+        chat, adapter, state = await _init_chat()
+        chat.on_action(lambda event: None)
+        resolved = ResolvedCallback(
+            url="https://example.com/webhook/ctx",
+            original_value="v",
+            action_id="minted-id",
+            scope=CallbackScope(id="slack:C123", type="channel"),
+        )
+        event = _make_action_event(adapter, action_id="approve", value="__cb:ctxtoken")
+
+        with (
+            patch("chat_sdk.chat.resolve_callback_url", new=AsyncMock(return_value=resolved)) as mock_resolve,
+            patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch,
+        ):
+            await _process_action_and_wait(chat, event)
+
+        assert mock_resolve.await_args.args[0] == "ctxtoken"
+        assert mock_resolve.await_args.args[2] == CallbackContext(
+            action_id="approve",
+            channel_id="slack:C123",
+            thread_id="slack:C123:1234.5678",
+        )
+        body = json.loads(mock_fetch.await_args.kwargs["body"])
+        assert body["actionId"] == "minted-id"
+
+    async def test_repeat_click_dispatches_raw_value_without_posting(self):
+        chat, adapter, state = await _init_chat()
+        received: list[ActionEvent] = []
+        chat.on_action(lambda event: received.append(event))
+        state.cache["chat:callback:once"] = {
+            "actionId": "approve",
+            "url": "https://example.com/webhook/once",
+            "originalValue": "order-1",
+            "scope": {"id": "slack:C123:1234.5678", "type": "thread"},
+        }
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(chat, _make_action_event(adapter, value="__cb:once"))
+            await _process_action_and_wait(chat, _make_action_event(adapter, value="__cb:once"))
+
+        assert [e.value for e in received] == ["order-1", "__cb:once"]
+        assert mock_fetch.await_count == 1
+        assert "chat:callback:once" not in state.cache
+
+    async def test_click_in_another_thread_does_not_resolve_or_consume(self):
+        chat, adapter, state = await _init_chat()
+        received: list[ActionEvent] = []
+        chat.on_action(lambda event: received.append(event))
+        record = {
+            "actionId": "approve",
+            "url": "https://example.com/webhook/bound",
+            "scope": {"id": "slack:C123:1234.5678", "type": "thread"},
+        }
+        state.cache["chat:callback:bound"] = dict(record)
+
+        with patch("chat_sdk.callback_url._fetch", new=AsyncMock(return_value=(200, "ok"))) as mock_fetch:
+            await _process_action_and_wait(
+                chat, _make_action_event(adapter, value="__cb:bound", thread_id="slack:C999:1.1")
+            )
+
+        assert [e.value for e in received] == ["__cb:bound"]
+        assert mock_fetch.await_count == 0
+        assert state.cache["chat:callback:bound"] == record
 
 
 # ============================================================================
@@ -4897,7 +5026,11 @@ class TestActionCallbackUrlErrorLogging:
 
         chat.on_action("approve", _handler)
 
-        state.cache["chat:callback:bad-token"] = {"url": "https://example.com/webhook/will-fail"}
+        state.cache["chat:callback:bad-token"] = {
+            "actionId": "approve",
+            "url": "https://example.com/webhook/will-fail",
+            "scope": {"id": "slack:C123:1234.5678", "type": "thread"},
+        }
 
         event = _make_action_event(adapter, action_id="approve", value="__cb:bad-token")
 

@@ -22,13 +22,12 @@ where ``response`` exposes an ``int`` ``status`` (or ``status_code``), an
 method (sync or async) returning the raw body string. :class:`TeamsHttpResponse`
 is the shape returned by the default fetch.
 
-Python-specific hardening (divergence from upstream, see
-``docs/UPSTREAM_SYNC.md`` Known Non-Parity): :func:`call_teams_connector_api`
-gates ``serviceUrl`` through :func:`is_trusted_teams_service_url` **before**
-attaching the ``Bearer`` token, refusing to forward the token to any host
-outside the Microsoft Bot Framework allowlist (SSRF / token-leak guard).
-Upstream attaches the token to whatever ``serviceUrl`` it is handed, with no
-host check.
+SSRF / token-leak guard: :func:`call_teams_connector_api` gates ``serviceUrl``
+through :func:`is_trusted_teams_service_url` **before** attaching the
+``Bearer`` token, and refuses a resolved request URL that leaves the
+``serviceUrl`` origin. Upstream validates too since chat@4.40.0 (vercel/chat
+#876, ``7609d8f6``); this port's host list is a superset of upstream's (see
+``docs/UPSTREAM_SYNC.md`` Known Non-Parity).
 """
 
 from __future__ import annotations
@@ -102,16 +101,37 @@ _LEADING_SLASH_PATTERN = re.compile(r"^/+")
 # Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
 # Mirrors ``ALLOWED_SERVICE_URL_PATTERNS`` in the high-level Teams adapter
 # (``teams/adapter.py``) — duplicated here (not imported) so this subpath never
-# pulls in the adapter. Covers commercial, GCC, GCCH, DoD, and sovereign
-# cloud endpoints.
+# pulls in the adapter. Covers commercial, GCC, GCCH, DoD, China (21Vianet) and
+# sovereign cloud endpoints. Upstream's ``TRUSTED_CONNECTOR_HOSTS``
+# (chat@4.40.0) is the exact-host subset ``smba.trafficmanager.net``,
+# ``smba.infra.{gcc,gov,dod}.teams.microsoft.*`` and
+# ``msteams.botframework.azure.cn``; the ``*.botframework.com/.us`` and
+# ``*.teams.microsoft.com/.us`` wildcards are kept so no existing deployment
+# regresses. Divergence from upstream — see docs/UPSTREAM_SYNC.md. Scheme and
+# host compare case-insensitively (upstream lowercases ``url.hostname``);
+# ``re.ASCII`` keeps ``[a-z]`` from folding non-ASCII letters such as the
+# Kelvin sign (U+212A) or long s (U+017F).
+_SERVICE_URL_FLAGS = re.IGNORECASE | re.ASCII
 _ALLOWED_SERVICE_URL_PATTERNS = [
-    re.compile(r"^https://smba\.trafficmanager\.net/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/"),
-    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/"),
-    re.compile(r"^https://smba\.infra\.(gcc|gov)\.teams\.microsoft\.(com|us)/"),
+    re.compile(r"^https://smba\.trafficmanager\.net/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://msteams\.botframework\.azure\.cn/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.botframework\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.com/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://[a-z0-9.-]+\.teams\.microsoft\.us/", _SERVICE_URL_FLAGS),
+    re.compile(r"^https://smba\.infra\.(gcc|gov|dod)\.teams\.microsoft\.(com|us)/", _SERVICE_URL_FLAGS),
 ]
+
+# Plain-``http`` loopback hosts accepted for the local Bot Framework Emulator
+# (upstream ``LOOPBACK_HOST_PATTERN``). Matched against the *parsed* hostname,
+# which ``urlparse`` lowercases and strips of IPv6 brackets, so upstream's
+# ``\[::1\]`` alternative is ``::1`` here; ``fullmatch`` keeps a suffix such as
+# ``localhost.example`` out.
+_LOOPBACK_HOST_PATTERN = re.compile(r"localhost|127(?:\.\d{1,3}){3}|::1")
+# Whitespace, control characters and backslashes are where URL parsers
+# disagree (WHATWG strips or rewrites them, ``urlparse`` does not), so a URL
+# carrying any of them is never treated as loopback.
+_URL_AMBIGUOUS_CHARS = re.compile(r"[\s\\\x00-\x1f\x7f]")
 
 
 class TeamsApiError(Exception):
@@ -332,20 +352,22 @@ async def call_teams_connector_api(
     ``path`` onto ``service_url``, and issues the request. Raises
     :class:`TeamsApiError` for non-2xx responses.
 
-    Python-specific hardening: ``service_url`` is validated through
-    :func:`is_trusted_teams_service_url` **before** the token is attached —
-    refusing to forward the bearer token to a host outside the Microsoft Bot
-    Framework allowlist (SSRF / token-leak guard). See ``docs/UPSTREAM_SYNC.md``
-    Known Non-Parity. Upstream performs no host check.
+    SSRF / token-leak guard (upstream parity since chat@4.40.0, with a wider
+    host list — see ``docs/UPSTREAM_SYNC.md`` Known Non-Parity): ``service_url``
+    is validated through :func:`is_trusted_teams_service_url`, and the resolved
+    request URL must keep the ``service_url`` origin (an absolute ``path``
+    cannot redirect the call). Both checks run **before** the token is resolved,
+    so a refused call makes no outbound request. Raises :class:`ValueError`
+    (upstream raises ``TeamsApiError``) with upstream's message text.
     """
     if not is_trusted_teams_service_url(service_url):
-        raise ValueError(f"Refusing to call Teams Connector API on untrusted serviceUrl: {service_url}")
+        raise ValueError(f"Refusing to send a Teams bot token to an untrusted Connector serviceUrl: {service_url}")
+    base_url = _ensure_trailing_slash(service_url)
+    url = urljoin(base_url, _LEADING_SLASH_PATTERN.sub("", path))
+    if _origin(url) != _origin(base_url):
+        raise ValueError("Refusing to send a Teams bot token outside the Connector serviceUrl origin")
     request = fetch if fetch is not None else _default_fetch
     token = await resolve_teams_access_token(credentials, fetch=fetch)
-    url = urljoin(
-        _ensure_trailing_slash(service_url),
-        _LEADING_SLASH_PATTERN.sub("", path),
-    )
 
     has_body = body is not _UNSET
     headers: dict[str, str] = {"authorization": f"Bearer {token}"}
@@ -561,17 +583,42 @@ def build_teams_typing_activity() -> TeamsActivity:
     return {"type": "typing"}
 
 
+def _is_loopback_emulator_url(url: str) -> bool:
+    """Return ``True`` for a plain-``http`` loopback URL (local Bot Framework Emulator).
+
+    Port of upstream's ``isLocalEmulator`` branch in ``getTrustedConnectorUrl``
+    (chat@4.40.0): scheme ``http`` and a hostname of ``localhost``,
+    ``127.x.x.x`` or ``::1``. Userinfo, an invalid port, whitespace, control
+    characters and backslashes fail closed. Shared with the high-level adapter's
+    ``_validate_service_url`` so both lists accept the same loopback forms.
+    """
+    if not isinstance(url, str) or _URL_AMBIGUOUS_CHARS.search(url):
+        return False
+    try:
+        parsed = urlparse(url)
+        _ = parsed.port  # raises ValueError for a non-numeric / out-of-range port
+    except (ValueError, TypeError):
+        return False
+    if parsed.scheme != "http" or parsed.username is not None or parsed.password is not None:
+        return False
+    host = parsed.hostname
+    return host is not None and _LOOPBACK_HOST_PATTERN.fullmatch(host) is not None
+
+
 def is_trusted_teams_service_url(url: str) -> bool:
     """Gate Connector calls to known Microsoft Bot Framework service hosts.
 
     The bearer token must never be forwarded to an arbitrary ``serviceUrl`` — a
-    crafted value could exfiltrate the bot's access token. This is a
-    Python-first divergence: the upstream primitives perform no URL validation.
-    See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity. The allowlist mirrors the
-    high-level adapter's ``ALLOWED_SERVICE_URL_PATTERNS``.
+    crafted value could exfiltrate the bot's access token. Accepts ``https`` on
+    the Bot Framework allowlist (a superset of upstream's
+    ``TRUSTED_CONNECTOR_HOSTS``, see ``docs/UPSTREAM_SYNC.md`` Known
+    Non-Parity) plus plain-``http`` loopback for the local Emulator. The
+    allowlist mirrors the high-level adapter's ``ALLOWED_SERVICE_URL_PATTERNS``.
     """
     if not isinstance(url, str):
         return False
+    if _is_loopback_emulator_url(url):
+        return True
     # Reject obviously malformed URLs early; the regexes already pin scheme +
     # host shape, but parse-failures should fail closed rather than raise.
     try:
@@ -647,6 +694,27 @@ def _encode_form(values: Mapping[str, str]) -> str:
 
 def _ensure_trailing_slash(value: str) -> str:
     return value if value.endswith("/") else f"{value}/"
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    """``(scheme, lowercased host, effective port)`` of ``url``, for origin comparison.
+
+    An omitted port becomes the scheme's default, as in a WHATWG ``URL.origin``
+    (upstream compares ``new URL(...).origin``), so ``https://host:443/`` and
+    ``https://host/`` are the same origin. An invalid port compares as ``-1``.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    return (scheme, parsed.hostname, port)
 
 
 def _response_status(response: Any) -> int:

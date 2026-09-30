@@ -1,6 +1,6 @@
 """Callback URL handling for buttons and modals.
 
-Python port of callback-url.ts (vercel/chat#454).
+Python port of callback-url.ts (vercel/chat#454, vercel/chat#875).
 
 When a button (or modal) carries a ``callback_url``, the SDK stores the URL
 in the state adapter under a short random token at post time and rewrites
@@ -9,14 +9,20 @@ button is clicked, :meth:`Chat.process_action` decodes the token, restores
 the original value for handlers, and POSTs the action payload to the stored
 URL. Modal callback URLs are stored in the modal context and POSTed on
 submit.
+
+Since chat@4.40.0 (vercel/chat#875) a button token is bound to the button
+that minted it (``actionId``) and to the conversation it was posted in
+(``scope``: a thread or a channel). A click resolves the token only when
+both match, and a resolved token is deleted, so each token is consumed at
+most once.
 """
 
 from __future__ import annotations
 
 import json
 import secrets
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from chat_sdk.cards import ActionsElement, ButtonElement, CardChild, CardElement
 from chat_sdk.errors import ChatError
@@ -24,7 +30,8 @@ from chat_sdk.types import StateAdapter
 
 CALLBACK_TOKEN_PREFIX = "__cb:"
 CALLBACK_CACHE_KEY_PREFIX = "chat:callback:"
-CALLBACK_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
+CALLBACK_TTL_MS = 7 * 24 * 60 * 60 * 1000  # 7 days
+CALLBACK_LOCK_TTL_MS = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +47,37 @@ class DecodedCallbackValue:
 
 
 @dataclass(frozen=True)
+class CallbackScope:
+    """The conversation a callback token is bound to.
+
+    Stored as ``{"id", "type"}``. A ``"thread"`` scope matches the clicked
+    message's thread id; a ``"channel"`` scope matches the channel id the
+    adapter derives from it (``channel_id_from_thread_id``).
+    """
+
+    id: str
+    type: Literal["channel", "thread"]
+
+
+@dataclass(frozen=True)
+class CallbackContext:
+    """Where a button click happened; matched against a stored callback."""
+
+    action_id: str
+    channel_id: str | None = None
+    thread_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ResolvedCallback:
-    """A stored callback resolved from the state adapter."""
+    """A stored callback, resolved and consumed from the state adapter."""
 
     url: str
     original_value: str | None = None
+    # Keyword-only so positional ``ResolvedCallback(url, original_value)``
+    # keeps binding the same fields as before these were added.
+    action_id: str = field(kw_only=True)
+    scope: CallbackScope = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -87,6 +120,7 @@ def _generate_token() -> str:
 async def _process_actions_element(
     actions: ActionsElement,
     state_adapter: StateAdapter,
+    scope: CallbackScope,
 ) -> ActionsElement:
     children: list[Any] = []
     for el in actions.get("children", []):
@@ -95,25 +129,21 @@ async def _process_actions_element(
             continue
 
         token = _generate_token()
-        # Stored shape matches the TS SDK (`{url, originalValue}`) so state
-        # written by either SDK resolves in both. `originalValue` is omitted
-        # (not None) when the button has no value — hazard #7.
-        stored: dict[str, Any] = {"url": el["callback_url"]}
+        # Stored shape matches the TS SDK (`{actionId, url, originalValue?,
+        # scope: {id, type}}`) so state written by either SDK resolves in
+        # both. `originalValue` is omitted (not None) when the button has no
+        # value — hazard #7.
+        stored: dict[str, Any] = {"actionId": el["id"], "url": el["callback_url"]}
         original_value = el.get("value")
         if original_value is not None:
             stored["originalValue"] = original_value
+        stored["scope"] = {"id": scope.id, "type": scope.type}
         await state_adapter.set(f"{CALLBACK_CACHE_KEY_PREFIX}{token}", stored, CALLBACK_TTL_MS)
 
-        # Rebuild the button without `callback_url` (mirrors upstream's
-        # explicit-key copy; keys absent on the source stay absent).
-        processed: ButtonElement = {"type": "button", "id": el["id"], "label": el["label"]}
-        if "style" in el:
-            processed["style"] = el["style"]
-        if "disabled" in el:
-            processed["disabled"] = el["disabled"]
+        # Keep every other button field so new ones (like tooltip) are not
+        # silently dropped; only the callback URL is replaced by the token.
+        processed: ButtonElement = {k: v for k, v in el.items() if k != "callback_url"}  # type: ignore[assignment]
         processed["value"] = encode_callback_value(token)
-        if "action_type" in el:
-            processed["action_type"] = el["action_type"]
         children.append(processed)
     return {"type": "actions", "children": children}
 
@@ -134,13 +164,14 @@ def _has_callback_buttons(children: list[CardChild]) -> bool:
 async def _process_children(
     children: list[CardChild],
     state_adapter: StateAdapter,
+    scope: CallbackScope,
 ) -> list[CardChild]:
     result: list[CardChild] = []
     for child in children:
         if isinstance(child, dict) and child.get("type") == "actions":
-            result.append(await _process_actions_element(child, state_adapter))  # type: ignore[arg-type]
+            result.append(await _process_actions_element(child, state_adapter, scope))  # type: ignore[arg-type]
         elif isinstance(child, dict) and child.get("type") == "section" and "children" in child:
-            result.append({**child, "children": await _process_children(child["children"], state_adapter)})  # type: ignore[misc]
+            result.append({**child, "children": await _process_children(child["children"], state_adapter, scope)})  # type: ignore[misc]
         else:
             result.append(child)
     return result
@@ -149,16 +180,18 @@ async def _process_children(
 async def process_card_callback_urls(
     card: CardElement,
     state_adapter: StateAdapter,
+    scope: CallbackScope,
 ) -> CardElement:
     """Replace ``callback_url`` buttons with encoded token values.
 
+    Each minted token is bound to its button's ``id`` and to ``scope``.
     Returns the *same* card object when no button carries a callback URL;
     otherwise returns a new card (the original is never mutated).
     """
     if not _has_callback_buttons(card.get("children", [])):
         return card
 
-    return {**card, "children": await _process_children(card.get("children", []), state_adapter)}
+    return {**card, "children": await _process_children(card.get("children", []), state_adapter, scope)}
 
 
 # ---------------------------------------------------------------------------
@@ -166,19 +199,87 @@ async def process_card_callback_urls(
 # ---------------------------------------------------------------------------
 
 
+def _parse_stored_callback(stored: Any) -> ResolvedCallback | None:
+    """Validate a stored record strictly; ``None`` for any other shape.
+
+    Mirrors upstream's ``typeof`` checks (never truthiness): a legacy
+    bare-string record, or one without ``actionId`` / ``scope``, is
+    rejected. An empty-string ``actionId`` is still a string and passes.
+    """
+    if not isinstance(stored, dict):
+        return None
+    action_id = stored.get("actionId")
+    url = stored.get("url")
+    if not isinstance(action_id, str) or not isinstance(url, str):
+        return None
+    original_value = stored.get("originalValue")
+    if "originalValue" in stored and not isinstance(original_value, str):
+        return None
+    scope = stored.get("scope")
+    if not isinstance(scope, dict):
+        return None
+    scope_id = scope.get("id")
+    if not isinstance(scope_id, str):
+        return None
+    raw_type = scope.get("type")
+    scope_type: Literal["channel", "thread"]
+    if raw_type == "channel":
+        scope_type = "channel"
+    elif raw_type == "thread":
+        scope_type = "thread"
+    else:
+        return None
+    return ResolvedCallback(
+        url=url,
+        original_value=original_value,
+        action_id=action_id,
+        scope=CallbackScope(id=scope_id, type=scope_type),
+    )
+
+
 async def resolve_callback_url(
     token: str,
     state_adapter: StateAdapter,
+    context: CallbackContext | None = None,
 ) -> ResolvedCallback | None:
-    """Look up a stored callback by token. Returns ``None`` when unknown."""
-    stored = await state_adapter.get(f"{CALLBACK_CACHE_KEY_PREFIX}{token}")
-    if not stored:
+    """Resolve and consume a stored button callback.
+
+    Returns ``None`` when the token is unknown or malformed, when a
+    concurrent click holds the token's lock, or when the record does not
+    match ``context`` (the clicked ``action_id`` and, depending on the
+    stored scope, ``channel_id`` or ``thread_id``). A ``None`` context
+    never matches. A matching record is deleted before returning, so each
+    token resolves at most once; a mismatch leaves the record in place. If
+    the lock lease lapsed while the record was being consumed, the result is
+    ``None`` (fail closed) so a concurrent click cannot also POST.
+    """
+    key = f"{CALLBACK_CACHE_KEY_PREFIX}{token}"
+    # Lock keys live in their own namespace in every state backend, so
+    # locking the value key does not touch the stored record.
+    lock = await state_adapter.acquire_lock(key, CALLBACK_LOCK_TTL_MS)
+    if lock is None:
         return None
-    if isinstance(stored, str):
-        # Legacy format: the URL was stored as a bare string.
-        return ResolvedCallback(url=stored)
-    original_value = stored["originalValue"] if "originalValue" in stored else stored.get("original_value")
-    return ResolvedCallback(url=stored.get("url"), original_value=original_value)
+
+    try:
+        resolved = _parse_stored_callback(await state_adapter.get(key))
+        if resolved is None or context is None:
+            return None
+
+        scope_id = context.channel_id if resolved.scope.type == "channel" else context.thread_id
+        if resolved.action_id != context.action_id or resolved.scope.id != scope_id:
+            return None
+
+        await state_adapter.delete(key)
+        # Python-specific fence (divergence from upstream — see
+        # docs/UPSTREAM_SYNC.md): if a stalled state call outlived the lock
+        # lease, another click may have taken the lock and consumed the same
+        # record. `extend_lock` succeeds only while our lease never lapsed,
+        # so a lost lease fails closed instead of POSTing a second time.
+        if not await state_adapter.extend_lock(lock, CALLBACK_LOCK_TTL_MS):
+            return None
+        return resolved
+    finally:
+        await state_adapter.release_lock(lock)
 
 
 async def _fetch(url: str, *, method: str, headers: dict[str, str], body: str) -> tuple[int, str]:

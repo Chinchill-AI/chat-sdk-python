@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from chat_sdk.callback_url import process_card_callback_urls
+from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.plan import is_postable_object, post_postable_object
 from chat_sdk.thread import (
@@ -340,9 +340,10 @@ class ChannelImpl:
         """Post an ephemeral message visible only to the specified user."""
         user_id = user if isinstance(user, str) else user.user_id
 
-        message = await self._process_callback_urls(message)  # type: ignore[assignment]
-
+        # Callback tokens are minted per delivery path so each is bound to
+        # the conversation the card actually lands in (vercel/chat#875).
         if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
+            message = await self._process_callback_urls(message)  # type: ignore[assignment]
             return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
 
         if not options.fallback_to_dm:
@@ -350,6 +351,10 @@ class ChannelImpl:
 
         if hasattr(self.adapter, "open_dm") and self.adapter.open_dm:  # type: ignore[union-attr]
             dm_thread_id: str = await self.adapter.open_dm(user_id)  # type: ignore[union-attr]
+            message = await self._process_callback_urls(  # type: ignore[assignment]
+                message,
+                CallbackScope(id=self.adapter.channel_id_from_thread_id(dm_thread_id), type="channel"),
+            )
             result: RawMessage = await self.adapter.post_message(dm_thread_id, message)
             return EphemeralMessage(
                 id=result.id,
@@ -379,20 +384,27 @@ class ChannelImpl:
     async def _process_callback_urls(
         self,
         postable: str | AdapterPostableMessage,
+        scope: CallbackScope | None = None,
     ) -> str | AdapterPostableMessage:
-        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454)."""
+        """Encode ``callback_url`` buttons in outgoing cards (vercel/chat#454).
+
+        Tokens are bound to ``scope``, which defaults to this channel.
+        """
         if isinstance(postable, str):
             return postable
 
+        if scope is None:
+            scope = CallbackScope(id=self._id, type="channel")
+
         if isinstance(postable, dict) and postable.get("type") == "card":
-            return await process_card_callback_urls(postable, self._state_adapter)
+            return await process_card_callback_urls(postable, self._state_adapter, scope)
 
         if (
             isinstance(postable, PostableCard)
             and isinstance(postable.card, dict)
             and postable.card.get("type") == "card"
         ):
-            processed = await process_card_callback_urls(postable.card, self._state_adapter)
+            processed = await process_card_callback_urls(postable.card, self._state_adapter, scope)
             if processed is not postable.card:
                 return replace(postable, card=processed)
 
@@ -547,8 +559,18 @@ class ChannelImpl:
 
         plain_text, formatted, attachments = _extract_message_content(postable)
 
+        # Upstream binds edited-card tokens to `{thread_id, "thread"}`. Python
+        # binds them to the channel, the scope the original `channel.post`
+        # used, because the thread id reported for a channel post often never
+        # equals a click's thread id: Teams and Google Chat report the channel
+        # id; Slack reports `slack:C…:` while a channel click carries the
+        # message ts and a DM click carries none; a chained edit drops the
+        # override. Every click on this message derives this channel id.
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
+        edit_scope = CallbackScope(id=channel_impl._id, type="channel")
+
         async def _edit(new_content: Any) -> SentMessage:
-            new_content = await channel_impl._process_callback_urls(new_content)
+            new_content = await channel_impl._process_callback_urls(new_content, edit_scope)
             await adapter.edit_message(thread_id, message_id, new_content)
             return channel_impl._create_sent_message(message_id, new_content)
 

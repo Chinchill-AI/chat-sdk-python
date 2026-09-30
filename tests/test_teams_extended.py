@@ -571,6 +571,49 @@ class TestToAppOptions:
         opts = _to_app_options(TeamsAdapterConfig(app_id="app-1", app_password="secret-1"))
         assert opts["service_url"] == "https://smba.gov.teams.microsoft.us/"
 
+    # -- custom token factory (upstream config.test.ts "toAppOptions", chat@4.35.0) --
+
+    def test_forwards_a_custom_token_factory_to_the_teams_sdk(self):
+        async def token(_scope, _tenant_id=None):
+            return "custom-access-token"
+
+        opts = _to_app_options(TeamsAdapterConfig(app_id="test-client-id", app_tenant_id="test-tenant-id", token=token))
+        assert opts["token"] is token
+        assert opts["client_id"] == "test-client-id"
+        assert opts["tenant_id"] == "test-tenant-id"
+
+    def test_suppresses_client_secret_when_a_token_factory_is_provided(self):
+        # Upstream emits ``clientSecret: ""``; the Python SDK treats an empty
+        # string as unset (``client_secret or os.getenv(...)``), so the key is
+        # omitted and the adapter's App subclass enforces the precedence.
+        opts = _to_app_options(
+            TeamsAdapterConfig(
+                app_id="test-client-id",
+                app_password="should-be-ignored",
+                token=lambda _scope, _tenant_id: "custom-access-token",
+            )
+        )
+        assert "client_secret" not in opts
+
+    def test_ignores_teams_app_password_env_var_when_a_token_factory_is_provided(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_APP_PASSWORD", "env-secret")
+
+        def token(_scope, _tenant_id):
+            return "custom-access-token"
+
+        opts = _to_app_options(TeamsAdapterConfig(app_id="test-client-id", token=token))
+        assert "client_secret" not in opts
+        assert opts["token"] is token
+
+    def test_omits_token_when_not_provided(self):
+        opts = _to_app_options(TeamsAdapterConfig(app_id="test-client-id", app_password="test-secret"))
+        assert "token" not in opts
+        assert opts["client_secret"] == "test-secret"
+
+    def test_unresolved_app_id_callable_is_rejected(self):
+        with pytest.raises(TypeError, match="resolved app_id"):
+            _to_app_options(TeamsAdapterConfig(app_id=lambda: "lazy", token=lambda _s, _t: "t"))
+
     def test_api_url_config_overrides_env(self, monkeypatch):
         """Explicit ``api_url`` wins over ``TEAMS_API_URL`` (config field precedence)."""
         monkeypatch.setenv("TEAMS_API_URL", "https://env.example.us/")
@@ -879,15 +922,18 @@ class TestCertificateAuth:
             )
 
     def test_raises_with_exact_upstream_message(self):
-        """Startup throw message matches upstream adapter-teams/src/config.ts:13-18 verbatim.
+        """Startup throw message matches upstream adapter-teams/src/config.ts verbatim.
 
         Upstream references ``appPassword`` (camelCase TS field name); we preserve
         that in the error text so consumers tailing upstream logs see identical
         output. Protects against well-meaning rewording to ``app_password``.
+        Since chat@4.35.0 (vercel/chat#732) the text also names the custom
+        ``token`` factory.
         """
         expected = (
             "Certificate-based authentication is not yet supported by the Teams SDK adapter. "
-            "Use appPassword (client secret) or federated (workload identity) authentication instead."
+            "Use appPassword (client secret), federated (workload identity), or token (custom token factory) "
+            "authentication instead."
         )
         with pytest.raises(ValidationError) as exc_info:
             TeamsAdapter(

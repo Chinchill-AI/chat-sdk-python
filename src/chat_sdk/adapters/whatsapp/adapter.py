@@ -8,16 +8,19 @@ Python port of packages/adapter-whatsapp/src/index.ts.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import inspect
 import json
 import math
 import os
+import re
 import time
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.whatsapp.cards import (
@@ -35,6 +38,7 @@ from chat_sdk.adapters.whatsapp.types import (
     WhatsAppRawMessage,
     WhatsAppThreadId,
     WhatsAppWebhookPayload,
+    WhatsAppWebhookValue,
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.logger import ConsoleLogger, Logger
@@ -70,6 +74,68 @@ DEFAULT_API_VERSION = "v25.0"
 
 # Maximum message length for WhatsApp Cloud API
 WHATSAPP_MESSAGE_LIMIT = 4096
+
+# Business-scoped user ID shape (e.g. ``US.13491208655302741918`` or the
+# parent form ``US.ENT.11815799212886844830``). Used with ``fullmatch`` so a
+# trailing newline does not match, like JS ``/^...$/`` without the ``m`` flag.
+_BSUID_PATTERN = re.compile(r"[A-Z]{2}\.(?:ENT\.)?[A-Za-z0-9]{1,128}")
+
+
+@dataclass(frozen=True)
+class _WhatsAppIdentity:
+    """Resolved sender identity.
+
+    ``user_id`` is the canonical identifier the thread is keyed by (a phone
+    number or a BSUID); the other fields are the identifiers known for the
+    user, any of which may be ``None``.
+    """
+
+    user_id: str
+    bsuid: str | None = None
+    parent: str | None = None
+    phone: str | None = None
+
+
+# Stored route: ``{"bsuid"?, "parent"?, "phone"?}`` with absent keys omitted
+# (never written as ``None``) so the JSON matches the TS SDK byte for byte.
+_WhatsAppRoute = dict[str, str]
+# Outbound addressing: ``{"to"?, "recipient"?}``, spread into send payloads.
+_WhatsAppRecipient = dict[str, str]
+
+
+def _route(bsuid: str | None, parent: str | None, phone: str | None) -> _WhatsAppRoute:
+    """Build a route dict, omitting absent (``None``) identifiers."""
+    route: _WhatsAppRoute = {}
+    if bsuid is not None:
+        route["bsuid"] = bsuid
+    if parent is not None:
+        route["parent"] = parent
+    if phone is not None:
+        route["phone"] = phone
+    return route
+
+
+def _first_not_none(*values: Any) -> Any:
+    """Return the first value that is not ``None`` (a JS ``??`` chain)."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return ``value`` if it is a dict, else an empty dict (JS ``?.`` on a non-object)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _metadata_phone_number_id(value: Any) -> str:
+    """Business ``phone_number_id`` from a webhook change value, or ``""``.
+
+    Tolerates a missing, null or non-dict ``metadata`` so a malformed change
+    can never raise out of ``handle_webhook``.
+    """
+    phone_number_id = _as_dict(_as_dict(value).get("metadata")).get("phone_number_id")
+    return phone_number_id if isinstance(phone_number_id, str) else ""
 
 
 def split_message(text: str) -> list[str]:
@@ -160,7 +226,8 @@ class WhatsAppAdapter:
         """Not implemented — see docs/UPSTREAM_SYNC.md non-parity table.
 
         WhatsApp Cloud API has no user lookup endpoint; the only stable
-        identifier is the phone number, and there's no equivalent of
+        identifiers are the phone number and the business-scoped user ID
+        (BSUID), and there's no equivalent of
         ``users.info`` exposed to business apps. Raising
         :class:`~chat_sdk.errors.ChatNotImplementedError` lets
         :meth:`Chat.get_user` translate this into a ``"does not support
@@ -225,10 +292,18 @@ class WhatsAppAdapter:
         # Process entries
         for entry in payload.get("entry", []):
             for change in entry.get("changes", []):
+                if change.get("field") == "user_id_update":
+                    await self._handle_user_id_update(change.get("value", {}))
+                    continue
+
                 if change.get("field") != "messages":
                     continue
 
-                value = change.get("value", {})
+                value = change.get("value")
+                if not isinstance(value, dict):
+                    continue
+                phone_number_id = _metadata_phone_number_id(value)
+                contacts = value.get("contacts") or []
 
                 # Process incoming messages. `value["messages"]` is typed as
                 # `list[dict[str, Any]]` on the webhook TypedDict; cast each
@@ -236,11 +311,33 @@ class WhatsAppAdapter:
                 if value.get("messages"):
                     for message in value["messages"]:
                         try:
+                            # Upstream reads `value.metadata.phone_number_id`
+                            # inside this try, so a malformed change fails
+                            # per message (logged) and the webhook still
+                            # returns 200. Raising here keeps that contract
+                            # and never writes identity keys under an empty
+                            # business number.
+                            if not phone_number_id:
+                                raise ValueError("WhatsApp change is missing metadata.phone_number_id")
+                            inbound = cast("WhatsAppInboundMessage", message)
+                            contact = self._match_contact(inbound, contacts)
+                            identity = await self._resolve(inbound, contact, phone_number_id)
+                            if identity is None:
+                                self._logger.warn(
+                                    "WhatsApp message has no user identifier",
+                                    {"messageId": inbound.get("id")},
+                                )
+                                continue
+                            # System messages (number / BSUID changes) only
+                            # re-link identity state; they are not dispatched.
+                            if inbound.get("type") == "system":
+                                continue
                             self._handle_inbound_message(
-                                cast("WhatsAppInboundMessage", message),
-                                (value.get("contacts") or [None])[0],
-                                value.get("metadata", {}).get("phone_number_id", ""),
+                                inbound,
+                                contact,
+                                phone_number_id,
                                 options,
+                                identity,
                             )
                         except Exception as error:
                             self._logger.error(
@@ -301,25 +398,34 @@ class WhatsAppAdapter:
         contact: WhatsAppContact | None,
         phone_number_id: str,
         options: WebhookOptions | None = None,
+        identity: _WhatsAppIdentity | None = None,
     ) -> None:
         """Handle an inbound message from a user."""
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring message")
             return
 
+        user = identity if identity is not None else self._fields(inbound, contact)
+        if user is None:
+            self._logger.warn(
+                "WhatsApp message has no user identifier",
+                {"messageId": inbound.get("id")},
+            )
+            return
+
         # Handle reactions separately
         if inbound.get("type") == "reaction" and inbound.get("reaction"):
-            self._handle_reaction(inbound, contact, phone_number_id, options)
+            self._handle_reaction(inbound, contact, phone_number_id, options, user)
             return
 
         # Handle interactive message replies (button clicks)
         if inbound.get("type") == "interactive" and inbound.get("interactive"):
-            self._handle_interactive_reply(inbound, contact, phone_number_id, options)
+            self._handle_interactive_reply(inbound, contact, phone_number_id, options, user)
             return
 
         # Handle legacy button responses (from template quick replies)
         if inbound.get("type") == "button" and inbound.get("button"):
-            self._handle_button_response(inbound, contact, phone_number_id, options)
+            self._handle_button_response(inbound, contact, phone_number_id, options, user)
             return
 
         # Extract text content based on message type
@@ -337,11 +443,11 @@ class WhatsAppAdapter:
         thread_id = self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=phone_number_id,
-                user_wa_id=inbound["from"],
+                user_wa_id=user.user_id,
             )
         )
 
-        message = self._build_message(inbound, contact, thread_id, text, phone_number_id)
+        message = self._build_message(inbound, contact, thread_id, text, phone_number_id, user)
         self._chat.process_message(self, thread_id, message, options)
 
     def _handle_reaction(
@@ -350,15 +456,20 @@ class WhatsAppAdapter:
         contact: WhatsAppContact | None,
         phone_number_id: str,
         options: WebhookOptions | None = None,
+        identity: _WhatsAppIdentity | None = None,
     ) -> None:
         """Handle reaction events."""
         if not (self._chat and inbound.get("reaction")):
             return
 
+        user = identity if identity is not None else self._fields(inbound, contact)
+        if user is None:
+            return
+
         thread_id = self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=phone_number_id,
-                user_wa_id=inbound["from"],
+                user_wa_id=user.user_id,
             )
         )
 
@@ -366,22 +477,13 @@ class WhatsAppAdapter:
         added = raw_emoji != ""
         emoji_value = get_emoji(raw_emoji) if added else get_emoji("")
 
-        contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
-        user = Author(
-            user_id=inbound["from"],
-            user_name=contact_name,
-            full_name=contact_name,
-            is_bot=False,
-            is_me=False,
-        )
-
         self._chat.process_reaction(
             ReactionEvent(
                 adapter=self,
                 thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["reaction"]["message_id"],
-                user=user,
+                user=self._author(user, contact),
                 emoji=emoji_value,
                 raw_emoji=raw_emoji,
                 added=added,
@@ -396,15 +498,20 @@ class WhatsAppAdapter:
         contact: WhatsAppContact | None,
         phone_number_id: str,
         options: WebhookOptions | None = None,
+        identity: _WhatsAppIdentity | None = None,
     ) -> None:
         """Handle interactive message replies (button/list selection)."""
         if not (self._chat and inbound.get("interactive")):
             return
 
+        user = identity if identity is not None else self._fields(inbound, contact)
+        if user is None:
+            return
+
         thread_id = self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=phone_number_id,
-                user_wa_id=inbound["from"],
+                user_wa_id=user.user_id,
             )
         )
 
@@ -425,20 +532,13 @@ class WhatsAppAdapter:
         action_id = decoded["action_id"] or ""
         value = decoded.get("value") if decoded.get("value") is not None else fallback_value
 
-        contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
                 thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["id"],
-                user=Author(
-                    user_id=inbound["from"],
-                    user_name=contact_name,
-                    full_name=contact_name,
-                    is_bot=False,
-                    is_me=False,
-                ),
+                user=self._author(user, contact),
                 action_id=action_id,
                 value=value,
                 raw=inbound,
@@ -452,38 +552,302 @@ class WhatsAppAdapter:
         contact: WhatsAppContact | None,
         phone_number_id: str,
         options: WebhookOptions | None = None,
+        identity: _WhatsAppIdentity | None = None,
     ) -> None:
         """Handle legacy button responses (from template quick replies)."""
         if not (self._chat and inbound.get("button")):
             return
 
+        user = identity if identity is not None else self._fields(inbound, contact)
+        if user is None:
+            return
+
         thread_id = self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=phone_number_id,
-                user_wa_id=inbound["from"],
+                user_wa_id=user.user_id,
             )
         )
 
-        contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
         self._chat.process_action(
             ActionEvent(
                 adapter=self,
                 thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
                 thread_id=thread_id,
                 message_id=inbound["id"],
-                user=Author(
-                    user_id=inbound["from"],
-                    user_name=contact_name,
-                    full_name=contact_name,
-                    is_bot=False,
-                    is_me=False,
-                ),
+                user=self._author(user, contact),
                 action_id=inbound["button"]["payload"],
                 value=inbound["button"]["text"],
                 raw=inbound,
             ),
             options,
         )
+
+    # =========================================================================
+    # Identity: phone numbers, business-scoped user IDs (BSUIDs), usernames
+    # =========================================================================
+
+    @staticmethod
+    def _match_contact(
+        inbound: WhatsAppInboundMessage,
+        contacts: list[WhatsAppContact],
+    ) -> WhatsAppContact | None:
+        """Find the contact for a message by BSUID, parent BSUID or phone.
+
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream also
+        matches only ``user_id`` / ``wa_id`` and otherwise falls back to
+        ``contacts[0]``. In a batched webhook that first contact can belong to
+        another sender, and ``_fields`` would then borrow its phone/BSUID and
+        alias this sender to the wrong user. We also match ``parent_user_id``,
+        and fall back only when the payload has exactly one contact and the
+        message carries no sender identifier of its own. A message whose
+        identifiers match no contact cannot be tied to one. System messages
+        carry their identifiers in ``system``, so they never take the fallback.
+        """
+        from_user_id = inbound.get("from_user_id")
+        from_parent_user_id = inbound.get("from_parent_user_id")
+        from_phone = inbound.get("from")
+        for item in contacts:
+            if not isinstance(item, dict):
+                continue
+            if (
+                (from_user_id and item.get("user_id") == from_user_id)
+                or (from_parent_user_id and item.get("parent_user_id") == from_parent_user_id)
+                or (from_phone and item.get("wa_id") == from_phone)
+            ):
+                return item
+        if from_user_id or from_parent_user_id or from_phone or inbound.get("type") == "system":
+            return None
+        return contacts[0] if len(contacts) == 1 else None
+
+    def _author(self, identity: _WhatsAppIdentity, contact: WhatsAppContact | None = None) -> Author:
+        """Build the message author for an identity.
+
+        ``or`` rather than ``is not None`` (upstream ``||``): an empty-string
+        profile name must still fall back to the user ID.
+        """
+        profile: dict[str, Any] = cast("dict[str, Any]", (contact or {}).get("profile") or {})
+        return Author(
+            user_id=identity.user_id,
+            user_name=profile.get("username") or profile.get("name") or identity.user_id,
+            full_name=profile.get("name") or profile.get("username") or identity.user_id,
+            is_bot=False,
+            is_me=identity.user_id == self._bot_user_id,
+        )
+
+    @staticmethod
+    def _fields(
+        inbound: WhatsAppInboundMessage,
+        contact: WhatsAppContact | None = None,
+    ) -> _WhatsAppIdentity | None:
+        """Extract the sender's identifiers from a message and its contact.
+
+        Precedence (upstream ``??`` chains): phone, then BSUID, then parent
+        BSUID. The system block wins because it carries the post-change values.
+        """
+        system: dict[str, Any] = cast("dict[str, Any]", inbound.get("system") or {})
+        contact_dict: dict[str, Any] = cast("dict[str, Any]", contact or {})
+        phone = _first_not_none(system.get("wa_id"), inbound.get("from"), contact_dict.get("wa_id"))
+        bsuid = _first_not_none(system.get("user_id"), inbound.get("from_user_id"), contact_dict.get("user_id"))
+        parent = _first_not_none(
+            system.get("parent_user_id"),
+            inbound.get("from_parent_user_id"),
+            contact_dict.get("parent_user_id"),
+        )
+        user_id = _first_not_none(phone, bsuid, parent)
+        if not user_id:
+            return None
+        return _WhatsAppIdentity(user_id=user_id, bsuid=bsuid, parent=parent, phone=phone)
+
+    async def _resolve(
+        self,
+        inbound: WhatsAppInboundMessage,
+        contact: WhatsAppContact | None,
+        phone_number_id: str,
+    ) -> _WhatsAppIdentity | None:
+        """Resolve the canonical identity for a message and persist its aliases.
+
+        State errors are logged and fall back to the un-linked identity, so a
+        state outage never drops an inbound message.
+        """
+        identity = self._fields(inbound, contact)
+        if identity is None:
+            return None
+
+        bsuid, parent, phone = identity.bsuid, identity.parent, identity.phone
+        changed = inbound.get("type") == "system"
+        # A system message's `from` carries the pre-change identifier, so
+        # prefer it as the canonical fallback: a thread that predates any
+        # alias state keeps its original key that way.
+        source = inbound.get("from") if changed else None
+        fallback = source if source is not None else identity.user_id
+
+        if not self._chat:
+            return _WhatsAppIdentity(user_id=fallback, bsuid=bsuid, parent=parent, phone=phone)
+
+        identifiers = [value for value in (source, bsuid, parent, phone) if value]
+
+        def merge(route: _WhatsAppRoute) -> _WhatsAppRoute:
+            return _route(
+                bsuid if bsuid is not None else route.get("bsuid"),
+                parent if parent is not None else route.get("parent"),
+                # A system message re-keys the phone: absent means the user no
+                # longer exposes one, so any stored number is stale.
+                phone if changed else (phone if phone is not None else route.get("phone")),
+            )
+
+        try:
+            return await self._link(self._chat.get_state(), phone_number_id, identifiers, fallback, merge)
+        except Exception as error:
+            self._logger.warn(
+                "Failed to persist WhatsApp user identity",
+                {"error": str(error), "messageId": inbound.get("id")},
+            )
+            return _WhatsAppIdentity(user_id=fallback, bsuid=bsuid, parent=parent, phone=phone)
+
+    async def _handle_user_id_update(self, value: WhatsAppWebhookValue) -> None:
+        """Handle a ``user_id_update`` change.
+
+        Meta sends it when a phone number change rotates a user's
+        business-scoped user ID. The payload carries the previous and current
+        values, so both get aliased to the same canonical user and the route
+        picks up the new identifiers.
+
+        See: https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids
+        """
+        if not self._chat or not isinstance(value, dict):
+            return
+
+        phone_number_id = _metadata_phone_number_id(value)
+        if not phone_number_id:
+            # Upstream throws out of handleWebhook here (500, Meta retries the
+            # batch); we skip the change instead of writing identity keys
+            # under an empty business number.
+            self._logger.warn("WhatsApp user_id_update is missing metadata.phone_number_id")
+            return
+        for update in value.get("user_id_update") or []:
+            if not isinstance(update, dict):
+                continue
+            # Upstream `update.user_id?.previous` yields undefined for a
+            # non-object field; treat any non-dict the same way.
+            user_id = _as_dict(update.get("user_id"))
+            parent_user_id = _as_dict(update.get("parent_user_id"))
+            wa_id = update.get("wa_id")
+            identifiers = [
+                identifier
+                for identifier in (
+                    user_id.get("previous"),
+                    parent_user_id.get("previous"),
+                    user_id.get("current"),
+                    parent_user_id.get("current"),
+                    wa_id,
+                )
+                if identifier
+            ]
+            # Prefer the previous BSUID as the canonical fallback so a thread
+            # keyed by it survives the rotation even without alias state.
+            if not identifiers:
+                continue
+            fallback = identifiers[0]
+            current_bsuid = user_id.get("current")
+            current_parent = parent_user_id.get("current")
+
+            def merge(
+                route: _WhatsAppRoute,
+                current_bsuid: str | None = current_bsuid,
+                current_parent: str | None = current_parent,
+                wa_id: str | None = wa_id,
+            ) -> _WhatsAppRoute:
+                return _route(
+                    current_bsuid if current_bsuid is not None else route.get("bsuid"),
+                    current_parent if current_parent is not None else route.get("parent"),
+                    # The rotation implies a phone number change, so any stored
+                    # phone is stale; keep only the update's wa_id, when present.
+                    wa_id,
+                )
+
+            try:
+                await self._link(self._chat.get_state(), phone_number_id, identifiers, fallback, merge)
+            except Exception as error:
+                self._logger.warn("Failed to apply WhatsApp user ID update", {"error": str(error)})
+
+    async def _link(
+        self,
+        state: Any,
+        phone_number_id: str,
+        identifiers: list[str],
+        fallback: str,
+        merge: Callable[[_WhatsAppRoute], _WhatsAppRoute],
+    ) -> _WhatsAppIdentity:
+        """Resolve the canonical user ID for equivalent identifiers and persist changes.
+
+        Aliases are looked up concurrently but honored in list order (the first
+        truthy one wins), so callers list the identifiers most likely to match
+        an existing thread first. Only aliases that differ, and a route whose
+        bsuid/parent/phone changed, are written.
+        """
+        aliases = await asyncio.gather(
+            *(state.get(self._identity_key("alias", phone_number_id, identifier)) for identifier in identifiers)
+        )
+        user_id = next((alias for alias in aliases if isinstance(alias, str) and alias), fallback)
+
+        path = self._identity_key("route", phone_number_id, user_id)
+        stored = await state.get(path)
+        route: _WhatsAppRoute = stored if isinstance(stored, dict) else {}
+        updated = merge(route)
+
+        writes = [
+            state.set(self._identity_key("alias", phone_number_id, identifier), user_id)
+            for identifier, alias in zip(identifiers, aliases, strict=True)
+            if alias != user_id
+        ]
+        if any(route.get(key) != updated.get(key) for key in ("bsuid", "parent", "phone")):
+            writes.append(state.set(path, updated))
+        await asyncio.gather(*writes)
+
+        return _WhatsAppIdentity(
+            user_id=user_id,
+            bsuid=updated.get("bsuid"),
+            parent=updated.get("parent"),
+            phone=updated.get("phone"),
+        )
+
+    async def _recipient(self, thread_id: str, user_id: str) -> _WhatsAppRecipient:
+        """Resolve outbound addressing (``to`` and/or ``recipient``) for a thread.
+
+        A stored route is honored only when it can address someone; otherwise
+        a BSUID-shaped ``user_id`` goes out as ``recipient`` and anything else
+        as ``to``. State errors are logged and fall through to that pattern.
+        """
+        if self._chat:
+            try:
+                decoded = self.decode_thread_id(thread_id)
+                stored = await self._chat.get_state().get(self._identity_key("route", decoded.phone_number_id, user_id))
+                route: _WhatsAppRoute = stored if isinstance(stored, dict) else {}
+                bsuid = route.get("bsuid")
+                recipient = bsuid if bsuid is not None else route.get("parent")
+                phone = route.get("phone")
+                # Only honor a stored route that can actually address someone;
+                # an empty route falls through to the user_id below.
+                if phone or recipient:
+                    result: _WhatsAppRecipient = {}
+                    if phone:
+                        result["to"] = phone
+                    if recipient:
+                        result["recipient"] = recipient
+                    return result
+            except Exception as error:
+                self._logger.warn(
+                    "Failed to resolve WhatsApp recipient",
+                    {"error": str(error), "threadId": thread_id},
+                )
+
+        return {"recipient": user_id} if _BSUID_PATTERN.fullmatch(user_id) else {"to": user_id}
+
+    @staticmethod
+    def _identity_key(kind: Literal["alias", "route"], phone_number_id: str, value: str) -> str:
+        """State key for identity aliases/routes (byte-identical to the TS SDK)."""
+        return f"whatsapp:identity:{kind}:{phone_number_id}:{value}"
 
     def _extract_text_content(self, message: WhatsAppInboundMessage) -> str | None:
         """Extract text content from an inbound message. Returns None for unsupported types."""
@@ -524,16 +888,14 @@ class WhatsAppAdapter:
         thread_id: str,
         text: str,
         phone_number_id: str | None = None,
+        identity: _WhatsAppIdentity | None = None,
     ) -> Message:
         """Build a Message from a WhatsApp inbound message."""
-        contact_name = (contact or {}).get("profile", {}).get("name", "") or inbound["from"]
-        author = Author(
-            user_id=inbound["from"],
-            user_name=contact_name,
-            full_name=contact_name,
-            is_bot=False,
-            is_me=False,
-        )
+        user = identity if identity is not None else self._fields(inbound, contact)
+        if user is None:
+            raise ValidationError("whatsapp", "Message has no user identifier")
+
+        author = self._author(user, contact)
 
         formatted = self._format_converter.to_ast(text)
 
@@ -541,6 +903,7 @@ class WhatsAppAdapter:
             "message": inbound,
             "contact": contact,
             "phone_number_id": phone_number_id or self._phone_number_id,
+            "user_id": user.user_id,
         }
 
         attachments = self._build_attachments(inbound)
@@ -759,6 +1122,9 @@ class WhatsAppAdapter:
         """Send a message to a WhatsApp user."""
         decoded = self.decode_thread_id(thread_id)
         user_wa_id = decoded.user_wa_id
+        # Resolve the route once per logical post; the send helpers reuse it
+        # across chunked and multi-part sends.
+        recipient = await self._recipient(thread_id, user_wa_id)
 
         # Check if this is a card with interactive buttons
         card = extract_card(message)
@@ -771,11 +1137,12 @@ class WhatsAppAdapter:
             if result.get("type") == "interactive":
                 interactive_raw = cast(WhatsAppCardResultInteractive, result)["interactive"]
                 interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
-                return await self._send_interactive_message(thread_id, user_wa_id, interactive)
+                return await self._send_interactive_message(thread_id, user_wa_id, interactive, recipient)
             return await self._send_text_message(
                 thread_id,
                 user_wa_id,
                 convert_emoji_placeholders(cast(WhatsAppCardResultText, result)["text"], "whatsapp"),
+                recipient,
             )
 
         # Regular text message
@@ -783,21 +1150,23 @@ class WhatsAppAdapter:
             self._format_converter.render_postable(message),
             "whatsapp",
         )
-        return await self._send_text_message(thread_id, user_wa_id, body)
+        return await self._send_text_message(thread_id, user_wa_id, body, recipient)
 
     async def _send_single_text_message(
         self,
         thread_id: str,
         to: str,
         text: str,
+        recipient: _WhatsAppRecipient | None = None,
     ) -> RawMessage:
         """Send a single text message via the Cloud API."""
+        addressing = recipient if recipient is not None else await self._recipient(thread_id, to)
         response = await self._graph_api_request(
             f"/{self._phone_number_id}/messages",
             {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
-                "to": to,
+                **addressing,
                 "type": "text",
                 "text": {"preview_url": False, "body": text},
             },
@@ -828,13 +1197,16 @@ class WhatsAppAdapter:
         thread_id: str,
         to: str,
         text: str,
+        recipient: _WhatsAppRecipient | None = None,
     ) -> RawMessage:
         """Send a text message, splitting into multiple if it exceeds the limit."""
         chunks = split_message(text)
+        # Resolve the route once so chunked sends share a single lookup.
+        resolved = recipient if recipient is not None else await self._recipient(thread_id, to)
         result: RawMessage | None = None
 
         for chunk in chunks:
-            result = await self._send_single_text_message(thread_id, to, chunk)
+            result = await self._send_single_text_message(thread_id, to, chunk, resolved)
 
         assert result is not None
         return result
@@ -844,14 +1216,16 @@ class WhatsAppAdapter:
         thread_id: str,
         to: str,
         interactive: WhatsAppInteractiveMessage,
+        recipient: _WhatsAppRecipient | None = None,
     ) -> RawMessage:
         """Send an interactive message (buttons or list) via the Cloud API."""
+        addressing = recipient if recipient is not None else await self._recipient(thread_id, to)
         response = await self._graph_api_request(
             f"/{self._phone_number_id}/messages",
             {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
-                "to": to,
+                **addressing,
                 "type": "interactive",
                 "interactive": interactive,
             },
@@ -921,7 +1295,7 @@ class WhatsAppAdapter:
             {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
-                "to": decoded.user_wa_id,
+                **(await self._recipient(thread_id, decoded.user_wa_id)),
                 "type": "reaction",
                 "reaction": {"message_id": message_id, "emoji": emoji_str},
             },
@@ -941,7 +1315,7 @@ class WhatsAppAdapter:
             {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
-                "to": decoded.user_wa_id,
+                **(await self._recipient(thread_id, decoded.user_wa_id)),
                 "type": "reaction",
                 "reaction": {"message_id": message_id, "emoji": ""},
             },
@@ -1053,17 +1427,25 @@ class WhatsAppAdapter:
         text = self._extract_text_content(raw["message"]) or ""
         formatted = self._format_converter.to_ast(text)
         attachments = self._build_attachments(raw["message"])
+        contact = raw.get("contact")
+        # A stored canonical user_id wins; otherwise derive the identity with
+        # the same precedence the webhook path uses.
+        identity = self._fields(raw["message"], contact)
+        stored_user_id = raw.get("user_id")
+        user_id = stored_user_id if stored_user_id is not None else (identity.user_id if identity else None)
+        if not user_id:
+            raise ValidationError("whatsapp", "WhatsApp message has no user identifier")
         thread_id = self.encode_thread_id(
             WhatsAppThreadId(
                 phone_number_id=raw["phone_number_id"],
-                user_wa_id=raw["message"]["from"],
+                user_wa_id=user_id,
             )
         )
 
-        contact = raw.get("contact")
-        contact_name = ""
-        contact_name = (
-            contact.get("profile", {}).get("name", "") or raw["message"]["from"] if contact else raw["message"]["from"]
+        author_identity = (
+            _WhatsAppIdentity(user_id=user_id, bsuid=identity.bsuid, parent=identity.parent, phone=identity.phone)
+            if identity
+            else _WhatsAppIdentity(user_id=user_id)
         )
 
         return Message(
@@ -1071,13 +1453,7 @@ class WhatsAppAdapter:
             thread_id=thread_id,
             text=text,
             formatted=formatted,
-            author=Author(
-                user_id=raw["message"]["from"],
-                user_name=contact_name,
-                full_name=contact_name,
-                is_bot=False,
-                is_me=raw["message"]["from"] == self._bot_user_id,
-            ),
+            author=self._author(author_identity, contact),
             metadata=MessageMetadata(
                 date_sent=datetime.fromtimestamp(
                     int(raw["message"].get("timestamp", "0")),

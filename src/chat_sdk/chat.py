@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from chat_sdk.callback_url import (
+    CallbackContext,
     decode_callback_value,
     post_to_callback_url,
     resolve_callback_url,
@@ -1742,12 +1743,24 @@ class Chat:
         # Decode a callback token (`__cb:<token>`) planted at post time by
         # process_card_callback_urls. When one resolves, handlers see the
         # button's original value and the action payload is POSTed to the
-        # stored callback URL concurrently with the handlers.
+        # stored callback URL concurrently with the handlers. A token only
+        # resolves for the button and conversation that minted it, and only
+        # once (vercel/chat#875); otherwise handlers see the raw value and
+        # nothing is POSTed.
         callback_token = decode_callback_value(event.value).callback_token
 
         resolved = None
         if callback_token:
-            resolved = await resolve_callback_url(callback_token, self._state_adapter)
+            channel_id = event.adapter.channel_id_from_thread_id(event.thread_id) if event.thread_id else None
+            resolved = await resolve_callback_url(
+                callback_token,
+                self._state_adapter,
+                CallbackContext(
+                    action_id=event.action_id,
+                    channel_id=channel_id,
+                    thread_id=event.thread_id,
+                ),
+            )
 
         action_value = resolved.original_value if resolved is not None else event.value
 
@@ -1756,7 +1769,8 @@ class Chat:
             callback_url = resolved.url
             # Wire payload: camelCase keys, optional keys omitted (not None)
             # to mirror upstream's JSON.stringify semantics — hazard #7.
-            payload: dict[str, Any] = {"type": "action", "actionId": event.action_id}
+            # `actionId` is the minted button's id, as stored with the token.
+            payload: dict[str, Any] = {"type": "action", "actionId": resolved.action_id}
             if resolved.original_value is not None:
                 payload["value"] = resolved.original_value
             payload["user"] = {"id": event.user.user_id, "name": event.user.user_name}

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import inspect
 import json
 import time
 from typing import Any
@@ -125,35 +124,32 @@ def _teams_request(body: str) -> _FakeRequest:
 
 
 def _teams_skip_auth():
-    """Force the Microsoft Teams SDK to skip inbound JWT validation.
+    """Configure the Microsoft Teams SDK App to skip inbound JWT validation.
 
     Inbound auth moved into the SDK ``App`` (issue #93 PR 1). Fixture replays
-    carry no signed Bot Framework token, so this patches ``HttpServer.initialize``
-    to enable ``skip_auth`` — exercising the real bridge → SDK → handler path
-    without signature checks. Returns a context manager covering both
-    ``adapter.initialize()`` (where the route + validator are set up) and the
-    subsequent ``handle_webhook`` dispatch.
+    carry no signed Bot Framework token, so this turns on the App's own
+    unauthenticated-requests option just before ``App.initialize`` hands it to
+    the ``HttpServer`` -- the same state a consumer gets from setting the
+    option, so the adapter's pre-validation issuer check (#250) sees the mode
+    too -- exercising the real bridge -> SDK -> handler path without signature
+    checks. Returns a context manager covering both ``adapter.initialize()``
+    (where the route + validator are set up) and the subsequent
+    ``handle_webhook`` dispatch.
     """
-    from microsoft_teams.apps.http.http_server import HttpServer
+    from microsoft_teams.apps import App
 
-    real_initialize = HttpServer.initialize
+    real_initialize = App.initialize
 
-    # microsoft-teams-apps 2.0.14+ renamed the SDK's ``skip_auth`` flag to
-    # ``dangerously_allow_unauthenticated_requests``; force whichever flag this
-    # version has and forward everything else untouched (the SDK calls
-    # ``initialize`` with keywords only).
-    skip_flag = (
-        "dangerously_allow_unauthenticated_requests"
-        if "dangerously_allow_unauthenticated_requests" in inspect.signature(real_initialize).parameters
-        else "skip_auth"
-    )
+    async def _initialize_skip_auth(self, *args, **kwargs):
+        # microsoft-teams-apps 2.0.14+ renamed the option ``skip_auth`` to
+        # ``dangerously_allow_unauthenticated_requests``; set whichever exists.
+        if hasattr(self.options, "dangerously_allow_unauthenticated_requests"):
+            self.options.dangerously_allow_unauthenticated_requests = True
+        else:
+            self.options.skip_auth = True
+        return await real_initialize(self, *args, **kwargs)
 
-    def _initialize_skip_auth(self, *args, **kwargs):
-        kwargs.pop("skip_auth", None)
-        kwargs.pop("dangerously_allow_unauthenticated_requests", None)
-        return real_initialize(self, *args, **{**kwargs, skip_flag: True})
-
-    return patch.object(HttpServer, "initialize", _initialize_skip_auth)
+    return patch.object(App, "initialize", _initialize_skip_auth)
 
 
 def _gchat_request(body: str) -> _FakeRequest:
