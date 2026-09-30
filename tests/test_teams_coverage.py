@@ -255,6 +255,65 @@ class TestValidateServiceUrl:
         with pytest.raises(ValidationError):
             _validate_service_url("https://fake-botframework.com.evil.com/")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Upstream TRUSTED_CONNECTOR_HOSTS (chat@4.40.0) additions.
+            "https://msteams.botframework.azure.cn/teams/",
+            "https://smba.infra.dod.teams.microsoft.us/teams/",
+            # Local Bot Framework Emulator (plain http on loopback).
+            "http://localhost:3978/",
+            "http://127.0.0.1:52673/",
+            "http://[::1]:3978/",
+            "HTTP://LOCALHOST:3978",
+        ],
+    )
+    def test_accepts_sovereign_connectors_and_the_local_emulator(self, url):
+        _validate_service_url(url)  # no exception = pass
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://localhost:3978/",  # loopback is http-only (the Emulator)
+            "http://localhost.example/",  # suffix must not match
+            "http://127.0.0.1.evil.example/",
+            "http://evil.example#@localhost/",
+            "http://user@localhost/",  # userinfo is refused outright
+            "http://localhost:99999/",  # invalid port
+            "http://localhost\\@evil.example/",  # parser-differential character
+            "https://msteams.botframework.azure.cn.evil.example/",
+        ],
+    )
+    def test_rejects_loopback_lookalikes(self, url):
+        with pytest.raises(ValidationError):
+            _validate_service_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://SMBA.trafficmanager.net/teams/",
+            "HTTPS://smba.infra.GCC.teams.microsoft.com/teams/",
+            "https://Some-Host.BotFramework.com/",
+        ],
+    )
+    def test_accepts_trusted_hosts_case_insensitively(self, url):
+        # Upstream compares ``url.hostname.toLowerCase()`` (WHATWG also
+        # lowercases the scheme), so an uppercase trusted host is accepted.
+        _validate_service_url(url)  # no exception = pass
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Kelvin sign (U+212A) / long s (U+017F) case-fold to ASCII ``k`` /
+            # ``s`` under a Unicode IGNORECASE; the patterns stay ASCII-only.
+            "https://smba.traffic\u212amanager.net/teams/",
+            "https://\u017fmba.trafficmanager.net/teams/",
+        ],
+    )
+    def test_rejects_non_ascii_case_folds(self, url):
+        with pytest.raises(ValidationError):
+            _validate_service_url(url)
+
 
 # ---------------------------------------------------------------------------
 # _get_access_token (Bot Framework token)
@@ -651,6 +710,33 @@ class TestOpenDM:
             conv_calls = [u for u in call_urls if "v3/conversations" in u]
             assert len(conv_calls) == 1
             assert "smba.trafficmanager.net" in conv_calls[0]
+
+    async def test_open_dm_joins_a_slashless_emulator_service_url(self):
+        """The local Emulator's serviceUrl has no trailing slash (``http://localhost:N``)."""
+        adapter = _make_adapter(logger=_make_logger())
+        state = _make_mock_state()
+        state._cache["teams:serviceUrl:user-emu"] = "http://localhost:58453"
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        conv_resp = _mock_aiohttp_response({"id": "a:emulator-conv"})
+        mock_session = _MockSession(default_response=conv_resp)
+        original_post = mock_session.post
+        call_urls = []
+
+        def routed_post(url, **kwargs):
+            call_urls.append(url)
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            await adapter.open_dm("user-emu")
+
+        assert [u for u in call_urls if "oauth2" not in u] == ["http://localhost:58453/v3/conversations"]
 
 
 # ---------------------------------------------------------------------------

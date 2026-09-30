@@ -17,6 +17,7 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from microsoft_teams.apps.http.adapter import HttpServerAdapter
 
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
@@ -149,16 +150,17 @@ class TestDispatch:
         assert result["status"] == 500
         assert "No handler registered" in result["body"]
 
-    async def test_empty_body_parses_to_object_and_calls_handler(self):
-        # An empty body parses to ``{}`` (a dict), so the handler is invoked.
+    async def test_empty_body_is_invalid_json(self):
+        # Upstream runs ``JSON.parse(body)`` unconditionally, so an empty body
+        # is a 400 and never reaches the SDK handler as an empty activity.
         bridge = _make_bridge()
         handler = AsyncMock(return_value={"status": 200, "body": None})
         bridge.register_route("POST", "/api/messages", handler)
 
         result = await bridge.dispatch(_FakeRequest(""))
-        assert result["status"] == 200
-        handler.assert_awaited_once()
-        assert handler.await_args.args[0]["body"] == {}
+        assert result["status"] == 400
+        assert result["body"] == "Invalid JSON"
+        handler.assert_not_called()
 
     async def test_dispatch_handler_exception_returns_500(self):
         bridge = _make_bridge()
@@ -170,6 +172,38 @@ class TestDispatch:
         result = await bridge.dispatch(_FakeRequest('{"id": "m1"}'))
         assert result["status"] == 500
         assert "Internal error" in result["body"]
+
+
+# ---------------------------------------------------------------------------
+# webhook_verifier (upstream TeamsWebhookVerifier, chat@4.41.0)
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookVerifier:
+    @pytest.mark.parametrize("result", [False, None, 0, "", {}])
+    async def test_falsy_result_answers_401_without_reaching_the_handler(self, result: Any):
+        bridge = BridgeHttpAdapter(ConsoleLogger("error", prefix="teams"), webhook_verifier=lambda _r, _b: result)
+        handler = AsyncMock(return_value={"status": 200, "body": None})
+        bridge.register_route("POST", "/api/messages", handler)
+
+        response = await bridge.dispatch(_FakeRequest('{"id": "m1"}'))
+
+        assert response == {"body": "Unauthorized", "status": 401, "headers": {"Content-Type": "text/plain"}}
+        handler.assert_not_awaited()
+
+    async def test_truthy_async_result_reaches_the_handler_with_the_parsed_body(self):
+        async def verifier(_request: Any, body: str) -> dict[str, bool]:
+            return {"verified": body == '{"id": "m1"}'}
+
+        bridge = BridgeHttpAdapter(ConsoleLogger("error", prefix="teams"), webhook_verifier=verifier)
+        handler = AsyncMock(return_value={"status": 200, "body": None})
+        bridge.register_route("POST", "/api/messages", handler)
+
+        response = await bridge.dispatch(_FakeRequest('{"id": "m1"}'))
+
+        assert response["status"] == 200
+        handler.assert_awaited_once()
+        assert handler.await_args.args[0]["body"] == {"id": "m1"}
 
 
 # ---------------------------------------------------------------------------

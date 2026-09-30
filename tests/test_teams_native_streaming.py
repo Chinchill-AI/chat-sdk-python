@@ -730,23 +730,94 @@ class TestHandleMessageActivityLifecycle:
 
 
 class TestCreateStreamer:
-    def test_creates_streamer_for_valid_dm_activity(self):
+    """``_create_streamer`` builds the SDK stream on both SDK lines (#250).
+
+    ``microsoft-teams-apps`` 2.0.x exposes ``App.activity_sender.create_stream``;
+    2.1.x removed ``ActivitySender`` and builds ``HttpStream(api, ref)``. The
+    branch tests force each shape by stubbing the App, so both run on
+    whichever SDK is installed. ``test_real_sdk_stream_is_pinned_to_inbound_service_url``
+    runs unstubbed against the installed SDK.
+    """
+
+    SOVEREIGN_URL = "https://smba.infra.gov.teams.microsoft.us/teams/"
+
+    @staticmethod
+    def _drop_activity_sender(adapter: TeamsAdapter) -> None:
+        """Make the App look like 2.1.x (no ``activity_sender``)."""
+        if hasattr(adapter._app, "activity_sender"):
+            del adapter._app.activity_sender
+
+    def test_real_sdk_stream_is_pinned_to_inbound_service_url(self):
+        """No stubs: the installed SDK yields an ``HttpStream`` on its own client.
+
+        The stream's client must target the inbound activity's service URL and
+        must not be the shared ``App.api``, which ``_point_app_api_at`` retargets
+        in place for every outbound call. If it were shared, an outbound call to
+        another region mid-stream would redirect the stream's chunks.
+        """
+        from microsoft_teams.apps import HttpStream
+
         adapter = _make_adapter()
         tid = _dm_thread_id(adapter)
-        created = {}
+        streamer = adapter._create_streamer(_dm_activity(), tid)
+
+        assert isinstance(streamer, HttpStream)
+        assert streamer._ref.conversation.id == "a:1Abc-DM-conversation-id"
+        assert streamer._ref.bot.id == "28:test-app-id"
+        assert streamer._client is not adapter._app.api
+        assert streamer._client.service_url == "https://smba.trafficmanager.net/teams"
+
+        adapter._point_app_api_at(self.SOVEREIGN_URL)
+        assert adapter._app.api.service_url == self.SOVEREIGN_URL.rstrip("/")
+        assert streamer._client.service_url == "https://smba.trafficmanager.net/teams"
+
+    def test_uses_activity_sender_when_present(self):
+        """2.0.x shape: ``activity_sender.create_stream(ref)`` builds the stream."""
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        created: dict[str, Any] = {}
+        fake = FakeStreamer()
 
         def create_stream(ref):
             created["ref"] = ref
-            return FakeStreamer()
+            return fake
 
-        adapter._app.activity_sender.create_stream = create_stream  # type: ignore[method-assign]
+        adapter._app.activity_sender = MagicMock(create_stream=create_stream)
 
-        streamer = adapter._create_streamer(_dm_activity(), tid)
-        assert streamer is not None
+        assert adapter._create_streamer(_dm_activity(), tid) is fake
         ref = created["ref"]
         assert ref.conversation.id == "a:1Abc-DM-conversation-id"
         assert ref.service_url == "https://smba.trafficmanager.net/teams/"
         assert ref.bot.id == "28:test-app-id"
+
+    def test_builds_http_stream_on_scoped_client_without_activity_sender(self, monkeypatch):
+        """2.1.x shape: ``HttpStream`` gets ``App.api`` scoped to the inbound service URL."""
+        import microsoft_teams.apps as teams_apps
+
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        self._drop_activity_sender(adapter)
+
+        scoped_api = object()
+        api = MagicMock()
+        api.from_service_url = MagicMock(return_value=scoped_api)
+        adapter._app.api = api
+
+        built: dict[str, Any] = {}
+        fake = FakeStreamer()
+
+        def fake_http_stream(client, ref):
+            built["client"] = client
+            built["ref"] = ref
+            return fake
+
+        monkeypatch.setattr(teams_apps, "HttpStream", fake_http_stream)
+
+        assert adapter._create_streamer(_dm_activity(), tid) is fake
+        api.from_service_url.assert_called_once_with("https://smba.trafficmanager.net/teams/")
+        assert built["client"] is scoped_api
+        assert built["ref"].conversation.id == "a:1Abc-DM-conversation-id"
+        assert built["ref"].bot.id == "28:test-app-id"
 
     def test_returns_none_without_service_url(self):
         adapter = _make_adapter()
@@ -770,8 +841,24 @@ class TestCreateStreamer:
         def boom(ref):
             raise RuntimeError("sdk exploded")
 
-        adapter._app.activity_sender.create_stream = boom  # type: ignore[method-assign]
+        adapter._app.activity_sender = MagicMock(create_stream=boom)
         assert adapter._create_streamer(_dm_activity(), tid) is None
+        adapter._logger.warn.assert_called_once()
+        assert adapter._logger.warn.call_args.args[1]["error"] == "sdk exploded"
+
+    def test_returns_none_when_sdk_has_neither_stream_entry_point(self):
+        """No ``activity_sender`` and no ``ApiClient.from_service_url`` → buffered fallback.
+
+        Guards an SDK shape we do not support: falling through to
+        ``HttpStream(App.api, ref)`` there could share the retargetable client.
+        """
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        self._drop_activity_sender(adapter)
+        adapter._app.api = MagicMock(spec=["service_url"])
+
+        assert adapter._create_streamer(_dm_activity(), tid) is None
+        adapter._logger.warn.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

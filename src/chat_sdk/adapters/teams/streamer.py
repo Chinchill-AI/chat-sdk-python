@@ -7,11 +7,12 @@ already parses. Kept in its own module so the SDK model construction stays
 isolated from ``adapter.py`` and importable lazily (Port Rule: optional/SDK
 deps imported inside functions, not at module top).
 
-Mirrors what the Teams SDK's own ``ActivityContext`` does in
-``microsoft_teams/apps/app_process.py`` ``_build_context`` (it builds a
-``ConversationReference`` from the activity and calls
-``ActivitySender.create_stream(ref)`` to expose ``ctx.stream``). Our bridge
-owns dispatch, so we reproduce just the reference-building step.
+Mirrors what the Teams SDK's own ``ActivityContext`` does: it builds a
+``ConversationReference`` from the activity and exposes ``ctx.stream`` from it
+(``ActivitySender.create_stream(ref)`` on ``microsoft-teams-apps`` 2.0.x,
+``HttpStream(api, ref)`` on 2.1.x). Our bridge owns dispatch, so we reproduce
+just the reference-building step; ``TeamsAdapter._create_streamer`` picks the
+stream constructor for the installed SDK.
 """
 
 from __future__ import annotations

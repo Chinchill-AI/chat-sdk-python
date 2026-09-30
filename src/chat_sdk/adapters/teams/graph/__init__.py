@@ -26,14 +26,14 @@ where ``response`` exposes an ``int`` ``status`` (or ``status_code``), an
 ``ok`` flag (optional; derived from ``status`` when absent), and a ``text()``
 method (sync or async) returning the raw body string.
 
-Python-specific hardening (divergence from upstream, see ``docs/UPSTREAM_SYNC.md``
-Known Non-Parity): :func:`call_teams_graph_api` gates an absolute ``path_or_url``
-(and, transitively, each ``@odata.nextLink`` followed by :func:`paginate_teams_graph`)
+SSRF / token-leak guard: :func:`call_teams_graph_api` gates the request URL
+(an absolute ``path_or_url``, each ``@odata.nextLink`` followed by
+:func:`paginate_teams_graph`, and a relative path joined onto ``graph_url``)
 through :func:`is_trusted_graph_url` **before** attaching the ``Bearer`` token,
-refusing to forward the Graph token to any host outside ``graph.microsoft.com``
-(SSRF / token-leak guard). Upstream attaches the token to whatever URL it is
-handed — including an attacker-controlled ``@odata.nextLink`` — with no host
-check.
+refusing to forward the Graph token outside the Microsoft Graph national-cloud
+hosts. Upstream validates the same host set since chat@4.40.0 (vercel/chat
+#876, ``7609d8f6``); see ``docs/UPSTREAM_SYNC.md`` Known Non-Parity for the
+remaining parser-level differences.
 """
 
 from __future__ import annotations
@@ -90,15 +90,23 @@ _DEFAULT_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 _DEFAULT_GRAPH_URL = "https://graph.microsoft.com/v1.0/"
 _LEADING_SLASH_PATTERN = re.compile(r"^/+")
 
-# SSRF allowlist (Python-first divergence from upstream). The Microsoft Graph
-# API lives on a single host; the Graph-scoped bearer token must never be
-# attached to any other host, including an attacker-supplied ``@odata.nextLink``.
-# This is the API-host counterpart to the broader file-download allowlist in the
-# high-level adapter (``teams/adapter.py`` ``_is_trusted_teams_download_url``,
-# which permits the ``.graph.microsoft.com`` suffix and the exact
-# ``graph.microsoft.com`` host); a Graph *API* call only ever targets the bare
-# ``graph.microsoft.com`` host, so we pin to it exactly.
-_TRUSTED_GRAPH_HOSTS = frozenset({"graph.microsoft.com"})
+# SSRF allowlist — the Microsoft Graph API hosts for the global, US Government
+# (L4 / L5 DoD), Germany and China (21Vianet) national clouds; exact parity
+# with upstream ``TRUSTED_GRAPH_HOSTS`` (chat@4.40.0). The Graph-scoped bearer
+# token must never be attached to any other host, including an
+# attacker-supplied ``@odata.nextLink``. This is the API-host counterpart to the
+# broader file-download allowlist in the high-level adapter (``teams/adapter.py``
+# ``_is_trusted_teams_download_url``); a Graph *API* call only ever targets one
+# of these bare hosts, so we match them exactly.
+_TRUSTED_GRAPH_HOSTS = frozenset(
+    {
+        "dod-graph.microsoft.us",
+        "graph.microsoft.com",
+        "graph.microsoft.de",
+        "graph.microsoft.us",
+        "microsoftgraph.chinacloudapi.cn",
+    }
+)
 
 
 @dataclass
@@ -210,12 +218,12 @@ class TeamsChannelInfo:
 
 
 def is_trusted_graph_url(url: str) -> bool:
-    """Return ``True`` when ``url`` targets the Microsoft Graph API host.
+    """Return ``True`` when ``url`` targets a Microsoft Graph API host.
 
-    Python-first SSRF / token-leak guard (no upstream counterpart): only an
-    ``https://`` URL whose host is exactly ``graph.microsoft.com`` is trusted to
-    receive the Graph-scoped bearer token. Used to gate both an absolute
-    ``path_or_url`` and a followed ``@odata.nextLink`` **before** the token is
+    SSRF / token-leak guard (upstream ``getTrustedGraphUrl``, chat@4.40.0): only
+    an ``https://`` URL whose host is exactly one of the Graph national-cloud
+    hosts in ``_TRUSTED_GRAPH_HOSTS`` is trusted to receive the Graph-scoped
+    bearer token. Used to gate every request URL **before** the token is
     attached. Parse failures fail closed.
     """
     try:
@@ -251,13 +259,12 @@ async def call_teams_graph_api(path_or_url: str, options: TeamsGraphOptions) -> 
     or ``https://graph.microsoft.com/v1.0/``) after stripping leading slashes.
     Raises :class:`TeamsApiError` for non-2xx responses.
 
-    Python-specific hardening: an absolute ``path_or_url`` is validated through
-    :func:`is_trusted_graph_url` **before** the token is resolved or attached,
-    raising :class:`ValueError` for any host other than ``graph.microsoft.com``.
-    This is what gates a hostile ``@odata.nextLink`` followed via
-    :func:`paginate_teams_graph`. Relative paths are always joined onto the
-    trusted base URL, so they need no host check. Upstream performs no such
-    check.
+    SSRF / token-leak guard (upstream parity since chat@4.40.0): the final
+    request URL — an absolute ``path_or_url`` (e.g. a hostile ``@odata.nextLink``
+    followed via :func:`paginate_teams_graph`) or a relative path joined onto
+    ``graph_url`` — is validated through :func:`is_trusted_graph_url` **before**
+    the token is resolved or attached, raising :class:`ValueError` (upstream
+    raises ``TeamsApiError``) with upstream's message text.
     """
     # Route on the PARSED form, not a case-sensitive ``startswith("http")`` prefix.
     # ``HTTPS://evil`` (mixed-case scheme) and ``//evil`` (scheme-relative) both slip
@@ -273,14 +280,17 @@ async def call_teams_graph_api(path_or_url: str, options: TeamsGraphOptions) -> 
     except (ValueError, TypeError):
         is_absolute = True  # unparseable -> fail closed; the allowlist below rejects it
     if is_absolute:
-        if not is_trusted_graph_url(path_or_url):
-            raise ValueError(f"Refusing to call Microsoft Graph API on untrusted host: {path_or_url}")
         url = path_or_url
     else:
         url = urljoin(
             options.graph_url if options.graph_url is not None else _DEFAULT_GRAPH_URL,
             _LEADING_SLASH_PATTERN.sub("", path_or_url),
         )
+    # Validate the FINAL URL either way: a caller-supplied ``graph_url`` is as
+    # untrusted as an absolute ``path_or_url`` (upstream validates the resolved
+    # URL too).
+    if not is_trusted_graph_url(url):
+        raise ValueError(f"Refusing to send a Microsoft Graph token to an untrusted URL: {url}")
 
     request = options.fetch if options.fetch is not None else _default_fetch
     token = await resolve_graph_access_token(options)
