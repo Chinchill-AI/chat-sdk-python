@@ -348,7 +348,8 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 
 ### WhatsApp business-scoped user IDs (chat@4.37–4.39, #236)
 
-Parity apart from one divergence: contact matching (see the
+Parity apart from malformed-payload hardening (below) and one divergence:
+contact matching (see the
 [Known Non-Parity](#known-non-parity-with-typescript-sdk) row "WhatsApp contact
 matching"). Ports upstream `3e6e866a` (vercel/chat#818,
 chat@4.39.0) and the type-only context variants of `16879fdc` (vercel/chat#723,
@@ -376,6 +377,19 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
   per logical post (shared by every chunk); `add_reaction` / `remove_reaction`
   resolve their own. `_BSUID_PATTERN` uses `fullmatch`, so, as with JS
   `/^...$/`, a trailing newline does not match.
+- **Malformed changes (Python-specific hardening):** a `messages` change whose
+  `metadata.phone_number_id` is missing, null or not a string fails each of its
+  messages with the per-message `"Failed to handle inbound message"` error and
+  the webhook still returns 200, so later changes in the same POST are
+  dispatched. That matches upstream for a null `metadata` (read inside its
+  per-message `try`); upstream would instead dispatch a `metadata` without
+  `phone_number_id` under `whatsapp:undefined:...`. A `user_id_update` change
+  without a business number is skipped with a warning (upstream throws out of
+  `handleWebhook`, a 500 and a Meta retry of the whole batch), and a non-dict
+  `user_id` / `parent_user_id` is read as absent, like upstream's `?.`. No
+  identity key is ever written under an empty business number. A non-dict
+  change `value` is skipped. Regression tests:
+  `TestBusinessScopedUserIdsMalformedPayloads`.
 - **Casing:** upstream's `WhatsAppRawMessage.userId` is `user_id` here,
   matching the existing snake_case raw key `phone_number_id`.
 - **Not yet ported here:** the `recipient()` calls in upstream `sendTemplate`
@@ -410,7 +424,8 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
 
 Regression coverage: `tests/test_whatsapp_webhook.py`
 (`TestHandleWebhookBusinessScopedUserIds`, `TestParseMessageBusinessScopedUserIds`,
-`TestPostMessageBusinessScopedRecipients`, `TestBusinessScopedUserIdsPythonSpecific`).
+`TestPostMessageBusinessScopedRecipients`, `TestBusinessScopedUserIdsPythonSpecific`,
+`TestBusinessScopedUserIdsMalformedPayloads`, `TestBusinessScopedUserIdsIdentityInvariants`).
 
 ## What to Port vs What to Adapt
 

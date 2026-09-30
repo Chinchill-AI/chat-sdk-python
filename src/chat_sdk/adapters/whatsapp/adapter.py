@@ -123,6 +123,21 @@ def _first_not_none(*values: Any) -> Any:
     return None
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return ``value`` if it is a dict, else an empty dict (JS ``?.`` on a non-object)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _metadata_phone_number_id(value: Any) -> str:
+    """Business ``phone_number_id`` from a webhook change value, or ``""``.
+
+    Tolerates a missing, null or non-dict ``metadata`` so a malformed change
+    can never raise out of ``handle_webhook``.
+    """
+    phone_number_id = _as_dict(_as_dict(value).get("metadata")).get("phone_number_id")
+    return phone_number_id if isinstance(phone_number_id, str) else ""
+
+
 def split_message(text: str) -> list[str]:
     """Split text into chunks that fit within WhatsApp's message limit.
 
@@ -284,8 +299,10 @@ class WhatsAppAdapter:
                 if change.get("field") != "messages":
                     continue
 
-                value = change.get("value", {})
-                phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
+                value = change.get("value")
+                if not isinstance(value, dict):
+                    continue
+                phone_number_id = _metadata_phone_number_id(value)
                 contacts = value.get("contacts") or []
 
                 # Process incoming messages. `value["messages"]` is typed as
@@ -294,6 +311,14 @@ class WhatsAppAdapter:
                 if value.get("messages"):
                     for message in value["messages"]:
                         try:
+                            # Upstream reads `value.metadata.phone_number_id`
+                            # inside this try, so a malformed change fails
+                            # per message (logged) and the webhook still
+                            # returns 200. Raising here keeps that contract
+                            # and never writes identity keys under an empty
+                            # business number.
+                            if not phone_number_id:
+                                raise ValueError("WhatsApp change is missing metadata.phone_number_id")
                             inbound = cast("WhatsAppInboundMessage", message)
                             contact = self._match_contact(inbound, contacts)
                             identity = await self._resolve(inbound, contact, phone_number_id)
@@ -693,12 +718,20 @@ class WhatsAppAdapter:
         if not self._chat or not isinstance(value, dict):
             return
 
-        phone_number_id = (value.get("metadata") or {}).get("phone_number_id", "")
+        phone_number_id = _metadata_phone_number_id(value)
+        if not phone_number_id:
+            # Upstream throws out of handleWebhook here (500, Meta retries the
+            # batch); we skip the change instead of writing identity keys
+            # under an empty business number.
+            self._logger.warn("WhatsApp user_id_update is missing metadata.phone_number_id")
+            return
         for update in value.get("user_id_update") or []:
             if not isinstance(update, dict):
                 continue
-            user_id = cast("dict[str, Any]", update.get("user_id") or {})
-            parent_user_id = cast("dict[str, Any]", update.get("parent_user_id") or {})
+            # Upstream `update.user_id?.previous` yields undefined for a
+            # non-object field; treat any non-dict the same way.
+            user_id = _as_dict(update.get("user_id"))
+            parent_user_id = _as_dict(update.get("parent_user_id"))
             wa_id = update.get("wa_id")
             identifiers = [
                 identifier

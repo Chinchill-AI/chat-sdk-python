@@ -1499,3 +1499,155 @@ class TestBusinessScopedUserIdsPythonSpecific:
         assert thread_id == f"whatsapp:123456789:{BSUID}"
         assert parsed.raw["message"]["context"] == {"forwarded": True}
         logger.error.assert_not_called()
+
+
+class TestBusinessScopedUserIdsMalformedPayloads:
+    """Python-specific: malformed change shapes never escape ``handle_webhook``
+    (issue #236 review). Upstream reads ``value.metadata.phone_number_id``
+    inside its per-message try, so a bad change fails per message and the
+    webhook still returns 200."""
+
+    @pytest.mark.parametrize("metadata", [None, "123456789", {}, {"phone_number_id": None}])
+    async def test_bad_metadata_fails_per_message_and_later_changes_still_dispatch(self, metadata):
+        adapter, chat, state, logger = await _bsuid_env()
+        payload = _notification([_inbound({"from": PHONE})])
+        bad_value = dict(payload["entry"][0]["changes"][0]["value"], metadata=metadata)
+        good_value = _notification([_inbound({"id": "wamid.2", "from": NEW_PHONE})])["entry"][0]["changes"][0]["value"]
+        payload["entry"][0]["changes"] = [
+            {"field": "messages", "value": bad_value},
+            {"field": "messages", "value": good_value},
+        ]
+
+        response = await _deliver(adapter, payload)
+
+        assert response["status"] == 200
+        assert [call[0][1] for call in chat.process_message.call_args_list] == [f"whatsapp:123456789:{NEW_PHONE}"]
+        logger.error.assert_called_once()
+        assert logger.error.call_args[0][0] == "Failed to handle inbound message"
+        # No identity keys under an empty business number.
+        assert sorted(state._cache) == [
+            f"whatsapp:identity:alias:123456789:{NEW_PHONE}",
+            f"whatsapp:identity:route:123456789:{NEW_PHONE}",
+        ]
+
+    async def test_null_change_value_is_skipped(self):
+        adapter, chat, _, _ = await _bsuid_env()
+        payload = _notification([_inbound({"from": PHONE})])
+        payload["entry"][0]["changes"].insert(0, {"field": "messages", "value": None})
+
+        response = await _deliver(adapter, payload)
+
+        assert response["status"] == 200
+        assert chat.process_message.call_args[0][1] == f"whatsapp:123456789:{PHONE}"
+
+    @pytest.mark.parametrize("field", ["user_id", "parent_user_id"])
+    async def test_user_id_update_ignores_non_dict_nested_identifiers(self, field):
+        adapter, _, state, logger = await _bsuid_env()
+
+        response = await _deliver(adapter, _user_id_update_notification([{field: "US.X", "wa_id": PHONE}]))
+
+        assert response["status"] == 200
+        # The string field is ignored, like upstream `update.user_id?.previous`
+        # on a non-object; only the wa_id is linked.
+        assert await state.get(f"whatsapp:identity:alias:123456789:{PHONE}") == PHONE
+        assert await state.get("whatsapp:identity:alias:123456789:US.X") is None
+        logger.warn.assert_not_called()
+
+    @pytest.mark.parametrize("metadata", [None, {}])
+    async def test_user_id_update_without_business_number_writes_nothing(self, metadata):
+        adapter, _, state, logger = await _bsuid_env()
+        payload = _user_id_update_notification([{"user_id": {"previous": "US.A", "current": "US.B"}}])
+        payload["entry"][0]["changes"][0]["value"]["metadata"] = metadata
+
+        response = await _deliver(adapter, payload)
+
+        assert response["status"] == 200
+        assert state._cache == {}
+        assert logger.warn.call_args[0][0] == "WhatsApp user_id_update is missing metadata.phone_number_id"
+
+
+class TestBusinessScopedUserIdsIdentityInvariants:
+    """Python-specific: pins identity-merge behaviors from the upstream port
+    (issue #236 porting notes) that no upstream test exercises."""
+
+    async def test_author_is_me_when_the_sender_is_the_business_number(self):
+        adapter, chat, _, _ = await _bsuid_env()
+
+        await _deliver(adapter, _notification([_inbound({"from": "123456789"})]))
+
+        assert chat.process_message.call_args[0][2].author.is_me is True
+
+    async def test_system_message_without_a_phone_drops_the_stored_phone(self):
+        adapter, chat, state, _ = await _bsuid_env()
+        await _deliver(adapter, _notification([_inbound({"from": PHONE, "from_user_id": BSUID})]))
+        rotation = {
+            "id": "wamid.system",
+            "timestamp": "1700000002",
+            "type": "system",
+            "system": {"body": "User changed", "user_id": BSUID, "type": "user_changed_user_id"},
+        }
+
+        await _deliver(adapter, _notification([rotation]))
+
+        assert await state.get(f"whatsapp:identity:route:123456789:{PHONE}") == {"bsuid": BSUID}
+        chat.process_message.assert_called_once()
+
+    async def test_aliases_are_honored_in_identifier_order(self):
+        adapter, chat, state, _ = await _bsuid_env()
+        await state.set(f"whatsapp:identity:alias:123456789:{BSUID}", "canonical-bsuid")
+        await state.set(f"whatsapp:identity:alias:123456789:{PHONE}", "canonical-phone")
+
+        await _deliver(adapter, _notification([_inbound({"from": PHONE, "from_user_id": BSUID})]))
+
+        assert chat.process_message.call_args[0][1] == "whatsapp:123456789:canonical-bsuid"
+        assert await state.get(f"whatsapp:identity:alias:123456789:{PHONE}") == "canonical-bsuid"
+
+    async def test_phone_only_message_keeps_stored_bsuid_and_parent(self):
+        adapter, _, state, _ = await _bsuid_env()
+        await _deliver(
+            adapter,
+            _notification([_inbound({"from": PHONE, "from_user_id": BSUID, "from_parent_user_id": PARENT_BSUID})]),
+        )
+
+        await _deliver(adapter, _notification([_inbound({"id": "wamid.2", "from": PHONE})]))
+
+        assert await state.get(f"whatsapp:identity:route:123456789:{PHONE}") == {
+            "bsuid": BSUID,
+            "parent": PARENT_BSUID,
+            "phone": PHONE,
+        }
+
+    async def test_recipient_falls_back_to_the_parent_without_a_bsuid(self):
+        adapter, _, state, _ = await _bsuid_env()
+        await state.set(f"whatsapp:identity:route:123456789:{PHONE}", {"phone": PHONE, "parent": PARENT_BSUID})
+
+        assert await adapter._recipient(f"whatsapp:123456789:{PHONE}", PHONE) == {
+            "to": PHONE,
+            "recipient": PARENT_BSUID,
+        }
+
+    async def test_user_id_update_without_prior_state_keys_by_the_previous_id(self):
+        adapter, _, state, _ = await _bsuid_env()
+
+        update = {"user_id": {"previous": "US.OLD", "current": "US.NEW"}, "wa_id": NEW_PHONE}
+
+        await _deliver(adapter, _user_id_update_notification([update]))
+
+        for identifier in ("US.OLD", "US.NEW", NEW_PHONE):
+            assert await state.get(f"whatsapp:identity:alias:123456789:{identifier}") == "US.OLD"
+        assert await state.get("whatsapp:identity:route:123456789:US.OLD") == {"bsuid": "US.NEW", "phone": NEW_PHONE}
+
+    async def test_user_id_update_without_a_parent_keeps_the_stored_parent(self):
+        adapter, _, state, _ = await _bsuid_env()
+        await state.set("whatsapp:identity:alias:123456789:US.OLD", "US.OLD")
+        await state.set("whatsapp:identity:route:123456789:US.OLD", {"bsuid": "US.OLD", "parent": PARENT_BSUID})
+
+        await _deliver(
+            adapter,
+            _user_id_update_notification([{"user_id": {"previous": "US.OLD", "current": "US.NEW"}}]),
+        )
+
+        assert await state.get("whatsapp:identity:route:123456789:US.OLD") == {
+            "bsuid": "US.NEW",
+            "parent": PARENT_BSUID,
+        }
