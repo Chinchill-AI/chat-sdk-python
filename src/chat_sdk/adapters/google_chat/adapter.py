@@ -2916,6 +2916,14 @@ class GoogleChatAdapter:
         (``message["thread"]["name"]``), not the one supplied, so callers can
         confirm which thread a message really belongs to before acting on it.
         Returns ``None`` when the message does not exist (404).
+
+        Reads with the app's own credentials even when ``impersonate_user`` is
+        configured, as upstream does (``this.chatApi``, not
+        ``impersonatedChatApi``). Unlike history listing, a single-message
+        read is used to confirm a message before acting on it as the app, so
+        it must only see what the app itself can see; a message visible only to
+        the delegated user reads as a 403/404 rather than via the user's
+        broader access.
         """
         self._assert_message_in_space(thread_id, message_id)
         space_name = self.decode_thread_id(thread_id).space_name

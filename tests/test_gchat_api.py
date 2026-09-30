@@ -808,6 +808,27 @@ class TestFetchMessage:
         assert await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/gone") is None
 
     @pytest.mark.asyncio
+    async def test_reads_with_app_credentials_even_when_impersonation_is_configured(self):
+        # Parity with upstream fetchMessage, which calls this.chatApi (app
+        # auth) rather than impersonatedChatApi, unlike fetchMessages.
+        adapter, api, _ = await _init_adapter(impersonate_user="admin@example.com")
+        api.set_response(
+            "GET",
+            "spaces/ABC123/messages/msg1",
+            {
+                "name": "spaces/ABC123/messages/msg1",
+                "text": "hello",
+                "sender": {"name": "users/1", "displayName": "Alice", "type": "HUMAN"},
+                "createTime": "2024-01-01T00:00:00Z",
+            },
+        )
+
+        await adapter.fetch_message(_SPACE_THREAD, "spaces/ABC123/messages/msg1")
+
+        calls = api.get_calls("GET", "spaces/ABC123/messages/msg1")
+        assert [c["use_impersonation"] for c in calls] == [False]
+
+    @pytest.mark.asyncio
     async def test_rejects_a_message_from_another_space_without_calling_the_api(self):
         adapter, api, _ = await _init_adapter()
         with pytest.raises(ValidationError, match=_FOREIGN_SPACE):
