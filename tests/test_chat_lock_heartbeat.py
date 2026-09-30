@@ -666,7 +666,7 @@ class TestLifetimeCapEndsDrains:
         assert handled == ["cap-q-1"]
         assert await state.queue_depth(THREAD) == 1
 
-    async def test_continuous_debounce_traffic_ends_one_ttl_after_the_cap(self, monkeypatch):
+    async def test_continuous_debounce_traffic_ends_at_the_lifetime_cap(self, monkeypatch):
         clock = FakeClock().install(monkeypatch)
         state = create_mock_state()
         install_token_lock_mock(state, clock)
@@ -696,11 +696,10 @@ class TestLifetimeCapEndsDrains:
         ended_after = clock.now - started_at
 
         assert holder.done()
-        # Renewal stops at the 20s cap tick. The last full-TTL extend (a
-        # heartbeat tick or a pre-dispatch ownership check just before the
-        # cap) keeps the lock at most one TTL longer; the loop notices after
-        # its next debounce sleep.
-        assert 40_000 <= ended_after <= 20_000 + DEFAULT_LOCK_TTL_MS + 1_500 + 1_000
+        # Past the 20s cap the pre-dispatch ownership check is refused, so the
+        # loop ends after its next debounce sleep (the lock itself lapses one
+        # TTL after the last extend).
+        assert 20_000 <= ended_after <= 20_000 + 1_500 + 1_000
         assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
 
         await clock.advance(10_000)
@@ -898,3 +897,102 @@ class TestHeldLockHandoff:
         assert "Releasing lock while a heartbeat extend is still in flight" in _warn_messages(logger)
         never.set()
         await clock.settle()
+
+    async def test_message_enqueued_while_the_drain_waits_on_an_in_flight_extend_is_drained(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        real_extend = state.extend_lock
+        gate = asyncio.Event()
+
+        async def gated_extend(lock: Lock, ttl_ms: int) -> bool:
+            await gate.wait()
+            return await real_extend(lock, ttl_ms)
+
+        chat, adapter, _ = await _make_chat(state, concurrency="queue")
+        finish = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "wait-1":
+                await finish.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("wait-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["wait-1"])
+        # Gate only the heartbeat tick: the drain's ownership check before
+        # the first handler finished already ran, so gate extends from now on.
+        state.extend_lock = gated_extend  # type: ignore[method-assign]
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3)  # heartbeat extend now in flight
+        state.extend_lock = real_extend  # type: ignore[method-assign]
+        finish.set()
+        await clock.settle()
+        assert not first.done()  # the holder is waiting on the in-flight extend
+
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("wait-2", "Hey @slack-bot two"))
+        gate.set()
+        await first
+
+        assert handled == ["wait-1", "wait-2"]
+        assert await state.queue_depth(THREAD) == 0
+
+
+class TestHeartbeatDeadlines:
+    """Unit coverage for ``_LockHeartbeat`` deadline bookkeeping."""
+
+    async def test_late_heartbeat_extend_keeps_a_newer_confirmed_deadline(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        calls = 0
+
+        async def extend(lock: Lock, ttl_ms: int) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # heartbeat tick at 10s, returns at 16s
+                await clock.sleep(6_000)
+                return True
+            if calls == 2:  # confirm_ownership at 15s
+                return True
+            raise ConnectionError("backend down")
+
+        state.extend_lock = AsyncMock(side_effect=extend)  # type: ignore[method-assign]
+        lock = Lock(thread_id=THREAD, token="t", expires_at=0)
+        hb = chat_module._LockHeartbeat(state, lock, chat_module._monotonic_ms(), 600_000, MockLogger())
+        try:
+            await clock.advance(15_000)
+            assert await hb.confirm_ownership() is True  # held until 45s
+            await clock.advance(26_000)  # 41s: the late 10s extend (40s) must not win
+            assert hb.is_ownership_lost() is False
+            await clock.advance(4_000)  # 45s
+            assert hb.is_ownership_lost() is True
+        finally:
+            await hb.stop()
+
+    async def test_confirm_is_refused_past_the_cap_even_with_renewal_stuck(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        never = asyncio.Event()
+        calls = 0
+
+        async def extend(lock: Lock, ttl_ms: int) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # the heartbeat's own extend stalls
+                await never.wait()
+            return True
+
+        state.extend_lock = AsyncMock(side_effect=extend)  # type: ignore[method-assign]
+        lock = Lock(thread_id=THREAD, token="t", expires_at=0)
+        hb = chat_module._LockHeartbeat(state, lock, chat_module._monotonic_ms(), 20_000, MockLogger())
+        try:
+            await clock.advance(15_000)
+            assert await hb.confirm_ownership() is True
+            await clock.advance(6_000)  # 21s: past the cap
+            assert await hb.confirm_ownership() is False
+            assert calls == 2  # the refused check never reached the backend
+        finally:
+            never.set()
+            await hb.stop()

@@ -355,8 +355,10 @@ class _LockHeartbeat:
             return True
         if extended:
             # The backend applied the new TTL after ``requested_at``, so this
-            # deadline never runs past the backend's expiry.
-            self._held_until = requested_at + DEFAULT_LOCK_TTL_MS
+            # deadline never runs past the backend's expiry. ``max`` keeps a
+            # newer deadline set by a ``confirm_ownership()`` that finished
+            # while this extend was in flight.
+            self._held_until = max(self._held_until, requested_at + DEFAULT_LOCK_TTL_MS)
             return True
         self._ownership_lost = True
         if not self._stopped:
@@ -376,27 +378,49 @@ class _LockHeartbeat:
         means another holder owns the thread now. A backend error falls back
         to the ``held_until`` rule, like the heartbeat's own extends.
 
-        While the heartbeat is still renewing, the check extends by the full
-        TTL, like a heartbeat tick (full-TTL extends only ever move the expiry
-        forward, so racing the heartbeat's own extend is harmless). Once
-        renewal has ended (``max_lock_lifetime_ms``), it extends only by the
-        time still known held, so the backend expiry stays at about
-        ``held_until`` and the cap still bounds a busy drain.
+        The check extends by the full TTL, like a heartbeat tick (full-TTL
+        extends only ever move the expiry forward, so racing the heartbeat's
+        own extend is harmless), so a confirmed step starts with a full TTL of
+        margin. It is refused -- the drain stops and leaves the queue for the
+        next holder -- once ``max_lock_lifetime_ms`` has elapsed (measured
+        here, not via the renewal task, which may be stuck in a stalled
+        extend) or renewal has ended for any other reason, so the cap bounds
+        a busy drain even when the backend answers these checks.
         """
         requested_at = _monotonic_ms()
-        ttl_ms = DEFAULT_LOCK_TTL_MS if self._renewing else self._held_until - requested_at
-        # Checked after ``requested_at`` is taken, so ``ttl_ms`` is positive.
-        if self.is_ownership_lost():
+        if not self._renewing or requested_at - self._started_at >= self._max_lifetime_ms or self.is_ownership_lost():
             return False
         try:
-            extended = await self._state.extend_lock(self._lock, ttl_ms)
+            extended = await self._state.extend_lock(self._lock, DEFAULT_LOCK_TTL_MS)
         except Exception:
             return not self.is_ownership_lost()
         if extended:
-            self._held_until = max(self._held_until, requested_at + ttl_ms)
+            self._held_until = max(self._held_until, requested_at + DEFAULT_LOCK_TTL_MS)
             return not self.is_ownership_lost()
         self._ownership_lost = True
         return False
+
+    async def settle_in_flight(self) -> bool:
+        """Wait for an in-flight heartbeat extend, bounded by ``held_until``.
+
+        Returns ``True`` if it had to wait (so it yielded to the event loop),
+        ``False`` if nothing was in flight. Drain loops call this before
+        returning on an empty queue: a message that enqueued while they
+        waited is then seen by one more pass, and ``stop()`` -- which runs
+        next with no await in between -- finds nothing in flight and releases
+        without yielding.
+        """
+        in_flight = self._in_flight
+        if in_flight is None or in_flight.done():
+            return False
+        remaining_ms = self._held_until - _monotonic_ms()
+        if remaining_ms > 0:
+            timer = asyncio.get_running_loop().create_task(_sleep(remaining_ms))
+            try:
+                await asyncio.wait({in_flight, timer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                timer.cancel()
+        return True
 
     async def stop(self) -> None:
         """Stop renewing before ``release_lock``.
@@ -406,6 +430,9 @@ class _LockHeartbeat:
         returns without yielding to the event loop: a message that enqueues
         between the drain's last empty-queue check and ``release_lock`` would
         otherwise be stranded until the next webhook.
+
+        (Drain loops already call :meth:`settle_in_flight` before returning on
+        an empty queue, so on those paths nothing is in flight here.)
 
         With an extend in flight, waits for it -- but only while the lock is
         still known held (``held_until``). Past that the lock may have lapsed
@@ -418,16 +445,9 @@ class _LockHeartbeat:
         self._stopped = True
         self._task.cancel()
         in_flight = self._in_flight
-        if in_flight is None or in_flight.done():
+        if not await self.settle_in_flight():
             return
-        remaining_ms = self._held_until - _monotonic_ms()
-        if remaining_ms > 0:
-            timer = asyncio.get_running_loop().create_task(_sleep(remaining_ms))
-            try:
-                await asyncio.wait({in_flight, timer}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                timer.cancel()
-        if not in_flight.done():
+        if in_flight is not None and not in_flight.done():
             self._logger.warn(
                 "Releasing lock while a heartbeat extend is still in flight",
                 {"thread_id": self._lock.thread_id, "token": self._lock.token},
@@ -2506,8 +2526,8 @@ class Chat:
         Loops until the queue stays empty for a whole window, so a message
         enqueued while the handler ran is debounced and processed instead
         of stranded until the next webhook. ``max_lock_lifetime_ms`` bounds
-        the loop: once renewal stops the lock lapses and
-        ``is_ownership_lost()`` ends it.
+        the loop: past it ``confirm_ownership()`` is refused and the loop
+        ends (see :meth:`_LockHeartbeat.confirm_ownership`).
         """
         debounce_ms = self._concurrency_debounce_ms
         skipped: list[Message] = []
@@ -2521,6 +2541,9 @@ class Chat:
 
             pending = await self._take_pending(adapter, lock_key)
             if not pending:
+                if await heartbeat.settle_in_flight():
+                    # We yielded: a message may have enqueued meanwhile.
+                    continue
                 return
 
             latest = pending[-1]
@@ -2576,6 +2599,9 @@ class Chat:
 
             pending = await self._take_pending(adapter, lock_key)
             if not pending:
+                if await heartbeat.settle_in_flight():
+                    # We yielded: a message may have enqueued meanwhile.
+                    continue
                 return
 
             # Latest message is the one we process, under ITS OWN thread id;
