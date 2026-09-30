@@ -2468,9 +2468,9 @@ class TestConcurrencyLockLifetime:
     """Faithful port of TS ``describe("concurrency: lock lifetime")``.
 
     TS uses ``vi.useFakeTimers()`` + ``installTokenLockMock``; the Python port
-    uses ``tests._fake_clock`` (virtual ``_sleep`` / ``_now_ms`` /
-    ``_monotonic_ms`` in ``chat_sdk.chat``) and a token-checked, expiry-aware
-    lock on the same clock.
+    uses ``tests._fake_clock`` (virtual ``_sleep`` / ``_now_ms`` in
+    ``chat_sdk.chat``) and a token-checked, expiry-aware lock on the same
+    clock.
     """
 
     # TS: it.each(["queue", "burst", "debounce"])("should keep the %s lock alive while a handler is running")

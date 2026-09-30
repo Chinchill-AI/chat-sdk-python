@@ -2,10 +2,10 @@
 
 Python stand-in for upstream's ``vi.useFakeTimers()`` and the
 ``installTokenLockMock`` helper in ``packages/chat/src/chat.test.ts``
-(chat@4.39.0, 5b538f6f). ``FakeClock.install`` swaps the three time helpers
-in ``chat_sdk.chat`` (``_sleep``, ``_now_ms``, ``_monotonic_ms``), so the
-lock heartbeat, debounce/burst windows and queue-entry expiry all run on
-virtual time: a 90-second scenario completes without a real sleep.
+(chat@4.39.0, 5b538f6f). ``FakeClock.install`` swaps the two time helpers
+in ``chat_sdk.chat`` (``_sleep`` and ``_now_ms``), so the lock heartbeat,
+debounce/burst windows and queue-entry expiry all run on virtual time: a
+90-second scenario completes without a real sleep.
 """
 
 from __future__ import annotations
@@ -29,11 +29,10 @@ _SETTLE_TURNS = 50
 
 
 class FakeClock:
-    """Virtual wall + monotonic clock with vitest-style timer advancement."""
+    """Virtual clock with vitest-style timer advancement."""
 
     def __init__(self) -> None:
         self.now = int(time.time() * 1000)
-        self._monotonic_base = self.now
         self._timers: list[tuple[int, int, asyncio.Future[None]]] = []
         self._seq = itertools.count()
 
@@ -41,9 +40,6 @@ class FakeClock:
 
     def now_ms(self) -> int:
         return self.now
-
-    def monotonic_ms(self) -> int:
-        return self.now - self._monotonic_base
 
     async def sleep(self, ms: int) -> None:
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -53,20 +49,9 @@ class FakeClock:
     def install(self, monkeypatch: pytest.MonkeyPatch) -> FakeClock:
         monkeypatch.setattr("chat_sdk.chat._sleep", self.sleep)
         monkeypatch.setattr("chat_sdk.chat._now_ms", self.now_ms)
-        monkeypatch.setattr("chat_sdk.chat._monotonic_ms", self.monotonic_ms)
         return self
 
     # -- test controls -----------------------------------------------------------
-
-    def jump_wall_clock(self, ms: int) -> None:
-        """Step only the wall clock (an NTP step); monotonic time is unchanged.
-
-        Timers are not fired: they run on elapsed (monotonic) time.
-        """
-        self.now += int(ms)
-        self._monotonic_base += int(ms)
-        self._timers = [(deadline + int(ms), seq, fut) for deadline, seq, fut in self._timers]
-        heapq.heapify(self._timers)
 
     def pending_timers(self) -> int:
         """Timers still waiting to fire (``vi.getTimerCount()``)."""
