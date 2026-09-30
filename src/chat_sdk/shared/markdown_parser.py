@@ -1092,38 +1092,39 @@ def _node_value(node: Content) -> str | None:
     return None
 
 
-def _child_plain_text(node: Content, separator: str, keep_empty: bool = False) -> str:
-    children = node.get("children")
-    if not isinstance(children, list):
-        return ""
-    texts = [_plain_text_node(child) for child in children]
-    return separator.join(texts if keep_empty else [text for text in texts if text])
-
-
 def _plain_text_node(node: Content) -> str:
+    # One Python frame per nesting level: the child walk is an explicit loop
+    # in this function (no helper, no comprehension), so extraction never
+    # overflows the stack before ``parse_markdown`` itself would. Deeply
+    # nested blockquotes/lists arrive in ordinary inbound messages.
     value = _node_value(node)
     if value is not None:
         return value
 
     node_type = node.get("type")
-    if node_type == "root":
-        return _child_plain_text(node, "\n\n")
-    if node_type in ("list", "listItem", "blockquote"):
-        return _child_plain_text(node, "\n")
-    if node_type == "table":
-        # Drop rows with no content (e.g. a placeholder header row) but keep
-        # rows that have any populated cell. JS ``trim()`` whitespace set.
-        children = node.get("children")
-        rows = [_plain_text_node(child) for child in children] if isinstance(children, list) else []
-        return "\n".join(row for row in rows if row.strip(JS_WHITESPACE))
-    if node_type == "tableRow":
-        # Keep empty cells so columns stay aligned in the tab-separated output
-        return _child_plain_text(node, "\t", keep_empty=True)
     if node_type == "break":
         return "\n"
     if node_type == "thematicBreak":
         return ""
-    return _child_plain_text(node, "")
+
+    children = node.get("children")
+    texts: list[str] = []
+    if isinstance(children, list):
+        for child in children:
+            texts.append(_plain_text_node(child))
+
+    if node_type == "root":
+        return "\n\n".join(text for text in texts if text)
+    if node_type in ("list", "listItem", "blockquote"):
+        return "\n".join(text for text in texts if text)
+    if node_type == "table":
+        # Drop rows with no content (e.g. a placeholder header row) but keep
+        # rows that have any populated cell. JS ``trim()`` whitespace set.
+        return "\n".join(row for row in texts if row.strip(JS_WHITESPACE))
+    if node_type == "tableRow":
+        # Keep empty cells so columns stay aligned in the tab-separated output
+        return "\t".join(texts)
+    return "".join(text for text in texts if text)
 
 
 def ast_to_plain_text(node: Content) -> str:

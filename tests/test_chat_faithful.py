@@ -386,7 +386,7 @@ class TestMentionHandling:
         assert calls[0] == "msg-1"
 
     # TS: "should call onNewMention for newline-separated GitHub bot mentions"
-    async def test_should_call_onnewmention_for_newline_separated_github_bot_mentions(self):
+    async def test_should_call_onnewmention_for_newlineseparated_github_bot_mentions(self):
         github = create_mock_adapter("github")
         github.user_name = "test-bot"
         chat = Chat(

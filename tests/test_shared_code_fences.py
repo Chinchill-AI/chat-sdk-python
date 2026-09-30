@@ -129,3 +129,19 @@ class TestNormalizeCodeFencesPortingHazards:
 
         assert normalize_code_fences("```a```", convert_text=record) == "```\na\n```"
         assert seen == ["", ""]
+
+    def test_no_extra_newline_before_a_fence_that_already_starts_a_line(self):
+        assert normalize_code_fences("a\n```x```") == "a\n```\nx\n```"
+
+    def test_empty_text_segment_between_adjacent_fences_adds_no_blank_line(self):
+        # The empty converted segment must not reset the "ends with newline"
+        # bookkeeping that stands in for JS ``result.endsWith("\n")``.
+        assert normalize_code_fences("```a``````b```") == "```\na\n```\n```\nb\n```"
+
+    def test_blockquote_check_only_looks_at_the_fences_own_line(self):
+        assert normalize_code_fences("> a ```c``` b\nx") == "> a ```c``` b\nx"
+        assert normalize_code_fences("> q\na ```c``` b") == "> q\na \n```\nc\n```\n b"
+
+    def test_inline_code_span_does_not_cross_a_newline(self):
+        # The lone backtick is literal, so the fence on the next line pairs.
+        assert normalize_code_fences("`a\n```b```") == "`a\n```\nb\n```"

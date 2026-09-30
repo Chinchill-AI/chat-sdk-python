@@ -233,3 +233,19 @@ class TestReplaceBareMentionsCodeSpans:
 
     def test_code_span_inside_unclosed_angle_run(self):
         assert to_token("<a `@x` @y") == "<a `@x` <@y>"
+
+
+class TestReplaceBareMentionsClosedAngleTokens:
+    """A closed ``<...>`` token is copied verbatim, even with an ``@`` inside it
+    that is not right after the ``<`` (outputs verified against chat@4.41.1)."""
+
+    def test_at_inside_a_closed_token_is_not_wrapped(self):
+        assert to_token("<!subteam^S1|@team>") == "<!subteam^S1|@team>"
+
+    def test_mention_after_a_closed_token_is_still_converted(self):
+        assert to_token("<#C1|@general> @bob") == "<#C1|@general> <@bob>"
+
+    def test_fence_closing_past_the_unclosed_angle_line_is_not_code(self):
+        # The unclosed ``<`` run ends at the newline, so a fence that closes
+        # on a later line is plain text inside that run (``close >= end``).
+        assert to_token("<a ```b\n``` @c") == "<a ```b\n``` <@c>"

@@ -648,6 +648,15 @@ class TestToPlainText:
         table: Content = {"type": "table", "children": [row("\ufeff"), row("\x1c"), row("a")]}
         assert ast_to_plain_text(table) == "\x1c\na"
 
+    def test_deeply_nested_blockquote_does_not_overflow_the_stack(self):
+        # One frame per nesting level: a 600-deep blockquote (a ~600-byte
+        # inbound comment) parses fine, so extraction must not RecursionError.
+        assert ast_to_plain_text(parse_markdown(">" * 600 + " x")) == "x"
+
+    def test_deeply_nested_list_does_not_overflow_the_stack(self):
+        text = "\n".join("  " * depth + "- a" for depth in range(300))
+        assert ast_to_plain_text(parse_markdown(text)) == "\n".join(["a"] * 300)
+
 
 # ============================================================================
 # markdownToPlainText Tests
@@ -665,11 +674,11 @@ class TestMarkdownToPlainText:
         result = _markdown_to_plain_text("# Heading\n\nParagraph with `code`.")
         assert result == "Heading\n\nParagraph with code."
 
-    def test_preserves_whitespace_after_a_newline_separated_mention(self):
+    def test_preserves_whitespace_after_a_newlineseparated_mention(self):
         result = _markdown_to_plain_text("@test-bot\nhi there")
         assert BOT_MENTION_WITH_WHITESPACE_REGEX.search(result) is not None
 
-    def test_preserves_whitespace_after_a_paragraph_separated_mention(self):
+    def test_preserves_whitespace_after_a_paragraphseparated_mention(self):
         result = _markdown_to_plain_text("@test-bot\n\nhi there")
         assert BOT_MENTION_WITH_WHITESPACE_REGEX.search(result) is not None
 
