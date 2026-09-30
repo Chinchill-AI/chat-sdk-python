@@ -33,7 +33,8 @@ from chat_sdk.adapters.messenger.types import (
     MessengerAdapterConfig,
 )
 from chat_sdk.logger import ConsoleLogger
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.errors import NetworkError, ValidationError
+from tests.test_messenger_fetch import FakeResponse, FakeSession, make_adapter
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -943,7 +944,7 @@ class TestAttachmentParsing:
             message={
                 "mid": "mid.fd",
                 "text": "x",
-                "attachments": [{"type": "image", "payload": {"url": "https://example.com/img.jpg"}}],
+                "attachments": [{"type": "image", "payload": {"url": "https://cdn.fbsbx.com/img.jpg"}}],
             }
         )
         parsed = adapter.parse_message(event)
@@ -951,44 +952,42 @@ class TestAttachmentParsing:
         assert callable(parsed.attachments[0].fetch_data)
 
     @pytest.mark.asyncio
-    async def test_attachment_download_uses_session(self) -> None:
-        """``fetch_data`` reads bytes from the shared aiohttp session."""
-        adapter = _make_adapter()
+    async def test_downloads_attachment_successfully(self) -> None:
+        """``fetch_data`` downloads a Meta-CDN URL through the shared session."""
+        session = FakeSession(FakeResponse(b"fake-image-data"))
+        adapter = make_adapter(session)
         event = _sample_event(
             message={
                 "mid": "mid.dl",
-                "text": "x",
-                "attachments": [{"type": "image", "payload": {"url": "https://example.com/img.jpg"}}],
+                "text": "photo",
+                "attachments": [{"type": "image", "payload": {"url": "https://cdn.fbsbx.com/img.jpg"}}],
             }
         )
         parsed = adapter.parse_message(event)
 
-        # Patch the shared session with a minimal context-manager mock.
-        class _Resp:
-            status = 200
-
-            async def read(self) -> bytes:
-                return b"image-bytes"
-
-            async def __aenter__(self) -> _Resp:
-                return self
-
-            async def __aexit__(self, *_: object) -> None:
-                pass
-
-        # aiohttp's session.get(url) is a sync call returning an
-        # async-context-manager request handle. Wire side_effect (instead of
-        # assigning a fresh mock to .get) so the call returns _Resp directly.
-        def _session_get(url: str, **_kw: object) -> _Resp:
-            return _Resp()
-
-        mock_session = MagicMock()
-        mock_session.closed = False
-        mock_session.get.side_effect = _session_get
-        adapter._http_session = mock_session
-
         result = await parsed.attachments[0].fetch_data()
-        assert result == b"image-bytes"
+        assert result == b"fake-image-data"
+        assert session.urls == ["https://cdn.fbsbx.com/img.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_external_fallback_downloads_before_the_network(self) -> None:
+        """A user-controlled ``fallback`` URL is kept for display but never fetched."""
+        session = FakeSession(FakeResponse(b"secret"))
+        adapter = make_adapter(session)
+        url = "https://169.254.169.254/latest/meta-data"
+        event = _sample_event(
+            message={
+                "mid": "mid.fallback",
+                "text": "link",
+                "attachments": [{"type": "fallback", "payload": {"url": url}}],
+            }
+        )
+        attachment = adapter.parse_message(event).attachments[0]
+
+        assert attachment.url == url
+        with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
+            await attachment.fetch_data()
+        assert session.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1013,12 +1012,12 @@ class TestRehydrateAttachment:
                 "mid": "mid.meta",
                 "text": "x",
                 "attachments": [
-                    {"type": "image", "payload": {"url": "https://scontent.example.com/img.jpg"}},
+                    {"type": "image", "payload": {"url": "https://scontent.xx.fbcdn.net/img.jpg"}},
                 ],
             }
         )
         parsed = adapter.parse_message(event)
-        assert parsed.attachments[0].fetch_metadata == {"url": "https://scontent.example.com/img.jpg"}
+        assert parsed.attachments[0].fetch_metadata == {"url": "https://scontent.xx.fbcdn.net/img.jpg"}
 
     @pytest.mark.asyncio
     async def test_rehydrate_rebuilds_fetch_data_after_queue_roundtrip(self) -> None:
@@ -1034,7 +1033,7 @@ class TestRehydrateAttachment:
                 "mid": "mid.rehy",
                 "text": "x",
                 "attachments": [
-                    {"type": "image", "payload": {"url": "https://scontent.example.com/img.jpg"}},
+                    {"type": "image", "payload": {"url": "https://scontent.xx.fbcdn.net/img.jpg"}},
                 ],
             }
         )
@@ -1049,35 +1048,38 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         assert callable(rehydrated.fetch_data)
         # Preserves the metadata so a second roundtrip would still work.
-        assert rehydrated.fetch_metadata == {"url": "https://scontent.example.com/img.jpg"}
+        assert rehydrated.fetch_metadata == {"url": "https://scontent.xx.fbcdn.net/img.jpg"}
 
         # Wire a fake session to capture the URL the rebuilt closure hits.
-        captured_urls: list[str] = []
-
-        class _Resp:
-            status = 200
-
-            async def read(self) -> bytes:
-                return b"rehydrated-bytes"
-
-            async def __aenter__(self) -> _Resp:
-                return self
-
-            async def __aexit__(self, *_: object) -> None:
-                pass
-
-        def _session_get(url: str, **_kw: object) -> _Resp:
-            captured_urls.append(url)
-            return _Resp()
-
-        mock_session = MagicMock()
-        mock_session.closed = False
-        mock_session.get.side_effect = _session_get
-        adapter._http_session = mock_session
+        session = FakeSession(FakeResponse(b"rehydrated-bytes"))
+        adapter._http_session = session
 
         data = await rehydrated.fetch_data()
         assert data == b"rehydrated-bytes"
-        assert captured_urls == ["https://scontent.example.com/img.jpg"]
+        assert session.urls == ["https://scontent.xx.fbcdn.net/img.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_closure_refuses_untrusted_url_without_io(self) -> None:
+        """A tampered ``fetch_metadata["url"]`` in persisted state is not fetched.
+
+        The allowlist runs inside the download closure, so the rehydrate path
+        is guarded exactly like a freshly parsed attachment.
+        """
+        from chat_sdk.types import Attachment
+
+        session = FakeSession(FakeResponse(b"internal"))
+        adapter = make_adapter(session)
+        tampered = Attachment(
+            type="image",
+            url="https://scontent.xx.fbcdn.net/img.jpg",
+            fetch_metadata={"url": "http://10.0.0.5/admin"},
+        )
+
+        rehydrated = adapter.rehydrate_attachment(tampered)
+        assert rehydrated.fetch_data is not None
+        with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
+            await rehydrated.fetch_data()
+        assert session.calls == []
 
     def test_rehydrate_no_metadata_returns_unchanged(self) -> None:
         """Degraded mode: attachment without ``fetch_metadata`` is returned as-is."""

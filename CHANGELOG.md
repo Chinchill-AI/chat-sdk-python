@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+Part of the upstream `4.31.0` → `4.41.1` sync wave (#184). `UPSTREAM_PARITY` stays `4.31.0` until the wave's final pin bump.
+
+- **Messenger: guard attachment downloads** (#234, **security**; port of vercel/chat 153bd964, chat@4.39.0). `Attachment.fetch_data()` used to GET whatever URL arrived in the webhook `payload.url` and follow redirects, and `fallback` / link-share attachments carry user-controlled URLs (SSRF). Downloads are now restricted to https URLs on `fbsbx.com` / `fbcdn.net` (or a subdomain), checked before any network I/O and on every redirect hop (at most 5), with a 25 MB body cap and a 30 s deadline; failures raise `NetworkError("messenger", ...)`. The check runs inside the download closure, so closures rebuilt by `rehydrate_attachment` from persisted queue/debounce state are covered too.
+  - **Consumer-visible:** `fetch_data()` for a Messenger attachment whose URL is not on a Meta CDN host (typically `fallback` / link shares) now raises `NetworkError("messenger", "Refusing to fetch an untrusted attachment URL")` instead of downloading. `attachment.url` is unchanged and still available for display.
+  - **Python-specific (divergence from upstream):** no DNS / private-IP resolution check yet (the host allowlist alone rejects IP literals and non-Meta names; tracked for #204/#239), and the URL check is stricter than upstream (also rejects userinfo, non-443 ports and non-DNS-label hosts). See `docs/UPSTREAM_SYNC.md`.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.
