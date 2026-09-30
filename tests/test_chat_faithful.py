@@ -45,6 +45,7 @@ from chat_sdk.types import (
     SlashCommandEvent,
     WebhookOptions,
 )
+from tests._fake_clock import FakeClock, install_token_lock_mock
 
 HELP_REGEX = re.compile(r"help", re.IGNORECASE)
 HELLO_REGEX = re.compile(r"hello", re.IGNORECASE)
@@ -2459,6 +2460,128 @@ class TestOnLockConflict:
 
 
 # ============================================================================
+# 16b. concurrency: lock lifetime (vercel/chat#821, chat@4.39.0)
+# ============================================================================
+
+
+class TestConcurrencyLockLifetime:
+    """Faithful port of TS ``describe("concurrency: lock lifetime")``.
+
+    TS uses ``vi.useFakeTimers()`` + ``installTokenLockMock``; the Python port
+    uses ``tests._fake_clock`` (virtual ``_sleep`` / ``_now_ms`` in
+    ``chat_sdk.chat``) and a token-checked, expiry-aware lock on the same
+    clock.
+    """
+
+    # TS: it.each(["queue", "burst", "debounce"])("should keep the %s lock alive while a handler is running")
+    @pytest.mark.parametrize("strategy", ["queue", "burst", "debounce"])
+    async def test_should_keep_the_lock_alive_while_a_handler_is_running(self, strategy, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+        install_token_lock_mock(state, clock)
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy=strategy, debounce_ms=100),
+        )
+
+        in_flight = 0
+        peak_in_flight = 0
+        release_first_handler = asyncio.Event()
+        handled_ids: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            nonlocal in_flight, peak_in_flight
+            handled_ids.append(message.id)
+            in_flight += 1
+            peak_in_flight = max(peak_in_flight, in_flight)
+            if message.id == "msg-long-1":
+                await release_first_handler.wait()
+            in_flight -= 1
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-long-1", "Hey @slack-bot first"),
+            )
+        )
+        await clock.wait_for(lambda: len(handled_ids) == 1)
+
+        # Past the 30s lock TTL: only the heartbeat keeps the lock held.
+        await clock.advance(30_001)
+        second = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-long-2", "Hey @slack-bot second"),
+            )
+        )
+        await clock.advance(200)
+
+        calls_before_release = len(handled_ids)
+        release_first_handler.set()
+        await clock.wait_for(lambda: len(handled_ids) == 2)
+        await clock.advance(200)
+        await asyncio.gather(first, second)
+
+        assert calls_before_release == 1
+        assert handled_ids[1] == "msg-long-2"
+        assert peak_in_flight == 1
+        assert clock.pending_timers() == 0
+
+    # TS: "should stop renewing after maxLockLifetimeMs so a hung handler frees the thread"
+    async def test_should_stop_renewing_after_maxlocklifetimems_so_a_hung_handler_frees_the_thread(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+        install_token_lock_mock(state, clock)
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="queue", max_lock_lifetime_ms=60_000),
+        )
+
+        hang_forever = asyncio.Event()  # never set -- a handler stuck on an external call
+        handled_ids: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled_ids.append(message.id)
+            if message.id == "msg-hung-1":
+                await hang_forever.wait()
+
+        hung = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-hung-1", "Hey @slack-bot first"),
+            )
+        )
+        try:
+            await clock.wait_for(lambda: len(handled_ids) == 1)
+
+            # Renewal stops at 60s; the lock lapses one TTL (30s) later
+            await clock.advance(90_001)
+
+            await chat.handle_incoming_message(
+                adapter,
+                "slack:C123:1234.5678",
+                create_test_message("msg-hung-2", "Hey @slack-bot second"),
+            )
+
+            assert handled_ids == ["msg-hung-1", "msg-hung-2"]
+            assert clock.pending_timers() == 0
+        finally:
+            hung.cancel()
+            await asyncio.gather(hung, return_exceptions=True)
+
+
+# ============================================================================
 # 17. concurrency: queue (tests 77-78)
 # ============================================================================
 
@@ -2529,6 +2652,75 @@ class TestConcurrencyQueue:
             "Hey @slack-bot third",
         ]
         assert received_contexts[1].total_since_last_handler == 3
+
+    # TS: "should call onNewMention when a skipped queued message mentions the bot"
+    async def test_should_call_onnewmention_when_a_skipped_queued_message_mentions_the_bot(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        handler = AsyncMock(return_value=None)
+        chat.on_mention(handler)
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-skip-mention-1", "Hey @slack-bot")
+        )
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-skip-mention-2", "please help")
+        )
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-skip-mention-3", "trigger")
+        )
+
+        assert handler.await_count == 1
+        message = handler.await_args_list[0].args[1]
+        context = handler.await_args_list[0].args[2]
+        assert message.text == "please help"
+        assert message.is_mention is False
+        assert [{"text": m.text, "is_mention": m.is_mention} for m in context.skipped] == [
+            {"text": "Hey @slack-bot", "is_mention": True}
+        ]
+
+    # TS: "should keep a definitive non-mention on skipped queued messages" -- not
+    # ported here: it needs tri-state ``is_mention`` (``??`` semantics), tracked in #192.
+
+    # TS: "should continue to message patterns when skipped queued mention has no handler"
+    async def test_should_continue_to_message_patterns_when_skipped_queued_mention_has_no_handler(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        handler = AsyncMock(return_value=None)
+        chat.on_message(HELP_REGEX)(handler)
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-pattern-1", "Hey @slack-bot")
+        )
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-pattern-2", "please help")
+        )
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-pattern-3", "trigger")
+        )
+
+        assert handler.await_count == 1
+        message = handler.await_args_list[0].args[1]
+        context = handler.await_args_list[0].args[2]
+        assert message.text == "please help"
+        assert message.is_mention is False
+        assert [{"text": m.text, "is_mention": m.is_mention} for m in context.skipped] == [
+            {"text": "Hey @slack-bot", "is_mention": True}
+        ]
 
 
 # ============================================================================
@@ -3181,6 +3373,43 @@ class TestConcurrencyDebounce:
         assert len(calls) == 1
         assert calls[0] == "Hey @slack-bot third"
 
+    # TS: "should call onNewMention when a skipped debounced message mentions the bot"
+    async def test_should_call_onnewmention_when_a_skipped_debounced_message_mentions_the_bot(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=100),
+        )
+
+        handler = AsyncMock(return_value=None)
+        chat.on_mention(handler)
+
+        pending = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter, "slack:C123:1234.5678", create_test_message("msg-d-skip-mention-1", "Hey @slack-bot")
+            )
+        )
+        await clock.settle()
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-d-skip-mention-2", "please help")
+        )
+
+        await clock.advance(250)
+        await pending
+
+        assert handler.await_count == 1
+        message = handler.await_args_list[0].args[1]
+        context = handler.await_args_list[0].args[2]
+        assert message.text == "please help"
+        assert message.is_mention is False
+        assert [{"text": m.text, "is_mention": m.is_mention} for m in context.skipped] == [
+            {"text": "Hey @slack-bot", "is_mention": True}
+        ]
+
 
 # ============================================================================
 # 20b. concurrency: burst (vercel/chat#495)
@@ -3247,6 +3476,43 @@ class TestConcurrencyBurst:
             "Hey @slack-bot second",
         ]
         assert received_contexts[0].total_since_last_handler == 3
+
+    # TS: "should call onNewMention when a skipped burst message mentions the bot"
+    async def test_should_call_onnewmention_when_a_skipped_burst_message_mentions_the_bot(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(
+            adapter=adapter,
+            state=state,
+            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=100),
+        )
+
+        handler = AsyncMock(return_value=None)
+        chat.on_mention(handler)
+
+        pending = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter, "slack:C123:1234.5678", create_test_message("msg-burst-skip-mention-1", "Hey @slack-bot")
+            )
+        )
+        await clock.settle()
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-burst-skip-mention-2", "please help")
+        )
+
+        await clock.advance(150)
+        await pending
+
+        assert handler.await_count == 1
+        message = handler.await_args_list[0].args[1]
+        context = handler.await_args_list[0].args[2]
+        assert message.text == "please help"
+        assert message.is_mention is False
+        assert [{"text": m.text, "is_mention": m.is_mention} for m in context.skipped] == [
+            {"text": "Hey @slack-bot", "is_mention": True}
+        ]
 
     # TS: "should process a lone idle message after the debounce window"
     async def test_should_process_a_lone_idle_message_after_the_debounce_window(self):
@@ -3449,49 +3715,6 @@ class TestConcurrencyBurst:
         # Exactly one handler invocation (with msg3 as the latest) -- ``queue``
         # would produce 2 (msg1 immediately, then drain msg2+msg3).
         assert invocations == ["burst-vs-queue-3"]
-
-    # Distinct semantics: burst vs debounce.
-    # ``debounce`` would silently drop earlier messages in the burst (no
-    # ``skipped`` context). ``burst`` preserves them via ``context.skipped`` so
-    # the handler can still see what was coalesced.
-    async def test_burst_preserves_skipped_unlike_debounce(self):
-        state = create_mock_state()
-        adapter = create_mock_adapter("slack")
-
-        chat, _, _ = await _init_chat(
-            adapter=adapter,
-            state=state,
-            concurrency=ConcurrencyConfig(strategy="burst", debounce_ms=60),
-        )
-
-        received_contexts: list[MessageContext | None] = []
-
-        @chat.on_mention
-        async def handler(thread, message, context=None):
-            received_contexts.append(context)
-
-        task = asyncio.create_task(
-            chat.handle_incoming_message(
-                adapter,
-                "slack:C123:1234.5678",
-                create_test_message("burst-vs-deb-1", "Hey @slack-bot a"),
-            )
-        )
-        await asyncio.sleep(0.005)
-        await chat.handle_incoming_message(
-            adapter,
-            "slack:C123:1234.5678",
-            create_test_message("burst-vs-deb-2", "Hey @slack-bot b"),
-        )
-
-        await task
-
-        assert len(received_contexts) == 1
-        # ``debounce`` would pass ``context=None`` here (it just drops earlier
-        # messages). ``burst`` exposes them via ``skipped``.
-        assert received_contexts[0] is not None
-        assert [m.id for m in received_contexts[0].skipped] == ["burst-vs-deb-1"]
-        assert received_contexts[0].total_since_last_handler == 2
 
 
 # ============================================================================
@@ -3904,6 +4127,122 @@ class TestLockScope:
         assert len(state._enqueue_calls) == 2
         for key, _entry, _max_size in state._enqueue_calls:
             assert key == "telegram:C123"
+
+    # TS: "should isolate queued messages across channel-scoped threads"
+    # (``activeConversation()`` assertions belong to #195 and are not ported here.)
+    async def test_should_isolate_queued_messages_across_channelscoped_threads(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("telegram")
+        adapter.lock_scope = "channel"
+        logger = MockLogger()
+
+        chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"telegram": adapter},
+                state=state,
+                logger=logger,
+                concurrency="queue",
+            )
+        )
+        await chat.webhooks["telegram"]("request")
+
+        first = "telegram:C123:topic1"
+        second = "telegram:C123:topic2"
+        mentions = AsyncMock(return_value=None)
+        subscribed_calls: list[tuple[Any, Any, Any]] = []
+
+        async def subscribed(thread, message, context=None):
+            subscribed_calls.append((thread, message, context))
+            await thread.set_state({"request": message.text})
+
+        chat.on_mention(mentions)
+        chat.on_subscribed_message(subscribed)
+        await state.subscribe(second)
+        await state.acquire_lock("telegram:C123", 30000)
+
+        await chat.handle_incoming_message(
+            adapter, first, create_test_message("msg-isolation-1", "Hey @telegram-bot", thread_id=first)
+        )
+        await chat.handle_incoming_message(
+            adapter, second, create_test_message("msg-isolation-2", "private request", thread_id=second)
+        )
+
+        await state.force_release_lock("telegram:C123")
+        await chat.handle_incoming_message(
+            adapter, first, create_test_message("msg-isolation-3", "Hey @telegram-bot", thread_id=first)
+        )
+
+        assert mentions.await_count == 1
+        assert len(subscribed_calls) == 1
+        thread, message, context = subscribed_calls[0]
+        assert thread.id == second
+        assert message.thread_id == second
+        assert context == MessageContext(skipped=[], total_since_last_handler=1)
+        assert state.cache.get(f"thread-state:{second}") == {"request": "private request"}
+        assert f"thread-state:{first}" not in state.cache
+        assert any(
+            call[0] == "message-dequeued"
+            and call[1].get("thread_id") == second
+            and call[1].get("message_id") == "msg-isolation-2"
+            for call in logger.info.calls
+        )
+
+    # TS: "should isolate debounced messages across channel-scoped threads"
+    # (``activeConversation()`` assertions belong to #195 and are not ported here.)
+    async def test_should_isolate_debounced_messages_across_channelscoped_threads(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        adapter = create_mock_adapter("telegram")
+        adapter.lock_scope = "channel"
+        logger = MockLogger()
+
+        chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"telegram": adapter},
+                state=state,
+                logger=logger,
+                concurrency=ConcurrencyConfig(strategy="debounce", debounce_ms=100),
+            )
+        )
+        await chat.webhooks["telegram"]("request")
+
+        first = "telegram:C123:topic1"
+        second = "telegram:C123:topic2"
+        mentions = AsyncMock(return_value=None)
+        subscribed = AsyncMock(return_value=None)
+        chat.on_mention(mentions)
+        chat.on_subscribed_message(subscribed)
+        await state.subscribe(second)
+
+        pending = asyncio.create_task(
+            chat.handle_incoming_message(
+                adapter, first, create_test_message("msg-debounce-isolation-1", "Hey @telegram-bot", thread_id=first)
+            )
+        )
+        await clock.settle()
+        await chat.handle_incoming_message(
+            adapter, second, create_test_message("msg-debounce-isolation-2", "private request", thread_id=second)
+        )
+
+        # Advance past the debounce window, plus the empty-queue check that
+        # follows the dispatch
+        await clock.advance(250)
+        await pending
+
+        assert mentions.await_count == 0
+        assert subscribed.await_count == 1
+        thread, message, context = subscribed.await_args_list[0].args
+        assert thread.id == second
+        assert message.thread_id == second
+        assert context == MessageContext(skipped=[], total_since_last_handler=1)
+        assert any(
+            call[0] == "message-dequeued"
+            and call[1].get("thread_id") == second
+            and call[1].get("message_id") == "msg-debounce-isolation-2"
+            for call in logger.info.calls
+        )
 
 
 # ============================================================================

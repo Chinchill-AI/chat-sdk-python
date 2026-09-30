@@ -225,10 +225,17 @@ class ConcurrencyConfig:
     # Debounce window in milliseconds (debounce/burst strategies). Default: 1500.
     debounce_ms: int = 1500
     max_concurrent: int | None = None  # None = Infinity
-    # Max queued messages per thread (queue/burst strategies). Default: 10.
+    # Max queued messages per thread (queue/debounce/burst strategies).
+    # Default: 10. Debounce keeps every message that arrives inside the
+    # window (superseded ones reach the handler as ``context.skipped``).
     max_queue_size: int = 10
     on_queue_full: Literal["drop-oldest", "drop-newest"] = "drop-oldest"
     queue_entry_ttl_ms: int = 90000
+    # Max total time one handler run may keep renewing its thread lock, in
+    # milliseconds (drop/queue/debounce/burst strategies). After this,
+    # renewal stops and the lock lapses at its TTL, so a hung handler cannot
+    # block the thread forever. Default: 600000 (10 minutes).
+    max_lock_lifetime_ms: int = 600_000
 
 
 # =============================================================================
@@ -1202,7 +1209,18 @@ class StateAdapter(Protocol):
 
     async def acquire_lock(self, thread_id: str, ttl_ms: int) -> Lock | None: ...
     async def release_lock(self, lock: Lock) -> None: ...
-    async def extend_lock(self, lock: Lock, ttl_ms: int) -> bool: ...
+    async def extend_lock(self, lock: Lock, ttl_ms: int) -> bool:
+        """Extend a held lock's TTL.
+
+        Implementations must compare the lock token and only extend a lock
+        that is still held with that token -- never create or resurrect one.
+        Returns ``False`` when the lock is no longer held with this token
+        (expired, released, or taken over). ``Chat`` renews held locks with
+        this call while a handler runs and treats ``False`` as lost
+        ownership.
+        """
+        ...
+
     async def force_release_lock(self, thread_id: str) -> None: ...
     async def get(self, key: str) -> Any | None: ...
     async def set(self, key: str, value: Any, ttl_ms: int | None = None) -> None: ...

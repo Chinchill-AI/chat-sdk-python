@@ -187,11 +187,15 @@ The `Chat` class manages four concurrency strategies, configured via `ChatConfig
 ```
 Message arrives -> acquire_lock(thread_id, 30s TTL)
   Lock acquired?
-    Yes -> dispatch to handlers -> release lock
+    Yes -> start heartbeat -> dispatch to handlers -> stop heartbeat -> release lock
     No  -> raise LockError (message dropped)
 ```
 
 The simplest strategy. If another handler is already processing the same thread, the new message is dropped. Suitable for bots where only the latest context matters.
+
+### Lock heartbeat
+
+Every lock-holding strategy (drop, queue, debounce, burst) runs through `Chat._with_held_lock`, which starts a `_LockHeartbeat`: every `30s / 3` it calls `state.extend_lock(lock, 30s)`, so a handler running longer than the TTL keeps its lock. Renewal stops after `ConcurrencyConfig.max_lock_lifetime_ms` (default 10 minutes); the lock then lapses one TTL later so a hung handler cannot block the thread forever. An extend returning `False`, or the backend staying unreachable past the last known expiry (`held_until`), marks ownership lost. As upstream, drain and debounce loops check `is_ownership_lost()` at the top of each iteration only, and dispatch a batch they already collected. The heartbeat is stopped (waiting for any in-flight extend) before `release_lock`.
 
 ### Queue
 
@@ -203,14 +207,14 @@ Message arrives -> acquire_lock
            (overflow behavior: drop-oldest or drop-newest)
 
 drain_queue():
-  while queue not empty:
+  while queue not empty and ownership not lost:
     dequeue all entries
     skip expired entries
-    dispatch latest entry (skip intermediate messages)
-    extend lock
+    dispatch latest entry under ITS OWN thread_id
+      (intermediate messages from the same thread -> context.skipped)
 ```
 
-Messages that arrive while the lock is held are queued. After the current handler completes, the queue is drained. Only the latest queued message is actually processed; intermediate messages are passed as `context.skipped`.
+Messages that arrive while the lock is held are queued. After the current handler completes, the queue is drained. Only the latest queued message is actually processed; intermediate messages from the same thread are passed as `context.skipped`. With a channel-scoped lock the queue can hold several threads: the latest message is dispatched in its own thread, and messages from other threads are not surfaced to it.
 
 ### Debounce
 
@@ -218,18 +222,20 @@ Messages that arrive while the lock is held are queued. After the current handle
 Message arrives -> acquire_lock
   Lock acquired?
     Yes -> enqueue message -> debounce_loop()
-    No  -> enqueue message (max_size=1, replaces previous)
+    No  -> enqueue message (max_size=max_queue_size)
 
-debounce_loop() (max 20 iterations):
-  sleep(debounce_ms)
-  extend lock
-  dequeue entry
-  if queue empty -> break (no new messages arrived, process this one)
-  if queue has more -> entry superseded, loop again
-  dispatch final message
+debounce_loop():
+  loop:
+    sleep(debounce_ms)
+    if ownership lost -> stop
+    dequeue all entries (skip expired); none -> stop
+    earlier entries -> skipped
+    if queue has more -> latest superseded (-> skipped), loop again
+    dispatch latest under its own thread_id with context.skipped
+    reset skipped, loop again (catches messages that arrived mid-handler)
 ```
 
-Waits for the user to stop typing. Each new message resets the debounce timer. Only the final message after a quiet period is processed.
+Waits for the user to stop typing. Each new message resets the debounce timer. Only the final message after a quiet period is dispatched; superseded messages reach the handler as `context.skipped`. Messages that arrive while the handler runs are debounced and dispatched afterwards under the same lock.
 
 ### Concurrent
 
