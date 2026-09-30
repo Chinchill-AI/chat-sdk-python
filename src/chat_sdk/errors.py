@@ -44,3 +44,13 @@ class StateNotConnectedError(ChatError):
     def __init__(self, adapter_name: str) -> None:
         self.adapter_name = adapter_name
         super().__init__(f"{adapter_name} is not connected. Call connect() first.")
+
+
+class StateSchemaError(ChatError):
+    """Raised by ``connect()`` when a migration-owned state schema is not ready.
+
+    Raised by :class:`~chat_sdk.state.postgres.PostgresStateAdapter` with
+    ``auto_create_schema=False`` when a table is missing (the driver error is
+    chained as ``__cause__``) or the current role lacks a privilege the
+    adapter uses (the message names every such table or sequence).
+    """
