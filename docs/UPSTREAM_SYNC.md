@@ -441,7 +441,8 @@ channel post often never equals a click's thread id:
   `slack:D…:<ts>`, but a DM click reports `slack:D…:` (Python's DM
   `_handle_block_actions` divergence), so a thread scope would still miss;
 - chained edits (`sent = await sent.edit(...)` twice), whose returned
-  `SentMessage` drops the thread-id override until #195 ports `16ea171e`.
+  `SentMessage` dropped the thread-id override before #195 ported `16ea171e`
+  (it now keeps it, so this reason no longer applies on its own).
 
 Binding to the channel resolves all of these, independent of #209's merge
 order, because every click on the message derives the same channel id.
@@ -662,6 +663,71 @@ separately (Slack #212, Teams #220); other adapters ignore the new fields.
   `Chart`, `DateInput`, `NumberInput`, `tooltip`, `width` and `dispatchAction`,
   and `929878b5` (chat@4.39.0, link-button ids in JSX). See the jsx-runtime row
   in the non-parity table.
+
+### Conversation context and agent-tool scoping (chat@4.36–4.40, #195)
+
+Parity, with one Python-only divergence (*Link-preview fence slicing* in the
+non-parity table). Ports `c5d86b10` (vercel/chat#751, chat@4.36.0),
+`85e3d22b` (#774, chat@4.37.0), the core half of `500b7e6d` (#857,
+chat@4.39.0), the `getUser` / `startTyping` / drain / link-fence parts of
+`b7c9316b` (#875, chat@4.40.0) and `16ea171e` (#848, chat@4.39.0).
+
+- **Active conversation.** `chat_sdk.context` (internal, not re-exported from
+  the root, as upstream) holds a `ContextVar[str | None]`.
+  `conversation(cid)` is upstream's `runInConversation`: a `None` id runs the
+  block bare (it inherits the current value); otherwise it sets the var and
+  resets it in `finally` in the same task. `active_conversation()` is `None`
+  outside handlers.
+- **Wrapped dispatch paths.** Each wrap is entered *inside* the coroutine that
+  runs the handlers, because `asyncio.create_task` copies the context when the
+  task is created. Tasks a handler spawns inherit the conversation, as with
+  Node's async context.
+  - `handle_incoming_message` (message thread id; covers `process_message` and
+    the `drop` / `queue` / `debounce` / `burst` / `concurrent` strategies).
+  - `process_reaction`, `process_action`, `process_assistant_thread_started`,
+    `process_assistant_context_changed` (event thread id).
+  - The slash-command handler loop, after the channel is resolved, and
+    `process_app_home_opened` / `process_member_joined_channel` (channel id).
+  - `process_modal_submit` / `process_modal_close`: `related_thread.id`, then
+    `related_channel.id`, then bare.
+  - Queue and debounce drains run in the lock holder's task, so each drained
+    message re-enters its **own** thread id (a channel-scoped lock drains
+    other threads' messages).
+  - `process_options_load` stays unwrapped, as upstream.
+  - `TODO(C1b)`: the `deduplicate=False` bypass in `process_message` (#191)
+    must wrap its direct routing call in `conversation(thread_id)` too.
+- **Scope guard.** `chat_sdk.ai.scope.create_scope_guard(chat, scope, strict)`
+  mirrors `createScopeGuard`: `scope=False` returns `None` (opt out);
+  otherwise each call resolves the explicit scope, else
+  `active_conversation()`. With neither, the call is allowed and the guard
+  warns once through `chat.get_logger()` (the flag lives in the closure, per
+  toolset). A call is in scope iff it resolves to the same channel
+  (`adapter.channel_id_from_thread_id`, falling back to the first two `:`
+  segments) and, under `strict`, the scope is a channel or the id is the
+  scoped conversation. A rejection raises `ChatError` with upstream's text
+  (upstream throws a plain `Error`).
+- **Guarded tools.** `create_chat_tools(..., scope=None, strict_scope=False)`
+  calls the guard before any platform call in the six read tools,
+  `startTyping`, `postMessage`, `postChannelMessage`, `editMessage`,
+  `deleteMessage`, `addReaction`, `removeReaction`, `subscribeThread` and
+  `unsubscribeThread`. `sendDirectMessage` and `getUser` take user ids and
+  are gated by approval instead; `getUser` now defaults to
+  `needs_approval=True` (`ChatApprovalToolName`). The standalone factories
+  take an optional guard (`ToolOptions.guard` for write tools) and are
+  unguarded without one, as upstream.
+- **Link fence.** `to_ai_messages` renders link previews with upstream's
+  `renderLinkForPrompt`: url/title/description/site are whitespace-normalized
+  and bounded (2048/300/1000/100), metadata is `&`/`<`/`>`-escaped and
+  re-bounded, and the metadata lines sit inside
+  `<untrusted-third-party-link-metadata>` fences. Normalization uses the JS
+  `\s`/`trim` code-point set, not Python's.
+- **Channel edit thread id (`16ea171e`).** A channel `SentMessage.edit()`
+  returns a message carrying the adapter-reported thread id instead of the
+  channel id.
+- Out of scope here: the web half of `500b7e6d` (no `WebAdapter`; see the
+  `adapter-web` row), lifecycle and agent-session event wraps (#196, #201),
+  `chat.history`-backed read tools (#197), link-/attachment-only message
+  retention (#198) and the thread `SentMessage.edit` thread id (#200).
 
 ## What to Port vs What to Adapt
 
@@ -1081,8 +1147,9 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
-| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #209 while clicks carry the message ts, a Slack DM click carries no ts even after #209 makes the post report one, and a chained edit drops the override until #195 ports `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #209), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
+| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #209 while clicks carry the message ts, a Slack DM click carries no ts even after #209 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #209), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
+| Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
 | `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
 | `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |
@@ -1181,7 +1248,7 @@ stay explicit instead of being rediscovered in code review.
 | WhatsApp `get_user` | Raises `ChatNotImplementedError` (`Chat.get_user` translates to "does not support get_user") | Not implemented upstream either (no `getUser` on the WhatsApp adapter) | WhatsApp Cloud API has no user lookup endpoint — phone numbers are the only stable identifier and there's no equivalent of `users.info` exposed to business apps. Documented explicitly so callers don't expect parity with Slack/Teams/Discord. |
 | Messenger `get_user` | Raising stub (`ChatNotImplementedError`); a Graph-API-backed impl is tracked as issue #132 | No `getUser` method on the Messenger adapter | **Parity — upstream Messenger has no user-lookup method**; the Python raising stub matches. (Meta's Graph API *could* back a real implementation, unlike WhatsApp — hence #132 stays open as an enhancement.) |
 | Linear agent sessions | **Complete** (5-PR wave, **#151** — Wave D done). All five landed on `main`: L1 agent-session types (`LinearAgentSessionThreadId`, `LinearAgentSessionCommentRawMessage`, `mode`/`kind`), L2 the `:s:{session}` thread-id encode/decode, L3 the webhook PARSE + routing (`_parse_message_from_agent_session_event`, `_handle_agent_session_event`), L4 the agent-activity EMIT path (`post_message`/`start_typing`/`stream` session branches as raw GraphQL — see the "Linear agent-activity emit" divergence row above), and **L5 (this change)**: the agent-session FETCH path (`fetch_messages` → `_fetch_agent_session_messages`, the `edit_message`/`delete_message` append-only guards, and `fetch_thread` `agentSessionId` metadata as raw GraphQL — see the "Linear agent-session fetch" divergence row above). | Full agent-sessions support (`adapter-linear` 4.27.0, `bc94f0a`): parses agent-session webhook events into messages, emits agent activity, fetches the session thread, and routes the agent-session thread id | Largest single gap from the 0.4.30 audit; pre-existing (present since 0.4.29). Closed across the 4.31 wave — tracked in **#151**. |
-| `adapter-web` (`@chat-adapter/web`) | Neither half ported. (a) The server-side `WebAdapter` is **deferred** — not yet ported; (b) the client subpaths are out of scope (see Rationale). | Two distinct things: (a) a server-side `WebAdapter` — an `Adapter` implementation serving a browser chat UI over the AI SDK UI stream protocol (`3490a8c`, vercel/chat#444); (b) React/Vue/Svelte client subpaths (`716e934`) | The `WebAdapter` (a) **is portable** to a Python server SDK (it's a standard `Adapter`) and is deferred, not excluded — a future wave can port it. The client subpaths (b) are genuinely browser-only (front-end framework bindings) and are out of scope for a Python server SDK. (Corrects the earlier over-broad "browser-only; no Python runtime" note in CHANGELOG.) |
+| `adapter-web` (`@chat-adapter/web`) | Neither half ported. (a) The server-side `WebAdapter` is **deferred** — not yet ported; (b) the client subpaths are out of scope (see Rationale). | Two distinct things: (a) a server-side `WebAdapter` — an `Adapter` implementation serving a browser chat UI over the AI SDK UI stream protocol (`3490a8c`, vercel/chat#444); (b) React/Vue/Svelte client subpaths (`716e934`) | The `WebAdapter` (a) **is portable** to a Python server SDK (it's a standard `Adapter`) and is deferred, not excluded — a future wave can port it. The client subpaths (b) are genuinely browser-only (front-end framework bindings) and are out of scope for a Python server SDK. (Corrects the earlier over-broad "browser-only; no Python runtime" note in CHANGELOG.) **A future `WebAdapter` port must include the web half of upstream `500b7e6d` (vercel/chat#857, chat@4.39.0):** consume only the latest user message from the client-supplied `messages` array and strip tool parts from it, so a client cannot forge tool-approval results and bypass `needs_approval`. The core half (guarded write tools) is ported by #195. |
 
 ### Serialization differences
 

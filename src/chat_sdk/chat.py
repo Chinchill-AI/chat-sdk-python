@@ -26,6 +26,7 @@ from chat_sdk.callback_url import (
     resolve_callback_url,
 )
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
+from chat_sdk.context import conversation
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
@@ -1141,6 +1142,10 @@ class Chat:
 
         async def _task() -> None:
             msg = await message_or_factory() if callable(message_or_factory) else message_or_factory
+            # handle_incoming_message enters the conversation itself.
+            # TODO(C1b): the ``deduplicate=False`` bypass (#191) must wrap its
+            # direct routing call in ``conversation(thread_id)`` too, as
+            # upstream processMessage does.
             await self.handle_incoming_message(adapter, thread_id, msg)
 
         task = _create_task(_task(), self._active_tasks)
@@ -1164,7 +1169,14 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         """Process an incoming reaction event."""
-        task = _create_task(self._handle_reaction_event(event), self._active_tasks)
+
+        async def _task() -> None:
+            # Enter the conversation inside the task: create_task copies the
+            # context at creation, so setting it here keeps it task-local.
+            with conversation(event.thread_id):
+                await self._handle_reaction_event(event)
+
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -1182,7 +1194,12 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         """Process an incoming action event (button click)."""
-        task = _create_task(self._handle_action_event(event), self._active_tasks)
+
+        async def _task() -> None:
+            with conversation(event.thread_id):
+                await self._handle_action_event(event)
+
+        task = _create_task(_task(), self._active_tasks)
         if task is not None:
             task.add_done_callback(
                 lambda t: (
@@ -1249,18 +1266,19 @@ class Chat:
         )
 
         result: ModalResponse | None = None
-        for pat in self._modal_submit_handlers:
-            if not pat.callback_ids or event.callback_id in pat.callback_ids:
-                try:
-                    response = await self._invoke_handler(pat.handler, full_event)
-                    if response is not None:
-                        result = response
-                        break
-                except Exception as exc:
-                    self._logger.error(
-                        "Modal submit handler error",
-                        {"callback_id": event.callback_id, "error": str(exc)},
-                    )
+        with conversation(_modal_conversation_id(full_event)):
+            for pat in self._modal_submit_handlers:
+                if not pat.callback_ids or event.callback_id in pat.callback_ids:
+                    try:
+                        response = await self._invoke_handler(pat.handler, full_event)
+                        if response is not None:
+                            result = response
+                            break
+                    except Exception as exc:
+                        self._logger.error(
+                            "Modal submit handler error",
+                            {"callback_id": event.callback_id, "error": str(exc)},
+                        )
 
         if callback_url and getattr(result, "action", None) != "errors":
             # POST the form values to the modal's callback URL. The response
@@ -1316,9 +1334,10 @@ class Chat:
                 raw=event.raw,
             )
 
-            for pat in self._modal_close_handlers:
-                if not pat.callback_ids or event.callback_id in pat.callback_ids:
-                    await self._invoke_handler(pat.handler, full_event)
+            with conversation(_modal_conversation_id(full_event)):
+                for pat in self._modal_close_handlers:
+                    if not pat.callback_ids or event.callback_id in pat.callback_ids:
+                        await self._invoke_handler(pat.handler, full_event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1356,8 +1375,9 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         async def _task() -> None:
-            for h in self._assistant_thread_started_handlers:
-                await self._invoke_handler(h, event)
+            with conversation(event.thread_id):
+                for h in self._assistant_thread_started_handlers:
+                    await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1377,8 +1397,9 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         async def _task() -> None:
-            for h in self._assistant_context_changed_handlers:
-                await self._invoke_handler(h, event)
+            with conversation(event.thread_id):
+                for h in self._assistant_context_changed_handlers:
+                    await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1398,8 +1419,9 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         async def _task() -> None:
-            for h in self._app_home_opened_handlers:
-                await self._invoke_handler(h, event)
+            with conversation(event.channel_id):
+                for h in self._app_home_opened_handlers:
+                    await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1419,8 +1441,9 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> None:
         async def _task() -> None:
-            for h in self._member_joined_channel_handlers:
-                await self._invoke_handler(h, event)
+            with conversation(event.channel_id):
+                for h in self._member_joined_channel_handlers:
+                    await self._invoke_handler(h, event)
 
         task = _create_task(_task(), self._active_tasks)
         if task is not None:
@@ -1494,14 +1517,17 @@ class Chat:
             _open_modal=_open_modal,
         )
 
-        for pat in self._slash_command_handlers:
-            if not pat.commands:
-                self._logger.debug("Running catch-all slash command handler")
-                await self._invoke_handler(pat.handler, full_event)
-                continue
-            if event.command in pat.commands:
-                self._logger.debug("Running matched slash command handler", {"command": event.command})
-                await self._invoke_handler(pat.handler, full_event)
+        # Run handlers with the command's channel as the active conversation
+        # (upstream handleSlashCommandEvent -> runInConversation(channelId)).
+        with conversation(channel_id):
+            for pat in self._slash_command_handlers:
+                if not pat.commands:
+                    self._logger.debug("Running catch-all slash command handler")
+                    await self._invoke_handler(pat.handler, full_event)
+                    continue
+                if event.command in pat.commands:
+                    self._logger.debug("Running matched slash command handler", {"command": event.command})
+                    await self._invoke_handler(pat.handler, full_event)
 
     # ========================================================================
     # Modal context persistence
@@ -2124,8 +2150,19 @@ class Chat:
     ) -> None:
         """Handle an incoming message. Called by adapters or process_message.
 
-        Handles deduplication, bot filtering, concurrency, and dispatch.
+        Handles deduplication, bot filtering, concurrency, and dispatch. Runs
+        with ``thread_id`` as the active conversation (upstream
+        ``handleIncomingMessage`` -> ``runInConversation``).
         """
+        with conversation(thread_id):
+            await self._route_incoming_message(adapter, thread_id, message)
+
+    async def _route_incoming_message(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message,
+    ) -> None:
         self._logger.debug(
             "Incoming message",
             {
@@ -2451,15 +2488,18 @@ class Chat:
                 "message-dequeued",
                 {"thread_id": message_thread_id, "lock_key": lock_key, "message_id": latest.id},
             )
-            await self._dispatch_to_handlers(
-                adapter,
-                message_thread_id,
-                latest,
-                MessageContext(
-                    skipped=message_skipped,
-                    total_since_last_handler=len(message_skipped) + 1,
-                ),
-            )
+            # Re-enter the conversation of the message being dispatched, not
+            # the lock holder's: a channel-scoped lock drains other threads.
+            with conversation(message_thread_id):
+                await self._dispatch_to_handlers(
+                    adapter,
+                    message_thread_id,
+                    latest,
+                    MessageContext(
+                        skipped=message_skipped,
+                        total_since_last_handler=len(message_skipped) + 1,
+                    ),
+                )
             skipped = []
             # Loop again: a message enqueued while the handler ran must be
             # debounced and processed, not stranded until the next webhook.
@@ -2512,7 +2552,8 @@ class Chat:
                 skipped=skipped,
                 total_since_last_handler=len(skipped) + 1,
             )
-            await self._dispatch_to_handlers(adapter, message_thread_id, latest, context)
+            with conversation(message_thread_id):
+                await self._dispatch_to_handlers(adapter, message_thread_id, latest, context)
             # After processing, check if MORE messages arrived during this
             # handler (loop continues).
 
@@ -2865,6 +2906,19 @@ class Chat:
 # ---------------------------------------------------------------------------
 # Helper: construct Message from serialized dict
 # ---------------------------------------------------------------------------
+
+
+def _modal_conversation_id(event: ModalSubmitEvent | ModalCloseEvent) -> str | None:
+    """The conversation a modal event runs in: its related thread, else channel.
+
+    Mirrors upstream ``relatedThread?.id ?? relatedChannel?.id``; ``None``
+    (no related thread or channel) runs the handlers bare.
+    """
+    for related in (event.related_thread, event.related_channel):
+        related_id = getattr(related, "id", None) if related is not None else None
+        if related_id is not None:
+            return related_id
+    return None
 
 
 def _coerce_attachments(raw: Any) -> list[Attachment]:

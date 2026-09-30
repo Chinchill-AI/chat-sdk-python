@@ -38,6 +38,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from chat_sdk.ai.scope import ReadScope, ScopeGuard, create_scope_guard
 from chat_sdk.chat import Chat
 from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.types import (
@@ -97,6 +98,8 @@ class ToolOptions:
     """
 
     needs_approval: bool = True
+    #: Scope guard the tool calls on its target id before executing.
+    guard: ScopeGuard | None = None
 
 
 #: Partial overrides for a single tool. Mirrors upstream's ``ToolOverrides``,
@@ -148,12 +151,29 @@ ChatWriteToolName = Literal[
     "unsubscribeThread",
 ]
 
-#: Whether write operations require user approval.
+#: Names of tools that require approval by default: every write tool plus
+#: ``getUser``, whose arbitrary user lookup can expose profile details
+#: outside the active conversation. Mirrors upstream ``ChatApprovalToolName``.
+ChatApprovalToolName = Literal[
+    "postMessage",
+    "postChannelMessage",
+    "sendDirectMessage",
+    "editMessage",
+    "deleteMessage",
+    "addReaction",
+    "removeReaction",
+    "subscribeThread",
+    "unsubscribeThread",
+    "getUser",
+]
+
+#: Whether sensitive operations require user approval.
 #:
-#: - ``True``  — every write tool needs approval (default)
-#: - ``False`` — no write tool needs approval
-#: - ``dict``  — per-tool override; unspecified write tools default to
-#:   ``True``
+#: - ``True``  — every approval-gated tool (write tools + ``getUser``) needs
+#:   approval (default)
+#: - ``False`` — no tool needs approval
+#: - ``dict``  — per-tool override keyed by :data:`ChatApprovalToolName`;
+#:   unspecified approval-gated tools default to ``True``
 ApprovalConfig = bool | dict[str, bool]
 
 #: Predefined tool presets for common chat-agent use cases.
@@ -329,10 +349,12 @@ def _to_postable(message: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def get_channel_info(chat: ChatBinding) -> ChatTool:
+def get_channel_info(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Fetch metadata for a channel (name, member count, DM status, etc.)."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["channelId"])
         channel = chat.channel(args["channelId"])
         info = await channel.fetch_metadata()
         return {
@@ -371,8 +393,11 @@ def get_channel_info(chat: ChatBinding) -> ChatTool:
 def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Post a message inside an existing thread."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         sent = await thread.post(_to_postable(args["message"]))
         return {"messageId": sent.id, "threadId": sent.thread_id}
@@ -403,8 +428,11 @@ def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 def post_channel_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Post a top-level channel message (not threaded under another message)."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["channelId"])
         channel = chat.channel(args["channelId"])
         sent = await channel.post(_to_postable(args["message"]))
         return {"messageId": sent.id, "threadId": sent.thread_id}
@@ -466,8 +494,11 @@ def send_direct_message(chat: ChatBinding, options: ToolOptions | None = None) -
 def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Edit a previously posted message in a thread."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         result = await thread.adapter.edit_message(
             args["threadId"],
@@ -503,8 +534,11 @@ def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 def delete_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Delete a message from a thread."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.adapter.delete_message(args["threadId"], args["messageId"])
         return {
@@ -542,8 +576,11 @@ def delete_message(chat: ChatBinding, options: ToolOptions | None = None) -> Cha
 def add_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Add an emoji reaction to a specific message."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.adapter.add_reaction(args["threadId"], args["messageId"], args["emoji"])
         return {
@@ -582,8 +619,11 @@ def add_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
 def remove_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Remove an emoji reaction the bot previously added."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.adapter.remove_reaction(args["threadId"], args["messageId"], args["emoji"])
         return {
@@ -628,10 +668,12 @@ _FETCH_DIRECTION_SCHEMA: dict[str, Any] = {
 }
 
 
-def fetch_messages(chat: ChatBinding) -> ChatTool:
+def fetch_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Fetch recent messages from a thread, oldest-first within the page."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
@@ -679,11 +721,13 @@ def fetch_messages(chat: ChatBinding) -> ChatTool:
     )
 
 
-def fetch_channel_messages(chat: ChatBinding) -> ChatTool:
+def fetch_channel_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Fetch top-level messages in a channel (not thread replies)."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         channel_id: str = args["channelId"]
+        if guard is not None:
+            guard(channel_id)
         adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
         adapter = chat.get_adapter(adapter_name) if adapter_name else None
         fetch_method = getattr(adapter, "fetch_channel_messages", None) if adapter is not None else None
@@ -730,10 +774,12 @@ def fetch_channel_messages(chat: ChatBinding) -> ChatTool:
     )
 
 
-def fetch_thread(chat: ChatBinding) -> ChatTool:
+def fetch_thread(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Fetch metadata about a thread."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         info = await thread.adapter.fetch_thread(args["threadId"])
         return {
@@ -758,11 +804,13 @@ def fetch_thread(chat: ChatBinding) -> ChatTool:
     )
 
 
-def list_threads(chat: ChatBinding) -> ChatTool:
+def list_threads(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """List recent threads in a channel."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         channel_id: str = args["channelId"]
+        if guard is not None:
+            guard(channel_id)
         adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
         adapter = chat.get_adapter(adapter_name) if adapter_name else None
         list_method = getattr(adapter, "list_threads", None) if adapter is not None else None
@@ -811,10 +859,12 @@ def list_threads(chat: ChatBinding) -> ChatTool:
     )
 
 
-def get_thread_participants(chat: ChatBinding) -> ChatTool:
+def get_thread_participants(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Return the unique non-bot participants in a thread."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         participants = await thread.get_participants()
         return {"participants": [_project_author(p) for p in participants]}
@@ -839,8 +889,11 @@ def get_thread_participants(chat: ChatBinding) -> ChatTool:
 def subscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Subscribe to all future messages in a thread."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.subscribe()
         return {"subscribed": True, "threadId": args["threadId"]}
@@ -869,8 +922,11 @@ def subscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> C
 def unsubscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> ChatTool:
     """Unsubscribe from a thread."""
     opts = options if options is not None else ToolOptions()
+    guard = opts.guard
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.unsubscribe()
         return {"subscribed": False, "threadId": args["threadId"]}
@@ -893,10 +949,12 @@ def unsubscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) ->
     )
 
 
-def start_typing(chat: ChatBinding) -> ChatTool:
+def start_typing(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool:
     """Show a typing indicator in a thread."""
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
+        if guard is not None:
+            guard(args["threadId"])
         thread = chat.thread(args["threadId"])
         await thread.start_typing(args.get("status"))
         return {"typing": True, "threadId": args["threadId"]}
@@ -927,8 +985,14 @@ def start_typing(chat: ChatBinding) -> ChatTool:
 # ---------------------------------------------------------------------------
 
 
-def get_user(chat: ChatBinding) -> ChatTool:
-    """Look up profile information about a user by platform-specific id."""
+def get_user(chat: ChatBinding, needs_approval: bool = True) -> ChatTool:
+    """Look up profile information about a user by platform-specific id.
+
+    Requires approval by default (upstream #875): an arbitrary user lookup can
+    expose profile details outside the active conversation. It targets a user
+    id, not a conversation, so it is gated by approval instead of the scope
+    guard.
+    """
 
     async def _execute(args: dict[str, Any]) -> dict[str, Any] | None:
         user = await chat.get_user(args["userId"])
@@ -961,6 +1025,7 @@ def get_user(chat: ChatBinding) -> ChatTool:
             "additionalProperties": False,
         },
         execute=_execute,
+        needs_approval=needs_approval,
     )
 
 
@@ -1020,6 +1085,10 @@ class ChatToolsOptions:
     overrides: dict[str, ToolOverrides] | None = None
     preset: ChatToolPreset | list[ChatToolPreset] | None = None
     require_approval: ApprovalConfig = True
+    #: See :func:`create_chat_tools`. ``None`` inherits the conversation
+    #: being handled; ``False`` opts out of scoping.
+    scope: ReadScope | Literal[False] | None = None
+    strict_scope: bool = False
 
 
 def create_chat_tools(
@@ -1028,6 +1097,8 @@ def create_chat_tools(
     preset: ChatToolPreset | list[ChatToolPreset] | None = None,
     require_approval: ApprovalConfig = True,
     overrides: dict[str, ToolOverrides] | None = None,
+    scope: ReadScope | Literal[False] | None = None,
+    strict_scope: bool = False,
 ) -> dict[str, ChatTool]:
     """Create a set of Chat SDK tools for an AI agent.
 
@@ -1048,12 +1119,33 @@ def create_chat_tools(
         Optional preset or list of presets to scope the returned toolset.
         Omit (or pass ``None``) to get every tool.
     require_approval:
-        ``True`` (default) to require human approval for every write tool;
-        ``False`` to disable approval globally; or a per-tool ``dict``
-        where unspecified write tools default to ``True``.
+        ``True`` (default) to require human approval for every write tool
+        and ``getUser``; ``False`` to disable approval globally; or a
+        per-tool ``dict`` where unspecified approval-gated tools default to
+        ``True``.
     overrides:
         Per-tool overrides. Mirrors upstream's behaviour: core fields
         cannot be overridden (see :data:`_PROTECTED_TOOL_FIELDS`).
+    scope:
+        Confine tools to a single conversation, so a thread or channel id
+        the model supplies that resolves elsewhere is rejected with
+        :class:`~chat_sdk.errors.ChatError`. Applies to reads, ``startTyping``
+        and writes that target a thread or channel; ``getUser`` and
+        ``sendDirectMessage`` target user ids and are gated by approval
+        instead. Accepts a thread/channel id or any object with an ``id``
+        (a ``Thread`` or ``Channel``).
+
+        Scoping is channel-level: a call is allowed when it resolves to the
+        same channel as the scoped conversation. Defaults (``None``) to the
+        conversation being handled, so tools created or run inside a handler
+        are already confined to it. Pass ``False`` to reach every
+        conversation the bot can see. When no scope resolves (outside a
+        handler, no explicit scope) tools run workspace-wide and a warning
+        is logged once per toolset.
+    strict_scope:
+        Tighten ``scope`` from channel-level to conversation-level: a thread
+        scope then rejects sibling threads and the parent channel. A channel
+        scope is unaffected.
     """
     if chat is None:
         raise ChatError(
@@ -1062,27 +1154,36 @@ def create_chat_tools(
 
     allowed: set[str] | None = _resolve_preset_tools(preset) if preset is not None else None
 
+    guard = create_scope_guard(chat, scope, strict_scope)
+
     def _approval(name: str) -> ToolOptions:
         return ToolOptions(needs_approval=_resolve_approval(name, require_approval))
 
+    # Write tools take the same guard as reads so a thread/channel id the
+    # model supplies that resolves outside the scoped conversation is rejected.
+    def _guarded_approval(name: str) -> ToolOptions:
+        return ToolOptions(needs_approval=_resolve_approval(name, require_approval), guard=guard)
+
     factories: dict[str, Callable[[], ChatTool]] = {
-        "fetchMessages": lambda: fetch_messages(chat),
-        "fetchChannelMessages": lambda: fetch_channel_messages(chat),
-        "fetchThread": lambda: fetch_thread(chat),
-        "listThreads": lambda: list_threads(chat),
-        "getThreadParticipants": lambda: get_thread_participants(chat),
-        "getChannelInfo": lambda: get_channel_info(chat),
-        "getUser": lambda: get_user(chat),
-        "startTyping": lambda: start_typing(chat),
-        "postMessage": lambda: post_message(chat, _approval("postMessage")),
-        "postChannelMessage": lambda: post_channel_message(chat, _approval("postChannelMessage")),
+        "fetchMessages": lambda: fetch_messages(chat, guard),
+        "fetchChannelMessages": lambda: fetch_channel_messages(chat, guard),
+        "fetchThread": lambda: fetch_thread(chat, guard),
+        "listThreads": lambda: list_threads(chat, guard),
+        "getThreadParticipants": lambda: get_thread_participants(chat, guard),
+        "getChannelInfo": lambda: get_channel_info(chat, guard),
+        "getUser": lambda: get_user(chat, _approval("getUser").needs_approval),
+        "startTyping": lambda: start_typing(chat, guard),
+        "postMessage": lambda: post_message(chat, _guarded_approval("postMessage")),
+        "postChannelMessage": lambda: post_channel_message(chat, _guarded_approval("postChannelMessage")),
+        # User-id tools do not resolve to a conversation, so approval is
+        # their gate instead of the conversation-scope guard.
         "sendDirectMessage": lambda: send_direct_message(chat, _approval("sendDirectMessage")),
-        "editMessage": lambda: edit_message(chat, _approval("editMessage")),
-        "deleteMessage": lambda: delete_message(chat, _approval("deleteMessage")),
-        "addReaction": lambda: add_reaction(chat, _approval("addReaction")),
-        "removeReaction": lambda: remove_reaction(chat, _approval("removeReaction")),
-        "subscribeThread": lambda: subscribe_thread(chat, _approval("subscribeThread")),
-        "unsubscribeThread": lambda: unsubscribe_thread(chat, _approval("unsubscribeThread")),
+        "editMessage": lambda: edit_message(chat, _guarded_approval("editMessage")),
+        "deleteMessage": lambda: delete_message(chat, _guarded_approval("deleteMessage")),
+        "addReaction": lambda: add_reaction(chat, _guarded_approval("addReaction")),
+        "removeReaction": lambda: remove_reaction(chat, _guarded_approval("removeReaction")),
+        "subscribeThread": lambda: subscribe_thread(chat, _guarded_approval("subscribeThread")),
+        "unsubscribeThread": lambda: unsubscribe_thread(chat, _guarded_approval("unsubscribeThread")),
     }
 
     result: dict[str, ChatTool] = {}
@@ -1103,6 +1204,7 @@ ChatTools = dict[str, ChatTool]
 
 __all__ = [
     "ApprovalConfig",
+    "ChatApprovalToolName",
     "ChatBinding",
     "ChatTool",
     "ChatToolName",
@@ -1110,6 +1212,7 @@ __all__ = [
     "ChatTools",
     "ChatToolsOptions",
     "ChatWriteToolName",
+    "ReadScope",
     "ToolOptions",
     "ToolOverrides",
     "add_reaction",

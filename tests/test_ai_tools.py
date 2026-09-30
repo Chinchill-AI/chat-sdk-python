@@ -9,20 +9,26 @@ filtering) or a specific tool factory's ``execute`` path.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from chat_sdk import Chat
 from chat_sdk.ai import (
     ChatTool,
+    ChatToolsOptions,
     create_chat_tools,
+    get_user,
 )
+from chat_sdk.context import active_conversation, conversation
+from chat_sdk.emoji import get_emoji
 from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.shared.mock_adapter import (
     MockAdapter,
+    MockLogger,
     MockStateAdapter,
     create_mock_adapter,
     create_mock_state,
@@ -30,14 +36,25 @@ from chat_sdk.shared.mock_adapter import (
     mock_logger,
 )
 from chat_sdk.types import (
+    ActionEvent,
+    AppHomeOpenedEvent,
+    AssistantContextChangedEvent,
+    AssistantThreadStartedEvent,
+    Author,
     ChannelInfo,
     FetchResult,
     ListThreadsResult,
+    MemberJoinedChannelEvent,
+    ModalCloseEvent,
+    ModalSubmitEvent,
     PostableMarkdown,
     PostableRaw,
+    ReactionEvent,
+    SlashCommandEvent,
     ThreadInfo,
     ThreadSummary,
     UserInfo,
+    WebhookOptions,
 )
 
 # ---------------------------------------------------------------------------
@@ -142,9 +159,11 @@ class TestCreateChatToolsShape:
 class TestRequireApproval:
     """Tests for the ``require_approval`` config (bool + per-tool mapping)."""
 
-    async def test_every_write_tool_defaults_to_needs_approval_true(self, harness: _Harness):
+    async def test_requires_approval_on_every_write_tool_and_getuser_by_default(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat)
-        write_tools = [
+        # Every mutating tool (and getUser, upstream #875) must default to
+        # needs_approval=True so a misnamed gated tool is caught.
+        gated_tools = [
             "postMessage",
             "postChannelMessage",
             "sendDirectMessage",
@@ -154,29 +173,30 @@ class TestRequireApproval:
             "removeReaction",
             "subscribeThread",
             "unsubscribeThread",
+            "getUser",
         ]
-        for name in write_tools:
+        for name in gated_tools:
             assert tools[name].needs_approval is True, name
-
-    async def test_read_only_tools_never_gate_on_approval(self, harness: _Harness):
-        tools = create_chat_tools(chat=harness.chat)
-        read_tools = [
+        # Conversation-scoped read tools do not gate on approval, and the
+        # typing indicator is harmless and never gated.
+        ungated_tools = [
             "fetchMessages",
             "fetchChannelMessages",
             "fetchThread",
             "listThreads",
             "getThreadParticipants",
             "getChannelInfo",
-            "getUser",
-            # Typing indicator is harmless and never gated
             "startTyping",
         ]
-        for name in read_tools:
+        for name in ungated_tools:
             assert tools[name].needs_approval is None, name
 
-    async def test_disables_approval_on_every_write_tool_when_requireapproval_is_false(self, harness: _Harness):
+    async def test_requires_approval_for_standalone_getuser_by_default(self, harness: _Harness):
+        assert get_user(harness.chat).needs_approval is True
+
+    async def test_disables_approval_on_every_gated_tool_when_requireapproval_is_false(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat, require_approval=False)
-        write_tools = [
+        gated_tools = [
             "postMessage",
             "postChannelMessage",
             "sendDirectMessage",
@@ -186,8 +206,9 @@ class TestRequireApproval:
             "removeReaction",
             "subscribeThread",
             "unsubscribeThread",
+            "getUser",
         ]
-        for name in write_tools:
+        for name in gated_tools:
             assert tools[name].needs_approval is False, name
 
     async def test_per_tool_approval_overrides(self, harness: _Harness):
@@ -735,6 +756,7 @@ class TestApprovalEdgeCases:
             "removeReaction",
             "subscribeThread",
             "unsubscribeThread",
+            "getUser",
         ):
             assert tools[name].needs_approval is True, name
 
@@ -815,3 +837,468 @@ class TestSchemaIsolation:
         fresh = create_chat_tools(chat=harness.chat)
         fresh_dir = fresh["fetchMessages"].input_schema["properties"]["direction"]
         assert fresh_dir["enum"] == ["forward", "backward"]
+
+
+# ---------------------------------------------------------------------------
+# Conversation scope (upstream "read scope" / "write scope", #751/#774/#875)
+# ---------------------------------------------------------------------------
+
+_CALLER_THREAD = "slack:C123:1234.5678"
+_OTHER_THREAD = "slack:C999:1111.2222"
+_OUT_OF_SCOPE = "tools are scoped to"
+_FETCH = {"limit": 5, "direction": "backward"}
+
+
+def _user() -> Author:
+    return Author(user_id="U1", user_name="alice", full_name="Alice", is_bot=False, is_me=False)
+
+
+def _recording_fetch(adapter: MockAdapter) -> AsyncMock:
+    mock = AsyncMock(return_value=FetchResult(messages=[], next_cursor=None))
+    adapter.fetch_messages = mock  # type: ignore[method-assign]
+    return mock
+
+
+def _recording_channel_fetch(adapter: MockAdapter) -> AsyncMock:
+    mock = AsyncMock(return_value=FetchResult(messages=[], next_cursor=None))
+    adapter.fetch_channel_messages = mock  # type: ignore[method-assign]
+    return mock
+
+
+async def _outcome(tools: dict[str, ChatTool], thread_id: str) -> str:
+    try:
+        await tools["fetchMessages"].execute({"threadId": thread_id, **_FETCH})
+    except ChatError:
+        return "blocked"
+    return "allowed"
+
+
+async def _drain(tasks: list[Any]) -> None:
+    """Await every fire-and-forget task captured through ``wait_until``."""
+    await asyncio.gather(*tasks)
+
+
+class TestReadScope:
+    """Upstream ``describe("read scope")``."""
+
+    async def test_blocks_reading_a_thread_outside_the_scoped_channel(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE) as exc_info:
+            await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        # Upstream's exact text.
+        assert str(exc_info.value) == (
+            f'Tool call blocked: tools are scoped to "{_CALLER_THREAD}", but "{_OTHER_THREAD}" resolves outside it.'
+        )
+        fetch.assert_not_called()
+
+    async def test_allows_a_sibling_thread_in_the_scoped_channel_by_default(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        await tools["fetchMessages"].execute({"threadId": "slack:C123:9999.0000", **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_blocks_a_sibling_thread_when_scoped_to_a_single_thread_with_strictscope(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD, strict_scope=True)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": "slack:C123:9999.0000", **_FETCH})
+        fetch.assert_not_called()
+
+    async def test_allows_a_sibling_thread_under_strictscope_when_a_channel_is_scoped(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope="slack:C123", strict_scope=True)
+        await tools["fetchMessages"].execute({"threadId": "slack:C123:9999.0000", **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_allows_channellevel_reads_when_scoped_to_a_thread(self, harness: _Harness):
+        channel_fetch = _recording_channel_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        await tools["fetchChannelMessages"].execute({"channelId": "slack:C123", **_FETCH})
+        channel_fetch.assert_awaited_once()
+
+    async def test_allows_sibling_threads_when_scoped_to_the_whole_channel(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope="slack:C123")
+        await tools["fetchMessages"].execute({"threadId": "slack:C123:9999.0000", **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_blocks_channeladdressed_reads_outside_the_scoped_channel(self, harness: _Harness):
+        channel_fetch = _recording_channel_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchChannelMessages"].execute({"channelId": "slack:C999", **_FETCH})
+        channel_fetch.assert_not_called()
+
+    async def test_scopes_every_read_tool(self, harness: _Harness):
+        harness.adapter.fetch_thread = AsyncMock()  # type: ignore[method-assign]
+        harness.adapter.list_threads = AsyncMock()  # type: ignore[method-assign]
+        harness.adapter.fetch_channel_info = AsyncMock()  # type: ignore[method-assign]
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchThread"].execute({"threadId": _OTHER_THREAD})
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["listThreads"].execute({"channelId": "slack:C999", "limit": 5})
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["getThreadParticipants"].execute({"threadId": _OTHER_THREAD})
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["getChannelInfo"].execute({"channelId": "slack:C999"})
+        # The guard runs before any platform call.
+        harness.adapter.fetch_thread.assert_not_called()
+        harness.adapter.list_threads.assert_not_called()
+        harness.adapter.fetch_channel_info.assert_not_called()
+        fetch.assert_not_called()
+
+    async def test_accepts_a_thread_as_the_scope(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=harness.chat.thread(_CALLER_THREAD))
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        fetch.assert_not_called()
+        # The Thread's own id is in scope.
+        await tools["fetchMessages"].execute({"threadId": _CALLER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_blocks_reads_across_adapters(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": "discord:C123:1.2", **_FETCH})
+
+    async def test_inherits_the_conversation_being_handled_when_no_scope_is_passed(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat)
+        with conversation(_CALLER_THREAD), pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        fetch.assert_not_called()
+
+    async def test_still_reads_its_own_conversation_when_inheriting(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat)
+        with conversation(_CALLER_THREAD):
+            await tools["fetchMessages"].execute({"threadId": _CALLER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_lets_an_explicit_scope_override_the_handled_conversation(self, harness: _Harness):
+        fetch = _recording_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope=_OTHER_THREAD)
+        with conversation(_CALLER_THREAD):
+            await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+
+    async def test_keeps_each_concurrent_conversations_scope_separate(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+
+        async def read(source: str, target: str) -> str:
+            with conversation(source):
+                await asyncio.sleep(0)
+                return await _outcome(tools, target)
+
+        results = await asyncio.gather(
+            read(_CALLER_THREAD, _CALLER_THREAD),
+            read(_OTHER_THREAD, _CALLER_THREAD),
+            read(_CALLER_THREAD, _OTHER_THREAD),
+            read(_OTHER_THREAD, _OTHER_THREAD),
+        )
+        assert results == ["allowed", "blocked", "blocked", "allowed"]
+        assert active_conversation() is None
+
+    async def test_scopes_reads_during_action_dispatch(self, harness: _Harness):
+        outcome = "not-run"
+
+        @harness.chat.on_action("do-thing")
+        async def _handler(event: Any) -> None:
+            nonlocal outcome
+            outcome = await _outcome(create_chat_tools(chat=harness.chat), _OTHER_THREAD)
+
+        tasks: list[Any] = []
+        harness.chat.process_action(
+            ActionEvent(
+                adapter=harness.adapter,
+                thread=None,
+                thread_id=_CALLER_THREAD,
+                message_id="m1",
+                user=_user(),
+                action_id="do-thing",
+                value=None,
+            ),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        await _drain(tasks)
+
+        assert outcome == "blocked"
+        assert active_conversation() is None
+
+    async def test_scopes_reads_during_slash_command_dispatch(self, harness: _Harness):
+        outcome = "not-run"
+
+        @harness.chat.on_slash_command("/go")
+        async def _handler(event: Any) -> None:
+            nonlocal outcome
+            outcome = await _outcome(create_chat_tools(chat=harness.chat), _OTHER_THREAD)
+
+        event = SlashCommandEvent(
+            adapter=harness.adapter,
+            channel=None,  # type: ignore[arg-type]
+            user=_user(),
+            command="/go",
+            text="",
+        )
+        # Adapters attach the resolved channel id to the partial event.
+        event.channel_id = "slack:C123"  # type: ignore[attr-defined]
+        tasks: list[Any] = []
+        harness.chat.process_slash_command(event, WebhookOptions(wait_until=tasks.append))
+        await _drain(tasks)
+
+        assert outcome == "blocked"
+
+    async def test_stays_unscoped_outside_a_handler_when_scope_is_omitted_but_warns(self):
+        adapter = create_mock_adapter("slack")
+        logger = MockLogger()
+        chat = Chat(user_name="testbot", adapters={"slack": adapter}, state=create_mock_state(), logger=logger)
+        fetch = _recording_fetch(adapter)
+        tools = create_chat_tools(chat=chat)
+
+        await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+        assert len(logger.warn.calls) == 1
+        assert logger.warn.calls[0][0].startswith(f'Agent tool ran unscoped: "{_OTHER_THREAD}" was accessed')
+        # A second unscoped read on the same guard must not warn again.
+        await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        assert len(logger.warn.calls) == 1
+
+    async def test_scopes_to_the_conversation_not_the_channel_across_adapters(self):
+        # Discord collapses a thread id to `discord:guild:channel`, so sibling
+        # threads share a channel that the coarse gate alone would allow.
+        discord = create_mock_adapter("discord")
+        discord.channel_id_from_thread_id = lambda tid: ":".join(tid.split(":")[:3])  # type: ignore[method-assign]
+        channel_fetch = _recording_channel_fetch(discord)
+        chat = Chat(user_name="testbot", adapters={"discord": discord}, state=create_mock_state(), logger=mock_logger)
+
+        tools = create_chat_tools(chat=chat, scope="discord:g:c:t1", strict_scope=True)
+        # Sibling thread under the same parent channel is blocked.
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": "discord:g:c:t2", **_FETCH})
+        # The parent channel is rejected too: on a per-thread-ACL platform it
+        # is the widest read available.
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchChannelMessages"].execute({"channelId": "discord:g:c", **_FETCH})
+        channel_fetch.assert_not_called()
+
+    async def test_keeps_dmonly_adapter_conversations_out_of_each_others_scope(self):
+        twilio = create_mock_adapter("twilio")
+        twilio.channel_id_from_thread_id = lambda tid: tid  # type: ignore[method-assign]
+        fetch = _recording_fetch(twilio)
+        chat = Chat(user_name="testbot", adapters={"twilio": twilio}, state=create_mock_state(), logger=mock_logger)
+
+        tools = create_chat_tools(chat=chat, scope="twilio:bot:user1")
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["fetchMessages"].execute({"threadId": "twilio:bot:user2", **_FETCH})
+        fetch.assert_not_called()
+
+    async def test_allows_a_channellevel_read_under_strictscope_when_a_channel_is_scoped(self, harness: _Harness):
+        channel_fetch = _recording_channel_fetch(harness.adapter)
+        tools = create_chat_tools(chat=harness.chat, scope="slack:C123", strict_scope=True)
+        await tools["fetchChannelMessages"].execute({"channelId": "slack:C123", **_FETCH})
+        channel_fetch.assert_awaited_once()
+
+    async def test_scopes_reads_during_memberjoined_dispatch(self, harness: _Harness):
+        outcome = "not-run"
+
+        @harness.chat.on_member_joined_channel
+        async def _handler(event: Any) -> None:
+            nonlocal outcome
+            outcome = await _outcome(create_chat_tools(chat=harness.chat), _OTHER_THREAD)
+
+        tasks: list[Any] = []
+        harness.chat.process_member_joined_channel(
+            MemberJoinedChannelEvent(adapter=harness.adapter, channel_id="slack:C123", user_id="U1"),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        await _drain(tasks)
+
+        assert outcome == "blocked"
+
+
+class TestWriteScope:
+    """Upstream ``describe("write scope")``."""
+
+    async def test_blocks_posting_to_a_thread_outside_the_scoped_channel(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["postMessage"].execute({"threadId": _OTHER_THREAD, "message": "hi"})
+        assert harness.adapter._post_calls == []
+
+    async def test_allows_posting_inside_the_scoped_conversation(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        await tools["postMessage"].execute({"threadId": _CALLER_THREAD, "message": "hi"})
+        assert harness.adapter._post_calls == [(_CALLER_THREAD, "hi")]
+
+    async def test_scopes_every_thread_or_channeltargeting_write_tool(self, harness: _Harness):
+        await harness.state.subscribe(_OTHER_THREAD)
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        calls: list[tuple[str, dict[str, Any]]] = [
+            ("postChannelMessage", {"channelId": "slack:C999", "message": "hi"}),
+            ("editMessage", {"threadId": _OTHER_THREAD, "messageId": "m1", "message": "hi"}),
+            ("deleteMessage", {"threadId": _OTHER_THREAD, "messageId": "m1"}),
+            ("addReaction", {"threadId": _OTHER_THREAD, "messageId": "m1", "emoji": "thumbs_up"}),
+            ("removeReaction", {"threadId": _OTHER_THREAD, "messageId": "m1", "emoji": "thumbs_up"}),
+            ("subscribeThread", {"threadId": _OTHER_THREAD}),
+            ("unsubscribeThread", {"threadId": _OTHER_THREAD}),
+            ("startTyping", {"threadId": _OTHER_THREAD, "status": "Injected status"}),
+        ]
+        for name, args in calls:
+            with pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+                await tools[name].execute(args)
+        assert harness.adapter._post_calls == []
+        assert harness.adapter._edit_calls == []
+        assert harness.adapter._delete_calls == []
+        assert harness.adapter._add_reaction_calls == []
+        assert harness.adapter._remove_reaction_calls == []
+        assert harness.adapter._start_typing_calls == []
+        # The blocked unsubscribe left the pre-seeded subscription in place.
+        assert await harness.state.is_subscribed(_OTHER_THREAD) is True
+
+    async def test_inherits_the_handled_conversation_for_writes_when_no_scope_is_passed(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+        with conversation(_CALLER_THREAD), pytest.raises(ChatError, match=_OUT_OF_SCOPE):
+            await tools["postMessage"].execute({"threadId": _OTHER_THREAD, "message": "hi"})
+        assert harness.adapter._post_calls == []
+
+    # sendDirectMessage targets a user id, not a thread or channel, so the
+    # conversation scope guard has nothing to check it against. Approval is
+    # its only gate.
+    async def test_does_not_scope_senddirectmessage(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat, scope=_CALLER_THREAD)
+        await tools["sendDirectMessage"].execute({"userId": "U42", "message": "hi"})
+        # MockAdapter.open_dm("U42") -> "slack:DU42:", then post there.
+        assert harness.adapter._post_calls == [("slack:DU42:", "hi")]
+
+
+class TestScopeOptOutAndContext:
+    """Python-specific: ``scope=False``, and the context var's lifecycle."""
+
+    async def test_scope_false_opts_out_even_inside_a_handled_conversation(self):
+        adapter = create_mock_adapter("slack")
+        logger = MockLogger()
+        chat = Chat(user_name="testbot", adapters={"slack": adapter}, state=create_mock_state(), logger=logger)
+        fetch = _recording_fetch(adapter)
+        tools = create_chat_tools(chat=chat, scope=False)
+        with conversation(_CALLER_THREAD):
+            await tools["fetchMessages"].execute({"threadId": _OTHER_THREAD, **_FETCH})
+        fetch.assert_awaited_once()
+        # Opting out is deliberate, so it does not warn.
+        assert logger.warn.calls == []
+
+    async def test_create_chat_tools_options_carries_scope_fields(self, harness: _Harness):
+        opts = ChatToolsOptions(chat=harness.chat)
+        assert opts.scope is None
+        assert opts.strict_scope is False
+
+    async def test_conversation_none_inherits_and_resets_after_a_raise(self):
+        assert active_conversation() is None
+        with conversation(_CALLER_THREAD):
+            # A ``None`` id runs bare, keeping the outer conversation.
+            with conversation(None):
+                assert active_conversation() == _CALLER_THREAD
+            with pytest.raises(RuntimeError), conversation(_OTHER_THREAD):
+                assert active_conversation() == _OTHER_THREAD
+                raise RuntimeError("boom")
+            assert active_conversation() == _CALLER_THREAD
+        assert active_conversation() is None
+
+    async def test_active_conversation_is_none_after_a_handler_raises(self, harness: _Harness):
+        seen: list[str | None] = []
+
+        @harness.chat.on_mention
+        async def _handler(thread: Any, message: Any, context: Any = None) -> None:
+            seen.append(active_conversation())
+            raise RuntimeError("handler failed")
+
+        # handle_incoming_message runs in THIS task, so a leak would be visible here.
+        with pytest.raises(RuntimeError, match="handler failed"):
+            await harness.chat.handle_incoming_message(
+                harness.adapter,
+                _CALLER_THREAD,
+                create_test_message("msg-raise", "Hey @slack-bot", thread_id=_CALLER_THREAD),
+            )
+        assert seen == [_CALLER_THREAD]
+        assert active_conversation() is None
+
+    async def test_every_dispatch_path_runs_handlers_in_its_conversation(self, harness: _Harness):
+        chat = harness.chat
+        seen: dict[str, str | None] = {}
+
+        def record(key: str) -> Any:
+            async def _h(*_args: Any, **_kwargs: Any) -> None:
+                seen[key] = active_conversation()
+
+            return _h
+
+        chat.on_reaction(record("reaction"))
+        chat.on_assistant_thread_started(record("assistant_started"))
+        chat.on_assistant_context_changed(record("assistant_context"))
+        chat.on_app_home_opened(record("app_home"))
+        chat.on_modal_submit(record("modal_submit"))
+        chat.on_modal_close(record("modal_close"))
+
+        tasks: list[Any] = []
+        opts = WebhookOptions(wait_until=tasks.append)
+        chat.process_reaction(
+            ReactionEvent(
+                adapter=harness.adapter,
+                thread=None,  # type: ignore[arg-type]
+                thread_id="slack:C1:1.1",
+                message_id="m1",
+                user=_user(),
+                emoji=get_emoji("thumbs_up"),
+                raw_emoji="+1",
+                added=True,
+            ),
+            opts,
+        )
+        chat.process_assistant_thread_started(
+            AssistantThreadStartedEvent(
+                adapter=harness.adapter, thread_id="slack:D2:2.2", thread_ts="2.2", channel_id="D2", user_id="U1"
+            ),
+            opts,
+        )
+        chat.process_assistant_context_changed(
+            AssistantContextChangedEvent(
+                adapter=harness.adapter, thread_id="slack:D3:3.3", thread_ts="3.3", channel_id="D3", user_id="U1"
+            ),
+            opts,
+        )
+        chat.process_app_home_opened(
+            AppHomeOpenedEvent(adapter=harness.adapter, channel_id="slack:D4", user_id="U1"), opts
+        )
+        await _drain(tasks)
+
+        # Modals resolve related_thread first, then related_channel, then run bare.
+        with patch.object(
+            chat,
+            "_retrieve_modal_context",
+            AsyncMock(return_value={"related_channel": chat.channel("slack:C5")}),
+        ):
+            await chat.process_modal_submit(
+                ModalSubmitEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb", values={}),
+                "ctx",
+            )
+        with patch.object(chat, "_retrieve_modal_context", AsyncMock(return_value={})):
+            tasks.clear()
+            chat.process_modal_close(
+                ModalCloseEvent(adapter=harness.adapter, user=_user(), view_id="v", callback_id="cb"),
+                "ctx",
+                opts,
+            )
+            await _drain(tasks)
+
+        assert seen == {
+            "reaction": "slack:C1:1.1",
+            "assistant_started": "slack:D2:2.2",
+            "assistant_context": "slack:D3:3.3",
+            "app_home": "slack:D4",
+            "modal_submit": "slack:C5",
+            "modal_close": None,
+        }
+        assert active_conversation() is None

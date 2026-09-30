@@ -1089,7 +1089,9 @@ class TestPostErrorCases:
 
         channel = _make_channel(adapter, state)
         result = await channel.post("Hello!")
+        edited = await result.edit("Updated!")
         assert result.thread_id == "slack:C123:new-thread"
+        assert edited.thread_id == "slack:C123:new-thread"
 
     # it("should return a SentMessage with edit/delete capabilities")
     @pytest.mark.asyncio

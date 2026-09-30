@@ -564,15 +564,17 @@ class ChannelImpl:
         # used, because the thread id reported for a channel post often never
         # equals a click's thread id: Teams and Google Chat report the channel
         # id; Slack reports `slack:C…:` while a channel click carries the
-        # message ts and a DM click carries none; a chained edit drops the
-        # override. Every click on this message derives this channel id.
+        # message ts and a DM click carries none. Every click on this message
+        # derives this channel id.
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
         edit_scope = CallbackScope(id=channel_impl._id, type="channel")
 
         async def _edit(new_content: Any) -> SentMessage:
             new_content = await channel_impl._process_callback_urls(new_content, edit_scope)
             await adapter.edit_message(thread_id, message_id, new_content)
-            return channel_impl._create_sent_message(message_id, new_content)
+            # Keep the adapter-returned thread id on the edited message
+            # (upstream #848) instead of falling back to the channel id.
+            return channel_impl._create_sent_message(message_id, new_content, thread_id)
 
         async def _delete() -> None:
             await adapter.delete_message(thread_id, message_id)
