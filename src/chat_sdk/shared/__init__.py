@@ -19,6 +19,12 @@ from chat_sdk.shared.card_utils import (
     map_button_style,
     render_gfm_table,
 )
+from chat_sdk.shared.download import (
+    AttachmentResponse,
+    AttachmentTransport,
+    download_attachment,
+    validate_attachment_url,
+)
 from chat_sdk.shared.errors import (
     AdapterError,
     AdapterPermissionError,
@@ -49,6 +55,8 @@ from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 __all__ = [
     "AdapterError",
     "AdapterRateLimitError",
+    "AttachmentResponse",
+    "AttachmentTransport",
     "AuthenticationError",
     "BUTTON_STYLE_MAPPINGS",
     "BaseFormatConverter",
@@ -68,6 +76,7 @@ __all__ = [
     "create_mock_adapter",
     "create_mock_state",
     "create_test_message",
+    "download_attachment",
     "escape_table_cell",
     "extract_card",
     "extract_files",
@@ -79,5 +88,6 @@ __all__ = [
     "stringify_markdown",
     "table_to_ascii",
     "to_buffer",
+    "validate_attachment_url",
     "walk_ast",
 ]

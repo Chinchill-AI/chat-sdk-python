@@ -3,12 +3,12 @@
   "tag": "chat@4.41.1",
   "sha": "f690af3c26a3bd7649387cccad12d215463ed22c",
   "totals": {
-    "ts_tests": 1036,
-    "each_templates": 16,
-    "matched_exact": 671,
+    "ts_tests": 1064,
+    "each_templates": 21,
+    "matched_exact": 699,
     "matched_fuzzy": 83,
     "missing": 282,
-    "extra": 362
+    "extra": 384
   },
   "absent_ts_files": [],
   "files": {
@@ -523,6 +523,19 @@
         ["on%s", "logs handler errors and resolves the background task"],
         ["on%s", "does nothing without handlers and runs without waitUntil"]
       ],
+      "fuzzy_matches": []
+    },
+    "packages/adapter-shared/src/download.test.ts": {
+      "python": "tests/test_shared_download.py",
+      "tier": "target",
+      "python_exists": true,
+      "ts_tests": 28,
+      "each_templates": 5,
+      "matched_exact": 28,
+      "matched_fuzzy": 0,
+      "missing_count": 0,
+      "extra_count": 22,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/cards.test.ts": {
