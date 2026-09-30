@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Literal, cast
 
-from chat_sdk.cards import CardChild, CardElement, card_child_to_fallback_text, table_element_to_ascii
+from chat_sdk.cards import (
+    CardChild,
+    CardElement,
+    ChartElement,
+    card_child_to_fallback_text,
+    chart_element_to_fallback_text,
+    table_element_to_ascii,
+)
 from chat_sdk.emoji import convert_emoji_placeholders
 
 PlatformName = Literal["slack", "gchat", "teams", "discord"]
@@ -86,6 +93,8 @@ def _child_to_fallback_text(child: CardChild, convert_text: Callable[[str], str]
             cast("list[str]", child.get("headers", [])),
             cast("list[list[str]]", child.get("rows", [])),
         )
+    if child_type == "chart":
+        return chart_element_to_fallback_text(cast("ChartElement", child))
     if child_type == "divider":
         return "---"
     return card_child_to_fallback_text(child)
