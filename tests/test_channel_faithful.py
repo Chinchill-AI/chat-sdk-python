@@ -1613,6 +1613,67 @@ class TestCallbackUrlProcessing:
         assert stored["actionId"] == "redo"
         assert stored["scope"] == {"id": "slack:C123:1700.1", "type": "thread"}
 
+    # Python-specific divergence (docs/UPSTREAM_SYNC.md): when the adapter
+    # reports the channel id as the post's thread id (Teams, Google Chat),
+    # upstream's `{channel_id, "thread"}` edit scope can never match a click.
+    # Round trip with the real Teams id functions and the replayed click shape.
+    @pytest.mark.asyncio
+    async def test_edited_teams_channel_card_resolves_for_a_click_in_that_channel(self):
+        pytest.importorskip("microsoft_teams")
+        from chat_sdk.adapters.teams.adapter import TeamsAdapter
+        from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
+        from chat_sdk.callback_url import CallbackContext, resolve_callback_url
+
+        adapter = TeamsAdapter(TeamsAdapterConfig(app_id="test-app-id", app_password="test-password"))
+        service_url = "https://smba.trafficmanager.net/teams/"
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=service_url)
+        )
+        # Real `post_channel_message` returns `thread_id=channel_id`.
+        adapter.post_channel_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="1767297849909", thread_id=channel_id, raw={})
+        )
+        adapter.edit_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        state = create_mock_state()
+        channel = ChannelImpl(_ChannelImplConfigWithAdapter(id=channel_id, adapter=adapter, state_adapter=state))
+
+        sent = await channel.post("Hello")
+        await sent.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edited_card = adapter.edit_message.await_args.args[2]
+        token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        assert token is not None
+        # A Teams card click reports the message's thread (`;messageid=`).
+        click_thread_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2;messageid=1767297849909", service_url=service_url)
+        )
+        resolved = await resolve_callback_url(
+            token,
+            state,
+            CallbackContext(
+                action_id="redo",
+                channel_id=adapter.channel_id_from_thread_id(click_thread_id),
+                thread_id=click_thread_id,
+            ),
+        )
+        assert resolved is not None
+        assert resolved.scope.type == "channel"
+        assert resolved.scope.id == channel_id
+
+    @pytest.mark.asyncio
+    async def test_chained_edit_keeps_callback_tokens_resolvable(self):
+        channel, adapter, state, post_calls = self._make_tracked_channel()
+
+        sent = await channel.post("Hello")
+        edited = await sent.edit("First edit")
+        await edited.edit(Card(children=[Actions([Button(id="redo", label="Redo", callback_url="https://e.com/x")])]))
+
+        edited_card = adapter._edit_calls[1][2]
+        token = decode_callback_value(edited_card["children"][0]["children"][0]["value"]).callback_token
+        stored = await state.get(f"chat:callback:{token}")
+        assert stored is not None
+        assert stored["scope"] == {"id": "slack:C123", "type": "channel"}
+
     # it("should pass plain string posts through unchanged")
     @pytest.mark.asyncio
     async def test_should_pass_plain_string_posts_through_unchanged(self):

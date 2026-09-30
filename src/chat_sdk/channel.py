@@ -559,10 +559,19 @@ class ChannelImpl:
 
         plain_text, formatted, attachments = _extract_message_content(postable)
 
+        # Upstream binds edited-card tokens to `{thread_id, "thread"}`. When the
+        # adapter reported no thread of its own for the post (Teams and Google
+        # Chat return the channel id; a chained edit drops the override), that
+        # id never equals a click's thread id, so bind to the channel as the
+        # original post did. Divergence from upstream — see docs/UPSTREAM_SYNC.md
+        edit_scope = (
+            CallbackScope(id=thread_id, type="thread")
+            if thread_id != channel_impl._id
+            else CallbackScope(id=channel_impl._id, type="channel")
+        )
+
         async def _edit(new_content: Any) -> SentMessage:
-            new_content = await channel_impl._process_callback_urls(
-                new_content, CallbackScope(id=thread_id, type="thread")
-            )
+            new_content = await channel_impl._process_callback_urls(new_content, edit_scope)
             await adapter.edit_message(thread_id, message_id, new_content)
             return channel_impl._create_sent_message(message_id, new_content)
 

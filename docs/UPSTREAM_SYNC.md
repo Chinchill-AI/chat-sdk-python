@@ -348,8 +348,9 @@ Regression coverage: `tests/test_twilio_adapter.py::TestThreadIds`
 
 ### Callback-URL tokens (chat@4.40, #194)
 
-Parity, except for one Python-only hardening: the lease fence in the
-non-parity table (*Callback-token lease fence*). The callback-token part of upstream `b7c9316b`
+Parity, with two Python-only divergences recorded in the non-parity table:
+*Callback-token lease fence* and *Channel edit callback scope*. The
+callback-token part of upstream `b7c9316b`
 (vercel/chat#875, chat@4.40.0) plus the button copy from `4a0b5c0c`
 (vercel/chat#895):
 
@@ -360,8 +361,9 @@ non-parity table (*Callback-token lease fence*). The callback-token part of upst
   (was 30).
 - **Scope.** Thread posts, schedules and edits bind to
   `{thread.id, "thread"}`. Channel posts and schedules bind to
-  `{channel.id, "channel"}`, and a channel `SentMessage.edit` binds to
-  `{thread_id, "thread"}`. The `post_ephemeral` DM fallback mints tokens only
+  `{channel.id, "channel"}`. A channel `SentMessage.edit` binds to
+  `{thread_id, "thread"}` when the post reported its own thread id, and
+  otherwise to `{channel.id, "channel"}` (a Python-only divergence). The `post_ephemeral` DM fallback mints tokens only
   after `open_dm`, bound to
   `{adapter.channel_id_from_thread_id(dm_thread_id), "channel"}`. When neither
   the native path nor the DM fallback runs, no token is minted.
@@ -398,29 +400,29 @@ conversation id; WhatsApp, Messenger and
 Twilio (#235): the thread id itself).
 
 Thread-scoped tokens resolve only when the adapter's click `thread_id`
-equals the thread id the card was posted or edited under. There are four
-known mismatches. All are upstream behavior at chat@4.41.1 or are fixed by
-another wave issue, so none is a divergence here. In each case the click
-still runs `on_action` handlers with the raw `__cb:…` value, but nothing is
-POSTed:
+equals the thread id the card was posted or edited under. Two known
+mismatches remain. Neither is a divergence: one is fixed by another wave
+issue and the other is upstream behavior at chat@4.41.1. In both cases the
+click still runs `on_action` handlers with the raw `__cb:…` value, but
+nothing is POSTed:
 
 - **Slack channel `SentMessage.edit`, until #209.** Python's
   `post_channel_message` still returns the synthetic `slack:C…:` thread id,
   but a click reports `slack:C…:<message_ts>`. Upstream `92530dd3`
   (vercel/chat#720, chat@4.35.0) makes the post return `slack:C…:<ts>`, and
   #209 ports it. `main` is not released mid-wave, so no consumer sees the gap.
-- **Chained channel edits (`sent = await sent.edit(...)` twice), until
-  #195.** The `SentMessage` returned by a channel edit drops the thread-id
-  override, so the second edit binds to the channel id as a thread. Upstream
-  `16ea171e` (vercel/chat#848) passes the thread id through, and #195 ports it.
-- **Google Chat channel `SentMessage.edit`.** `post_channel_message` returns
-  the channel id as the thread id, upstream included, so an edited channel
-  card is bound to `gchat:spaces/X` as a thread.
 - **Google Chat cards posted to a DM thread** (`gchat:spaces/X:dm`) by
   `thread.post`. `_handle_card_click` encodes the clicked message's thread
   name without the `:dm` suffix, as upstream `handleCardClick` does. The
   `post_ephemeral` DM fallback is unaffected, because it binds to the DM
   *channel*, which both ids share.
+
+The channel-edit divergence covers the edits where a thread scope could never
+match a click:
+- Teams and Google Chat edits, whose `post_channel_message` returns the channel
+  id as the thread id (upstream too);
+- chained edits (`sent = await sent.edit(...)` twice), whose returned
+  `SentMessage` drops the thread-id override until #195 ports `16ea171e`.
 
 **Breaking for `callback_url` users:** tokens minted before the upgrade stop
 resolving, a repeat click no longer POSTs, tokens expire after 7 days, and the
@@ -841,6 +843,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
+| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{thread_id, "thread"}` only when `thread_id` (the id the adapter reported for the post) differs from the channel id. Otherwise it binds to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` always binds to `{threadId, "thread"}`, where `threadId` is the reported id or the channel id | Teams and Google Chat `postChannelMessage` return the channel id as `threadId` (upstream as well), and so does a `SentMessage` returned by an edit until #195 ports `16ea171e`. A thread scope with the channel id never equals a click's thread id (Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), so upstream's edited buttons never POST there. Binding to the channel is no broader than the original post. Adapters whose thread id is the channel id (WhatsApp, Messenger, Twilio) resolve under either scope. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
 | `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |

@@ -8,7 +8,7 @@
     "matched_exact": 678,
     "matched_fuzzy": 82,
     "missing": 276,
-    "extra": 378
+    "extra": 380
   },
   "absent_ts_files": [],
   "files": {
@@ -121,7 +121,7 @@
       "matched_exact": 66,
       "matched_fuzzy": 1,
       "missing_count": 0,
-      "extra_count": 6,
+      "extra_count": 8,
       "missing": [],
       "fuzzy_matches": [
         ["should resolve a JSX Card and its children before scheduling", "test_should_convert_jsx_card_elements_to_cardelement"]
