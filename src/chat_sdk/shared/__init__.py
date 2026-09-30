@@ -19,6 +19,7 @@ from chat_sdk.shared.card_utils import (
     map_button_style,
     render_gfm_table,
 )
+from chat_sdk.shared.code_fences import normalize_code_fences
 from chat_sdk.shared.errors import (
     AdapterError,
     AdapterPermissionError,
@@ -34,6 +35,11 @@ from chat_sdk.shared.markdown_parser import (
     stringify_markdown,
     table_to_ascii,
     walk_ast,
+)
+from chat_sdk.shared.mentions import (
+    MentionReplacer,
+    mask_code_spans,
+    replace_bare_mentions,
 )
 from chat_sdk.shared.mock_adapter import (
     MockAdapter,
@@ -52,6 +58,7 @@ __all__ = [
     "AuthenticationError",
     "BUTTON_STYLE_MAPPINGS",
     "BaseFormatConverter",
+    "MentionReplacer",
     "MockAdapter",
     "MockLogger",
     "MockStateAdapter",
@@ -73,9 +80,12 @@ __all__ = [
     "extract_files",
     "extract_postable_attachments",
     "map_button_style",
+    "mask_code_spans",
     "mock_logger",
+    "normalize_code_fences",
     "parse_markdown",
     "render_gfm_table",
+    "replace_bare_mentions",
     "stringify_markdown",
     "table_to_ascii",
     "to_buffer",

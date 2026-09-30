@@ -291,11 +291,30 @@ The Python module layout mirrors the TS package layout:
 | `packages/core/src/from-full-stream.ts` | `src/chat_sdk/from_full_stream.py` |
 | `packages/core/src/markdown.ts` | `src/chat_sdk/shared/markdown_parser.py` + `base_format_converter.py` |
 | `packages/core/src/streaming-markdown.ts` | `src/chat_sdk/shared/streaming_markdown.py` |
+| `packages/adapter-shared/src/mentions.ts` | `src/chat_sdk/shared/mentions.py` |
+| `packages/adapter-shared/src/code-fences.ts` | `src/chat_sdk/shared/code_fences.py` |
 | `packages/adapter-slack/src/index.ts` | `src/chat_sdk/adapters/slack/adapter.py` |
 | `packages/state-memory/src/index.ts` | `src/chat_sdk/state/memory.py` |
 | `packages/state-redis/src/index.ts` | `src/chat_sdk/state/redis.py` |
 | `packages/state-ioredis/src/index.ts` | `src/chat_sdk/state/redis.py` (`IoRedisStateAdapter`) |
 | `packages/state-pg/src/index.ts` | `src/chat_sdk/state/postgres.py` |
+
+### Shared text utilities (chat@4.33–4.41, #193)
+
+`adapter-shared/src/mentions.ts` (`replaceBareMentions`, `maskCodeSpans`; `d4c52cad`, `683eadc1`) and `adapter-shared/src/code-fences.ts` (`normalizeCodeFences`; `e71bfead`) are ported character-for-character as `chat_sdk.shared.mentions` / `chat_sdk.shared.code_fences` and exported from `chat_sdk.shared`. They are utilities only: adapters adopt them in #206/#209 (Slack), #229 (Discord) and #239 (WhatsApp). Teams must not adopt the scanner, because upstream removed Teams outbound mention conversion in `7062c395` (#216).
+
+JS string semantics are reproduced explicitly, so there is no boundary-character gap:
+
+- `isLetter`/`isNumber`/`isWord` are ASCII range checks, not `str.isalpha()`/`\w` (`é@x` → `é<@x>`).
+- `isBoundary`'s `char.trim() === ""` and `code-fences.ts`'s `trimStart()` use the JS whitespace set in `shared/_js_compat.py` (`JS_WHITESPACE`): U+FEFF counts as whitespace, U+001C–U+001F and U+0085 do not. The table-row emptiness check in `ast_to_plain_text` uses the same set.
+- `startsWith(text, index, value)` lowercases the slice, so `HTTPS://` is a URL.
+- JS `text[i]` outside the string is `undefined`; the port bounds-checks every look-behind/look-ahead instead of letting `text[-1]` wrap.
+- The code-fence patterns use `\Z` for JS `$` (no `m` flag) and `[0-9]` for `\d`.
+- JS indexes UTF-16 code units and Python indexes code points. The output is the same, because every cut point is an ASCII delimiter or a BMP whitespace character, so no slice can split a surrogate pair.
+
+Both modules were checked against the TS sources at `chat@4.41.1` (run under Node) with a differential fuzz of about 130k random inputs built from the delimiter alphabet plus JS/Python whitespace edge characters. There were 0 mismatches.
+
+`ast_to_plain_text` follows upstream `toPlainText` from `5c926f19` (chat@4.34.0) and the core half of `764e4759` (chat@4.38.1). Root children are joined with `"\n\n"`. `list`, `listItem` and `blockquote` children are joined with `"\n"`. A `tableRow` joins its cells with `"\t"` and keeps empty cells. A `table` joins its rows with `"\n"` and drops rows that are empty after `trim()`. A string `value`/`alt` is returned as-is. The Python parser already kept soft line breaks inside text nodes, which was the remark half of #604. `table_to_ascii` reads cells, so its output does not change.
 
 ### SDK-free primitive subpaths (Teams, chat@4.31)
 

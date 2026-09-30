@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1036,
     "each_templates": 16,
-    "matched_exact": 689,
-    "matched_fuzzy": 82,
-    "missing": 265,
-    "extra": 367
+    "matched_exact": 699,
+    "matched_fuzzy": 81,
+    "missing": 256,
+    "extra": 376
   },
   "absent_ts_files": [],
   "files": {
@@ -18,13 +18,11 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 132,
+      "matched_exact": 134,
       "matched_fuzzy": 12,
-      "missing_count": 33,
+      "missing_count": 31,
       "extra_count": 13,
       "missing": [
-        ["Chat", "should call onNewMention for newline-separated GitHub bot mentions"],
-        ["Chat", "should not call onNewMention for concatenated GitHub bot mention text"],
         ["Chat", "should optionally propagate handler errors through waitUntil"],
         ["Chat", "aborts an active thread signal from another Chat instance"],
         ["Chat", "should dispatch message updates without normal message routing"],
@@ -135,21 +133,12 @@
       "python_exists": true,
       "ts_tests": 130,
       "each_templates": 0,
-      "matched_exact": 117,
-      "matched_fuzzy": 6,
-      "missing_count": 7,
-      "extra_count": 77,
-      "missing": [
-        ["toPlainText", "preserves soft line breaks as whitespace"],
-        ["toPlainText", "separates list items with whitespace"],
-        ["toPlainText", "separates table cells and rows with structural whitespace"],
-        ["toPlainText", "keeps empty table cells so columns stay aligned"],
-        ["toPlainText", "drops table rows with no content"],
-        ["markdownToPlainText", "preserves whitespace after a newline-separated mention"],
-        ["markdownToPlainText", "preserves whitespace after a paragraph-separated mention"]
-      ],
+      "matched_exact": 125,
+      "matched_fuzzy": 5,
+      "missing_count": 0,
+      "extra_count": 86,
+      "missing": [],
       "fuzzy_matches": [
-        ["preserves paragraph boundaries as whitespace", "test_roundtrip_preserves_escaped_block_markers_at_paragraph_start"],
         ["handles empty AST", "test_fromast_handles_empty_ast"],
         ["handles empty AST", "test_toplaintext_handles_empty_ast"],
         ["handles empty string", "test_text_handles_empty_string"],
