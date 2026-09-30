@@ -866,8 +866,14 @@ class TestHeldLockHandoff:
         state = create_mock_state()
         never = asyncio.Event()
 
+        outcome: list[str] = []
+
         async def stalled_extend(lock: Lock, ttl_ms: int) -> bool:
-            await never.wait()
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                outcome.append("cancelled")
+                raise
             return True
 
         state.extend_lock = AsyncMock(side_effect=stalled_extend)  # type: ignore[method-assign]
@@ -895,8 +901,9 @@ class TestHeldLockHandoff:
 
         state.release_lock.assert_awaited_once()
         assert "Releasing lock while a heartbeat extend is still in flight" in _warn_messages(logger)
-        never.set()
+        # The stalled call is cancelled so it cannot pin a backend connection.
         await clock.settle()
+        assert outcome == ["cancelled"]
 
     async def test_message_enqueued_while_the_drain_waits_on_an_in_flight_extend_is_drained(self, monkeypatch):
         clock = FakeClock().install(monkeypatch)
@@ -1086,3 +1093,166 @@ class TestHandBackOnOwnershipLoss:
         assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
         # The superseded message is not lost: it is back on the queue for the new holder.
         assert sorted(_queued_ids(state, THREAD)) == ["deb-take-1", "deb-take-2"]
+
+    async def test_takeover_during_collection_hands_the_batch_back(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        real_dequeue = state.dequeue
+        taken_over = False
+
+        async def dequeue_with_takeover(lock_key: str) -> QueueEntry | None:
+            nonlocal taken_over
+            if not taken_over:
+                taken_over = True
+                await state.force_release_lock(lock_key)
+                await state.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+            return await real_dequeue(lock_key)
+
+        chat, adapter, logger = await _make_chat(state, concurrency="queue")
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "coll-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("coll-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["coll-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("coll-2", "Hey @slack-bot two"))
+        state.dequeue = dequeue_with_takeover  # type: ignore[method-assign]
+        release.set()
+        await first
+
+        assert handled == ["coll-1"]
+        assert "Stopping queue drain after lock ownership was lost" in _warn_messages(logger)
+        assert _queued_ids(state, THREAD) == ["coll-2"]
+
+    async def test_arrivals_as_fast_as_dequeues_cannot_keep_debounce_collecting(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        real_dequeue = state.dequeue
+        dequeues = 0
+
+        async def flooding_dequeue(lock_key: str) -> QueueEntry | None:
+            nonlocal dequeues
+            dequeues += 1
+            if dequeues > 500:
+                raise AssertionError("collection never returned to the loop's checks")
+            flood = create_test_message(f"flood-{dequeues}", "Hey @slack-bot")
+            await state.enqueue(
+                lock_key, QueueEntry(message=flood, enqueued_at=clock.now, expires_at=clock.now + 90_000), 3
+            )
+            return await real_dequeue(lock_key)
+
+        chat, adapter, logger = await _make_chat(
+            state,
+            concurrency=ConcurrencyConfig(
+                strategy="debounce", debounce_ms=1500, max_queue_size=3, max_lock_lifetime_ms=5_000
+            ),
+        )
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+
+        task = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("flood-0", "Hey @slack-bot"))
+        )
+        await clock.settle()
+        state.dequeue = flooding_dequeue  # type: ignore[method-assign]
+        for _ in range(5):
+            await clock.advance(1500)
+        assert task.done()
+        await task
+
+        # Every window finds newer arrivals, so nothing is dispatched; the
+        # loop stops at the 5s cap and hands its superseded batch back.
+        assert handled == []
+        assert "Stopping debounce loop after lock ownership was lost" in _warn_messages(logger)
+        assert len(_queued_ids(state, THREAD)) == 3
+
+    async def test_hand_back_never_evicts_newer_arrivals(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        install_token_lock_mock(state, clock)
+        real_dequeue = state.dequeue
+        taken_over = False
+
+        def _entry(message_id: str) -> QueueEntry:
+            msg = create_test_message(message_id, "Hey @slack-bot")
+            return QueueEntry(message=msg, enqueued_at=clock.now, expires_at=clock.now + 90_000)
+
+        async def dequeue_with_takeover(lock_key: str) -> QueueEntry | None:
+            nonlocal taken_over
+            if not taken_over:
+                taken_over = True
+                await state.force_release_lock(lock_key)
+                await state.acquire_lock(lock_key, DEFAULT_LOCK_TTL_MS)
+                for message_id in ("evict-n1", "evict-n2"):
+                    await state.enqueue(lock_key, _entry(message_id), 3)
+            return await real_dequeue(lock_key)
+
+        chat, adapter, logger = await _make_chat(
+            state, concurrency=ConcurrencyConfig(strategy="queue", max_queue_size=2)
+        )
+        release = asyncio.Event()
+        handled: list[str] = []
+
+        @chat.on_mention
+        async def handler(thread, message, context=None):
+            handled.append(message.id)
+            if message.id == "evict-1":
+                await release.wait()
+
+        first = asyncio.create_task(
+            chat.handle_incoming_message(adapter, THREAD, create_test_message("evict-1", "Hey @slack-bot one"))
+        )
+        await clock.wait_for(lambda: handled == ["evict-1"])
+        await chat.handle_incoming_message(adapter, THREAD, create_test_message("evict-2", "Hey @slack-bot two"))
+        state.dequeue = dequeue_with_takeover  # type: ignore[method-assign]
+        release.set()
+        await first
+
+        # Queue at collection: [evict-2, evict-n1, evict-n2]; max_queue_size=2
+        # takes [evict-2, evict-n1] and leaves evict-n2. One slot is free, so
+        # only the newer evict-n1 goes back; the older evict-2 is dropped
+        # rather than evicting evict-n2.
+        assert handled == ["evict-1"]
+        assert _queued_ids(state, THREAD) == ["evict-n2", "evict-n1"]
+        dropped = [call[1]["message_id"] for call in logger.info.calls if call[0] == "message-dropped"]
+        assert dropped == ["evict-2"]
+
+    async def test_cancelling_stop_mid_wait_cancels_the_in_flight_extend(self, monkeypatch):
+        clock = FakeClock().install(monkeypatch)
+        state = create_mock_state()
+        never = asyncio.Event()
+        outcome: list[str] = []
+
+        async def stalled_extend(lock: Lock, ttl_ms: int) -> bool:
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                outcome.append("cancelled")
+                raise
+            return True
+
+        state.extend_lock = AsyncMock(side_effect=stalled_extend)  # type: ignore[method-assign]
+        lock = Lock(thread_id=THREAD, token="t", expires_at=0)
+        hb = chat_module._LockHeartbeat(state, lock, chat_module._monotonic_ms(), 600_000, MockLogger())
+        await clock.advance(DEFAULT_LOCK_TTL_MS // 3)  # extend in flight, stalled
+        stopper = asyncio.create_task(hb.stop())
+        await clock.settle()
+        assert not stopper.done()  # waiting while the lock is still known held
+        stopper.cancel()
+        await asyncio.gather(stopper, return_exceptions=True)
+        await clock.settle()
+
+        assert stopper.cancelled()
+        assert outcome == ["cancelled"]

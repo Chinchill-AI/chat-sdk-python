@@ -368,27 +368,41 @@ class _LockHeartbeat:
             )
         return False
 
+    def may_start_step(self) -> bool:
+        """Cheap gate before a drain/debounce step dequeues anything.
+
+        ``False`` once ownership is known lost, renewal has ended, or
+        ``max_lock_lifetime_ms`` has elapsed (measured here, not via the
+        renewal task, which may be stuck in a stalled extend), so the cap
+        bounds a busy drain. Divergence from upstream (which keeps draining
+        until the lock lapses one TTL after the cap) — see
+        docs/UPSTREAM_SYNC.md.
+        """
+        return (
+            self._renewing
+            and _monotonic_ms() - self._started_at < self._max_lifetime_ms
+            and not self.is_ownership_lost()
+        )
+
     async def confirm_ownership(self) -> bool:
-        """Token-checked extend before a drain/debounce step dispatches queued work.
+        """Token-checked extend after a drain/debounce step has collected its batch.
 
         Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream's drain
-        only consults ``isOwnershipLost()``, which cannot see a takeover
-        (``on_lock_conflict="force"`` on another worker) until the next
-        heartbeat tick. ``extend_lock`` compares the token, so a ``False`` here
-        means another holder owns the thread now. A backend error falls back
-        to the ``held_until`` rule, like the heartbeat's own extends.
+        only consults ``isOwnershipLost()`` before collecting, which cannot see
+        a takeover (``on_lock_conflict="force"`` on another worker) until the
+        next heartbeat tick, nor a loss while the dequeues ran. ``extend_lock``
+        compares the token, so a ``False`` here means another holder owns the
+        thread now. A backend error falls back to the ``held_until`` rule,
+        like the heartbeat's own extends.
 
         The check extends by the full TTL, like a heartbeat tick (full-TTL
         extends only ever move the expiry forward, so racing the heartbeat's
-        own extend is harmless), so a confirmed step starts with a full TTL of
-        margin. It is refused -- the drain stops and leaves the queue for the
-        next holder -- once ``max_lock_lifetime_ms`` has elapsed (measured
-        here, not via the renewal task, which may be stuck in a stalled
-        extend) or renewal has ended for any other reason, so the cap bounds
-        a busy drain even when the backend answers these checks.
+        own extend is harmless), so the dispatch that follows starts with a
+        full TTL of margin. It is refused under the same conditions as
+        :meth:`may_start_step`.
         """
         requested_at = _monotonic_ms()
-        if not self._renewing or requested_at - self._started_at >= self._max_lifetime_ms or self.is_ownership_lost():
+        if not self.may_start_step():
             return False
         try:
             extended = await self._state.extend_lock(self._lock, DEFAULT_LOCK_TTL_MS)
@@ -439,15 +453,27 @@ class _LockHeartbeat:
         anyway, and ``extend_lock``'s token-compare contract means a late
         extend cannot resurrect a released lock; an unbounded wait would let a
         stalled backend call hang the handler's cleanup and ``Chat.shutdown()``.
+        An extend still running at that point is cancelled. Within the bound,
         ``asyncio.wait`` is used so that cancelling the caller never cancels
         the extend mid-call.
         """
         self._stopped = True
         self._task.cancel()
         in_flight = self._in_flight
-        if not await self.settle_in_flight():
-            return
+        try:
+            if not await self.settle_in_flight():
+                return
+        except asyncio.CancelledError:
+            # Cancelled while waiting (e.g. ``Chat.shutdown()`` cancelling a
+            # handler already in cleanup): don't leave the extend orphaned.
+            if in_flight is not None:
+                in_flight.cancel()
+            raise
         if in_flight is not None and not in_flight.done():
+            # Past ``held_until``: cancel the stalled call so it cannot keep a
+            # backend connection (e.g. a Postgres pool slot) checked out and
+            # hang ``disconnect()`` during ``Chat.shutdown()``.
+            in_flight.cancel()
             self._logger.warn(
                 "Releasing lock while a heartbeat extend is still in flight",
                 {"thread_id": self._lock.thread_id, "token": self._lock.token},
@@ -2502,9 +2528,18 @@ class Chat:
 
         Returns ``(rehydrated message, original entry)`` pairs; the entry is
         kept so :meth:`_hand_back` can re-enqueue it unchanged.
+
+        Takes at most ``max_queue_size`` entries -- the most the queue can hold
+        at once -- so arrivals as fast as the dequeues cannot keep a drain
+        collecting forever without reaching its ownership / lifetime checks;
+        anything left is picked up by the next step. Divergence from upstream
+        (unbounded) — see docs/UPSTREAM_SYNC.md.
         """
         pending: list[tuple[Message, QueueEntry]] = []
-        while True:
+        # Only live entries count toward the bound: expired ones are old by
+        # definition, so they cannot be a stream of new arrivals.
+        limit = max(1, self._concurrency_max_queue_size)
+        while len(pending) < limit:
             entry = await self._state_adapter.dequeue(lock_key)
             if entry is None:
                 return pending
@@ -2516,6 +2551,7 @@ class Chat:
                     "message-expired",
                     {"thread_id": msg.thread_id, "lock_key": lock_key, "message_id": msg.id},
                 )
+        return pending
 
     async def _hand_back(self, lock_key: str, taken: list[tuple[Message, QueueEntry]], loop_name: str) -> None:
         """Ownership was lost with messages dequeued but not dispatched: re-enqueue them.
@@ -2525,15 +2561,28 @@ class Chat:
         slow still dispatches the batch under another holder's lock, and a
         debounce loop that stops drops its accumulated superseded messages.
         Here they go back on the queue, in their original order, for the
-        next holder.
+        next holder -- but only into free capacity: they are older than
+        anything queued since, and re-enqueueing into a full queue would
+        evict those newer arrivals. The oldest that do not fit are dropped
+        (logged as ``message-dropped``).
         """
         self._logger.warn(f"Stopping {loop_name} after lock ownership was lost", {"lock_key": lock_key})
-        for _, entry in taken:
-            await self._state_adapter.enqueue(lock_key, entry, self._concurrency_max_queue_size)
-        if taken:
+        if not taken:
+            return
+        max_size = self._concurrency_max_queue_size
+        room = max(0, max_size - await self._state_adapter.queue_depth(lock_key))
+        keep = taken[len(taken) - room :] if room else []
+        for msg, _ in taken[: len(taken) - len(keep)]:
+            self._logger.info(
+                "message-dropped",
+                {"thread_id": msg.thread_id, "lock_key": lock_key, "message_id": msg.id, "reason": "queue-full"},
+            )
+        for _, entry in keep:
+            await self._state_adapter.enqueue(lock_key, entry, max_size)
+        if keep:
             self._logger.info(
                 "messages-requeued",
-                {"lock_key": lock_key, "message_ids": [msg.id for msg, _ in taken]},
+                {"lock_key": lock_key, "message_ids": [msg.id for msg, _ in keep]},
             )
 
     # -- Debounce loop -------------------------------------------------------
@@ -2558,7 +2607,7 @@ class Chat:
 
         while True:
             await _sleep(debounce_ms)
-            if not await heartbeat.confirm_ownership():
+            if not heartbeat.may_start_step():
                 # Another instance may hold the lock now -- leave the queue to it.
                 await self._hand_back(lock_key, skipped, "debounce loop")
                 return
@@ -2569,8 +2618,9 @@ class Chat:
                     # We yielded: a message may have enqueued meanwhile.
                     continue
                 return
-            if heartbeat.is_ownership_lost():
-                # Lost while collecting (a slow dequeue during an outage).
+            if not await heartbeat.confirm_ownership():
+                # Lost before or while collecting (a takeover, or a slow
+                # dequeue during an outage): hand the batch to the new holder.
                 await self._hand_back(lock_key, skipped + pending, "debounce loop")
                 return
 
@@ -2621,7 +2671,7 @@ class Chat:
     ) -> None:
         """Dispatch the latest pending message with the rest as skipped; repeat until empty."""
         while True:
-            if not await heartbeat.confirm_ownership():
+            if not heartbeat.may_start_step():
                 # Another instance may hold the lock now -- leave the queue to it.
                 await self._hand_back(lock_key, [], "queue drain")
                 return
@@ -2632,8 +2682,9 @@ class Chat:
                     # We yielded: a message may have enqueued meanwhile.
                     continue
                 return
-            if heartbeat.is_ownership_lost():
-                # Lost while collecting (a slow dequeue during an outage).
+            if not await heartbeat.confirm_ownership():
+                # Lost before or while collecting (a takeover, or a slow
+                # dequeue during an outage): hand the batch to the new holder.
                 await self._hand_back(lock_key, pending, "queue drain")
                 return
 
