@@ -21,6 +21,7 @@ import gzip
 import importlib
 import socket
 import sys
+import time
 import types
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -429,8 +430,26 @@ class TestHostCanonicalization:
             "https://files.example.com/a%20b/%2F%C3%A9?download=a%2Fb&x=%22y%22"
         )
 
-    def test_unicode_host_is_converted_to_ascii(self) -> None:
-        assert validate_attachment_url("https://bücher.example/x", "test") == "https://xn--bcher-kva.example/x"
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://bücher.example/x", "https://xn--bcher-kva.example/x"),
+            # Non-transitional UTS46 (WHATWG, yarl): not IDNA 2003's fass.de.
+            ("https://faß.de/file", "https://xn--fa-hia.de/file"),
+            # Case mapping is UTS46's, applied to the raw host (matches Node).
+            ("https://FAẞ.de/file", "https://xn--fa-hia.de/file"),
+            ("https://BÜCHER.Example/x", "https://xn--bcher-kva.example/x"),
+        ],
+    )
+    def test_unicode_host_is_converted_to_ascii(self, url: str, expected: str) -> None:
+        assert validate_attachment_url(url, "test") == expected
+
+    def test_unicode_host_is_untrusted_without_the_idna_package(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "idna", None)
+
+        with pytest.raises(NetworkError, match=UNTRUSTED):
+            validate_attachment_url("https://faß.de/file", "test")
+        assert validate_attachment_url("https://files.example.com/x", "test") == "https://files.example.com/x"
 
     @pytest.mark.parametrize(
         ("address", "blocked"),
@@ -509,39 +528,50 @@ class TestBrotli:
             await download_attachment("https://files.example.com/file", adapter="test", transport=transport)
         assert transport.calls[0][1]["accept-encoding"] == "gzip, deflate"
 
-    async def test_br_is_decoded_and_capped_with_a_bounded_brotli(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        class Decompressor:
-            """Expands each input byte to 1000 bytes, 400 bytes per step."""
+    async def test_br_is_unsupported_with_a_brotli_that_cannot_bound_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Decompressor:  # Brotli < 1.2: no output_buffer_limit support
+            def process(self, data: bytes) -> bytes:
+                return data
 
-            def __init__(self) -> None:
-                self._pending = 0
+        old = types.ModuleType("brotli")
+        old.Decompressor = Decompressor  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "brotli", old)
+        transport = FakeTransport(FakeResponse("payload", 200, {"content-encoding": "br"}))
 
-            def process(self, data: bytes, output_buffer_limit: int) -> bytes:
-                self._pending += len(data) * 1000
-                step = min(self._pending, 400, output_buffer_limit)
-                self._pending -= step
-                return b"x" * step
+        with pytest.raises(NetworkError, match="Unsupported attachment encoding: br"):
+            await download_attachment("https://files.example.com/file", adapter="test", transport=transport)
+        assert transport.calls[0][1]["accept-encoding"] == "gzip, deflate"
 
-            def can_accept_more_data(self) -> bool:
-                return self._pending == 0
+    @pytest.mark.parametrize("chunk_size", [5, 4096, 1 << 20])
+    async def test_br_bodies_are_decoded_with_real_brotli(self, chunk_size: int) -> None:
+        brotli = pytest.importorskip("brotli")
+        payload = bytes(range(256)) * 400 + b"x" * 100_000  # buffered output past one step
+        body = brotli.compress(payload)
+        chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
+        transport = FakeTransport(FakeResponse(headers={"content-encoding": "br"}, chunks=chunks))
 
-            def is_finished(self) -> bool:
-                return True
+        result = await download_attachment("https://files.example.com/file", adapter="test", transport=transport)
 
-        fake = types.ModuleType("brotli")
-        fake.Decompressor = Decompressor  # type: ignore[attr-defined]
-        fake.error = ValueError  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "brotli", fake)
+        assert result == payload
+        assert transport.calls[0][1]["accept-encoding"] == "gzip, deflate, br"
 
-        ok = FakeTransport(FakeResponse(b"ab", 200, {"content-encoding": "br"}))
-        assert await download_attachment("https://files.example.com/file", adapter="test", transport=ok) == (
-            b"x" * 2000
-        )
-        assert ok.calls[0][1]["accept-encoding"] == "gzip, deflate, br"
+    async def test_br_download_limit_applies_to_decompressed_bytes(self) -> None:
+        brotli = pytest.importorskip("brotli")
+        body = brotli.compress(bytes(10 * 1024 * 1024))  # tiny on the wire
+        transport = FakeTransport(FakeResponse(body, 200, {"content-encoding": "br"}))
 
-        big = FakeTransport(FakeResponse(b"abc", 200, {"content-encoding": "br"}))
         with pytest.raises(NetworkError, match="Attachment exceeds the download limit"):
-            await download_attachment("https://files.example.com/file", adapter="test", limit=2500, transport=big)
+            await download_attachment("https://files.example.com/file", adapter="test", limit=1024, transport=transport)
+
+    async def test_truncated_br_body_is_an_error(self) -> None:
+        brotli = pytest.importorskip("brotli")
+        body = brotli.compress(bytes(range(256)) * 400)
+        message = FakeResponse(headers={"content-encoding": "br"}, chunks=[body[: len(body) // 2]])
+
+        with pytest.raises(brotli.error, match="unexpected end of file"):
+            await read_attachment_body(message, "test")
 
 
 class TestBodyDecoding:
@@ -634,6 +664,42 @@ class TestDeadlineAndCancellation:
         )
         assert result == b"ok"
         assert done.close_calls == 1
+
+    async def test_no_hop_starts_after_a_slow_redirect_close_uses_up_the_deadline(self) -> None:
+        class SlowClose(FakeResponse):
+            def close(self) -> asyncio.Future[None]:
+                self.close_calls += 1
+                return asyncio.get_running_loop().create_future()  # never completes
+
+        responses = [SlowClose("", 302, {"location": "https://cdn.example.net/file"}), FakeResponse("too late")]
+        calls: list[str] = []
+
+        def transport(url: str, headers: dict[str, str]) -> asyncio.Future[AttachmentResponse]:
+            # Synchronous transport: does its work when called, never suspends.
+            calls.append(url)
+            done: asyncio.Future[AttachmentResponse] = asyncio.get_running_loop().create_future()
+            done.set_result(responses.pop(0))
+            return done
+
+        with pytest.raises(NetworkError, match=TIMED_OUT):
+            await download_attachment(
+                "https://files.example.com/file", adapter="test", timeout_ms=20, transport=transport
+            )
+        assert calls == ["https://files.example.com/file"]
+
+    async def test_a_body_read_completing_after_the_deadline_is_refused(self) -> None:
+        class BlockingBody(FakeResponse):
+            async def _iterate(self) -> AsyncIterator[bytes]:
+                time.sleep(0.05)  # blocking work past the 20 ms deadline, no suspension
+                yield b"too late"
+
+        late = BlockingBody()
+
+        with pytest.raises(NetworkError, match=TIMED_OUT):
+            await download_attachment(
+                "https://files.example.com/file", adapter="test", timeout_ms=20, transport=FakeTransport(late)
+            )
+        assert late.close_calls >= 1
 
     async def test_transport_errors_propagate_unchanged(self) -> None:
         async def transport(url: str, headers: dict[str, str]) -> AttachmentResponse:

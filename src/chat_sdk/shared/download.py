@@ -25,7 +25,6 @@ import inspect
 import ipaddress
 import re
 import socket
-import unicodedata
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol, cast
@@ -227,6 +226,25 @@ def _parse_ipv4(host: str) -> ipaddress.IPv4Address | None:
     return ipaddress.IPv4Address(value)
 
 
+def _domain_to_ascii(host: str) -> str | None:
+    """WHATWG "domain to ASCII": UTS46 non-transitional processing.
+
+    Uses the ``idna`` package (a dependency of aiohttp/yarl, httpx and
+    requests), which is also what yarl uses, so the validated host and the
+    one the HTTP client contacts agree. Python's built-in ``idna`` codec is
+    IDNA 2003 (``faß.de`` -> ``fass.de``) and would change the destination,
+    so without the package a non-ASCII host is refused.
+    """
+    try:
+        import idna
+    except ImportError:
+        return None
+    try:
+        return idna.encode(host, uts46=True).decode("ascii")
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return None
+
+
 def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """Canonicalize the URL host the way a WHATWG ``URL`` would.
 
@@ -236,18 +254,20 @@ def _canonical_host(parts: SplitResult) -> str | ipaddress.IPv4Address | ipaddre
     an IP address object for literals, the lowercased ASCII hostname
     otherwise, or ``None`` when the host is not valid.
     """
-    host = parts.hostname
-    if not host:
+    if not parts.hostname:
         return None
+    # The raw host, before ``urlsplit``'s ``str.lower()``: UTS46 does its
+    # own case mapping, which differs for a few code points (e.g. U+1E9E).
+    host = parts.netloc.rpartition("@")[2]
+    host = host[1 : host.index("]")] if host.startswith("[") else host.partition(":")[0]
     if "%" in host:
         try:
             host = unquote(host, errors="strict")
         except UnicodeDecodeError:
             return None
     if not host.isascii():
-        try:
-            host = unicodedata.normalize("NFKC", host).encode("idna").decode("ascii")
-        except UnicodeError:
+        host = _domain_to_ascii(host)
+        if host is None:
             return None
     host = host.lower()
     if ":" in host:
@@ -490,9 +510,16 @@ class _BrotliDecoder:
         self._error = module.error
 
     def feed(self, data: bytes) -> Iterator[bytes]:
-        yield self._stream.process(data, output_buffer_limit=_DECODE_STEP)
-        while not self._stream.can_accept_more_data():
-            yield self._stream.process(b"", output_buffer_limit=_DECODE_STEP)
+        if self._stream.is_finished():
+            return  # data after the end of the stream is ignored
+        out = self._stream.process(data, output_buffer_limit=_DECODE_STEP)
+        # Output can stay buffered even when ``can_accept_more_data()`` is
+        # true, so drain with empty input until a step produces nothing.
+        while out:
+            yield out
+            if self._stream.is_finished():
+                return
+            out = self._stream.process(b"", output_buffer_limit=_DECODE_STEP)
 
     def finish(self) -> None:
         if not self._stream.is_finished():
@@ -699,19 +726,31 @@ async def _within_deadline(
 
     Unlike ``asyncio.timeout`` this does not wait for ``pending`` to honour
     cancellation, so an awaitable that ignores it cannot stall the download.
-    ``late`` receives a result that arrives after the deadline.
+    ``late`` receives a result that arrives after the deadline. Once the
+    deadline has passed nothing new is started, and a result that completes
+    at or after it is treated as late (upstream destroys such a response).
     """
     task = asyncio.ensure_future(pending)
     loop = asyncio.get_running_loop()
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        # Cancelled before its first step, so a coroutine never runs.
+        _abandon(task, late)
+        raise NetworkError(adapter, _TIMED_OUT)
     try:
-        done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - loop.time()))
+        done, _ = await asyncio.wait({task}, timeout=remaining)
     except BaseException:
         _abandon(task, late)
         raise
-    if task not in done:
+    if task not in done or loop.time() >= deadline:
         _abandon(task, late)
         raise NetworkError(adapter, _TIMED_OUT)
     return task.result()
+
+
+def _check_deadline(deadline: float, adapter: str) -> None:
+    if asyncio.get_running_loop().time() >= deadline:
+        raise NetworkError(adapter, _TIMED_OUT)
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +822,9 @@ async def download_attachment(
     deadline = loop.time() + timeout_ms / 1000
     try:
         for hop in range(redirects + 1):
+            # No new hop once the deadline has passed (e.g. a slow redirect
+            # close used it up), even for a transport that never suspends.
+            _check_deadline(deadline, adapter)
             hop_headers = _hop_headers(headers, current, first_origin)
             response: AttachmentResponse = await _within_deadline(
                 send(current, hop_headers), deadline, adapter, late=_close_late
