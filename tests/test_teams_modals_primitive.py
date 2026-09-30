@@ -328,6 +328,8 @@ class TestDateAndNumberInputs:
         # number. JSON ``1e400`` is a float infinity in Python and
         # ``Infinity`` after JSON.parse, as is an over-long int literal once
         # JS holds it as a double: all render as JS ``String(Infinity)``.
+        # Python's ``json`` also accepts ``NaN``; it is a number upstream too
+        # (``typeof NaN === "number"``), so it renders as ``String(NaN)``.
         parsed = parse_teams_dialog_submit_values(
             {
                 "a": 5.0,
@@ -339,6 +341,7 @@ class TestDateAndNumberInputs:
                 "g": None,
                 "h": [1],
                 "i": 10**400,
+                "j": float("nan"),
             }
         )
         assert parsed["values"] == {
@@ -348,6 +351,7 @@ class TestDateAndNumberInputs:
             "e": "-Infinity",
             "f": "Infinity",
             "i": "Infinity",
+            "j": "NaN",
         }
 
 

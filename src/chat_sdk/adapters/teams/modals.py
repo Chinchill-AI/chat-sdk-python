@@ -300,7 +300,8 @@ def parse_teams_dialog_submit_values(
     when string-typed. Every other key is copied into ``values`` when its
     value is a string, or stringified when it is a number (``Input.Number``
     submits a JSON number), formatted as JS ``String(value)`` does so ``5.0``
-    becomes ``"5"`` and infinities become ``"Infinity"`` / ``"-Infinity"``.
+    becomes ``"5"``, infinities become ``"Infinity"`` / ``"-Infinity"`` and
+    NaN becomes ``"NaN"``.
     ``bool`` is not a number upstream and is dropped, as is any other type.
     """
     if not data:
@@ -318,7 +319,10 @@ def parse_teams_dialog_submit_values(
         elif isinstance(value, (int, float)):
             # Input.Number submits a JSON number. Every number is kept, as
             # upstream's ``typeof value === "number"`` does: ``JSON.parse``
-            # yields ``Infinity`` for ``1e400``, rendered as "Infinity".
+            # yields ``Infinity`` for ``1e400``, rendered as "Infinity". A
+            # Teams client serializes Input.Number from a JS double, so an
+            # integer literal on the wire is already exactly representable
+            # and ``str(int)`` gives the digits ``String()`` would.
             values[key] = _js_number_to_string(value)
 
     raw_callback_id = data.get("__callbackId")

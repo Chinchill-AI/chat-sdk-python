@@ -694,7 +694,8 @@ SDK-free cards-primitives surface, so upstream's two table converters (and the
   numbers as JS `String(value)` does, via `cards._js_number_to_string`
   (`5.0` → `"5"`, `1e21` → `"1e+21"`, and `1e400` or an over-long int
   literal → `"Infinity"`, as `JSON.parse` yields `Infinity` for both). Every
-  `int` / `float` is kept, as upstream keeps every `typeof value === "number"`.
+  `int` / `float` is kept, as upstream keeps every `typeof value === "number"`
+  (NaN, which Python's `json` accepts, renders as `"NaN"`).
   `bool` is dropped, as upstream drops every non-number.
 - **Primitive emoji.** Upstream's plain-object converter resolves Slack-style
   `:white_check_mark:` shortcodes in cell text and tooltips; the shared
