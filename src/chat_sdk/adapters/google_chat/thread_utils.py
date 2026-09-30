@@ -6,7 +6,10 @@ Python port of thread-utils.ts.
 from __future__ import annotations
 
 import base64
+import json
+import re
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 from chat_sdk.shared import ValidationError
 
@@ -66,6 +69,43 @@ def decode_thread_id(thread_id: str) -> GoogleChatThreadId:
         thread_name=thread_name,
         is_dm=is_dm,
     )
+
+
+class GoogleChatMessageName(NamedTuple):
+    """Google Chat message resource name data (upstream ``GoogleChatMessageName``)."""
+
+    space_name: str
+    """Space resource name, e.g. ``spaces/AAQAJ9CXYcg``."""
+    message_id: str
+    """Message segment, e.g. ``FGEOaAwNIcs.FGEOaAwNIcs`` or ``client-my-id``."""
+
+
+# Exactly ``spaces/{space}/messages/{message}`` (upstream d6343460 pattern; its
+# ``^``/``$`` anchors are replaced by ``fullmatch``).
+# Segments are the characters Google uses in resource ids; a dot may only join
+# two non-empty groups, so ``.`` and ``..`` segments, empty segments, ``?``,
+# ``#``, ``%``, ``/``, and whitespace are all rejected before the name reaches
+# the API. ASCII ranges are spelled out, and the pattern is applied with
+# ``fullmatch`` (``re.match`` with ``$`` would accept a trailing ``\n``).
+_MESSAGE_NAME_PATTERN = re.compile(r"spaces/([A-Za-z0-9_-]+)/messages/([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)")
+
+
+def parse_message_name(message_id: Any) -> GoogleChatMessageName:
+    """Parse a Google Chat message resource name.
+
+    Message ids identify a message on their own, so anything that lets a name
+    resolve somewhere other than it appears to (path traversal, query strings,
+    percent-encoding) is rejected with ``ValidationError`` rather than
+    normalized downstream.
+    """
+    match = _MESSAGE_NAME_PATTERN.fullmatch(message_id) if isinstance(message_id, str) else None
+    if match is None:
+        raise ValidationError(
+            "gchat",
+            f"Invalid Google Chat message id: {json.dumps(message_id, ensure_ascii=False, default=repr)} "
+            "(expected spaces/{space}/messages/{message})",
+        )
+    return GoogleChatMessageName(space_name=f"spaces/{match.group(1)}", message_id=match.group(2))
 
 
 def is_dm_thread(thread_id: str) -> bool:

@@ -365,3 +365,13 @@ class GoogleChatAdapterConfig:
     # Falls back to the GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL env var when
     # left unset (None).
     pubsub_service_account_email: str | None = field(default=None, kw_only=True)
+
+    # Canonical ``users/...`` resource name of this Chat app (the
+    # ``sender.name`` of a verified message the app authored), e.g.
+    # ``users/123456789``. Used for exact self-message detection and to decide
+    # which bot mention to normalize to ``@{user_name}``. The adapter never
+    # learns this from inbound mentions (upstream f485255b). When unset, every
+    # ``BOT`` sender is treated as self (fail closed, no reply loops -- but
+    # other bots' messages are ignored) and no bot mention is normalized.
+    # Falls back to the GOOGLE_CHAT_BOT_USER_ID env var when left unset (None).
+    bot_user_id: str | None = field(default=None, kw_only=True)
