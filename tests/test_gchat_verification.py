@@ -1,22 +1,42 @@
 """Tests for Google Chat webhook verification behaviour.
 
 Covers: the constructor fail-closed verification gate (google_chat_project_number,
-pubsub_audience, or the disable_signature_verification escape hatch, with env
-fallback), rejecting webhooks without auth header, rejecting invalid tokens,
-warning when no project number is configured, and allowing webhooks
-when verification is unconfigured.
+endpoint_url, pubsub_audience, or the disable_signature_verification escape
+hatch, with env fallback), rejecting webhooks without auth header, rejecting
+invalid tokens, warning when no project number is configured, allowing
+webhooks when verification is unconfigured, and the identity binding of each
+transport (upstream 270b1c25 / 7a192235 / c3b5a08e, issue #222): endpoint-URL
+OIDC tokens, project-number tokens self-signed by the Chat service account,
+Workspace Add-on identities, Pub/Sub push identities, and button-click
+endpoint inference.
+
+Verification runs for real against locally generated RSA keys: the adapter's
+``_fetch_json`` is replaced with an in-memory key server, so no test touches
+the network and every signature/claim check executes unmocked.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import jwt as pyjwt
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from jwt.algorithms import RSAAlgorithm
 
-from chat_sdk.adapters.google_chat.adapter import GoogleChatAdapter
+from chat_sdk.adapters.google_chat.adapter import (
+    GOOGLE_CHAT_ISSUER_CERTS_URL,
+    GOOGLE_OIDC_CERTS_URL,
+    GoogleChatAdapter,
+)
 from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
@@ -31,6 +51,20 @@ _VERIFICATION_ENV_KEYS = (
     "GOOGLE_CHAT_PUBSUB_AUDIENCE",
     "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION",
 )
+
+# Identity env vars. Cleared for EVERY test in this module (autouse) so a
+# developer shell that exports them can't turn a "no identity configured"
+# rejection test into an accidental pass.
+_IDENTITY_ENV_KEYS = (
+    "GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL",
+    "GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_identity_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _IDENTITY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
@@ -125,12 +159,147 @@ class FakeRequest:
         self,
         body: str,
         headers: dict[str, str] | None = None,
+        url: str | None = None,
     ) -> None:
         self.body = body.encode("utf-8")
         self.headers = headers or {}
+        if url is not None:
+            self.url = url
 
     async def text(self) -> str:
         return self.body.decode("utf-8")
+
+
+# =============================================================================
+# Local key infrastructure (no network)
+#
+# Three RSA keys stand in for: Google's OIDC signer (endpoint-URL and Pub/Sub
+# tokens), the Chat service account's self-signed issuer (project-number
+# tokens), and an attacker. The adapter's ``_fetch_json`` is replaced with an
+# in-memory server that publishes the first two exactly as Google does: a JWKS
+# document for OIDC, and a ``{kid: PEM certificate}`` map for the Chat issuer.
+# =============================================================================
+
+_OIDC_KID = "oidc-kid"
+_CHAT_KID = "chat-kid"
+_OIDC_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_CHAT_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_ATTACKER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+_CHAT_SA = "chat@system.gserviceaccount.com"
+_ENDPOINT = "https://example.com/webhook"
+_PUBSUB_AUDIENCE = "https://example.com/webhook/pubsub"
+_PUSH_SA = "pubsub@my-project.iam.gserviceaccount.com"
+_ADD_ON_SA = "service-111@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
+
+
+def _self_signed_cert_pem(key: rsa.RSAPrivateKey) -> str:
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _CHAT_SA)])
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def _jwks_document() -> dict[str, Any]:
+    jwk = RSAAlgorithm.to_jwk(_OIDC_KEY.public_key(), as_dict=True)
+    jwk.update({"kid": _OIDC_KID, "alg": "RS256", "use": "sig"})
+    return {"keys": [jwk]}
+
+
+_CHAT_CERTS_DOCUMENT = {_CHAT_KID: _self_signed_cert_pem(_CHAT_KEY)}
+
+
+class _KeyServer:
+    """In-memory stand-in for Google's key endpoints; records every fetch."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+        self.fail_next = False
+        self.documents: dict[str, Any] = {
+            GOOGLE_OIDC_CERTS_URL: _jwks_document(),
+            GOOGLE_CHAT_ISSUER_CERTS_URL: _CHAT_CERTS_DOCUMENT,
+        }
+
+    async def fetch(self, url: str) -> Any:
+        self.urls.append(url)
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("simulated key fetch failure")
+        return self.documents[url]
+
+
+def _install_key_server(adapter: GoogleChatAdapter) -> _KeyServer:
+    server = _KeyServer()
+    adapter._fetch_json = AsyncMock(side_effect=server.fetch)  # type: ignore[method-assign]
+    return server
+
+
+def _mint(key: rsa.RSAPrivateKey, kid: str, claims: dict[str, Any]) -> str:
+    # Signed at the JWS layer so tests can mint claim shapes PyJWT's encoder
+    # refuses (e.g. a list-valued `iss`) -- a forger isn't bound by it either.
+    return pyjwt.api_jws.encode(json.dumps(claims).encode("utf-8"), key, algorithm="RS256", headers={"kid": kid})
+
+
+def _oidc_claims(audience: str, **overrides: Any) -> dict[str, Any]:
+    """Claims of a Google OIDC ID token (endpoint-URL / Pub/Sub tokens)."""
+    now = int(time.time())
+    claims: dict[str, Any] = {
+        "iss": "https://accounts.google.com",
+        "aud": audience,
+        "iat": now,
+        "exp": now + 3600,
+        "email": _CHAT_SA,
+        "email_verified": True,
+    }
+    claims.update(overrides)
+    return claims
+
+
+def _chat_claims(project_number: str, **overrides: Any) -> dict[str, Any]:
+    """Claims of a project-number token self-signed by the Chat issuer."""
+    now = int(time.time())
+    claims: dict[str, Any] = {"iss": _CHAT_SA, "aud": project_number, "iat": now, "exp": now + 3600}
+    claims.update(overrides)
+    return claims
+
+
+def _oidc_token(audience: str, **overrides: Any) -> str:
+    return _mint(_OIDC_KEY, _OIDC_KID, _oidc_claims(audience, **overrides))
+
+
+def _logger_mock() -> MagicMock:
+    logger = MagicMock()
+    logger.child = MagicMock(return_value=logger)
+    return logger
+
+
+def _warn_messages(logger: MagicMock) -> list[str]:
+    return [str(call.args[0]) for call in logger.warn.call_args_list]
+
+
+async def _verifying_adapter(**config: Any) -> tuple[GoogleChatAdapter, MagicMock, _KeyServer]:
+    """Initialized adapter with verification ON and a local key server."""
+    config.setdefault("disable_signature_verification", False)
+    config.setdefault("logger", _logger_mock())
+    adapter = GoogleChatAdapter(GoogleChatAdapterConfig(credentials=_make_credentials(), **config))
+    server = _install_key_server(adapter)
+    chat = _make_mock_chat()
+    await adapter.initialize(chat)
+    return adapter, chat, server
+
+
+def _direct(token: str | None = None, *, url: str = _ENDPOINT) -> FakeRequest:
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    return FakeRequest(json.dumps(_make_message_event()), headers=headers, url=url)
 
 
 # =============================================================================
@@ -170,22 +339,25 @@ class TestRejectsWithInvalidToken:
     @pytest.mark.asyncio
     async def test_rejects_webhook_with_invalid_token(self):
         adapter = _make_adapter(google_chat_project_number="123456789")
+        key_server = _install_key_server(adapter)
         state = _make_mock_state()
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
 
-        event = _make_message_event()
+        # Right kid, right claims, wrong signing key: the project-number path
+        # (Chat issuer X.509 certs) must reject it on the signature.
+        token = _mint(_ATTACKER_KEY, _CHAT_KID, _chat_claims("123456789"))
         request = FakeRequest(
-            json.dumps(event),
-            headers={"Authorization": "Bearer invalid.jwt.token"},
+            json.dumps(_make_message_event()),
+            headers={"Authorization": f"Bearer {token}"},
         )
 
-        # The _verify_bearer_token will attempt JWT verification which will fail
-        # on an invalid token -- the adapter should return 401
         result = await adapter.handle_webhook(request)
 
         assert result["status"] == 401
         chat.process_message.assert_not_called()
+        # Project-number tokens are checked against the Chat issuer certs only.
+        assert key_server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
 
 
 # =============================================================================
@@ -298,6 +470,14 @@ class TestConstructorEachGatingFieldSatisfiesIndividually:
         adapter = GoogleChatAdapter(_config(google_chat_project_number="123456789"))
         assert adapter.name == "gchat"
         assert adapter._google_chat_project_number == "123456789"
+
+    def test_endpoint_url_satisfies(self, clear_verification_env: pytest.MonkeyPatch):
+        # Upstream: "should not throw in constructor when only endpointUrl is
+        # configured" -- apps whose authentication audience is "HTTP endpoint
+        # URL" verify direct webhooks against it.
+        adapter = GoogleChatAdapter(_config(endpoint_url="https://example.com/webhook"))
+        assert adapter.name == "gchat"
+        assert adapter._endpoint_url == "https://example.com/webhook"
 
     def test_pubsub_audience_satisfies(self, clear_verification_env: pytest.MonkeyPatch):
         adapter = GoogleChatAdapter(_config(pubsub_audience="https://example.com/webhook"))
@@ -487,14 +667,30 @@ class TestPerShapeVerificationRejection:
 
 
 class TestDisableSignatureVerificationFieldOrder:
-    def test_disable_signature_verification_is_last_field(self):
+    def test_disable_signature_verification_is_last_positional_field(self):
         # Load-bearing: this test fails if a future change re-inserts the field
-        # in the middle of the dataclass.
-        field_names = [f.name for f in dataclasses.fields(GoogleChatAdapterConfig)]
-        assert field_names[-1] == "disable_signature_verification", (
-            f"disable_signature_verification must be the LAST field of "
-            f"GoogleChatAdapterConfig (positional-args back-compat); got order: {field_names}"
+        # in the middle of the dataclass, or adds a new field positionally
+        # after it. Fields added later (the identity emails, #222) are
+        # ``kw_only`` and therefore don't count.
+        positional = [f.name for f in dataclasses.fields(GoogleChatAdapterConfig) if not f.kw_only]
+        assert positional[-1] == "disable_signature_verification", (
+            f"disable_signature_verification must be the LAST positional field of "
+            f"GoogleChatAdapterConfig (positional-args back-compat); got order: {positional}"
         )
+
+    def test_identity_fields_are_keyword_only(self):
+        fields = {f.name: f for f in dataclasses.fields(GoogleChatAdapterConfig)}
+        assert fields["workspace_add_on_service_account_email"].kw_only is True
+        assert fields["pubsub_service_account_email"].kw_only is True
+
+    def test_extra_positional_arg_is_rejected_not_absorbed(self):
+        # With the identity fields keyword-only, an 11th positional argument
+        # has nowhere to go -- it must raise rather than silently become an
+        # identity the verifier trusts.
+        with pytest.raises(TypeError):
+            GoogleChatAdapterConfig(
+                None, False, None, None, None, None, None, None, None, None, "pubsub@p.iam.gserviceaccount.com"
+            )
 
     def test_old_positional_call_does_not_misalign(self, clear_verification_env: pytest.MonkeyPatch):
         # Simulates a pre-fail-closed-PR caller using the OLD positional order:
@@ -519,6 +715,489 @@ class TestDisableSignatureVerificationFieldOrder:
         assert config.impersonate_user == "alice@example.com"
         assert config.logger is logger_sentinel
         assert config.pubsub_audience == "https://example.com/audience"
-        # New field falls back to its default rather than absorbing any of the
-        # above positional args.
+        # New fields fall back to their defaults rather than absorbing any of
+        # the above positional args.
         assert config.disable_signature_verification is None
+        assert config.workspace_add_on_service_account_email is None
+        assert config.pubsub_service_account_email is None
+
+
+# =============================================================================
+# Tests -- direct webhook identity binding (upstream 270b1c25, #518)
+#
+# Ports of the upstream `webhook verification` cases added in chat@4.35 and
+# chat@4.37. Direct webhooks carry one of two token types depending on the
+# Chat app's "Authentication audience": a Google OIDC ID token with
+# aud=endpoint URL (checked for the Chat identity), or a JWT self-signed by
+# chat@system.gserviceaccount.com with aud=project number.
+# =============================================================================
+
+
+def _pubsub_request(token: str | None = None) -> FakeRequest:
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    return FakeRequest(json.dumps(_make_pubsub_push()), headers=headers, url=_ENDPOINT)
+
+
+class TestProjectNumberVerification:
+    @pytest.mark.asyncio
+    async def test_allows_direct_webhook_with_valid_token_when_project_number_configured(self):
+        # Real project-number tokens are self-signed by chat@system and are
+        # verifiable only against its X.509 certs -- never Google's OIDC keys.
+        adapter, chat, server = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 200
+        chat.process_message.assert_called_once()
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_rejects_google_oidc_token_with_project_number_audience(self):
+        # Python-specific: a token that is genuinely Google-signed (OIDC key)
+        # and names the project number as `aud` is still not a Chat token --
+        # the project-number path only trusts the Chat issuer's own keys.
+        adapter, chat, server = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _oidc_token("123456789")
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_rejects_chat_issuer_token_with_wrong_issuer_claim(self):
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789", iss="https://accounts.google.com"))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_chat_issuer_token_for_a_different_project(self):
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("999999999"))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_signed_token_whose_payload_is_not_a_claims_object(self):
+        # Port of upstream "should reject when verifyIdToken returns no
+        # payload": a correctly signed JWS that carries no claims object.
+        adapter, chat, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = pyjwt.api_jws.encode(b'"not-a-claims-object"', _CHAT_KEY, algorithm="RS256", headers={"kid": _CHAT_KID})
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+
+class TestEndpointUrlVerification:
+    @pytest.mark.asyncio
+    async def test_allows_direct_webhook_with_valid_token_when_only_endpoint_url_configured(self):
+        adapter, chat, server = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT)))
+
+        assert result["status"] == 200
+        chat.process_message.assert_called_once()
+        assert server.urls == [GOOGLE_OIDC_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_rejects_endpoint_url_token_when_email_is_not_google_chat(self):
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, email="attacker@example.com")))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("email_verified", [False, "true", 1, None])
+    async def test_rejects_endpoint_url_token_when_email_is_not_verified(self, email_verified: Any):
+        # Upstream checks `email_verified !== true`; Python checks identity
+        # (`is True`), so the string "true" and the integer 1 fail as well.
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, email_verified=email_verified)))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("iss", ["https://evil.example", ["https://accounts.google.com"]])
+    async def test_rejects_endpoint_url_token_with_non_google_issuer(self, iss: Any):
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, iss=iss)))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_endpoint_url_token_with_list_audience(self):
+        # `aud` must equal the endpoint URL exactly (google-auth-library's
+        # strict comparison), not merely contain it.
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, aud=[_ENDPOINT, "https://other.example"])))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepts_bare_accounts_google_com_issuer(self):
+        adapter, _, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, iss="accounts.google.com")))
+
+        assert result["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_rejects_expired_endpoint_url_token(self):
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+        past = int(time.time()) - 7200
+        token = _oidc_token(_ENDPOINT, iat=past - 3600, exp=past)
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_endpoint_url_token_signed_by_unknown_key(self):
+        adapter, chat, _ = await _verifying_adapter(endpoint_url=_ENDPOINT)
+        token = _mint(_ATTACKER_KEY, _OIDC_KID, _oidc_claims(_ENDPOINT))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepts_endpoint_url_token_when_both_verifiers_configured(self):
+        adapter, _, server = await _verifying_adapter(google_chat_project_number="123456789", endpoint_url=_ENDPOINT)
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT)))
+
+        assert result["status"] == 200
+        # The project-number verifier is not needed when the OIDC path passes.
+        assert server.urls == [GOOGLE_OIDC_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_project_number_when_both_configured_and_oidc_check_fails(self):
+        adapter, chat, server = await _verifying_adapter(google_chat_project_number="123456789", endpoint_url=_ENDPOINT)
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        result = await adapter.handle_webhook(_direct(token))
+
+        assert result["status"] == 200
+        chat.process_message.assert_called_once()
+        assert server.urls == [GOOGLE_OIDC_CERTS_URL, GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_does_not_use_request_inferred_endpoint_url_as_verification_audience(self):
+        # Defense in depth: even if the inferred routing URL were poisoned, a
+        # Google-signed Chat-identity token naming it as `aud` must not verify.
+        adapter, chat, server = await _verifying_adapter(google_chat_project_number="123456789")
+        adapter._inferred_endpoint_url = "https://attacker.example/webhook"
+        token = _oidc_token("https://attacker.example/webhook")
+
+        result = await adapter.handle_webhook(_direct(token, url="https://attacker.example/webhook"))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+        # Only the project-number verifier ran; the OIDC keys were never used.
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+
+class TestWorkspaceAddOnIdentity:
+    """Upstream 7a192235 (#787): add-on tokens need the exact configured identity."""
+
+    @staticmethod
+    async def _add_on_webhook(token_email: str, configured: str | None = None) -> tuple[dict[str, Any], MagicMock]:
+        config: dict[str, Any] = {"endpoint_url": _ENDPOINT}
+        if configured is not None:
+            config["workspace_add_on_service_account_email"] = configured
+        adapter, _, _ = await _verifying_adapter(**config)
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, email=token_email)))
+        return result, adapter._logger  # type: ignore[return-value]
+
+    @pytest.mark.asyncio
+    async def test_allows_add_on_token_matching_configured_service_account(self):
+        result, _ = await self._add_on_webhook(_ADD_ON_SA, _ADD_ON_SA)
+        assert result["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_rejects_add_on_token_from_a_different_project(self):
+        result, _ = await self._add_on_webhook("service-999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", _ADD_ON_SA)
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_add_on_token_when_no_service_account_configured(self):
+        result, logger = await self._add_on_webhook(_ADD_ON_SA)
+        assert result["status"] == 401
+        assert any("no add-on identity is configured" in m for m in _warn_messages(logger))
+
+    @pytest.mark.asyncio
+    async def test_still_allows_chat_system_service_account_without_add_on_config(self):
+        result, _ = await self._add_on_webhook(_CHAT_SA)
+        assert result["status"] == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "email",
+        [
+            pytest.param(f"{_ADD_ON_SA}.evil.test", id="a suffixed lookalike domain"),
+            pytest.param(
+                "service-111@evil.test/gcp-sa-gsuiteaddons.iam.gserviceaccount.com", id="a prefixed lookalike domain"
+            ),
+            pytest.param(_ADD_ON_SA.upper(), id="an uppercase variant"),
+            pytest.param(f"{_ADD_ON_SA} ", id="trailing whitespace"),
+            # Python-specific: `re.match(... $)` would accept a trailing "\n".
+            pytest.param(f"{_ADD_ON_SA}\n", id="a trailing newline"),
+        ],
+    )
+    async def test_rejects_lookalikes_of_the_configured_add_on_identity(self, email: str):
+        result, _ = await self._add_on_webhook(email, _ADD_ON_SA)
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_configured_add_on_identity_when_email_verified_is_false(self):
+        adapter, chat, _ = await _verifying_adapter(
+            endpoint_url=_ENDPOINT, workspace_add_on_service_account_email=_ADD_ON_SA
+        )
+
+        result = await adapter.handle_webhook(_direct(_oidc_token(_ENDPOINT, email=_ADD_ON_SA, email_verified=False)))
+
+        assert result["status"] == 401
+        chat.process_message.assert_not_called()
+
+
+# =============================================================================
+# Tests -- Pub/Sub push identity binding (upstream c3b5a08e, #797)
+# =============================================================================
+
+
+class TestPubSubIdentity:
+    @staticmethod
+    async def _pubsub_webhook(
+        claims: dict[str, Any], configured: str | None = None
+    ) -> tuple[dict[str, Any], GoogleChatAdapter]:
+        config: dict[str, Any] = {"pubsub_audience": _PUBSUB_AUDIENCE}
+        if configured is not None:
+            config["pubsub_service_account_email"] = configured
+        adapter, _, _ = await _verifying_adapter(**config)
+        now = int(time.time())
+        token = _mint(
+            _OIDC_KEY,
+            _OIDC_KID,
+            {"iss": "accounts.google.com", "aud": _PUBSUB_AUDIENCE, "iat": now, "exp": now + 3600, **claims},
+        )
+        return await adapter.handle_webhook(_pubsub_request(token)), adapter
+
+    @pytest.mark.asyncio
+    async def test_allows_pubsub_webhook_with_valid_token_when_pubsub_audience_configured(self):
+        result, adapter = await self._pubsub_webhook({"email": _PUSH_SA, "email_verified": True}, _PUSH_SA)
+        assert result["status"] == 200
+        adapter._fetch_json.assert_awaited_once_with(GOOGLE_OIDC_CERTS_URL)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_rejects_pubsub_webhook_with_invalid_token(self):
+        adapter, _, _ = await _verifying_adapter(
+            pubsub_audience=_PUBSUB_AUDIENCE, pubsub_service_account_email=_PUSH_SA
+        )
+        token = _mint(_ATTACKER_KEY, _OIDC_KID, _oidc_claims(_PUBSUB_AUDIENCE, email=_PUSH_SA))
+
+        result = await adapter.handle_webhook(_pubsub_request(token))
+
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_pubsub_token_from_a_different_service_account(self):
+        result, _ = await self._pubsub_webhook(
+            {"email": "attacker@evil-project.iam.gserviceaccount.com", "email_verified": True}, _PUSH_SA
+        )
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_pubsub_token_when_no_service_account_configured(self):
+        result, adapter = await self._pubsub_webhook({"email": _PUSH_SA, "email_verified": True})
+        assert result["status"] == 401
+        assert any("no push identity is configured" in m for m in _warn_messages(adapter._logger))  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("email_verified", [False, "true"])
+    async def test_rejects_pubsub_token_when_email_verified_is_not_true(self, email_verified: Any):
+        result, _ = await self._pubsub_webhook({"email": _PUSH_SA, "email_verified": email_verified}, _PUSH_SA)
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_pubsub_token_with_no_email_claim(self):
+        result, _ = await self._pubsub_webhook({"email_verified": True}, _PUSH_SA)
+        assert result["status"] == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_direct_webhook_token_replayed_as_pubsub(self):
+        # A genuine Chat endpoint-URL token (email chat@system) is not a push
+        # identity: transports are bound to different identities.
+        adapter, _, _ = await _verifying_adapter(
+            pubsub_audience=_PUBSUB_AUDIENCE, pubsub_service_account_email=_PUSH_SA
+        )
+
+        result = await adapter.handle_webhook(_pubsub_request(_oidc_token(_PUBSUB_AUDIENCE)))
+
+        assert result["status"] == 401
+
+
+class TestIdentityConfigResolution:
+    def test_identities_fall_back_to_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL", _ADD_ON_SA)
+        monkeypatch.setenv("GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL", _PUSH_SA)
+        adapter = _make_adapter(pubsub_audience=_PUBSUB_AUDIENCE)
+        assert adapter._workspace_add_on_service_account_email == _ADD_ON_SA
+        assert adapter._pubsub_service_account_email == _PUSH_SA
+
+    def test_explicit_config_wins_over_env_even_when_empty(self, monkeypatch: pytest.MonkeyPatch):
+        # `??` semantics: an explicit value (even "") is not replaced by env.
+        monkeypatch.setenv("GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL", _ADD_ON_SA)
+        monkeypatch.setenv("GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL", _PUSH_SA)
+        adapter = _make_adapter(workspace_add_on_service_account_email="", pubsub_service_account_email="")
+        assert adapter._workspace_add_on_service_account_email == ""
+        assert adapter._pubsub_service_account_email == ""
+
+
+# =============================================================================
+# Tests -- verification key cache (Python-specific)
+# =============================================================================
+
+
+class TestVerificationKeyCache:
+    @pytest.mark.asyncio
+    async def test_reuses_certs_within_ttl_and_refetches_after_expiry(self):
+        adapter, _, server = await _verifying_adapter(google_chat_project_number="123456789")
+        clock = [1000.0]
+        adapter._clock = lambda: clock[0]
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 200
+        clock[0] += 3599
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 200
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+        clock[0] += 1  # exactly one hour after the first fetch
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 200
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL, GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_does_not_poison_the_cache(self):
+        adapter, _, server = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        server.fail_next = True
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 401
+        assert adapter._chat_issuer_keys is None
+        # The next request fetches again and succeeds.
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 200
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL, GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+    @pytest.mark.asyncio
+    async def test_empty_key_set_is_not_cached(self):
+        adapter, _, server = await _verifying_adapter(google_chat_project_number="123456789")
+        server.documents[GOOGLE_CHAT_ISSUER_CERTS_URL] = {}
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        assert (await adapter.handle_webhook(_direct(token)))["status"] == 401
+        assert adapter._chat_issuer_keys is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_kid_does_not_trigger_a_refetch(self):
+        # A flood of tokens with random key ids must not amplify into key
+        # fetches: within the TTL the cached set is authoritative.
+        adapter, _, server = await _verifying_adapter(google_chat_project_number="123456789")
+        good = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+        assert (await adapter.handle_webhook(_direct(good)))["status"] == 200
+
+        unknown = _mint(_CHAT_KEY, "some-other-kid", _chat_claims("123456789"))
+        assert (await adapter.handle_webhook(_direct(unknown)))["status"] == 401
+        assert server.urls == [GOOGLE_CHAT_ISSUER_CERTS_URL]
+
+
+# =============================================================================
+# Tests -- button-click endpoint inference (upstream 270b1c25, #518)
+# =============================================================================
+
+
+class TestButtonClickEndpointInference:
+    @pytest.mark.asyncio
+    async def test_infers_button_click_endpoint_url_but_never_exposes_it_as_audience(self):
+        adapter = _make_adapter()  # explicit opt-out: verification disabled
+        await adapter.initialize(_make_mock_chat())
+
+        result = await adapter.handle_webhook(
+            FakeRequest(json.dumps({"chat": {}}), url="https://my-app.vercel.app/api/webhooks/gchat")
+        )
+
+        assert result["status"] == 200
+        # Explicit config field stays unset; the routing-only field is populated.
+        assert adapter._endpoint_url is None
+        assert adapter._inferred_endpoint_url == "https://my-app.vercel.app/api/webhooks/gchat"
+        assert adapter._button_click_endpoint_url() == "https://my-app.vercel.app/api/webhooks/gchat"
+
+    @pytest.mark.asyncio
+    async def test_does_not_overwrite_explicitly_configured_endpoint_url(self):
+        adapter, _, _ = await _verifying_adapter(endpoint_url="https://original.example.com/webhook")
+        token = _oidc_token("https://original.example.com/webhook")
+
+        result = await adapter.handle_webhook(_direct(token, url="https://other.example.com/webhook"))
+
+        assert result["status"] == 200
+        assert adapter._endpoint_url == "https://original.example.com/webhook"
+        assert adapter._inferred_endpoint_url is None
+        assert adapter._button_click_endpoint_url() == "https://original.example.com/webhook"
+
+    @pytest.mark.asyncio
+    async def test_does_not_infer_endpoint_url_from_request_that_fails_verification(self):
+        adapter, _, _ = await _verifying_adapter(google_chat_project_number="123456789")
+
+        result = await adapter.handle_webhook(_direct(None, url="https://attacker.example/webhook"))
+
+        assert result["status"] == 401
+        assert adapter._inferred_endpoint_url is None
+
+    @pytest.mark.asyncio
+    async def test_does_not_infer_endpoint_url_from_pubsub_push(self):
+        # Behaviour change (#222): only verified *direct* webhooks feed routing.
+        adapter = _make_adapter()
+        await adapter.initialize(_make_mock_chat())
+
+        result = await adapter.handle_webhook(_pubsub_request())
+
+        assert result["status"] == 200
+        assert adapter._inferred_endpoint_url is None
+
+    @pytest.mark.asyncio
+    async def test_infers_from_first_verified_request_only(self):
+        adapter, _, _ = await _verifying_adapter(google_chat_project_number="123456789")
+        token = _mint(_CHAT_KEY, _CHAT_KID, _chat_claims("123456789"))
+
+        await adapter.handle_webhook(_direct(token, url="https://first.example/webhook"))
+        await adapter.handle_webhook(_direct(token, url="https://second.example/webhook"))
+
+        assert adapter._inferred_endpoint_url == "https://first.example/webhook"
+
+    @pytest.mark.asyncio
+    async def test_relative_request_url_is_not_inferred(self):
+        adapter = _make_adapter()
+        await adapter.initialize(_make_mock_chat())
+
+        await adapter.handle_webhook(FakeRequest(json.dumps({"chat": {}}), url="/api/webhooks/gchat"))
+
+        assert adapter._inferred_endpoint_url is None

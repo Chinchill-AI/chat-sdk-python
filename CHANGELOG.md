@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased (4.41 wave)
+
+Work toward upstream `chat@4.41.1` parity, tracked in #184. `UPSTREAM_PARITY` stays `4.31.0` until the wave's final PR (#203).
+
+### Google Chat: webhook JWT verification bound to configured identities (#222, security)
+
+Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) and `c3b5a08e` (#797, chat@4.37.0). Before this change, Google Chat webhook verification checked only a Google signature and the `aud` claim. The audiences in play (project number, endpoint URL, Pub/Sub push URL) are not secrets, so that check did not identify the caller. Every transport is now bound to a configured identity:
+
+- **Project-number tokens (direct webhooks)** are verified against the Chat service account's own X.509 certificates (`service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com`, cached 1 hour) with issuer `chat@system.gserviceaccount.com`. **This makes project-number verification work.** The previous code checked these tokens against Google's OIDC key set, which never holds the Chat issuer's keys, so every genuine project-number webhook was rejected with 401. (We confirmed on 2026-09-29 that the two published key sets share no key ids. We did not capture a real token for this check.)
+- **`endpoint_url` is now a direct-webhook verifier.** It covers Chat apps whose "Authentication audience" is "HTTP endpoint URL", which includes every Workspace Add-on Chat app. The token must be a Google OIDC ID token (`iss` of `accounts.google.com` or `https://accounts.google.com`) whose `aud` is exactly the configured URL, with `email_verified` exactly `true` and `email` equal to `chat@system.gserviceaccount.com` or the configured add-on identity. `endpoint_url` alone now satisfies the constructor's fail-closed check. When both verifiers are configured, the endpoint-URL token is tried first and the project number second.
+- **Pub/Sub pushes** need `email_verified` to be `true` and `email` to equal the configured push identity.
+- **Google's OIDC keys are fetched asynchronously and cached.** The old `PyJWKClient` did blocking network I/O on the event loop.
+
+#### Breaking (Google Chat)
+
+- **Pub/Sub deployments must set `pubsub_service_account_email`** (env `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`) to the service account in the subscription's push auth settings. Without it, every Pub/Sub push is rejected with 401 and a warning.
+- **Workspace Add-on Chat apps must set `workspace_add_on_service_account_email`** (env `GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL`) to their own `service-{projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com` identity, and must set `endpoint_url`. Add-on tokens are compared exactly. Without the setting they are rejected with 401 and a warning. Standalone Chat apps are unaffected.
+- **Button-click endpoint inference changed.** When `endpoint_url` is not configured, the adapter still infers a routing URL from `request.url`, but only from a *direct* webhook that passed verification (or ran with verification explicitly disabled). Before, the first request of any kind set it before verification ran, including Pub/Sub pushes and requests that were later rejected. The inferred value now lives in its own field (`_inferred_endpoint_url`) and never overwrites `endpoint_url`. The Python port never used the inferred URL as a verification audience, so audience checks are unchanged.
+- Upgrading also fixes project-number deployments, which were rejecting genuine webhooks (see above). No config change is needed for them.
+
+#### Python-specific (divergence from upstream)
+
+- The two new `GoogleChatAdapterConfig` fields are keyword-only (`field(kw_only=True)`). The dataclass is positional, so adding them positionally would shift existing callers' arguments.
+- OIDC verification uses PyJWT against Google's JWKS with a fixed 1-hour async cache, not google-auth-library's `verifyIdToken`. The issuer is checked by hand after decode. The claim checks are the same as upstream's.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.
