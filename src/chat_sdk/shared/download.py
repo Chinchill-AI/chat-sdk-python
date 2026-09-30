@@ -570,7 +570,7 @@ def _combined_header(headers: Mapping[str, str], name: str) -> str | None:
     Multi-value mappings (aiohttp's ``CIMultiDictProxy``) expose ``getall``;
     a plain mapping holds one value per key.
     """
-    getall = getattr(headers, "getall", None)
+    getall: Callable[[str, list[str]], Sequence[str]] | None = getattr(headers, "getall", None)
     if callable(getall):
         values = [str(v) for v in getall(name, [])]
         return ", ".join(values) if values else None
