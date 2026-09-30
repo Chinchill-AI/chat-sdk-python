@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -16,6 +18,7 @@ from chat_sdk.adapters.github.adapter import (
 from chat_sdk.adapters.github.types import GitHubThreadId
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import ValidationError
+from chat_sdk.testing import MockLogger
 from chat_sdk.types import EmojiValue
 
 # ---------------------------------------------------------------------------
@@ -257,9 +260,231 @@ class TestCreateGitHubAdapter:
             if old_key is not None:
                 os.environ["GITHUB_PRIVATE_KEY"] = old_key
 
-    def test_adapter_properties(self):
+    def test_adapter_properties(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
         adapter = _make_adapter()
         assert adapter.name == "github"
         assert adapter.lock_scope is None
         assert adapter.persist_message_history is None
         assert adapter.bot_user_id is None
+
+
+# ---------------------------------------------------------------------------
+# Bot user id: GITHUB_BOT_USER_ID env var and learned-from-post fallback
+# (upstream 6750d59e, chat@4.33; #233)
+# ---------------------------------------------------------------------------
+
+
+def _posted_comment(user: object) -> dict:
+    return {
+        "id": 100,
+        "body": "hi",
+        "user": user,
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "html_url": "https://github.com/acme/app/issues/42#issuecomment-100",
+    }
+
+
+class _WebhookRequest:
+    def __init__(self, body: str, headers: dict[str, str]) -> None:
+        self.body = body.encode("utf-8")
+        self.headers = headers
+
+
+def _signed_issue_comment_request(sender_id: int) -> _WebhookRequest:
+    payload = {
+        "action": "created",
+        "comment": {
+            "id": 101,
+            "body": "echo of a reply",
+            "user": {"id": sender_id, "login": "someone", "type": "User"},
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+        },
+        "issue": {"number": 42, "title": "Issue"},
+        "repository": {
+            "id": 1,
+            "name": "app",
+            "full_name": "acme/app",
+            "owner": {"id": 10, "login": "acme", "type": "Organization"},
+        },
+        "sender": {"id": sender_id, "login": "someone", "type": "User"},
+    }
+    body = json.dumps(payload)
+    signature = "sha256=" + hmac.new(b"test-webhook-secret", body.encode(), hashlib.sha256).hexdigest()
+    return _WebhookRequest(
+        body,
+        {
+            "x-hub-signature-256": signature,
+            "x-github-event": "issue_comment",
+            "content-type": "application/json",
+        },
+    )
+
+
+@pytest.fixture
+def _no_bot_user_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
+
+
+class TestGitHubBotUserIdEnv:
+    """``config.botUserId ?? GITHUB_BOT_USER_ID`` (describe("createGitHubAdapter"))."""
+
+    def test_auto_detects_bot_user_id_from_the_github_bot_user_id_env_var(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "env-secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "env-token")
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", "4242")
+        adapter = create_github_adapter()
+        assert adapter.bot_user_id == "4242"
+        assert adapter._bot_user_id == 4242
+
+    def test_prefers_an_explicit_bot_user_id_over_github_bot_user_id(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "env-secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "env-token")
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", "4242")
+        adapter = create_github_adapter({"bot_user_id": 99})
+        assert adapter.bot_user_id == "99"
+
+    def test_explicit_zero_bot_user_id_still_wins_over_env(self, monkeypatch: pytest.MonkeyPatch):
+        # ``??`` not ``||``: a falsy explicit id must not fall through to the
+        # env var, and the property must not hide it behind a truthiness check.
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", "4242")
+        adapter = _make_adapter(bot_user_id=0)
+        assert adapter._bot_user_id == 0
+        assert adapter.bot_user_id == "0"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "12abc",
+            "0x10",
+            "1_000",
+            "4.2",
+            pytest.param("\u0664\u0662", id="arabic-indic-digits"),
+            "  ",
+            pytest.param("9" * 5000, id="5000-digits"),
+        ],
+    )
+    def test_malformed_env_value_is_ignored_with_a_warning(self, monkeypatch: pytest.MonkeyPatch, value: str):
+        # Divergence from upstream: parseInt("12abc", 10) === 12 there. We
+        # refuse to truncate and treat the value as unset.
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", value)
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        assert adapter._bot_user_id is None
+        assert adapter.bot_user_id is None
+        assert logger.warn.calls == [
+            ("Ignoring GITHUB_BOT_USER_ID: not a base-10 integer", {"length": len(value)}),
+        ]
+
+    def test_empty_env_value_is_treated_as_unset_without_a_warning(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", "")
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger)
+        assert adapter._bot_user_id is None
+        assert logger.warn.calls == []
+
+    def test_env_value_with_surrounding_whitespace_is_accepted(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", " 4242\n")
+        adapter = _make_adapter()
+        assert adapter._bot_user_id == 4242
+
+    @pytest.mark.asyncio
+    async def test_env_bot_user_id_skips_auto_detection(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("GITHUB_BOT_USER_ID", "4242")
+        adapter = _make_adapter()
+        api = AsyncMock(side_effect=AssertionError("no API call expected"))
+        adapter._github_api_request = api
+        await adapter.initialize(MagicMock())
+        api.assert_not_awaited()
+        assert adapter._bot_user_id == 4242
+
+
+@pytest.mark.usefixtures("_no_bot_user_id_env")
+class TestGitHubCaptureBotUserId:
+    """``captureBotUserId``: describe("GitHubAdapter - Vercel Connect mode"), ported without Connect."""
+
+    @staticmethod
+    async def _adapter_with_failed_detection() -> tuple[GitHubAdapter, AsyncMock]:
+        adapter = _make_adapter()
+        api = AsyncMock(side_effect=RuntimeError("403 Resource not accessible by integration"))
+        adapter._github_api_request = api
+        await adapter._detect_bot_user_id()
+        assert adapter._bot_user_id is None
+        api.side_effect = None
+        api.reset_mock()
+        return adapter, api
+
+    @pytest.mark.asyncio
+    async def test_learns_the_bot_user_id_from_the_first_posted_comment(self):
+        adapter, api = await self._adapter_with_failed_detection()
+        logger = MockLogger()
+        adapter._logger = logger
+        assert adapter.bot_user_id is None
+
+        api.return_value = _posted_comment({"id": 4242, "login": "bot[bot]", "type": "Bot"})
+        result = await adapter.post_message("github:acme/app:issue:42", "hi")
+
+        assert result.id == "100"
+        assert api.await_args.args[:2] == ("POST", "/repos/acme/app/issues/42/comments")
+        assert adapter._bot_user_id == 4242
+        assert adapter.bot_user_id == "4242"
+        assert logger.info.calls == [
+            ("GitHub bot user ID learned from posted comment", {"botUserId": 4242, "login": "bot[bot]"}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_review_comment_reply_branch_captures_the_bot_user_id(self):
+        adapter, api = await self._adapter_with_failed_detection()
+        api.return_value = _posted_comment({"id": 4343, "login": "bot[bot]"})
+        await adapter.post_message("github:acme/app:42:rc:777", "hi")
+
+        assert api.await_args.args[:2] == ("POST", "/repos/acme/app/pulls/42/comments/777/replies")
+        assert adapter._bot_user_id == 4343
+
+    @pytest.mark.asyncio
+    async def test_capture_does_not_overwrite_a_known_bot_user_id(self):
+        adapter = _make_adapter(bot_user_id=1)
+        adapter._github_api_request = AsyncMock(return_value=_posted_comment({"id": 4242, "login": "other"}))
+        await adapter.post_message("github:acme/app:42", "hi")
+        assert adapter._bot_user_id == 1
+
+    @pytest.mark.asyncio
+    async def test_edit_message_does_not_capture(self):
+        adapter, api = await self._adapter_with_failed_detection()
+        api.return_value = _posted_comment({"id": 4242, "login": "bot[bot]"})
+        await adapter.edit_message("github:acme/app:42", "100", "edited")
+        assert api.await_args.args[0] == "PATCH"
+        assert adapter._bot_user_id is None
+
+    @pytest.mark.parametrize(
+        "user",
+        [None, "bot[bot]", {"login": "bot[bot]"}, {"id": "4242"}, {"id": True}, {"id": 4242.0}],
+    )
+    def test_ignores_users_without_a_numeric_id(self, user: object):
+        adapter = _make_adapter()
+        adapter._capture_bot_user_id(user)
+        assert adapter._bot_user_id is None
+
+    @pytest.mark.asyncio
+    async def test_own_comment_webhook_is_skipped_after_capture(self):
+        adapter, api = await self._adapter_with_failed_detection()
+        chat = MagicMock()
+        chat.process_message = MagicMock()
+        adapter._chat = chat
+
+        api.return_value = _posted_comment({"id": 4242, "login": "bot[bot]", "type": "Bot"})
+        await adapter.post_message("github:acme/app:issue:42", "hi")
+        api.reset_mock()
+
+        response = await adapter.handle_webhook(_signed_issue_comment_request(sender_id=4242))
+
+        assert response["status"] == 200
+        chat.process_message.assert_not_called()
+        # The id is known now, so the webhook does not retry detection either.
+        api.assert_not_awaited()
+
+        await adapter.handle_webhook(_signed_issue_comment_request(sender_id=7))
+        chat.process_message.assert_called_once()
+        assert chat.process_message.call_args.args[2].author.is_me is False

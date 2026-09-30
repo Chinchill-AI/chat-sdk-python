@@ -216,7 +216,8 @@ class TestGitHubAdapterConstructor:
         a = _make_adapter(bot_user_id=42)
         assert a.bot_user_id == "42"
 
-    def test_bot_user_id_none_by_default(self):
+    def test_bot_user_id_none_by_default(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("GITHUB_BOT_USER_ID", raising=False)
         a = _make_adapter()
         assert a.bot_user_id is None
 
