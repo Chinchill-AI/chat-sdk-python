@@ -2010,6 +2010,431 @@ class TestStream:
 # =============================================================================
 
 
+# =============================================================================
+# Outgoing mention resolution (upstream index.test.ts "resolveOutgoingMentions")
+# =============================================================================
+
+_MENTION_THREAD = "slack:C123:1234567890.123456"
+
+
+async def _init_adapter_with_memory_state() -> tuple[SlackAdapter, MockSlackClient, Any]:
+    """Adapter wired to a real ``MemoryStateAdapter`` (upstream ``createAdapterWithState``)."""
+    from chat_sdk.state.memory import MemoryStateAdapter
+
+    state = MemoryStateAdapter()
+    await state.connect()
+    adapter = _make_adapter()
+    mock_client = MockSlackClient()
+    mock_client.set_response("auth_test", {"user_id": "U_BOT", "bot_id": "B_BOT", "user": "testbot"})
+    _patch_client(adapter, mock_client)
+    await adapter.initialize(_make_mock_chat(state))  # type: ignore[arg-type]
+    return adapter, mock_client, state
+
+
+class TestResolveOutgoingMentions:
+    @pytest.mark.asyncio
+    async def test_resolves_unambiguous_mention_to_user_id(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        result = await adapter._resolve_outgoing_mentions("Hey @dominik, check this out", _MENTION_THREAD)
+
+        assert result == "Hey <@U_DOM_123>, check this out"
+
+    @pytest.mark.asyncio
+    async def test_handles_case_insensitivity(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        assert await adapter._resolve_outgoing_mentions("Hey @Dominik!", _MENTION_THREAD) == "Hey <@U_DOM_123>!"
+
+    @pytest.mark.asyncio
+    async def test_does_not_resolve_handles_inside_urls(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:jkyang", "U_URL_123")
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+        await state.append_to_list("slack:user-by-name:example", "U_EMAIL_123")
+
+        text = (
+            "See https://hackmd.io/@jkyang/abc, https://example.com/p?user=@jkyang, "
+            "https://example.com/docs#@jkyang, hackmd.io/@jkyang/abc, "
+            "<https://example.com/@jkyang|profile>, and user@example.com cc @dominik"
+        )
+        result = await adapter._resolve_outgoing_mentions(text, _MENTION_THREAD)
+
+        assert result == text.replace("cc @dominik", "cc <@U_DOM_123>")
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_user_ids_from_reverse_index(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        assert await adapter._resolve_outgoing_mentions("Hey @dominik", _MENTION_THREAD) == "Hey <@U_DOM_123>"
+
+    @pytest.mark.asyncio
+    async def test_leaves_mention_as_plain_text_when_no_match_found(self):
+        adapter, _, _ = await _init_adapter_with_memory_state()
+
+        assert await adapter._resolve_outgoing_mentions("Hey @unknown_user", _MENTION_THREAD) == "Hey @unknown_user"
+
+    @pytest.mark.asyncio
+    async def test_skips_already_resolved_user_id_mentions(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        result = await adapter._resolve_outgoing_mentions("Hey <@U_DOM_123> and @dominik", _MENTION_THREAD)
+
+        assert result == "Hey <@U_DOM_123> and <@U_DOM_123>"
+
+    @pytest.mark.asyncio
+    async def test_disambiguates_using_thread_participants(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:alex", "U_ALEX_1")
+        await state.append_to_list("slack:user-by-name:alex", "U_ALEX_2")
+        await state.append_to_list(f"slack:thread-participants:{_MENTION_THREAD}", "U_ALEX_2")
+
+        assert await adapter._resolve_outgoing_mentions("Hey @alex", _MENTION_THREAD) == "Hey <@U_ALEX_2>"
+
+    @pytest.mark.asyncio
+    async def test_leaves_ambiguous_mentions_as_plain_text_when_thread_participants_dont_help(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:alex", "U_ALEX_1")
+        await state.append_to_list("slack:user-by-name:alex", "U_ALEX_2")
+        await state.append_to_list(f"slack:thread-participants:{_MENTION_THREAD}", "U_ALEX_1")
+        await state.append_to_list(f"slack:thread-participants:{_MENTION_THREAD}", "U_ALEX_2")
+
+        assert await adapter._resolve_outgoing_mentions("Hey @alex", _MENTION_THREAD) == "Hey @alex"
+
+    @pytest.mark.asyncio
+    async def test_resolves_multiple_different_mentions_in_one_message(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+        await state.append_to_list("slack:user-by-name:malte", "U_MAL_456")
+
+        result = await adapter._resolve_outgoing_mentions("@dominik and @malte please review", _MENTION_THREAD)
+
+        assert result == "<@U_DOM_123> and <@U_MAL_456> please review"
+
+    @pytest.mark.asyncio
+    async def test_does_nothing_when_chat_is_not_initialized(self):
+        adapter = _make_adapter()
+
+        assert await adapter._resolve_outgoing_mentions("Hey @dominik", _MENTION_THREAD) == "Hey @dominik"
+
+    @pytest.mark.asyncio
+    async def test_skips_mentions_inside_inline_code_backticks(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        result = await adapter._resolve_outgoing_mentions("Use `@vercel/postgres` for the database", _MENTION_THREAD)
+
+        assert result == "Use `@vercel/postgres` for the database"
+
+    @pytest.mark.asyncio
+    async def test_skips_mentions_inside_code_blocks_triple_backticks(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        text = "Install:\n```\nnpm install @vercel/postgres\n```"
+        assert await adapter._resolve_outgoing_mentions(text, _MENTION_THREAD) == text
+
+    @pytest.mark.asyncio
+    async def test_resolves_mentions_outside_code_but_skips_those_inside(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        result = await adapter._resolve_outgoing_mentions(
+            "Hey @dominik, use `@vercel/postgres` for this", _MENTION_THREAD
+        )
+
+        assert result == "Hey <@U_DOM_123>, use `@vercel/postgres` for this"
+
+    @pytest.mark.asyncio
+    async def test_handles_multiple_inline_code_spans_with_mentions(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:neondatabase", "U_NEON_123")
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        text = "Use `@neondatabase/serverless` or `@vercel/postgres`"
+        assert await adapter._resolve_outgoing_mentions(text, _MENTION_THREAD) == text
+
+    @pytest.mark.asyncio
+    async def test_resolves_the_same_name_outside_code_while_skipping_it_inside_code(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        result = await adapter._resolve_outgoing_mentions(
+            "Ping @vercel, but don't link `@vercel/postgres`", _MENTION_THREAD
+        )
+
+        assert result == "Ping <@U_VER_123>, but don't link `@vercel/postgres`"
+
+    @pytest.mark.asyncio
+    async def test_resolves_a_mention_immediately_following_an_inline_code_span(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        result = await adapter._resolve_outgoing_mentions("Run `npm i` then ping @dominik", _MENTION_THREAD)
+
+        assert result == "Run `npm i` then ping <@U_DOM_123>"
+
+    @pytest.mark.asyncio
+    async def test_resolves_a_mention_immediately_preceding_an_inline_code_span(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        result = await adapter._resolve_outgoing_mentions("@dominik try `npm i`", _MENTION_THREAD)
+
+        assert result == "<@U_DOM_123> try `npm i`"
+
+    @pytest.mark.asyncio
+    async def test_resolves_mentions_surrounding_a_multiline_fenced_code_block(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+        await state.append_to_list("slack:user-by-name:george", "U_GEO_123")
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        result = await adapter._resolve_outgoing_mentions(
+            "Hey @dominik:\n```bash\nnpm install @vercel/postgres\n```\ncc @george", _MENTION_THREAD
+        )
+
+        assert result == "Hey <@U_DOM_123>:\n```bash\nnpm install @vercel/postgres\n```\ncc <@U_GEO_123>"
+
+    @pytest.mark.asyncio
+    async def test_does_not_skip_a_mention_after_an_unbalanced_single_backtick(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:dominik", "U_DOM_123")
+
+        result = await adapter._resolve_outgoing_mentions("Cost is `5 and @dominik should know", _MENTION_THREAD)
+
+        assert result == "Cost is `5 and <@U_DOM_123> should know"
+
+    @pytest.mark.asyncio
+    async def test_skips_a_mention_inside_inline_code_at_the_start_of_the_text(self):
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:vercel", "U_VER_123")
+
+        text = "`@vercel/postgres` is the package"
+        assert await adapter._resolve_outgoing_mentions(text, _MENTION_THREAD) == text
+
+    # -- Python-specific guards ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_letters_end_the_name(self):
+        # Upstream's scanner is ASCII-only (JS char codes); the old Python
+        # regex used Unicode ``\w`` and would have looked up ``josé``.
+        adapter, _, state = await _init_adapter_with_memory_state()
+        await state.append_to_list("slack:user-by-name:jos", "U_JOS")
+        await state.append_to_list("slack:user-by-name:josé", "U_JOSE")
+
+        assert await adapter._resolve_outgoing_mentions("hi @josé", _MENTION_THREAD) == "hi <@U_JOS>é"
+
+    @pytest.mark.asyncio
+    async def test_text_without_bare_mentions_never_reads_state(self):
+        # The native stream path calls the resolver once per committed line;
+        # lines without a bare mention (including code-only ones) must not
+        # touch state.
+        adapter, _, state = await _init_adapter_with_memory_state()
+        state.get_list = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        text = "plain `@vercel/pkg` https://x.io/@a user@example.com <@U123>\n"
+        assert await adapter._resolve_outgoing_mentions(text, _MENTION_THREAD) == text
+        state.get_list.assert_not_awaited()
+
+
+# =============================================================================
+# Native streaming outgoing mention resolution (vercel/chat 6f0d2f02 #755)
+# =============================================================================
+
+_STREAM_THREAD = "slack:D123:1234567890.000000"
+
+
+async def _init_mention_stream_adapter() -> tuple[SlackAdapter, MagicMock, Any]:
+    adapter, client, state = await _init_adapter_with_memory_state()
+    streamer = MagicMock()
+    streamer.append = AsyncMock(return_value={"ok": True})
+    streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.111111"})
+    client.chat_stream = AsyncMock(return_value=streamer)  # type: ignore[method-assign]
+    return adapter, streamer, state
+
+
+def _appended_markdown(streamer: MagicMock) -> list[str]:
+    return [call.kwargs["markdown_text"] for call in streamer.append.call_args_list if "markdown_text" in call.kwargs]
+
+
+async def _stream_texts(adapter: SlackAdapter, *chunks: str) -> None:
+    async def gen() -> AsyncIterator[str]:
+        for chunk in chunks:
+            yield chunk
+
+    await adapter.stream(_STREAM_THREAD, gen(), StreamOptions(recipient_user_id="U1", recipient_team_id="T1"))
+
+
+class TestNativeStreamingOutgoingMentionResolution:
+    @pytest.mark.asyncio
+    async def test_resolves_cached_name_mentions_on_the_native_streaming_path(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "Thanks, @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "Thanks, <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_resolves_mentions_that_span_source_chunks(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "Thanks, @ali", "ce")
+
+        assert "".join(_appended_markdown(streamer)) == "Thanks, <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_resolves_mentions_on_lines_committed_mid_stream(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "Hi @alice\nmore ", "text")
+
+        appended = _appended_markdown(streamer)
+        # The completed line flushes before the stream ends, already resolved.
+        assert appended[0] == "Hi <@U_ALICE_1>\n"
+        assert "".join(appended) == "Hi <@U_ALICE_1>\nmore text"
+
+    @pytest.mark.asyncio
+    async def test_leaves_ambiguous_mentions_as_plain_text(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_2")
+
+        await _stream_texts(adapter, "hey @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "hey @alice"
+
+    @pytest.mark.asyncio
+    async def test_disambiguates_ambiguous_mentions_using_thread_participants(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_2")
+        await state.append_to_list(f"slack:thread-participants:{_STREAM_THREAD}", "U_ALICE_2")
+
+        await _stream_texts(adapter, "hey @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "hey <@U_ALICE_2>"
+
+    @pytest.mark.asyncio
+    async def test_keeps_mentions_literal_inside_code_fences(self):
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "```\n@alice\n```\nping @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "```\n@alice\n```\nping <@U_ALICE_1>"
+
+    # -- Python-specific guards ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_growing_replacements_neither_duplicate_nor_drop_text_across_appends(self):
+        # ``last_appended`` must track the resolved buffer: each replacement
+        # changes length, so a delta taken in source coordinates would repeat
+        # or lose characters on the next append.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:al", "U_AL")
+        await state.append_to_list("slack:user-by-name:alice", "U1")
+        await state.append_to_list("slack:user-by-name:bob", "U_BOB_LONGER_ID")
+
+        await _stream_texts(adapter, "Hi @al", "ice and @bob\n", "then @al\n", "bye @bo", "b")
+
+        assert _appended_markdown(streamer) == [
+            "Hi <@U1> and <@U_BOB_LONGER_ID>\n",
+            "then <@U_AL>\n",
+            "bye <@U_BOB_LONGER_ID>",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_streamed_code_stays_literal_while_cached_user_is_pinged(self):
+        # The issue's live-loop scenario over small chunks: inline code and a
+        # fenced shell snippet stay literal while the fence opens and closes
+        # across chunk boundaries.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:scope", "U_SCOPE")
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(
+            adapter,
+            "Run `npm i @sc",
+            "ope/pkg` then ping @al",
+            "ice\n``",
+            "`sh\nnpm i @scope",
+            "/pkg\n```\ndone @alice",
+        )
+
+        assert "".join(_appended_markdown(streamer)) == (
+            "Run `npm i @scope/pkg` then ping <@U_ALICE_1>\n```sh\nnpm i @scope/pkg\n```\ndone <@U_ALICE_1>"
+        )
+
+    @pytest.mark.asyncio
+    async def test_closing_fence_committed_before_its_newline_toggles_once(self):
+        # One character per chunk: the closing fence line is committed while
+        # still inside the fence, before its newline arrives. Fence state must
+        # toggle only once that newline is committed, or it flips twice and
+        # stays stuck "inside", leaving the final mention literal.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, *list("```\ncode\n```\ndone @alice"))
+
+        assert "".join(_appended_markdown(streamer)) == "```\ncode\n```\ndone <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_closing_fence_split_across_commits_is_detected_on_the_whole_line(self):
+        # The closing fence arrives as "``" then "`\n...": fence detection must
+        # read the whole line from its start, not only the newly committed
+        # segment ("`\n"), or the fence never closes.
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        await _stream_texts(adapter, "```\ncode\n``", "`\nping @alice")
+
+        assert "".join(_appended_markdown(streamer)) == "```\ncode\n```\nping <@U_ALICE_1>"
+
+    @pytest.mark.asyncio
+    async def test_final_flush_appends_raw_text_without_remend_closing_marker(self):
+        # The final delta comes from ``get_committable_text()`` after
+        # ``finish()`` (upstream parity), not from ``finish()``'s remend'd
+        # render, so an unclosed inline marker is not closed on the way out.
+        adapter, streamer, _ = await _init_mention_stream_adapter()
+
+        await _stream_texts(adapter, "hello **bold")
+
+        assert "".join(_appended_markdown(streamer)) == "hello **bold"
+
+    @pytest.mark.asyncio
+    async def test_resolves_text_flushed_before_a_structured_chunk(self):
+        # ``send_structured_chunk`` pre-flushes committed text; that delta
+        # must be resolved and share the resolved coordinate space.
+        from chat_sdk.types import TaskUpdateChunk
+
+        adapter, streamer, state = await _init_mention_stream_adapter()
+        await state.append_to_list("slack:user-by-name:alice", "U_ALICE_1")
+
+        async def gen() -> AsyncIterator[Any]:
+            yield "cc @alice\n"
+            yield TaskUpdateChunk(id="t1", title="Search", status="in_progress")
+            yield "and @alice"
+
+        await adapter.stream(_STREAM_THREAD, gen(), StreamOptions(recipient_user_id="U1", recipient_team_id="T1"))
+
+        calls = [call.kwargs for call in streamer.append.call_args_list]
+        assert [c["markdown_text"] for c in calls if "markdown_text" in c] == [
+            "cc <@U_ALICE_1>\n",
+            "and <@U_ALICE_1>",
+        ]
+        assert calls[1]["chunks"] == [{"type": "task_update", "id": "t1", "title": "Search", "status": "in_progress"}]
+
+
 class TestPublicContextAccessors:
     """``current_token`` / ``current_client`` expose the same values as the
     underscore-prefixed helpers without forcing callers into private API.

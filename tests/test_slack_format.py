@@ -255,8 +255,7 @@ class TestMentions:
         }
 
     def test_does_not_mangle_mention_in_schemeless_host_path(self):
-        # ``URL_REGEX`` does not match a schemeless host; the ``/`` in the
-        # mention lookbehind guards this case.
+        # The shared scanner treats ``host.tld/...`` as a URL span.
         assert self.converter.to_slack_payload("See hackmd.io/@jkyang/abc") == {"text": "See hackmd.io/@jkyang/abc"}
 
     def test_still_rewrites_real_mention_after_url(self):
@@ -281,17 +280,6 @@ class TestMentions:
         )
 
     # -- adversarial budget (docs/SELF_REVIEW.md) -------------------------------
-
-    def test_email_address_still_preserved_after_fix(self):
-        # The ``\w`` lookbehind still protects email local parts.
-        assert self.converter.to_slack_payload("Contact user@example.com for help") == {
-            "text": "Contact user@example.com for help"
-        }
-
-    def test_mailto_link_still_preserved_after_fix(self):
-        assert self.converter.to_slack_payload("Email <mailto:user@example.com>") == {
-            "text": "Email <mailto:user@example.com>"
-        }
 
     def test_cc_george_regression_guard(self):
         # The original real-mention behavior must survive the URL-skip rewrite.
@@ -318,6 +306,50 @@ class TestMentions:
         # preserved — neither is double-wrapped.
         assert self.converter.to_slack_payload("hi <@U123> see https://x.io/@bob") == {
             "text": "hi <@U123> see https://x.io/@bob"
+        }
+
+    # -- shared bare-mention scanner (vercel/chat a8c4af74 #619, 07c11129 #629) --
+    # Ports of upstream markdown.test.ts "mentions". The converter now uses
+    # ``chat_sdk.shared.mentions.replace_bare_mentions``, which also skips
+    # code spans and ``<...>`` tokens.
+
+    def test_does_not_mangle_handles_inside_slack_links(self):
+        assert self.converter.to_slack_payload("See <https://example.com/p?user=@george|George's profile>") == {
+            "text": "See <https://example.com/p?user=@george|George's profile>"
+        }
+
+    def test_does_not_mangle_handles_inside_markdown_links(self):
+        assert self.converter.to_slack_payload({"markdown": "See [profile](https://example.com/p?user=@george)"}) == {
+            "markdown_text": "See [profile](https://example.com/p?user=@george)"
+        }
+
+    def test_does_not_link_handles_inside_inline_code(self):
+        assert self.converter.to_slack_payload("Use `@vercel/postgres` and ping @george") == {
+            "text": "Use `@vercel/postgres` and ping <@george>"
+        }
+
+    def test_does_not_link_handles_inside_fenced_code(self):
+        assert self.converter.to_slack_payload(
+            {"markdown": "Install:\n```\nnpm install @vercel/postgres\n```\ncc @george"}
+        ) == {"markdown_text": "Install:\n```\nnpm install @vercel/postgres\n```\ncc <@george>"}
+
+    def test_rewrites_slash_separated_mentions(self):
+        # Behavior change: the old ``(?<![<\w/])`` lookbehind skipped ``@anne``.
+        assert self.converter.to_slack_payload("cc @george/@anne") == {"text": "cc <@george>/<@anne>"}
+
+    def test_rewrites_mentions_after_schemeless_host_punctuation(self):
+        assert self.converter.to_slack_payload("See example.com,@george") == {"text": "See example.com,<@george>"}
+
+    def test_preserves_schemeless_url_handles_in_response_url_markdown(self):
+        assert (
+            self.converter.to_response_url_text({"markdown": "See hackmd.io/@jkyang/abc cc @george"})
+            == "See hackmd.io/@jkyang/abc cc <@george>"
+        )
+
+    def test_handles_malformed_angle_text_without_rescanning_it(self):
+        prefix = "<" * 20_000
+        assert self.converter.to_slack_payload(f"{prefix} https://example.com/@jkyang cc @george") == {
+            "text": f"{prefix} https://example.com/@jkyang cc <@george>"
         }
 
 

@@ -73,6 +73,7 @@ from chat_sdk.shared.adapter_utils import (
 )
 from chat_sdk.shared.errors import AdapterError, AdapterRateLimitError, AuthenticationError, ValidationError
 from chat_sdk.shared.log_utils import utf8_byte_length
+from chat_sdk.shared.mentions import replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -3071,60 +3072,60 @@ class SlackAdapter:
     # ==================================================================
 
     async def _resolve_outgoing_mentions(self, text: str, thread_id: str) -> str:
-        """Resolve ``@name`` mentions in text to Slack ``<@USER_ID>`` format."""
+        """Resolve ``@name`` mentions in text to Slack ``<@USER_ID>`` format.
+
+        Uses the reverse user cache; when several users share a display name,
+        prefers the one who participates in *thread_id*. The shared scanner
+        (:func:`chat_sdk.shared.mentions.replace_bare_mentions`) skips inline
+        code, fenced code, URLs, ``<...>`` tokens and email addresses, and
+        matches names with ASCII word characters only (upstream JS
+        semantics).
+        """
         if not self._chat:
             return text
         state = self._chat.get_state()
-
-        mention_pattern = re.compile(r"(?<![\w<])@(\w+)")
         mentions: dict[str, list[str]] = {}
 
-        for match in mention_pattern.finditer(text):
-            name = match.group(1)
-            if SLACK_USER_ID_EXACT_PATTERN.match(name):
-                continue
-            idx = match.start()
-            if idx > 0 and text[idx - 1] == "<":
-                continue
-            lower_name = name.lower()
-            if lower_name not in mentions:
-                mentions[lower_name] = []
+        def collect(mention: str, name: str) -> str:
+            if not SLACK_USER_ID_EXACT_PATTERN.match(name):
+                mentions.setdefault(name.lower(), [])
+            return mention
 
+        replace_bare_mentions(text, collect)
+
+        # Lines without a bare mention never touch state (the native stream
+        # path calls this once per committed line).
         if not mentions:
             return text
 
         # Look up user IDs for each mentioned name
         for name in list(mentions.keys()):
             user_ids = await state.get_list(f"slack:user-by-name:{self._installation_cache_scope()}{name}")
-            mentions[name] = list(set(user_ids))
+            # Dedup, keeping first-seen order (JS ``[...new Set(ids)]``).
+            mentions[name] = list(dict.fromkeys(user_ids))
 
-        # Load thread participants if needed (ambiguous mentions)
+        # Load thread participants only if needed (ambiguous mentions)
         participants: set[str] | None = None
-        needs_participants = any(len(ids) > 1 for ids in mentions.values())
-        if needs_participants:
+        if any(len(ids) > 1 for ids in mentions.values()):
             participant_list = await state.get_list(f"slack:thread-participants:{thread_id}")
             participants = set(participant_list)
 
-        def replace_mention(match: re.Match[str]) -> str:
-            name = match.group(1)
-            offset = match.start()
-            if offset > 0 and text[offset - 1] == "<":
-                return match.group(0)
+        def resolve(mention: str, name: str) -> str:
             if SLACK_USER_ID_EXACT_PATTERN.match(name):
-                return match.group(0)
-
+                return mention
             user_ids = mentions.get(name.lower())
             if not user_ids:
-                return match.group(0)
+                return mention
             if len(user_ids) == 1:
                 return f"<@{user_ids[0]}>"
+            # Disambiguate using thread participants
             if participants:
                 in_thread = [uid for uid in user_ids if uid in participants]
                 if len(in_thread) == 1:
                     return f"<@{in_thread[0]}>"
-            return match.group(0)
+            return mention
 
-        return mention_pattern.sub(replace_mention, text)
+        return replace_bare_mentions(text, resolve)
 
     async def _resolve_message_mentions(
         self, message: AdapterPostableMessage, thread_id: str
@@ -4074,6 +4075,62 @@ class SlackAdapter:
         renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
         structured_chunks_supported = True
 
+        # Outgoing @name mention resolution for the native streaming path
+        # (vercel/chat 6f0d2f02). post_message/edit_message resolve mentions
+        # themselves, so the committed renderer text is resolved here before
+        # deltas are calculated. ``resolved_source_done`` indexes into the
+        # renderer's committable text; ``resolved_committed`` is its resolved
+        # counterpart and the coordinate space ``last_appended`` tracks.
+        # Mixing the two spaces would duplicate or drop text as soon as a
+        # replacement changes length (``@alice`` -> ``<@U123>``).
+        resolved_committed = ""
+        resolved_source_done = 0
+        inside_resolved_fence = False
+
+        def is_fence_line(line: str) -> bool:
+            # Python ``lstrip()`` rather than JS ``trimStart()`` (different
+            # whitespace sets, e.g. U+FEFF / U+001C-U+001F) on purpose: it
+            # matches the Python StreamingMarkdownRenderer's own fence
+            # tracking, which decides what gets committed mid-fence.
+            trimmed = line.lstrip()
+            return trimmed.startswith("```") or trimmed.startswith("~~~")
+
+        async def resolve_committed(committable: str) -> None:
+            """Extend ``resolved_committed`` with newly committed renderer text.
+
+            Works line by line, tracking code-fence state. The renderer only
+            commits partial lines inside fences (where mentions stay literal,
+            matching ``_resolve_outgoing_mentions``) or at inline-marker
+            holdback cuts (which never split a bare mention), so every bare
+            mention reaches the resolver whole even when it spans source
+            chunks. No resolution is cached across lines: the participant
+            list can change mid-stream.
+
+            Upstream parity: a segment that starts at a holdback cut is
+            scanned without the text before the cut, so a URL cut at an
+            unclosed marker (``https://x.io/*@alice``) can resolve the
+            handle after it. Upstream ``resolveCommitted`` behaves the same.
+            """
+            nonlocal resolved_committed, resolved_source_done, inside_resolved_fence
+            while resolved_source_done < len(committable):
+                # JS ``lastIndexOf("\n", done - 1)``: last newline before
+                # ``done``. (At ``done == 0`` JS clamps to index 0; the only
+                # difference is a leading "\n" line, which is never a fence.)
+                line_start = committable.rfind("\n", 0, resolved_source_done) + 1
+                newline_at = committable.find("\n", resolved_source_done)
+                line_end = len(committable) if newline_at == -1 else newline_at + 1
+                segment = committable[resolved_source_done:line_end]
+                fence_line = is_fence_line(committable[line_start:line_end])
+                if inside_resolved_fence or fence_line:
+                    # Fence delimiters and fenced content are literal.
+                    resolved_committed += segment
+                else:
+                    resolved_committed += await self._resolve_outgoing_mentions(segment, thread_id)
+                # Toggle only once the fence line's newline is committed.
+                if newline_at != -1 and fence_line:
+                    inside_resolved_fence = not inside_resolved_fence
+                resolved_source_done = line_end
+
         # The resolved bot token is passed on EVERY append and on stop
         # (vercel/chat#573). Passing it only on the first append left
         # chat.startStream/chat.stopStream unauthenticated ("not_authed")
@@ -4094,10 +4151,10 @@ class SlackAdapter:
             nonlocal last_appended, structured_chunks_supported
             if not structured_chunks_supported:
                 return
-            committable = renderer.get_committable_text()
-            delta = committable[len(last_appended) :]
+            await resolve_committed(renderer.get_committable_text())
+            delta = resolved_committed[len(last_appended) :]
             await flush_markdown_delta(delta)
-            last_appended = committable
+            last_appended = resolved_committed
 
             def _read(name: str) -> Any:
                 if isinstance(chunk, dict):
@@ -4133,10 +4190,10 @@ class SlackAdapter:
         async def push_text_and_flush(text: str) -> None:
             nonlocal last_appended
             renderer.push(text)
-            committable = renderer.get_committable_text()
-            delta = committable[len(last_appended) :]
+            await resolve_committed(renderer.get_committable_text())
+            delta = resolved_committed[len(last_appended) :]
             await flush_markdown_delta(delta)
-            last_appended = committable
+            last_appended = resolved_committed
 
         async for chunk in text_stream:
             if isinstance(chunk, str):
@@ -4163,9 +4220,14 @@ class SlackAdapter:
             else:
                 await send_structured_chunk(chunk)
 
-        # Flush remaining (finish releases all held-back content)
-        final_committable = renderer.finish()
-        final_delta = final_committable[len(last_appended) :]
+        # Flush remaining (finish releases all held-back content). As
+        # upstream, the final delta comes from ``get_committable_text()``
+        # (the raw accumulated text), not ``finish()``'s remend'd render:
+        # the resolved buffer is built incrementally from committable text,
+        # so the final source must extend the same prefix.
+        renderer.finish()
+        await resolve_committed(renderer.get_committable_text())
+        final_delta = resolved_committed[len(last_appended) :]
         await flush_markdown_delta(final_delta)
 
         stop_kwargs: dict[str, Any] = {"token": token}
