@@ -27,6 +27,54 @@ Sync wave from `chat@4.31.0` to `chat@4.41.1` (tracking #184). `UPSTREAM_PARITY`
   - **Consumer-visible (custom `api_url` only):** with a non-default `api_url`, media hosted on any other origin, including inbound media on `https://api.twilio.com`, is now refused (upstream behaves the same). With a non-Twilio or `http` `api_url` (a proxy or local mock), no media URL passes both layers: `api.twilio.com` fails the origin check and the proxy origin fails the host allowlist, so attachment downloads always raise. Before this change such configs downloaded `api.twilio.com` media. The default config (`api_url` unset) is unaffected.
 - **Teams: cap `microsoft-teams-{apps,api,cards}` at `<2.1`.** `uv.lock` is not committed and the extras were unbounded, so fresh installs resolved `microsoft-teams-apps` 2.1.0 (released 2026-09-16). 2.1.0 removed `App.activity_sender`, which the adapter uses to create native DM streams (`teams/adapter.py:943`), and changed the activities-client `update` signature that `edit_message`'s service-URL retargeting relies on. Native streaming and edits could fail on a fresh install, and CI turned red. The cap resolves to 2.0.16 until the adapter supports 2.1.
 
+### Google Chat: webhook JWT verification bound to configured identities (#222, security)
+
+Ports upstream `270b1c25` (#518, chat@4.35.0), `7a192235` (#787, chat@4.37.0) and `c3b5a08e` (#797, chat@4.37.0). Before this change, Google Chat webhook verification checked only a Google signature and the `aud` claim. The audiences in play (project number, endpoint URL, Pub/Sub push URL) are not secrets, so that check did not identify the caller. Every transport is now bound to a configured identity:
+
+- **Project-number tokens (direct webhooks)** are verified against the Chat service account's own X.509 certificates (`service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com`, cached 1 hour) with issuer `chat@system.gserviceaccount.com`. **This makes project-number verification work.** The previous code checked these tokens against Google's OIDC key set, which never holds the Chat issuer's keys, so every genuine project-number webhook was rejected with 401. (We confirmed on 2026-09-29 that the two published key sets share no key ids. We did not capture a real token for this check.)
+- **`endpoint_url` is now a direct-webhook verifier.** It covers Chat apps whose "Authentication audience" is "HTTP endpoint URL", which includes every Workspace Add-on Chat app. The token must be a Google OIDC ID token (`iss` of `accounts.google.com` or `https://accounts.google.com`) whose `aud` is exactly the configured URL, with `email_verified` exactly `true` and `email` equal to `chat@system.gserviceaccount.com` or the configured add-on identity. `endpoint_url` alone now satisfies the constructor's fail-closed check. When both verifiers are configured, the endpoint-URL token is tried first and the project number second.
+- **Pub/Sub pushes** need `email_verified` to be `true` and `email` to equal the configured push identity.
+- **Google's OIDC keys are fetched asynchronously and cached.** The old `PyJWKClient` did blocking network I/O on the event loop.
+
+#### Breaking (Google Chat)
+
+- **Pub/Sub deployments must set `pubsub_service_account_email`** (env `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`) to the service account in the subscription's push auth settings. Without it, every Pub/Sub push is rejected with 401 and a warning.
+- **Workspace Add-on Chat apps must set `workspace_add_on_service_account_email`** (env `GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL`) to their own `service-{projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com` identity, and must set `endpoint_url`. Add-on tokens are compared exactly. Without the setting they are rejected with 401 and a warning. Standalone Chat apps are unaffected.
+- **Button-click endpoint inference changed.** When `endpoint_url` is not configured, the adapter still infers a routing URL from `request.url`, but only from a *direct* webhook that passed verification (or ran with verification explicitly disabled). Before, the first request of any kind set it before verification ran, including Pub/Sub pushes and requests that were later rejected. The inferred value now lives in its own field (`_inferred_endpoint_url`) and never overwrites `endpoint_url`. The Python port never used the inferred URL as a verification audience, so audience checks are unchanged.
+- **Setting `endpoint_url` now turns on direct-webhook verification, even when `disable_signature_verification` is set.** A configured verifier takes precedence over the opt-out (same branch order as upstream). Before, a deployment with `endpoint_url` set (for button routing), no project number and `disable_signature_verification=True` accepted direct webhooks unverified. Such deployments are common, because project-number verification never worked before this change. After upgrading, each direct webhook that does not carry an endpoint-URL-audience Chat token gets a 401. Fix it in one of three ways: set `google_chat_project_number` if the Chat app uses the "Project number" authentication audience; switch the app to the "HTTP endpoint URL" audience with exactly the configured URL; or unset `endpoint_url` and let button routing use the inferred URL. The constructor now logs a warning when `endpoint_url` and `disable_signature_verification` are both set.
+- Upgrading also fixes project-number deployments, which were rejecting genuine webhooks (see above). No config change is needed for them.
+
+#### Python-specific (divergence from upstream)
+
+- The two new `GoogleChatAdapterConfig` fields are keyword-only (`field(kw_only=True)`). The dataclass is positional, so adding them positionally would shift existing callers' arguments.
+- Verification uses PyJWT with a fixed 1-hour async key cache, not google-auth-library's `verifyIdToken` / `verifySignedJwtWithCertsAsync`. The time checks are ported by hand to match google-auth-library: `exp` and `iat` are required, with 300 s of clock skew, and a token whose `exp` is 24 hours or more in the future is rejected (PyJWT has no such limit). The issuer is compared exactly by hand on both paths, not through PyJWT's `issuer=`, because PyJWT 2.10.0 matched it as a substring (CVE-2024-53861).
+- The constructor warning when `endpoint_url` and `disable_signature_verification` are both set is Python-only. Upstream has the same precedence but does not log it.
+
+### Security
+
+- **Webhook log hygiene: raw bodies and message content no longer reach DEBUG logs** (#187; ports upstream `fc7df9c4` / vercel/chat#500 and the logging parts of `f485255b` / vercel/chat#877). Several adapters logged raw webhook bodies, or previews of them, at DEBUG. In some cases this happened before signature or JWT verification, so unauthenticated input and message content could be copied into log sinks. Webhook handlers now log only request-shape metadata:
+  - GitHub: `{bodyBytes, contentType, eventType, signaturePresent}`, under "GitHub webhook signature verification failed" or "GitHub webhook request verified", plus `jsonParseStatus: "error"` on invalid JSON.
+  - GChat, Slack (after verification only) and the Teams bridge: `"… webhook received" {bodyLength}`.
+  - Linear: the raw-body log is gone.
+  - `Chat` "Incoming message": drops `author` and adds `is_bot`, matching upstream's key set.
+- **Consumer-visible (DEBUG logs only; no routing, response or status change):**
+  - The `"GitHub/GChat/Slack/Teams/Linear/WhatsApp webhook raw body"` messages are gone. GChat, Slack and Teams now emit `"… webhook received"` with `bodyLength`, which is a UTF-8 byte count.
+  - GitHub's `"GitHub webhook event type"` is replaced by `"GitHub webhook request verified"`.
+  - `bodyPreview` becomes `bodyBytes` on the GitHub, Linear and WhatsApp invalid-JSON errors.
+  - "Incoming message" loses `author`.
+
+  Anything that parses these log lines must be updated.
+
+### Python-specific (divergence from upstream)
+
+- **WhatsApp** drops its raw-body debug log and invalid-JSON `bodyPreview` (#187). Upstream 4.41.1 still logs both.
+- **Message-content debug logs** (#187):
+  - GChat "message event" logs `{space, textLength}`.
+  - GChat "Pub/Sub parsed message" drops `text` and `author`.
+  - The `Chat`, Slack and Discord slash-command debug logs log `textLength` instead of `text`.
+
+  Upstream still logs this content. Both divergences are recorded in `docs/UPSTREAM_SYNC.md`.
+
 ## 0.4.31.3
 
 Python-only fixes on top of `4.31.0` (`UPSTREAM_PARITY` unchanged at `4.31.0`). Same content as the `0.4.31.2` tag, which never reached PyPI: the publish action's pinned twine rejected the `Metadata-Version 2.5` that uv's build backend now emits (fixed in #182), and the tag is immutable, so the release ships as 0.4.31.3.

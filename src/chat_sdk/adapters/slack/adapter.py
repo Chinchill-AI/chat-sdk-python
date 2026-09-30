@@ -71,6 +71,7 @@ from chat_sdk.shared.adapter_utils import (
     maybe_render_thinking,
 )
 from chat_sdk.shared.errors import AdapterRateLimitError, AuthenticationError, ValidationError
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -1457,8 +1458,6 @@ class SlackAdapter:
         # implementation for duck-typed framework requests.
         body: str = await read_slack_request_body(request)
 
-        self._logger.debug("Slack webhook raw body", {"body": body[:500]})
-
         # Extract headers
         headers = getattr(request, "headers", {})
 
@@ -1537,6 +1536,9 @@ class SlackAdapter:
         except Exception as exc:
             self._logger.warn("Webhook verifier rejected request", {"error": exc})
             return {"body": "Invalid signature", "status": 401}
+        # Request-shape metadata only, and only once the request is verified
+        # (upstream f485255b) — never the body or any slice of it.
+        self._logger.debug("Slack webhook received", {"bodyLength": utf8_byte_length(body)})
 
         # URL verification is special: Slack sends a JSON ``url_verification``
         # ping at app-install / event-subscription time and only expects the
@@ -1788,9 +1790,11 @@ class SlackAdapter:
         channel_id = (params.get("channel_id") or [""])[0]
         trigger_id = (params.get("trigger_id") or [None])[0]
 
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: log the
+        # command text's length, not its content.
         self._logger.debug(
             "Processing Slack slash command",
-            {"command": command, "text": text, "userId": user_id, "channelId": channel_id},
+            {"command": command, "textLength": len(text), "userId": user_id, "channelId": channel_id},
         )
         user_info = await self._lookup_user(user_id)
         event = SlashCommandEvent(

@@ -57,6 +57,7 @@ from chat_sdk.shared.errors import (
     NetworkError,
     ValidationError,
 )
+from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -104,6 +105,32 @@ SUBSCRIPTION_CACHE_TTL_MS = 25 * 60 * 60 * 1000
 SPACE_SUB_KEY_PREFIX = "gchat:space-sub:"
 # Regex for extracting message name from reaction resource name
 REACTION_MESSAGE_NAME_PATTERN = re.compile(r"(spaces/[^/]+/messages/[^/]+)")
+
+# Webhook JWT verification (upstream 270b1c25 / 7a192235 / c3b5a08e).
+GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL = "chat@system.gserviceaccount.com"
+# Shape of a Workspace Add-on service identity. Used only to pick the warning
+# path -- acceptance always requires an exact match with the configured
+# identity. ``[0-9]`` rather than ``\d`` (which matches non-ASCII digits in
+# Python); always applied with ``fullmatch`` (``$`` tolerates a trailing "\n").
+_WORKSPACE_ADD_ON_SERVICE_ACCOUNT_PATTERN = re.compile(r"service-[0-9]+@gcp-sa-gsuiteaddons\.iam\.gserviceaccount\.com")
+# X.509 certs for project-number-audience tokens, which are self-signed by the
+# Chat service account (not standard OIDC tokens). See
+# https://developers.google.com/workspace/chat/verify-requests-from-chat
+GOOGLE_CHAT_ISSUER_CERTS_URL = (
+    f"https://www.googleapis.com/service_accounts/v1/metadata/x509/{GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL}"
+)
+# Google's OIDC signing keys for endpoint-URL and Pub/Sub push tokens.
+GOOGLE_OIDC_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+_GOOGLE_OIDC_ISSUERS = frozenset({"accounts.google.com", "https://accounts.google.com"})
+# Key-set cache lifetime (upstream caches the Chat issuer certs for 1 hour).
+_VERIFICATION_KEYS_TTL_SECONDS = 60 * 60
+# Clock skew tolerated on exp/iat (google-auth-library's default, which
+# upstream's verifyIdToken / verifySignedJwtWithCertsAsync apply).
+_JWT_CLOCK_SKEW_SECONDS = 300
+# Maximum token lifetime: google-auth-library rejects a token whose ``exp`` is
+# this far or further in the future ("Expiration time too far in future",
+# DEFAULT_MAX_TOKEN_LIFETIME_SECS_), on both upstream verification paths.
+_JWT_MAX_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60
 
 # Google Chat API base URL
 GCHAT_API_BASE = "https://chat.googleapis.com/v1"
@@ -155,6 +182,24 @@ class GoogleChatAdapter:
             "GOOGLE_CHAT_PROJECT_NUMBER"
         )
         self._pubsub_audience = config.pubsub_audience or os.environ.get("GOOGLE_CHAT_PUBSUB_AUDIENCE")
+        # Identities the endpoint-URL (Workspace Add-on) and Pub/Sub tokens must
+        # carry. Explicit config wins over the env var (``??`` semantics).
+        self._workspace_add_on_service_account_email: str | None = (
+            config.workspace_add_on_service_account_email
+            if config.workspace_add_on_service_account_email is not None
+            else os.environ.get("GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL")
+        )
+        self._pubsub_service_account_email: str | None = (
+            config.pubsub_service_account_email
+            if config.pubsub_service_account_email is not None
+            else os.environ.get("GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL")
+        )
+        # Endpoint URL inferred from the first *verified* direct webhook's
+        # ``request.url``. Used ONLY for button-click routing when
+        # ``endpoint_url`` is not configured -- never as a JWT verification
+        # audience, because ``request.url`` derives from the attacker-
+        # controllable Host header behind many proxies / serverless runtimes.
+        self._inferred_endpoint_url: str | None = None
         # Explicit opt-out of signature verification. An explicit
         # config.disable_signature_verification value (True OR False) wins over
         # the env var; only fall back to the env var when the config field is
@@ -172,12 +217,17 @@ class GoogleChatAdapter:
         # accepted any webhook in this state, allowing forged payloads to
         # impersonate users / trigger handlers. Mirrors the gchat slice of
         # upstream 9824d33 (PR #441).
-        if not (self._google_chat_project_number or self._pubsub_audience or self._disable_signature_verification):
+        #
+        # ``endpoint_url`` counts as a direct-webhook verifier because Chat apps
+        # whose "Authentication audience" is "HTTP endpoint URL" receive OIDC
+        # tokens whose ``aud`` is the endpoint URL (upstream 270b1c25, #518).
+        has_verifier = bool(self._google_chat_project_number or self._endpoint_url or self._pubsub_audience)
+        if not (has_verifier or self._disable_signature_verification):
             raise ValidationError(
                 "gchat",
                 "Webhook signature verification is required. Set "
-                "google_chat_project_number (or GOOGLE_CHAT_PROJECT_NUMBER) for "
-                "direct webhooks and/or pubsub_audience (or "
+                "google_chat_project_number (or GOOGLE_CHAT_PROJECT_NUMBER) and/or "
+                "endpoint_url for direct webhooks and/or pubsub_audience (or "
                 "GOOGLE_CHAT_PUBSUB_AUDIENCE) for Pub/Sub. To accept unverified "
                 "webhooks (NOT recommended in production), set "
                 "disable_signature_verification=True.",
@@ -185,14 +235,30 @@ class GoogleChatAdapter:
 
         # The escape hatch is dev-only -- warn loudly whenever it is the only
         # reason the adapter was allowed to construct without a verifier.
-        if self._disable_signature_verification and not (self._google_chat_project_number or self._pubsub_audience):
+        if self._disable_signature_verification and not has_verifier:
             self._logger.warn(
                 "Google Chat webhook signature verification is disabled "
                 "(disable_signature_verification / "
                 "GOOGLE_CHAT_DISABLE_SIGNATURE_VERIFICATION). Incoming webhooks "
                 "will be accepted without JWT verification. Do not use this in "
-                "production -- set google_chat_project_number and/or "
-                "pubsub_audience instead.",
+                "production -- set google_chat_project_number, endpoint_url "
+                "and/or pubsub_audience instead.",
+            )
+
+        # ``endpoint_url`` is a direct-webhook verifier (upstream 270b1c25), and
+        # a configured verifier takes precedence over the opt-out. Deployments
+        # that set ``endpoint_url`` only for button routing and relied on the
+        # opt-out for direct webhooks now get 401s -- say so at startup.
+        # Python-only log line; the precedence itself matches upstream.
+        if self._disable_signature_verification and self._endpoint_url:
+            self._logger.warn(
+                "disable_signature_verification does not cover direct Google Chat "
+                "webhooks while endpoint_url is set: endpoint_url is a direct-webhook "
+                "verifier, so each direct webhook must carry a Google OIDC token "
+                "whose aud is endpoint_url (the 'HTTP endpoint URL' authentication "
+                "audience). For the 'Project number' audience, also set "
+                "google_chat_project_number.",
+                {"endpointUrl": self._endpoint_url},
             )
 
         # In-progress subscription creations to prevent duplicate requests
@@ -202,8 +268,16 @@ class GoogleChatAdapter:
         self._warned_no_webhook_verification = False
         self._warned_no_pubsub_verification = False
 
-        # Cached JWKS client for JWT verification (lazy init on first use)
-        self._jwks_client: Any | None = None
+        # Divergence from upstream -- see docs/UPSTREAM_SYNC.md (JWT verification
+        # mechanics). Verification key caches, stored as ``(fetched_at, {kid: public_key})``
+        # on ``self._clock`` (monotonic; injectable for tests). Google's OIDC
+        # keys verify endpoint-URL and Pub/Sub tokens; the Chat issuer's X.509
+        # certs verify project-number tokens. A failed fetch never replaces a
+        # cache entry.
+        self._clock: Callable[[], float] = time.monotonic
+        self._google_oidc_keys: tuple[float, dict[str, Any]] | None = None
+        self._chat_issuer_keys: tuple[float, dict[str, Any]] | None = None
+        self._verification_keys_lock = asyncio.Lock()
 
         # Shared aiohttp session for connection pooling
         self._http_session: Any | None = None
@@ -722,53 +796,249 @@ class GoogleChatAdapter:
     # JWT verification
     # =========================================================================
 
-    async def _verify_bearer_token(
-        self,
-        request: Any,
-        expected_audience: str,
-    ) -> bool:
-        """Verify a Google-signed JWT Bearer token from the Authorization header.
-
-        Used for both direct Google Chat webhooks and Pub/Sub push messages.
-        """
-        # Extract authorization header
+    def _get_bearer_token(self, request: Any) -> str | None:
+        """Extract the Bearer token from the request's Authorization header."""
         auth_header: str | None = None
         if hasattr(request, "headers"):
             headers = request.headers
             if isinstance(headers, dict) or hasattr(headers, "get"):
                 auth_header = headers.get("authorization") or headers.get("Authorization")
 
-        if not auth_header or not auth_header.startswith("Bearer "):
+        if not isinstance(auth_header, str) or not auth_header.startswith("Bearer "):
+            return None
+        return auth_header[7:]
+
+    async def _verify_bearer_token(
+        self,
+        request: Any,
+        expected_audience: str,
+        validate_payload: Callable[[dict[str, Any]], bool],
+    ) -> bool:
+        """Verify a Google-signed OIDC ID token from the Authorization header.
+
+        Used for endpoint-URL direct webhooks and Pub/Sub push messages. The
+        signature, ``aud``, ``exp``/``iat`` and ``iss`` are checked here; the
+        caller's ``validate_payload`` then decides whether the token names the
+        identity it expects. The validator is required, not optional: a
+        Google-signed token with the right ``aud`` proves nothing about who
+        sent it, because every audience in play is public.
+        """
+        token = self._get_bearer_token(request)
+        if token is None:
             self._logger.warn("Missing or invalid Authorization header")
             return False
 
-        token = auth_header[7:]
         try:
             import jwt as pyjwt
-            from jwt import PyJWKClient
 
-            # Lazily create and cache the JWKS client (avoid per-request instantiation)
-            if self._jwks_client is None:
-                self._jwks_client = PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
-            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            key = await self._get_verification_key(token, chat_issuer=False)
             payload = pyjwt.decode(
                 token,
-                signing_key.key,
+                key,
                 algorithms=["RS256"],
                 audience=expected_audience,
+                leeway=_JWT_CLOCK_SKEW_SECONDS,
+                options={"require": ["exp", "iat", "iss"], "strict_aud": True},
             )
-            self._logger.debug(
-                "JWT verified",
-                {
-                    "iss": payload.get("iss"),
-                    "aud": payload.get("aud"),
-                    "email": payload.get("email"),
-                },
-            )
-            return True
         except Exception as error:
             self._logger.warn("JWT verification failed", {"error": error})
             return False
+
+        claims = {"iss": payload.get("iss"), "aud": payload.get("aud"), "email": payload.get("email")}
+        if _exceeds_max_token_lifetime(payload):
+            self._logger.warn("JWT expiration time too far in future", claims)
+            return False
+        # Issuer is checked by hand rather than through PyJWT's ``issuer=``
+        # sequence support, whose behaviour varies across the supported
+        # ``pyjwt>=2.8`` range. ``isinstance`` first: a list-valued ``iss``
+        # must fail, not raise ``TypeError`` on the set lookup.
+        iss = payload.get("iss")
+        if not isinstance(iss, str) or iss not in _GOOGLE_OIDC_ISSUERS:
+            self._logger.warn("JWT issuer is not Google", claims)
+            return False
+        self._logger.debug("JWT verified", claims)
+        if not validate_payload(payload):
+            self._logger.warn("JWT payload failed claim validation", claims)
+            return False
+        return True
+
+    def _validate_endpoint_url_token_payload(self, payload: dict[str, Any]) -> bool:
+        """Claim validation for endpoint-URL-audience tokens.
+
+        These are standard Google OIDC ID tokens, so anyone can mint one with
+        ``aud`` set to our public endpoint URL. The token is only trustworthy
+        if it was issued to Google Chat itself: ``email`` must be the Chat
+        system service account (or this app's own Workspace Add-on identity)
+        and ``email_verified`` must be exactly ``True``.
+
+        Add-on identities are compared exactly, never by shape: every add-on
+        project produces a ``service-{projectNumber}@gcp-sa-gsuiteaddons``
+        email, so the shape alone would accept anyone's add-on.
+        """
+        email = payload.get("email")
+        if payload.get("email_verified") is not True or not isinstance(email, str) or not email:
+            return False
+        if email == GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL:
+            return True
+        if not _WORKSPACE_ADD_ON_SERVICE_ACCOUNT_PATTERN.fullmatch(email):
+            return False
+        if not self._workspace_add_on_service_account_email:
+            self._logger.warn(
+                "Rejected a Workspace Add-on token because no add-on identity is "
+                "configured. Set workspace_add_on_service_account_email (or "
+                "GOOGLE_CHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL) to your own "
+                "service-{projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com address.",
+                {"email": email},
+            )
+            return False
+        return email == self._workspace_add_on_service_account_email
+
+    def _validate_pubsub_token_payload(self, payload: dict[str, Any]) -> bool:
+        """Claim validation for Pub/Sub push tokens.
+
+        The audience is our public push endpoint, so anyone can have Google
+        mint a validly signed token for it from their own project. Only the
+        ``email`` claim identifies the caller. Fail closed when no push
+        identity is configured.
+        """
+        email = payload.get("email")
+        if payload.get("email_verified") is not True or not isinstance(email, str) or not email:
+            return False
+        if not self._pubsub_service_account_email:
+            self._logger.warn(
+                "Rejected a Pub/Sub push because no push identity is configured. "
+                "Set pubsub_service_account_email (or "
+                "GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL) to the service account "
+                "in your subscription's push auth settings.",
+                {"email": email},
+            )
+            return False
+        return email == self._pubsub_service_account_email
+
+    async def _verify_project_number_token(self, token: str, project_number: str) -> bool:
+        """Verify a project-number-audience direct-webhook token.
+
+        These are NOT standard OIDC ID tokens: they are self-signed by
+        ``chat@system.gserviceaccount.com`` with its own key set, so Google's
+        OIDC keys can never validate them. Per Google's docs, verify against
+        the Chat service account's X.509 certs with issuer
+        ``chat@system.gserviceaccount.com``.
+        """
+        try:
+            import jwt as pyjwt
+
+            key = await self._get_verification_key(token, chat_issuer=True)
+            payload = pyjwt.decode(
+                token,
+                key,
+                algorithms=["RS256"],
+                audience=project_number,
+                leeway=_JWT_CLOCK_SKEW_SECONDS,
+                options={"require": ["exp", "iat", "iss"], "strict_aud": True},
+            )
+        except Exception as error:
+            self._logger.warn("Project-number JWT verification failed", {"error": error})
+            return False
+
+        claims = {"iss": payload.get("iss"), "aud": payload.get("aud")}
+        # Issuer checked by hand, not with PyJWT's ``issuer=``: PyJWT 2.10.0
+        # (inside the supported ``pyjwt>=2.8`` range) matched a string
+        # ``issuer`` as a substring (CVE-2024-53861), accepting e.g. ``"chat"``
+        # or ``""``.
+        iss = payload.get("iss")
+        if not isinstance(iss, str) or iss != GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL:
+            self._logger.warn("Project-number JWT issuer is not the Chat service account", claims)
+            return False
+        if _exceeds_max_token_lifetime(payload):
+            self._logger.warn("Project-number JWT expiration time too far in future", claims)
+            return False
+        return True
+
+    async def _verify_direct_webhook_token(self, request: Any) -> bool:
+        """Verify a direct Google Chat webhook.
+
+        The token shape depends on the Chat app's "Authentication audience":
+
+        - "HTTP endpoint URL" (and all Workspace Add-on Chat apps): a Google
+          OIDC ID token with ``aud`` = endpoint URL, checked by
+          ``_verify_bearer_token`` plus the Chat identity claims.
+        - "Project number": a JWT self-signed by
+          ``chat@system.gserviceaccount.com`` with ``aud`` = project number.
+
+        When both verifiers are configured, the endpoint-URL path is tried
+        first, then the project number. Only the *configured* ``endpoint_url``
+        is ever an audience -- never the request-inferred URL.
+        """
+        token = self._get_bearer_token(request)
+        if token is None:
+            self._logger.warn("Missing or invalid Authorization header")
+            return False
+        if self._endpoint_url and await self._verify_bearer_token(
+            request, self._endpoint_url, self._validate_endpoint_url_token_payload
+        ):
+            return True
+        if self._google_chat_project_number:
+            return await self._verify_project_number_token(token, self._google_chat_project_number)
+        return False
+
+    def _button_click_endpoint_url(self) -> str | None:
+        """URL used for routing card button-click actions.
+
+        Prefers explicit config; falls back to the URL inferred from a verified
+        direct webhook. Never used as a JWT audience.
+        """
+        return self._endpoint_url if self._endpoint_url is not None else self._inferred_endpoint_url
+
+    async def _get_verification_key(self, token: str, *, chat_issuer: bool) -> Any:
+        """Return the public key named by the token's ``kid`` header.
+
+        ``chat_issuer=True`` selects the Chat service account's X.509 certs
+        (project-number tokens); otherwise Google's OIDC JWKS. Raises when the
+        key set cannot be fetched or has no key for the ``kid``.
+        """
+        import jwt as pyjwt
+
+        kid = pyjwt.get_unverified_header(token).get("kid")
+        if not isinstance(kid, str) or not kid:
+            raise ValueError("JWT header has no key id")
+        keys = await self._get_verification_keys(chat_issuer=chat_issuer)
+        key = keys.get(kid)
+        if key is None:
+            raise ValueError("No verification key matches the JWT key id")
+        return key
+
+    async def _get_verification_keys(self, *, chat_issuer: bool) -> dict[str, Any]:
+        """Return a cached ``{kid: public_key}`` map, refetching after 1 hour.
+
+        The fetch is async (no blocking I/O on the event loop) and serialized
+        by a lock so a cold cache under concurrent webhooks fetches once. A
+        failed or empty fetch raises and leaves the previous entry in place.
+        """
+        cached = self._chat_issuer_keys if chat_issuer else self._google_oidc_keys
+        if cached is not None and self._clock() - cached[0] < _VERIFICATION_KEYS_TTL_SECONDS:
+            return cached[1]
+        async with self._verification_keys_lock:
+            cached = self._chat_issuer_keys if chat_issuer else self._google_oidc_keys
+            now = self._clock()
+            if cached is not None and now - cached[0] < _VERIFICATION_KEYS_TTL_SECONDS:
+                return cached[1]
+            if chat_issuer:
+                keys = _parse_x509_cert_map(await self._fetch_json(GOOGLE_CHAT_ISSUER_CERTS_URL))
+                self._chat_issuer_keys = (now, keys)
+            else:
+                keys = _parse_jwks(await self._fetch_json(GOOGLE_OIDC_CERTS_URL))
+                self._google_oidc_keys = (now, keys)
+            return keys
+
+    async def _fetch_json(self, url: str) -> Any:
+        """GET a JSON document with the shared session; raise on non-200."""
+        import aiohttp
+
+        session = await self._get_http_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status != 200:
+                raise NetworkError("gchat", f"Failed to fetch {url}: HTTP {response.status}")
+            return await response.json(content_type=None)
 
     # =========================================================================
     # Public user lookup (chat.get_user)
@@ -821,19 +1091,6 @@ class GoogleChatAdapter:
         Returns:
             Response dict with body and status keys.
         """
-        # Auto-detect endpoint URL from incoming request for button click routing
-        if not self._endpoint_url:
-            try:
-                if hasattr(request, "url"):
-                    url_str = str(request.url)
-                    self._endpoint_url = url_str
-                    self._logger.debug(
-                        "Auto-detected endpoint URL",
-                        {"endpointUrl": self._endpoint_url},
-                    )
-            except Exception:
-                pass
-
         # Parse request body. `hasattr` narrows `Any` → `object` (not
         # awaitable); `getattr(..., None)` preserves `Any` for the
         # framework duck-typed path.
@@ -864,7 +1121,7 @@ class GoogleChatAdapter:
             else:
                 body = str(request)
 
-        self._logger.debug("GChat webhook raw body", {"body": body})
+        self._logger.debug("GChat webhook received", {"bodyLength": utf8_byte_length(body)})
 
         try:
             parsed = json.loads(body)
@@ -886,7 +1143,9 @@ class GoogleChatAdapter:
             # not sufficient here for that reason. Mirrors upstream
             # adapter-gchat/src/index.ts.
             if self._pubsub_audience:
-                valid = await self._verify_bearer_token(request, self._pubsub_audience)
+                valid = await self._verify_bearer_token(
+                    request, self._pubsub_audience, self._validate_pubsub_token_payload
+                )
                 if not valid:
                     return {"body": "Unauthorized", "status": 401}
             elif self._disable_signature_verification:
@@ -909,11 +1168,13 @@ class GoogleChatAdapter:
                 return {"body": "Unauthorized", "status": 401}
             return self._handle_pub_sub_message(parsed, options)
 
-        # Verify direct Google Chat webhook JWT if project number is configured.
+        # Verify direct Google Chat webhook JWT if a verifier is configured.
         # Same reasoning as the Pub/Sub branch: each shape requires its own
         # verifier (or explicit opt-out) to prevent cross-transport bypass.
-        if self._google_chat_project_number:
-            valid = await self._verify_bearer_token(request, self._google_chat_project_number)
+        # See `_verify_direct_webhook_token` for the two token types Google
+        # sends depending on the Chat app's "Authentication audience" setting.
+        if self._google_chat_project_number or self._endpoint_url:
+            valid = await self._verify_direct_webhook_token(request)
             if not valid:
                 return {"body": "Unauthorized", "status": 401}
         elif self._disable_signature_verification:
@@ -921,16 +1182,32 @@ class GoogleChatAdapter:
                 self._warned_no_webhook_verification = True
                 self._logger.warn(
                     "Google Chat webhook verification is disabled. "
-                    "Set GOOGLE_CHAT_PROJECT_NUMBER or googleChatProjectNumber "
-                    "to verify incoming requests."
+                    "Set GOOGLE_CHAT_PROJECT_NUMBER, google_chat_project_number, "
+                    "or endpoint_url to verify incoming requests."
                 )
         else:
             self._logger.warn(
-                "Rejected direct Google Chat webhook: google_chat_project_number "
-                "is not configured. Set GOOGLE_CHAT_PROJECT_NUMBER, or set "
-                "disable_signature_verification to accept unverified payloads."
+                "Rejected direct Google Chat webhook: neither "
+                "google_chat_project_number nor endpoint_url is configured. Set "
+                "one of them, or set disable_signature_verification to accept "
+                "unverified payloads."
             )
             return {"body": "Unauthorized", "status": 401}
+
+        # Infer an endpoint URL for button-click routing if none is configured.
+        # Runs only after the request passed verification (or verification was
+        # explicitly disabled) so an unauthenticated caller cannot poison the
+        # routing URL, and is kept apart from the verification audience (only
+        # the configured `endpoint_url` is ever an audience) because
+        # `request.url` derives from the attacker-controllable Host header.
+        if not (self._endpoint_url or self._inferred_endpoint_url):
+            inferred = _absolute_request_url(request)
+            if inferred is not None:
+                self._inferred_endpoint_url = inferred
+                self._logger.debug(
+                    "Inferred button-click endpoint URL from request",
+                    {"inferredEndpointUrl": inferred},
+                )
 
         # Treat as a direct Google Chat webhook event
         event: dict[str, Any] = parsed
@@ -961,12 +1238,15 @@ class GoogleChatAdapter:
         # Check for message payload in the Add-ons format
         message_payload = (event.get("chat") or {}).get("messagePayload")
         if message_payload:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream
+            # still logs the sender display name and a text prefix here; we
+            # log only the text length so message content stays out of logs.
+            message_text = (message_payload.get("message") or {}).get("text")
             self._logger.debug(
                 "message event",
                 {
                     "space": message_payload.get("space", {}).get("name"),
-                    "sender": (message_payload.get("message") or {}).get("sender", {}).get("displayName"),
-                    "text": (message_payload.get("message") or {}).get("text", "")[:50],
+                    "textLength": len(message_text) if isinstance(message_text, str) else 0,
                 },
             )
             self._handle_message_event(event, options)
@@ -1227,8 +1507,8 @@ class GoogleChatAdapter:
             {
                 "threadId": thread_id,
                 "messageId": parsed_message.id,
-                "text": parsed_message.text,
-                "author": parsed_message.author.full_name,
+                # Divergence from upstream — see docs/UPSTREAM_SYNC.md: no
+                # message text or author display name in logs.
                 "isBot": parsed_message.author.is_bot,
                 "isMe": parsed_message.author.is_me,
             },
@@ -1481,7 +1761,7 @@ class GoogleChatAdapter:
                 card_id = f"card-{int(time.time() * 1000)}-{_random_id()}"
                 google_card = card_to_google_card(
                     card,
-                    {"card_id": card_id, "endpoint_url": self._endpoint_url},
+                    {"card_id": card_id, "endpoint_url": self._button_click_endpoint_url()},
                 )
 
                 self._logger.debug(
@@ -1588,7 +1868,7 @@ class GoogleChatAdapter:
                 card_id = f"card-{int(time.time() * 1000)}-{_random_id()}"
                 google_card = card_to_google_card(
                     card,
-                    {"card_id": card_id, "endpoint_url": self._endpoint_url},
+                    {"card_id": card_id, "endpoint_url": self._button_click_endpoint_url()},
                 )
                 request_body["cardsV2"] = [google_card]
 
@@ -1655,7 +1935,7 @@ class GoogleChatAdapter:
                 card_id = f"card-{int(time.time() * 1000)}-{_random_id()}"
                 google_card = card_to_google_card(
                     card,
-                    {"card_id": card_id, "endpoint_url": self._endpoint_url},
+                    {"card_id": card_id, "endpoint_url": self._button_click_endpoint_url()},
                 )
 
                 self._logger.debug(
@@ -2547,7 +2827,7 @@ class GoogleChatAdapter:
                 card_id = f"card-{int(time.time() * 1000)}-{_random_id()}"
                 google_card = card_to_google_card(
                     card,
-                    {"card_id": card_id, "endpoint_url": self._endpoint_url},
+                    {"card_id": card_id, "endpoint_url": self._button_click_endpoint_url()},
                 )
 
                 self._logger.debug(
@@ -2934,6 +3214,87 @@ class _GoogleApiError(Exception):
         super().__init__(message)
         self.code = code
         self.errors = errors
+
+
+def _exceeds_max_token_lifetime(payload: dict[str, Any]) -> bool:
+    """Whether ``exp`` is at least 24 hours ahead of the wall clock.
+
+    Mirrors google-auth-library's ``exp >= now + maxExpiry`` check (no clock
+    skew applied), which PyJWT does not perform. An ``exp`` that cannot be
+    read as a number fails closed.
+    """
+    try:
+        exp = float(payload["exp"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return exp >= time.time() + _JWT_MAX_TOKEN_LIFETIME_SECONDS
+
+
+def _absolute_request_url(request: Any) -> str | None:
+    """Return ``str(request.url)`` when it is an absolute URL, else ``None``.
+
+    Mirrors upstream's ``new URL(request.url)`` guard: a relative or missing
+    URL leaves button-click inference unset.
+    """
+    try:
+        url = getattr(request, "url", None)
+        if url is None:
+            return None
+        url_str = str(url)
+        parsed = urlparse(url_str)
+    except Exception:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return url_str
+
+
+def _parse_jwks(document: Any) -> dict[str, Any]:
+    """Parse a JWKS document into ``{kid: public_key}``; skip unusable entries.
+
+    Raises when no usable key remains so an empty/garbled response is never
+    cached.
+    """
+    import jwt as pyjwt
+
+    keys: dict[str, Any] = {}
+    entries = document.get("keys") if isinstance(document, dict) else None
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kid = entry.get("kid")
+            if not isinstance(kid, str) or not kid:
+                continue
+            try:
+                keys[kid] = pyjwt.PyJWK(entry).key
+            except Exception:
+                continue
+    if not keys:
+        raise ValueError("Google OIDC key set contained no usable keys")
+    return keys
+
+
+def _parse_x509_cert_map(document: Any) -> dict[str, Any]:
+    """Parse a ``{kid: PEM certificate}`` map into ``{kid: public_key}``.
+
+    Raises when no usable certificate remains so an empty/garbled response is
+    never cached.
+    """
+    from cryptography.x509 import load_pem_x509_certificate
+
+    keys: dict[str, Any] = {}
+    if isinstance(document, dict):
+        for kid, pem in document.items():
+            if not isinstance(kid, str) or not kid or not isinstance(pem, str):
+                continue
+            try:
+                keys[kid] = load_pem_x509_certificate(pem.encode("utf-8")).public_key()
+            except Exception:
+                continue
+    if not keys:
+        raise ValueError("Google Chat issuer certificate set contained no usable certificates")
+    return keys
 
 
 def _random_id() -> str:
