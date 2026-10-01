@@ -1132,10 +1132,19 @@ class DiscordAdapter:
         (``POST /webhooks/{app}/{token}?wait=true``). The deferral's flags
         (e.g. ephemeral) are OR'd into every response, so follow-ups stay
         ephemeral too.
+
+        Upstream parity, deliberately: the returned message id is a plain
+        message id. ``edit_message`` / ``delete_message`` (and the
+        post-then-edit streaming fallback) still target
+        ``/channels/{id}/messages/{id}``, which cannot reach an ephemeral
+        message; upstream ``editMessage`` / ``deleteMessage`` do the same
+        (chat@4.41.1 adapter-discord index.ts:1732-1789).
         """
         is_initial_response = not slash_ctx.initial_response_sent
         # Set before awaiting so a concurrent post becomes a follow-up rather
-        # than a second ``@original`` edit.
+        # than a second ``@original`` edit. Upstream parity (index.ts:1483-1486
+        # sets the flag the same way and does not wait for the PATCH before
+        # a concurrent follow-up is sent).
         slash_ctx.initial_response_sent = True
 
         token = quote(slash_ctx.interaction_token, safe="")

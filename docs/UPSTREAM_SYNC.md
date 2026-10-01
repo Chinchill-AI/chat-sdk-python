@@ -1114,7 +1114,11 @@ part of `0fdb9029` (#678), `26c05225` (#715), the slash-flags part of
   to the interaction's conversation edits `@original`; later ones are
   follow-ups, `POST /webhooks/{app}/{token}?wait=true`. The port used to send
   them to the channel as ordinary bot messages, which could never be
-  ephemeral.
+  ephemeral. Also parity, and deliberately kept: the first-response flag is
+  set before the PATCH is awaited (concurrent posts are not serialized), and
+  `edit_message` / `delete_message` (and the post-then-edit streaming path)
+  still use `/channels/{id}/messages/{id}`, which cannot reach an ephemeral
+  response. Upstream `editMessage` / `deleteMessage` do the same.
 - **Slash request context is scoped** like upstream's
   `requestContext.run(...)`: `_handle_application_command_interaction` resets
   the `ContextVar` once `process_slash_command` has created the handler task
