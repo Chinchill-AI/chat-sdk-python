@@ -41,6 +41,7 @@ __all__ = [
     "format_teams_mention",
     "markdown_to_teams_html",
     "safe_link_href",
+    "strip_html_tags",
     "teams_html_to_markdown",
     "teams_mention_to_plain_text",
     "unescape_teams_text",
@@ -51,7 +52,9 @@ __all__ = [
 _HTML_ESCAPE_PATTERN = re.compile(r"[&<>\"]")
 _MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _TEAMS_MENTION_PATTERN = re.compile(r"<at\b[^>]*>(.*?)</at>", re.DOTALL | re.IGNORECASE)
-_TAG_PATTERN = re.compile(r"<[^>]+>")
+# Tag body bounded so one scan stays linear (upstream ``HTML_TAG_PATTERN``,
+# chat@4.37.0); :func:`strip_html_tags` repeats it until the text is stable.
+_HTML_TAG_PATTERN = re.compile(r"<[^>]{1,2048}>")
 
 # Order matters: `&` is escaped via the single-pass regex below so an already
 # present `&` is not double-escaped. Matches upstream `HTML_ESCAPES`.
@@ -107,7 +110,7 @@ def teams_mention_to_plain_text(text: str) -> str:
 
     def _replace(match: re.Match[str]) -> str:
         name = match.group(1)
-        return f"@{unescape_teams_text(_strip_tags(name).strip())}"
+        return f"@{unescape_teams_text(strip_html_tags(name).strip())}"
 
     return _TEAMS_MENTION_PATTERN.sub(_replace, text)
 
@@ -130,7 +133,7 @@ def teams_html_to_markdown(html: str) -> str:
     )
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p>\s*<p[^>]*>", "\n\n", text, flags=re.IGNORECASE)
-    text = _TAG_PATTERN.sub("", text)
+    text = strip_html_tags(text)
     text = text.replace(" ", " ")
     return unescape_teams_text(text).strip()
 
@@ -173,8 +176,28 @@ def convert_teams_emoji_placeholders(text: str) -> str:
     return converted
 
 
-def _strip_tags(text: str) -> str:
-    return _TAG_PATTERN.sub("", text)
+def strip_html_tags(text: str) -> str:
+    """Strip HTML tags, repeating until the text stops changing.
+
+    Port of upstream ``stripHtmlTags`` (chat@4.37.0). One pass can leave a tag
+    behind when removing an inner tag joins the halves of an outer one
+    (``<<b>b>`` becomes ``<b>``), so this loops until stable. Each pass bounds
+    the tag body to 2048 characters, so a long run of unclosed ``<`` cannot
+    make a scan quadratic; a longer "tag" stays as text.
+
+    Upstream parity (``format/index.ts`` ``stripHtmlTags``, chat@4.41.1): the
+    same pattern and loop. A run of ``<`` followed by ``>`` still needs about
+    ``len / 2049`` passes (``"<" * n + ">" * n`` is ~0.08 s at 28 KB, roughly
+    the Teams message cap, and ~2 s at 160 KB); upstream has the same cost.
+    The unbounded ``<[^>]+>`` loop this replaces in ``TeamsFormatConverter``
+    was slower on its own worst case (``"<" * 160_000``: ~9 s).
+    """
+    current = text
+    while True:
+        stripped = _HTML_TAG_PATTERN.sub("", current)
+        if stripped == current:
+            return stripped
+        current = stripped
 
 
 def safe_link_href(href: str) -> bool:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias, TypedDict
+from typing import Any, Literal, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
 
@@ -110,11 +110,18 @@ class TeamsAdapterConfig:
 # =============================================================================
 
 
+# Bot Framework ``conversation.conversationType`` values Teams sends.
+TeamsConversationType: TypeAlias = Literal["channel", "groupChat", "personal"]
+
+
 @dataclass(frozen=True)
 class TeamsThreadId:
     """Decoded thread ID for Teams.
 
-    Format: teams:{base64url(conversation_id)}:{base64url(service_url)}
+    Format: ``teams:{base64url(conversation_id)}:{base64url(service_url)}``,
+    plus a ``:{conversation_type}`` segment only when the explicit type
+    disagrees with the ``19:``-prefix heuristic (an ``a:`` group chat or a
+    ``19:`` personal chat), so every other ID stays byte-identical.
     """
 
     # Teams conversation ID
@@ -123,6 +130,10 @@ class TeamsThreadId:
     service_url: str
     # Reply-to message ID (optional)
     reply_to_id: str | None = None
+    # Explicit conversation type (upstream ``conversationType``, chat@4.36.0).
+    # ``None`` falls back to the ``19:``-prefix heuristic. Last field so
+    # positional construction keeps working.
+    conversation_type: TeamsConversationType | None = None
 
 
 # =============================================================================

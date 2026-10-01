@@ -18,6 +18,7 @@ from __future__ import annotations
 import inspect
 import json
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -108,12 +109,16 @@ class _SentActivity:
 
 
 def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
-    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+    """Replace the SDK activity sender with an AsyncMock returning a SentActivity.
 
-    The migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    Outbound send/typing paths go through ``TeamsAdapter._send_to``, which hands
+    ``(activity, ConversationReference)`` to ``App.activity_sender.send`` when the
+    App has one (the 2.0.x shape, set here on every SDK line). Mirrors upstream's
+    ``vi.spyOn(app.activitySender, "send")``. Returns the mock so tests can
+    assert call count / arguments.
     """
     send = AsyncMock(return_value=_SentActivity(sent_id))
-    adapter._app.send = send  # type: ignore[method-assign]
+    adapter._app.activity_sender = SimpleNamespace(send=send)
     return send
 
 
@@ -333,7 +338,7 @@ class TestPostMessageAdaptiveCard:
             },
         )
         assert result.id == "card-msg-1"
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         assert dumped["type"] == "message"
         assert len(dumped["attachments"]) == 1
@@ -1034,8 +1039,8 @@ class TestStream:
         assert result.id == "stream-msg-1"
         # Single SDK send carrying the full accumulated text — no edits.
         send.assert_called_once()
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
         assert activity.text == "Hello world"
         assert activity.text_format == "markdown"
 

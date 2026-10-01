@@ -5,17 +5,22 @@ Ported from packages/adapter-teams/src/index.test.ts.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from chat_sdk.adapters.teams.adapter import TeamsAdapter, create_teams_adapter
 from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.shared.errors import NetworkError, ValidationError
+from tests._slack_file_transport import FakeFileResponse, FakeFileTransport
 
 TEAMS_PREFIX_PATTERN = re.compile(r"^teams:")
 
@@ -49,14 +54,16 @@ class _SentActivity:
 
 
 def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
-    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+    """Replace the SDK activity sender with an AsyncMock returning a SentActivity.
 
-    Mirrors upstream's ``mockApp.send = vi.fn(async () => ({ id, type }))`` —
-    the migrated outbound send/typing paths delegate to the SDK ``App.send``.
-    Returns the mock so tests can assert call count / arguments.
+    Outbound send/typing paths go through ``TeamsAdapter._send_to``, which hands
+    ``(activity, ConversationReference)`` to ``App.activity_sender.send`` when the
+    App has one (the 2.0.x shape, set here on every SDK line). Mirrors upstream's
+    ``vi.spyOn(app.activitySender, "send")``. Returns the mock so tests can
+    assert call count / arguments.
     """
     send = AsyncMock(return_value=_SentActivity(sent_id))
-    adapter._app.send = send  # type: ignore[method-assign]
+    adapter._app.activity_sender = SimpleNamespace(send=send)
     return send
 
 
@@ -78,36 +85,46 @@ def _mock_app_activities(
     ops.update = update
     ops.delete = delete
     api = MagicMock()
+    # The SDK default service URL: threads on it use ``App.api`` itself.
+    api.service_url = "https://smba.trafficmanager.net/teams"
     api.conversations.activities = MagicMock(return_value=ops)
     adapter._app.api = api  # type: ignore[method-assign]
     return update, delete
 
 
-class _MockAiohttpSession:
-    """Stub for ``aiohttp.ClientSession`` that supports the
-    ``async with session.get(url) as resp`` pattern.
+def _download_transport(monkeypatch: pytest.MonkeyPatch, payload: bytes = b"file-bytes") -> FakeFileTransport:
+    """Give the shared guarded downloader an in-memory transport for anonymous Teams downloads."""
+    transport = FakeFileTransport(FakeFileResponse(payload))
+    _route_downloads(monkeypatch, transport)
+    return transport
 
-    ``session.get(url)`` returns a synchronous async-context-manager (not
-    a coroutine), so we can't use ``AsyncMock`` for it — the real
-    aiohttp API is not itself async.  Implementing it as a real method
-    also keeps us out of ``audit_test_quality.py``'s "MagicMock used for
-    async method `.get`" false-positive (which pattern-matches on
-    ``KeyValueState.get``, not ``ClientSession.get``).
-    """
 
-    def __init__(self, payload: bytes = b"", status: int = 200):
-        response = MagicMock()
-        response.status = status
-        response.read = AsyncMock(return_value=payload)
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(return_value=response)
-        cm.__aexit__ = AsyncMock(return_value=False)
-        self._cm = cm
-        self.get_calls: list[str] = []
+def _route_downloads(monkeypatch: pytest.MonkeyPatch, transport: Any) -> None:
+    """Anonymous Teams downloads call ``download_attachment`` without a transport
+    (the DNS-pinned aiohttp default); pass ``transport`` instead. The
+    downloader's own URL checks, cap and deadline still run."""
+    from chat_sdk.adapters.teams import attachments
 
-    def get(self, url: str):
-        self.get_calls.append(url)
-        return self._cm
+    real = attachments.download_attachment
+
+    async def download(url: str, **kwargs: Any) -> bytes:
+        return await real(url, transport=transport, **kwargs)
+
+    monkeypatch.setattr(attachments, "download_attachment", download)
+
+
+async def _streamed(data: bytes):
+    """A streamed ``httpx`` body (``httpx.Response(content=bytes)`` is pre-read)."""
+    yield data
+
+
+def _bot_http_client(handler) -> Any:
+    """The real Teams SDK HTTP client carrying a bot token, over an in-memory ``httpx`` transport."""
+    from microsoft_teams.common import Client, ClientOptions
+
+    client = Client(ClientOptions(token="bot-token"))
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +186,14 @@ class TestThreadIdEncoding:
             adapter.decode_thread_id("slack:abc:def")
         with pytest.raises(ValidationError):
             adapter.decode_thread_id("teams")
+        valid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:x", service_url="https://smba.trafficmanager.net/teams/")
+        )
+        # A fourth segment must be a known conversation type, and no fifth.
+        with pytest.raises(ValidationError, match="conversation type"):
+            adapter.decode_thread_id(f"{valid}:meeting")
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id(f"{valid}:groupChat:extra")
 
     def test_special_characters(self):
         adapter = _make_adapter()
@@ -435,19 +460,17 @@ class TestParseMessage:
 
 class TestRehydrateAttachment:
     @pytest.mark.asyncio
-    async def test_rehydrates_fetch_data_from_fetch_metadata_url(self):
+    async def test_rehydrates_fetch_data_from_fetch_metadata_url(self, monkeypatch):
         """After JSON roundtrip (fetch_data stripped), the URL in fetch_metadata restores the closure.
 
-        Awaits the rebuilt closure against a stubbed HTTP session to prove
+        Awaits the rebuilt closure against a fake download transport to prove
         the wire-up is correct (not just "some callable was returned").
         """
         from chat_sdk.types import Attachment
 
         trusted_url = "https://graph.microsoft.com/photo.jpg"
         adapter = _make_adapter(app_id="test-app")
-
-        session = _MockAiohttpSession(payload=b"teams-bytes")
-        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        transport = _download_transport(monkeypatch, b"teams-bytes")
 
         attachment = Attachment(
             type="image",
@@ -459,24 +482,24 @@ class TestRehydrateAttachment:
 
         bytes_result = await rehydrated.fetch_data()
         assert bytes_result == b"teams-bytes"
-        assert session.get_calls == [trusted_url]
+        assert [url for url, _ in transport.calls] == [trusted_url]
+        # Anonymous: no credentials on the request.
+        assert transport.authorizations == [None]
 
     @pytest.mark.asyncio
-    async def test_rehydrate_falls_back_to_attachment_url_when_fetch_metadata_missing(self):
+    async def test_rehydrate_falls_back_to_attachment_url_when_fetch_metadata_missing(self, monkeypatch):
         """When fetch_metadata is absent, rehydrate falls back to the attachment's top-level url."""
         from chat_sdk.types import Attachment
 
         trusted_url = "https://attachments.office.net/doc.pdf"
         adapter = _make_adapter(app_id="test-app")
-
-        session = _MockAiohttpSession(payload=b"fallback-bytes")
-        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        transport = _download_transport(monkeypatch, b"fallback-bytes")
 
         attachment = Attachment(type="file", url=trusted_url)
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
         assert await rehydrated.fetch_data() == b"fallback-bytes"
-        assert session.get_calls == [trusted_url]
+        assert [url for url, _ in transport.calls] == [trusted_url]
 
     def test_rehydrate_returns_unchanged_when_no_url(self):
         """Without any URL, rehydrate returns the attachment unchanged."""
@@ -487,14 +510,13 @@ class TestRehydrateAttachment:
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated is attachment
 
-    # Python-first divergence: SSRF guard at fetch time.
+    # Python-first divergence: host allowlist in front of the downloader.
     @pytest.mark.asyncio
-    async def test_rehydrated_fetch_data_rejects_untrusted_host(self):
+    async def test_rehydrated_fetch_data_rejects_untrusted_host(self, monkeypatch):
         from chat_sdk.types import Attachment
 
         adapter = _make_adapter(app_id="test-app")
-        # If the validator is bypassed, this would be called — it must not be.
-        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
+        transport = _download_transport(monkeypatch)
 
         attachment = Attachment(
             type="image",
@@ -503,9 +525,226 @@ class TestRehydrateAttachment:
         )
         rehydrated = adapter.rehydrate_attachment(attachment)
         assert rehydrated.fetch_data is not None
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match="Refusing to fetch Teams file from untrusted URL"):
             await rehydrated.fetch_data()
-        adapter._get_http_session.assert_not_awaited()
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    async def test_preserves_anonymous_fetch_overrides_during_rehydration(self):
+        from chat_sdk.types import Attachment
+
+        overridden_fetch = AsyncMock(return_value=b"overridden")
+        seen_urls: list[str] = []
+
+        class CustomTeamsAdapter(TeamsAdapter):
+            def _build_teams_fetch_data(self, url):
+                seen_urls.append(url)
+                return overridden_fetch
+
+        adapter = CustomTeamsAdapter(TeamsAdapterConfig(app_id="test-app", app_password="test"))
+        attachment = adapter.rehydrate_attachment(
+            Attachment(
+                type="file",
+                url="https://files.example.com/report.pdf",
+                fetch_metadata={"url": "https://files.example.com/report.pdf"},
+            )
+        )
+
+        assert attachment.fetch_data is not None
+        assert await attachment.fetch_data() == b"overridden"
+        assert seen_urls == ["https://files.example.com/report.pdf"]
+        overridden_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tampered_connector_origin_sends_no_token(self):
+        """Python-specific: metadata naming an attacker host as both the URL and
+        its ``connectorOrigin`` passes upstream's same-origin check, but the
+        token only goes to an allow-listed Bot Framework connector."""
+        from types import SimpleNamespace
+
+        from chat_sdk.types import Attachment
+
+        adapter = _make_adapter(app_id="test-app")
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_streamed(b"stolen"))
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        url = "https://evil.example/teams/v3/attachments/a"
+        attachment = adapter.rehydrate_attachment(
+            Attachment(
+                type="image",
+                url=url,
+                fetch_metadata={"url": url, "auth": "bot", "connectorOrigin": "https://evil.example"},
+            )
+        )
+
+        assert attachment.fetch_data is not None
+        with pytest.raises(NetworkError, match="Refusing to send a bot token to an untrusted attachment URL"):
+            await attachment.fetch_data()
+        assert requests == []
+
+
+# ---------------------------------------------------------------------------
+# Inline attachment retrieval (parseMessage)
+# ---------------------------------------------------------------------------
+
+_CONNECTOR_IMAGE = "https://smba.trafficmanager.net/teams/v3/attachments/image/views/original"
+
+
+def _inline_image_activity(url: str = _CONNECTOR_IMAGE, **attachment: Any) -> dict:
+    return {
+        "type": "message",
+        "id": "msg-inline",
+        "text": "look",
+        "from": {"id": "user-1", "name": "Alice"},
+        "conversation": {"id": "19:abc@thread.tacv2"},
+        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        "attachments": [{"contentType": "image/png", "contentUrl": url, "name": "screenshot.png", **attachment}],
+    }
+
+
+class TestInlineAttachmentRetrieval:
+    @pytest.mark.asyncio
+    async def test_authenticates_trusted_inline_attachment_downloads(self, monkeypatch):
+        from types import SimpleNamespace
+
+        adapter = _make_adapter(app_id="test-app")
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_streamed(b"protected image"))
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        anonymous = _download_transport(monkeypatch)
+
+        attachment = adapter.parse_message(_inline_image_activity()).attachments[0]
+
+        assert attachment.fetch_metadata == {
+            "url": _CONNECTOR_IMAGE,
+            "auth": "bot",
+            "connectorOrigin": "https://smba.trafficmanager.net",
+        }
+        assert attachment.fetch_data is not None
+        assert await attachment.fetch_data() == b"protected image"
+        assert [str(r.url) for r in requests] == [_CONNECTOR_IMAGE]
+        assert requests[0].headers["authorization"] == "Bearer bot-token"
+        assert anonymous.calls == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_default_port_on_the_connector_still_authenticates(self):
+        """Python-specific allowlist gate: ``:443`` is the same origin, so the
+        bot-token download must not be refused (upstream fetches it)."""
+        from types import SimpleNamespace
+
+        adapter = _make_adapter(app_id="test-app")
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_streamed(b"protected image"))
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        url = "https://smba.trafficmanager.net:443/teams/v3/attachments/image/views/original"
+        attachment = adapter.parse_message(_inline_image_activity(url)).attachments[0]
+
+        assert attachment.fetch_metadata is not None and attachment.fetch_metadata["auth"] == "bot"
+        assert attachment.fetch_data is not None
+        assert await attachment.fetch_data() == b"protected image"
+        assert len(requests) == 1
+        assert requests[0].headers["authorization"] == "Bearer bot-token"
+
+    @pytest.mark.asyncio
+    async def test_rejects_internal_file_download_urls_from_activities(self, monkeypatch):
+        adapter = _make_adapter(app_id="test-app")
+        anonymous = _download_transport(monkeypatch)
+        url = "http://169.254.169.254/latest/meta-data"
+        activity = {
+            "type": "message",
+            "id": "msg-107",
+            "text": "file",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "attachments": [
+                {
+                    "contentType": _FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": url, "fileType": ".txt"},
+                    "name": "file.txt",
+                }
+            ],
+        }
+
+        attachment = adapter.parse_message(activity).attachments[0]
+        assert attachment.fetch_data is not None
+        with pytest.raises(NetworkError, match="Refusing to fetch an internal attachment URL"):
+            await attachment.fetch_data()
+        assert anonymous.calls == []
+
+    @pytest.mark.asyncio
+    async def test_connector_redirect_is_not_followed(self):
+        """Python-specific: a redirect from the connector errors and the token never leaves it."""
+        from types import SimpleNamespace
+
+        adapter = _make_adapter(app_id="test-app")
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url))
+            return httpx.Response(302, headers={"location": "https://evil.example/collect"})
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        attachment = adapter.parse_message(_inline_image_activity()).attachments[0]
+
+        assert attachment.fetch_data is not None
+        with pytest.raises(NetworkError, match="Failed to fetch authenticated file: 302"):
+            await attachment.fetch_data()
+        assert requests == [_CONNECTOR_IMAGE]
+
+    @pytest.mark.asyncio
+    async def test_oversized_connector_body_is_rejected(self):
+        """Python-specific: the 25 MB cap also covers the bot-authenticated path
+        (here via ``Content-Length``; the streamed-body cap is covered in
+        ``tests/test_teams_attachments.py``)."""
+        from types import SimpleNamespace
+
+        adapter = _make_adapter(app_id="test-app")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-length": str(25 * 1024 * 1024 + 1)},
+                content=_streamed(b"x"),
+            )
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        attachment = adapter.parse_message(_inline_image_activity()).attachments[0]
+
+        assert attachment.fetch_data is not None
+        with pytest.raises(NetworkError, match="Attachment exceeds the download limit"):
+            await attachment.fetch_data()
+
+    @pytest.mark.asyncio
+    async def test_anonymous_download_failure_is_wrapped(self, monkeypatch):
+        """Transport errors surface as ``NetworkError("teams", "Failed to fetch attachment")``."""
+
+        async def failing(url: str, headers: dict[str, str]):
+            raise OSError("connection reset")
+
+        _route_downloads(monkeypatch, failing)
+        adapter = _make_adapter(app_id="test-app")
+        attachment = adapter.parse_message(_inline_image_activity("https://contoso.sharepoint.com/a.png")).attachments[
+            0
+        ]
+
+        assert attachment.fetch_metadata == {"url": "https://contoso.sharepoint.com/a.png"}
+        assert attachment.fetch_data is not None
+        with pytest.raises(NetworkError, match="Failed to fetch attachment") as info:
+            await attachment.fetch_data()
+        assert isinstance(info.value.original_error, OSError)
 
     def test_is_trusted_teams_download_url_allowlist(self):
         # Accepts Microsoft-owned hosts
@@ -523,16 +762,14 @@ class TestRehydrateAttachment:
 
 
 # ---------------------------------------------------------------------------
-# file.download.info attachments (content.downloadUrl fallback)
+# file.download.info attachments (content.downloadUrl)
 #
-# Python-first divergence (supersedes stale PR #136). A SharePoint/OneDrive
-# file shared in a personal/group chat arrives as a
+# A SharePoint/OneDrive file shared in a personal/group chat arrives as a
 # ``application/vnd.microsoft.teams.file.download.info`` attachment whose
 # top-level ``contentUrl`` (the SharePoint item) 403s on an anonymous GET,
 # while the nested ``content.downloadUrl`` is a pre-signed link that works.
-# Upstream reads ``contentUrl`` only (adapter-teams/src/index.ts:833), so the
-# attachment is undownloadable. We prefer ``content.downloadUrl`` for this
-# attachment type. See docs/UPSTREAM_SYNC.md Known Non-Parity.
+# Upstream reads ``content.downloadUrl`` for file cards since vercel/chat#749
+# (chat@4.36.0); this was a Python-first fix before that (stale PR #136).
 # ---------------------------------------------------------------------------
 
 _FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
@@ -584,34 +821,17 @@ class TestFileDownloadInfoAttachment:
         assert att.fetch_metadata == {"url": download_url}
         assert att.name == "report.pdf"
         assert att.type == "file"
-
-    def test_uses_download_url_when_content_url_absent(self):
-        """A file.download.info attachment with no top-level contentUrl still
-        yields a downloadable Attachment via content.downloadUrl."""
-        adapter = _make_adapter(app_id="test-app")
-        download_url = "https://contoso.sharepoint.com/_layouts/download.aspx?presigned=xyz"
-        activity = _file_download_activity(
-            {
-                "contentType": _FILE_DOWNLOAD_INFO,
-                "name": "notes.txt",
-                "content": {"downloadUrl": download_url, "fileType": "txt"},
-            }
-        )
-        msg = adapter.parse_message(activity)
-        assert len(msg.attachments) == 1
-        att = msg.attachments[0]
-        assert att.url == download_url
-        assert att.fetch_metadata == {"url": download_url}
-        assert att.fetch_data is not None
+        # MIME type comes from ``fileType``, not the card's content type.
+        assert att.mime_type == "application/pdf"
 
     def test_regular_attachment_uses_content_url_unchanged(self):
-        """An ordinary (inline image) attachment keeps the upstream contentUrl
-        path — the downloadUrl fallback must not perturb it.
+        """An ordinary (inline image) attachment keeps the contentUrl path.
 
         The attachment deliberately ALSO carries a ``content.downloadUrl`` so an
         over-eager mutation that prefers ``content.downloadUrl`` for *every*
         attachment type (rather than only ``file.download.info``) is caught: it
         would surface the downloadUrl instead of the inline-image contentUrl.
+        The image is on the activity's connector, so it is bot-authenticated.
         """
         adapter = _make_adapter(app_id="test-app")
         content_url = "https://smba.trafficmanager.net/teams/v3/attachments/img/photo.png"
@@ -630,20 +850,23 @@ class TestFileDownloadInfoAttachment:
         att = msg.attachments[0]
         assert att.url == content_url
         assert att.type == "image"
-        assert att.fetch_metadata == {"url": content_url}
+        assert att.fetch_metadata == {
+            "url": content_url,
+            "auth": "bot",
+            "connectorOrigin": "https://smba.trafficmanager.net",
+        }
 
     @pytest.mark.asyncio
-    async def test_download_url_flows_through_trusted_fetch(self):
-        """The pre-signed downloadUrl becomes the URL the SSRF-gated fetch
-        closure GETs — proving the fallback URL is what actually gets fetched.
+    async def test_download_url_flows_through_trusted_fetch(self, monkeypatch):
+        """The pre-signed downloadUrl becomes the URL the guarded downloader
+        GETs, without credentials — proving it is what actually gets fetched.
 
         A SharePoint host is in the Teams allowlist, so the GET proceeds and
         returns the stubbed bytes.
         """
         adapter = _make_adapter(app_id="test-app")
         download_url = "https://contoso.sharepoint.com/_layouts/download.aspx?presigned=ok"
-        session = _MockAiohttpSession(payload=b"file-contents")
-        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        transport = _download_transport(monkeypatch, b"file-contents")
 
         activity = _file_download_activity(
             {
@@ -657,15 +880,15 @@ class TestFileDownloadInfoAttachment:
         assert att.fetch_data is not None
         assert await att.fetch_data() == b"file-contents"
         # The pre-signed URL — not the SharePoint item — is what gets fetched.
-        assert session.get_calls == [download_url]
+        assert [url for url, _ in transport.calls] == [download_url]
+        assert transport.authorizations == [None]
 
     @pytest.mark.asyncio
-    async def test_download_url_still_gated_by_ssrf_allowlist(self):
+    async def test_download_url_still_gated_by_ssrf_allowlist(self, monkeypatch):
         """Even via the downloadUrl path, an untrusted host fails closed at
-        fetch time — the fallback does NOT bypass the SSRF allowlist."""
+        fetch time — the Python host allowlist runs before the downloader."""
         adapter = _make_adapter(app_id="test-app")
-        # If the gate were bypassed, the session would be awaited — it must not.
-        adapter._get_http_session = AsyncMock()  # type: ignore[method-assign]
+        transport = _download_transport(monkeypatch)
 
         activity = _file_download_activity(
             {
@@ -679,7 +902,7 @@ class TestFileDownloadInfoAttachment:
         assert att.fetch_data is not None
         with pytest.raises(ValidationError):
             await att.fetch_data()
-        adapter._get_http_session.assert_not_awaited()
+        assert transport.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1168,10 +1391,10 @@ class TestPostMessage:
         assert result.id == "sent-msg-123"
         assert result.thread_id == thread_id
         send.assert_called_once()
-        # delegates to the SDK App.send with the conversation ID and a
-        # MessageActivityInput carrying the rendered text + markdown format
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
+        # delegates to the SDK sender with a MessageActivityInput carrying the
+        # rendered text + markdown format and a reference to the conversation
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
         assert activity.text == "Hi there"
         assert activity.text_format == "markdown"
 
@@ -1226,82 +1449,517 @@ class TestEditMessage:
 
 
 class TestOutboundServiceUrlRouting:
-    """Each outbound op must retarget the SDK App's Bot Framework client at the
-    thread's decoded service URL before sending — so different regions / sovereign
-    clouds reach the right endpoint. Exercises the REAL ``ApiClient`` (not a mock)
-    to prove ``_point_app_api_at`` actually walks the service-url chain rather than
-    silently no-opping via its mock-tolerant ``AttributeError`` guard.
+    """Outbound ops address the thread's encoded service URL through a client
+    for that URL (``_api_for`` / ``_send_to``) and never retarget the shared
+    ``App.api`` — so concurrent sends to different regions or sovereign clouds
+    cannot race. Edit/delete run on the REAL ``ApiClient`` with only the HTTP
+    verb stubbed, so the SDK's own URL building stays in the test.
     """
 
     SOVEREIGN_URL = "https://smba.infra.gov.teams.microsoft.us/teams/"
+    DEFAULT_URL = "https://smba.trafficmanager.net/teams"
 
-    @pytest.mark.asyncio
-    async def test_post_message_retargets_real_api_client(self):
-        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        seen: dict[str, str] = {}
-
-        async def fake_send(conversation_id, activity):
-            # captured at call time: the real ApiClient is now on the thread's URL
-            seen["api"] = adapter._app.api.service_url
-            seen["conversations"] = adapter._app.api.conversations.service_url
-            seen["activities"] = adapter._app.api.conversations.activities_client.service_url
-            return _SentActivity("m")
-
-        adapter._app.send = fake_send  # type: ignore[method-assign]
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
+    def _thread(self, adapter: TeamsAdapter, service_url: str | None = None) -> str:
+        return adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=service_url or self.SOVEREIGN_URL)
         )
-        await adapter.post_message(tid, {"markdown": "hi"})
-        # the trailing slash is normalized off, matching ApiClient's own rstrip
-        assert seen["api"] == self.SOVEREIGN_URL.rstrip("/")
-        assert seen["conversations"] == self.SOVEREIGN_URL.rstrip("/")
-        assert seen["activities"] == self.SOVEREIGN_URL.rstrip("/")
 
     @staticmethod
-    def _capture_wire(adapter: TeamsAdapter, method: str) -> list[str]:
-        """Stub the REAL activities client's HTTP ``method`` and record each URL.
+    def _capture_wire(monkeypatch: pytest.MonkeyPatch, method: str) -> list[str]:
+        """Stub the SDK HTTP client's ``method`` (class-wide) and record each URL.
 
-        Patching at the HTTP boundary (not ``activities_client.update``) keeps
-        the SDK's own call chain in the test, so it holds on every supported
-        ``microsoft-teams-apps`` line: 2.0.x calls ``http.put(url, json=...)``;
-        2.1.x routes ``activities(...).update`` through
-        ``conversations.update_activity(..., service_url=None, agentic_identity=None)``
-        and adds a ``_metadata=`` kwarg (#250).
+        Class-wide so it also covers the per-URL client ``_api_for`` builds
+        (2.1 clones share the connection but not the ``Client`` instance).
+        2.1 adds a ``_metadata=`` kwarg (#250), absorbed by ``**_kwargs``.
         """
+        from microsoft_teams.common.http.client import Client
+
         urls: list[str] = []
 
         class _Response:
             def json(self) -> dict[str, str]:
                 return {"id": "edit-1"}
 
-        async def fake_http(url, **_kwargs):
+        async def fake_http(_self, url, **_kwargs):
             urls.append(url)
             return _Response()
 
-        http = adapter._app.api.conversations.activities_client.http
-        setattr(http, method, fake_http)
+        monkeypatch.setattr(Client, method, fake_http)
         return urls
 
     @pytest.mark.asyncio
-    async def test_edit_message_retargets_real_activities_client(self):
+    async def test_post_message_sends_to_the_thread_url_without_retargeting_app_api(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        urls = self._capture_wire(adapter, "put")
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
-        )
-        result = await adapter.edit_message(tid, "edit-1", {"markdown": "x"})
-        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/edit-1"]
-        assert result.id == "edit-1"
+        send = _mock_app_send(adapter, "m")
+
+        await adapter.post_message(self._thread(adapter), {"markdown": "hi"})
+
+        _activity, ref = send.call_args.args
+        # the trailing slash is normalized off, matching ApiClient's own rstrip
+        assert ref.service_url == self.SOVEREIGN_URL.rstrip("/")
+        assert adapter._app.api.service_url == self.DEFAULT_URL
 
     @pytest.mark.asyncio
-    async def test_delete_message_retargets_real_activities_client(self):
+    async def test_edit_message_uses_a_client_for_the_thread_url(self, monkeypatch: pytest.MonkeyPatch):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        urls = self._capture_wire(adapter, "delete")
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
-        )
-        await adapter.delete_message(tid, "gone-1")
+        urls = self._capture_wire(monkeypatch, "put")
+
+        result = await adapter.edit_message(self._thread(adapter), "edit-1", {"markdown": "x"})
+
+        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/edit-1"]
+        assert result.id == "edit-1"
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @pytest.mark.asyncio
+    async def test_delete_message_uses_a_client_for_the_thread_url(self, monkeypatch: pytest.MonkeyPatch):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        urls = self._capture_wire(monkeypatch, "delete")
+
+        await adapter.delete_message(self._thread(adapter), "gone-1")
+
         assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/gone-1"]
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @pytest.mark.asyncio
+    async def test_concurrent_posts_to_different_service_urls_each_hit_their_own_url(self):
+        """Python-specific: two sends interleaved on the event loop. The old
+        ``_point_app_api_at`` mutated ``App.api`` before awaiting, so the
+        second call could redirect the first."""
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        seen: dict[str, list[str]] = {}
+
+        async def fake_send(activity, ref):
+            seen.setdefault(activity.text, []).append(ref.service_url)
+            await asyncio.sleep(0)  # yield so the other send runs mid-flight
+            seen[activity.text].append(ref.service_url)
+            return _SentActivity(activity.text)
+
+        adapter._app.activity_sender = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+        emea = "https://smba.trafficmanager.net/emea/"
+
+        results = await asyncio.gather(
+            adapter.post_message(self._thread(adapter, emea), "to-emea"),
+            adapter.post_message(self._thread(adapter), "to-gov"),
+        )
+
+        assert [r.id for r in results] == ["to-emea", "to-gov"]
+        assert seen == {
+            "to-emea": [emea.rstrip("/")] * 2,
+            "to-gov": [self.SOVEREIGN_URL.rstrip("/")] * 2,
+        }
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @staticmethod
+    def _card() -> Any:
+        from chat_sdk.cards import Card
+        from chat_sdk.types import PostableCard
+
+        return PostableCard(card=Card(title="Results"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "post_message_text",
+            "post_message_card",
+            "post_channel_message_text",
+            "post_channel_message_card",
+            "edit_message",
+            "delete_message",
+            "start_typing",
+        ],
+    )
+    async def test_every_outbound_op_rejects_a_disallowed_thread_url_before_sending(
+        self, operation: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The SSRF allow-list check runs at each outbound call site (the
+        per-URL client carries the bot token), so each site is pinned here:
+        a thread ID naming an attacker host never reaches the SDK sender, the
+        HTTP client, or the per-URL client cache."""
+        from microsoft_teams.common.http.client import Client
+
+        from chat_sdk.shared.errors import NetworkError
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter)
+        http_calls: list[str] = []
+
+        async def fake_http(_self, url, **_kwargs):
+            http_calls.append(url)
+            raise AssertionError(f"unexpected HTTP call to {url}")
+
+        for verb in ("post", "put", "delete"):
+            monkeypatch.setattr(Client, verb, fake_http)
+
+        thread_id = self._thread(adapter, "https://evil.example.com/")
+        calls = {
+            "post_message_text": lambda: adapter.post_message(thread_id, "hi"),
+            "post_message_card": lambda: adapter.post_message(thread_id, self._card()),
+            "post_channel_message_text": lambda: adapter.post_channel_message(thread_id, "hi"),
+            "post_channel_message_card": lambda: adapter.post_channel_message(thread_id, self._card()),
+            "edit_message": lambda: adapter.edit_message(thread_id, "m-1", "hi"),
+            "delete_message": lambda: adapter.delete_message(thread_id, "m-1"),
+            "start_typing": lambda: adapter.start_typing(thread_id),
+        }
+
+        if operation == "start_typing":
+            # typing failures are logged, never raised (upstream parity)
+            await calls[operation]()
+            assert "not an allowed Bot Framework endpoint" in str(adapter._logger.error.call_args)
+        else:
+            with pytest.raises(NetworkError, match="not an allowed Bot Framework endpoint"):
+                await calls[operation]()
+        send.assert_not_called()
+        assert http_calls == []
+        assert adapter._api_clients == {}
+
+
+class TestTeamsAppRouting:
+    """Port of upstream ``app.test.ts`` (``TeamsApp.apiFor`` / ``sendTo``,
+    chat@4.41.0) against ``TeamsAdapter._api_for`` / ``_send_to``."""
+
+    APP_ID = "11111111-2222-3333-4444-555555555555"
+    EMEA = "https://smba.trafficmanager.net/emea/"
+    GATEWAY = "https://gateway.example/teams"
+
+    def _adapter(self, **overrides) -> TeamsAdapter:
+        return _make_adapter(app_id=self.APP_ID, app_password="secret", logger=_make_logger(), **overrides)
+
+    def test_reuses_the_app_client_for_the_default_service_url(self):
+        adapter = self._adapter()
+        api = adapter._app.api
+        assert adapter._api_for(api.service_url) is api
+        assert adapter._api_for(f"{api.service_url}/") is api
+        assert adapter._api_for("") is api
+
+    def test_targets_other_service_urls_with_a_dedicated_client(self):
+        adapter = self._adapter()
+        regional = adapter._api_for(self.EMEA)
+        assert regional is not adapter._app.api
+        assert regional.service_url == "https://smba.trafficmanager.net/emea"
+        # Python divergence (docs/UPSTREAM_SYNC.md): one cached client per
+        # normalized URL rather than a new client per call.
+        assert adapter._api_for(self.EMEA.rstrip("/")) is regional
+
+    def test_keeps_every_client_on_the_configured_endpoint(self):
+        adapter = self._adapter(api_url=self.GATEWAY)
+        assert adapter._app.api.service_url == self.GATEWAY
+        assert adapter._api_for(self.EMEA) is adapter._app.api
+
+    def test_teams_api_url_env_pins_every_client(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("TEAMS_API_URL", self.GATEWAY)
+        adapter = self._adapter()
+        assert adapter._api_for(self.EMEA) is adapter._app.api
+
+    @pytest.mark.asyncio
+    async def test_sends_through_the_configured_endpoint_instead_of_the_thread_url(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter(api_url=self.GATEWAY)
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.EMEA),
+            MessageActivityInput(text="hello"),
+        )
+
+        assert send.call_args.args[1].service_url == self.GATEWAY
+
+    @pytest.mark.asyncio
+    async def test_sends_through_the_sdk_with_the_threads_service_url_and_conversation(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url=self.EMEA,
+                conversation_type="channel",
+            ),
+            MessageActivityInput(text="hello"),
+        )
+
+        send.assert_called_once()
+        activity, ref = send.call_args.args
+        assert (activity.type, activity.text) == ("message", "hello")
+        assert ref.model_dump(by_alias=True, exclude_none=True) == {
+            "channelId": "msteams",
+            "serviceUrl": "https://smba.trafficmanager.net/emea",
+            "bot": {"id": self.APP_ID},
+            "conversation": {"id": "19:abc@thread.tacv2", "conversationType": "channel"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_default_service_url_when_the_thread_has_none(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(TeamsThreadId(conversation_id="a:dm", service_url=""), MessageActivityInput(text="hi"))
+
+        ref = send.call_args.args[1]
+        assert ref.service_url == adapter._app.api.service_url
+        # conversation_type is put on the wire only when the thread ID knows it
+        assert ref.conversation.model_dump(by_alias=True, exclude_none=True) == {"id": "a:dm"}
+
+    @pytest.mark.asyncio
+    async def test_rejects_sends_without_credentials(self, monkeypatch: pytest.MonkeyPatch):
+        from microsoft_teams.api import MessageActivityInput
+
+        for name in ("TEAMS_APP_ID", "CLIENT_ID"):
+            monkeypatch.delenv(name, raising=False)
+        adapter = _make_adapter(app_id="", logger=_make_logger())
+        send = _mock_app_send(adapter)
+
+        with pytest.raises(ValueError, match="credentials"):
+            await adapter._send_to(
+                TeamsThreadId(conversation_id="a:dm", service_url=""), MessageActivityInput(text="hello")
+            )
+        send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sdk_without_activity_sender_sends_on_the_thread_urls_client(self, monkeypatch: pytest.MonkeyPatch):
+        """``microsoft-teams-apps`` 2.1+ removed ``ActivitySender``: the send goes
+        through ``send_or_update_activity`` with the ``_api_for`` client."""
+        activity_send = pytest.importorskip("microsoft_teams.apps.activity_send")
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        if hasattr(adapter._app, "activity_sender"):
+            del adapter._app.activity_sender
+        calls: list[tuple[Any, Any, Any]] = []
+
+        async def fake_send_or_update(api, activity, ref):
+            calls.append((api, activity, ref))
+            return _SentActivity("sent-21")
+
+        monkeypatch.setattr(activity_send, "send_or_update_activity", fake_send_or_update)
+        activity = MessageActivityInput(text="hello")
+
+        sent = await adapter._send_to(TeamsThreadId(conversation_id="a:dm", service_url=self.EMEA), activity)
+
+        assert sent.id == "sent-21"
+        [(api, sent_activity, ref)] = calls
+        assert api is adapter._api_for(self.EMEA)
+        assert sent_activity is activity
+        assert ref.service_url == "https://smba.trafficmanager.net/emea"
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_puts_the_thread_conversation_on_the_wire(self, monkeypatch: pytest.MonkeyPatch):
+        """Unstubbed SDK send path on whichever SDK line is installed; only the
+        HTTP ``post`` is replaced."""
+        from microsoft_teams.common.http.client import Client
+
+        posts: list[tuple[str, dict[str, Any]]] = []
+
+        class _Response:
+            def json(self) -> dict[str, str]:
+                return {"id": "wire-1"}
+
+        async def fake_post(_self, url, *, json=None, **_kwargs):
+            posts.append((url, json))
+            return _Response()
+
+        monkeypatch.setattr(Client, "post", fake_post)
+        adapter = self._adapter()
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group-chat", service_url=self.EMEA, conversation_type="groupChat")
+        )
+
+        result = await adapter.post_message(tid, "hello")
+
+        assert result.id == "wire-1"
+        [(url, body)] = posts
+        assert url == "https://smba.trafficmanager.net/emea/v3/conversations/a:group-chat/activities"
+        assert body["conversation"] == {"id": "a:group-chat", "conversationType": "groupChat"}
+        assert body["from"]["id"] == self.APP_ID
+        assert body["text"] == "hello"
+
+    def test_client_cache_follows_the_app_api_it_was_built_from(self):
+        adapter = self._adapter()
+        first = adapter._api_for(self.EMEA)
+        replacement = MagicMock()
+        replacement.service_url = "https://smba.trafficmanager.net/teams"
+        scoped = object()
+        replacement.from_service_url = MagicMock(return_value=scoped)
+        adapter._app.api = replacement
+
+        assert adapter._api_for(self.EMEA) is scoped
+        assert scoped is not first
+        replacement.from_service_url.assert_called_once_with("https://smba.trafficmanager.net/emea")
+
+    def test_client_cache_is_bounded(self):
+        from chat_sdk.adapters.teams.adapter import _MAX_CACHED_API_CLIENTS
+
+        adapter = self._adapter()
+        urls = [f"https://region{i}.botframework.com" for i in range(_MAX_CACHED_API_CLIENTS + 1)]
+        first = adapter._api_for(urls[0])
+        for url in urls[1:]:
+            adapter._api_for(url)
+
+        assert len(adapter._api_clients) == _MAX_CACHED_API_CLIENTS
+        assert urls[0] not in adapter._api_clients
+        assert adapter._api_for(urls[0]) is not first
+
+
+class TestConversationTypeRouting:
+    """Port of upstream ``index.test.ts`` › "Teams conversation type routing"
+    (chat@4.36.0 / chat@4.40.0)."""
+
+    SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+
+    def test_keeps_the_legacy_id_when_the_conversation_type_agrees_with_its_prefix(self):
+        adapter = _make_adapter()
+        personal = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:personal-conversation", service_url=self.SERVICE_URL, conversation_type="personal"
+            )
+        )
+        legacy_personal = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:personal-conversation", service_url=self.SERVICE_URL)
+        )
+        channel = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:channel@thread.tacv2", service_url=self.SERVICE_URL, conversation_type="channel"
+            )
+        )
+        legacy_channel = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:channel@thread.tacv2", service_url=self.SERVICE_URL)
+        )
+
+        assert personal == legacy_personal
+        assert channel == legacy_channel
+        assert personal.count(":") == 2
+
+    def _message(self, adapter: TeamsAdapter, conversation: dict[str, Any], **extra: Any):
+        return adapter.parse_message(
+            {
+                "conversation": conversation,
+                "from": {"id": "user-1", "name": "Alice"},
+                "id": "message-1",
+                "serviceUrl": self.SERVICE_URL,
+                "text": "hello",
+                "type": "message",
+                **extra,
+            }
+        )
+
+    def test_falls_back_to_is_group_when_conversation_type_is_missing(self):
+        adapter = _make_adapter()
+        group = self._message(adapter, {"id": "a:group-chat-id", "isGroup": True})
+        channel = self._message(
+            adapter, {"id": "a:channel-id", "isGroup": True}, channelData={"team": {"id": "team-id"}}
+        )
+        personal = self._message(adapter, {"id": "19:personal-id", "isGroup": False})
+
+        assert adapter.decode_thread_id(group.thread_id).conversation_type == "groupChat"
+        assert adapter.is_dm(group.thread_id) is False
+        assert adapter.decode_thread_id(channel.thread_id).conversation_type == "channel"
+        assert adapter.is_dm(channel.thread_id) is False
+        assert adapter.decode_thread_id(personal.thread_id).conversation_type == "personal"
+        assert adapter.is_dm(personal.thread_id) is True
+
+    def test_prefers_an_explicit_conversation_type_over_is_group(self):
+        adapter = _make_adapter()
+        message = self._message(adapter, {"conversationType": "personal", "id": "19:personal-id", "isGroup": True})
+        assert adapter.is_dm(message.thread_id) is True
+
+    def test_is_group_is_checked_by_identity_not_truthiness(self):
+        adapter = _make_adapter()
+        # A non-bool isGroup is "missing": the 19:/a: heuristic decides and
+        # the thread ID keeps its legacy three-segment form.
+        message = self._message(adapter, {"id": "a:conversation", "isGroup": "false"})
+        assert adapter.decode_thread_id(message.thread_id).conversation_type is None
+        assert message.thread_id.count(":") == 2
+        assert adapter.is_dm(message.thread_id) is True
+        # A falsy non-bool is not ``False``: no ``personal`` override.
+        channel = self._message(adapter, {"id": "19:channel@thread.tacv2", "isGroup": 0})
+        assert adapter.decode_thread_id(channel.thread_id).conversation_type is None
+        assert adapter.is_dm(channel.thread_id) is False
+
+    def test_explicit_group_chat_id_round_trips_with_a_fourth_segment(self):
+        adapter = _make_adapter()
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group", service_url=self.SERVICE_URL, conversation_type="groupChat")
+        )
+        assert thread_id.endswith(":groupChat")
+        assert adapter.decode_thread_id(thread_id) == TeamsThreadId(
+            conversation_id="a:group", service_url=self.SERVICE_URL, conversation_type="groupChat"
+        )
+        # channel IDs keep the type, so a channel-level post stays a group chat
+        assert adapter.channel_id_from_thread_id(thread_id) == thread_id
+
+    def test_encode_rejects_an_unknown_conversation_type(self):
+        adapter = _make_adapter()
+        with pytest.raises(ValidationError, match="conversation type"):
+            adapter.encode_thread_id(
+                TeamsThreadId(conversation_id="a:x", service_url=self.SERVICE_URL, conversation_type="bogus")  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_group_chat_is_not_routed_as_a_dm(self):
+        """An ``a:`` group chat goes to ``process_message`` without a native
+        streamer (Teams streams natively only in 1:1 chats)."""
+        adapter = _make_adapter()
+        adapter._create_streamer = MagicMock(side_effect=AssertionError("group chats must not stream natively"))  # type: ignore[method-assign]
+        chat = MagicMock()
+        chat.process_message = MagicMock(return_value=None)
+        adapter._chat = chat
+
+        await adapter._handle_message_activity(
+            {
+                "type": "message",
+                "id": "m-1",
+                "text": "hi",
+                "from": {"id": "user-1", "name": "Alice"},
+                "conversation": {"id": "a:group-chat", "conversationType": "groupChat"},
+                "serviceUrl": self.SERVICE_URL,
+            }
+        )
+
+        chat.process_message.assert_called_once()
+        thread_id = chat.process_message.call_args.args[1]
+        assert adapter.is_dm(thread_id) is False
+        assert adapter._active_streams == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["message_action", "card_invoke", "reaction"])
+    async def test_actions_and_reactions_in_a_group_chat_get_the_typed_thread_id(self, handler: str):
+        """Button clicks and reactions in an ``a:`` group chat share the
+        message's ``:groupChat`` thread ID (and so its subscription/state
+        keys), not the untyped DM-looking three-segment form."""
+        adapter = _make_adapter()
+        chat = MagicMock()
+        adapter._chat = chat
+        activity: dict[str, Any] = {
+            "id": "m-1",
+            "replyToId": "m-0",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "a:group-chat", "conversationType": "groupChat"},
+            "serviceUrl": self.SERVICE_URL,
+        }
+        expected = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group-chat", service_url=self.SERVICE_URL, conversation_type="groupChat")
+        )
+
+        if handler == "message_action":
+            adapter._handle_message_action({**activity, "type": "message"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        elif handler == "card_invoke":
+            await adapter._handle_adaptive_card_action({**activity, "type": "invoke"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        else:
+            adapter._handle_reaction_activity(
+                {**activity, "type": "messageReaction", "reactionsAdded": [{"type": "like"}]}
+            )
+            event = chat.process_reaction.call_args.args[0]
+
+        assert event.thread_id == expected
+        assert event.thread_id.endswith(":groupChat")
+        assert adapter.is_dm(event.thread_id) is False
 
 
 class TestFileAttachments:
@@ -1324,9 +1982,9 @@ class TestFileAttachments:
     @staticmethod
     def _sent_attachments(send: AsyncMock) -> list[dict]:
         """Serialize the attachments off the MessageActivityInput handed to the
-        SDK ``app.send``, back to the camelCase wire dicts — proving the file
+        SDK sender, back to the camelCase wire dicts — proving the file
         attachments actually reached the SDK boundary (not just the raw echo)."""
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         return dumped.get("attachments", [])
 
@@ -1548,9 +2206,9 @@ class TestStartTyping:
         )
         await adapter.start_typing(thread_id)
         assert send.call_count == 1
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
-        # delegates a TypingActivityInput (type == "typing") to the SDK App.send
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
+        # delegates a TypingActivityInput (type == "typing") to the SDK sender
         assert isinstance(activity, TypingActivityInput)
         assert activity.type == "typing"
 
@@ -1574,3 +2232,289 @@ class TestReactions:
         adapter = _make_adapter(logger=logger)
         await adapter.remove_reaction("tid", "mid", "emoji")
         assert logger.warn.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Incoming sender email (upstream describe "incoming sender email")
+# ---------------------------------------------------------------------------
+
+
+def _incoming_activity(aad_object_id: str | None = None, **overrides: Any) -> dict:
+    sender: dict[str, Any] = {"id": "29:user-123", "name": "Alice"}
+    if aad_object_id is not None:
+        sender["aadObjectId"] = aad_object_id
+    return {
+        "type": "message",
+        "id": "msg-100",
+        "text": "Hello world",
+        "from": sender,
+        "conversation": {"id": "19:abc@thread.tacv2"},
+        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        **overrides,
+    }
+
+
+class _GraphSession:
+    """``aiohttp`` session stand-in for the hand-rolled Graph ``GET /users/{id}``."""
+
+    def __init__(self, user: dict[str, Any] | None) -> None:
+        self._user = user
+        self.urls: list[str] = []
+
+    def get(self, url: str, headers: dict[str, str] | None = None):
+        self.urls.append(url)
+        user = self._user
+
+        class _Response:
+            ok = user is not None
+            status = 200 if user is not None else 403
+
+            async def json(self):
+                return user
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+        return _Response()
+
+
+class _IncomingSetup:
+    def __init__(self, member: dict[str, Any] | Exception, *, cached_aad_object_id: str | None = None) -> None:
+        from types import SimpleNamespace
+
+        from microsoft_teams.api import TeamsChannelAccount
+
+        self.logger = _make_logger()
+        self.adapter = _make_adapter(app_id="test", logger=self.logger)
+        self.cache: dict[str, Any] = {}
+        if cached_aad_object_id is not None:
+            self.cache["teams:aadObjectId:29:user-123"] = cached_aad_object_id
+        self.state = MagicMock()
+        self.state.get = AsyncMock(side_effect=lambda key: self.cache.get(key))
+        self.state.set = AsyncMock(side_effect=lambda key, value, ttl_ms=None: self.cache.__setitem__(key, value))
+        self.chat = MagicMock()
+        self.chat.get_state = MagicMock(return_value=self.state)
+        self.chat.process_message = MagicMock(return_value=None)
+        self.adapter._chat = self.chat
+
+        if isinstance(member, Exception):
+            self.get_member_by_id = AsyncMock(side_effect=member)
+        else:
+            self.get_member_by_id = AsyncMock(
+                return_value=TeamsChannelAccount.model_validate({"id": "29:user-123", **member})
+            )
+        self.from_service_url = MagicMock(
+            return_value=SimpleNamespace(conversations=SimpleNamespace(get_member_by_id=self.get_member_by_id))
+        )
+        self.adapter._app.api = SimpleNamespace(from_service_url=self.from_service_url)  # type: ignore[method-assign]
+        self.graph_session = _GraphSession(None if isinstance(member, Exception) else member)
+        self.adapter._get_graph_token = AsyncMock(return_value="graph-token")  # type: ignore[method-assign]
+        self.adapter._get_http_session = AsyncMock(return_value=self.graph_session)  # type: ignore[method-assign]
+
+    def message(self, index: int = 0):
+        return self.chat.process_message.call_args_list[index].args[2]
+
+
+class TestIncomingSenderEmail:
+    @pytest.mark.asyncio
+    async def test_hydrates_email_from_the_conversation_member_without_graph(self):
+        setup = _IncomingSetup(
+            {"email": "alice@example.com", "name": "Alice", "userPrincipalName": "alice@contoso.com"}
+        )
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        assert "teams:aadObjectId:29:user-123" not in [c.args[0] for c in setup.state.get.call_args_list]
+        # The lookup goes to the activity's own connector.
+        setup.from_service_url.assert_called_once_with("https://smba.trafficmanager.net/teams")
+        setup.get_member_by_id.assert_awaited_once_with("19:abc@thread.tacv2", "29:user-123")
+        setup.adapter._get_graph_token.assert_not_awaited()
+        assert setup.graph_session.urls == []
+        assert setup.message().author.email == "alice@example.com"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_conversation_member_user_principal_name(self):
+        setup = _IncomingSetup({"name": "Alice", "userPrincipalName": "alice@contoso.com"})
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        assert setup.message().author.email == "alice@contoso.com"
+
+    @pytest.mark.asyncio
+    async def test_empty_member_email_falls_back_to_the_user_principal_name(self):
+        """Python-only: ``""`` counts as missing (upstream ``??`` would keep it)."""
+        setup = _IncomingSetup({"email": "", "name": "Alice", "userPrincipalName": "alice@contoso.com"})
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        assert setup.message().author.email == "alice@contoso.com"
+
+    @pytest.mark.asyncio
+    async def test_replaces_a_failed_graph_lookup_cached_for_the_sender(self):
+        setup = _IncomingSetup({"email": "alice@example.com", "name": "Alice"})
+        setup.cache["teams:userInfo:activity-aad-id"] = "unresolvable"
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        setup.get_member_by_id.assert_awaited_once()
+        assert setup.message().author.email == "alice@example.com"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_cached_aad_object_id(self):
+        setup = _IncomingSetup(
+            {"displayName": "Alice", "mail": None, "userPrincipalName": "alice@contoso.com"},
+            cached_aad_object_id="cached-aad-id",
+        )
+
+        await setup.adapter._handle_message_activity(_incoming_activity())
+
+        assert setup.graph_session.urls == ["https://graph.microsoft.com/v1.0/users/cached-aad-id"]
+        setup.get_member_by_id.assert_not_awaited()
+        assert setup.message().author.email == "alice@contoso.com"
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_message_when_conversation_member_lookup_fails(self):
+        setup = _IncomingSetup(RuntimeError("Forbidden"))
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        setup.adapter._get_graph_token.assert_not_awaited()
+        assert setup.chat.process_message.call_count == 1
+        assert setup.message().author.email is None
+        warnings = [c.args[0] for c in setup.logger.warn.call_args_list]
+        assert "Failed to fetch user info from Teams conversation members API" in warnings
+
+    @pytest.mark.asyncio
+    async def test_caches_the_conversation_member_lookup_across_messages(self):
+        import asyncio
+        import json
+
+        setup = _IncomingSetup(
+            {"email": "alice@example.com", "name": "Alice", "userPrincipalName": "alice@contoso.com"}
+        )
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+        # The cache write is fire-and-forget (upstream ``.catch(() => {})``);
+        # let it run before the next message.
+        await asyncio.sleep(0)
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        setup.get_member_by_id.assert_awaited_once()
+        assert setup.message(1).author.email == "alice@example.com"
+        # Cross-SDK wire shape: upstream's camelCase ``UserInfo`` JSON, 1 h TTL.
+        setup.state.set.assert_awaited_once()
+        key, value, ttl_ms = setup.state.set.await_args.args
+        assert key == "teams:userInfo:activity-aad-id"
+        assert ttl_ms == 60 * 60 * 1000
+        assert json.loads(value) == {
+            "userId": "29:user-123",
+            "userName": "alice@contoso.com",
+            "fullName": "Alice",
+            "isBot": False,
+            "email": "alice@example.com",
+        }
+
+    @pytest.mark.asyncio
+    async def test_does_not_let_a_failed_conversation_lookup_suppress_retries(self):
+        import asyncio
+
+        setup = _IncomingSetup(RuntimeError("Forbidden"))
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+        await asyncio.sleep(0)
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        assert setup.get_member_by_id.await_count == 2
+        assert setup.chat.process_message.call_count == 2
+        assert setup.message(1).author.email is None
+        # No negative sentinel is written for the members API.
+        setup.state.set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hydrates_email_on_the_dm_path_and_completes_processing(self):
+        import asyncio
+
+        setup = _IncomingSetup(
+            {"email": "alice@example.com", "name": "Alice", "userPrincipalName": "alice@contoso.com"}
+        )
+        streamer = MagicMock()
+        streamer.close = AsyncMock()
+        setup.adapter._create_streamer = MagicMock(return_value=streamer)  # type: ignore[method-assign]
+
+        def process_message(adapter, thread_id, message, options=None):
+            # DM handling blocks until the handler task settles, so hand it one.
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            options.wait_until(done)
+
+        setup.chat.process_message = MagicMock(side_effect=process_message)
+
+        await setup.adapter._handle_message_activity(
+            _incoming_activity("activity-aad-id", conversation={"id": "a:1dm-conversation"})
+        )
+
+        assert setup.chat.process_message.call_count == 1
+        assert setup.message().author.email == "alice@example.com"
+        streamer.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_hung_lookup_is_bounded_and_the_message_still_dispatches(self, monkeypatch):
+        """Python-only: the awaited lookup cannot hold the webhook past the bound."""
+        import asyncio
+
+        monkeypatch.setattr("chat_sdk.adapters.teams.adapter.INCOMING_USER_TIMEOUT_S", 0.01)
+        setup = _IncomingSetup({"email": "alice@example.com", "name": "Alice"})
+
+        async def hang(*args: Any) -> Any:
+            await asyncio.get_running_loop().create_future()
+
+        setup.get_member_by_id.side_effect = hang
+
+        await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+
+        assert setup.chat.process_message.call_count == 1
+        assert setup.message().author.email is None
+        warnings = [c.args[0] for c in setup.logger.warn.call_args_list]
+        assert "Failed to look up the Teams message sender" in warnings
+
+    @pytest.mark.asyncio
+    async def test_an_untrusted_service_url_is_never_asked_for_the_member(self):
+        """The members call carries the bot token, so the activity's serviceUrl
+        must pass the Bot Framework allowlist first."""
+        setup = _IncomingSetup({"email": "alice@example.com", "name": "Alice"})
+
+        await setup.adapter._handle_message_activity(
+            _incoming_activity("activity-aad-id", serviceUrl="https://evil.example/teams/")
+        )
+
+        setup.from_service_url.assert_not_called()
+        setup.get_member_by_id.assert_not_awaited()
+        assert setup.message().author.email is None
+
+    @pytest.mark.asyncio
+    async def test_sdks_without_scoped_clients_use_the_shared_api(self):
+        """``microsoft-teams-apps`` 2.0.x has no ``from_service_url``: the member is
+        asked on ``App.api`` (``get_member_by_id`` from 2.0.16, the grouped
+        ``members(conversation).get`` before that)."""
+        from types import SimpleNamespace
+
+        from microsoft_teams.api import TeamsChannelAccount
+
+        member = TeamsChannelAccount.model_validate({"id": "29:user-123", "email": "alice@example.com"})
+        flat = SimpleNamespace(conversations=SimpleNamespace(get_member_by_id=AsyncMock(return_value=member)))
+        grouped_get = AsyncMock(return_value=member)
+        members = MagicMock(return_value=SimpleNamespace(get=grouped_get))
+        grouped = SimpleNamespace(conversations=SimpleNamespace(members=members))
+
+        for api in (flat, grouped):
+            setup = _IncomingSetup({"name": "unused"})
+            setup.adapter._app.api = api  # type: ignore[method-assign]
+            await setup.adapter._handle_message_activity(_incoming_activity("activity-aad-id"))
+            assert setup.message().author.email == "alice@example.com"
+
+        flat.conversations.get_member_by_id.assert_awaited_once_with("19:abc@thread.tacv2", "29:user-123")
+        members.assert_called_once_with("19:abc@thread.tacv2")
+        grouped_get.assert_awaited_once_with("29:user-123")
