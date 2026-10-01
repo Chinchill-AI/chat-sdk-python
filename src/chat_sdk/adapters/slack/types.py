@@ -299,6 +299,13 @@ class SlackInstallation:
     bot_token: str
     bot_user_id: str | None = None
     team_name: str | None = None
+    # Enterprise Grid org ID, when the workspace belongs to (or the app is
+    # installed org-wide on) a Grid org
+    enterprise_id: str | None = None
+    # True when this is an Enterprise Grid org-wide installation (stored under
+    # the enterprise ID). ``None`` when not recorded, as upstream's optional
+    # ``isEnterpriseInstall``.
+    is_enterprise_install: bool | None = None
 
 
 class SlackInstallationProvider(Protocol):
@@ -736,3 +743,13 @@ class RequestContext:
     # cache keys (user profiles, display-name index, channel names, unfurl
     # metadata) so one workspace's data is never served to another.
     installation_id: str | None = None
+    # Workspace the current event occurred in. Sent as an explicit ``team_id``
+    # on Web API calls made with an org-wide token (``is_enterprise_install``).
+    team_id: str | None = None
+    # ``context_team_id`` from the incoming event envelope, echoed back as
+    # ``client_context_team_id`` on calls addressed to ``context_channel``
+    # (shared channels hosted on an "away" workspace).
+    context_team_id: str | None = None
+    # Channel the ``context_team_id`` came from; the echo only applies to
+    # calls targeting that channel.
+    context_channel: str | None = None

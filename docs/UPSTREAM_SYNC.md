@@ -1314,6 +1314,78 @@ SDK-free cards-primitives surface, so upstream's two table converters (and the
   modals to cards (see the "Teams dialog/modal inbound" row in the non-parity
   table), so only the primitive gains the new children.
 
+### Slack Enterprise Grid: org-wide installs, `authorizations[]`, retry marker (chat@4.35, #268)
+
+Parity with the non-cache half of upstream `907450d7` (vercel/chat#724,
+chat@4.35.0); the installation-scoped caches landed in #205. Code is in
+`slack/adapter.py` and `slack/types.py`.
+
+- **OAuth.** `handle_oauth_callback` keys an org-wide install
+  (`is_enterprise_install`, `team: null`) by `enterprise.id` and raises
+  `AuthenticationError("Slack OAuth failed: missing access_token or
+  enterprise.id")` without it. The result gains `enterprise_id` and
+  `is_enterprise_install`; `team_id` is always the storage key.
+  `SlackInstallation` gains `enterprise_id` / `is_enterprise_install`, stored
+  as `enterpriseId` / `isEnterpriseInstall` only when set (upstream's spread
+  drops undefined keys), so a plain install's stored shape is unchanged.
+- **Event routing.** `_resolve_event_request_context(payload)` returns a
+  `RequestContext`, `"not-applicable"` or `"unresolved"` and is shared by the
+  HTTP and Socket Mode `events_api` paths. It prefers `authorizations[0]`
+  (`is_enterprise_install` via `??`, ids via `||`) over the top-level fields
+  and records `team_id`, `context_team_id` (an envelope field) and
+  `context_channel` (`event.channel`). Slash commands go through
+  `_run_slash_command` on both paths, and Socket Mode interactive payloads
+  through `_extract_installation_from_interactive_payload`, so all three
+  resolve org-wide installs by enterprise ID. Socket slash fields that arrive
+  as JSON booleans become `"true"` / `"false"` (JS `String(v)`). The socket
+  `events_api` envelope now keeps `authorizations`, `context_team_id`, the
+  enterprise fields and `is_ext_shared_channel`, as upstream, so shared
+  channels seen over Socket Mode are marked external too.
+- **`team_id` / `client_context_team_id`.** `_with_token_kwargs(**kwargs)`
+  (upstream `withToken`; the token is already bound to the client) adds
+  `team_id` under an org-wide context and `client_context_team_id` on calls
+  whose `channel` is the event's channel. Keys the caller set (not `None`)
+  win. It wraps the same call sites as upstream; `chat_stream`,
+  `chat_scheduleMessage` / `chat_deleteScheduledMessage`, `files_upload_v2`
+  and `oauth_v2_access` stay unwrapped as upstream, so the #95 `chat_stream`
+  `team_id` (`recipient_team_id`) is unchanged under an org-wide context.
+- **Retry marker.** `_process_event_payload` writes
+  `slack:event-delivered:{event_id}` (24 h TTL) as a fire-and-forget task (a
+  pinned reference plus a done-callback that logs at debug).
+  `_is_duplicate_event_delivery(payload, retry_num)` reads it only when
+  `retry_num > 0` (HTTP `x-slack-retry-num`, a malformed header counts as 0;
+  socket `retry_attempt`; forwarded `retryNum`), and a state read error means
+  "process".
+- **`W…` user ids.** `SLACK_USER_ID_EXACT_PATTERN` is `^[UW][A-Z0-9]+$`.
+- **`with_bot_token(token, fn, *, installation_id=None)`** and
+  `with_bot_token_async(...)` set `RequestContext.installation_id`. Upstream
+  passes an async function to `withBotToken`; in Python a coroutine returned
+  by the sync form runs after the context is reset, so async work belongs in
+  `with_bot_token_async` (the ported cache tests use it).
+
+Python-specific notes:
+
+- **Socket retries before #283.** `_on_socket_request` still acks and skips
+  envelopes with `retry_attempt > 0`, so on a live socket the marker only
+  sees first deliveries; it already covers HTTP retries and forwarded socket
+  events. #283 (split from #209) removes the skip, after which `retry_attempt` reaches the
+  marker unchanged.
+- **Flag normalization.** `is_enterprise_install` counts only as `True` or
+  `"true"` everywhere (upstream's event path uses `Boolean(...)`, so a
+  `"false"` string would count there). Slack sends booleans in event JSON, so
+  this differs only for malformed payloads.
+- **`with_token` scope.** Only the adapter's own calls are wrapped; the
+  public `web_client` / `current_client` are plain clients, as upstream's
+  `webClient`.
+
+Regression coverage: `tests/test_slack_enterprise_grid.py` (ports the
+`handleOAuthCallback` Grid cases, `socket mode - multi-workspace token
+resolution`, `withToken enterprise context injection`, `event delivery
+deduplication`, `W-prefixed enterprise user IDs` and `event routing via
+authorizations[]`), the two `withBotToken` cases in
+`tests/test_slack_webhook.py::TestInstallationScopedCaches`, and
+`tests/test_slack_api.py::TestStream::test_stream_keeps_the_recipient_team_id_under_an_org_wide_context`
+for #95.
 ### Teams routing and outbound text (chat@4.36–4.41, #216)
 
 Ports `7062c395` (vercel/chat#898, chat@4.40.0), `257a32d0` (#746,
@@ -3031,7 +3103,7 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat heading rendering | `#`-headings emit as `*text*` (bold) so they're visually distinct | Falls through to default node-to-text (plain concatenation) | Google Chat has no heading syntax; emitting plain text loses the visual hierarchy. Bold is the closest approximation the platform supports. |
 | Google Chat image rendering | Images emit as `{alt} ({url})` or bare `url` | No image branch — falls through to default which concatenates children only, dropping the URL | Upstream silently drops image URLs when rendering to Google Chat text. We preserve the URL so the message content isn't lost. |
 | Fallback streaming stream-exception capture (non-Telegram adapters using core post+edit, including Teams with an explicit placeholder) | `_fallback_stream` captures exceptions from the stream iterator, flushes whatever content was already rendered, awaits `pending_edit`, and re-raises after cleanup | `try/finally` only — exception propagates immediately, `pendingEdit` is un-awaited, and the placeholder is stranded as `"..."` | Upstream leaves a hard UX failure when streams crash mid-flight (common: LLM connection drops): placeholder visible forever, orphan background task. We flush + clean up before re-raising so the caller still sees the original error and users see the partial content instead of a spinner. It applies to Teams only when `stream()` returns `None` (no active streamer and an explicit `str` placeholder, #219), which routes the reply through `_fallback_stream`. Teams DMs with a streamer stream natively through the SDK `IStreamer` (`_stream_via_emit`), where a non-cancel iterator exception propagates straight to the caller while the SDK closes the streamer after the handler returns; Teams without a placeholder accumulates and posts once. Nor does it apply to Telegram: since the 4.41 wave (#226, vercel/chat#822) every Telegram chat streams through the adapter's own post-and-edit loop, where, as in upstream (`adapter-telegram/src/index.ts` `postAndEditStream`), a text-stream exception propagates without a partial flush, so a stream that fails before the first paced edit leaves the `"..."` placeholder visible. |
-| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. Since #208 every stream segment (each `chat_stream` call when a long reply rotates) gets the same `team_id`. Since #207 it is sent only when `recipient_team_id` is truthy (a DM streams natively without recipient context); a Grid DM without one that hits `team_not_found` is delivered by the first-call post+edit fallback. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard `test_stream_without_team_id_on_grid_falls_back_to_post_and_edit`) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. |
+| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. Since #208 every stream segment (each `chat_stream` call when a long reply rotates) gets the same `team_id`. Since #207 it is sent only when `recipient_team_id` is truthy (a DM streams natively without recipient context); a Grid DM without one that hits `team_not_found` is delivered by the first-call post+edit fallback. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard `test_stream_without_team_id_on_grid_falls_back_to_post_and_edit`) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. Re-checked for #268: upstream 4.35+ injects an org-wide event's `team_id` through `withToken`, but its `chatStream` call does not go through `withToken`, and ours does not go through `_with_token_kwargs`, so `chat_stream` keeps `team_id = recipient_team_id` and gets no `client_context_team_id` under an org-wide context (`test_stream_keeps_the_recipient_team_id_under_an_org_wide_context`). |
 | Slack `stream()` fallback with an empty reply (#207) | When the post+edit fallback engaged but nothing was ever posted (e.g. an empty stream whose `stop()` failed), returns `RawMessage(id="", thread_id=thread_id, raw=None)` | Returns `fallback.message`, which is `null` when nothing was posted (`adapter-slack/src/index.ts` `stream()` fallback returns) | Returning `None` after the stream was consumed would make core run its own post+edit fallback (`thread.py` `_handle_stream`) on an exhausted iterator, posting the `"..."` placeholder and a `" "` final message for a reply that had no content. `RawMessage(id="")` keeps core's "adapter handled it" path. Pinned by `tests/test_slack_api.py::TestNativeStreamingFallback::test_warns_about_skipped_stream_blocks_and_returns_an_empty_reply_marker`. |
 | Fallback streaming final SentMessage content (adapters using core post+edit, including Teams with an explicit placeholder) | SentMessage + final edit carry `final_content` (remend'd — inline markers auto-closed) | SentMessage + final edit carry raw `accumulated` | Narrow UX refinement. If a stream ends with an unclosed `*`/`~~`/etc., upstream ships the unclosed marker; we run `_remend` so the user sees a clean final message. Not observable in the common case where streams close their own markers. It applies to every adapter whose `stream()` returns `None`, including Teams with no active streamer and an explicit `str` placeholder (#219: the final edit of the placeholder is remend'd). Teams DMs with a streamer stream through the SDK `IStreamer`, and Teams without a placeholder ships raw `accumulated` in one `post_message`, matching upstream. |
 | Teams group-chat / channel streaming via accumulate-and-post | Without a native streamer, `TeamsAdapter.stream` accumulates the full text and issues a single `post_message` (SDK-backed) instead of post+edit, unless `fallback_streaming_placeholder_text` is an explicit `str` (`""` included): then it returns `None` before reading the stream and core posts the placeholder and edits it (#219). `UNSET` and `None` keep the buffered post | Same (chat@4.41.1 `stream`: `if (activeStream && !activeStream.canceled) streamViaEmit(…)`; `if (!activeStream && typeof options?.fallbackStreamingPlaceholderText === "string") return null`; else accumulate and `postMessage`) — no divergence at the adapter level | Documented for clarity: the Python port matches upstream's behavior of avoiding the post+edit flicker where Teams doesn't support native streaming, unless the app asked for a placeholder. The buffered fallback routes through the same SDK send path (`_send_to`) as a normal `post_message`. |

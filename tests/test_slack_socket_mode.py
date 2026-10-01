@@ -872,7 +872,7 @@ class TestSocketContextVar:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        resolve.assert_awaited_once_with("T1")
+        resolve.assert_awaited_once_with("T1", False)
         assert captured == [("xoxb-team-1", "T1")]
         assert adapter._request_context.get() is None
 
@@ -910,7 +910,7 @@ class TestSocketContextVar:
             ack,
         )
 
-        resolve.assert_awaited_once_with("T1")
+        resolve.assert_awaited_once_with("T1", False)
         assert captured == [("xoxb-team-1", "T1")]
         assert adapter._request_context.get() is None
 
@@ -940,7 +940,7 @@ class TestSocketContextVar:
         # Per-team token lookup. The first lookup awaits long enough for
         # the second to interleave; if isolation is broken the first will
         # observe the second's token.
-        async def fake_resolve(team_id: str) -> RequestContext:
+        async def fake_resolve(team_id: str, _is_enterprise_install: bool = False) -> RequestContext:
             if team_id == "T1":
                 # Yield so the T2 dispatch can race in and set the
                 # ContextVar before T1's process_message runs.
@@ -1032,7 +1032,7 @@ class TestSocketUnresolvedInstallations:
             ack,
         )
 
-        resolve.assert_awaited_once_with("T_UNKNOWN")
+        resolve.assert_awaited_once_with("T_UNKNOWN", False)
         chat.process_action.assert_not_called()
         ack.assert_awaited_once_with()
 
@@ -1279,15 +1279,16 @@ class TestInteractiveDispatchErrorAck:
 
 
 class TestSocketEventsApiPayloadParity:
-    """Regression for review finding #7.
+    """The socket events_api envelope keeps upstream's fields.
 
-    What to fix if this fails: the synthesized ``event_callback`` payload
-    in the socket-mode events_api branch must match the webhook path.
-    Adding ``is_ext_shared_channel`` here is a quiet socket-vs-webhook
-    divergence — neither upstream nor the Python webhook path includes it.
+    What to fix if this fails: the ``event_callback`` payload rebuilt in the
+    socket-mode events_api branch must carry the fields upstream's
+    ``routeSocketEvent`` keeps since vercel/chat#724 (chat@4.35): the
+    installation identity, ``context_team_id`` and ``is_ext_shared_channel``,
+    with ``is_enterprise_install`` normalized to a bool.
     """
 
-    async def test_synthesized_payload_does_not_include_is_ext_shared_channel(self):
+    async def test_synthesized_payload_keeps_enterprise_and_shared_channel_fields(self):
         adapter = _make_socket_adapter()
         adapter._chat = _make_mock_chat()
 
@@ -1299,25 +1300,54 @@ class TestSocketEventsApiPayloadParity:
 
         adapter._process_event_payload = fake_process  # type: ignore[method-assign]
         ack = AsyncMock()
+        authorizations = [{"enterprise_id": "E1", "team_id": None, "is_enterprise_install": True}]
+        event = {
+            "type": "message",
+            "channel": "C1",
+            "ts": "1.0",
+            "user": "U1",
+            "text": "hi",
+            "team": "T1",
+        }
         body = {
             "team_id": "T1",
+            "enterprise_id": "E1",
+            "context_team_id": "T_AWAY",
+            "authorizations": authorizations,
             "event_id": "Ev1",
             "event_time": 1234,
-            "is_ext_shared_channel": True,  # Should be dropped.
-            "event": {
-                "type": "message",
-                "channel": "C1",
-                "ts": "1.0",
-                "user": "U1",
-                "text": "hi",
-                "team": "T1",
-            },
+            "is_ext_shared_channel": True,
+            "unrelated": "dropped",
+            "event": event,
         }
         await adapter._route_socket_event(body, "events_api", ack)
-        assert len(captured) == 1
-        assert "is_ext_shared_channel" not in captured[0]
-        # Sanity: the keys we *do* synthesize are still present.
-        assert captured[0]["type"] == "event_callback"
-        assert captured[0]["team_id"] == "T1"
-        assert captured[0]["event_id"] == "Ev1"
-        assert captured[0]["event_time"] == 1234
+        assert captured == [
+            {
+                "type": "event_callback",
+                "event": event,
+                "authorizations": authorizations,
+                "team_id": "T1",
+                "context_team_id": "T_AWAY",
+                "enterprise_id": "E1",
+                "is_enterprise_install": False,
+                "is_ext_shared_channel": True,
+                "event_id": "Ev1",
+                "event_time": 1234,
+            }
+        ]
+
+    async def test_socket_shared_channel_flag_marks_the_channel_external(self):
+        adapter = _make_socket_adapter()
+        adapter._chat = _make_mock_chat()
+
+        await adapter._route_socket_event(
+            {
+                "team_id": "T1",
+                "is_ext_shared_channel": True,
+                "event": {"type": "message", "channel": "C_SHARED", "ts": "1.0", "user": "U1", "text": "hi"},
+            },
+            "events_api",
+            AsyncMock(),
+        )
+
+        assert "C_SHARED" in adapter._external_channels
