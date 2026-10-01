@@ -267,10 +267,19 @@ class SlackEvent(TypedDict, total=False):
     channel: str
     # Channel type: "channel", "group", "mpim", or "im" (DM)
     channel_type: str
+    # Deleted message timestamp on message_deleted events
+    deleted_ts: str
     edited: dict[str, str]  # {"ts": "..."}
+    event_ts: str
     files: list[SlackFileInfo]
+    # Hidden flag on message_changed events (true for unfurl-only updates)
+    hidden: bool
     # Timestamp of the latest reply (present on thread parent messages)
     latest_reply: str
+    # Inner message on message_changed events
+    message: SlackEvent
+    # Previous message snapshot on message_changed / message_deleted events
+    previous_message: SlackEvent
     # Number of replies in the thread (present on thread parent messages)
     reply_count: int
     subtype: str
