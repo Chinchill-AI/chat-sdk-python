@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,8 +23,10 @@ import pytest
 try:
     from chat_sdk.adapters.slack.adapter import SlackAdapter
     from chat_sdk.adapters.slack.types import RequestContext, SlackAdapterConfig, SlackInstallation
+    from chat_sdk.cards import Card
     from chat_sdk.shared.errors import AuthenticationError
     from chat_sdk.state.memory import MemoryStateAdapter
+    from chat_sdk.types import FetchOptions
 
     _SLACK_AVAILABLE = True
 except ImportError:
@@ -472,6 +475,79 @@ class TestHttpEnterpriseResolution:
 # withToken enterprise context injection
 # ---------------------------------------------------------------------------
 
+_GENERIC_SLACK_RESPONSE: dict[str, Any] = {
+    "ok": True,
+    "ts": "2.2",
+    "message_ts": "2.2",
+    "messages": [],
+    "has_more": False,
+    "channel": {"id": "D1", "name": "x"},
+    "user": {"id": "U1", "name": "u", "real_name": "U", "profile": {"display_name": "u"}},
+    "view": {"id": "V1"},
+}
+
+_MODAL: dict[str, Any] = {"type": "modal", "callback_id": "cb", "title": "T", "children": []}
+
+
+async def _react(adapter: SlackAdapter) -> None:
+    adapter._handle_reaction_event(
+        {
+            "type": "reaction_added",
+            "user": "U1",
+            "reaction": "thumbsup",
+            "item": {"type": "message", "channel": "C1", "ts": "2.2"},
+        }
+    )
+    await _settle()
+
+
+async def _fetch_linked_message(adapter: SlackAdapter) -> None:
+    preview = adapter._create_link_preview("https://acme.slack.com/archives/C1/p1234567890123456")
+    assert preview.fetch_message is not None
+    with pytest.raises(RuntimeError, match="Message not found"):  # the generic response holds no match
+        await preview.fetch_message()
+
+
+# (client method, adapter call, whether the call targets the originating
+# channel C1 and so must also echo ``client_context_team_id``).
+_WITH_TOKEN_CALL_SITES: list[tuple[str, Callable[[SlackAdapter], Awaitable[Any]], bool]] = [
+    ("chat_postMessage", lambda a: a.post_message("slack:C1:1.1", "hello"), True),
+    ("chat_postMessage", lambda a: a.post_message("slack:C1:1.1", Card(title="t")), True),
+    ("chat_update", lambda a: a.edit_message("slack:C1:1.1", "2.2", "edited"), True),
+    ("chat_update", lambda a: a.edit_message("slack:C1:1.1", "2.2", Card(title="t")), True),
+    ("chat_delete", lambda a: a.delete_message("slack:C1:1.1", "2.2"), True),
+    ("reactions_add", lambda a: a.add_reaction("slack:C1:1.1", "2.2", "thumbsup"), True),
+    ("reactions_remove", lambda a: a.remove_reaction("slack:C1:1.1", "2.2", "thumbsup"), True),
+    ("chat_postEphemeral", lambda a: a.post_ephemeral("slack:C1:1.1", "U1", "psst"), True),
+    ("chat_postEphemeral", lambda a: a.post_ephemeral("slack:C1:1.1", "U1", Card(title="t")), True),
+    ("conversations_replies", lambda a: a.fetch_messages("slack:C1:1.1"), True),
+    ("conversations_replies", lambda a: a.fetch_messages("slack:C1:1.1", FetchOptions(direction="forward")), True),
+    ("conversations_replies", lambda a: a.fetch_message("slack:C1:1.1", "2.2"), True),
+    ("conversations_history", lambda a: a.fetch_message("slack:C1:", "2.2"), True),
+    ("conversations_history", lambda a: a.fetch_channel_messages("slack:C1"), True),
+    (
+        "conversations_history",
+        lambda a: a.fetch_channel_messages("slack:C1", FetchOptions(direction="forward")),
+        True,
+    ),
+    ("conversations_history", lambda a: a.list_threads("slack:C1"), True),
+    ("conversations_history", _fetch_linked_message, True),
+    ("conversations_replies", _react, True),
+    ("conversations_info", lambda a: a.fetch_thread("slack:C1:1.1"), True),
+    ("conversations_info", lambda a: a.fetch_channel_info("slack:C_OTHER"), False),
+    ("conversations_info", lambda a: a._lookup_channel("C_OTHER"), False),
+    ("users_info", lambda a: a._lookup_user("U1"), False),
+    ("conversations_open", lambda a: a.open_dm("U1"), False),
+    ("views_open", lambda a: a.open_modal("trigger-1", _MODAL), False),
+    ("views_update", lambda a: a.update_modal("V1", _MODAL), False),
+    ("views_publish", lambda a: a.publish_home_view("U1", {"type": "home", "blocks": []}), False),
+    # assistant.* methods take ``channel_id``, never ``channel`` (as upstream).
+    ("assistant_threads_setStatus", lambda a: a.start_typing("slack:C1:1.1"), False),
+    ("assistant_threads_setStatus", lambda a: a.set_assistant_status("C1", "1.1", "thinking"), False),
+    ("assistant_threads_setTitle", lambda a: a.set_assistant_title("C1", "1.1", "title"), False),
+    ("api_call", lambda a: a.set_suggested_prompts("C1", None, [{"title": "t", "message": "m"}]), False),
+]
+
 
 def _run_in_context(adapter: SlackAdapter, ctx: RequestContext, **kwargs: Any) -> dict[str, Any]:
     tok = adapter._request_context.set(ctx)
@@ -571,9 +647,29 @@ class TestWithTokenEnterpriseContextInjection:
     async def test_no_request_context_leaves_kwargs_unchanged(self):
         assert self._adapter()._with_token_kwargs(channel="C1", text="hi") == {"channel": "C1", "text": "hi"}
 
-    async def test_api_calls_carry_the_resolved_enterprise_context(self):
-        """Python-specific wiring check: the adapter's Web API call sites go
-        through ``_with_token_kwargs`` (upstream ``withToken``)."""
+    async def test_a_caller_specified_client_context_team_id_is_kept(self):
+        result = _run_in_context(
+            self._adapter(),
+            RequestContext(token="xoxb-team", context_team_id="T_AWAY_HOST", context_channel="C1"),
+            channel="C1",
+            client_context_team_id="T_EXPLICIT",
+        )
+
+        assert result == {"channel": "C1", "client_context_team_id": "T_EXPLICIT"}
+
+    @pytest.mark.parametrize(
+        ("client_method", "invoke", "to_originating_channel"),
+        _WITH_TOKEN_CALL_SITES,
+        ids=[case[0] + ":" + str(i) for i, case in enumerate(_WITH_TOKEN_CALL_SITES)],
+    )
+    async def test_api_calls_carry_the_resolved_enterprise_context(
+        self, client_method: str, invoke: Callable[[SlackAdapter], Awaitable[Any]], to_originating_channel: bool
+    ):
+        """Python-specific wiring check, one case per ``_with_token_kwargs``
+        call site (upstream ``withToken``). Upstream's ``withToken`` also
+        supplies the token, so a skipped site fails loudly there; here the
+        token is bound by ``_get_client`` and a skipped wrap would silently
+        drop ``team_id`` / ``client_context_team_id``."""
         adapter, _, _ = await _multi_workspace_adapter()
         await adapter.set_installation("E_ORG_1", SlackInstallation(bot_token="xoxb-org", is_enterprise_install=True))
         resolved = await adapter._resolve_event_request_context(
@@ -588,29 +684,25 @@ class TestWithTokenEnterpriseContextInjection:
         )
         assert isinstance(resolved, RequestContext)
         client = MagicMock()
-        client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "2.2"})
-        client.conversations_info = AsyncMock(return_value={"ok": True, "channel": {"name": "x"}})
-        client.api_call = AsyncMock(return_value={"ok": True})
+        mocked = AsyncMock(return_value=_GENERIC_SLACK_RESPONSE)
+        setattr(client, client_method, mocked)
         adapter._get_client = lambda token=None: client  # type: ignore[method-assign]
 
         tok = adapter._request_context.set(resolved)
         try:
-            await adapter.post_message("slack:C1:1.1", "hello")  # type: ignore[arg-type]
-            await adapter.fetch_channel_info("slack:C_OTHER")
-            # ``api_call`` path: the ``json`` body is what goes through withToken.
-            await adapter.set_suggested_prompts("C1", None, [{"title": "t", "message": "m"}])
+            await invoke(adapter)
         finally:
             adapter._request_context.reset(tok)
 
-        post_kwargs = client.chat_postMessage.await_args.kwargs
-        assert (post_kwargs["team_id"], post_kwargs["client_context_team_id"]) == ("T_GRID_1", "T_AWAY_HOST")
-        info_kwargs = client.conversations_info.await_args.kwargs
-        assert info_kwargs == {"channel": "C_OTHER", "team_id": "T_GRID_1"}
-        assert client.api_call.await_args.kwargs["json"] == {
-            "channel_id": "C1",
-            "prompts": [{"title": "t", "message": "m"}],
-            "team_id": "T_GRID_1",
-        }
+        mocked.assert_awaited_once()
+        sent = mocked.await_args.kwargs
+        if client_method == "api_call":
+            # ``api_call`` path: the ``json`` body is what goes through withToken.
+            sent = sent["json"]
+        assert (sent.get("team_id"), sent.get("client_context_team_id")) == (
+            "T_GRID_1",
+            "T_AWAY_HOST" if to_originating_channel else None,
+        )
 
 
 # ---------------------------------------------------------------------------
