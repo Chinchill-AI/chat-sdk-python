@@ -66,6 +66,7 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -1415,7 +1416,9 @@ class DiscordAdapter:
                 raise
         return await operation(decoded.channel_id)
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Start typing indicator in a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
         target_channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)

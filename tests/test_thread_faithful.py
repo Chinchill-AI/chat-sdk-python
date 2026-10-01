@@ -46,6 +46,7 @@ from chat_sdk.types import (
     RawMessage,
     ScheduledMessage,
     TaskUpdateChunk,
+    TypingOptions,
 )
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1154,7 @@ class TestStreaming:
             StreamingPlanOptions(
                 group_tasks="plan",
                 end_with=[{"type": "actions"}],
+                session_status="suspended",
                 update_interval_ms=1000,
             ),
         )
@@ -1164,6 +1166,7 @@ class TestStreaming:
         # Upstream maps groupTasks->taskDisplayMode, endWith->stopBlocks
         assert options.task_display_mode == "plan"
         assert options.stop_blocks == [{"type": "actions"}]
+        assert options.session_status == "suspended"
         assert options.update_interval_ms == 1000
 
     # it("should pass StreamingPlan with only groupTasks")
@@ -2854,6 +2857,29 @@ class TestStartTyping:
         thread = _make_thread(adapter, state)
         await thread.start_typing("thinking...")
         assert adapter._start_typing_calls[0] == ("slack:C123:1234.5678", "thinking...")
+
+    # it("passes the initiating user and clears processing after posting")
+    @pytest.mark.asyncio
+    async def test_passes_the_initiating_user_and_clears_processing_after_posting(self):
+        adapter = create_mock_adapter()
+        adapter.end_typing = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        current_message = create_test_message("msg-1", "Hello")
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=adapter,
+                channel_id="C123",
+                state_adapter=create_mock_state(),
+                current_message=current_message,
+            )
+        )
+
+        await thread.start_typing()
+        await thread.post("Done")
+
+        assert adapter._start_typing_calls == [("slack:C123:1234.5678", None)]
+        assert adapter._start_typing_options == [TypingOptions(initiator_user_id=current_message.author.user_id)]
+        adapter.end_typing.assert_awaited_once_with("slack:C123:1234.5678", "active")
 
 
 # ===========================================================================

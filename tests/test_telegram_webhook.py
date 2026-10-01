@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -251,6 +252,18 @@ class TestTelegramConstructorEnvVars:
         monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", "env-secret")
         with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
             TelegramAdapter(TelegramAdapterConfig(bot_token="token", mode="webhook", secret_token=""))
+
+    # -- Python-specific: dataclass positional back-compat (#228) -----------
+
+    def test_mention_on_reply_does_not_shift_existing_positional_fields(self):
+        # ``mention_on_reply`` is keyword-only, so a caller passing every
+        # pre-existing field positionally keeps its streaming settings.
+        config = TelegramAdapterConfig(None, "token", None, None, None, None, None, None, None, True, 0)
+        assert config.native_streaming is True
+        assert config.streaming_edit_interval_ms == 0
+        assert config.mention_on_reply is None
+        with pytest.raises(TypeError):
+            TelegramAdapterConfig(None, "token", None, None, None, None, None, None, None, True, 0, True)  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -3203,7 +3216,27 @@ class TestTelegramPollingAcknowledgement:
 
     @pytest.mark.asyncio
     async def test_recovers_bot_identity_while_polling_after_a_failed_startup_get_me(self):
-        fixture = _PollingFixture([_polled_message(1)])
+        # A group reply to the bot is a mention only once the identity is
+        # known (``mention_on_reply``, #228), so the failing ``on_mention``
+        # handler below runs only if polling recovered it.
+        group = {"id": -100123, "type": "supergroup", "title": "General"}
+        fixture = _PollingFixture(
+            [
+                _polled_message(
+                    1,
+                    chat_id=group["id"],
+                    chat=group,
+                    text="and the second one?",
+                    reply_to_message={
+                        "message_id": 5,
+                        "date": 1,
+                        "chat": group,
+                        "from": {"id": 999, "is_bot": True, "first_name": "Bot", "username": "mybot"},
+                    },
+                )
+            ]
+        )
+        fixture.adapter._mention_on_reply = True
         api = fixture.api
         get_me_calls = 0
 
@@ -3216,11 +3249,15 @@ class TestTelegramPollingAcknowledgement:
             return await api(method, payload, **kwargs)
 
         fixture.adapter.telegram_fetch = flaky_get_me  # type: ignore[method-assign]
-        fixture.chat.on_mention(AsyncMock(side_effect=RuntimeError("Reply failed")))
+        handler = AsyncMock(side_effect=RuntimeError("Reply failed"))
+        fixture.chat.on_mention(handler)
         try:
             await fixture.start()
             await _wait_until(lambda: len(fixture.api.polls) >= 2)
             assert get_me_calls == 2
+            assert fixture.adapter.bot_user_id == "999"
+            handler.assert_awaited_once()
+            assert handler.await_args.args[1].is_mention is True
             # The failure is saved under the recovered bot's scope.
             saved = await fixture.checkpoint()
             assert [entry["update"]["update_id"] for entry in saved["pending"]] == [1]
@@ -3383,3 +3420,198 @@ class TestTelegramPollingShutdownPythonEdges:
 
 async def _is_none(value: Any) -> bool:
     return (await value) is None
+
+
+# ---------------------------------------------------------------------------
+# 4.41 replies (#228): replied-to context, reply-to-bot as mention, portable
+# file data
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramReplyContext:
+    """Port of the Telegram half of vercel/chat#802."""
+
+    def test_parses_replied_to_message_context(self):
+        adapter = _make_adapter(mode="webhook", allow_unverified_webhooks=True, user_name="mybot")
+        parsed = adapter.parse_message(
+            _sample_message(
+                message_id=12,
+                text="reply",
+                reply_to_message=_sample_message(
+                    message_id=11,
+                    text="original",
+                    date=1735689500,
+                    **{"from": {"id": 789, "is_bot": False, "first_name": "Original", "username": "original"}},
+                ),
+            )
+        )
+
+        assert isinstance(parsed.reply_to, Message)
+        assert parsed.reply_to.id == "123:11"
+        assert parsed.reply_to.thread_id == "telegram:123"
+        assert parsed.reply_to.text == "original"
+        assert parsed.reply_to.author.user_name == "original"
+        assert parsed.reply_to.metadata.date_sent == datetime.fromtimestamp(1735689500, tz=timezone.utc)
+
+
+_REPLY_BOT_USER_ID = 8981792219
+_REPLY_BOT_USER = {"id": _REPLY_BOT_USER_ID, "is_bot": True, "first_name": "Bot", "username": "mybot"}
+_GROUP_CHAT = {"id": -100123, "type": "supergroup", "title": "General"}
+
+
+async def _deliver_reply(
+    *,
+    mention_on_reply: bool | None = None,
+    reply_from_bot: bool,
+    from_bot: bool = False,
+    message_thread_id: int | None = None,
+    reply_to_message_id: int = 5,
+    drop_text: bool = False,
+    **message_overrides: Any,
+) -> Message:
+    """``deliverReply`` from the upstream suite: one group reply via the webhook."""
+    chat = _mock_chat(create_mock_state())
+    adapter = _dedupe_adapter(
+        get_me=AsyncMock(return_value=dict(_REPLY_BOT_USER)),
+        mention_on_reply=mention_on_reply,
+    )
+    await adapter.initialize(chat)
+
+    replied_to_sender = (
+        dict(_REPLY_BOT_USER)
+        if reply_from_bot
+        else {"id": 777, "is_bot": False, "first_name": "Someone", "username": "someone"}
+    )
+    message = _sample_message(
+        chat=dict(_GROUP_CHAT),
+        text="and the second one?",
+        reply_to_message=_sample_message(
+            message_id=reply_to_message_id,
+            chat=dict(_GROUP_CHAT),
+            **{"from": replied_to_sender},
+        ),
+    )
+    message.update(message_overrides)
+    if drop_text:
+        del message["text"]
+    if message_thread_id is not None:
+        message["message_thread_id"] = message_thread_id
+    if from_bot:
+        message["from"] = dict(_REPLY_BOT_USER)
+
+    response = await adapter.handle_webhook(_update_request({"update_id": 1, "message": message}))
+    assert response["status"] == 200
+    assert chat.process_message.call_count == 1
+    return chat.process_message.call_args.args[2]
+
+
+class TestTelegramMentionOnReply:
+    """Ports of vercel/chat#834 (``mentionOnReply``)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_telegram_env(monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_counts_a_reply_to_the_bot_as_a_mention_when_enabled(self):
+        parsed = await _deliver_reply(mention_on_reply=True, reply_from_bot=True)
+        assert parsed.is_mention is True
+
+    @pytest.mark.asyncio
+    async def test_ignores_a_reply_to_somebody_else(self):
+        parsed = await _deliver_reply(mention_on_reply=True, reply_from_bot=False)
+        assert parsed.is_mention is False
+
+    @pytest.mark.asyncio
+    async def test_stays_off_by_default_so_existing_bots_keep_mention_only_behaviour(self):
+        parsed = await _deliver_reply(reply_from_bot=True)
+        assert parsed.is_mention is False
+
+    @pytest.mark.asyncio
+    async def test_ignores_a_forum_topics_implicit_reply_to_the_bots_topic_creation_message(self):
+        # In forum topics every message replies to the topic-creation service
+        # message, whose message_id equals message_thread_id.
+        parsed = await _deliver_reply(
+            mention_on_reply=True, reply_from_bot=True, message_thread_id=5, reply_to_message_id=5
+        )
+        assert parsed.is_mention is False
+
+    @pytest.mark.asyncio
+    async def test_counts_an_explicit_reply_to_the_bot_inside_a_forum_topic(self):
+        parsed = await _deliver_reply(
+            mention_on_reply=True, reply_from_bot=True, message_thread_id=5, reply_to_message_id=42
+        )
+        assert parsed.is_mention is True
+
+    @pytest.mark.asyncio
+    async def test_does_not_flag_the_bots_own_reply_to_one_of_its_messages(self):
+        # The Bot API echoes outbound sends back; the echo replies to the
+        # bot's earlier message but is authored by the bot itself.
+        parsed = await _deliver_reply(mention_on_reply=True, reply_from_bot=True, from_bot=True)
+        assert parsed.is_mention is False
+
+    # Python-specific: the reply check runs before the empty-text guard, so a
+    # reply carrying only a photo counts.
+    @pytest.mark.asyncio
+    async def test_counts_a_photo_only_reply_to_the_bot(self):
+        parsed = await _deliver_reply(
+            mention_on_reply=True,
+            reply_from_bot=True,
+            drop_text=True,
+            photo=[{"file_id": "p1", "file_unique_id": "u1", "width": 10, "height": 10}],
+        )
+        assert parsed.text == ""
+        assert len(parsed.attachments) == 1
+        assert parsed.is_mention is True
+
+    # Python-specific: ``config ?? env === "true"`` -- an explicit False wins
+    # over the env var, and only the exact string "true" opts in.
+    @pytest.mark.parametrize(
+        ("config_value", "env_value", "expected"),
+        [
+            (None, "true", True),
+            (None, "TRUE", False),
+            (None, "1", False),
+            (False, "true", False),
+            (True, None, True),
+        ],
+    )
+    def test_resolves_mention_on_reply_from_config_then_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        config_value: bool | None,
+        env_value: str | None,
+        expected: bool,
+    ):
+        if env_value is not None:
+            monkeypatch.setenv("TELEGRAM_MENTION_ON_REPLY", env_value)
+        adapter = _dedupe_adapter(mention_on_reply=config_value)
+        adapter._bot_user_id = str(_REPLY_BOT_USER_ID)
+        reply = _sample_message(
+            chat=dict(_GROUP_CHAT),
+            text="no handle here",
+            reply_to_message=_sample_message(message_id=5, chat=dict(_GROUP_CHAT), **{"from": dict(_REPLY_BOT_USER)}),
+        )
+        assert adapter.is_bot_mentioned(reply, reply["text"]) is expected  # type: ignore[arg-type]
+
+
+class TestTelegramPortableFileData:
+    """Telegram half of vercel/chat#828 (N/A in substance: Python returns ``bytes``)."""
+
+    @pytest.mark.asyncio
+    async def test_downloads_file_bytes_without_the_node_buffer_global(self):
+        # Upstream asserts an ``ArrayBuffer``; the Python contract is plain
+        # ``bytes`` (not ``bytearray`` / ``memoryview``) from ``fetch_data``.
+        expected = bytes([0, 127, 255])
+        session = _FakeSession(_FakeResponse([expected[:1], expected[1:]], content_length=3))
+        adapter = _download_adapter(session)
+        parsed = adapter.parse_message(
+            _message_without_text(document={"file_id": "f1", "file_unique_id": "u1", "file_name": "file.bin"})
+        )
+        [attachment] = parsed.attachments
+        assert attachment.fetch_data is not None
+
+        data = await attachment.fetch_data()
+
+        assert type(data) is bytes
+        assert data == expected

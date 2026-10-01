@@ -41,6 +41,10 @@ from chat_sdk.thread import (
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
+    AgentSessionStoppedEvent,
+    AgentSessionStoppedHandler,
+    AgentSessionTitleChangedEvent,
+    AgentSessionTitleChangedHandler,
     AppContextChangedEvent,
     AppContextChangedHandler,
     AppHomeOpenedEvent,
@@ -82,6 +86,7 @@ from chat_sdk.types import (
     StreamOptions,
     TranscriptsApi,
     TranscriptsConfig,
+    TurnSignal,
     UninstalledEvent,
     UninstalledHandler,
     UserHistoryConfig,
@@ -100,6 +105,11 @@ DEFAULT_MAX_LOCK_LIFETIME_MS = 600_000  # 10 minutes
 # 10 minutes: outlives Slack's ~+5 min Events API retry (vercel/chat#667).
 DEDUPE_TTL_MS = 10 * 60 * 1000
 MODAL_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
+# Turn cancellation (adapters with ``supports_turn_cancellation``): how long
+# the ``active-turn:`` / ``abort-turn:`` markers live, and how often a running
+# turn polls for an abort from another process.
+ACTIVE_TURN_TTL_MS = 60 * 60 * 1000  # 1 hour
+ABORT_POLL_INTERVAL_MS = 250
 
 SLACK_USER_ID_REGEX = re.compile(r"^[UW][A-Z0-9]+$")
 DISCORD_SNOWFLAKE_REGEX = re.compile(r"^\d{17,19}$")
@@ -623,6 +633,8 @@ class Chat:
         self._slash_command_handlers: list[_SlashCommandPattern] = []
         self._assistant_thread_started_handlers: list[AssistantThreadStartedHandler] = []
         self._assistant_context_changed_handlers: list[AssistantContextChangedHandler] = []
+        self._agent_session_stopped_handlers: list[AgentSessionStoppedHandler] = []
+        self._agent_session_title_changed_handlers: list[AgentSessionTitleChangedHandler] = []
         self._app_home_opened_handlers: list[AppHomeOpenedHandler] = []
         self._app_context_changed_handlers: list[AppContextChangedHandler] = []
         self._member_joined_channel_handlers: list[MemberJoinedChannelHandler] = []
@@ -637,6 +649,9 @@ class Chat:
 
         # -- Active handler tasks (for cancellation on shutdown) --------------
         self._active_tasks: set[asyncio.Task[Any]] = set()
+
+        # -- Running turns: thread_id -> turn_id -> signal (``abort_turn``) ---
+        self._active_turn_signals: dict[str, dict[str, TurnSignal]] = {}
 
         # -- Cached mention regex patterns (populated lazily) ----------------
         self._mention_patterns: dict[str, re.Pattern[str]] = {}
@@ -1177,6 +1192,23 @@ class Chat:
         self._logger.debug("Registered assistant context changed handler")
         return handler
 
+    def on_agent_session_stopped(self, handler: AgentSessionStoppedHandler) -> AgentSessionStoppedHandler:
+        """Handle the user stopping an agent session's turn (Slack native stop).
+
+        Runs without the thread lock (the stopped turn still holds it).
+        """
+        self._agent_session_stopped_handlers.append(handler)
+        self._logger.debug("Registered agent session stopped handler")
+        return handler
+
+    def on_agent_session_title_changed(
+        self, handler: AgentSessionTitleChangedHandler
+    ) -> AgentSessionTitleChangedHandler:
+        """Handle an agent session's title change."""
+        self._agent_session_title_changed_handlers.append(handler)
+        self._logger.debug("Registered agent session title changed handler")
+        return handler
+
     def on_app_home_opened(self, handler: AppHomeOpenedHandler) -> AppHomeOpenedHandler:
         self._app_home_opened_handlers.append(handler)
         self._logger.debug("Registered app home opened handler")
@@ -1675,6 +1707,69 @@ class Chat:
                 )
             )
             self._hand_to_wait_until(task, options)
+
+    def process_agent_session_stopped(
+        self,
+        event: AgentSessionStoppedEvent,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Dispatch an agent-session stop (upstream ``processAgentSessionStopped``).
+
+        Takes no lock: the turn being stopped holds the thread lock.
+        """
+        self._run_agent_session_handlers(
+            "Agent session stopped handler error", self._agent_session_stopped_handlers, event, options
+        )
+
+    def process_agent_session_title_changed(
+        self,
+        event: AgentSessionTitleChangedEvent,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Dispatch an agent-session title change (upstream ``processAgentSessionTitleChanged``)."""
+        self._run_agent_session_handlers(
+            "Agent session title changed handler error", self._agent_session_title_changed_handlers, event, options
+        )
+
+    def _run_agent_session_handlers(
+        self,
+        error_message: str,
+        handlers: list[Any],
+        event: AgentSessionStoppedEvent | AgentSessionTitleChangedEvent,
+        options: WebhookOptions | None,
+    ) -> None:
+        async def _task() -> None:
+            with conversation(event.thread_id):
+                for h in handlers:
+                    await self._invoke_handler(h, event)
+
+        task = _create_task(_task(), self._active_tasks)
+        if task is not None:
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error(error_message, {"error": t.exception(), "thread_id": event.thread_id})
+                    if not t.cancelled() and t.exception()
+                    else None
+                )
+            )
+            self._hand_to_wait_until(task, options)
+
+    async def abort_turn(self, thread_id: str) -> None:
+        """Abort the active turn for ``thread_id`` (upstream ``abortTurn``).
+
+        Aborts ``thread.signal`` for turns running in this process. When a
+        turn running elsewhere published itself (its adapter sets
+        ``supports_turn_cancellation``), the abort is recorded in the shared
+        state backend and that process aborts its turn on its next poll.
+        """
+        local = self._active_turn_signals.get(thread_id)
+        if local:
+            for signal in list(local.values()):
+                signal._abort()
+
+        active_turn_id = await self._state_adapter.get(self._active_turn_key(thread_id))
+        if active_turn_id:
+            await self._state_adapter.set(self._abort_turn_key(thread_id), active_turn_id, ACTIVE_TURN_TTL_MS)
 
     def process_assistant_context_changed(
         self,
@@ -2943,6 +3038,96 @@ class Chat:
         message: Message,
         context: MessageContext | None = None,
     ) -> None:
+        """Run one turn: route the message under a fresh cancellation signal.
+
+        Upstream ``dispatchToHandlers``. The signal is registered for
+        :meth:`abort_turn`; for adapters with ``supports_turn_cancellation``
+        the turn is also published to the state backend and polled for an
+        abort from another process, and its markers are cleared afterwards.
+        """
+        turn_id = str(uuid.uuid4())
+        signal = TurnSignal()
+        # ``is True``: a MagicMock adapter would otherwise opt in by accident.
+        cancellable = getattr(adapter, "supports_turn_cancellation", False) is True
+        monitor: asyncio.Task[None] | None = None
+        signals = self._active_turn_signals.setdefault(thread_id, {})
+        signals[turn_id] = signal
+        # Python-specific: everything after registration sits inside the
+        # ``try`` so a cancelled task still unregisters (JS cannot be
+        # interrupted between these steps).
+        try:
+            if cancellable:
+                try:
+                    await self._state_adapter.set(self._active_turn_key(thread_id), turn_id, ACTIVE_TURN_TTL_MS)
+                except Exception as error:
+                    self._logger.warn(
+                        "Could not publish active turn for cancellation", {"error": error, "thread_id": thread_id}
+                    )
+                monitor = asyncio.get_running_loop().create_task(self._monitor_turn_abort(thread_id, turn_id, signal))
+            await self._dispatch_to_handlers_with_signal(adapter, thread_id, message, signal, context)
+        finally:
+            signals.pop(turn_id, None)
+            if not signals and self._active_turn_signals.get(thread_id) is signals:
+                del self._active_turn_signals[thread_id]
+            try:
+                if monitor is not None:
+                    monitor.cancel()
+                    # Waits for the poll to stop; a cancellation of this task
+                    # still propagates (``gather`` only absorbs the monitor's).
+                    await asyncio.gather(monitor, return_exceptions=True)
+            finally:
+                # Still runs when this task is cancelled during the join.
+                if cancellable:
+                    await self._clear_turn_markers(thread_id, turn_id)
+
+    @staticmethod
+    def _active_turn_key(thread_id: str) -> str:
+        return f"active-turn:{thread_id}"
+
+    @staticmethod
+    def _abort_turn_key(thread_id: str) -> str:
+        return f"abort-turn:{thread_id}"
+
+    async def _monitor_turn_abort(self, thread_id: str, turn_id: str, signal: TurnSignal) -> None:
+        """Poll for an abort of this turn until it is aborted or cancelled."""
+        key = self._abort_turn_key(thread_id)
+        while not signal.aborted:
+            try:
+                aborted_turn_id = await self._state_adapter.get(key)
+            except Exception as error:
+                self._logger.warn("Could not poll turn cancellation state", {"error": error, "thread_id": thread_id})
+                return
+            if aborted_turn_id == turn_id:
+                signal._abort()
+                return
+            await asyncio.sleep(ABORT_POLL_INTERVAL_MS / 1000)
+
+    async def _clear_turn_markers(self, thread_id: str, turn_id: str) -> None:
+        """Delete this turn's markers, leaving any written by a newer turn.
+
+        Upstream parity (chat.ts ``clearTurnMarkers``, chat@4.41.1): the
+        ownership check and the delete are separate state calls, as upstream;
+        ``StateAdapter`` has no compare-and-delete. A newer turn publishing
+        in between loses its marker until it publishes again.
+        """
+        try:
+            active_key = self._active_turn_key(thread_id)
+            if await self._state_adapter.get(active_key) == turn_id:
+                await self._state_adapter.delete(active_key)
+            abort_key = self._abort_turn_key(thread_id)
+            if await self._state_adapter.get(abort_key) == turn_id:
+                await self._state_adapter.delete(abort_key)
+        except Exception as error:
+            self._logger.warn("Could not clear turn cancellation state", {"error": error, "thread_id": thread_id})
+
+    async def _dispatch_to_handlers_with_signal(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message,
+        signal: TurnSignal,
+        context: MessageContext | None = None,
+    ) -> None:
         """Route a message to the correct handler chain."""
         # Register the owning adapter so handlers can lazily resolve
         # ``message.subject`` via the adapter's optional ``fetch_subject`` hook.
@@ -2967,7 +3152,7 @@ class Chat:
         is_subscribed = await self._state_adapter.is_subscribed(thread_id)
         self._logger.debug("Subscription check", {"thread_id": thread_id, "is_subscribed": is_subscribed})
 
-        thread = self._create_thread(adapter, thread_id, message, is_subscribed)
+        thread = self._create_thread(adapter, thread_id, message, is_subscribed, signal)
         await self._resolve_message_identity(adapter, thread_id, message)
 
         # DM routing
@@ -3131,6 +3316,7 @@ class Chat:
         thread_id: str,
         initial_message: Message | None,
         is_subscribed_context: bool = False,
+        signal: TurnSignal | None = None,
     ) -> ThreadImpl:
         channel_id = adapter.channel_id_from_thread_id(thread_id)
         is_dm = (
@@ -3155,6 +3341,7 @@ class Chat:
                 is_dm=is_dm,
                 channel_visibility=channel_visibility,
                 current_message=initial_message,
+                signal=signal,
                 logger=self._logger,
                 streaming_update_interval_ms=self._streaming_update_interval_ms,
                 fallback_streaming_placeholder_text=self._fallback_streaming_placeholder_text,

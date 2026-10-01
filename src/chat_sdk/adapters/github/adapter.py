@@ -61,6 +61,7 @@ from chat_sdk.types import (
     Thread,
     ThreadInfo,
     ThreadSummary,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -833,7 +834,9 @@ class GitHubAdapter:
         emoji_name = emoji if isinstance(emoji, str) else emoji.name
         return EMOJI_TO_GITHUB_REACTION.get(emoji_name, "+1")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """No-op for GitHub."""
         pass
 

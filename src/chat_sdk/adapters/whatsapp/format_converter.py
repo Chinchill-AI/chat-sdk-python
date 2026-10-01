@@ -23,6 +23,7 @@ from chat_sdk.shared.base_format_converter import (
     table_to_ascii,
     walk_ast,
 )
+from chat_sdk.shared.code_fences import normalize_code_fences
 
 
 class WhatsAppFormatConverter(BaseFormatConverter):
@@ -82,10 +83,12 @@ class WhatsAppFormatConverter(BaseFormatConverter):
     def to_ast(self, platform_text: str) -> Root:
         """Parse WhatsApp markdown into an AST.
 
-        Transforms WhatsApp-specific formatting to standard markdown first,
+        Normalizes WhatsApp's ``` fences for CommonMark (the text after the
+        opening fence is code, not an info string) and transforms
+        WhatsApp-specific formatting to standard markdown outside the fences,
         then parses with the shared parser.
         """
-        standard_markdown = self._from_whatsapp_format(platform_text)
+        standard_markdown = normalize_code_fences(platform_text, convert_text=self._from_whatsapp_format)
         return parse_markdown(standard_markdown)
 
     def _to_whatsapp_format(self, text: str) -> str:

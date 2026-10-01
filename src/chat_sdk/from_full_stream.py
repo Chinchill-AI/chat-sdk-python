@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator
 
+from chat_sdk._compat import aclose_quietly
 from chat_sdk.types import StreamInput, ThinkingChunk
 
 _STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_update"})
@@ -84,55 +85,66 @@ async def from_full_stream(
     needs_separator = False
     has_emitted_text = False
 
-    async for event in stream:
-        # Plain string chunk (e.g. from AI SDK textStream)
-        if isinstance(event, str):
-            yield event
-            continue
+    # Upstream's ``for await`` calls the source's ``return()`` when the
+    # consumer stops early; Python's ``async for`` does not, so close the
+    # source when this generator exits before exhausting it (e.g. a turn
+    # aborted between chunks). Nothing is closed after normal exhaustion.
+    iterator = aiter(stream)
+    exhausted = False
+    try:
+        async for event in iterator:
+            # Plain string chunk (e.g. from AI SDK textStream)
+            if isinstance(event, str):
+                yield event
+                continue
 
-        if event is None:
-            continue
+            if event is None:
+                continue
 
-        # Support both dict and object-style events
-        if isinstance(event, dict):
-            event_type = event.get("type", "")
-        elif hasattr(event, "type"):
-            event_type = getattr(event, "type", "")
-        else:
-            continue
+            # Support both dict and object-style events
+            if isinstance(event, dict):
+                event_type = event.get("type", "")
+            elif hasattr(event, "type"):
+                event_type = getattr(event, "type", "")
+            else:
+                continue
 
-        # Python AG-UI producers (``ag-ui-protocol``, pydantic-ai) type events
-        # with a ``str`` Enum; compare on its value.
-        event_type = getattr(event_type, "value", event_type)
-        if not event_type or not isinstance(event_type, str):
-            continue
+            # Python AG-UI producers (``ag-ui-protocol``, pydantic-ai) type events
+            # with a ``str`` Enum; compare on its value.
+            event_type = getattr(event_type, "value", event_type)
+            if not event_type or not isinstance(event_type, str):
+                continue
 
-        # Pass through canonical StreamChunk objects. (Pre-built ThinkingChunk
-        # has ``type == "thinking"`` and is handled by the reasoning branch
-        # below, gated on ``emit_thinking``.)
-        if event_type in _STREAM_CHUNK_TYPES:
-            yield event  # type: ignore[misc]
-            continue
+            # Pass through canonical StreamChunk objects. (Pre-built ThinkingChunk
+            # has ``type == "thinking"`` and is handled by the reasoning branch
+            # below, gated on ``emit_thinking``.)
+            if event_type in _STREAM_CHUNK_TYPES:
+                yield event  # type: ignore[misc]
+                continue
 
-        # Opt-in reasoning surfacing. Default-off => this whole branch is
-        # skipped and reasoning parts fall through (dropped) exactly as
-        # upstream chat@4.31 does.
-        if event_type in _REASONING_TYPES:
-            if emit_thinking:
-                content = _pick(event, _REASONING_KEYS)
-                if isinstance(content, str) and content:
-                    yield ThinkingChunk(content=content)
-            continue
+            # Opt-in reasoning surfacing. Default-off => this whole branch is
+            # skipped and reasoning parts fall through (dropped) exactly as
+            # upstream chat@4.31 does.
+            if event_type in _REASONING_TYPES:
+                if emit_thinking:
+                    content = _pick(event, _REASONING_KEYS)
+                    if isinstance(content, str) and content:
+                        yield ThinkingChunk(content=content)
+                continue
 
-        # AI SDK v6 uses "text", v5 uses "textDelta"; AG-UI uses "delta".
-        # Priority: text > delta > textDelta > text_delta (matches TS)
-        text_content = _pick(event, _TEXT_KEYS)
+            # AI SDK v6 uses "text", v5 uses "textDelta"; AG-UI uses "delta".
+            # Priority: text > delta > textDelta > text_delta (matches TS)
+            text_content = _pick(event, _TEXT_KEYS)
 
-        if event_type in _TEXT_DELTA_TYPES and isinstance(text_content, str):
-            if needs_separator and has_emitted_text:
-                yield "\n\n"
-            needs_separator = False
-            has_emitted_text = True
-            yield text_content
-        elif event_type in _STEP_END_TYPES:
-            needs_separator = True
+            if event_type in _TEXT_DELTA_TYPES and isinstance(text_content, str):
+                if needs_separator and has_emitted_text:
+                    yield "\n\n"
+                needs_separator = False
+                has_emitted_text = True
+                yield text_content
+            elif event_type in _STEP_END_TYPES:
+                needs_separator = True
+        exhausted = True
+    finally:
+        if not exhausted:
+            await aclose_quietly(iterator)
