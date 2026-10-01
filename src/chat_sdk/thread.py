@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from chat_sdk._compat import accepts_kwarg
+from chat_sdk._compat import accepts_kwarg, aclose_quietly
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.from_full_stream import from_full_stream
@@ -261,10 +261,7 @@ async def _take_until_aborted[T](source: AsyncIterable[T], signal: TurnSignal) -
             yield value
     finally:
         signal.remove_listener(_on_abort)
-        aclose = getattr(iterator, "aclose", None)
-        if aclose is not None:
-            with contextlib.suppress(Exception):  # closing is best-effort, as upstream
-                await aclose()
+        await aclose_quietly(iterator)
 
 
 def _extract_slack_recipient_team_id(raw: Any) -> str | None:

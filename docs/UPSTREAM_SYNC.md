@@ -1818,7 +1818,10 @@ behavior differences.
   does not. `from_full_stream` now closes the source iterator (`aclose()`,
   errors suppressed) when it is closed or fails before the source is
   exhausted, so an abort between chunks also closes the caller's generator.
-  Nothing is closed after normal exhaustion.
+  Nothing is closed after normal exhaustion. Both close sites use
+  `chat_sdk._compat.aclose_quietly`, which also absorbs the
+  `BaseExceptionGroup([GeneratorExit()])` a generator holding a `TaskGroup`
+  across `yield` raises when closed (cancellation still propagates).
 - **Typing lifecycle.** `start_typing` passes
   `TypingOptions(initiator_user_id=…)` when the current message's author
   has a truthy `user_id` (upstream truthiness), then marks typing started.

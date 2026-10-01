@@ -28,9 +28,9 @@ chat@4.31 (reasoning is dropped, no ``ThinkingChunk`` is emitted). See
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import AsyncIterable, AsyncIterator
 
+from chat_sdk._compat import aclose_quietly
 from chat_sdk.types import StreamInput, ThinkingChunk
 
 _STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_update"})
@@ -146,7 +146,5 @@ async def from_full_stream(
                 needs_separator = True
         exhausted = True
     finally:
-        aclose = getattr(iterator, "aclose", None)
-        if not exhausted and aclose is not None:
-            with contextlib.suppress(Exception):  # best-effort, like JS ``return()``
-                await aclose()
+        if not exhausted:
+            await aclose_quietly(iterator)

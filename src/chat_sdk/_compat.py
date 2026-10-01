@@ -41,6 +41,27 @@ def accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
     return result
 
 
+async def aclose_quietly(iterator: object) -> None:
+    """Best-effort ``aclose()``, like upstream's ``iterator.return().catch(() => {})``.
+
+    Suppresses errors raised while closing, including the
+    ``BaseExceptionGroup([GeneratorExit()])`` an async generator raises when
+    it holds a ``TaskGroup`` across ``yield``. Cancellation and other
+    control-flow exceptions still propagate. No-op without ``aclose``.
+    """
+    aclose = getattr(iterator, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:  # noqa: S110 — closing is best-effort
+        pass
+    except BaseExceptionGroup as group:
+        _, rest = group.split((GeneratorExit, Exception))
+        if rest is not None:
+            raise
+
+
 def _probe(fn: Callable[..., Any], name: str) -> bool:
     try:
         params = inspect.signature(fn).parameters.values()

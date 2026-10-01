@@ -218,6 +218,30 @@ class TestThreadAbortAndTyping:
         assert received == ["a"]
         assert source.closed is True  # closed through from_full_stream, not left to GC
 
+    async def test_abort_closes_a_taskgroup_backed_source_cleanly(self):
+        adapter = create_mock_adapter()
+        signal = TurnSignal()
+        closed: list[bool] = []
+
+        async def source() -> AsyncIterator[str]:
+            async with asyncio.TaskGroup():  # held across ``yield``
+                try:
+                    yield "a"
+                    yield "b"
+                finally:
+                    closed.append(True)
+
+        async def native_stream(thread_id: str, stream: Any, options: Any = None) -> RawMessage:
+            async for _ in stream:
+                signal._abort()
+            return RawMessage(id="s1", thread_id=thread_id, raw={})
+
+        adapter.stream = native_stream  # type: ignore[attr-defined]
+        sent = await _thread(adapter, signal=signal).post(source())
+
+        assert sent.text == "a"
+        assert closed == [True]
+
     async def test_native_stream_receives_the_thread_signal(self):
         adapter = create_mock_adapter()
         signal = TurnSignal()
