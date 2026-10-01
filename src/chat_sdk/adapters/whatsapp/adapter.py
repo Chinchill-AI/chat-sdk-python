@@ -21,7 +21,7 @@ from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from chat_sdk.adapters.whatsapp.cards import (
     WhatsAppCardResultInteractive,
@@ -51,6 +51,7 @@ from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.adapter_utils import extract_card, extract_files, extract_postable_attachments
 from chat_sdk.shared.buffer_utils import to_buffer
 from chat_sdk.shared.card_utils import card_to_fallback_text
+from chat_sdk.shared.download import AttachmentTransport, download_attachment
 from chat_sdk.shared.errors import AdapterError, NetworkError, ValidationError
 from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.thread_history import ThreadHistoryCache
@@ -86,6 +87,53 @@ WHATSAPP_MESSAGE_LIMIT = 4096
 
 # Maximum caption length for WhatsApp media messages
 WHATSAPP_CAPTION_LIMIT = 1024
+
+# Meta hosts that serve WhatsApp media (exact host or any subdomain). The
+# access token goes only to these and to the configured Graph API origin.
+_WHATSAPP_MEDIA_HOSTS = ("fbcdn.net", "fbsbx.com")
+_UNTRUSTED_MEDIA_URL = "Refusing to send the access token to an untrusted media URL"
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    """``(scheme, hostname, port)`` with the scheme's default port filled in.
+
+    Raises ``ValueError`` for an unparseable URL or port.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port
+    return scheme, parts.hostname or "", port if port is not None else _DEFAULT_PORTS.get(scheme)
+
+
+def _is_whatsapp_media_url(url: str, graph_api_url: str) -> bool:
+    """Port of upstream ``isWhatsAppMediaUrl``: may ``url`` receive the access token?
+
+    True for the exact configured Graph API origin (scheme, host and port),
+    or for an https URL with no explicit non-default port whose host is one
+    of :data:`_WHATSAPP_MEDIA_HOSTS` or a subdomain of one.
+
+    :func:`download_attachment` re-runs this on every hop's normalized URL
+    (WHATWG host parsing) before attaching the token, so that per-hop check
+    is the authoritative one; this also runs on the raw Graph-supplied URL
+    to refuse early, as upstream does.
+    """
+    if not isinstance(url, str):
+        return False
+    try:
+        scheme, hostname, port = _url_origin(url)
+        if not hostname:
+            return False
+        if (scheme, hostname, port) == _url_origin(graph_api_url):
+            return True
+    except ValueError:
+        return False
+    return (
+        scheme == "https"
+        and port == 443
+        and any(hostname == host or hostname.endswith(f".{host}") for host in _WHATSAPP_MEDIA_HOSTS)
+    )
+
 
 # WhatsApp media message types supported for outbound sends
 WhatsAppMediaType = Literal["image", "document", "video", "audio"]
@@ -178,6 +226,15 @@ def _route(bsuid: str | None, parent: str | None, phone: str | None) -> _WhatsAp
     if phone is not None:
         route["phone"] = phone
     return route
+
+
+def _reply_context(reply_id: str | None) -> dict[str, Any]:
+    """``{"context": {"message_id": reply_id}}``, or ``{}`` for no reply.
+
+    Truthiness, as upstream's ``...(replyId ? {context} : {})``: an empty
+    ID sends no context.
+    """
+    return {"context": {"message_id": reply_id}} if reply_id else {}
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -1202,12 +1259,22 @@ class WhatsAppAdapter:
             fetch_metadata=attachment.fetch_metadata,
         )
 
-    async def download_media(self, media_id: str) -> bytes:
+    async def download_media(self, media_id: str, transport: AttachmentTransport | None = None) -> bytes:
         """Download media from WhatsApp.
 
         Two-step process:
         1. GET the media metadata to obtain the download URL
-        2. GET the actual binary data from the download URL
+        2. GET the binary data through the shared guarded downloader
+           (:func:`~chat_sdk.shared.download.download_attachment`): https
+           only, internal addresses refused, at most 5 redirects, a 25 MB cap
+           and a 30 s deadline. The access token is attached per hop, only
+           when that hop's URL passes :func:`_is_whatsapp_media_url`, so a
+           redirect cannot carry it off-policy.
+
+        ``transport`` overrides the downloader's HTTP transport (upstream's
+        optional ``transport`` argument), e.g. for tests or custom egress.
+
+        See: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media#download-media
         """
         # Step 1: Get the media URL
         media_info = await self._graph_fetch_json(
@@ -1218,49 +1285,35 @@ class WhatsAppAdapter:
             context={"mediaId": media_id},
         )
 
-        # Validate the download URL to prevent SSRF
-        download_url = media_info["url"]
-        parsed = urlparse(download_url)
-        if parsed.scheme != "https":
-            raise ValidationError(
-                "whatsapp",
-                f"Media download URL must use HTTPS, got: {parsed.scheme}",
-            )
-        host = (parsed.hostname or "").lower()
-        allowed_suffixes = (
-            ".facebook.com",
-            ".fbcdn.net",
-            ".fbsbx.com",
-            ".whatsapp.net",
-            ".whatsapp.com",
-        )
-        allowed_exact = {"facebook.com", "fbcdn.net", "fbsbx.com", "whatsapp.net", "whatsapp.com"}
-        if not (any(host.endswith(s) for s in allowed_suffixes) or host in allowed_exact):
-            raise ValidationError(
-                "whatsapp",
-                f"Media download URL host is not an allowed Meta domain: {host}",
-            )
+        download_url = media_info.get("url") if isinstance(media_info, dict) else None
+        if not isinstance(download_url, str) or not _is_whatsapp_media_url(download_url, self._graph_api_url):
+            raise NetworkError("whatsapp", _UNTRUSTED_MEDIA_URL)
 
-        # Step 2: Download the actual file.
-        # The WhatsApp Cloud API requires the Bearer token for media downloads
-        # (the URL is not pre-signed). The SSRF domain validation above ensures
-        # we only send the token to legitimate Meta/WhatsApp domains.
-        session = await self._get_http_session()
-        async with session.get(
-            download_url,
-            headers={"Authorization": f"Bearer {self._access_token}"},
-        ) as data_response:
-            if data_response.status != 200:
-                self._logger.error(
-                    "Failed to download media",
-                    {
-                        "status": data_response.status,
-                        "mediaId": media_id,
-                    },
-                )
-                raise RuntimeError(f"Failed to download media: {data_response.status}")
+        graph_api_url = self._graph_api_url
+        graph_host = urlsplit(graph_api_url).hostname
+        hosts = (*_WHATSAPP_MEDIA_HOSTS, graph_host) if graph_host else _WHATSAPP_MEDIA_HOSTS
 
-            return await data_response.read()
+        def headers_for(hop_url: str) -> dict[str, str]:
+            if not _is_whatsapp_media_url(hop_url, graph_api_url):
+                raise NetworkError("whatsapp", _UNTRUSTED_MEDIA_URL)
+            return {"authorization": f"Bearer {self._access_token}"}
+
+        # Step 2: Download the actual file. Every hop is checked against the
+        # exact-origin and Meta media host policy before the access token is
+        # attached, so a redirect cannot carry it to an off-policy host.
+        try:
+            return await download_attachment(
+                download_url,
+                adapter="whatsapp",
+                headers=headers_for,
+                hosts=hosts,
+                transport=transport,
+            )
+        except Exception as error:
+            self._logger.error("Failed to download media", {"mediaId": media_id})
+            if isinstance(error, NetworkError):
+                raise
+            raise NetworkError("whatsapp", f"Failed to download media {media_id}", error) from error
 
     async def post_message(
         self,
@@ -1272,6 +1325,31 @@ class WhatsAppAdapter:
         Files and attachments go out as media messages (see
         :meth:`_post_message_with_media`).
         """
+        return await self._send(thread_id, message)
+
+    async def reply(
+        self,
+        thread_id: str,
+        message_id: str,
+        message: AdapterPostableMessage,
+    ) -> RawMessage:
+        """Send ``message`` as a contextual reply to ``message_id``.
+
+        The first outgoing message (first text chunk, first media item, or
+        the interactive card) carries ``context.message_id``; any further
+        messages of the same post do not.
+
+        See: https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages#contextual-replies
+        """
+        return await self._send(thread_id, message, message_id)
+
+    async def _send(
+        self,
+        thread_id: str,
+        message: AdapterPostableMessage,
+        reply_id: str | None = None,
+    ) -> RawMessage:
+        """Shared body of :meth:`post_message` and :meth:`reply`."""
         decoded = self.decode_thread_id(thread_id)
         user_wa_id = decoded.user_wa_id
         # Resolve the route once per logical post; the send helpers reuse it
@@ -1288,6 +1366,7 @@ class WhatsAppAdapter:
                 user_wa_id,
                 message,
                 media_items,
+                reply_id=reply_id,
                 recipient=recipient,
             )
 
@@ -1302,12 +1381,15 @@ class WhatsAppAdapter:
             if result.get("type") == "interactive":
                 interactive_raw = cast(WhatsAppCardResultInteractive, result)["interactive"]
                 interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
-                return await self._send_interactive_message(thread_id, user_wa_id, interactive, recipient)
+                return await self._send_interactive_message(
+                    thread_id, user_wa_id, interactive, recipient, reply_id=reply_id
+                )
             return await self._send_text_message(
                 thread_id,
                 user_wa_id,
                 convert_emoji_placeholders(cast(WhatsAppCardResultText, result)["text"], "whatsapp"),
                 recipient,
+                reply_id=reply_id,
             )
 
         # Regular text message
@@ -1315,7 +1397,7 @@ class WhatsAppAdapter:
             self._format_converter.render_postable(message),
             "whatsapp",
         )
-        return await self._send_text_message(thread_id, user_wa_id, body, recipient)
+        return await self._send_text_message(thread_id, user_wa_id, body, recipient, reply_id=reply_id)
 
     async def _post_message_with_media(
         self,
@@ -1324,6 +1406,7 @@ class WhatsAppAdapter:
         message: AdapterPostableMessage,
         media_items: list[FileUpload | Attachment],
         *,
+        reply_id: str | None = None,
         recipient: _WhatsAppRecipient | None = None,
     ) -> RawMessage:
         """Send one or more media messages, optionally followed by a card.
@@ -1335,6 +1418,8 @@ class WhatsAppAdapter:
         them, while a text-fallback card (plus its link-button lines) is the
         caption.
         """
+        # Only the first message sent carries the reply context.
+        remaining_id = reply_id
         card = extract_card(message)
         # cta_url promotion is disabled alongside media: the text fallback
         # captions the media in a single send, whereas an interactive
@@ -1369,7 +1454,8 @@ class WhatsAppAdapter:
         )
 
         if use_separate_text:
-            await self._send_text_message(thread_id, user_wa_id, text, recipient)
+            await self._send_text_message(thread_id, user_wa_id, text, recipient, reply_id=remaining_id)
+            remaining_id = None
 
         result: RawMessage | None = None
 
@@ -1385,21 +1471,28 @@ class WhatsAppAdapter:
                 media.payload,
                 caption=caption,
                 filename=media.filename,
+                reply_id=remaining_id,
                 recipient=recipient,
             )
+            remaining_id = None
 
         if card_result is not None:
             if card_result.get("type") == "interactive":
                 interactive_raw = cast(WhatsAppCardResultInteractive, card_result)["interactive"]
                 interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
-                result = await self._send_interactive_message(thread_id, user_wa_id, interactive, recipient)
+                result = await self._send_interactive_message(
+                    thread_id, user_wa_id, interactive, recipient, reply_id=remaining_id
+                )
+                remaining_id = None
             elif len(text) == 0:
                 result = await self._send_text_message(
                     thread_id,
                     user_wa_id,
                     convert_emoji_placeholders(cast(WhatsAppCardResultText, card_result)["text"], "whatsapp"),
                     recipient,
+                    reply_id=remaining_id,
                 )
+                remaining_id = None
 
         if result is None:
             raise RuntimeError("WhatsApp media message did not return a result")
@@ -1461,6 +1554,7 @@ class WhatsAppAdapter:
         *,
         caption: str | None = None,
         filename: str | None = None,
+        reply_id: str | None = None,
         recipient: _WhatsAppRecipient | None = None,
     ) -> RawMessage:
         """Send a media message (image, document, video, or audio)."""
@@ -1485,6 +1579,7 @@ class WhatsAppAdapter:
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
                 **addressing,
+                **_reply_context(reply_id),
                 "type": media_type,
                 media_type: media_object,
             },
@@ -1594,6 +1689,8 @@ class WhatsAppAdapter:
         to: str,
         text: str,
         recipient: _WhatsAppRecipient | None = None,
+        *,
+        reply_id: str | None = None,
     ) -> RawMessage:
         """Send a single text message via the Cloud API."""
         addressing = recipient if recipient is not None else await self._recipient(thread_id, to)
@@ -1603,6 +1700,7 @@ class WhatsAppAdapter:
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
                 **addressing,
+                **_reply_context(reply_id),
                 "type": "text",
                 "text": {"preview_url": False, "body": text},
             },
@@ -1634,15 +1732,22 @@ class WhatsAppAdapter:
         to: str,
         text: str,
         recipient: _WhatsAppRecipient | None = None,
+        *,
+        reply_id: str | None = None,
     ) -> RawMessage:
-        """Send a text message, splitting into multiple if it exceeds the limit."""
+        """Send a text message, splitting into multiple if it exceeds the limit.
+
+        Only the first chunk carries ``reply_id``'s reply context.
+        """
         chunks = split_message(text)
         # Resolve the route once so chunked sends share a single lookup.
         resolved = recipient if recipient is not None else await self._recipient(thread_id, to)
         result: RawMessage | None = None
 
-        for chunk in chunks:
-            result = await self._send_single_text_message(thread_id, to, chunk, resolved)
+        for index, chunk in enumerate(chunks):
+            result = await self._send_single_text_message(
+                thread_id, to, chunk, resolved, reply_id=reply_id if index == 0 else None
+            )
 
         assert result is not None
         return result
@@ -1653,6 +1758,8 @@ class WhatsAppAdapter:
         to: str,
         interactive: WhatsAppInteractiveMessage,
         recipient: _WhatsAppRecipient | None = None,
+        *,
+        reply_id: str | None = None,
     ) -> RawMessage:
         """Send an interactive message (buttons or list) via the Cloud API."""
         addressing = recipient if recipient is not None else await self._recipient(thread_id, to)
@@ -1662,6 +1769,7 @@ class WhatsAppAdapter:
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
                 **addressing,
+                **_reply_context(reply_id),
                 "type": "interactive",
                 "interactive": interactive,
             },
@@ -1980,16 +2088,36 @@ class WhatsAppAdapter:
         """Render formatted content to WhatsApp markdown."""
         return self._format_converter.from_ast(content)
 
-    async def mark_as_read(self, message_id: str) -> None:
-        """Mark an inbound message as read."""
-        await self._graph_api_request(
+    async def mark_as_read(
+        self,
+        thread_id_or_message_id: str,
+        message_id: str | None = None,
+        message: Message | None = None,
+    ) -> None:
+        """Mark an inbound message as read.
+
+        Called by ``Thread.mark_as_read()`` as ``(thread_id, message_id,
+        message)``; the one-argument form ``mark_as_read(message_id)`` still
+        works, as upstream's ``messageId ?? threadIdOrMessageId``.
+
+        Raises :class:`AdapterError` unless the Graph API answers
+        ``success: true``.
+
+        See: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/mark-messages-as-read
+        """
+        response = await self._graph_api_request(
             f"/{self._phone_number_id}/messages",
             {
                 "messaging_product": "whatsapp",
                 "status": "read",
-                "message_id": message_id,
+                "message_id": message_id if message_id is not None else thread_id_or_message_id,
             },
         )
+
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream's
+        # ``!response.success`` is truthiness; only a JSON ``true`` counts here.
+        if not (isinstance(response, dict) and response.get("success") is True):
+            raise AdapterError("WhatsApp mark as read failed", "whatsapp")
 
     # =========================================================================
     # Private helpers

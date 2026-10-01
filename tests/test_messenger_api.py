@@ -383,6 +383,39 @@ class TestStartTyping:
 
 
 # ---------------------------------------------------------------------------
+# Read receipts (port of describe("markAsRead"))
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPostSession:
+    """aiohttp-like session that records each POST's URL and JSON body."""
+
+    closed = False
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, Any]] = []
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        self.posts.append((url, kwargs.get("json")))
+        return _FakeResponse(200, {"recipient_id": RECIPIENT_ID})
+
+
+class TestMarkAsRead:
+    @pytest.mark.asyncio
+    async def test_sends_the_mark_seen_sender_action(self) -> None:
+        adapter = _make_adapter()
+        session = _RecordingPostSession()
+        adapter._http_session = session
+
+        await adapter.mark_as_read(THREAD_ID, "mid.1")
+
+        assert len(session.posts) == 1
+        url, body = session.posts[0]
+        assert "me/messages" in url
+        assert body == {"recipient": {"id": RECIPIENT_ID}, "sender_action": "mark_seen"}
+
+
+# ---------------------------------------------------------------------------
 # Unsupported operations
 # ---------------------------------------------------------------------------
 
