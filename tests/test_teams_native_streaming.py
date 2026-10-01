@@ -821,6 +821,8 @@ class TestFirstChunkIdWait:
         from chat_sdk.adapters.teams import adapter as adapter_module
 
         monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        # The fake never fires ``chunk``, so the settled result's id is used.
+        monkeypatch.setattr(adapter_module, "STREAM_SETTLED_CHUNK_ID_TIMEOUT_S", 0.05)
         adapter = _make_adapter()
         tid = _dm_thread_id(adapter)
         streamer = self._silent_streamer(_SentActivity("late-stream-1"))
@@ -965,7 +967,8 @@ class TestFirstChunkIdWait:
     @pytest.mark.asyncio
     async def test_real_sdk_slow_first_flush_is_not_duplicated(self, monkeypatch: pytest.MonkeyPatch):
         """The first flush is still in flight when the bound expires: the
-        reply is finalized as a stream, never also posted."""
+        reply is finalized as a stream, never also posted, and keeps the id
+        Teams assigned to the first chunk."""
         import httpx
 
         from chat_sdk.adapters.teams import adapter as adapter_module
@@ -977,7 +980,9 @@ class TestFirstChunkIdWait:
             requests.append(body)
             if len(requests) == 1:
                 await asyncio.sleep(0.3)
-            return httpx.Response(200, json={"id": "stream-msg-1"})
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            # Teams returns the id only on the first streaming response.
+            return httpx.Response(200, json={})
 
         adapter = _real_sdk_adapter(handler)
         tid = _dm_thread_id(adapter)

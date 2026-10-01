@@ -123,6 +123,9 @@ TARGETED_ACTIVITY_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
 # ``HttpStream`` close wait.
 # Divergence from upstream — see docs/UPSTREAM_SYNC.md (first-chunk wait).
 STREAM_FIRST_CHUNK_ID_TIMEOUT_S = 30.0
+# After a timed-out stream is settled with a delivered chunk, the bound on
+# waiting for the SDK's background ``chunk`` handler to record that chunk's id.
+STREAM_SETTLED_CHUNK_ID_TIMEOUT_S = 1.0
 # Common Chat SDK names that differ from Teams reaction IDs (upstream
 # TEAMS_REACTION_ALIASES). Other names pass through as native Teams IDs.
 _TEAMS_REACTION_ALIASES: dict[str, str] = {
@@ -2937,7 +2940,10 @@ class TeamsAdapter:
         # canceled before any chunk was delivered (which would hang forever).
         if accumulated and not stream.canceled:
             try:
-                message_id = await asyncio.wait_for(id_captured, STREAM_FIRST_CHUNK_ID_TIMEOUT_S)
+                # Shielded so a timeout leaves the capture alive: a first chunk
+                # that lands while ``close()`` settles the stream still records
+                # its id (Teams returns the id only on the first response).
+                message_id = await asyncio.wait_for(asyncio.shield(id_captured), STREAM_FIRST_CHUNK_ID_TIMEOUT_S)
             except StreamCancelledError:
                 self._logger.debug(
                     "Teams stream canceled before first chunk delivered",
@@ -2963,7 +2969,16 @@ class TeamsAdapter:
                         )
                         return RawMessage(id="", thread_id=thread_id, raw={"text": accumulated})
                     if settled is not None:
-                        message_id = getattr(settled, "id", "") or ""
+                        # A settled stream means the first chunk was delivered,
+                        # and its id is the message id (the final response may
+                        # carry none). The SDK runs async ``chunk`` handlers as a
+                        # background task, so give the capture a moment to land.
+                        try:
+                            message_id = await asyncio.wait_for(
+                                asyncio.shield(id_captured), STREAM_SETTLED_CHUNK_ID_TIMEOUT_S
+                            )
+                        except asyncio.TimeoutError:
+                            message_id = getattr(settled, "id", "") or ""
                     elif not stream.canceled:
                         # Nothing reached the user: deliver the text with one
                         # buffered post instead of dropping the reply.
