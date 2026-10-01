@@ -3387,6 +3387,9 @@ class SlackAdapter:
 
             # Parse the pre-edit snapshot through the same async path as the
             # new message so mentions render identically on both sides.
+            # Upstream parity (chat@4.41.1 adapter-slack index.ts:3670-3675):
+            # the snapshot inherits only channel / channel_type / type, not
+            # team / team_id (unlike ``normalized`` and the delete path).
             async def _parse_previous() -> Message:
                 snapshot: dict[str, Any] = {
                     **before,
