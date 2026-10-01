@@ -20,15 +20,16 @@ Each item names the wave issues; their entries under "Wave PRs" below have the d
 - **New lifecycle and API surface (additive).** `on_message_updated` / `on_message_deleted`, `on_installed` / `on_uninstalled`, app-context and agent-session events (#196, #201, #211, #215, #217); `chat.history` (#197); `Thread.reply` / `Thread.mark_as_read` (#200); turn cancellation (`chat.abort_turn`, `thread.signal`, #201); Slack `agent_view` and Agent Sessions (#214, #215); cards `Chart`, table options, tooltips, `DateInput` / `NumberInput` (#202, #212, #220); Telegram albums and media groups (#227, #278); WhatsApp templates, media and read receipts (#237, #238, #239).
 - **Dependencies.** The `[teams]` extra allows `microsoft-teams-{apps,api,cards,common}` `>=2.0.13,<2.2` (#250).
 
-### Pending live checks before publishing
+### Live validation (2026-10-01)
 
-The maintainer runs these against a live workspace before tagging and publishing 0.4.41 (release gate in #184). This PR does not tag, release or publish.
+Run on chinchill's customer-demo Slack app: `oss/agent-framework` plus the 0.4.41 adoption at `@0fd3cc3`, with a test-only 20 s stream-segment cap. Every live Slack result below was re-checked independently against Slack and Logfire. The Teams and Agent Sessions items were not run live. Demo was restored afterwards.
 
-- [ ] **Teams on SDK 2.1** (#262 / #250): native DM streaming, `edit_message` and `delete_message` on `microsoft-teams-apps` 2.1.x.
-- [ ] **Slack streamed mentions** (#206): a streamed `@name` for a cached user becomes a real `<@U…>` ping on the native stream.
-- [ ] **Slack stream rotation past 5 minutes** (#208): a native stream longer than `stream_segment_max_age_ms` continues in a new message without losing text.
-- [ ] **Slack `agent_view` Stop button** (#215): clicking Stop aborts the running turn and sets the session `active`.
-- [ ] Pre-publish git-ref smoke test of downstream consumers (chinchill) against the release commit, as for 0.4.30/0.4.31.
+- [x] **Slack streamed mentions** (#206): a streamed `@Patrick` became `<@U0917L892RX>` on the native stream path; code spans and URLs were left untouched.
+- [x] **Slack stream rotation** (#208): one reply split into two consecutive messages. Every `startStream`/`appendStream`/`stopStream` call returned 200, with no `message_not_in_streaming_state` and no lost or duplicated text. Rotation is by age only, so a long reply that streams fast can still hit Slack `msg_too_long`. Upstream has the same gap; it's tracked in #310, not a 0.4.41 regression.
+- [x] **Downstream git-ref smoke test (chinchill)**: on both `main` and `oss/agent-framework`, chinchill's chat_sdk boundary suites (743 and 1004 tests) and CI Tests/Lint passed.
+- [x] Basic native streaming, outbound markdown/code rendering, DMs, and a Logfire error sweep: all clean. Inbound mrkdwn normalization was not covered by a dedicated live check; it is covered by the ported tests.
+- **Teams on SDK 2.1** (#262 / #250): **not live-verified**, because no Teams tenant is available. The full suite passes on `microsoft-teams-apps` 2.1.0, and the Teams and fixture-replay suites also pass on 2.0.16 and 2.0.13.4.
+- **Slack Agent Sessions native Stop** (#215): **not live-verified**. It is opt-in and only runs with a Slack app that has the Agent messaging experience enabled and `agent_view=True`; chinchill enables neither. Covered by the ported upstream tests.
 
 ### Wave PRs
 
