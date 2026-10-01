@@ -733,8 +733,9 @@ class TestIgnoredSubtypes:
     @pytest.mark.parametrize(
         "subtype",
         [
-            "message_changed",
-            "message_deleted",
+            # message_changed / message_deleted are not ignored: they dispatch
+            # to the lifecycle handlers (see TestMessageSubtypes in
+            # test_slack_webhook.py).
             "message_replied",
             "channel_join",
             "channel_leave",
@@ -764,6 +765,8 @@ class TestIgnoredSubtypes:
         req = _make_signed_request(body)
         await adapter.handle_webhook(req)
         assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+        assert not chat.process_message_deleted.called
 
 
 # ---------------------------------------------------------------------------

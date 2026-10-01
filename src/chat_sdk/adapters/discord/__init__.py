@@ -5,9 +5,15 @@ from chat_sdk.adapters.discord.cards import (
     decode_discord_custom_id,
     encode_discord_custom_id,
 )
+from chat_sdk.adapters.discord.types import (
+    DiscordInteractionFlagsContext,
+    DiscordInteractionResponseFlag,
+)
 
 __all__ = [
     "DiscordAdapter",
+    "DiscordInteractionFlagsContext",
+    "DiscordInteractionResponseFlag",
     "create_discord_adapter",
     "decode_discord_custom_id",
     "encode_discord_custom_id",
