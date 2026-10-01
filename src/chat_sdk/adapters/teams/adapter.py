@@ -147,6 +147,20 @@ _TEAMS_REACTION_TYPE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _background_tasks: set[asyncio.Task[Any]] = set()
 
 
+def _stream_send_in_flight(stream: Any) -> bool:
+    """Whether the SDK ``HttpStream`` still has queued or in-flight content.
+
+    The SDK exposes no public flag for an in-flight flush, so this reads
+    ``HttpStream._lock`` (held for the whole flush, including retries; present
+    on every supported ``microsoft-teams-apps`` version). A streamer without
+    it counts as idle.
+    """
+    if getattr(stream, "count", 0):
+        return True
+    lock = getattr(stream, "_lock", None)
+    return isinstance(lock, asyncio.Lock) and lock.locked()
+
+
 def _resolve_teams_reaction_type(emoji: EmojiValue | str) -> str:
     """Map an emoji to a Teams reaction ID (upstream ``resolveTeamsReactionType``).
 
@@ -2979,9 +2993,20 @@ class TeamsAdapter:
                             )
                         except asyncio.TimeoutError:
                             message_id = getattr(settled, "id", "") or ""
+                    elif _stream_send_in_flight(stream):
+                        # close() gave up waiting while a flush is still in
+                        # flight (the SDK client has no request timeout). It
+                        # may still deliver, and the handler's close() will
+                        # finalize it, so posting now could send the reply
+                        # twice.
+                        self._logger.warn(
+                            "Teams stream first chunk still in flight; not posting a fallback",
+                            {"threadId": thread_id},
+                        )
                     elif not stream.canceled:
-                        # Nothing reached the user: deliver the text with one
-                        # buffered post instead of dropping the reply.
+                        # Nothing reached the user and nothing is in flight:
+                        # deliver the text with one buffered post instead of
+                        # dropping the reply.
                         self._logger.warn(
                             "Teams stream delivered no chunk; posting the reply as one message",
                             {"threadId": thread_id},

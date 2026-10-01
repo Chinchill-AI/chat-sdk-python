@@ -1002,6 +1002,47 @@ class TestFirstChunkIdWait:
         assert await stream.close() is not None
         assert len(requests) == 2
 
+    @pytest.mark.asyncio
+    async def test_real_sdk_flush_outlasting_close_is_not_also_posted(self, monkeypatch: pytest.MonkeyPatch):
+        """The first flush is still in flight after both the first-chunk bound
+        and ``close()``'s own wait: no buffered post is sent, because the SDK
+        can still deliver the stream (the SDK client has no request timeout),
+        and the handler's later ``close()`` finalizes it."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+        release = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await release.wait()
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            return httpx.Response(200, json={})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        stream._total_wait_timeout = 0.05  # type: ignore[attr-defined]  # the SDK's 30 s close() wait
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert [_is_stream_activity(r) for r in requests] == [True]
+        assert result.id == ""
+        # The flush completes later; the handler's close() finalizes the stream.
+        release.set()
+        stream._total_wait_timeout = 5  # type: ignore[attr-defined]
+        assert await stream.close() is not None
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
+
 
 # ---------------------------------------------------------------------------
 # Webhook-level lifecycle (end-to-end through _handle_message_activity)
