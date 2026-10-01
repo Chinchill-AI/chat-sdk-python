@@ -869,6 +869,13 @@ class TeamsAdapter:
         others fall back to :meth:`get_user`. Never raises: the lookup is
         bounded by ``INCOMING_USER_TIMEOUT_S`` (Python-only) and on any
         failure the message is dispatched without email.
+
+        The bound covers awaited I/O only. The SDK resolves the bot token
+        itself; on a cold cache, ``microsoft-teams-apps`` builds its MSAL
+        client synchronously (once per tenant, then cached), on the event
+        loop. Every outbound call (reply, typing, edit) already does this, so
+        the lookup only moves that one-time cost to the first inbound message.
+        Offloading SDK token internals is out of scope here.
         """
         aad_object_id = (activity.get("from") or {}).get("aadObjectId")
         user_id = message.author.user_id
