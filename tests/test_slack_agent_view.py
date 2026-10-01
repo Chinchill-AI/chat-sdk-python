@@ -323,6 +323,10 @@ class TestAgentViewDmThreading:
         await _dispatch(adapter, _dm_message())
 
         assert chat.process_message.call_args.args[1] == "slack:D1:"
+        # The parsed message carries the routed thread ID too (not the
+        # per-message ``slack:D1:1771.99``).
+        message = await chat.process_message.call_args.args[2]()
+        assert message.thread_id == "slack:D1:"
 
     # TS: "keeps DM top-level messages conversation-scoped without agentView"
     async def test_keeps_dm_top_level_messages_conversation_scoped_without_agentview(self):
@@ -468,6 +472,7 @@ class TestAgentViewBridgeErrors:
     # TS: "keeps Slack failures handled without a waitUntil callback"
     async def test_keeps_slack_failures_handled_without_a_waituntil_callback(self):
         chat, _ = _real_chat()
+        logger = chat.get_adapter("slack")._logger  # type: ignore[union-attr]
         handler = AsyncMock(side_effect=RuntimeError("Database admission failed"))
         chat.on_direct_message(handler)
         loop = asyncio.get_running_loop()
@@ -486,6 +491,9 @@ class TestAgentViewBridgeErrors:
             assert response["status"] == 200
             # The bridge swallowed the failure: no "exception was never retrieved".
             assert unhandled == []
+            # ... and did not re-raise it (only done with a wait_until to observe it).
+            assert [c[0] for c in logger.warn.calls] == ["Agent view DM processing failed"]
+            assert [c for c in logger.debug.calls if c[0] == "Agent view DM bridge re-raised a handler error"] == []
         finally:
             loop.set_exception_handler(None)
             await chat.shutdown()
@@ -632,6 +640,49 @@ class TestConfiguredSuggestedPrompts:
 
         assert resolver.await_args.args[0].team_id == "T_AUTH"
 
+    # Python-specific (upstream normalizes separately, index.ts:4049-4062):
+    # a resolver mutating its context's entities must not change what the
+    # app_home_opened handlers see.
+    async def test_resolver_entities_are_not_shared_with_app_home_opened_event(self):
+        def resolver(ctx: SlackSuggestedPromptsContext) -> None:
+            assert ctx.entities is not None
+            ctx.entities.clear()
+
+        adapter, _, _ = await _prompts_setup(agent_view=True, suggested_prompts=resolver)
+        chat = adapter._chat
+
+        await _dispatch(
+            adapter, _home_opened_t123("messages", {"entities": [{"type": "slack#/types/channel_id", "value": "C42"}]})
+        )
+
+        event = chat.process_app_home_opened.call_args.args[0]  # type: ignore[union-attr]
+        assert event.entities == [AppContextChannelEntity(channel_id="C42")]
+
+    # Python-specific: as for the DM bridge, a host cancelling its wait_until
+    # awaitable must not cancel the prompts task (upstream promises cannot be
+    # cancelled).
+    async def test_cancelling_wait_until_does_not_drop_the_prompts(self):
+        release = asyncio.Event()
+
+        async def resolver(_ctx: SlackSuggestedPromptsContext) -> SlackSuggestedPromptsOptions:
+            await release.wait()
+            return SlackSuggestedPromptsOptions(prompts=[{"title": "Late", "message": "Still applied"}])
+
+        adapter, client, _ = await _prompts_setup(suggested_prompts=resolver)
+        tasks: list[Any] = []
+
+        await adapter.handle_webhook(
+            _signed(json.dumps(_assistant_thread_started())), WebhookOptions(wait_until=tasks.append)
+        )
+        await asyncio.sleep(0)
+        tasks[0].cancel()
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert tasks[0].cancelled()
+        assert [c["prompts"] for c in _prompt_calls(client)] == [[{"title": "Late", "message": "Still applied"}]]
+
     # TS: "skips setting prompts when the resolver returns null"
     async def test_skips_setting_prompts_when_the_resolver_returns_null(self):
         adapter, client, _ = await _prompts_setup(suggested_prompts=lambda _ctx: None)
@@ -752,6 +803,27 @@ class TestConfiguredLoadingMessages:
 
         client.assistant_threads_setStatus.assert_awaited_once_with(
             channel_id="D1", thread_ts="1.2", status="Typing...", loading_messages=["Typing..."]
+        )
+
+    # Python-specific (upstream ``loadingMessages ?? this.loadingMessages``):
+    # an explicit ``[]`` is not replaced by the config; empty lists are
+    # omitted from the request.
+    async def test_setassistantstatus_explicit_empty_loading_messages_skip_config(self):
+        adapter, client = _status_adapter(["Thinking..."])
+
+        await adapter.set_assistant_status("D1", "1.2", "working", [])
+
+        client.assistant_threads_setStatus.assert_awaited_once_with(channel_id="D1", thread_ts="1.2", status="working")
+
+    # Python-specific (upstream ``this.loadingMessages ?? ["Typing..."]``): a
+    # configured ``[]`` is sent as-is; the status still defaults to "Typing...".
+    async def test_starttyping_sends_configured_empty_loading_messages(self):
+        adapter, client = _status_adapter([])
+
+        await adapter.start_typing("slack:D1:1.2")
+
+        client.assistant_threads_setStatus.assert_awaited_once_with(
+            channel_id="D1", thread_ts="1.2", status="Typing...", loading_messages=[]
         )
 
     # Python-specific (upstream ``??`` parity): an explicit empty status is

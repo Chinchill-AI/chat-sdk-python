@@ -3389,7 +3389,10 @@ class SlackAdapter:
                     channel_id=event.get("channel", ""),
                     user_id=event.get("user", ""),
                     team_id=team_id,
-                    entities=entities,
+                    # Normalized again, as upstream does (index.ts:4049-4062):
+                    # the resolver and the app_home_opened handlers must not
+                    # share (and so mutate) one entities list.
+                    entities=normalize_app_context_entities(context) if _js_truthy(context) else None,
                 ),
                 options,
             )
