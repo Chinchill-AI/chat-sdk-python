@@ -3829,8 +3829,12 @@ class SlackAdapter:
             # Alert attachments link their title (e.g. the Sentry issue URL);
             # surface it so handlers can reach what the Slack UI links to.
             # Upstream parity (adapter-slack/src/index.ts:4466-4470): the
-            # preview carries no title, so ``_enrich_links`` may wait for an
-            # unfurl like it does for any untitled link.
+            # preview carries no title, so on a webhook ``_enrich_links`` may
+            # wait for an unfurl like it does for any untitled link. Fetched
+            # (history) messages wait too, but only because of the Python
+            # ``_unfurl_channel_for`` fallback (upstream returns at once there,
+            # index.ts:4704); that applies to every untitled link and is
+            # tracked with that divergence in docs/UPSTREAM_SYNC.md (#292).
             title_link = att.get("title_link")
             if isinstance(title_link, str) and title_link and not _is_foreign_attachment(att):
                 urls.add(title_link)
@@ -4306,7 +4310,7 @@ class SlackAdapter:
         # then fold in tables and attachment content (their mentions resolve
         # in one more lookup wave).
         text = await self._resolve_inline_mentions(raw_text)
-        formatted = await self._resolved_content(event, text, attachments)
+        formatted, plain_text = await self._resolved_content(event, text, attachments)
         author_id, is_system = self._author_fields(event)
 
         ts_str = event.get("ts", "0")
@@ -4325,7 +4329,7 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=ast_to_plain_text(formatted),
+            text=plain_text,
             formatted=formatted,
             raw=event,
             is_mention=is_mention,
@@ -4391,7 +4395,7 @@ class SlackAdapter:
         # Classified the same way as the async path, so an edit's pre-edit
         # snapshot cannot disagree with the edited message about it.
         is_mention = self._detect_self_mention(event, text, attachments)
-        formatted = self._content(event, text, attachments)
+        formatted, plain_text = self._content(event, text, attachments)
         author_id, is_system = self._author_fields(event)
         user_name = event.get("username") or event.get("user") or "unknown"
         full_name = event.get("username") or event.get("user") or "unknown"
@@ -4412,7 +4416,7 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=ast_to_plain_text(formatted),
+            text=plain_text,
             formatted=formatted,
             raw=event,
             is_mention=is_mention,
@@ -4445,10 +4449,11 @@ class SlackAdapter:
         event: dict[str, Any],
         text: str,
         attachments: list[_AttachmentContent] | None = None,
-    ) -> FormattedContent:
-        """The message's AST: body text, its tables and attachment content.
+    ) -> tuple[FormattedContent, str]:
+        """The message's AST (body text, its tables and attachment content) and plain text.
 
-        Upstream ``content`` (sync, no mention lookups).
+        Upstream ``content`` (sync, no mention lookups). See
+        :meth:`_assemble_content` for how the plain text is derived.
         """
         if attachments is None:
             attachments = [_attachment_content(a) for a in _author_attachments(event)]
@@ -4463,7 +4468,7 @@ class SlackAdapter:
         event: dict[str, Any],
         text: str,
         attachments: list[_AttachmentContent] | None = None,
-    ) -> FormattedContent:
+    ) -> tuple[FormattedContent, str]:
         """Like :meth:`_content`, resolving mentions in cells and attachments.
 
         Upstream ``resolvedContent``. User and channel mentions inside table
@@ -4507,16 +4512,35 @@ class SlackAdapter:
         text: str,
         tables: _EventTables,
         attachment_nodes: list[Content],
-    ) -> FormattedContent:
-        """Body AST with leading tables above it, then trailing tables and attachments."""
+    ) -> tuple[FormattedContent, str]:
+        """Body AST with leading tables above it, then trailing tables and attachments.
+
+        Returns ``(formatted, plain_text)``. Upstream derives ``message.text``
+        as ``toPlainText(formatted)``. Until #283 ports upstream's inbound
+        mrkdwn normalization (``slackMrkdwnToMarkdown``), our ``to_ast`` drops
+        code on a fence's opening line (the body ``"```npm test```"`` parses to
+        nothing), so the body's share of the plain text keeps the regex
+        ``extract_plain_text`` used before #210, and only the table and
+        attachment nodes go through ``ast_to_plain_text``. A message without
+        tables or attachments gets exactly the pre-#210 text. Otherwise the
+        pieces are joined with a blank line, skipping empty ones, as
+        ``toPlainText`` joins root children (the body loses trailing
+        whitespace there, as a parsed paragraph would). Temporary divergence:
+        #283 replaces this with ``ast_to_plain_text(formatted)``.
+        """
+        before = [self._table_node(data) for data in tables.leading]
+        after = [*(self._table_node(data) for data in tables.trailing), *attachment_nodes]
         formatted = self._format_converter.to_ast(text)
-        formatted["children"] = [
-            *(self._table_node(data) for data in tables.leading),
-            *formatted.get("children", []),
-            *(self._table_node(data) for data in tables.trailing),
-            *attachment_nodes,
+        formatted["children"] = [*before, *formatted.get("children", []), *after]
+        body = self._format_converter.extract_plain_text(text)
+        if not (before or after):
+            return formatted, body
+        pieces = [
+            *(ast_to_plain_text(node) for node in before),
+            body.rstrip(JS_WHITESPACE),
+            *(ast_to_plain_text(node) for node in after),
         ]
-        return formatted
+        return formatted, "\n\n".join(piece for piece in pieces if piece)
 
     def _attachment_nodes(self, content: _AttachmentContent) -> list[Content]:
         """Render one attachment's content to block nodes (upstream ``attachmentNodes``).

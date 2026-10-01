@@ -1093,15 +1093,17 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
 
 ### Slack inbound content: pasted tables and alert attachments (chat@4.38–4.39, #210)
 
-Parity, with no new divergence. Ports the Slack halves of `764e4759` (#817,
+Parity apart from one temporary divergence (the body's plain text, below,
+until #283). Ports the Slack halves of `764e4759` (#817,
 chat@4.38.1) and `864d9222` (#846, chat@4.39.0); the core `toPlainText` table
 rules were #193 and the `previous_message` hunk of #846 is #211.
 
 - **Content assembly.** Both parse paths build `formatted` from the body text
   plus `table` / `data_table` blocks (tables before the first non-table block
-  above the text, the rest below) plus each non-unfurl attachment's content,
-  and derive `text = ast_to_plain_text(formatted)` instead of
-  `extract_plain_text(event["text"])`. The helpers are module-level in
+  above the text, the rest below) plus each non-unfurl attachment's content.
+  `text` appends the tables' and attachments' `ast_to_plain_text` to the
+  body's plain text (see the #283 bullet for how the body's share is
+  derived). The helpers are module-level in
   `adapters/slack/adapter.py` (no separate module): `_block_text`,
   `_has_bold_text`, `_table_data`, `_event_tables`, `_attachment_content`,
   `_literal_phrasing`, `_collect_mention_ids`, `_apply_mention_names`, and the
@@ -1134,21 +1136,42 @@ rules were #193 and the `previous_message` hunk of #846 is #211.
   Python slices copy, so the upstream shape is quadratic (about 4 s on 200k
   characters of `<@U1>` tokens) now that it also runs over attachment text.
   Output is identical (fuzzed against the upstream-shaped versions).
-- **Depends on #283 (merge after it).** Upstream's `toAst` runs
+- **Temporary divergence until #283: the body's plain text.** Upstream
+  derives `text = toPlainText(formatted)`, and its `toAst` runs
   `slackMrkdwnToMarkdown`, which moves code after an opening fence onto its
-  own line, unescapes `&amp;` / `&lt;` / `&gt;` and renders `<!subteam^…>` as
-  `@…`. The Python `SlackFormatConverter.to_ast` does none of this yet (#283
-  ports it). Because `text` is now derived from `formatted`, a body like
-  `` ```npm test``` `` gives `text == ""` and a fenced block loses its first
-  line until #283 lands (the old regex `extract_plain_text` kept them;
-  `formatted` already lost them). Body text already showed the entities; table cells
-  and mrkdwn attachment parts now render through the same converter, so a
-  `raw_text` cell holding `R&D` or `<@U…>` (escaped by `_block_text`, as
-  upstream does) shows `R&amp;D` / `&lt;@U…&gt;`, and a usergroup cell shows
-  `<!subteam^S…>`. The "preserves rich text metadata within table cells" port
-  pins the current output with a comment; #283 should update it. Literal
-  attachment parts unescape on their own (`_literal_phrasing`) and are
-  unaffected.
+  own line, unescapes `&amp;` / `&lt;` / `&gt;`, renders `<!subteam^…>` as
+  `@…` and `<#C…|name>` as `#name (C…)`. The Python
+  `SlackFormatConverter.to_ast` does none of this yet (#283 ports it), so
+  deriving all of `text` from `formatted` would drop code from ordinary
+  messages (`` ```npm test``` `` would give `text == ""`). Until #283,
+  `_assemble_content` builds `text` as the blank-line join of the non-empty
+  plain texts of the leading tables, `extract_plain_text(body)` (the pre-#210
+  rendering, so a message without tables or attachments gets the same `text`
+  as before) and the trailing tables and attachment nodes. That is what
+  `toPlainText` does with root children, so only the body's share differs
+  from upstream. #283 replaces it with `ast_to_plain_text(formatted)` and
+  updates these assertions in `tests/test_slack_inbound_content.py`:
+  `test_body_text_keeps_its_pre_283_rendering` (to upstream's fence output),
+  `test_keeps_attachment_content_out_of_an_unclosed_code_fence_in_the_body`
+  (upstream's `"Deploy failed:\n\nTypeError: boom\n\n…"`),
+  `test_preserves_rich_text_metadata_within_table_cells` (upstream's
+  `"#C789 @S789 July 11 #ff0000"`) and
+  `test_resolves_user_and_channel_mentions_in_table_cells`
+  (`"@Test Bot\t#general (C789)"`).
+  Table cells and mrkdwn attachment parts go through `to_ast` already, so
+  until #283 they show the same gaps body `formatted` shows today: a cell
+  fence loses its opening line, a `raw_text` cell holding `R&D` or `<@U…>`
+  (escaped by `_block_text`, as upstream does) shows `R&amp;D` /
+  `&lt;@U…&gt;`, a usergroup cell shows `<!subteam^S…>` and a labelled
+  channel shows `#name`. That content was absent before #210. Literal
+  attachment parts unescape on their own (`_literal_phrasing`) and already
+  match upstream.
+- **`title_link` and the unfurl wait.** On a webhook, an untitled
+  `title_link` preview makes `_enrich_links` poll the unfurl cache (up to
+  2 s) exactly as upstream does. Fetched (history) messages poll too, only
+  because of the `_unfurl_channel_for` fallback in the divergence table; that
+  already applied to every untitled link in fetched messages and is tracked
+  there and in #292.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
@@ -2137,7 +2160,7 @@ stay explicit instead of being rediscovered in code review.
 | Slack legacy mrkdwn renderer (response_url surface only, post-#440) | `_node_to_mrkdwn` renders headings as `*bold*` and images as `{alt} ({url})` / bare URL | TS `nodeToMrkdwn` has no heading/image branches — both fall through to `defaultNodeToText`, dropping heading emphasis and image URLs | Pre-existing Python improvement; after vercel/chat#440 it affects only `to_response_url_text` (ephemeral edits via response_url). Preserves visual hierarchy and image URLs Slack would otherwise lose. |
 | Slack `api` primitives `send_slack_response_url` URL gate (vercel/chat#548; allowlist aligned with vercel/chat#876 in #205) | `send_slack_response_url` (`slack/api/__init__.py`) calls `_assert_slack_response_url(url)` before POSTing, which routes through the same `_is_trusted_slack_response_url` helper the high-level adapter uses, and raises `ValueError` for anything else | Upstream's **adapter** validates `response_url` since chat@4.40 (`isTrustedSlackResponseUrl`, vercel/chat#876 — checked at ephemeral-id encode, decode and before the send; the Python adapter ports that 1:1). Upstream's SDK-free `api/client.ts` `sendResponseUrl` still POSTs to whatever `response_url` it is handed, with no scheme/host validation | SSRF guard. The only remaining divergence is that the SDK-free primitive also validates. The `response_url` reaching this primitive can originate from a parsed-but-unverified interaction payload; without a gate a crafted value could redirect the POST (which carries no bearer token but does echo SDK-controlled message content and trigger an arbitrary outbound request) to another host. Enforces `CLAUDE.md`'s "Validate external URLs before requests (SSRF)" rule. Allowlist (shared with the adapter): scheme `https`, no userinfo, no explicit port, host exactly `hooks.slack.com` or `hooks.slack-gov.com` (set membership, never a suffix match; a non-numeric port is untrusted). The shared helper is marginally stricter than upstream's WHATWG-`URL` check on two edges Slack never emits: an explicit default port (`:443`) and an empty userinfo (`https://@hooks.slack.com/...`) are rejected, where `new URL()` normalizes both away. Before #205 this primitive accepted any `*.slack.com` host. Regression coverage: `tests/test_slack_api_primitives.py::TestSlackApiPrimitives::test_rejects_non_slack_response_urls`. |
 | Slack self-edit short-circuit on `message_changed` (#211; upstream `4ac04551`) | `_handle_message_changed` returns before building the parse factory when `_is_message_from_self(normalized)` is true (after unfurl caching and the hidden / no-change checks), with a `"Skipping message_changed from self"` debug log | `handleMessageChanged` always calls `processMessageUpdated`; core drops the bot's own edit only after resolving the `message` factory | Performance only; handlers see the same calls. Core's skip uses `author.is_me`, which `_parse_slack_message` computes with the same `_is_message_from_self(event)` and request context, so the check is identical. Skipping it here avoids a `users.info` lookup, a thread-participant state write and up to `_UNFURL_WAIT_MS` (2 s) of unfurl polling per streamed delta: post+edit and native streaming emit one `message_changed` per update. Pinned by `tests/test_slack_webhook.py::TestMessageLifecyclePythonSpecific::test_bot_own_edit_skips_user_lookup_and_update_dispatch`. |
-| Slack unfurl-cache channel for fetched messages (vercel/chat#877 port, #205) | `_parse_slack_message` passes `_unfurl_channel_for(event, thread_id)` to `_enrich_links`: `event["channel"]` when present, otherwise the channel decoded from the `thread_id` the message is parsed under | Upstream `parseSlackMessage` passes `event.channel` only. Messages from `conversations.history` / `conversations.replies` have no `channel` field, so upstream's `enrichLinks` returns early for every fetched message (`fetchMessage`, `fetchMessages`, channel history, `listThreads`) | Avoids a regression from pre-#205 Python, where the ts-only unfurl key let fetched messages pick up `message_changed` unfurl metadata. The fetch paths always build `thread_id` from the channel they queried, so the fallback names the same channel the `message_changed` writer keyed by; the installation scope still comes from the request ContextVar, so nothing crosses installations. Regression coverage: `tests/test_slack_api.py::TestFetchedMessagesKeepCachedUnfurls`. |
+| Slack unfurl-cache channel for fetched messages (vercel/chat#877 port, #205) | `_parse_slack_message` passes `_unfurl_channel_for(event, thread_id)` to `_enrich_links`: `event["channel"]` when present, otherwise the channel decoded from the `thread_id` the message is parsed under | Upstream `parseSlackMessage` passes `event.channel` only. Messages from `conversations.history` / `conversations.replies` have no `channel` field, so upstream's `enrichLinks` returns early for every fetched message (`fetchMessage`, `fetchMessages`, channel history, `listThreads`) | Avoids a regression from pre-#205 Python, where the ts-only unfurl key let fetched messages pick up `message_changed` unfurl metadata. The fetch paths always build `thread_id` from the channel they queried, so the fallback names the same channel the `message_changed` writer keyed by; the installation scope still comes from the request ContextVar, so nothing crosses installations. Regression coverage: `tests/test_slack_api.py::TestFetchedMessagesKeepCachedUnfurls`. Cost: a fetched message with any untitled link (a text URL, or since #210 an alert attachment's `title_link`) polls the cache for up to `_UNFURL_WAIT_MS` (2 s) where upstream returns at once; a page's parses are gathered, so it is about 2 s per page. Follow-up: #292 (read the cache once on the fallback path). |
 | Slack `api` primitives `fetch_slack_file` host allowlist (vercel/chat#548; token scoping vercel/chat `7c269653` #859, #213) | `fetch_slack_file(*, url, token, api_url=None, fetch=None)` (`slack/api/__init__.py`) first gates `url` through `is_trusted_slack_file_url(url, api_url=...)`, raising `ValueError` for untrusted hosts before the token is resolved. It then matches upstream: the token is resolved and sent only when `is_slack_auth_url(url, api_url)` (exact origin in `{https://files.slack.com, https://files.slack-gov.com, https://slack-files.com, https://slack-files-gov.com, https://slack.com, https://slack-gov.com}` or the `api_url` origin), and the raw response of the injected `fetch` is returned | Upstream `api/client.ts` `fetchSlackFile` (chat@4.39.0+) sends `Authorization` only for `isSlackAuthUrl` URLs and fetches every other URL without credentials; it does not use the guarded downloader either | Token-leak / SSRF guard: a crafted `url_private` is refused instead of fetched. Same allowlist as the adapter's `rehydrate_attachment` row. The primitive keeps upstream's contract (plain `fetch`, response returned) rather than moving onto `download_attachment`, which would change its return type and bypass the injectable `fetch`; the default `fetch` (httpx) does not follow redirects. Regression coverage: `tests/test_slack_api_primitives.py::TestSlackApiPrimitives::test_refuses_external_url_without_resolving_the_token` (upstream's "fetches external URL %s without bearer auth" cases), `::test_authenticates_file_urls_on_the_configured_api_origin`, `::test_fetches_allowlisted_non_auth_origin_without_resolving_the_token`. |
 | Slack `web_client_options` → slack_sdk `WebClient` kwargs (vercel/chat#8336a3e, chat@4.31) | `SlackAdapterConfig.web_client_options: dict[str, Any] \| None` is spread (gated on `is not None`, so an explicit `{}` still spreads as a no-op) into **both** WebClient construction sites — the default `AsyncWebClient` (`_get_client`) and the per-token sync `WebClient` (`_get_web_client_for_token`). The keys are **slack_sdk** `WebClient` constructor kwargs: `timeout` (int seconds), `retry_handlers` (a list of `slack_sdk.http_retry.RetryHandler`), `headers`, etc. Any nested `headers` dict is **deep-copied per client** (`_web_client_kwargs`) so cached per-token clients never share a mutable dict and the caller's input is never mutated. | Upstream `webClientOptions?: Omit<WebClientOptions, "slackApiUrl">` forwards to `@slack/web-api`'s axios-backed `WebClient`; its headline keys are `retryConfig` (a `retryPolicies.*` policy), `rejectRateLimitedCalls`, and `timeout` (ms). | No 1:1 mapping: `slack_sdk` has no `retryConfig`/`rejectRateLimitedCalls` (retry behavior is configured via `retry_handlers`) and its `timeout` is seconds, not ms. So the option bag maps to slack_sdk `WebClient` kwargs rather than axios options. Same intent (tune the underlying HTTP client the adapter doesn't otherwise expose) and same per-client header isolation. Documented inline in `slack/types.py` (`web_client_options` docstring) and `slack/adapter.py` (`_web_client_kwargs`). **Socket Mode (vercel/chat `6adca361` #916, #213):** upstream's `socketTransportOptions` forwards only `agent`, `tls` and `slackApiUrl` to `SocketModeClient`; Python's counterpart `_socket_client_kwargs` passes `web_client_options["proxy"]` as `SocketModeClient(proxy=...)` (the WebSocket) and a fresh `AsyncWebClient` built from the `proxy`/`ssl` subset plus `api_url` as `base_url` as `web_client=` (`apps.connections.open`). Headers, timeouts and retry handlers are not forwarded, as upstream. With none of them set the client gets only `app_token`, so slack_sdk still falls back to its `HTTPS_PROXY` env handling. Regression coverage: `tests/test_adapter_api_url_config.py::TestSlackWebClientOptions`, `tests/test_slack_socket_mode.py::TestSocketModeTransport`. |
 | Slack card/modal length limits and date check (#212; upstream `4717a384`, `0153a39f`) | The `data_table` 10,000-character cell budget, the 3,000-character ASCII fallback cut, and the chart title/label/axis-label limits count Python code points (`len`, slicing). A `DateInput` `initial_value` of `0000-MM-DD` is dropped with a warning (`datetime.date` has no year 0). | Counts UTF-16 code units (`.length`, `.slice`), so a character outside the BMP (most emoji) counts as 2; `new Date("0000-01-01T00:00:00Z")` round-trips, so year 0 is kept. | Near a limit, a table or chart with astral characters can render natively in Python where upstream falls back, or be cut a few characters later; Python's cut never splits a surrogate pair (upstream's can). Counting UTF-16 units would need a Python-only helper on every limit check. Slack's own datepicker cannot pick year 0. Breadcrumbs in `slack/cards.py` (`_convert_table_to_blocks`), `slack/blocks/__init__.py` (`_table_to_blocks`) and `slack/modals.py` (`_to_initial_date`). Regression tests: `tests/test_slack_cards.py::TestCardToBlockKitWithDataTables::test_counts_table_characters_in_code_points` and `tests/test_slack_modals.py::TestDateAndNumberInputs::test_drops_a_year_zero_initial_date`. |
