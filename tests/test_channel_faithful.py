@@ -1615,7 +1615,7 @@ class TestCallbackUrlProcessing:
     # card binds its tokens to the channel, not to the reported thread id.
     # Round trip with the real Slack id functions and the real block_actions
     # click, both for the synthetic `slack:C…:` post id Python reports today
-    # and for the `slack:C…:<ts>` id upstream 92530dd3 reports (#209). A DM
+    # and for the `slack:C…:<ts>` id upstream 92530dd3 reports (#283). A DM
     # click reports no ts, so a thread scope would miss it either way.
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
