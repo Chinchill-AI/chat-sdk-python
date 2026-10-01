@@ -445,16 +445,16 @@ The channel-edit divergence exists because the thread id reported for a
 channel post often never equals a click's thread id:
 - Teams and Google Chat `post_channel_message` return the channel id as the
   thread id (upstream too);
-- Slack `post_channel_message` returns the synthetic `slack:C…:` until #209
+- Slack `post_channel_message` returns the synthetic `slack:C…:` until #283
   ports upstream `92530dd3` (vercel/chat#720), while a click reports
-  `slack:C…:<message_ts>`. After #209 a Slack *DM* post reports
+  `slack:C…:<message_ts>`. After #283 a Slack *DM* post reports
   `slack:D…:<ts>`, but a DM click reports `slack:D…:` (Python's DM
   `_handle_block_actions` divergence), so a thread scope would still miss;
 - chained edits (`sent = await sent.edit(...)` twice), whose returned
   `SentMessage` dropped the thread-id override before #195 ported `16ea171e`
   (it now keeps it, so this reason no longer applies on its own).
 
-Binding to the channel resolves all of these, independent of #209's merge
+Binding to the channel resolves all of these, independent of #283's merge
 order, because every click on the message derives the same channel id.
 
 **Breaking for `callback_url` users:** tokens minted before the upgrade stop
@@ -903,7 +903,7 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   `None` and resolves with `is not None` (upstream `??`). Before this change the
   dataclass default `300000` always won and `0` fell through `or` to the
   constant. `0` now reaches the state adapter, and the bundled backends treat a
-  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #209.
+  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #283 (split from #209).
 - **`wait_until` and handler errors (`c21ccbc0`, `91683e52`).** Upstream hands
   `waitUntil` a `task.catch(log)` promise that fulfils when the handler fails.
   Python passed the raw task, so a host that awaited it saw handler errors
@@ -951,7 +951,7 @@ Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
     `isTeamsMention(): boolean`. Nothing outside `adapters/teams/webhook/` turns
     that payload into a `Message`, so it does not affect routing.
   - Telegram passes `is_bot_mentioned(...)` (a `bool`), as upstream, so a
-    Telegram `False` is definitive too. Slack's content-based `is_mention` is #209.
+    Telegram `False` is definitive too. Slack's content-based `is_mention` landed in #209.
   - Linear (#232): agent-session messages report `True`; ordinary comments
     (webhook, fetch and `parse_message`) leave `is_mention` unset, so a
     `@name` in a comment body still routes through text detection.
@@ -974,7 +974,7 @@ Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
   `None`. A `False` `isSystem` is still emitted, as upstream. `from_json`,
   `_message_from_json` and the `_rehydrate_message` dict fallback read
   `isSystem`, then `is_system`. `from_json_compat` reads snake_case first.
-  Population is per adapter: Teams email is #218, Slack `USLACK` is #209.
+  Population is per adapter: Teams email is #218; Slack `email` / `USLACK` landed in #209.
 - **`Message.reply_to` (`0f24cc30`)** is the last `Message` field, and is also
   on `MessageData` and `SentMessage`. `to_json` emits `replyTo` only when set.
   `from_json` / `from_json_compat` / `_message_from_json` recurse and pass an
@@ -1045,6 +1045,50 @@ Slack half of upstream `4717a384` (chat@4.34.0), `0153a39f` (chat@4.36.0) and
   "invalid_blocks")` with the original error as `__cause__`. Upstream throws a
   plain `Error` with `cause`; `AdapterError` is this SDK's adapter error base.
   Only the card path of `post_message` is wrapped, as upstream.
+
+### Slack inbound mentions and authors (chat@4.35–4.41, #209)
+
+Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
+`bb7cd124` (#716) and `80def3ab` (#707, chat@4.35.0), `51322dde` (#891) and
+`c2b6bff0` (#883, chat@4.40.0), and `683eadc1` (#947, chat@4.41.0). Part (b)
+(the mrkdwn normalization from `e71bfead` / `44423bdc` / `c3118279`, the
+`92530dd3` channel-post id and the `0b63791b` Socket Mode retries) is #283.
+
+- **Self mention (`51322dde`).** `_resolve_inline_mentions` no longer skips
+  the bot's id. `<@U_BOT>` resolves through `_lookup_user_name` like any other
+  user and falls back to the id when `users.info` fails. `skip_self_mention`
+  is gone from `_parse_slack_message`.
+- **Content-based `is_mention` (`683eadc1`).** `_detect_self_mention` runs on
+  the raw event before resolution, in both parse paths. The `app_mention`
+  override in `_handle_message_event` is gone. Blocks win over `text`.
+  Non-unfurl attachments are classified from their blocks, or else from their
+  legacy parts (`pretext` / `title` / `text` / `fields` / `fallback`); a part is
+  mrkdwn only when `mrkdwn_in` names it. With the bot id unknown, the result is
+  `True` for `app_mention` and `None` otherwise. This tri-state is never
+  collapsed with `or`. The bot id comes from the `bot_user_id` property, so a
+  multi-workspace request uses its `RequestContext.bot_user_id`. The attachment
+  extractor is a minimal private port of `attachmentContent` (blocks and
+  parts, no tables). Upstream builds the parts when `tables.length === 0`;
+  with no tables extracted that gate is always open, so parts are built even
+  beside blocks (detection ignores them there). #210 extends it for rendering
+  and restores the tables gate.
+- **Author (`c2b6bff0`, `bb7cd124`, `80def3ab`).** `user_id` is `user`, then
+  `bot_profile.user_id`, then `bot_id`. `_is_message_from_self` matches the bot
+  user id against `user or bot_profile.user_id`. `email` comes from the
+  `users.info` cache, in the async path only (as upstream). `is_system` is
+  `user == "USLACK"`. A non-dict `bot_profile` is ignored.
+- **Sync path.** `parse_message` classifies `is_mention` exactly as the async
+  path does. It does no lookups, so mentions stay `@U…` and `email` is unset,
+  as in upstream's sync path.
+- **Linear-time matching (an implementation detail, not a divergence).**
+  Results match upstream's. The mention token `/<@!?id(?:\|[^>]*)?>/i` is
+  matched as a prefix regex plus a tail check, because the single regex
+  backtracks quadratically on a run of unclosed `<@id|` tokens (about 1.3 s on
+  50k characters). `re.ASCII` limits `IGNORECASE` to ASCII folding, as JS `i`
+  does without `u`. The block walk uses an explicit stack, so deep nesting
+  cannot raise `RecursionError`.
+- **Known gap.** Table blocks do not render into `text` yet (#210), so two
+  ported table tests assert only `is_mention`.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
@@ -1151,6 +1195,79 @@ and the Teams part of `4cc3445c` (#779, chat@4.37.0). `d4c52cad` (#652) is
   was slower on its own worst case (`"<" * 160_000`: ~9 s).
 - **Divergences** (rows in the non-parity table): the per-URL client cache
   and `TeamsFormatConverter.to_ast` using the bounded stripper.
+
+### Telegram polling acknowledgement and incoming albums (chat@4.37–4.41, #227)
+
+Ports `629e6555` (vercel/chat#760, chat@4.37.0) and `91683e52`
+(vercel/chat#942, chat@4.41.0) in `adapters/telegram/adapter.py`. The core
+half of #942 (`WebhookOptions.deduplicate`, task-returning `process_*`)
+landed in #191. Outbound multi-file `sendMediaGroup` (`8d7ccdb1`, #605) is
+split out to #278.
+
+- `process_update` returns the list of dispatched handler tasks (message,
+  album, slash command, action, reactions). The webhook path ignores it.
+- **Albums.** A part with `media_group_id` skips slash-command routing and is
+  buffered under `telegram:incoming-media-group:{thread}:{media_group_id}`
+  (state lock 5 s TTL / 50 ms retry, buffer 30 s TTL, newest 10 parts). After
+  1 s with no new part, one `Message` is dispatched: id, raw, author and
+  metadata of the newest part (highest `message_id`), text and AST of the
+  first part with text, every attachment in `message_id` order, links
+  concatenated (`None` when no part has any), `is_mention` if any part
+  mentions the bot. `reply_to` is the first part's non-`None` `reply_to`, as
+  upstream; Telegram parsing does not populate it until #228. Typing starts once, for
+  the first part, after the album settles. On the webhook path the album task
+  is held in `_media_group_tasks` (no GC mid-settle); `wait_until` gets a
+  wrapper that never raises, a failure is logged as "Failed to process
+  incoming Telegram media group", and the task returned from `process_update`
+  still raises.
+- **Polling.** `polling_loop` follows upstream `pollingLoop` /
+  `processPollingUpdates` step for step: handler tasks are awaited (per
+  album, `asyncio.wait` + first error rethrown, so the handler tasks are
+  never cancelled by the loop) before `offset` moves; failures and unsettled
+  album parts are kept in `telegram:polling:{sha256(bot_user_id)}` as
+  `{"offset", "pending": [{"update", "receivedAt", "attempts", "retryAt"}]}`
+  (camelCase, JSON-safe raw update dicts); the retry delay is
+  `max(retry_delay_ms, 1000) * 2**(attempts-1)` capped at 30 s and at least
+  `AdapterRateLimitError.retry_after` seconds; the loop polls once between
+  ready retry batches (`drained`); `getUpdates` is cut short (no updates) when
+  the earliest pending deadline falls due, and asks with `timeout=0` when one
+  is already due. Polled updates are dispatched with
+  `WebhookOptions(deduplicate=False)`: the checkpoint, not core dedupe,
+  deduplicates them, so a retry is not dropped by the 10-minute dedupe window.
+  `_ensure_bot_identity` runs on every iteration, so a failed startup `getMe`
+  recovers once Telegram is reachable.
+- **Clock.** `receivedAt` / `retryAt` are epoch milliseconds
+  (`int(time.time() * 1000)`, upstream `Date.now()`), not monotonic, because
+  they are persisted and compared after a restart or on another instance. The
+  adapter reads time through `_now_ms()` and sleeps through `_sleep(ms)` so
+  tests can inject a fake clock.
+- **Python-specific: stop semantics.** Upstream's per-iteration
+  `AbortController` reaches only `getUpdates` and the loop's sleeps.
+  `stop_polling` therefore cancels the polling task only while it is parked
+  in one of those (`_polling_abortable`); while handlers run or the
+  checkpoint is written it waits for that step, and the loop then exits,
+  as upstream's `stopPolling` does. `stop_polling` waits with
+  `asyncio.wait` instead of `suppress(CancelledError)`, so cancelling the
+  caller still propagates. One divergence: a stop that lands while the loop
+  awaits `_ensure_bot_identity()` or the checkpoint `state.get` makes the
+  loop return before dispatching the ready retry batch. Upstream has no
+  `pollingActive` check there and still dispatches it; in Python that batch
+  could start handlers after `Chat.shutdown`'s cancellation sweep. The batch
+  stays in the checkpoint and is retried on the next start.
+- **Python-specific: cancelled handlers.** `Chat.shutdown` cancels in-flight
+  handler tasks before disconnecting adapters (upstream waits for them). A
+  cancelled handler task is counted as a failure, so the update stays in the
+  checkpoint and is retried after a restart instead of being acknowledged
+  unhandled. For the same reason `disconnect()` cancels albums still settling
+  (`_media_group_tasks`) before stopping the poller; otherwise an album could
+  dispatch a new handler after `Chat.shutdown`'s cancellation sweep and keep
+  `stop_polling` waiting on it.
+- **Album buffer key (parity).** The buffer key is not scoped to the bot
+  identity, exactly as upstream. Bots that share one state namespace must not
+  share a group chat (core `dedupe:` keys are not bot-scoped either).
+- Delivery is now at-least-once: an update whose handler finished but whose
+  acknowledgement never reached Telegram (a crash before the next
+  `getUpdates`) is delivered again, as upstream.
 
 ### Discord correctness and security (chat@4.32–4.41, #229)
 
@@ -1848,7 +1965,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
-| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #209 while clicks carry the message ts, a Slack DM click carries no ts even after #209 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #209), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
+| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #283 while clicks carry the message ts, a Slack DM click carries no ts even after #283 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
@@ -1950,8 +2067,8 @@ stay explicit instead of being rediscovered in code review.
 | Teams `User-Agent: Vercel.ChatSDK` outbound header | Not set on `aiohttp` calls | Propagated by `botbuilder` 2.0.8 | Python Teams adapter doesn't use `botbuilder` (raw `aiohttp`). Upstream's vercel/chat#415 was a JS-only `botbuilder` SDK bump that flipped `X-User-Agent` → `User-Agent`. No equivalent dependency to bump on the Python side. Setting a `User-Agent` on the ~9 outbound `aiohttp` call sites would be a defense-in-depth nice-to-have; deferred to a follow-up. |
 | Teams adapter on `microsoft-teams-apps` (official MS Python SDK) | Inbound webhook + JWT auth, outbound send/edit/delete/typing, and native DM streaming all delegate to the official `microsoft-teams-apps` SDK `App`; Graph reads stay hand-rolled over `aiohttp` | `@microsoft/teams.apps` owns the wire format, throttling, and activity routing | **Delivered in 0.4.30** (issue #93, PRs 1–4). The migration shipped as four PRs: inbound + auth (#143), outbound (#144), native streaming via the SDK `IStreamer` (#145), and this release cut. The 3.12 floor bump (#111) — the migration's prerequisite — landed in 0.4.29. The residual adapter-level divergences (we keep the SDK as auth + transport but route the authenticated activity ourselves; close the streamer in our own `finally` because our bridge owns dispatch) are documented in the Teams divergence rows above. Graph stays hand-rolled (no `msgraph-sdk` / `[graph]` extra). |
 | Telegram `get_user().is_bot` | Always `False` (matches upstream — `getChat` does not expose `is_bot`) | Always `false` (same caveat documented in upstream code comment) | The Telegram Bot API's `getChat` endpoint does not surface the `is_bot` field that's available on the `User` object inside incoming `Message` updates. Callers needing bot detection must use `message.author.is_bot` from webhooks instead of `chat.get_user(...).is_bot`. |
-| Telegram webhook verification + `update_id` dedupe (4.41 wave, #224) | **Parity** with upstream `c4a359e7` (vercel/chat#858, chat@4.39), `1d2b78d9` (#799, chat@4.38) and the bot-identity scope helper from `7a1150ce` (#813): webhook mode requires `secret_token` unless `allow_unverified_webhooks` / `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true`; each integer `update_id` is claimed as `telegram:webhook-update:{sha256(bot_user_id)}:{update_id}` (24h) before dispatch; state/identity failure → 503. Python-surface adaptations only: the `ValidationError` text names options in snake_case (`secret_token`, `allow_unverified_webhooks=True`); the shared `getMe` is an `asyncio.Task` awaited through `asyncio.shield` so a cancelled webhook does not cancel it for other waiters; `update_id` claiming mirrors `Number.isInteger`: an integral JSON float (`7.0`, `7e0` — floats under `json.loads`, the number 7 in JS) is normalised to `int` and shares the `...:7` key, while `bool` (an `int` subclass) and fractional floats are not claimed. **Deliberate Python divergence:** a non-`bool` `allow_unverified_webhooks` (e.g. the string `"false"`) raises `ValidationError` instead of being coerced truthy — upstream's TS `boolean` type rules this out at compile time, Python has no such guard and `bool("false")` would silently fail open. `secret_token` now resolves with `??` semantics (`is not None`), replacing the earlier `or` fallback, so an explicit `""` no longer silently picks up the env secret. **Deliberate Python divergence (fixes an upstream bug):** the `getMe` username is cached and reapplied on a repeat `initialize()` — upstream's `ensureBotIdentity` returns early once `webhookScope` is set, so after `initialize` re-applies `chat.getUserName()` the Telegram username is never restored and `@real_bot` / `/cmd@real_bot` stop routing after a shutdown + re-initialize. `allow_unverified_webhooks` is the *last* `TelegramAdapterConfig` field (not alphabetical) so positional callers are not shifted. | Same | Not ported here: the Vercel Connect async `bot_token` resolver (#189) and the polling checkpoint keyed on the same scope (#227). Cross-instance dedupe on Postgres relies on #240, which makes `set_if_not_exists` reclaim expired rows. |
-| Telegram inbound parsing, allowlist and typing (4.41 wave, #225) | **Parity** with upstream `4ee187ac` (#612), `2531a422` (#621, Telegram half), `0701679e` (#706, regex cache only), `54eea715` (#742), `53bf73db` (#752), `a0ba9868` (#835), `a18e7922` (#836) and the Telegram half of `b6fa24c6` (#865). Python-surface adaptations only, no behavior divergence beyond the mention-regex fold and the `allowed_user_ids` type check noted here: location coordinates and dice values go through `_js_number_str`, which renders a JSON number as JS `String()` does (`51.0` -> `"51"`, `1e-05` -> `"0.00001"`, `1.5e-07` -> `"1.5e-7"`), since `json.loads` keeps floats that JS prints differently; invoice amounts use `f"{amount / 10**e:.{e}f}"` for `toFixed(e)`; the mention pattern is `@{re.escape(name)}(?![A-Za-z0-9_-])` with `re.IGNORECASE`, because JS `\w` without the `u` flag is ASCII-only while Python's is Unicode (JS `/i` still folds non-ASCII letters, so `re.ASCII` is not used: `@ботик` matches `@БОТИК` on both sides; one residual difference is that Python's Unicode folding also equates the Kelvin sign with `k` and long s `ſ` with `s`, which JS's non-`u` canonicalization never maps onto ASCII, so `@` + U+212A + `bot` mentions a `kbot` in Python only); allowlist ids are stringified with the same `_js_number_str` (`456.0` -> `"456"`); a non-list `allowed_user_ids` (e.g. a bare `"123,456"` string, which Python would iterate per character, where upstream's `.map` throws) raises `ValidationError`; and the acting-user chain (`callback_query.from` -> `message_reaction.user` -> first non-`None` of `message`/`edited_message`/`channel_post`/`edited_channel_post` `.from`) uses `is not None` at every step; the typing action runs as an `asyncio` task created before `Chat.process_message`/`process_slash_command` schedules the handler task (JS fires the request synchronously; in Python both are tasks and run FIFO, so typing still goes first), is passed to `wait_until` when given and otherwise held in `_typing_tasks` so it is not garbage-collected (`disconnect()` cancels and awaits any still pending before closing the aiohttp session, so none reopens it); the download uses the shared aiohttp session with `ClientTimeout(total=30)` (covers the body read) and a running byte count over `response.content.iter_chunked`, raising `NetworkError`. It deliberately does **not** use `chat_sdk.shared.download` (#204): its HTTPS/public-address checks would break self-hosted Bot API servers, which upstream also exempts, and `read_attachment_body` decodes `Content-Encoding` itself while the shared aiohttp session already auto-decompresses. | Same | Not ported here: the media-group (album) path, which must also start typing and honour the allowlist, plus the `pollingGroup` allowlist check (#227); `reply_to_message` parsing and `mentionOnReply` (#228); `business_message.from` in the allowlist chain (#189). |
+| Telegram webhook verification + `update_id` dedupe (4.41 wave, #224) | **Parity** with upstream `c4a359e7` (vercel/chat#858, chat@4.39), `1d2b78d9` (#799, chat@4.38) and the bot-identity scope helper from `7a1150ce` (#813): webhook mode requires `secret_token` unless `allow_unverified_webhooks` / `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true`; each integer `update_id` is claimed as `telegram:webhook-update:{sha256(bot_user_id)}:{update_id}` (24h) before dispatch; state/identity failure → 503. Python-surface adaptations only: the `ValidationError` text names options in snake_case (`secret_token`, `allow_unverified_webhooks=True`); the shared `getMe` is an `asyncio.Task` awaited through `asyncio.shield` so a cancelled webhook does not cancel it for other waiters; `update_id` claiming mirrors `Number.isInteger`: an integral JSON float (`7.0`, `7e0` — floats under `json.loads`, the number 7 in JS) is normalised to `int` and shares the `...:7` key, while `bool` (an `int` subclass) and fractional floats are not claimed. **Deliberate Python divergence:** a non-`bool` `allow_unverified_webhooks` (e.g. the string `"false"`) raises `ValidationError` instead of being coerced truthy — upstream's TS `boolean` type rules this out at compile time, Python has no such guard and `bool("false")` would silently fail open. `secret_token` now resolves with `??` semantics (`is not None`), replacing the earlier `or` fallback, so an explicit `""` no longer silently picks up the env secret. **Deliberate Python divergence (fixes an upstream bug):** the `getMe` username is cached and reapplied on a repeat `initialize()` — upstream's `ensureBotIdentity` returns early once `webhookScope` is set, so after `initialize` re-applies `chat.getUserName()` the Telegram username is never restored and `@real_bot` / `/cmd@real_bot` stop routing after a shutdown + re-initialize. `allow_unverified_webhooks` is the *last* `TelegramAdapterConfig` field (not alphabetical) so positional callers are not shifted. | Same | Not ported here: the Vercel Connect async `bot_token` resolver (#189) and the polling checkpoint keyed on the same scope (#227, now ported: see the Telegram polling section above). Cross-instance dedupe on Postgres relies on #240, which makes `set_if_not_exists` reclaim expired rows. |
+| Telegram inbound parsing, allowlist and typing (4.41 wave, #225) | **Parity** with upstream `4ee187ac` (#612), `2531a422` (#621, Telegram half), `0701679e` (#706, regex cache only), `54eea715` (#742), `53bf73db` (#752), `a0ba9868` (#835), `a18e7922` (#836) and the Telegram half of `b6fa24c6` (#865). Python-surface adaptations only, no behavior divergence beyond the mention-regex fold and the `allowed_user_ids` type check noted here: location coordinates and dice values go through `_js_number_str`, which renders a JSON number as JS `String()` does (`51.0` -> `"51"`, `1e-05` -> `"0.00001"`, `1.5e-07` -> `"1.5e-7"`), since `json.loads` keeps floats that JS prints differently; invoice amounts use `f"{amount / 10**e:.{e}f}"` for `toFixed(e)`; the mention pattern is `@{re.escape(name)}(?![A-Za-z0-9_-])` with `re.IGNORECASE`, because JS `\w` without the `u` flag is ASCII-only while Python's is Unicode (JS `/i` still folds non-ASCII letters, so `re.ASCII` is not used: `@ботик` matches `@БОТИК` on both sides; one residual difference is that Python's Unicode folding also equates the Kelvin sign with `k` and long s `ſ` with `s`, which JS's non-`u` canonicalization never maps onto ASCII, so `@` + U+212A + `bot` mentions a `kbot` in Python only); allowlist ids are stringified with the same `_js_number_str` (`456.0` -> `"456"`); a non-list `allowed_user_ids` (e.g. a bare `"123,456"` string, which Python would iterate per character, where upstream's `.map` throws) raises `ValidationError`; and the acting-user chain (`callback_query.from` -> `message_reaction.user` -> first non-`None` of `message`/`edited_message`/`channel_post`/`edited_channel_post` `.from`) uses `is not None` at every step; the typing action runs as an `asyncio` task created before `Chat.process_message`/`process_slash_command` schedules the handler task (JS fires the request synchronously; in Python both are tasks and run FIFO, so typing still goes first), is passed to `wait_until` when given and otherwise held in `_typing_tasks` so it is not garbage-collected (`disconnect()` cancels and awaits any still pending before closing the aiohttp session, so none reopens it); the download uses the shared aiohttp session with `ClientTimeout(total=30)` (covers the body read) and a running byte count over `response.content.iter_chunked`, raising `NetworkError`. It deliberately does **not** use `chat_sdk.shared.download` (#204): its HTTPS/public-address checks would break self-hosted Bot API servers, which upstream also exempts, and `read_attachment_body` decodes `Content-Encoding` itself while the shared aiohttp session already auto-decompresses. | Same | The media-group (album) path, its typing and the `pollingGroup` allowlist check landed in #227 (see the Telegram polling section above). Not ported here: `reply_to_message` parsing and `mentionOnReply` (#228); `business_message.from` in the allowlist chain (#189). |
 | WhatsApp `get_user` | Raises `ChatNotImplementedError` (`Chat.get_user` translates to "does not support get_user") | Not implemented upstream either (no `getUser` on the WhatsApp adapter) | WhatsApp Cloud API has no user lookup endpoint — phone numbers are the only stable identifier and there's no equivalent of `users.info` exposed to business apps. Documented explicitly so callers don't expect parity with Slack/Teams/Discord. |
 | Messenger `get_user` | Raising stub (`ChatNotImplementedError`); a Graph-API-backed impl is tracked as issue #132 | No `getUser` method on the Messenger adapter | **Parity — upstream Messenger has no user-lookup method**; the Python raising stub matches. (Meta's Graph API *could* back a real implementation, unlike WhatsApp — hence #132 stays open as an enhancement.) |
 | Linear agent sessions | **Complete** (5-PR wave, **#151** — Wave D done). All five landed on `main`: L1 agent-session types (`LinearAgentSessionThreadId`, `LinearAgentSessionCommentRawMessage`, `mode`/`kind`), L2 the `:s:{session}` thread-id encode/decode, L3 the webhook PARSE + routing (`_parse_message_from_agent_session_event`, `_handle_agent_session_event`), L4 the agent-activity EMIT path (`post_message`/`start_typing`/`stream` session branches as raw GraphQL — see the "Linear agent-activity emit" divergence row above), and **L5 (this change)**: the agent-session FETCH path (`fetch_messages` → `_fetch_agent_session_messages`, the `edit_message`/`delete_message` append-only guards, and `fetch_thread` `agentSessionId` metadata as raw GraphQL — see the "Linear agent-session fetch" divergence row above). | Full agent-sessions support (`adapter-linear` 4.27.0, `bc94f0a`): parses agent-session webhook events into messages, emits agent activity, fetches the session thread, and routes the agent-session thread id | Largest single gap from the 0.4.30 audit; pre-existing (present since 0.4.29). Closed across the 4.31 wave — tracked in **#151**. |
