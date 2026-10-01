@@ -1269,6 +1269,63 @@ split out to #278.
   acknowledgement never reached Telegram (a crash before the next
   `getUpdates`) is delivered again, as upstream.
 
+### Telegram streaming and MarkdownV2 truncation (chat@4.32–4.41, #226)
+
+Ports `3bbf3ff5` (vercel/chat#822) and the Telegram half of `745fdf5a`
+(#826), both chat@4.38.0, and `f893470e` (#915, chat@4.41.0) in
+`adapters/telegram/adapter.py`. `937cac98` (#610, chat@4.32.0) was already
+ported; #915 replaced its helpers, and its cases are now covered by the
+#915 tests. `43dba3de` (#900, chat@4.40.0) was already equivalent in
+`flush_draft`, so only its test is ported.
+
+- **Streaming mode.** `stream()` uses the native draft bubble only when
+  `TelegramAdapterConfig.native_streaming` is true and the thread is a
+  private chat. Every other stream, DMs included by default, goes through
+  `_post_and_edit_stream`. `stream()` never returns `None`, so Telegram no
+  longer reaches the core `_fallback_stream`.
+- **Post-and-edit.** Port of upstream `postAndEditStream`. Edits are
+  `max(options.update_interval_ms, streaming_edit_interval_ms or floor)` ms
+  apart; the floor is 1100 ms for private chats and 3100 ms otherwise. The
+  placeholder is `"..."` when `StreamOptions.fallback_streaming_placeholder_text`
+  is `UNSET`. `None` means no placeholder: the first renderable text is
+  posted. A string, including `""`, is passed to `post_message`, which
+  rejects `""` as upstream does. An intermediate edit failure is logged
+  (`"Telegram stream edit failed"`); a 429 also blocks edits until
+  `retry_after` (default 1 s) has passed. The final edit waits
+  `max(blocked, pacing)`, retries once after a 429, and raises when the wait
+  or the 429's `retry_after` exceeds 5 s, or the retry fails. Every wait is
+  an inline `await self._sleep(ms)`, so cancelling the caller cancels the
+  stream.
+- **Python-surface adaptations (no behavior change).** Pacing reads
+  `_monotonic_ms()` (`time.monotonic()`), not the epoch `_now_ms()` the
+  polling checkpoint persists; both it and `_sleep` are overridable for
+  fake-clock tests. `streaming_edit_interval_ms` ignores `bool` (upstream's
+  `typeof` check) and non-finite values. A `retry_after` that is not a finite
+  number counts as missing (1 s), because Python would multiply a string by
+  1000 instead of failing.
+- **Truncation.** `truncate_for_telegram` returns text that fits the limit
+  unchanged for every parse mode. This removes the under-limit MarkdownV2
+  trim ported from chat#446 (`f46a6fb`): it could cut a valid rendered
+  message, for example at a backtick in a link URL. No send path depends on
+  it: all MarkdownV2 is rendered from an AST (plain strings and `raw` ship
+  with no parse mode), and a rejected message still falls back to plain text
+  through `with_telegram_markdown_fallback`. Over the limit,
+  `_trim_to_markdown_v2_safe_boundary` makes one `_scan_delimiters` pass
+  (upstream `scanDelimiters`). The pass skips escapes, code and link URLs,
+  pairs `__` separately from `_`, treats two trailing backticks as a cut
+  fence, and counts a bare `]` as closing a link unless it is the last
+  character. `find_unescaped_positions`,
+  `_find_unescaped_positions_outside_code` and
+  `_find_unclosed_link_dest_open_bracket` are removed, as upstream removed
+  `findUnescapedPositions`.
+- **No scanner divergence.** Positions index the Python `str` (code points)
+  where upstream's index UTF-16 units. They are only used to slice the same
+  string, and every delimiter is BMP, so the cuts match. The hard cut still
+  uses `_slice_to_utf16_units`.
+- **Test adaptation.** The Python parser has no GFM autolink literals, so
+  "preserves an autolinked bare URL containing a backtick" runs the trimmer on
+  the string upstream's renderer produces.
+
 ### Discord correctness and security (chat@4.32–4.41, #229)
 
 Parity with upstream `adapter-discord` at chat@4.41.1 for the webhook
@@ -2205,7 +2262,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams inbound activity routing (issue #93 PR 1) | `BridgeHttpAdapter.dispatch` feeds webhooks through the SDK `HttpServer` (JWT validation), but the adapter **overrides `app.server.on_request`** with `_dispatch_activity` instead of letting the SDK's default router run. Our callback dumps the lenient `CoreActivity` to a camelCase dict and routes by `type` to the existing handler logic. | Upstream `@chat-adapter/teams@4.30.0` registers `app.on("message" / "card.action" / …)` and lets `@microsoft/teams.apps` route via its typed dispatcher; handlers receive `ctx.activity` as a strongly-typed `IMessageActivity` etc. | The Python SDK's default `on_request` (`App._process_activity_event` → `ActivityProcessor.process_activity`) runs `ActivityTypeAdapter.validate_python` (strict per-activity validation — `recipient`/`id` required) **and** a live `api.users.token.get` network call inside `_build_context` before any handler fires. Minimal serverless webhook payloads (and the adapter's dict-based handler logic) can't survive strict validation, and the token fetch would make an unwanted outbound call per inbound activity. We keep the SDK as the **auth + transport** layer (JWT genuinely validated by its `TokenValidator`) but route the already-authenticated activity ourselves through the lenient `CoreActivity`, preserving the exact pre-migration handler behavior. The SDK `on_message`/`on_card_action`/… decorators are still registered for parity/forward-compat. Regression coverage: `tests/test_teams_extended.py::TestActivityTypes`, `tests/test_teams_coverage.py::TestSdkInboundAuth`, `tests/test_teams_bridge.py`. |
 | Teams dialog/modal inbound (issue #93 PR 1) | `on_dialog_open` / `on_dialog_submit` are registered on the SDK App but only cache user context (no `process_modal_submit`, no task-module response) | Upstream `@chat-adapter/teams@4.30.0` `handleDialogOpen`/`handleDialogSubmit` drive `chat.processModalSubmit` + `modalToAdaptiveCard` | The pre-migration Python Teams adapter never implemented modal/dialog inbound processing, so PR 1 (inbound + auth plumbing) preserves that behavior rather than introducing new modal handling. Wiring dialogs to `chat.process_modal_submit` is tracked as a later wave of the #93 migration. |
 | Teams dialog-open action options (4.41 wave, #191) | N/A: dialog-open inbound is not ported (see the row above), so there is no `process_action` call with `on_open_modal` to spread `WebhookOptions` into or to guard against a rejected action task | `c21ccbc0` spreads `...webhookOptions` into `handleDialogOpen`'s `processAction` call; `91683e52` resolves the empty dialog response when that action rejects | Lands with the dialog inbound wave of the #93 migration. The DM message path does spread the caller's options (see the native streaming row). |
-| Fallback streaming with whitespace-only streams (non-Teams adapters) | Placeholder cleared to `" "` on final edit | Placeholder left visible (`"..."` stuck) | Upstream 4.26 guards against empty edits but leaves the placeholder stranded on the message. We issue one final `edit_message(" ")` so the placeholder disappears when no real content was produced. Teams does not route through `_fallback_stream` (DMs stream natively through the SDK `IStreamer`; group chats accumulate-and-post), so this divergence applies only to Slack / Discord / GitHub / Telegram / Google Chat / Linear / WhatsApp. |
+| Fallback streaming with whitespace-only streams (non-Teams adapters) | Placeholder cleared to `" "` on final edit | Placeholder left visible (`"..."` stuck) | Upstream 4.26 guards against empty edits but leaves the placeholder stranded on the message. We issue one final `edit_message(" ")` so the placeholder disappears when no real content was produced. Teams does not route through `_fallback_stream` (DMs stream natively through the SDK `IStreamer`; group chats accumulate-and-post), so this divergence applies only to Slack / Discord / GitHub / Google Chat / Linear / WhatsApp. Telegram has streamed every chat through its own post-and-edit loop since the 4.41 wave (#226, vercel/chat#822); like upstream's, that loop leaves the `"..."` placeholder on a whitespace-only stream. |
 | Google Chat `<url\|text>` round-trip | `to_ast()` / `extract_plain_text()` parse the custom-label syntax back to a link node / bare label | `toAst()` / `extractPlainText()` leave `<url\|text>` as raw text (or parse the whole string as an autolink with a malformed URL) | Upstream 4.26 emits `<url\|text>` in `from_ast` but never taught the reverse direction to parse it. A message posted with `[label](url)` then read back through `fetch_messages` comes back as unstructured text (or worse, a link node with the full `url\|text` as its URL) in upstream. We close the round-trip via an AST placeholder substitution: each `<url\|text>` is extracted to a private-use sentinel, Markdown is parsed on the rest, and link nodes are injected where the sentinels landed. This avoids the Markdown parser's incomplete handling of balanced-parens link destinations, so URLs like `https://en.wikipedia.org/wiki/Foo_(bar)` round-trip intact. |
 | Restored thread/channel ownership (4.41 wave, #199) | `ThreadImpl.from_json` / `ChannelImpl.from_json` resolve ownership when called: an explicit `chat` with an explicit `adapter` it did not register raises `RuntimeError` ("does not belong to this Chat instance") before anything is built; an explicit `adapter` alone is matched against the active Chat at once (and again on access); modal-context restore binds the event's adapter with `chat=self` when this Chat registered it under any key, never the active singleton | `ChatBinding` resolves ownership on first access: the same error is thrown by the first state read or write, and the singleton is consulted only then | `chat.activate()` is scoped to a `contextvars.Context`, so a thread restored inside the block and used after it would find no Chat, or a different one, if ownership were resolved lazily. Raising in `from_json` also leaves an existing instance untouched on an idempotent rebind. Regression tests: `tests/test_chat_resolver.py::TestContextVarActivation::test_explicit_adapter_restored_inside_activate_keeps_its_owner`, `tests/test_serialization.py::TestThreadFromJsonFaithful::test_should_raise_before_rebinding_when_chat_does_not_own_the_adapter`, `::TestRestoredRuntimeOwnershipFixes::test_throws_for_an_explicit_chat_that_does_not_own_the_explicit_adapter` and `::TestRevivedStreamingConfiguration::test_modal_context_for_an_adapter_under_a_custom_key_stays_with_its_chat`. |
 | `from_json(data, adapter=X)` → `_adapter_name` | Updated to `X.name` so `to_json()` reflects the bound adapter | Kept at `json.adapterName`, so re-serialization can emit a name that no longer matches the actual adapter | Upstream TS has the same gap but only exposes it via the `fromJSON(json, adapter?)` overload. In Python we lean on this API more (explicit `chat=` / explicit `adapter=` is preferred over the singleton). We sync the name on rebind so runtime and serialize agree. |

@@ -78,6 +78,7 @@ from chat_sdk.shared.errors import (
 from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown, stringify_markdown
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     AdapterPostableMessage,
     Attachment,
@@ -91,6 +92,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
@@ -140,6 +142,15 @@ TELEGRAM_DEFAULT_POLLING_TIMEOUT_SECONDS = 30
 TELEGRAM_DEFAULT_POLLING_LIMIT = 100
 TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS = 1000
 TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS = 250
+# Post-and-edit streaming (vercel/chat#822, #826): minimum gap between edits
+# of the streamed message. Telegram allows roughly one edit per second in a
+# private chat and fewer in groups, so the floors sit just above that.
+TELEGRAM_DEFAULT_PRIVATE_STREAMING_EDIT_INTERVAL_MS = 1100
+TELEGRAM_DEFAULT_NON_PRIVATE_STREAMING_EDIT_INTERVAL_MS = 3100
+# The final edit of a stream waits out at most this long for a rate limit
+# before raising instead.
+TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS = 5000
+TELEGRAM_STREAM_PLACEHOLDER_TEXT = "..."
 # Incoming albums (vercel/chat#760): parts are buffered in state until no new
 # part has arrived for the settle window, then emitted as one message.
 TELEGRAM_INCOMING_MEDIA_GROUP_BUFFER_TTL_MS = 30_000
@@ -292,7 +303,8 @@ def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
 # MarkdownV2-safe truncation
 # ---------------------------------------------------------------------------
 #
-# Port of packages/adapter-telegram/src/markdown.ts (chat@4.27.0).
+# Port of packages/adapter-telegram/src/markdown.ts (chat@4.41.1,
+# vercel/chat#915).
 #
 # Naive ``slice + "..."`` produces invalid MarkdownV2: ``.`` is a reserved
 # character (must be escaped as ``\.``); a slice can leave an orphan
@@ -301,67 +313,57 @@ def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
 # leaving it unclosed. Telegram rejects all three with
 # ``Bad Request: can't parse entities``.
 #
-# These helpers walk back past unbalanced delimiters and orphan backslashes
-# before appending an escaped ellipsis. They also run on
-# under-the-limit MarkdownV2 inputs (per upstream f46a6fb / chat#446) so
-# streamed chunks that arrive with a transiently unpaired opener are
-# trimmed back to a parseable boundary.
+# Text that fits the limit is returned unchanged: the MarkdownV2 renderer
+# emits balanced entities, so there is nothing to repair, and a trim there
+# could only delete valid content (such as a link URL holding a backtick).
+# Over the limit, the slice is walked back past unbalanced delimiters and
+# orphan backslashes before an escaped ellipsis is appended.
 
 # Entity delimiters whose opener/closer pairing must be preserved when
-# truncating a rendered MarkdownV2 string.
-_MARKDOWN_V2_ENTITY_MARKERS: tuple[str, ...] = ("*", "_", "~", "`")
+# truncating a rendered MarkdownV2 string. Telegram reads ``__`` as
+# underline, which pairs separately from single ``_`` italics.
+_MARKDOWN_V2_ENTITY_MARKERS: tuple[str, ...] = ("*", "_", "__", "~", "`")
 
 _MARKDOWN_V2_ELLIPSIS = "\\.\\.\\."
 _PLAIN_ELLIPSIS = "..."
 
 
-def find_unescaped_positions(text: str, marker: str) -> list[int]:
-    """Return indices of every occurrence of *marker* in *text* not preceded
-    by an odd number of backslashes (i.e. not escaped)."""
-    positions: list[int] = []
-    for i, ch in enumerate(text):
-        if ch != marker:
-            continue
-        backslashes = 0
-        j = i - 1
-        while j >= 0 and text[j] == "\\":
-            backslashes += 1
-            j -= 1
-        if backslashes % 2 == 0:
-            positions.append(i)
-    return positions
+@dataclass
+class _DelimiterScan:
+    """Result of :func:`_scan_delimiters` (upstream ``DelimiterScan``)."""
 
+    close_brackets: int
+    """Number of ``]`` that close a link label."""
 
-def _find_unescaped_positions_outside_code(
-    text: str,
-    marker: str,
-    *,
-    skip_link_dest: bool = False,
-) -> list[int]:
-    """Like :func:`find_unescaped_positions` but skips occurrences inside
-    fenced code blocks (```````) or inline code spans
-    (`````). Inside those regions Telegram treats ``*``, ``_``, ``~``,
-    ``[``, ``]`` as literal text.
+    markers: dict[str, list[int]]
+    """Unescaped entity delimiter positions outside code and link URLs.
 
-    When ``skip_link_dest`` is True, also skips occurrences inside a
-    MarkdownV2 link destination region (the ``(...)`` immediately
-    following ``]``). Per Telegram's MarkdownV2 spec, only ``)`` and
-    ``\\`` need escaping inside the destination -- ``_``, ``*``, ``~``
-    are literal text and must not be counted as unbalanced entity
-    delimiters by the safe-boundary trimmer. Without this, an under-limit
-    link like ``[x](https://example.com/foo_bar)`` would be truncated to
-    ``[x](https://example.com/foo`` because the trimmer saw the ``_`` as
-    an unpaired italic opener.
-
-    Port of upstream ``findUnescapedPositionsOutsideCode`` (chat#446).
+    Fences and ``__`` record one position per delimiter so a cut through an
+    opener retreats to its first character.
     """
-    positions: list[int] = []
+
+    open_brackets: list[int]
+    """Unescaped ``[`` positions outside code and link URLs."""
+
+
+def _scan_delimiters(text: str) -> _DelimiterScan:
+    """Collect every delimiter the trimmer pairs up, in one pass.
+
+    Port of upstream ``scanDelimiters``. Markers inside fenced code, inline
+    code, or the ``(...)`` part of a link are literal text and are skipped.
+    Positions index *text* (code points), which is what the caller slices.
+    """
+    markers: dict[str, list[int]] = {marker: [] for marker in _MARKDOWN_V2_ENTITY_MARKERS}
+    open_brackets: list[int] = []
+    close_brackets = 0
     in_fence = False
     in_inline = False
-    in_link_dest = False
+    in_link_url = False
     backslashes = 0
-    i = 0
     n = len(text)
+    last_index = n - 1
+
+    i = 0
     while i < n:
         ch = text[i]
 
@@ -372,47 +374,72 @@ def _find_unescaped_positions_outside_code(
 
         escaped = backslashes % 2 == 1
         backslashes = 0
+        if escaped:
+            i += 1
+            continue
 
-        if ch == "`" and not escaped and not in_link_dest:
-            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
-            if is_triple and not in_inline:
+        if in_link_url:
+            # A link's ``]`` only counts toward bracket pairing once its URL
+            # closes, so a slice mid-URL leaves the ``[`` unmatched.
+            if ch == ")":
+                in_link_url = False
+                close_brackets += 1
+            i += 1
+            continue
+
+        if ch == "`":
+            if not in_inline and text.startswith("```", i):
+                markers["`"].append(i)
                 in_fence = not in_fence
                 i += 3
                 continue
-            if not in_fence:
-                in_inline = not in_inline
+            if in_fence:
+                i += 1
+                continue
+            markers["`"].append(i)
+            # A slice that ends in two opening backticks is a cut fence, not
+            # a balanced empty inline-code span.
+            if not in_inline and i + 2 == n and text[i + 1] == "`":
+                i += 1
+            in_inline = not in_inline
             i += 1
             continue
 
-        # Enter a link destination when we see ``](`` outside code -- the
-        # ``]`` itself is still counted (the caller scans brackets in a
-        # separate pass), but the URL inside ``(...)`` is treated as
-        # literal text for delimiter-balance purposes.
-        if (
-            skip_link_dest
-            and not in_link_dest
-            and not in_fence
-            and not in_inline
-            and not escaped
-            and ch == "]"
-            and text[i + 1 : i + 2] == "("
-        ):
-            if ch == marker:
-                positions.append(i)
-            in_link_dest = True
-            i += 2  # consume ``](``
-            continue
-
-        if in_link_dest and not escaped and ch == ")":
-            in_link_dest = False
+        if in_fence or in_inline:
             i += 1
             continue
 
-        if ch == marker and not escaped and not in_fence and not in_inline and not in_link_dest:
-            positions.append(i)
+        if ch == "[":
+            open_brackets.append(i)
+            i += 1
+            continue
+
+        if ch == "]":
+            if text[i + 1 : i + 2] == "(":
+                in_link_url = True
+                i += 2
+                continue
+            if i < last_index:
+                # Telegram accepts a bare ``[label]``; only a ``]`` that ends
+                # the slice may have lost its ``(url)`` to the cut.
+                close_brackets += 1
+            i += 1
+            continue
+
+        if ch == "_":
+            if text[i + 1 : i + 2] == "_":
+                markers["__"].append(i)
+                i += 2
+            else:
+                markers["_"].append(i)
+                i += 1
+            continue
+
+        if ch in ("*", "~"):
+            markers[ch].append(i)
         i += 1
 
-    return positions
+    return _DelimiterScan(close_brackets=close_brackets, markers=markers, open_brackets=open_brackets)
 
 
 def ends_with_orphan_backslash(text: str) -> bool:
@@ -425,99 +452,21 @@ def ends_with_orphan_backslash(text: str) -> bool:
     return trailing % 2 == 1
 
 
-def _find_unclosed_link_dest_open_bracket(text: str) -> int | None:
-    """Return the position of the ``[`` that opens an inline link whose
-    destination ``(`` is never closed by ``)``.
-
-    A truncated chunk like ``[label](https://example.com/very-long`` has
-    balanced ``[]`` brackets but a dangling ``(`` -- Telegram rejects this
-    as invalid MarkdownV2. The detector walks the text honouring fenced/
-    inline code regions and escape backslashes, finds each ``](`` pair,
-    and reports the corresponding ``[`` position if no unescaped ``)``
-    closes the destination before end-of-string.
-    """
-    n = len(text)
-    in_fence = False
-    in_inline = False
-    backslashes = 0
-    bracket_stack: list[int] = []  # positions of unmatched ``[`` outside code
-    i = 0
-    while i < n:
-        ch = text[i]
-
-        if ch == "\\":
-            backslashes += 1
-            i += 1
-            continue
-
-        escaped = backslashes % 2 == 1
-        backslashes = 0
-
-        if ch == "`" and not escaped:
-            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
-            if is_triple and not in_inline:
-                in_fence = not in_fence
-                i += 3
-                continue
-            if not in_fence:
-                in_inline = not in_inline
-            i += 1
-            continue
-
-        if escaped or in_fence or in_inline:
-            i += 1
-            continue
-
-        if ch == "[":
-            bracket_stack.append(i)
-            i += 1
-            continue
-
-        if ch == "]" and bracket_stack:
-            open_pos = bracket_stack.pop()
-            # If immediately followed by ``(``, this is an inline link
-            # destination. Scan forward to verify there's an unescaped
-            # closing ``)`` before EOS.
-            if text[i + 1 : i + 2] == "(":
-                j = i + 2
-                inner_backslashes = 0
-                closed = False
-                while j < n:
-                    cj = text[j]
-                    if cj == "\\":
-                        inner_backslashes += 1
-                        j += 1
-                        continue
-                    inner_escaped = inner_backslashes % 2 == 1
-                    inner_backslashes = 0
-                    if cj == ")" and not inner_escaped:
-                        closed = True
-                        break
-                    j += 1
-                if not closed:
-                    return open_pos
-            i += 1
-            continue
-
-        i += 1
-
-    return None
-
-
 def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
     """Drop trailing characters that would produce invalid MarkdownV2.
 
-    Drops:
-      - orphan trailing ``\\`` (would escape the appended ellipsis or nothing)
-      - unclosed entity delimiter (``*``, ``_``, ``~``, `` ` ``) whose closer
-        was cut off
-      - unmatched ``[`` from a link whose closer was cut off
-      - inline link with balanced ``[]`` but unclosed ``(`` destination
-        (e.g. ``[label](https://example.com/very-long``) -- chunk is
-        trimmed back to the opening ``[``
+    Port of upstream ``trimToMarkdownV2SafeBoundary`` (chat@4.41.1). Drops:
+
+      - an orphan trailing ``\\`` (would escape the appended ellipsis or
+        nothing)
+      - an unclosed entity delimiter (``*``, ``_``, ``__``, ``~``,
+        `` ` ``) whose closer was cut off
+      - an unmatched ``[`` from a link whose closer was cut off, or whose
+        ``(...)`` URL part was left unterminated by the slice
 
     Best-effort: may drop more than strictly necessary in edge cases, but
     guarantees the output is parseable MarkdownV2 (when the input was).
+    Production callers go through :func:`truncate_for_telegram`.
     """
     current = text
     max_iterations = len(current) + 1
@@ -527,33 +476,21 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
             current = current[:-1]
             continue
 
-        min_unsafe_position = len(current)
+        scan = _scan_delimiters(current)
+        cut = len(current)
 
         for marker in _MARKDOWN_V2_ENTITY_MARKERS:
-            if marker == "`":
-                positions = find_unescaped_positions(current, marker)
-            else:
-                positions = _find_unescaped_positions_outside_code(current, marker, skip_link_dest=True)
+            positions = scan.markers[marker]
             if len(positions) % 2 == 1:
-                last_unpaired = positions[-1] if positions else len(current)
-                if last_unpaired < min_unsafe_position:
-                    min_unsafe_position = last_unpaired
+                cut = min(cut, positions[-1])
 
-        open_brackets = _find_unescaped_positions_outside_code(current, "[")
-        close_brackets = _find_unescaped_positions_outside_code(current, "]")
-        if len(open_brackets) > len(close_brackets):
-            last_open = open_brackets[-1] if open_brackets else len(current)
-            if last_open < min_unsafe_position:
-                min_unsafe_position = last_open
+        if len(scan.open_brackets) > scan.close_brackets:
+            cut = min(cut, scan.open_brackets[-1])
 
-        unclosed_link_open = _find_unclosed_link_dest_open_bracket(current)
-        if unclosed_link_open is not None and unclosed_link_open < min_unsafe_position:
-            min_unsafe_position = unclosed_link_open
-
-        if min_unsafe_position >= len(current):
+        if cut >= len(current):
             return current
 
-        current = current[:min_unsafe_position]
+        current = current[:cut]
 
     return current
 
@@ -561,15 +498,14 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
 def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
     """Truncate *text* to *limit* UTF-16 code units, appending an ellipsis.
 
-    For MarkdownV2 (``parse_mode == "MarkdownV2"``), uses an escaped
-    ellipsis (``\\.\\.\\.``) and trims back past any unbalanced entity
-    delimiter or orphan backslash before appending. Plain text gets a
-    literal ``...``.
+    Text that fits the limit is returned unchanged for every parse mode
+    (vercel/chat#915): the MarkdownV2 renderer emits balanced entities, so a
+    trim there could only delete valid content.
 
-    Even when *text* is under the limit, MarkdownV2 inputs go through
-    :func:`_trim_to_markdown_v2_safe_boundary` so that streamed chunks
-    with transiently unpaired entity markers don't trigger Telegram's
-    ``can't parse entities`` 400 (port of chat#446 / upstream f46a6fb).
+    Over the limit, MarkdownV2 (``parse_mode == "MarkdownV2"``) gets an
+    escaped ellipsis (``\\.\\.\\.``) and the slice is trimmed back past any
+    unbalanced entity delimiter or orphan backslash first; plain text gets a
+    literal ``...``.
 
     ``limit`` is interpreted in UTF-16 code units to match Telegram's
     documented 4096 / 1024 caps and upstream JavaScript's ``string.length``
@@ -577,11 +513,10 @@ def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
     units each, so a 4096-emoji MarkdownV2 message would otherwise sail
     past this check and be rejected by Telegram as too long.
     """
-    is_markdown_v2 = parse_mode == "MarkdownV2"
-
     if _utf16_len(text) <= limit:
-        return _trim_to_markdown_v2_safe_boundary(text) if is_markdown_v2 else text
+        return text
 
+    is_markdown_v2 = parse_mode == "MarkdownV2"
     ellipsis = _MARKDOWN_V2_ELLIPSIS if is_markdown_v2 else _PLAIN_ELLIPSIS
     sliced = _slice_to_utf16_units(text, limit - _utf16_len(ellipsis))
 
@@ -589,6 +524,19 @@ def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
         sliced = _trim_to_markdown_v2_safe_boundary(sliced)
 
     return f"{sliced}{ellipsis}"
+
+
+def _retry_after_seconds(error: AdapterRateLimitError) -> float:
+    """``error.retryAfter ?? 1`` for the streaming rate-limit waits.
+
+    ``retry_after`` comes straight from Telegram's JSON ``parameters``. A
+    value that is not a finite number is treated as absent (1 s): in Python
+    ``"5" * 1000`` would build a string instead of a delay.
+    """
+    retry_after = error.retry_after
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and math.isfinite(retry_after):
+        return float(retry_after)
+    return 1.0
 
 
 def _trim_trailing_slashes(url: str) -> str:
@@ -891,6 +839,20 @@ class TelegramAdapter:
         self._has_explicit_user_name: bool = bool(explicit_user_name)
 
         self._mode: str = config.mode or "auto"
+        # Streaming (vercel/chat#822): drafts are opt-in; every other stream
+        # posts and edits. ``nativeStreaming ?? false`` then a truthiness test.
+        self._native_streaming: bool = bool(config.native_streaming)
+        # ``typeof !== "number" || !Number.isFinite`` -> unset; else clamped to
+        # an integer >= 0. ``bool`` is an ``int`` subclass, but upstream's
+        # ``typeof true`` is ``"boolean"``, so it is ignored too.
+        raw_edit_interval = config.streaming_edit_interval_ms
+        self._streaming_edit_interval_ms: int | None = (
+            self.clamp_integer(raw_edit_interval, 0, 0, 2**53 - 1)
+            if isinstance(raw_edit_interval, (int, float))
+            and not isinstance(raw_edit_interval, bool)
+            and math.isfinite(raw_edit_interval)
+            else None
+        )
         self._long_polling: TelegramLongPollingConfig | None = config.long_polling
 
         self._runtime_mode: TelegramRuntimeMode = "webhook"
@@ -2642,16 +2604,215 @@ class TelegramAdapter:
         text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage | None:
-        """Stream a message to a Telegram private chat via draft updates.
+        """Stream a message to a Telegram chat.
 
-        Port of upstream ``TelegramAdapter.stream`` (vercel/chat#479, on top
-        of the #340 draft-streaming foundation). Private chats (DMs) get
-        native draft streaming: the draft bubble updates in place as chunks
-        arrive, throttled to ``options.update_interval_ms`` (default
+        Port of upstream ``TelegramAdapter.stream`` (chat@4.41.1). Every chat
+        streams through :meth:`_post_and_edit_stream` (a posted message
+        edited as chunks arrive, paced to Telegram's edit limits) unless
+        ``native_streaming`` is on and the thread is a private chat, which
+        uses :meth:`_native_draft_stream` (vercel/chat#822). Always returns a
+        message; it never hands the stream back to the core fallback.
+        """
+        if self._native_streaming and self.is_dm(thread_id):
+            return await self._native_draft_stream(thread_id, text_stream, options)
+
+        return await self._post_and_edit_stream(thread_id, text_stream, options)
+
+    def _monotonic_ms(self) -> float:
+        """Monotonic milliseconds for streaming pacing.
+
+        Separate from :meth:`_now_ms` (epoch time, persisted in state) because
+        edit pacing is only compared within one stream. Overridable so tests
+        can inject a fake clock (together with :meth:`_sleep`).
+        """
+        return time.monotonic() * 1000.0
+
+    @staticmethod
+    def _stream_chunk_text(chunk: StreamInput) -> str | None:
+        """Text of a streamed chunk, or ``None`` for chunks without any.
+
+        Plain strings and ``markdown_text`` chunks carry text; task / plan
+        progress chunks have no Telegram representation.
+        """
+        if isinstance(chunk, str):
+            return chunk
+        if isinstance(chunk, dict):
+            return chunk.get("text", "") if chunk.get("type") == "markdown_text" else None
+        if getattr(chunk, "type", None) == "markdown_text":
+            # Runtime-narrowed to a MarkdownTextChunk via the `type` tag; only
+            # that variant has `.text`. Pyrefly doesn't do tag-based union
+            # narrowing, so read via `getattr`.
+            return getattr(chunk, "text", "")
+        return None
+
+    async def _post_and_edit_stream(
+        self,
+        thread_id: str,
+        text_stream: AsyncIterable[StreamInput],
+        options: StreamOptions | None,
+    ) -> RawMessage:
+        """Post a placeholder message and edit it as chunks arrive.
+
+        Port of upstream ``postAndEditStream`` (vercel/chat#822, #826). The
+        adapter owns this loop rather than deferring to the core fallback so
+        edits can be throttled to Telegram's per-chat rate limit, which the
+        core interval (500 ms by default) sits under.
+
+        * Edits are at least ``max(options.update_interval_ms,
+          streaming_edit_interval_ms or the chat-type floor)`` apart: 1100 ms
+          for private chats, 3100 ms otherwise.
+        * The placeholder is ``options.fallback_streaming_placeholder_text``
+          when the bot or thread set one (``None`` posts nothing until the
+          first text arrives) and ``"..."`` when it is ``UNSET``.
+        * An intermediate edit failure is logged and skipped; a 429 also
+          holds further edits until its ``retry_after`` has passed.
+        * The final edit waits for both the pacing interval and any rate
+          limit, retries once after a 429, and raises when the wait would
+          exceed :data:`TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS` or the retry
+          fails, so a caller never mistakes a truncated message for the
+          complete one.
+
+        Every wait is awaited inline (no background task), so cancelling the
+        caller cancels the stream.
+        """
+        default_interval_ms = (
+            TELEGRAM_DEFAULT_PRIVATE_STREAMING_EDIT_INTERVAL_MS
+            if self.is_dm(thread_id)
+            else TELEGRAM_DEFAULT_NON_PRIVATE_STREAMING_EDIT_INTERVAL_MS
+        )
+        interval_ms = max(
+            self.clamp_integer(
+                options.update_interval_ms if options is not None else None,
+                0,
+                0,
+                2**53 - 1,
+            ),
+            self._streaming_edit_interval_ms if self._streaming_edit_interval_ms is not None else default_interval_ms,
+        )
+        configured_placeholder = options.fallback_streaming_placeholder_text if options is not None else UNSET
+        placeholder_text: str | None = (
+            TELEGRAM_STREAM_PLACEHOLDER_TEXT if configured_placeholder is UNSET else configured_placeholder
+        )
+
+        renderer = StreamingMarkdownRenderer()
+        accumulated = ""
+        posted: RawMessage | None = None
+        edit_thread_id = thread_id
+        last_edit_content = ""
+        last_edit_at = 0.0
+        blocked_until = 0.0
+        rate_limit_error: AdapterRateLimitError | None = None
+
+        if placeholder_text is not None:
+            posted = await self.post_message(thread_id, placeholder_text)
+            edit_thread_id = posted.thread_id or thread_id
+            last_edit_content = placeholder_text
+            last_edit_at = self._monotonic_ms()
+
+        async def apply_edit(content: str) -> None:
+            nonlocal posted, edit_thread_id, last_edit_content, last_edit_at, blocked_until, rate_limit_error
+            if posted is None:
+                return
+            posted = await self.edit_message(edit_thread_id, posted.id, PostableMarkdown(markdown=content))
+            edit_thread_id = posted.thread_id or edit_thread_id
+            last_edit_content = content
+            last_edit_at = self._monotonic_ms()
+            blocked_until = 0.0
+            rate_limit_error = None
+
+        def remember_rate_limit(error: AdapterRateLimitError) -> None:
+            nonlocal blocked_until, rate_limit_error
+            retry_after_ms = max(0.0, _retry_after_seconds(error)) * 1000
+            blocked_until = max(blocked_until, self._monotonic_ms() + retry_after_ms)
+            rate_limit_error = error
+
+        def should_edit(content: str) -> bool:
+            return posted is not None and bool(content.strip(JS_WHITESPACE)) and content != last_edit_content
+
+        async def flush_edit(content: str) -> None:
+            if not should_edit(content):
+                return
+            try:
+                await apply_edit(content)
+            except Exception as error:
+                if isinstance(error, AdapterRateLimitError):
+                    remember_rate_limit(error)
+                self._logger.warn(
+                    "Telegram stream edit failed",
+                    {"error": str(error), "thread_id": thread_id},
+                )
+
+        async def flush_final_edit(content: str) -> None:
+            if not should_edit(content):
+                return
+
+            now = self._monotonic_ms()
+            blocked_ms = max(0.0, blocked_until - now)
+            pacing_ms = max(0.0, interval_ms - (now - last_edit_at))
+            if blocked_ms > TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS and rate_limit_error is not None:
+                raise rate_limit_error
+            await self._sleep(max(blocked_ms, pacing_ms))
+
+            try:
+                await apply_edit(content)
+                return
+            except AdapterRateLimitError as error:
+                remember_rate_limit(error)
+                retry_after_ms = _retry_after_seconds(error) * 1000
+                if retry_after_ms > TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS:
+                    raise
+                await self._sleep(retry_after_ms)
+
+            await apply_edit(content)
+
+        async for chunk in text_stream:
+            text = self._stream_chunk_text(chunk)
+            if text is None:
+                continue
+
+            accumulated += text
+            renderer.push(text)
+
+            if posted is not None:
+                now = self._monotonic_ms()
+                if now >= blocked_until and now - last_edit_at >= interval_ms:
+                    await flush_edit(renderer.render())
+                continue
+
+            initial = renderer.render()
+            if initial.strip(JS_WHITESPACE):
+                posted = await self.post_message(thread_id, PostableMarkdown(markdown=initial))
+                edit_thread_id = posted.thread_id or thread_id
+                last_edit_content = initial
+                last_edit_at = self._monotonic_ms()
+
+        final_content = renderer.finish()
+
+        if posted is not None:
+            await flush_final_edit(final_content)
+            return posted
+
+        # Nothing was posted: the caller suppressed the placeholder and the
+        # stream produced no renderable text.
+        if not accumulated.strip(JS_WHITESPACE):
+            raise ValidationError("telegram", "Telegram streaming requires text content")
+
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
+
+    async def _native_draft_stream(
+        self,
+        thread_id: str,
+        text_stream: AsyncIterable[StreamInput],
+        options: StreamOptions | None,
+    ) -> RawMessage:
+        """Stream to a private chat via native draft updates.
+
+        Port of upstream ``nativeDraftStream`` (vercel/chat#479 on top of the
+        #340 draft-streaming foundation; opt-in since #822). The draft bubble
+        updates in place as chunks arrive, throttled to
+        ``options.update_interval_ms`` (default
         :data:`TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS`), and a final send
-        persists the message when the stream ends. Returns ``None`` for
-        non-DM threads — before consuming any chunks — so the SDK's built-in
-        post+edit fallback handles groups, supergroups, and channels.
+        persists the message when the stream ends.
 
         The outbound ladder is **rich → MarkdownV2 → plain**:
 
@@ -2669,9 +2830,6 @@ class TelegramAdapter:
         attempted. There is no longer an empty opening draft; the first
         bubble update carries real content.
         """
-        if not self.is_dm(thread_id):
-            return None
-
         parsed_thread = self._resolve_thread_id(thread_id)
         update_interval_ms = self.clamp_integer(
             options.update_interval_ms if options is not None else None,
@@ -2688,9 +2846,6 @@ class TelegramAdapter:
         draft_streaming_enabled = True
         stream_uses_markdown = True
         stream_uses_rich = self._rich_messages_available
-
-        def _now_ms() -> float:
-            return time.monotonic() * 1000.0
 
         def render_markdown_text(text: str) -> str:
             return self.truncate_message(
@@ -2738,7 +2893,7 @@ class TelegramAdapter:
                         },
                     )
                     last_draft_text = text
-                    last_flush_at = _now_ms()
+                    last_flush_at = self._monotonic_ms()
                     return
                 except Exception as error:
                     if not self.can_fallback_from_rich_message(error, "sendRichMessageDraft"):
@@ -2768,7 +2923,7 @@ class TelegramAdapter:
             try:
                 await self.telegram_fetch("sendMessageDraft", _draft_payload(draft_text, markdown=use_markdown))
                 last_draft_text = draft_text
-                last_flush_at = _now_ms()
+                last_flush_at = self._monotonic_ms()
             except Exception as error:
                 if use_markdown and self.is_telegram_markdown_parse_error(error):
                     # Telegram rejected the MarkdownV2 entities: downgrade
@@ -2779,7 +2934,7 @@ class TelegramAdapter:
                     try:
                         await self.telegram_fetch("sendMessageDraft", _draft_payload(plain_draft_text, markdown=False))
                         last_draft_text = plain_draft_text
-                        last_flush_at = _now_ms()
+                        last_flush_at = self._monotonic_ms()
                     except Exception as retry_error:
                         draft_streaming_enabled = False
                         self._logger.warn(
@@ -2806,17 +2961,7 @@ class TelegramAdapter:
             await send_draft(draft_text, stream_uses_markdown)
 
         async for chunk in text_stream:
-            text: str | None = None
-            if isinstance(chunk, str):
-                text = chunk
-            elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
-                text = chunk.get("text", "")
-            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
-                # Runtime-narrowed to a MarkdownTextChunk via the `type`
-                # tag; only that variant has `.text`. Pyrefly doesn't do
-                # tag-based union narrowing, so read via `getattr`.
-                text = getattr(chunk, "text", "")
-
+            text = self._stream_chunk_text(chunk)
             if text is None:
                 # Task/plan progress chunks have no draft representation.
                 continue
@@ -2824,7 +2969,7 @@ class TelegramAdapter:
             accumulated += text
             renderer.push(text)
 
-            if _now_ms() - last_flush_at >= update_interval_ms:
+            if self._monotonic_ms() - last_flush_at >= update_interval_ms:
                 await flush_draft()
 
         if not accumulated.strip():
