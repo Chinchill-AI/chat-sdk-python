@@ -262,6 +262,12 @@ class TestTeamsGraphTextExtraction:
             "@Ada said:\nline\ntwo\n\nnext  <tag>&done"
         )
 
+    def test_strips_tags_revealed_by_an_earlier_pass(self) -> None:
+        # Single-pass ``<[^>]+>`` left ``>done``; the shared bounded stripper
+        # loops until stable (upstream chat@4.37.0).
+        content = "<" + "x" * 2047 + "<b>>done"
+        assert extract_text_from_graph_message({"body": {"content": content}}) == "done"
+
     def test_decodes_amp_last_so_encoded_entities_survive(self) -> None:
         # ``&amp;lt;`` must decode to ``&lt;`` (literal), NOT to ``<``: ``&amp;``
         # is the LAST replacement, so the ``&lt;`` pass never sees this ``<``.

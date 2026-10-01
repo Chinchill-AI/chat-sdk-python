@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 
+from chat_sdk.adapters.teams.format import strip_html_tags
 from chat_sdk.shared.base_format_converter import (
     BaseFormatConverter,
     Content,
@@ -67,11 +68,12 @@ class TeamsFormatConverter(BaseFormatConverter):
         # Pre: <pre>text</pre> -> ```text```
         markdown = re.sub(r"<pre>([^<]+)</pre>", r"```\n\1\n```", markdown, flags=re.IGNORECASE)
 
-        # Strip remaining HTML tags (loop to handle nested/reconstructed tags)
-        prev = ""
-        while markdown != prev:
-            prev = markdown
-            markdown = re.sub(r"<[^>]+>", "", markdown)
+        # Strip remaining HTML tags (loop to handle nested/reconstructed tags).
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream's
+        # ``toAst`` still loops an unbounded ``<[^>]+>``; this uses the bounded
+        # ``strip_html_tags`` primitive (chat@4.37.0) like the other Teams
+        # HTML-to-text paths.
+        markdown = strip_html_tags(markdown)
 
         # Decode HTML entities in a single pass
         entity_map = {
@@ -90,16 +92,19 @@ class TeamsFormatConverter(BaseFormatConverter):
         return parse_markdown(markdown)
 
     def render_postable(self, message: object) -> str:
-        """Override renderPostable to convert @mentions in plain strings.
+        """Render text messages, returning plain strings and raw text unchanged.
 
-        Extends the base implementation with Teams mention conversion
-        and dataclass-style message support.
+        Outgoing ``@name`` text is never rewritten to ``<at>name</at>``
+        (upstream chat@4.40.0, vercel/chat#898): Teams only notifies a user
+        when the activity also carries a mention entity, so the markup alone
+        notified no one and mangled emails and URLs (``user@example.com``).
+        Extends the base implementation with dataclass-style message support.
         """
         if isinstance(message, str):
-            return self._convert_mentions_to_teams(message)
+            return message
         if isinstance(message, dict):
             if "raw" in message:
-                return self._convert_mentions_to_teams(message["raw"])
+                return message["raw"]
             if "markdown" in message:
                 return self.from_ast(parse_markdown(message["markdown"]))
             if "ast" in message:
@@ -109,17 +114,13 @@ class TeamsFormatConverter(BaseFormatConverter):
             return ""
         # Dataclass / object-style messages
         if hasattr(message, "raw"):
-            return self._convert_mentions_to_teams(message.raw)
+            return message.raw
         if hasattr(message, "markdown"):
             return self.from_ast(parse_markdown(message.markdown))
         if hasattr(message, "ast"):
             return self.from_ast(message.ast)
         # Fall back to base implementation for remaining cases (e.g. card objects)
         return super().render_postable(message)
-
-    def _convert_mentions_to_teams(self, text: str) -> str:
-        """Convert @mentions to Teams format: @name -> <at>name</at>."""
-        return re.sub(r"@(\w+)", r"<at>\1</at>", text)
 
     def _node_to_teams(self, node: Content) -> str:
         """Convert an AST node to Teams markdown."""
@@ -129,8 +130,7 @@ class TeamsFormatConverter(BaseFormatConverter):
             return "".join(self._node_to_teams(child) for child in get_node_children(node))
 
         if node_type == "text":
-            # Convert @mentions to Teams format <at>mention</at>
-            return re.sub(r"@(\w+)", r"<at>\1</at>", get_node_value(node))
+            return get_node_value(node)
 
         if node_type == "strong":
             content = "".join(self._node_to_teams(child) for child in get_node_children(node))
