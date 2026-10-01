@@ -663,6 +663,14 @@ multipart filename (see **Upload**); otherwise no behavioral divergence.
   discriminated on `type`, because pyrefly does not narrow TypedDict unions on
   a tag; the `cta_url` action is modelled by `WhatsAppCtaUrlAction` /
   `WhatsAppCtaUrlParameters`. `WhatsAppMediaUploadResponse` is new.
+- **Kept as upstream (not divergences).** A text-fallback card posted with
+  media is captioned with the shared `card_to_fallback_text`, which omits
+  `image_url` and image children (the full `card_to_whatsapp_text` is sent
+  only when that caption is empty). `cta_url` eligibility checks element
+  types, not lengths, so a title over 60 or a body over 1024 characters is
+  truncated in the interactive envelope rather than kept as text. Both match
+  chat@4.41.1 (`index.ts` `postMessageWithMedia`, `cards.ts`
+  `findPromotableCtaLink` / `buildInteractiveEnvelope`).
 - `_extract_reply_buttons` already returned `None` (never `[]`) for an actions
   row without reply buttons; `card_to_whatsapp` now tests `is not None`, like
   upstream's `if (actionButtons)`.

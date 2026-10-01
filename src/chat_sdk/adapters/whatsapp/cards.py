@@ -402,6 +402,10 @@ def _find_promotable_cta_link(card: CardElement) -> LinkButtonElement | None:
     ):
         return None
 
+    # Upstream parity (adapter-whatsapp/src/cards.ts findPromotableCtaLink at
+    # chat@4.41.1): eligibility is by element type only. A title over 60 or a
+    # body over 1024 characters is truncated by ``_build_interactive_envelope``
+    # exactly as upstream's ``buildInteractiveEnvelope`` does, not kept as text.
     if not _children_fit_cta_body(card.get("children", [])):
         return None
 

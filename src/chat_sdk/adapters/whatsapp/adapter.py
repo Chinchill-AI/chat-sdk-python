@@ -1347,6 +1347,10 @@ class WhatsAppAdapter:
             if card_result is not None and card_result.get("type") != "interactive":
                 # The shared fallback excludes action elements, so append link
                 # button URLs to keep them reachable from the caption.
+                # Upstream parity (adapter-whatsapp/src/index.ts:1318-1327 at
+                # chat@4.41.1): the caption is the shared ``cardToFallbackText``,
+                # which omits ``image_url`` / image children, and the full
+                # ``card_to_whatsapp_text`` is only sent when that caption is empty.
                 fallback = "\n".join(
                     part for part in [card_to_fallback_text(card), *card_link_button_lines(card)] if part
                 )
