@@ -469,6 +469,22 @@ class TestExecutePaths:
         # Author is flattened into camelCase keys that match the wire shape.
         assert result["messages"][0]["author"]["userName"] == "testuser"
 
+    async def test_fetch_messages_serves_sdk_cached_history_for_persisting_adapters(self, harness: _Harness):
+        # fetchMessages routes through chat.history.thread.list, so an adapter
+        # whose history lives in the SDK-side cache (Telegram, WhatsApp) gets
+        # the cached messages when the platform page is empty.
+        harness.adapter.persist_thread_history = True
+        await harness.chat.history.thread.append("slack:C123:1234.5678", create_test_message("c1", "cached"))
+        tools = create_chat_tools(chat=harness.chat)
+        result = await tools["fetchMessages"].execute({"threadId": "slack:C123:1234.5678"})
+        assert [m["text"] for m in result["messages"]] == ["cached"]
+        assert result["nextCursor"] is None
+
+    async def test_fetch_messages_raises_for_an_unregistered_adapter_prefix(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+        with pytest.raises(ChatError, match='no adapter registered with name "slcak"'):
+            await tools["fetchMessages"].execute({"threadId": "slcak:C123:1234.5678"})
+
     async def test_get_channel_info_returns_flattened_metadata(self, harness: _Harness):
         tools = create_chat_tools(chat=harness.chat)
         result = await tools["getChannelInfo"].execute({"channelId": "slack:C123"})
@@ -510,6 +526,8 @@ class TestExecutePaths:
         tools = create_chat_tools(chat=harness.chat)
         with pytest.raises(ChatError, match="does not support fetching channel messages"):
             await tools["fetchChannelMessages"].execute({"channelId": "slack:C123"})
+        # No silent fallback to thread reads for a non-persisting adapter.
+        assert harness.adapter._fetch_calls == []
 
     async def test_fetch_channel_messages_wraps_not_implemented(self, harness: _Harness):
         # BaseAdapter's default stub for optional methods raises
@@ -591,7 +609,7 @@ class TestExecutePaths:
     async def test_listthreads_throws_when_the_adapter_does_not_support_it(self, harness: _Harness):
         harness.adapter.list_threads = None  # type: ignore[method-assign,assignment]
         tools = create_chat_tools(chat=harness.chat)
-        with pytest.raises(ChatError, match="does not support listing threads"):
+        with pytest.raises(ChatError, match="does not implement listThreads"):
             await tools["listThreads"].execute({"channelId": "slack:C123"})
 
     async def test_list_threads_wraps_not_implemented(self, harness: _Harness):
@@ -599,7 +617,7 @@ class TestExecutePaths:
             side_effect=ChatNotImplementedError("slack", "list_threads"),
         )
         tools = create_chat_tools(chat=harness.chat)
-        with pytest.raises(ChatError, match="does not support listing threads") as exc_info:
+        with pytest.raises(ChatError, match="does not implement listThreads") as exc_info:
             await tools["listThreads"].execute({"channelId": "slack:C123"})
         assert isinstance(exc_info.value.__cause__, ChatNotImplementedError)
 
