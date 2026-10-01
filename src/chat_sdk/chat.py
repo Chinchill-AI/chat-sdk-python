@@ -3044,6 +3044,10 @@ class Chat:
 
         Upstream ``handleMessageUpdated``: no dedupe, no lock, no routing.
         """
+        # Upstream parity (chat@4.41.1 chat.ts:2503): only the current message
+        # is bound to the adapter; ``previous_message`` is passed through as the
+        # adapter built it (its ``subject`` resolves to None unless the adapter
+        # bound it, as upstream message.ts:191-198).
         set_message_adapter(message, adapter)
         self._logger.debug(
             "Incoming message update",
