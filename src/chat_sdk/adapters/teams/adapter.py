@@ -2460,6 +2460,11 @@ class TeamsAdapter:
         conversation. ``options`` is accepted and ignored, as upstream.
         """
         if self.is_dm(thread_id):
+            # Upstream parity (chat@4.41.1 adapter-teams/src/index.ts
+            # postEphemeral: `if (this.isDM(threadId)) return postMessage(...)`):
+            # a 1:1 chat's other member is the only possible viewer, and the
+            # thread ID does not record who that is, so ``user_id`` is not
+            # checked against it; callers pass the DM's own user.
             sent = await self.post_message(thread_id, message)
             return EphemeralMessage(
                 id=sent.id,
