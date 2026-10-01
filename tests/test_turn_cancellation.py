@@ -250,7 +250,9 @@ class TestThreadAbortAndTyping:
         signal._abort()
         sent = await asyncio.wait_for(posting, 1)
 
-        assert sent.text == "Hello "
+        # ``text`` is the plain text of the parsed markdown; like remark,
+        # ``parse_markdown`` strips a paragraph's trailing space.
+        assert sent.text == "Hello"
         assert adapter._edit_calls[-1] == (THREAD_ID, "msg-1", PostableMarkdown(markdown="Hello "))
         adapter.end_typing.assert_awaited_once_with(THREAD_ID, "active")
 

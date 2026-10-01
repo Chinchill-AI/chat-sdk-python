@@ -97,11 +97,9 @@ class TestToMarkdown:
         assert ast["children"][0]["type"] == "code"
         assert ast["children"][0]["value"] == "x"
         assert ast["children"][1]["type"] == "paragraph"
-        # Upstream: toPlainText == "x\n\n> note". CommonMark strips the
-        # paragraph's leading space; the shared Python parser keeps it (known
-        # parser limitation), so compare without it. The escaped ``\>`` must
-        # still read as text, not a blockquote.
-        assert ast_to_plain_text(ast).replace("\n\n ", "\n\n") == "x\n\n> note"
+        # The escaped ``\>`` reads as text, not a blockquote, and the
+        # paragraph's leading space is stripped (CommonMark).
+        assert ast_to_plain_text(ast) == "x\n\n> note"
 
     def test_keeps_code_content_verbatim_inside_the_fence(self):
         ast = self.converter.to_ast("```int *a = *b;```")

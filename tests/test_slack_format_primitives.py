@@ -229,6 +229,29 @@ class TestSlackFormatPrimitives:
         indented_quote = " " * 20_000 + "&gt;" + "```" * 6_665
         assert slack_mrkdwn_to_markdown(indented_quote) == " " * 20_000 + ">" + "```" * 6_665
 
+    @pytest.mark.parametrize(
+        ("mrkdwn", "expected"),
+        [
+            # The quoted-line answer resets on each new line, both ways.
+            ("&gt; ```a``` b\nsee ```x``` y", "> ```a``` b\nsee \n```\nx\n```\n y"),
+            ("see ```x``` y\n&gt; ```a``` b", "see \n```\nx\n```\n y\n> ```a``` b"),
+            ("  &gt; ```q``` x\n  ```c``` y", "  > ```q``` x\n  \n```\nc\n```\n y"),
+            # JS ``trimStart`` whitespace includes NBSP before ``&gt;``.
+            ("\u00a0&gt; a ```c``` b", "\u00a0> a ```c``` b"),
+            # A failed ``<`` scan stops at ``\n`` / ``\r``; tokens after it still convert.
+            ("a < b\n<!here> ping", "a < b\n@here ping"),
+            ("a <b\r<!here>", "a <b\r@here"),
+            ("a <b\r```code```>", "a <b\r\n```\ncode\n```\n>"),
+            # A ``` run is no inline-code opener for the mention pass.
+            ("``` <!here> `", "``` @here `"),
+        ],
+    )
+    def test_memoized_scanners_match_upstream_across_lines(self, mrkdwn: str, expected: str):
+        """Exact upstream ``slackMrkdwnToMarkdown`` output for inputs that
+        exercise the scanners' remembered state (``_BlockquoteLines`` and
+        ``_AngleTokenScanner``) across line boundaries."""
+        assert slack_mrkdwn_to_markdown(mrkdwn) == expected
+
     def test_converts_basic_markdown_bold_to_slack_mrkdwn_bold(self):
         assert markdown_bold_to_slack_mrkdwn("The **domain** is example.com") == "The *domain* is example.com"
 

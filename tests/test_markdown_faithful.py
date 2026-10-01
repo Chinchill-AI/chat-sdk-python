@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -1507,6 +1509,49 @@ class TestParseMarkdownEdgeCases:
         assert len(ast["children"]) >= 3
         types = [c["type"] for c in ast["children"]]
         assert "thematicBreak" in types
+
+
+class TestCommonMarkRulesExposedBySlackText:
+    """Python-only: CommonMark rules the shared parser follows since #283 made
+    Slack's ``message.text`` the plain text of ``parse_markdown``. Expected
+    values are remark-parse + remark-gfm ``toPlainText`` output."""
+
+    @pytest.mark.parametrize(
+        ("markdown", "expected"),
+        [
+            # Links never nest: the inner link wins, outer brackets stay text.
+            ("[[a](https://x.com) b](https://y.com)", "[a b](https://y.com)"),
+            ("[a [b](https://x.com)](https://y.com)", "[a b](https://y.com)"),
+            # A thematic break repeats one marker; mixed markers are text.
+            ("-_-", "-_-"),
+            ("ok\n-_-", "ok\n-_-"),
+            ("*-*", "-"),
+            ("_*_", "*"),
+            ("- - -", ""),
+            ("_ _ _", ""),
+            # ``_`` emphasis is never intraword.
+            ("my_var and snake_case_name", "my_var and snake_case_name"),
+            ("see my_notes: [link](https://e.com/?utm_source=x)", "see my_notes: link"),
+            ("x _y_z", "x _y_z"),
+            ("(_emph_)", "(emph)"),
+            ("_a_b_", "a_b"),
+            # Paragraph lines lose leading spaces, the paragraph its trailing ones.
+            ("  lead\n   b  ", "lead\nb"),
+            ("run \n```\nnpm test\n```\n please", "run\n\nnpm test\n\nplease"),
+        ],
+    )
+    def test_plain_text_matches_remark(self, markdown: str, expected: str):
+        assert ast_to_plain_text(parse_markdown(markdown)) == expected
+
+    def test_nested_link_label_keeps_only_the_inner_link(self):
+        para = parse_markdown("[[a](https://x.com) b](https://y.com)")["children"][0]
+        links = [c for c in para["children"] if c.get("type") == "link"]
+        assert [link["url"] for link in links] == ["https://x.com"]
+
+    def test_underscored_url_after_snake_case_stays_one_link(self):
+        para = parse_markdown("my_var see [page](https://example.com/my_page)")["children"][0]
+        assert [c["type"] for c in para["children"]] == ["text", "link"]
+        assert para["children"][1]["url"] == "https://example.com/my_page"
 
 
 # ============================================================================

@@ -569,6 +569,13 @@ class TestPythonContentGuards:
             ("- item\n> quoted `code`", "item\n\nquoted code"),
             (" ", ""),
             ("hi\n", "hi"),
+            # Values below are upstream's (slackMrkdwnToMarkdown + remark toPlainText).
+            ("run ```npm test``` please", "run\n\nnpm test\n\nplease"),
+            ("  lead and trail  ", "lead and trail"),
+            ("-_-", "-_-"),
+            ("ok\n-_-", "ok\n-_-"),
+            ("see my_notes: <https://example.com/?utm_source=slack|link>", "see my_notes: link"),
+            ("my_var see <https://example.com/my_page|page>", "my_var see page"),
         ],
     )
     async def test_body_text_is_the_plain_text_of_formatted(self, text: str, expected: str):

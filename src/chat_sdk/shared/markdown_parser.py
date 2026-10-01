@@ -320,10 +320,12 @@ _INLINE_PATTERNS = [
     # the destination (one level here): ``[build [failed]](u)``,
     # ``[Foo](https://en.wikipedia.org/wiki/Foo_(bar))``. Escape-sentinel
     # pairs (``\(`` / ``\)``) are consumed whole, so they never balance.
+    # A nested ``[...]`` directly followed by ``(`` is an inner link, and links
+    # never nest: ``[[a](u) b](v)`` is the inner link with literal brackets.
     (
         "link",
         re.compile(
-            r"(?<!﷐)\[((?:[^\[\]﷐]|﷐.|\[(?:[^\[\]﷐]|﷐.)*\])*)\]"
+            r"(?<!﷐)\[((?:[^\[\]﷐]|﷐.|\[(?:[^\[\]﷐]|﷐.)*\](?!\())*)\]"
             r'\(((?:﷐\S|[^\s()﷐]|\((?:﷐\S|[^\s()﷐])*\))+?)(?:\s+"([^"]*)")?\)'
         ),
     ),
@@ -337,8 +339,11 @@ _INLINE_PATTERNS = [
     ("delete", re.compile(r"(?<!﷐)~~(.+?)~~")),
     # Emphasis: *text*  (not preceded/followed by * or sentinel)
     ("emphasis_star", re.compile(r"(?<![*﷐])\*(?!\*)(.+?)(?<![*﷐])\*(?!\*)")),
-    # Emphasis: _text_  (not preceded/followed by _ or sentinel)
-    ("emphasis_under", re.compile(r"(?<![_﷐])_(?!_)(.+?)(?<![_﷐])_(?!_)")),
+    # Emphasis: _text_  (not preceded/followed by _ or sentinel). CommonMark
+    # forbids intraword ``_`` emphasis: the opener may not follow a word
+    # character and the closer may not precede one, so ``my_var`` and
+    # ``?utm_source=x`` keep their underscores.
+    ("emphasis_under", re.compile(r"(?<![\w﷐])_(?!_)(.+?)(?<![_﷐])_(?!\w)")),
 ]
 
 
@@ -536,7 +541,8 @@ def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Conten
 
 # Patterns used by the block parser
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
-_THEMATIC_BREAK_RE = re.compile(r"^([-*_]\s*){3,}\s*$")
+# CommonMark: three or more of the *same* marker (``-_-`` is text, not a break).
+_THEMATIC_BREAK_RE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 # CommonMark: a backtick fence's info string may not contain a backtick, so
 # "```npm test```" on one line is a (code span) paragraph, not a fence.
 _FENCED_CODE_START_RE = re.compile(r"^(`{3,}(?=[^`]*$)|~{3,})(.*)")
@@ -837,7 +843,10 @@ def _parse_blocks(text: str, quote_depth: int) -> Root:
             para_lines.append(next_line)
             i += 1
 
-        children.append(make_paragraph(_parse_inline("\n".join(para_lines))))
+        # CommonMark strips each paragraph line's leading spaces/tabs and the
+        # paragraph's trailing ones (``"run \n```"`` reads ``run``).
+        para_text = "\n".join(para_line.lstrip(" \t") for para_line in para_lines).rstrip(" \t")
+        children.append(make_paragraph(_parse_inline(para_text)))
 
     return make_root(children)
 

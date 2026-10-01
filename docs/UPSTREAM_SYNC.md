@@ -1285,14 +1285,28 @@ chat@4.41.1).
   re-slices the line per fence). `tests/test_slack_format_primitives.py`
   covers 50k-character inputs, and a differential fuzz against upstream
   `format/index.ts` (40k random mrkdwn inputs) found no mismatch.
-- **Known gaps (shared parser, not Slack-specific).** Two `markdown.test.ts`
-  cases are adapted: `parse_markdown` has no multi-backtick code spans
+- **Known gaps (shared parser, not Slack-specific).** One `markdown.test.ts`
+  case is adapted: `parse_markdown` has no multi-backtick code spans
   (```` ```c``` ```` inside a quote stays backticked text, where remark reads a
-  code span) and keeps a paragraph's leading space (`"```x``` &gt; note"`
-  gives `"x\n\n > note"`, upstream `"x\n\n> note"`). `parse_markdown` is
-  also quadratic on some inputs (about 2.4 s for 20k characters of `` `x ``);
-  this predates the port, since `to_ast` always ran it on every inbound
-  message, and is tracked in #308 (with the two gaps above).
+  code span). Not handled either, and now visible in `message.text`: no lazy
+  blockquote continuation (`"&gt; quoted\nreply"` gives `"quoted\n\nreply"`,
+  upstream `"quoted\nreply"` in one quote paragraph), and `\r` is not a line
+  ending. `parse_markdown` is also quadratic on some inputs (about 1.6 s for
+  16k characters of `` `x ``); this predates the port, since `to_ast` always
+  ran it on every inbound message. The fence rule below adds new inputs of
+  that cost: ```` ``` ```` followed by `` a` `` repeated (16 KB, about 1.6 s)
+  or ```` ```x` ```` lines (48 KB, about 10 s) were one O(n) code block
+  before and now go through the inline parser. All are tracked in #308.
+- **Shared parser fixes (CommonMark rules exposed by `message.text`).**
+  Since `text` is the plain text of `parse_markdown`, these parser bugs now
+  lost or corrupted text, so the parser follows CommonMark (values checked
+  against remark): a paragraph drops its lines' leading spaces/tabs and its
+  trailing ones (`"run ```npm test``` please"` reads `"run\n\nnpm test\n\nplease"`,
+  not `"run \n\nnpm test\n\n please"`); a thematic break repeats one marker
+  (`-_-` stayed empty text); `_` emphasis is never intraword (`my_var` and a
+  `?utm_source=` URL after a snake_case word kept losing underscores and
+  leaking `[label](url)`); and links never nest (`[[a](u) b](v)` is the inner
+  link with literal outer brackets).
 - **Shared parser fix (CommonMark fence rule).** A backtick fence's info
   string may not contain a backtick, so `parse_markdown` no longer opens a
   code block on a line like ```` ```npm test``` ````. The Slack normalizer
