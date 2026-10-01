@@ -1997,8 +1997,8 @@ of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
   `propagate_handler_errors` and `wait_until` are both set. The task is created
   synchronously inside the webhook's copied context, so it sees the
   multi-workspace token. It is pinned and has a done-callback that retrieves
-  its exception. `CancelledError` propagates. The Agent Sessions title hook
-  (#215) goes at the end of the task. Python-specific: `wait_until` gets
+  its exception. `CancelledError` propagates. The task ends by applying the
+  configured Agent Sessions title (#215). Python-specific: `wait_until` gets
   `asyncio.shield(bridge)`, not the task itself. Upstream's promise cannot be
   cancelled, but an asyncio task can, so a host that cancels its `wait_until`
   awaitable after the 200 would otherwise drop the DM before `process_message`
@@ -2020,8 +2020,8 @@ of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
   `loading_messages=[status] if status else (configured if configured is not None
   else ["Typing..."])` (upstream `??`). `set_assistant_status` uses the
   explicit `loading_messages` when it is not `None`, otherwise the config.
-  As before, the field is omitted when it is empty. Upstream's agent-view
-  status branches belong to #215.
+  As before, the field is omitted when it is empty. The agent-view status
+  branches came with #215.
 - **`feedback_buttons: bool | SlackFeedbackButtonsOptions | None`.** `True`
   normalizes to `SlackFeedbackButtonsOptions()`. `build_feedback_buttons_block(options=None)`
   builds the `context_actions` block (`message_feedback`, `"Good response"` /
@@ -2053,9 +2053,9 @@ of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
   next to #211's flat-DM case. Under agent_view, edits and deletes of a
   top-level DM use the per-message thread and are not bridged to a subscribed
   `slack:{D}:` thread, as upstream (`handleMessageChanged` /
-  `handleMessageDeleted` call `threadIdForMessageEvent` directly). Not
-  ported: the session-title / session-status cases in the same describe
-  blocks (#215).
+  `handleMessageDeleted` call `threadIdForMessageEvent` directly). The
+  session-title / session-status cases in the same describe blocks are in
+  `tests/test_slack_agent_sessions.py` (#215).
 
 ### Streaming and thread API (chat@4.32–4.41.1, #199)
 
@@ -2274,18 +2274,92 @@ current stream (a "segment") and continues the reply in a new message.
 - **slack_sdk floor.** The `slack` extras now need `slack-sdk>=3.40.0`, the
   first release whose `AsyncChatStream.append` takes `chunks` (the
   replay and the `chunks=[]` flush need it).
-- **Deferred (#215).** The rotation `stop()` does not send
-  `session_status="processing"` under `agent_view`, and the return of the
-  finalized message after a final-stop expiry does not call `end_typing`
-  (upstream `index.ts:6508`). Both places carry a `# SL10:` marker.
+- **Agent Sessions (#215).** Under `agent_view` the rotation `stop()` sends
+  `session_status="processing"`, and the return of the finalized message
+  after a final-stop expiry calls `end_typing` (upstream `index.ts:6508`).
 - **Tests.** `tests/test_slack_stream_rotation.py` ports 17 of the 18
   "native stream rotation" tests (the `it.each` max-age case is one
-  parametrized test; the `agent_view` one is #215), plus Python tests for
+  parametrized test; the `agent_view` one landed with #215), plus Python tests for
   the Grid `team_id` on every segment, rotation cutting the
   mention-resolved buffer, cancellation during the rotation `stop()` and
   the successor's replay, the final-stop expiry without a recorded ts, a
   structured chunk confirming buffered text, the table separator's
   whitespace set and the fence tracker's closing rules.
+
+### Slack Agent Sessions lifecycle and native stop (chat@4.39–4.40, #215)
+
+Slack half of `2ce2be00` (vercel/chat#862, chat@4.39.0) plus `8b6d7f3a`
+(#882) and `2cc8cc3f` (#897, both chat@4.40.0), on top of #201's turn
+cancellation and #214's `agent_view`. Everything is gated on `agent_view`;
+the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
+
+- **Lifecycle calls.** `set_session_status(channel_id, thread_ts, status, *,
+  initiator_user_id=None, title=None)` and `_rename_agent_session` call
+  `client.api_call(api_method="agents.sessions.setStatus" | "agents.sessions.rename",
+  json=...)` (slack_sdk has no generated `agents_sessions_*` methods). The
+  optional fields are sent only when truthy, as upstream's spreads. Upstream's
+  `withToken` also adds `team_id` / `client_context_team_id` for org-wide
+  installs; Python has no such per-call helper yet (it is not part of #213 as
+  landed), so these calls send what every other Python Web API call sends.
+- **`supports_turn_cancellation`** returns `agent_view`.
+- **`start_typing(thread_id, status=None, *, options=None)`.** Under
+  `agent_view`, `None` sets the session to `processing` and `""` to `active`
+  (8b6d7f3a; compared with `== ""`, never `or`), with `initiator_user_id`
+  from `TypingOptions`, logging failures without a legacy fallback. A custom
+  status still uses `assistant.threads.setStatus` (2cc8cc3f: Slack's
+  compatibility bridge renders it in the agent-session loading UX).
+- **`end_typing(thread_id, status="active")`** sets the session status; it
+  does nothing without `agent_view` or a thread ts and logs failures.
+- **`set_assistant_status`.** Under `agent_view` an empty or whitespace-only
+  status (`not status.strip()`) sets the session to `active`. Otherwise the
+  legacy call's `loading_messages` is the explicit list, then the config,
+  then `[status]` under `agent_view` (omitted when empty, as before).
+  **`set_assistant_title`** renames the agent session under `agent_view`.
+- **`stream()`.** Each chunk-loop iteration first checks
+  `options.signal.aborted` and breaks, so the stream is still finalized
+  through `stop()` (the signal is checked, the task is not cancelled).
+  Under `agent_view` the final `stop()` carries `session_status`
+  (`options.session_status`, default `"active"`), the rotation `stop()`
+  carries `"processing"`, and every fallback return (post+edit fallback,
+  first-stop failure, final-stop expiry) calls `end_typing` with the same
+  status.
+- **Events.** `agent_session_stopped` builds the thread id from `channel` +
+  `thread_ts` and runs a task that awaits `chat.abort_turn` (warns on error),
+  sets the session `active` (warns on error) and calls
+  `chat.process_agent_session_stopped` with `streaming_message_ts`. It never
+  takes the thread lock (the stopped turn holds it). The task is pinned, has
+  a logging done-callback, and is handed to `wait_until` shielded, as #214's
+  bridge. `agent_session_title_changed` calls
+  `process_agent_session_title_changed` (`title`, `previous_title`).
+- **`session_title`** (`SlackSessionTitle = bool | resolver`, default
+  `None` meaning `agent_view`; `SlackSessionTitleContext(channel_id, text,
+  thread_ts, user_id)`). The open_dm bridge task applies it after
+  `process_message` for a top-level human DM with text (no `bot_id`,
+  `subtype` or `thread_ts`): the resolver's result (sync or async; `None`
+  skips) or the first line, trimmed and cut to 80 characters (code points;
+  upstream's `slice` counts UTF-16 units). Errors are logged. Upstream also
+  schedules the title after `processMessage` on the non-bridge path for the
+  same messages; that branch is unreachable (the bridge takes every
+  agent_view top-level DM first), so it is not ported.
+- **Tests.** `tests/test_slack_agent_sessions.py` ports the named
+  `index.test.ts` cases ("routes custom labels and clearing separately on an
+  agent_view DM thread", "uses native $expected without custom text in agent
+  view", "does not fall back to a legacy label when native status fails",
+  "surfaces custom status text via the legacy API and clears via the
+  sessions lifecycle", "passes agent loading messages $expected", "renames
+  an agent session under agentView", "aborts and activates an agent session
+  when the user stops it", "dispatches agent session title changes" and the
+  three automatic-title cases); "finishes agent streams with an active
+  session status" is in `tests/test_slack_api.py` and "keeps the agent
+  session processing while the reply continues" in
+  `tests/test_slack_stream_rotation.py`. Python tests cover legacy mode
+  making no `agents.sessions.*` call, `""` versus `None`, an aborted signal
+  still awaiting `stop()` once, fallback and final-expiry `end_typing`, the
+  stop handler aborting a real turn that holds the thread lock, and title
+  trimming, resolvers and failures. `index.test.ts` is not fidelity-mapped.
+- **Live check pending.** The Stop button cancelling a streaming reply and
+  the session returning to `active` still need a check in an `agent_view`
+  workspace.
 
 ### AI messages without text and tool names (chat@4.35–4.41, #198)
 

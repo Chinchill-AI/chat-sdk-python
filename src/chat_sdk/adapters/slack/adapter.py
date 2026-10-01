@@ -68,6 +68,8 @@ from chat_sdk.adapters.slack.types import (
     SlackFeedbackButtonsOptions,
     SlackInstallation,
     SlackInstallationProvider,
+    SlackSessionTitle,
+    SlackSessionTitleContext,
     SlackSuggestedPrompts,
     SlackSuggestedPromptsContext,
     SlackThreadId,
@@ -107,6 +109,9 @@ from chat_sdk.shared.mentions import mask_code_spans, replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
+    AgentSessionStatus,
+    AgentSessionStoppedEvent,
+    AgentSessionTitleChangedEvent,
     AppContextChangedEvent,
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
@@ -1406,6 +1411,11 @@ class SlackAdapter:
         self._agent_view: bool = config.agent_view
         self._suggested_prompts: SlackSuggestedPrompts | None = config.suggested_prompts
         self._loading_messages: list[str] | None = config.loading_messages
+        # Automatic agent-session titles (vercel/chat 2ce2be00 #862): on by
+        # default under agent_view (upstream ``sessionTitle ?? agentView``).
+        self._session_title: SlackSessionTitle = (
+            config.session_title if config.session_title is not None else self._agent_view
+        )
         # Normalized feedback_buttons config (``True`` becomes the defaults).
         self._feedback_buttons: SlackFeedbackButtonsOptions | None = None
         if config.feedback_buttons:
@@ -1540,6 +1550,16 @@ class SlackAdapter:
     @property
     def lock_scope(self) -> LockScope:
         return self._lock_scope
+
+    @property
+    def supports_turn_cancellation(self) -> bool:
+        """``True`` under ``agent_view``: Slack's native Stop button aborts turns.
+
+        Chat then publishes each turn in the state backend, so an
+        ``agent_session_stopped`` delivered to another process still aborts
+        the turn (upstream ``supportsTurnCancellation = agentView``).
+        """
+        return self._agent_view
 
     @property
     def persist_message_history(self) -> bool:
@@ -2687,6 +2707,10 @@ class SlackAdapter:
             self._handle_assistant_thread_started(event, options)
         elif event_type == "assistant_thread_context_changed":
             self._handle_assistant_context_changed(event, options)
+        elif event_type == "agent_session_stopped":
+            self._handle_agent_session_stopped(event, options)
+        elif event_type == "agent_session_title_changed":
+            self._handle_agent_session_title_changed(event, options)
         elif event_type == "app_context_changed":
             self._handle_app_context_changed(event, options)
         elif event_type == "app_home_opened":
@@ -3681,6 +3705,11 @@ class SlackAdapter:
             self._bridge_agent_view_dm(event, thread_id, make_factory, options)
             return
 
+        # Upstream (chat@4.41.1 index.ts:3537-3557) also schedules the session
+        # title after this call for an agent_view top-level human DM. That
+        # branch is unreachable there: every such message took the bridge
+        # above (same ``agentView && isDM && !thread_ts`` guard), which applies
+        # the title itself. Not ported.
         self._chat.process_message(self, thread_id, make_factory(thread_id), options)
 
     def _bridge_agent_view_dm(
@@ -3726,8 +3755,7 @@ class SlackAdapter:
                 # and has a wait_until to observe the failure.
                 if options is not None and options.propagate_handler_errors and options.wait_until is not None:
                     raise
-            # Hook for #215 (Agent Sessions): upstream applies the configured
-            # session title here (``applyConfiguredSessionTitle``).
+            await self._apply_configured_session_title(event)
 
         try:
             bridge = asyncio.get_running_loop().create_task(_bridge())
@@ -3971,6 +3999,138 @@ class SlackAdapter:
         )
 
     # ==================================================================
+    # Agent Sessions (agent_view)
+    # ==================================================================
+
+    def _handle_agent_session_stopped(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """The user pressed Slack's native Stop button (vercel/chat 2ce2be00 #862).
+
+        Aborts the session's running turn, moves the session back to
+        ``active`` and dispatches ``on_agent_session_stopped``. Runs as its
+        own task without the thread lock: the turn being stopped holds it.
+        """
+        chat = self._chat
+        if chat is None:
+            self._logger.warn("Chat instance not initialized, ignoring agent_session_stopped")
+            return
+
+        channel_id: str = event.get("channel") or ""
+        thread_ts: str = event.get("thread_ts") or ""
+        thread_id = self.encode_thread_id(SlackThreadId(channel=channel_id, thread_ts=thread_ts))
+        streaming_message_ts = event.get("streaming_message_ts")
+
+        async def _stop() -> None:
+            try:
+                await chat.abort_turn(thread_id)
+            except Exception as error:
+                self._logger.warn(
+                    "Failed to abort stopped Slack agent session", {"error": error, "threadId": thread_id}
+                )
+            try:
+                await self.set_session_status(channel_id, thread_ts, "active")
+            except Exception as error:
+                self._logger.warn(
+                    "Failed to activate stopped Slack agent session", {"error": error, "threadId": thread_id}
+                )
+            chat.process_agent_session_stopped(
+                AgentSessionStoppedEvent(
+                    adapter=self,
+                    channel_id=channel_id,
+                    streaming_message_ts=list(streaming_message_ts) if isinstance(streaming_message_ts, list) else [],
+                    thread_id=thread_id,
+                    thread_ts=thread_ts,
+                    user_id=event.get("user") or "",
+                ),
+                options,
+            )
+
+        try:
+            task = asyncio.get_running_loop().create_task(_stop())
+        except RuntimeError:
+            return  # No running event loop
+        # Upstream parity: not tracked by ``disconnect()`` (see the DM bridge).
+        _pin_task(task)
+        task.add_done_callback(self._log_agent_session_stop_result)
+        if options is not None and options.wait_until is not None:
+            # Shielded, as for the DM bridge: a host cancelling its wait_until
+            # task must not cancel the (uncancellable upstream) stop work.
+            options.wait_until(asyncio.shield(task))
+
+    def _log_agent_session_stop_result(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback for the stop task: log (and so retrieve) an unexpected failure."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._logger.error("Slack agent_session_stopped handling failed", {"error": error})
+
+    def _handle_agent_session_title_changed(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """An agent session's title changed (vercel/chat 2ce2be00 #862)."""
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring agent_session_title_changed")
+            return
+        channel_id: str = event.get("channel") or ""
+        thread_ts: str = event.get("thread_ts") or ""
+        self._chat.process_agent_session_title_changed(
+            AgentSessionTitleChangedEvent(
+                adapter=self,
+                channel_id=channel_id,
+                previous_title=event.get("previous_title"),
+                thread_id=self.encode_thread_id(SlackThreadId(channel=channel_id, thread_ts=thread_ts)),
+                thread_ts=thread_ts,
+                title=event.get("title") or "",
+                user_id=event.get("user") or "",
+            ),
+            options,
+        )
+
+    async def _apply_configured_session_title(self, event: dict[str, Any]) -> None:
+        """Title a new agent session from its root message (upstream ``applyConfiguredSessionTitle``).
+
+        Only for a top-level human DM with text under ``agent_view``. The
+        title is the resolver's result, or the message's first line, trimmed
+        and cut to 80 characters (code points, where upstream's ``slice``
+        counts UTF-16 units); an empty title is skipped. Errors are logged,
+        never raised.
+        """
+        channel_id = event.get("channel")
+        ts = event.get("ts")
+        user_id = event.get("user")
+        text = event.get("text")
+        if not (
+            self._agent_view
+            and self._session_title
+            and channel_id
+            and ts
+            and user_id
+            and isinstance(text, str)
+            and text
+            and not event.get("bot_id")
+            and not event.get("subtype")
+            and not event.get("thread_ts")
+        ):
+            return
+        try:
+            configured = self._session_title
+            if callable(configured):
+                resolved = configured(
+                    SlackSessionTitleContext(channel_id=channel_id, text=text, thread_ts=ts, user_id=user_id)
+                )
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+            else:
+                resolved = text.split("\n", 1)[0].strip()
+            title = resolved.strip()[:80] if isinstance(resolved, str) else ""
+            if not title:
+                return
+            await self._rename_agent_session(channel_id, ts, title)
+        except Exception as error:
+            self._logger.warn(
+                "Failed to set Slack agent session title",
+                {"channelId": channel_id, "error": error, "threadTs": ts},
+            )
+
+    # ==================================================================
     # App home / member joined
     # ==================================================================
 
@@ -4180,9 +4340,20 @@ class SlackAdapter:
     ) -> None:
         """Set status/thinking indicator for an assistant thread.
 
+        A custom status goes through the legacy ``assistant.threads.setStatus``
+        API, also under ``agent_view``, where Slack's compatibility bridge
+        renders the text in the agent-session loading UX
+        (``agents.sessions.setStatus`` only takes lifecycle states). Under
+        ``agent_view`` an empty or whitespace-only status clears the loading
+        state by moving the session to ``active`` (vercel/chat 2cc8cc3f #897).
+
         When ``loading_messages`` is omitted (``None``), falls back to the
-        adapter-level ``loading_messages`` config (vercel/chat 0f743c9b).
+        adapter-level ``loading_messages`` config (vercel/chat 0f743c9b), and
+        under ``agent_view`` then to ``[status]``.
         """
+        if self._agent_view and not status.strip():
+            await self.set_session_status(channel_id, thread_ts, "active")
+            return
         client = self._get_client()
         kwargs: dict[str, Any] = {
             "channel_id": channel_id,
@@ -4190,12 +4361,49 @@ class SlackAdapter:
             "status": status,
         }
         effective_loading_messages = loading_messages if loading_messages is not None else self._loading_messages
+        if effective_loading_messages is None and self._agent_view:
+            effective_loading_messages = [status]
         if effective_loading_messages:
             kwargs["loading_messages"] = effective_loading_messages
         await client.assistant_threads_setStatus(**kwargs)
 
+    async def set_session_status(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        status: AgentSessionStatus,
+        *,
+        initiator_user_id: str | None = None,
+        title: str | None = None,
+    ) -> None:
+        """Set a Slack Agent Session lifecycle state, creating the session if needed.
+
+        Calls ``agents.sessions.setStatus`` (vercel/chat 2ce2be00 #862). Raises
+        ``SlackApiError`` when Slack rejects the call.
+        """
+        payload: dict[str, Any] = {"channel_id": channel_id, "thread_ts": thread_ts, "status": status}
+        if initiator_user_id:
+            payload["initiator_user_id"] = initiator_user_id
+        if title:
+            payload["title"] = title
+        # slack_sdk has no generated ``agents_sessions_*`` methods.
+        await self._get_client().api_call(api_method="agents.sessions.setStatus", json=payload)
+
+    async def _rename_agent_session(self, channel_id: str, thread_ts: str, title: str) -> None:
+        """Rename a Slack Agent Session (``agents.sessions.rename``)."""
+        await self._get_client().api_call(
+            api_method="agents.sessions.rename",
+            json={"channel_id": channel_id, "thread_ts": thread_ts, "title": title},
+        )
+
     async def set_assistant_title(self, channel_id: str, thread_ts: str, title: str) -> None:
-        """Set title for an assistant thread (shown in History tab)."""
+        """Set title for an assistant thread (shown in History tab).
+
+        Under ``agent_view`` this renames the agent session instead.
+        """
+        if self._agent_view:
+            await self._rename_agent_session(channel_id, thread_ts, title)
+            return
         client = self._get_client()
         await client.assistant_threads_setTitle(channel_id=channel_id, thread_ts=thread_ts, title=title)
 
@@ -5652,13 +5860,37 @@ class SlackAdapter:
     ) -> None:
         """Show typing / status indicator in the thread.
 
-        Uses Slack's ``assistant.threads.setStatus`` API when available.
+        A custom status uses Slack's ``assistant.threads.setStatus`` API. Under
+        ``agent_view`` without one, the agent session moves to
+        ``processing`` (no status) or ``active`` (an explicit ``""``, which
+        clears it) through ``agents.sessions.setStatus`` instead
+        (vercel/chat 2ce2be00, 8b6d7f3a, 2cc8cc3f). Failures are logged.
         """
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
         thread_ts = decoded.thread_ts
         if not thread_ts:
             self._logger.debug("Slack: startTyping skipped - no thread context")
+            return
+        if self._agent_view and not status:
+            # ``""`` and ``None`` differ here: ``""`` clears (8b6d7f3a).
+            session_status: AgentSessionStatus = "active" if status == "" else "processing"
+            self._logger.debug(
+                "Slack API: agents.sessions.setStatus",
+                {"channel": channel, "threadTs": thread_ts, "status": session_status},
+            )
+            try:
+                await self.set_session_status(
+                    channel,
+                    thread_ts,
+                    session_status,
+                    initiator_user_id=options.initiator_user_id if options is not None else None,
+                )
+            except Exception as exc:
+                self._logger.warn(
+                    "Slack API: agents.sessions.setStatus failed",
+                    {"channel": channel, "threadTs": thread_ts, "error": exc},
+                )
             return
 
         # Upstream (vercel/chat 0f743c9b): ``status ?? loadingMessages?.[0] ??
@@ -5686,6 +5918,27 @@ class SlackAdapter:
             self._logger.warn(
                 "Slack API: assistant.threads.setStatus failed",
                 {"channel": channel, "threadTs": thread_ts, "error": exc},
+            )
+
+    async def end_typing(self, thread_id: str, status: AgentSessionStatus | None = "active") -> None:
+        """Move the agent session to ``status`` after a reply (``agent_view`` only).
+
+        Does nothing without ``agent_view`` or a thread ts. ``None`` means
+        ``"active"``. Failures are logged (upstream ``endTyping``).
+        """
+        if not self._agent_view:
+            return
+        decoded = self.decode_thread_id(thread_id)
+        if not decoded.thread_ts:
+            return
+        try:
+            await self.set_session_status(
+                decoded.channel, decoded.thread_ts, status if status is not None else "active"
+            )
+        except Exception as exc:
+            self._logger.warn(
+                "Slack API: agents.sessions.setStatus failed",
+                {"channel": decoded.channel, "threadTs": decoded.thread_ts, "error": exc},
             )
 
     # ==================================================================
@@ -5777,6 +6030,12 @@ class SlackAdapter:
             stream_kwargs["team_id"] = recipient_team_id
         if options and options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
+        # Agent session state once the reply ends (agent_view only; vercel/chat
+        # 2ce2be00): sent with the final ``stop`` and on every early return.
+        session_status: AgentSessionStatus = (
+            options.session_status if options is not None and options.session_status is not None else "active"
+        )
+        signal = options.signal if options is not None else None
 
         async def create_streamer() -> Any:
             # Every segment gets the same kwargs, including the Grid
@@ -6069,9 +6328,10 @@ class SlackAdapter:
             stop_kwargs: dict[str, Any] = {"token": token}
             if final_text:
                 stop_kwargs["markdown_text"] = final_text
-            # SL10: agent_view keeps the session busy here with
-            # ``session_status="processing"`` (upstream d4a1f03a), since the
-            # reply continues in the next segment. Wired with #215.
+            if self._agent_view:
+                # Keep the agent session busy: the reply continues in the next
+                # segment, and chat.stopStream defaults to "active".
+                stop_kwargs["session_status"] = "processing"
             try:
                 result = await segment.streamer.stop(**stop_kwargs)
                 last_flushed = sent
@@ -6200,6 +6460,10 @@ class SlackAdapter:
             await flush_committed()
 
         async for chunk in text_stream:
+            # The turn was stopped (e.g. Slack's Stop button): stop reading
+            # and finalize below, so the stream is still closed cleanly.
+            if signal is not None and signal.aborted:
+                break
             if isinstance(chunk, str):
                 await push_text_and_flush(chunk)
             elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
@@ -6233,6 +6497,7 @@ class SlackAdapter:
         await flush_committed(force=True)
 
         if mode == "fallback":
+            await self.end_typing(thread_id, session_status)
             return finish_fallback()
 
         # Caller blocks (StreamingPlan end_with) first, then the configured
@@ -6242,6 +6507,9 @@ class SlackAdapter:
         if self._feedback_buttons is not None:
             stop_blocks.append(build_feedback_buttons_block(self._feedback_buttons))
         stop_kwargs: dict[str, Any] = {"token": token}
+        if self._agent_view:
+            # Only under agent_view, so legacy stop payloads are unchanged.
+            stop_kwargs["session_status"] = session_status
         if stop_blocks:
             stop_kwargs["blocks"] = stop_blocks
         try:
@@ -6259,6 +6527,7 @@ class SlackAdapter:
                 # ``ts`` accessor).
                 switch_to_fallback(exc)
                 await flush_fallback(True)
+                await self.end_typing(thread_id, session_status)
                 return finish_fallback()
             if not is_stream_expired(exc):
                 raise
@@ -6276,8 +6545,7 @@ class SlackAdapter:
                     "Slack: stream expired before stop, stream-end blocks skipped",
                     {"channel": channel, "messageId": expired_ts, "skippedBlocks": len(stop_blocks)},
                 )
-                # SL10: end_typing(thread_id, session_status) before this
-                # return (upstream index.ts:6508). Wired with #215.
+                await self.end_typing(thread_id, session_status)
                 return RawMessage(id=expired_ts, thread_id=thread_id, raw={"ts": expired_ts})
             self._logger.warn(
                 "Slack: stream expired before stop, delivering the rest in a new message",

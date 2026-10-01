@@ -167,6 +167,22 @@ class TestNativeStreamRotation:
         assert counts_mid_stream == [1]
         assert s.chat_stream.await_count == 2
 
+    # TS: "keeps the agent session processing while the reply continues"
+    # (vercel/chat d4a1f03a, wired with #215)
+    @pytest.mark.asyncio
+    async def test_keeps_the_agent_session_processing_while_the_reply_continues(self, tick):
+        s = _setup(agent_view=True)
+
+        async def stream() -> AsyncIterator[str]:
+            yield "a\n"
+            tick(MAX_AGE + 1)
+            yield "b\n\nc\n"
+
+        await s.adapter.stream(THREAD, stream())
+
+        assert s.segments[0].stop.await_args.kwargs["session_status"] == "processing"
+        assert s.segments[1].stop.await_args.kwargs["session_status"] == "active"
+
     @pytest.mark.asyncio
     async def test_continues_in_a_new_message_when_slack_expired_the_segment_before_rotation(self, tick):
         s = _setup()
@@ -513,6 +529,28 @@ class TestNativeStreamRotationPythonSpecific:
         s.segments[1].stop.assert_not_awaited()
         warnings = [call.args[0] for call in s.logger.warn.call_args_list]
         assert not any("structured-chunk append failed" in message for message in warnings)
+
+    # Upstream index.ts:6508: the expired-final early return still hands the
+    # agent session back (#215).
+    @pytest.mark.asyncio
+    async def test_an_expired_final_segment_still_ends_the_agent_session_with_the_requested_status(self):
+        s = _setup(agent_view=True)
+        s.segments[0].stop.side_effect = _ExpiredStreamError()
+        client = s.adapter._get_client()
+        client.api_call = AsyncMock(return_value={"ok": True})
+
+        async def stream() -> AsyncIterator[str]:
+            yield "first\n"
+
+        result = await s.adapter.stream(THREAD, stream(), StreamOptions(session_status="suspended"))
+
+        assert result is not None
+        assert result.id == "1234567890.0"
+        assert s.segments[0].stop.await_args.kwargs["session_status"] == "suspended"
+        client.api_call.assert_awaited_once_with(
+            api_method="agents.sessions.setStatus",
+            json={"channel_id": "D123", "thread_ts": "1234567890.000000", "status": "suspended"},
+        )
 
     @pytest.mark.asyncio
     async def test_an_expired_final_segment_with_no_recorded_ts_re_raises(self):
