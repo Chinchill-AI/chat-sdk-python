@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -64,6 +65,7 @@ from chat_sdk.shared.errors import (
     ValidationError,
 )
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     AdapterPostableMessage,
     Attachment,
@@ -71,6 +73,7 @@ from chat_sdk.types import (
     ChannelInfo,
     ChatInstance,
     EmojiValue,
+    EphemeralMessage,
     FetchOptions,
     FetchResult,
     FileUpload,
@@ -81,11 +84,13 @@ from chat_sdk.types import (
     Message,
     MessageMetadata,
     PostableMarkdown,
+    PostEphemeralOptions,
     RawMessage,
     ReactionEvent,
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    Unset,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -107,10 +112,45 @@ USER_INFO_NEGATIVE_SENTINEL = "unresolvable"
 # Bound on the sender lookup awaited before dispatch (Python-only; see
 # docs/UPSTREAM_SYNC.md). On expiry the message is dispatched without email.
 INCOMING_USER_TIMEOUT_S = 5.0
+# Teams deletes a targeted message 24 hours after it is sent, so a record of
+# one is worthless past that point (upstream TARGETED_ACTIVITY_TTL_MS).
+TARGETED_ACTIVITY_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
+# Bound on waiting for the first native-stream chunk id. Matches the SDK
+# ``HttpStream`` close wait.
+# Divergence from upstream — see docs/UPSTREAM_SYNC.md (first-chunk wait).
+STREAM_FIRST_CHUNK_ID_TIMEOUT_S = 30.0
+# Common Chat SDK names that differ from Teams reaction IDs (upstream
+# TEAMS_REACTION_ALIASES). Other names pass through as native Teams IDs.
+_TEAMS_REACTION_ALIASES: dict[str, str] = {
+    "check": "2705_whiteheavycheckmark",
+    "eyes": "1f440_eyes",
+    "pin": "1f4cc_pushpin",
+    "rocket": "launch",
+    "thinking": "think",
+    "thumbs_up": "like",
+    "x": "274c_crossmark",
+}
+# The SDK interpolates the reaction type into the URL path unescaped, so only
+# path-safe IDs (``like``, ``1f440_eyes``, hyphenated names) are sent.
+# Divergence from upstream — see docs/UPSTREAM_SYNC.md (reaction-ID check).
+_TEAMS_REACTION_TYPE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 # Strong references for fire-and-forget tasks (user-info cache writes) so the
 # GC does not collect them mid-flight.
 _background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _resolve_teams_reaction_type(emoji: EmojiValue | str) -> str:
+    """Map an emoji to a Teams reaction ID (upstream ``resolveTeamsReactionType``).
+
+    Raises :class:`ValidationError` for an ID that is not path-safe, before
+    any request is made.
+    """
+    name = emoji if isinstance(emoji, str) else emoji.name
+    reaction_type = _TEAMS_REACTION_ALIASES.get(name, name)
+    if not _TEAMS_REACTION_TYPE_PATTERN.fullmatch(reaction_type):
+        raise ValidationError("teams", f"Invalid Teams reaction type: {reaction_type!r}")
+    return reaction_type
 
 
 def _pin_task(task: asyncio.Task[Any]) -> None:
@@ -2176,6 +2216,161 @@ class TeamsAdapter:
             # Should not reach here due to _handle_teams_error always raising
             raise  # pragma: no cover
 
+    async def post_ephemeral(
+        self,
+        thread_id: str,
+        user_id: str,
+        message: AdapterPostableMessage,
+        *,
+        options: PostEphemeralOptions | None = None,
+    ) -> EphemeralMessage:
+        """Send a message only ``user_id`` can see, as a Teams targeted message.
+
+        Port of upstream ``postEphemeral`` (vercel/chat#737, chat@4.35.0). In a
+        1:1 chat Teams has no targeted messages, so the message is posted
+        normally and ``used_fallback`` is ``True``; the check runs before the
+        activity is built because the SDK rejects a targeted send to a
+        personal conversation. Elsewhere the activity is addressed to
+        ``user_id`` with ``with_recipient(..., True)`` (the SDK routes it to the
+        targeted endpoint) and the sent id is recorded so a later edit or
+        delete uses the targeted endpoint too. The app must be installed in the
+        conversation. ``options`` is accepted and ignored, as upstream.
+        """
+        if self.is_dm(thread_id):
+            sent = await self.post_message(thread_id, message)
+            return EphemeralMessage(
+                id=sent.id,
+                thread_id=sent.thread_id,
+                used_fallback=True,
+                raw=sent.raw,
+            )
+
+        decoded = self.decode_thread_id(thread_id)
+
+        files = extract_files(message)
+        file_attachments = await self._files_to_attachments(files) if files else []
+
+        card = extract_card(message)
+        activity_payload: dict[str, Any]
+        if card:
+            activity_payload = {
+                "type": "message",
+                "attachments": [
+                    {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": card_to_adaptive_card(card),
+                    },
+                    *file_attachments,
+                ],
+            }
+            self._logger.debug(
+                "Teams API: send (targeted adaptive card)",
+                {
+                    "conversationId": decoded.conversation_id,
+                    "userId": user_id,
+                    "fileCount": len(file_attachments),
+                },
+            )
+        else:
+            text = convert_emoji_placeholders(
+                self._format_converter.render_postable(message),
+                "teams",
+            )
+            activity_payload = {
+                "type": "message",
+                "text": text,
+                "textFormat": "markdown",
+            }
+            if file_attachments:
+                activity_payload["attachments"] = file_attachments
+            self._logger.debug(
+                "Teams API: send (targeted message)",
+                {
+                    "conversationId": decoded.conversation_id,
+                    "userId": user_id,
+                    "textLength": len(text),
+                    "fileCount": len(file_attachments),
+                },
+            )
+
+        try:
+            _validate_service_url(decoded.service_url)
+            activity = self._message_activity_input(activity_payload).with_recipient(
+                self._create_targeted_recipient(user_id), True
+            )
+            sent = await self._send_to(decoded, activity)
+        except Exception as error:
+            self._logger.error(
+                "Teams API: targeted send failed",
+                {
+                    "conversationId": decoded.conversation_id,
+                    "userId": user_id,
+                    "error": str(error),
+                },
+            )
+            _handle_teams_error(error, "postEphemeral")
+            raise  # unreachable: _handle_teams_error always raises
+
+        sent_id = getattr(sent, "id", "") or ""
+        await self._remember_targeted_activity(decoded.conversation_id, sent_id)
+        self._logger.debug("Teams API: targeted send response", {"messageId": sent_id})
+        return EphemeralMessage(
+            id=sent_id,
+            thread_id=thread_id,
+            used_fallback=False,
+            raw=activity_payload,
+        )
+
+    @staticmethod
+    def _create_targeted_recipient(user_id: str) -> Any:
+        """The recipient account of a targeted message (upstream ``createTargetedRecipient``).
+
+        ``role`` is a field on ``microsoft-teams-api`` 2.1's ``Account``; 2.0.x
+        keeps it as an extra field, so it is on the wire either way.
+        """
+        from microsoft_teams.api import Account
+
+        return Account(id=user_id, name=user_id, role="user")
+
+    # Teams accepts an update or a delete of a targeted activity only through
+    # the ``?isTargetedActivity=true`` endpoint; the plain one answers 400.
+    # Nothing on the wire says afterwards which activities were targeted, and
+    # ``edit_message`` / ``delete_message`` get only an id, so the ids sent
+    # targeted are recorded in the Chat state adapter (shared across instances
+    # and restarts) and read back on mutation. Every access is best effort: a
+    # lost record costs the 400, never the message. Upstream vercel/chat#951.
+
+    @staticmethod
+    def _targeted_activity_key(conversation_id: str, message_id: str) -> str:
+        return f"teams:targetedActivity:{conversation_id}:{message_id}"
+
+    async def _remember_targeted_activity(self, conversation_id: str, message_id: str) -> None:
+        if not (self._chat and message_id):
+            return
+        # A state adapter that cannot write must not fail the send.
+        with contextlib.suppress(Exception):
+            await self._chat.get_state().set(
+                self._targeted_activity_key(conversation_id, message_id),
+                "1",
+                TARGETED_ACTIVITY_TTL_MS,
+            )
+
+    async def _is_targeted_activity(self, conversation_id: str, message_id: str) -> bool:
+        if not (self._chat and message_id):
+            return False
+        try:
+            recorded = await self._chat.get_state().get(self._targeted_activity_key(conversation_id, message_id))
+        except Exception:
+            return False
+        return recorded == "1"
+
+    async def _forget_targeted_activity(self, conversation_id: str, message_id: str) -> None:
+        if not (self._chat and message_id):
+            return
+        # The TTL clears it anyway.
+        with contextlib.suppress(Exception):
+            await self._chat.get_state().delete(self._targeted_activity_key(conversation_id, message_id))
+
     async def edit_message(
         self,
         thread_id: str,
@@ -2216,21 +2411,23 @@ class TeamsAdapter:
                 "textFormat": "markdown",
             }
 
+        targeted = await self._is_targeted_activity(decoded.conversation_id, message_id)
+
         self._logger.debug(
             "Teams API: updateActivity",
             {
                 "conversationId": decoded.conversation_id,
                 "messageId": message_id,
+                "targeted": targeted,
             },
         )
 
         try:
             _validate_service_url(decoded.service_url)
             api = self._api_for(decoded.service_url)
-            await api.conversations.activities(decoded.conversation_id).update(
-                message_id,
-                self._message_activity_input(activity_payload),
-            )
+            activities = api.conversations.activities(decoded.conversation_id)
+            update = activities.update_targeted if targeted else activities.update
+            await update(message_id, self._message_activity_input(activity_payload))
         except Exception as error:
             self._logger.error(
                 "Teams API: updateActivity failed",
@@ -2249,18 +2446,23 @@ class TeamsAdapter:
         """Delete a Teams message."""
         decoded = self.decode_thread_id(thread_id)
 
+        targeted = await self._is_targeted_activity(decoded.conversation_id, message_id)
+
         self._logger.debug(
             "Teams API: deleteActivity",
             {
                 "conversationId": decoded.conversation_id,
                 "messageId": message_id,
+                "targeted": targeted,
             },
         )
 
         try:
             _validate_service_url(decoded.service_url)
             api = self._api_for(decoded.service_url)
-            await api.conversations.activities(decoded.conversation_id).delete(message_id)
+            activities = api.conversations.activities(decoded.conversation_id)
+            delete = activities.delete_targeted if targeted else activities.delete
+            await delete(message_id)
         except Exception as error:
             self._logger.error(
                 "Teams API: deleteActivity failed",
@@ -2273,14 +2475,22 @@ class TeamsAdapter:
             _handle_teams_error(error, "deleteMessage")
             raise  # unreachable: _handle_teams_error always raises
 
+        await self._forget_targeted_activity(decoded.conversation_id, message_id)
+
     async def add_reaction(
         self,
         thread_id: str,
         message_id: str,
         emoji: EmojiValue | str,
     ) -> None:
-        """Add a reaction (not supported by Teams Bot Framework API)."""
-        self._logger.warn("addReaction is not supported by the Teams Bot Framework API")
+        """Add the bot's reaction to a message (upstream vercel/chat#734).
+
+        ``check``, ``eyes``, ``pin``, ``rocket``, ``thinking``, ``thumbs_up``
+        and ``x`` map to their Teams IDs; any other name is sent as a native
+        Teams reaction ID. A name that is not path-safe raises
+        :class:`ValidationError` before any request.
+        """
+        await self._send_reaction(thread_id, message_id, emoji, remove=False)
 
     async def remove_reaction(
         self,
@@ -2288,8 +2498,50 @@ class TeamsAdapter:
         message_id: str,
         emoji: EmojiValue | str,
     ) -> None:
-        """Remove a reaction (not supported by Teams Bot Framework API)."""
-        self._logger.warn("removeReaction is not supported by the Teams Bot Framework API")
+        """Remove the bot's reaction from a message (upstream vercel/chat#734)."""
+        await self._send_reaction(thread_id, message_id, emoji, remove=True)
+
+    async def _send_reaction(
+        self,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
+        *,
+        remove: bool,
+    ) -> None:
+        """Add or delete a reaction through the conversations reactions API.
+
+        ``microsoft-teams-api`` 2.0.16+ has ``conversations.add_reaction`` /
+        ``delete_reaction`` (upstream's ``conversations.addReaction``); 2.0.13
+        has only ``ApiClient.reactions.add`` / ``delete``, which 2.0.16+
+        deprecates. Both issue the same request.
+        """
+        decoded = self.decode_thread_id(thread_id)
+        reaction_type = _resolve_teams_reaction_type(emoji)
+        label = "deleteReaction" if remove else "addReaction"
+        log_context = {
+            "conversationId": decoded.conversation_id,
+            "messageId": message_id,
+            "reactionType": reaction_type,
+        }
+
+        self._logger.debug(f"Teams API: {label}", log_context)
+
+        try:
+            _validate_service_url(decoded.service_url)
+            api = self._api_for(decoded.service_url)
+            conversations = api.conversations
+            if hasattr(conversations, "add_reaction"):
+                call = conversations.delete_reaction if remove else conversations.add_reaction
+            else:
+                call = api.reactions.delete if remove else api.reactions.add
+            await call(decoded.conversation_id, message_id, reaction_type)
+        except Exception as error:
+            self._logger.error(f"Teams API: {label} failed", {**log_context, "error": str(error)})
+            _handle_teams_error(error, "removeReaction" if remove else "addReaction")
+            raise  # unreachable: _handle_teams_error always raises
+
+        self._logger.debug(f"Teams API: {label} response", {"ok": True})
 
     async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Send typing indicator to a Teams conversation."""
@@ -2321,23 +2573,31 @@ class TeamsAdapter:
         thread_id: str,
         text_stream: Any,
         options: StreamOptions | None = None,
-    ) -> RawMessage:
+    ) -> RawMessage | None:
         """Stream responses to a Teams conversation.
 
         DMs stream natively via the Teams SDK ``IStreamer.emit()`` when an
         active streamer exists (captured by :meth:`_handle_message_activity`
-        from the inbound activity). Group chats / channels / proactive messages
-        accumulate the stream and post a single message — Teams supports native
+        from the inbound activity); a placeholder set with
+        ``fallback_streaming_placeholder_text`` is shown there as the native
+        status line. Without a streamer (group chats, channels, proactive
+        messages), a placeholder string returns ``None`` before the stream is
+        read, so core posts the placeholder and edits it; otherwise the stream
+        is accumulated and posted as a single message. Teams supports native
         streaming only in 1:1 chats.
 
-        Mirrors upstream ``stream`` in
-        ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``):
-        delegate to ``streamViaEmit`` when ``activeStream && !activeStream.canceled``,
-        else accumulate and ``postMessage``.
+        Mirrors upstream ``stream`` in ``packages/adapter-teams/src/index.ts``
+        (vercel/chat#709, chat@4.35.0). Only an explicit ``str`` (``""``
+        included) changes behaviour: ``UNSET`` (not configured) and ``None``
+        (no placeholder) keep the native and buffered paths unchanged.
         """
+        placeholder = options.fallback_streaming_placeholder_text if options is not None else UNSET
         active_stream = self._active_streams.get(thread_id)
         if active_stream is not None and not active_stream.canceled:
-            return await self._stream_via_emit(thread_id, text_stream, active_stream)
+            return await self._stream_via_emit(thread_id, text_stream, active_stream, placeholder)
+
+        if active_stream is None and isinstance(placeholder, str):
+            return None
 
         # No native streamer (group chats, proactive messages, or DMs whose
         # streamer was already canceled). Accumulate and post once — matching
@@ -2371,8 +2631,13 @@ class TeamsAdapter:
         thread_id: str,
         text_stream: Any,
         stream: StreamerProtocol,
+        placeholder_text: str | None | Unset = UNSET,
     ) -> RawMessage:
         """Native streaming via the Teams SDK ``IStreamer.emit()``.
+
+        A ``placeholder_text`` string is sent first with ``stream.update()``
+        (an informative status, replaced by the first text chunk); ``None``
+        and ``UNSET`` send nothing.
 
         Each non-empty chunk is handed to ``stream.emit(text)``; the SDK
         ``HttpStream`` owns the Bot Framework streaming wire format
@@ -2393,7 +2658,11 @@ class TeamsAdapter:
         We capture the first chunk's server-assigned id via ``on_chunk`` and
         await it ONLY when text was emitted and the stream was not canceled —
         awaiting unconditionally would hang forever if no chunk was ever
-        delivered (empty stream, or canceled before the first flush).
+        delivered (empty stream, or canceled before the first flush). The wait
+        is also bounded by ``STREAM_FIRST_CHUNK_ID_TIMEOUT_S`` (Python-only):
+        ``microsoft-teams-apps`` 2.0.16+ leaves ``canceled`` unset when the
+        first flush fails terminally (e.g. a 403 that is not a cancel), so no
+        chunk ever arrives; the id is then ``""``.
 
         Mirrors upstream ``streamViaEmit`` in
         ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``).
@@ -2418,6 +2687,11 @@ class TeamsAdapter:
         stream.on_chunk(_on_chunk)
 
         try:
+            if isinstance(placeholder_text, str):
+                # Synchronous on the SDK streamer: it queues an informative
+                # typing activity for the next flush.
+                stream.update(placeholder_text)
+
             async for chunk in text_stream:
                 if stream.canceled:
                     self._logger.debug("Teams stream canceled by user", {"threadId": thread_id})
@@ -2454,10 +2728,15 @@ class TeamsAdapter:
         # canceled before any chunk was delivered (which would hang forever).
         if accumulated and not stream.canceled:
             try:
-                message_id = await id_captured
+                message_id = await asyncio.wait_for(id_captured, STREAM_FIRST_CHUNK_ID_TIMEOUT_S)
             except StreamCancelledError:
                 self._logger.debug(
                     "Teams stream canceled before first chunk delivered",
+                    {"threadId": thread_id},
+                )
+            except asyncio.TimeoutError:
+                self._logger.warn(
+                    "Teams stream delivered no chunk; returning without a message id",
                     {"threadId": thread_id},
                 )
 

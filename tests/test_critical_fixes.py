@@ -4,7 +4,6 @@ Covers:
 1. Telegram process_action uses snake_case keys
 2. Telegram process_reaction uses snake_case keys
 3. Google Chat stream() accepts AsyncIterable
-4. Teams add_reaction / remove_reaction don't raise (just warn)
 5. WhatsApp post_message calls Graph API correctly
 6. WhatsApp add_reaction sends correct emoji payload
 7. WhatsApp stream accumulates and posts
@@ -29,8 +28,6 @@ from chat_sdk.adapters.google_chat.types import (
     GoogleChatAdapterConfig,
     ServiceAccountCredentials,
 )
-from chat_sdk.adapters.teams.adapter import TeamsAdapter
-from chat_sdk.adapters.teams.types import TeamsAdapterConfig
 from chat_sdk.adapters.telegram.adapter import TelegramAdapter
 from chat_sdk.adapters.telegram.types import TelegramAdapterConfig
 from chat_sdk.adapters.whatsapp.adapter import WhatsAppAdapter
@@ -49,15 +46,6 @@ def _make_telegram_adapter(**overrides) -> TelegramAdapter:
         **overrides,
     )
     return TelegramAdapter(config)
-
-
-def _make_teams_adapter(**overrides) -> TeamsAdapter:
-    config = TeamsAdapterConfig(
-        app_id=overrides.pop("app_id", "test-app-id"),
-        app_password=overrides.pop("app_password", "test-password"),
-        **overrides,
-    )
-    return TeamsAdapter(config)
 
 
 def _make_whatsapp_adapter(**overrides) -> WhatsAppAdapter:
@@ -353,47 +341,6 @@ class TestGoogleChatStreamSignature:
         await adapter.stream("gchat:spaces/xyz", mixed_stream())
 
         assert posted[0][1].markdown == "Start middle end"
-
-
-# ---------------------------------------------------------------------------
-# 4. Teams add_reaction / remove_reaction don't raise
-# ---------------------------------------------------------------------------
-
-
-class TestTeamsReactionsGraceful:
-    """Verify Teams reactions log a warning instead of raising NotImplementedError."""
-
-    @pytest.mark.asyncio
-    async def test_add_reaction_does_not_raise(self):
-        mock_logger = MagicMock(
-            debug=MagicMock(),
-            info=MagicMock(),
-            warn=MagicMock(),
-            error=MagicMock(),
-        )
-        adapter = _make_teams_adapter(logger=mock_logger)
-
-        # Should not raise
-        await adapter.add_reaction("teams:conv123", "msg456", "thumbs_up")
-
-        mock_logger.warn.assert_called_once()
-        assert "not supported" in mock_logger.warn.call_args[0][0].lower()
-
-    @pytest.mark.asyncio
-    async def test_remove_reaction_does_not_raise(self):
-        mock_logger = MagicMock(
-            debug=MagicMock(),
-            info=MagicMock(),
-            warn=MagicMock(),
-            error=MagicMock(),
-        )
-        adapter = _make_teams_adapter(logger=mock_logger)
-
-        # Should not raise
-        await adapter.remove_reaction("teams:conv123", "msg456", "thumbs_up")
-
-        mock_logger.warn.assert_called_once()
-        assert "not supported" in mock_logger.warn.call_args[0][0].lower()
 
 
 # ---------------------------------------------------------------------------
