@@ -243,6 +243,14 @@ class SlackAdapterConfig:
     # is degraded), ``start_socket_mode`` raises after this many seconds so
     # ``initialize()`` doesn't block forever (hazard #11).
     connect_timeout_s: float = 30.0
+    # Stream replies through Slack's native streaming API (``chat.startStream``
+    # / ``appendStream`` / ``stopStream``). With ``False``, ``stream()``
+    # returns ``None`` and core delivers replies with post+edit. When the
+    # workspace rejects the first native call, the reply falls back to
+    # post+edit mid-stream; ``feature_not_enabled`` / ``method_deprecated`` /
+    # ``unknown_method`` also turn native streaming off for the rest of this
+    # adapter instance's life. Upstream ``nativeStreaming`` (default ``true``).
+    native_streaming: bool = True
     # Override bot username (optional)
     user_name: str | None = None
     # Enable Slack's Agent messaging experience (``agent_view`` manifest mode).

@@ -936,6 +936,36 @@ def _literal_phrasing(line: str) -> list[Content]:
     return children
 
 
+# Slack platform errors meaning the workspace will never accept the native
+# streaming methods (as opposed to transient or request-specific failures).
+# Upstream ``NATIVE_STREAMING_UNSUPPORTED_ERRORS`` (vercel/chat 0f743c9b).
+_NATIVE_STREAMING_UNSUPPORTED_ERRORS = frozenset({"feature_not_enabled", "method_deprecated", "unknown_method"})
+
+
+def _slack_platform_error_code(error: BaseException) -> str | None:
+    """Return the Slack platform error code (``response["error"]``) or ``None``.
+
+    Upstream ``slackPlatformErrorCode``. slack_sdk raises ``SlackApiError``
+    with a ``response`` (a ``SlackResponse`` whose ``data`` dict holds
+    ``error``). Read by shape, as ``_handle_slack_error`` does, because
+    slack_sdk is an optional dependency. Network errors, timeouts and
+    ``SlackRequestError`` carry no response, so they return ``None``.
+    """
+    resp = getattr(error, "response", None)
+    data = getattr(resp, "data", None)
+    body = data if isinstance(data, dict) else resp
+    if isinstance(body, dict):
+        code = body.get("error")
+        if isinstance(code, str) and code:
+            return code
+    return None
+
+
+def _monotonic_ms() -> float:
+    """Monotonic clock in ms for stream fallback throttling (patched in tests)."""
+    return time.monotonic() * 1000
+
+
 def _normalize_bot_token_provider(
     value: SlackBotToken | None,
 ) -> SlackBotTokenResolver | None:
@@ -1106,6 +1136,13 @@ class SlackAdapter:
         bot_token_provider = _normalize_bot_token_provider(bot_token_config)
 
         self._name = "slack"
+        # Native streaming switch (upstream ``nativeStreaming``, vercel/chat
+        # 0f743c9b). ``_native_streaming_broken`` latches when the workspace
+        # rejects the native methods with an error that won't heal, so later
+        # streams go straight to post+edit. It is per adapter instance, which
+        # multi-workspace mode shares across workspaces (as upstream).
+        self._native_streaming: bool = config.native_streaming
+        self._native_streaming_broken: bool = False
         self._signing_secret: str | None = signing_secret
         # ``webhook_verifier`` takes precedence; ``signing_secret`` is only used
         # when no verifier is configured (matches upstream vercel/chat#468).
@@ -5483,50 +5520,51 @@ class SlackAdapter:
         Consumes an async iterable of text chunks and/or structured
         ``StreamChunk`` objects and streams them to Slack.
 
-        Native streaming needs ``recipient_user_id`` and ``recipient_team_id``
-        in *options*. Without them this returns ``None`` before consuming
-        *text_stream*, so the core post+edit fallback delivers the reply.
+        Returns ``None`` before consuming *text_stream*, so core's post+edit
+        fallback delivers the reply, when the thread has no ``thread_ts``
+        (top-level DMs), when a non-DM channel lacks ``recipient_user_id`` /
+        ``recipient_team_id``, or when native streaming is off
+        (``native_streaming=False`` or latched off by an unsupported-method
+        error). If the first native call fails, the rest of the reply is
+        delivered here with throttled post+edit.
         """
-        if not options or not (options.recipient_user_id and options.recipient_team_id):
-            # Upstream returns null here (438f5513, vercel/chat#633) for
-            # threads with no message context: `chat.thread(id)`, open_dm,
-            # and message-less action/reaction threads (#199). Minimal port
-            # of that guard; upstream's DM exemption and the rest of the
-            # Slack streaming half (native_streaming, mid-stream fallback,
-            # retiring the #94 branch below) are #207.
-            self._logger.debug("Slack: using fallback stream - no recipient context")
-            return None
-
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
-        # Normalize empty thread_ts to None to avoid Slack API "invalid_thread_ts" errors.
-        # ``chat.startStream`` rejects an empty thread_ts (top-level DMs have no
-        # parent thread to attach to), but ``chat.postMessage`` accepts it.
-        # Degrade DMs to a single accumulated post_message call so streaming
-        # replies aren't silently dropped (chat-sdk-python#94).
+        # chat.startStream rejects an empty thread_ts (top-level DMs have no
+        # parent to attach to), so those replies go through core's post+edit.
         thread_ts = decoded.thread_ts or None
         if not thread_ts:
+            self._logger.debug("Slack: using fallback stream - no thread context")
+            return None
+        recipient_user_id = options.recipient_user_id if options else None
+        recipient_team_id = options.recipient_team_id if options else None
+        # DMs stream natively without recipient ids; channels need both
+        # (upstream 438f5513, vercel/chat#633). Message-less threads
+        # (``chat.thread(id)``, open_dm, action/reaction threads) have none.
+        if not (channel.startswith("D") or (recipient_user_id and recipient_team_id)):
+            self._logger.debug("Slack: using fallback stream - no recipient context")
+            return None
+        if not self._native_streaming or self._native_streaming_broken:
             self._logger.debug(
-                "Slack: stream degraded to post_message - no thread context",
-                {"channel": channel},
+                "Slack: using fallback stream - native streaming disabled",
+                {"configured": self._native_streaming, "broken": self._native_streaming_broken},
             )
-            accumulated = ""
-            async for chunk in text_stream:
-                if isinstance(chunk, str):
-                    accumulated += chunk
-                elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
-                    accumulated += chunk.text  # type: ignore[union-attr]
-            return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
-        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
-
+            return None
         token = self._get_token()
         client = self._get_client(token)
+        if not callable(getattr(client, "chat_stream", None)):
+            # Python-specific: slack_sdk releases older than the streaming
+            # helper (the declared floor is 3.27.0) have no ``chat_stream``.
+            # Defer to core's post+edit before the stream is read.
+            self._logger.debug("Slack: using fallback stream - slack_sdk has no chat_stream")
+            return None
+        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
-        stream_kwargs: dict[str, Any] = {
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "recipient_user_id": options.recipient_user_id,
-            "recipient_team_id": options.recipient_team_id,
+        stream_kwargs: dict[str, Any] = {"channel": channel, "thread_ts": thread_ts}
+        if recipient_user_id:
+            stream_kwargs["recipient_user_id"] = recipient_user_id
+        if recipient_team_id:
+            stream_kwargs["recipient_team_id"] = recipient_team_id
             # Enterprise Grid disambiguation (chat-sdk-python#95). On Grid
             # orgs ``chat.startStream`` fails with ``team_not_found`` unless
             # the workspace ``team_id`` is supplied explicitly — the
@@ -5542,9 +5580,11 @@ class SlackAdapter:
             # inbound path (the workspace where the interaction happened =
             # the streaming target workspace). Harmless on non-Grid
             # workspaces: passing the correct ``team_id`` is always valid.
-            "team_id": options.recipient_team_id,
-        }
-        if options.task_display_mode:
+            # Sent only when a recipient team is known (a DM without
+            # recipient context has none); if a Grid ``chat.startStream``
+            # then fails, the first-call fallback below delivers the reply.
+            stream_kwargs["team_id"] = recipient_team_id
+        if options and options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
 
         streamer = await client.chat_stream(**stream_kwargs)
@@ -5613,6 +5653,77 @@ class SlackAdapter:
                     inside_resolved_fence = not inside_resolved_fence
                 resolved_source_done = line_end
 
+        # In-stream fallback (vercel/chat 0f743c9b). If the very first native
+        # call is rejected (streaming methods unavailable, e.g. GovSlack, or
+        # the feature is off for the workspace), nothing has rendered yet, so
+        # the rest of the reply goes out as throttled post+edit instead. The
+        # consumed text lives in the renderer, so nothing is lost. Failures
+        # after content has rendered natively still propagate: mixing the two
+        # modes would duplicate output.
+        mode: Literal["native", "fallback"] = "native"
+        # True once Slack accepted a native call: a non-None ``append``
+        # response (slack_sdk's ``AsyncChatStream.append`` buffers and returns
+        # None until it flushes) or a successful structured-chunk append.
+        native_rendered = False
+        fallback_message: RawMessage | None = None
+        fallback_sent = ""
+        last_fallback_edit_at: float | None = None
+        # Core seeds ``update_interval_ms`` from ``streaming_update_interval_ms``
+        # (default 500), so this 1000 ms default applies only to direct calls.
+        update_interval_ms = (
+            options.update_interval_ms if options is not None and options.update_interval_ms is not None else 1000
+        )
+
+        async def flush_fallback(force: bool) -> None:
+            nonlocal fallback_message, fallback_sent, last_fallback_edit_at
+            committable = renderer.get_committable_text()
+            if not committable or committable == fallback_sent:
+                return
+            now = _monotonic_ms()
+            if not (force or last_fallback_edit_at is None or now - last_fallback_edit_at >= update_interval_ms):
+                return
+            # Through the markdown field (Slack ``markdown_text``, 12k chars),
+            # not a bare string, which resolves to ``text``: legacy mrkdwn
+            # that shows raw ``**``/``#`` and caps at 4k (vercel/chat 8fdaf4a9).
+            # post_message/edit_message resolve outgoing mentions themselves.
+            if fallback_message is not None:
+                await self.edit_message(thread_id, fallback_message.id, PostableMarkdown(markdown=committable))
+            else:
+                fallback_message = await self.post_message(thread_id, PostableMarkdown(markdown=committable))
+            fallback_sent = committable
+            last_fallback_edit_at = now
+
+        def switch_to_fallback(error: Exception) -> None:
+            nonlocal mode
+            mode = "fallback"
+            if _slack_platform_error_code(error) in _NATIVE_STREAMING_UNSUPPORTED_ERRORS:
+                # The workspace will reject every future attempt too: latch so
+                # later streams skip straight to post+edit.
+                self._native_streaming_broken = True
+            self._logger.warn(
+                "Slack native streaming unavailable, falling back to post-and-edit",
+                {"channel": channel, "error": error},
+            )
+
+        def finish_fallback() -> RawMessage:
+            if (options is not None and options.stop_blocks) or self._feedback_buttons is not None:
+                self._logger.warn(
+                    "Slack: stream-end blocks (stop_blocks/feedback_buttons) skipped - "
+                    "post-and-edit fallback cannot attach stream blocks",
+                    {"channel": channel},
+                )
+            self._logger.debug(
+                "Slack: fallback stream complete",
+                {"messageId": fallback_message.id if fallback_message is not None else None},
+            )
+            if fallback_message is not None:
+                return fallback_message
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
+            # returns ``fallback.message`` (null for an empty reply), and core
+            # then re-runs its fallback. Here the stream is already consumed,
+            # so ``None`` would make core post its placeholder for nothing.
+            return RawMessage(id="", thread_id=thread_id, raw=None)
+
         # The resolved bot token is passed on EVERY append and on stop
         # (vercel/chat#573). Passing it only on the first append left
         # chat.startStream/chat.stopStream unauthenticated ("not_authed")
@@ -5620,23 +5731,43 @@ class SlackAdapter:
         # had flushed (e.g. fully buffered markdown). In multi-workspace
         # mode `token` is the per-request installation token resolved by
         # _get_token() at stream entry.
-        async def flush_markdown_delta(delta: str) -> None:
+        async def flush_committed(force: bool = False) -> None:
+            """Flush committed renderer text.
+
+            As a mention-resolved ``markdown_text`` delta on the native
+            stream, or as a throttled post/edit in fallback mode. A failure
+            before any native call succeeded switches to fallback mode.
+            """
+            nonlocal last_appended, native_rendered
+            if mode == "fallback":
+                await flush_fallback(force)
+                return
+            await resolve_committed(renderer.get_committable_text())
+            delta = resolved_committed[len(last_appended) :]
             if not delta:
                 return
-            await streamer.append(markdown_text=delta, token=token)
+            try:
+                response = await streamer.append(markdown_text=delta, token=token)
+            except Exception as exc:
+                if native_rendered:
+                    # Content is already rendering natively; a mid-stream
+                    # failure can't be recovered here.
+                    raise
+                switch_to_fallback(exc)
+                await flush_fallback(force)
+                return
+            if response is not None:
+                native_rendered = True
+            last_appended = resolved_committed
 
         # Accepts the residual stream-input union: ``is_thinking_chunk`` filters
         # ``ThinkingChunk`` out before this runs (it is never reached with one),
         # but it stays in the static type since that runtime guard does not
         # narrow it. The generic ``_read``-based body handles any chunk shape.
         async def send_structured_chunk(chunk: StreamChunk | ThinkingChunk | dict[str, Any]) -> None:
-            nonlocal last_appended, structured_chunks_supported
-            if not structured_chunks_supported:
-                return
-            await resolve_committed(renderer.get_committable_text())
-            delta = resolved_committed[len(last_appended) :]
-            await flush_markdown_delta(delta)
-            last_appended = resolved_committed
+            nonlocal structured_chunks_supported, native_rendered
+            # Flush buffered markdown first to keep ordering.
+            await flush_committed()
 
             def _read(name: str) -> Any:
                 if isinstance(chunk, dict):
@@ -5644,6 +5775,10 @@ class SlackAdapter:
                 return getattr(chunk, name, None)
 
             chunk_type = _read("type")
+            if mode == "fallback" or not structured_chunks_supported:
+                # Task cards only exist on the native streaming surface.
+                self._logger.debug("Slack: structured chunk skipped", {"chunkType": chunk_type, "mode": mode})
+                return
             if not chunk_type:
                 self._logger.warn(
                     "Slack stream: ignoring chunk with no `type` field",
@@ -5659,6 +5794,9 @@ class SlackAdapter:
                         chunk_data[field_name] = value
 
                 await streamer.append(chunks=[chunk_data], token=token)
+                # A chunks append always calls the API, so success means
+                # Slack accepted the stream (upstream ``markSegmentStarted``).
+                native_rendered = True
             except Exception as exc:
                 structured_chunks_supported = False
                 self._logger.warn(
@@ -5670,12 +5808,8 @@ class SlackAdapter:
                 )
 
         async def push_text_and_flush(text: str) -> None:
-            nonlocal last_appended
             renderer.push(text)
-            await resolve_committed(renderer.get_committable_text())
-            delta = resolved_committed[len(last_appended) :]
-            await flush_markdown_delta(delta)
-            last_appended = resolved_committed
+            await flush_committed()
 
         async for chunk in text_stream:
             if isinstance(chunk, str):
@@ -5708,20 +5842,36 @@ class SlackAdapter:
         # the resolved buffer is built incrementally from committable text,
         # so the final source must extend the same prefix.
         renderer.finish()
-        await resolve_committed(renderer.get_committable_text())
-        final_delta = resolved_committed[len(last_appended) :]
-        await flush_markdown_delta(final_delta)
+        await flush_committed(force=True)
+
+        if mode == "fallback":
+            return finish_fallback()
 
         # Caller blocks (StreamingPlan end_with) first, then the configured
         # feedback buttons so they render at the very end of the reply
         # (vercel/chat 0f743c9b).
-        stop_blocks: list[Any] = list(options.stop_blocks or [])
+        stop_blocks: list[Any] = list(options.stop_blocks or []) if options is not None else []
         if self._feedback_buttons is not None:
             stop_blocks.append(build_feedback_buttons_block(self._feedback_buttons))
         stop_kwargs: dict[str, Any] = {"token": token}
         if stop_blocks:
             stop_kwargs["blocks"] = stop_blocks
-        result = await streamer.stop(**stop_kwargs)
+        try:
+            result = await streamer.stop(**stop_kwargs)
+        except Exception as exc:
+            if native_rendered:
+                raise
+            # Short replies can buffer every delta in the streamer, making
+            # stop() the FIRST real API call; on an unsupported workspace the
+            # failure lands here, so the fallback must engage here too.
+            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6471-6484):
+            # stop() makes chat.startStream then chat.stopStream in both SDKs,
+            # and upstream also falls back on ``!nativeRendered`` without
+            # checking whether startStream succeeded before stopStream failed
+            # (it deliberately avoids the streamer's ``ts`` accessor).
+            switch_to_fallback(exc)
+            await flush_fallback(True)
+            return finish_fallback()
 
         message_ts = ""
         if isinstance(result, dict):

@@ -1888,9 +1888,8 @@ of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
   normalizes to `SlackFeedbackButtonsOptions()`. `build_feedback_buttons_block(options=None)`
   builds the `context_actions` block (`message_feedback`, `"Good response"` /
   `"Bad response"`, `positive` / `negative`). Native `stream()` appends it to
-  the `chat.stopStream` blocks after the caller's `stop_blocks`. The warning
-  for skipping it in the post-and-edit fallback is #207's, which has not
-  landed.
+  the `chat.stopStream` blocks after the caller's `stop_blocks`. The
+  post-and-edit fallback skips it with a warning (#207).
 - **Env auth fallback.** `SlackAdapter.__init__` is Python's only env-fallback
   site (`create_slack_adapter` is a thin wrapper). It now uses upstream
   `createSlackAdapter`'s `noAuthConfig` set (`signing_secret`, `bot_token`,
@@ -1930,8 +1929,7 @@ Of the adapter halves, only Slack's no-recipient guard is ported here:
 `recipient_user_id` or `recipient_team_id` is missing, so message-less
 threads (`chat.thread(id)`, `open_dm`, action/reaction threads) reply through
 core's post+edit fallback instead of raising `ValidationError`. The rest of
-Slack's half (DMs streaming natively without recipient ids, `native_streaming`,
-the mid-stream fallback, retiring the #94 branch) is #207. Teams informative
+Slack's half is in "Slack streaming fallback (#207)" below. Teams informative
 status is #219.
 
 - **Lightweight threads (`438f5513`).** `_create_thread` takes
@@ -2031,6 +2029,63 @@ status is #219.
   `fromJSON(data)`), so the `workflow` restore method would duplicate the
   `json` case and is not parametrized. A fake-timer interval check records the
   edit loop's `wait_for` timeout instead.
+
+### Slack streaming fallback (chat@4.32–4.40, #207)
+
+Ports the Slack half of `438f5513` (vercel/chat#633, chat@4.32.0), the
+streaming half of `0f743c9b` (#698, chat@4.34.0) and `8fdaf4a9` (#901,
+chat@4.40.0). Segment rotation (`d4a1f03a`) is #208; the agent config
+(`feedback_buttons`, `agent_view`) is #214; `session_status` / `signal` are
+#215 / #201. One row in the non-parity table (the empty fallback reply); the
+Python-only #94 row is retired.
+
+- **Guards.** `stream()` decodes the thread id and returns `None` before
+  iterating `text_stream`, in upstream order: empty `thread_ts` (top-level
+  DMs), a non-`D` channel without both recipient ids, then native streaming
+  off (`SlackAdapterConfig.native_streaming=False`, upstream `nativeStreaming`)
+  or latched broken. DMs stream natively without recipient ids. Python adds
+  one more `None` return before the stream is read: a slack_sdk client with
+  no `chat_stream` (releases older than the streaming helper; the declared
+  floor is 3.27.0), so those DM replies keep using core's post+edit.
+- **Start args.** `recipient_user_id` / `recipient_team_id` are passed to
+  `chat_stream` only when truthy. The #95 `team_id` is passed only when
+  `recipient_team_id` is (see the #95 row).
+- **First-call fallback.** `flush_committed` wraps the markdown append, the
+  pre-flush before a structured chunk and the final flush; `stop()` is
+  wrapped too. A failure before Slack accepted any native call switches the
+  rest of the reply to throttled post+edit through `PostableMarkdown`
+  (Slack `markdown_text`, `8fdaf4a9`); after that it re-raises. Slack has
+  accepted the stream once an `append` returns non-`None` (slack_sdk's
+  `AsyncChatStream.append` buffers and returns `None` until it flushes) or a
+  structured-chunk append succeeds, as upstream's `response` check and
+  `markSegmentStarted`. Short replies can make `stop()` the first API call.
+  Fallback mode skips structured chunks (debug log) and warns when
+  `stop_blocks` or `feedback_buttons` are skipped (upstream warns only on
+  the final-flush path; Python warns on both).
+- **Latch.** `feature_not_enabled`, `method_deprecated` and `unknown_method`
+  set `_native_streaming_broken`, read from `error.response` (`.data["error"]`
+  or a dict `["error"]`, the same shape `_handle_slack_error` reads; slack_sdk
+  is optional). Network errors, timeouts and `SlackRequestError` have no
+  response and never latch. The latch is per adapter instance, which
+  multi-workspace mode shares across workspaces, as upstream.
+- **Interval.** `update_interval_ms if not None else 1000`, as upstream. Core
+  always seeds `StreamOptions.update_interval_ms` from
+  `streaming_update_interval_ms` (default 500), so through `thread.post`
+  Python throttles fallback edits at 500 ms. The throttle reads a monotonic
+  clock (`_monotonic_ms`), not wall-clock time; the first post is never
+  throttled.
+- **Consumer-visible.** A top-level DM reply used to be one accumulated
+  `post_message` (#94). It now goes through core's post+edit: the `"..."`
+  placeholder, then edits. A Grid DM without a recipient team no longer sends
+  `team_id`; if `chat.startStream` then fails with `team_not_found`, the
+  first-call fallback delivers the reply and nothing latches.
+- **Tests.** `index.test.ts` is not fidelity-mapped. `tests/test_slack_api.py`
+  ports the three `438f5513` tests (`TestStream`) and nine of the ten
+  "native streaming fallback" tests (`TestNativeStreamingFallback`; the
+  agent-session one is #215), plus Python checks for the recipient/`team_id`
+  kwargs, the throttle, the empty fallback reply and a top-level DM
+  `thread.post` end to end. The #95 mutation guard now asserts the
+  `team_not_found` reply falls back to post+edit.
 
 ### AI messages without text and tool names (chat@4.35–4.41, #198)
 
@@ -2589,8 +2644,8 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat heading rendering | `#`-headings emit as `*text*` (bold) so they're visually distinct | Falls through to default node-to-text (plain concatenation) | Google Chat has no heading syntax; emitting plain text loses the visual hierarchy. Bold is the closest approximation the platform supports. |
 | Google Chat image rendering | Images emit as `{alt} ({url})` or bare `url` | No image branch — falls through to default which concatenates children only, dropping the URL | Upstream silently drops image URLs when rendering to Google Chat text. We preserve the URL so the message content isn't lost. |
 | Fallback streaming stream-exception capture (non-Teams, non-Telegram adapters) | `_fallback_stream` captures exceptions from the stream iterator, flushes whatever content was already rendered, awaits `pending_edit`, and re-raises after cleanup | `try/finally` only — exception propagates immediately, `pendingEdit` is un-awaited, and the placeholder is stranded as `"..."` | Upstream leaves a hard UX failure when streams crash mid-flight (common: LLM connection drops): placeholder visible forever, orphan background task. We flush + clean up before re-raising so the caller still sees the original error and users see the partial content instead of a spinner. This divergence does not apply to Teams: Teams DMs stream natively through the SDK `IStreamer` (`_stream_via_emit`), and a non-cancel iterator exception propagates straight to the caller while the SDK closes the streamer after the handler returns. Nor does it apply to Telegram: since the 4.41 wave (#226, vercel/chat#822) every Telegram chat streams through the adapter's own post-and-edit loop, where, as in upstream (`adapter-telegram/src/index.ts` `postAndEditStream`), a text-stream exception propagates without a partial flush, so a stream that fails before the first paced edit leaves the `"..."` placeholder visible. |
-| Slack `stream()` to a top-level DM (empty `thread_ts`) | Normalizes the empty `thread_ts` to `None` and degrades to a single accumulated `post_message` call so the streamed reply still lands (chat-sdk-python#94) | Passes the empty `thread_ts` straight to `chat.startStream` (`adapter-slack/src/index.ts` `stream()`), which Slack rejects (`invalid_thread_ts`) — the streamed DM reply is silently dropped | Top-level DM messages intentionally encode `threadTs=""` on both sides (`_handle_message_event` / `handleMessageEvent`, "matches openDM subscriptions") — that part is faithful to upstream and **not** a bug. The bug is that upstream's `stream()` never reconciled that legitimate value with `startStream`'s requirement for a non-empty `thread_ts`; `postMessage` accepts no `thread_ts` for DMs, so we degrade instead of erroring. Tracked for contribution upstream — remove this divergence once vercel/chat fixes `stream()` to handle empty-`thread_ts` DM thread ids. |
-| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. |
+| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. Since #207 it is sent only when `recipient_team_id` is truthy (a DM streams natively without recipient context); a Grid DM without one that hits `team_not_found` is delivered by the first-call post+edit fallback. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard `test_stream_without_team_id_on_grid_falls_back_to_post_and_edit`) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. |
+| Slack `stream()` fallback with an empty reply (#207) | When the post+edit fallback engaged but nothing was ever posted (e.g. an empty stream whose `stop()` failed), returns `RawMessage(id="", thread_id=thread_id, raw=None)` | Returns `fallback.message`, which is `null` when nothing was posted (`adapter-slack/src/index.ts` `stream()` fallback returns) | Returning `None` after the stream was consumed would make core run its own post+edit fallback (`thread.py` `_handle_stream`) on an exhausted iterator, posting the `"..."` placeholder and a `" "` final message for a reply that had no content. `RawMessage(id="")` keeps core's "adapter handled it" path. Pinned by `tests/test_slack_api.py::TestNativeStreamingFallback::test_warns_about_skipped_stream_blocks_and_returns_an_empty_reply_marker`. |
 | Fallback streaming final SentMessage content (non-Teams adapters) | SentMessage + final edit carry `final_content` (remend'd — inline markers auto-closed) | SentMessage + final edit carry raw `accumulated` | Narrow UX refinement. If a stream ends with an unclosed `*`/`~~`/etc., upstream ships the unclosed marker; we run `_remend` so the user sees a clean final message. Not observable in the common case where streams close their own markers. Teams DMs stream through the SDK `IStreamer` and the Teams accumulate-and-post path ships raw `accumulated` via `post_message`, matching upstream; this divergence applies only to the remaining adapters that still route through `_fallback_stream`. |
 | Teams group-chat / channel streaming via accumulate-and-post | `TeamsAdapter.stream` accumulates the full text and issues a single `post_message` (SDK-backed) instead of post+edit, even for group chats and channel threads | Same (`@chat-adapter/teams@4.30.0`: `if (activeStream && !activeStream.canceled) … else { accumulate; postMessage }`) — no divergence at the adapter level | Documented for clarity: the Python port matches upstream's behavior of avoiding the post+edit flicker where Teams doesn't support native streaming. The buffered fallback routes through the same SDK send path (`_send_to`) as a normal `post_message`. |
 | Teams native streaming via the SDK `IStreamer` (DMs) | `TeamsAdapter._handle_message_activity` captures a Teams SDK `IStreamer` (`microsoft_teams.apps.StreamerProtocol` / `HttpStream`) for DMs via `app.activity_sender.create_stream(ref)` on `microsoft-teams-apps` 2.0.x, or `HttpStream(app.api.from_service_url(ref.service_url), ref)` on 2.1.x, which removed `ActivitySender` (#250), registers it in `_active_streams`, and `await`s a `processing_done` gate (a wrapped `wait_until` shim) so the streamer stays alive while the handler streams. The shim builds its options with `dataclasses.replace(options or WebhookOptions(), wait_until=...)`, so `propagate_handler_errors` / `deduplicate` reach `Chat.process_message` (upstream `{ ...baseOptions, waitUntil }`). Since #191 `wait_until` receives Chat's error-swallowing wrapper Task by default (the raw handler task with `propagate_handler_errors=True`). The gate's `add_done_callback` hooks the handler task that `process_message` returns, not the handed wrapper: a host can cancel the wrapper while the shielded handler keeps streaming, whereas upstream's `.catch` promise cannot be cancelled and always settles with the handler. The handed task is only the fallback when `process_message` returns no Task (pinned by `tests/test_teams_native_streaming.py::TestHandleMessageActivityWithRealChat`). `stream()` → `_stream_via_emit` calls `stream.emit(text)` per chunk and NEVER calls `close()`; the adapter's `_handle_message_activity` `finally` calls `stream.close()` once (the lifecycle-owner role the SDK App's `process_activity` plays upstream). | `@chat-adapter/teams@4.30.0` `index.ts` does exactly this: `this.activeStreams.set(threadId, ctx.stream)`, build `processingDone` + wrapped `waitUntil`, `await processingDone`, `streamViaEmit` calls `stream.emit(text)` and never `close()` (the SDK App auto-closes after the handler returns). | **No adapter-level divergence.** The only mechanical difference is the close call site: upstream lets the SDK `App` auto-close `ctx.stream` because the SDK owns dispatch; our bridge overrides `server.on_request`, so we own dispatch and reproduce the close in `_handle_message_activity`'s `finally`. The SDK `HttpStream.close` no-ops when the stream was canceled or had no content, so closing in both success and cancel paths is safe (matching the SDK App, which closes in both its success and `StreamCancelledError` branches). Cancellation is detected via `stream.canceled` (checked before each emit) and by catching `StreamCancelledError` (other exceptions re-raise). The first chunk id is captured via `on_chunk` and awaited only when text was emitted and the stream was not canceled. Replaces the prior hand-rolled wire format, the 1500ms emit throttle, and the `RawMessage.text` / `update_interval_ms` divergences (all unwound in #93 PR 3). |
