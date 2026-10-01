@@ -16,7 +16,9 @@ from __future__ import annotations
 from chat_sdk.history.user import (
     DEFAULT_LIST_LIMIT,
     DEFAULT_MAX_PER_USER,
+    DURATION_RE,
     KEY_PREFIX,
+    MS_PER_UNIT,
     TOMBSTONE_MARKER,
     UserHistoryApiImpl,
 )
@@ -26,7 +28,9 @@ TranscriptsApiImpl = UserHistoryApiImpl
 __all__ = [
     "DEFAULT_LIST_LIMIT",
     "DEFAULT_MAX_PER_USER",
+    "DURATION_RE",
     "KEY_PREFIX",
+    "MS_PER_UNIT",
     "TOMBSTONE_MARKER",
     "TranscriptsApiImpl",
 ]

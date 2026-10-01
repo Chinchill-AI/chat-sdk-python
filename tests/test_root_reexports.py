@@ -121,3 +121,22 @@ def test_history_4_41_additions_are_root_exports() -> None:
     assert chat_sdk.HistoryEntry is chat_sdk.TranscriptEntry
     assert chat_sdk.UserHistoryEntry is chat_sdk.TranscriptEntry
     assert chat_sdk.UserHistoryApi is chat_sdk.TranscriptsApi
+
+
+def test_deprecated_transcripts_module_keeps_pre_197_constants() -> None:
+    # `chat_sdk.transcripts` is a deprecated alias of `chat_sdk.history.user`;
+    # every public module-level name it defined before #197 must still import.
+    import chat_sdk.history.user as history_user
+    import chat_sdk.transcripts as transcripts
+
+    for name in (
+        "DEFAULT_LIST_LIMIT",
+        "DEFAULT_MAX_PER_USER",
+        "DURATION_RE",
+        "KEY_PREFIX",
+        "MS_PER_UNIT",
+        "TOMBSTONE_MARKER",
+    ):
+        assert name in transcripts.__all__
+        assert getattr(transcripts, name) is getattr(history_user, name)
+    assert transcripts.TranscriptsApiImpl is history_user.UserHistoryApiImpl

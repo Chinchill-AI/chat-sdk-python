@@ -207,3 +207,35 @@ class TestThreadHistoryApiImplPythonSpecific:
             break
 
         assert env.mock_adapter.fetch_messages.await_count == 1
+
+    async def test_list_keeps_an_empty_page_that_carries_a_next_cursor(self, env: _Env):
+        # An empty page with a next cursor is not "no history": the cache
+        # must not replace it, and the cursor is passed back unchanged.
+        await env.cache.append("telegram:C123:42", create_test_message("c1", "cached"))
+        env.persist_adapter.fetch_messages = AsyncMock(  # type: ignore[method-assign]
+            return_value=FetchResult(messages=[], next_cursor="x")
+        )
+
+        result = await env.api.list("telegram:C123:42", FetchOptions(limit=5))
+
+        assert result.messages == []
+        assert result.next_cursor == "x"
+
+    async def test_collect_does_not_replay_the_cache_after_adapter_messages(self, env: _Env):
+        await env.cache.append("telegram:C123:42", create_test_message("c1", "cached"))
+        env.persist_adapter.fetch_messages = AsyncMock(  # type: ignore[method-assign]
+            return_value=FetchResult(messages=[create_test_message("m1", "from adapter")])
+        )
+
+        assert await _collect_texts(env.api, "telegram:C123:42") == ["from adapter"]
+
+    async def test_list_falls_back_to_cache_for_the_legacy_persist_message_history_flag(self, env: _Env):
+        # Messenger sets only the legacy `persist_message_history` flag.
+        legacy = create_mock_adapter("messenger")
+        legacy.persist_message_history = True  # type: ignore[attr-defined]
+        api = ThreadHistoryApiImpl(lambda name: legacy if name == "messenger" else None, env.cache)
+        await env.cache.append("messenger:P1:U1", create_test_message("c1", "cached"))
+
+        result = await api.list("messenger:P1:U1", FetchOptions(limit=5))
+
+        assert [m.text for m in result.messages] == ["cached"]

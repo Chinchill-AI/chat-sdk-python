@@ -158,7 +158,7 @@ class TestChannelHistoryApiImpl:
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0)
             in_flight -= 1
             return FetchResult(messages=[create_test_message(f"{thread_id}-r", "reply")])
 
@@ -171,6 +171,17 @@ class TestChannelHistoryApiImpl:
         assert [t.thread_id for t in result.threads] == [f"slack:C123:{i}.0" for i in range(10)]
         # Bounded, and actually concurrent within a batch.
         assert max_in_flight == 4
+
+    async def test_listthreadswithmessages_forwards_the_cursor_and_returns_next_cursor(self, env: _Env):
+        env.mock_adapter.list_threads = AsyncMock(  # type: ignore[method-assign]
+            return_value=ListThreadsResult(threads=[], next_cursor="page-3")
+        )
+
+        result = await env.api.list_threads_with_messages("slack:C123", cursor="page-2")
+
+        options = env.mock_adapter.list_threads.await_args.kwargs["options"]
+        assert (options.cursor, options.limit) == ("page-2", 5)
+        assert result.next_cursor == "page-3"
 
 
 class _StubOnlyAdapter(BaseAdapter):

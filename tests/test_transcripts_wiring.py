@@ -34,8 +34,8 @@ from chat_sdk.types import (
     UserHistoryConfig,
 )
 
-USER_HISTORY_NOT_CONFIGURED_RE = r"chat\.history\.user is not configured|chat\.transcripts is not configured"
-IDENTITY_REQUIRED_RE = r"identity resolver|requires ChatConfig\.identity"
+USER_HISTORY_NOT_CONFIGURED_RE = r"chat\.history\.user is not configured"
+IDENTITY_REQUIRED_RE = r"requires an identity resolver when user history"
 
 THREAD_ID = "slack:C123:1234.5678"
 
@@ -345,3 +345,30 @@ class TestHistoryConfigPrecedence:
 
         stored = await mock_state.get_list(f"msg-history:{THREAD_ID}")
         assert [entry["text"] for entry in stored] == ["msg 1", "msg 2"]
+
+    # Upstream spreads `{...transcripts, ...history.user}`, so an explicit
+    # `history.user.store_formatted` wins (including an explicit False) and an
+    # unset one falls back to the legacy block.
+    @pytest.mark.parametrize(
+        ("legacy", "preferred", "expect_formatted"),
+        [(True, False, False), (True, None, True), (False, True, True)],
+    )
+    async def test_history_user_store_formatted_merges_over_transcripts(
+        self, mock_adapter, mock_state, legacy, preferred, expect_formatted
+    ):
+        chat = _make_chat(
+            mock_adapter,
+            mock_state,
+            history=HistoryConfig(user=UserHistoryConfig(identity=lambda ctx: "u1", store_formatted=preferred)),
+            transcripts=TranscriptsConfig(store_formatted=legacy),
+        )
+        msg = create_test_message("m1", "**hello**")
+        assert msg.formatted is not None
+        msg.user_key = "u1"
+
+        entry = await chat.history.user.append(SimpleNamespace(adapter=mock_adapter, id=THREAD_ID), msg)
+
+        stored = await mock_state.get_list("transcripts:user:u1")
+        assert len(stored) == 1
+        assert ("formatted" in stored[0]) is expect_formatted
+        assert (entry.formatted is not None) is expect_formatted

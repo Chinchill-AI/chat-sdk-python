@@ -1018,7 +1018,7 @@ Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
   now raise for unregistered adapter prefixes (`fetchMessages` no longer
   goes through `chat.thread()` and its thread-ID shape check, as
   upstream), return SDK-cached history
-  for persisting adapters (Telegram, WhatsApp, Twilio), and use upstream's
+  for persisting adapters (Telegram, WhatsApp, Twilio, Messenger), and use upstream's
   error text (`history.channel.listMessages: adapter "x" does not support
   fetching channel messages`, `history.channel.listThreads: adapter "x"
   does not implement listThreads`). `ChatNotImplementedError` is still
