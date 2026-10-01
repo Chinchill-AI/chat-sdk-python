@@ -621,6 +621,29 @@ class TestInlineAttachmentRetrieval:
         assert anonymous.calls == []
 
     @pytest.mark.asyncio
+    async def test_explicit_default_port_on_the_connector_still_authenticates(self):
+        """Python-specific allowlist gate: ``:443`` is the same origin, so the
+        bot-token download must not be refused (upstream fetches it)."""
+        from types import SimpleNamespace
+
+        adapter = _make_adapter(app_id="test-app")
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_streamed(b"protected image"))
+
+        adapter._app.api = SimpleNamespace(http=_bot_http_client(handler))  # type: ignore[method-assign]
+        url = "https://smba.trafficmanager.net:443/teams/v3/attachments/image/views/original"
+        attachment = adapter.parse_message(_inline_image_activity(url)).attachments[0]
+
+        assert attachment.fetch_metadata is not None and attachment.fetch_metadata["auth"] == "bot"
+        assert attachment.fetch_data is not None
+        assert await attachment.fetch_data() == b"protected image"
+        assert len(requests) == 1
+        assert requests[0].headers["authorization"] == "Bearer bot-token"
+
+    @pytest.mark.asyncio
     async def test_rejects_internal_file_download_urls_from_activities(self, monkeypatch):
         adapter = _make_adapter(app_id="test-app")
         anonymous = _download_transport(monkeypatch)

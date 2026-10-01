@@ -28,6 +28,7 @@ from chat_sdk.adapters.teams.api import _is_loopback_emulator_url, is_trusted_te
 from chat_sdk.adapters.teams.attachments import (
     BOT_TOKEN_REFUSAL,
     TeamsAttachmentFetchers,
+    _connector_origin,
     create_anonymous_attachment_fetch_data,
     create_teams_attachment,
     fetch_with_bot_token,
@@ -1848,8 +1849,10 @@ class TeamsAdapter:
         # ``connectorOrigin`` in rehydrated metadata cannot send it to a
         # non-Bot-Framework host. Plain-``http`` loopback stays accepted for
         # the Emulator (upstream parity: ``getConnectorOrigin`` in
-        # ``attachments.ts`` accepts it too).
-        if not is_trusted_teams_service_url(url):
+        # ``attachments.ts`` accepts it too). The allowlist is checked on the
+        # normalized origin, so an explicit default port (``:443``) passes.
+        origin = _connector_origin(url)
+        if origin is None or not is_trusted_teams_service_url(origin):
             raise NetworkError("teams", BOT_TOKEN_REFUSAL)
         try:
             return await fetch_with_bot_token(self._app.api.http, url)
