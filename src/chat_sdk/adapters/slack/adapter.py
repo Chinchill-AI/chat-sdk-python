@@ -4032,6 +4032,9 @@ class SlackAdapter:
                 self._logger.warn(
                     "Failed to activate stopped Slack agent session", {"error": error, "threadId": thread_id}
                 )
+            # Upstream parity (chat@4.41.1 index.ts:3980-3990): dispatch is
+            # fire-and-forget here; ``process_agent_session_stopped`` hands
+            # its own handler task to the same ``wait_until``.
             chat.process_agent_session_stopped(
                 AgentSessionStoppedEvent(
                     adapter=self,
@@ -6459,10 +6462,17 @@ class SlackAdapter:
             renderer.push(text)
             await flush_committed()
 
-        async for chunk in text_stream:
+        source = aiter(text_stream)
+        async for chunk in source:
             # The turn was stopped (e.g. Slack's Stop button): stop reading
             # and finalize below, so the stream is still closed cleanly.
             if signal is not None and signal.aborted:
+                # Python-specific: JS ``for await`` closes the iterator on
+                # ``break``; Python's ``async for`` does not, which would leave
+                # a generator input (and its producer cleanup) suspended.
+                aclose = getattr(source, "aclose", None)
+                if aclose is not None:
+                    await aclose()
                 break
             if isinstance(chunk, str):
                 await push_text_and_flush(chunk)

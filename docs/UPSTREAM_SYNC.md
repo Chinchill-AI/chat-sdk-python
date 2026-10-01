@@ -2318,6 +2318,8 @@ the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
 - **`stream()`.** Each chunk-loop iteration first checks
   `options.signal.aborted` and breaks, so the stream is still finalized
   through `stop()` (the signal is checked, the task is not cancelled).
+  Before breaking it closes the input iterator (`aclose()`): JS `for await`
+  does that on `break`, Python's `async for` does not.
   Under `agent_view` the final `stop()` carries `session_status`
   (`options.session_status`, default `"active"`), the rotation `stop()`
   carries `"processing"`, and every fallback return (post+edit fallback,
@@ -2326,7 +2328,9 @@ the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
 - **Events.** `agent_session_stopped` builds the thread id from `channel` +
   `thread_ts` and runs a task that awaits `chat.abort_turn` (warns on error),
   sets the session `active` (warns on error) and calls
-  `chat.process_agent_session_stopped` with `streaming_message_ts`. It never
+  `chat.process_agent_session_stopped` with `streaming_message_ts`. As
+  upstream, that dispatch is fire-and-forget: the handlers run in their own
+  task, which core hands to the same `wait_until`. It never
   takes the thread lock (the stopped turn holds it). The task is pinned, has
   a logging done-callback, and is handed to `wait_until` shielded, as #214's
   bridge. `agent_session_title_changed` calls

@@ -313,19 +313,23 @@ class TestStreamCancellation:
         consumed: list[str] = []
 
         async def chunks() -> AsyncIterator[str]:
-            consumed.append("first")
-            yield "first\n"
-            signal._abort()  # what Chat.abort_turn does for a running turn
-            consumed.append("second")
-            yield "second\n"
-            consumed.append("third")
-            yield "third\n"
+            try:
+                consumed.append("first")
+                yield "first\n"
+                signal._abort()  # what Chat.abort_turn does for a running turn
+                consumed.append("second")
+                yield "second\n"
+                consumed.append("third")
+                yield "third\n"
+            finally:
+                # JS ``for await`` closes the source on ``break``; so must we.
+                consumed.append("closed")
 
         result = await adapter.stream(thread_id, chunks(), StreamOptions(signal=signal))
 
         assert signal.aborted is True
         # The chunk yielded after the abort is never sent.
-        assert consumed == ["first", "second"]
+        assert consumed == ["first", "second", "closed"]
         assert [c.kwargs["markdown_text"] for c in streamer.append.await_args_list] == ["first\n"]
         streamer.stop.assert_awaited_once_with(token=TOKEN, session_status="active")
         assert isinstance(result, RawMessage)
