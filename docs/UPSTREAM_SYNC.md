@@ -2369,10 +2369,10 @@ the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
   initiator_user_id=None, title=None)` and `_rename_agent_session` call
   `client.api_call(api_method="agents.sessions.setStatus" | "agents.sessions.rename",
   json=...)` (slack_sdk has no generated `agents_sessions_*` methods). The
-  optional fields are sent only when truthy, as upstream's spreads. Upstream's
-  `withToken` also adds `team_id` / `client_context_team_id` for org-wide
-  installs; Python has no such per-call helper yet (it is not part of #213 as
-  landed), so these calls send what every other Python Web API call sends.
+  optional fields are sent only when truthy, as upstream's spreads. As
+  upstream's `withToken`, the `json` body goes through `_with_token_kwargs`
+  (#268), so an org-wide install adds the event's `team_id` (the body has
+  `channel_id`, not `channel`, so no `client_context_team_id`).
 - **`supports_turn_cancellation`** returns `agent_view`.
 - **`start_typing(thread_id, status=None, *, options=None)`.** Under
   `agent_view`, `None` sets the session to `processing` and `""` to `active`
@@ -2431,7 +2431,8 @@ the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
   session processing while the reply continues" in
   `tests/test_slack_stream_rotation.py`. Python tests cover legacy mode
   making no `agents.sessions.*` call, `""` versus `None`, an aborted signal
-  still awaiting `stop()` once, fallback and final-expiry `end_typing`, the
+  still awaiting `stop()` once, append-failure, first-stop-failure and
+  final-expiry `end_typing`, the
   stop handler aborting a real turn that holds the thread lock, and title
   trimming, resolvers and failures. `index.test.ts` is not fidelity-mapped.
 - **Live check pending.** The Stop button cancelling a streaming reply and

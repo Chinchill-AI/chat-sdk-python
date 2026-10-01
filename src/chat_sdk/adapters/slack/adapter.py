@@ -4640,13 +4640,15 @@ class SlackAdapter:
         if title:
             payload["title"] = title
         # slack_sdk has no generated ``agents_sessions_*`` methods.
-        await self._get_client().api_call(api_method="agents.sessions.setStatus", json=payload)
+        await self._get_client().api_call(
+            api_method="agents.sessions.setStatus", json=self._with_token_kwargs(**payload)
+        )
 
     async def _rename_agent_session(self, channel_id: str, thread_ts: str, title: str) -> None:
         """Rename a Slack Agent Session (``agents.sessions.rename``)."""
         await self._get_client().api_call(
             api_method="agents.sessions.rename",
-            json={"channel_id": channel_id, "thread_ts": thread_ts, "title": title},
+            json=self._with_token_kwargs(channel_id=channel_id, thread_ts=thread_ts, title=title),
         )
 
     async def set_assistant_title(self, channel_id: str, thread_ts: str, title: str) -> None:
