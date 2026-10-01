@@ -872,12 +872,22 @@ class TestMessagesWithoutText:
         # bare ``str.strip()`` does the opposite. A BOM-only message is empty;
         # a NEL-only message is text and is kept.
         messages = [
-            create_test_message("1", "﻿"),
+            create_test_message("1", "\ufeff"),
             create_test_message("2", "\x85"),
         ]
         result = await to_ai_messages(messages)
 
         assert result == [{"role": "user", "content": "\x85"}]
+
+    @pytest.mark.asyncio
+    async def test_bom_only_message_skipped_with_include_names(self):
+        # With ``include_names`` the name prefix makes the content non-blank,
+        # so only the per-message text check can drop a BOM-only message.
+        # A bare ``str.strip()`` there would keep it as ``"[testuser]: \ufeff"``.
+        messages = [create_test_message("1", "\ufeff")]
+        result = await to_ai_messages(messages, ToAiMessagesOptions(include_names=True))
+
+        assert result == []
 
 
 # ============================================================================
