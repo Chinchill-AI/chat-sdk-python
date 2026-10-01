@@ -13,9 +13,12 @@ import inspect
 import json
 import os
 import re
+import time
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import quote
 
 from chat_sdk.adapters.discord.cards import (
@@ -69,6 +72,8 @@ from chat_sdk.types import (
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_CONTENT_LENGTH = 2000
+DISCORD_UNKNOWN_MESSAGE = 10_008
+DISCORD_THREAD_ALREADY_CREATED = 160_004
 HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 HEX_PATTERN = re.compile(r"^[0-9a-f]+$")
 
@@ -88,6 +93,67 @@ CHANNEL_TYPE_GROUP_DM = 3
 
 # Thread parent cache TTL
 THREAD_PARENT_CACHE_TTL = 5 * 60  # 5 minutes in seconds
+THREAD_PARENT_CACHE_MAX = 1000
+
+_T = TypeVar("_T")
+
+
+class DiscordApiError(Exception):
+    """A non-2xx Discord REST response (upstream ``DiscordApiError``).
+
+    Carried as :attr:`NetworkError.original_error` by ``_discord_fetch`` so
+    callers can branch on Discord's JSON error ``code`` (e.g. ``10008``
+    Unknown Message, ``160004`` thread already created) instead of
+    string-matching the body.
+    """
+
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(body)
+        self.status = status
+        self.body = body
+        self.code: int | None = _parse_discord_error_code(body)
+
+
+def _parse_discord_error_code(body: str) -> int | None:
+    """Discord's numeric ``code`` from a JSON error body, else ``None``."""
+    try:
+        data = json.loads(body)
+    # ``RecursionError``: a deeply nested body must not escape the error
+    # wrapper (upstream's bare ``catch`` around ``JSON.parse`` swallows it).
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = data.get("code")
+    # ``bool`` is an ``int`` subclass; a JSON ``true`` is not an error code.
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
+def _flatten(
+    text: str | None,
+    files: Iterable[dict[str, Any]] | None,
+    snapshots: Iterable[dict[str, Any]] | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Merge a message's own content/attachments with its forwarded snapshots.
+
+    Port of upstream ``flatten`` (#825): text is ``[content, *snapshot
+    contents]`` minus empties, joined by a blank line; attachments are the
+    message's own followed by each snapshot's.
+    """
+    items = [item for item in (snapshots or []) if isinstance(item, dict)]
+    attachments: list[dict[str, Any]] = list(files or [])
+    for item in items:
+        attachments.extend(item.get("attachments") or [])
+    parts = [text, *(item.get("content") for item in items)]
+    return "\n\n".join(part for part in parts if part), attachments
+
+
+def _snapshot_messages(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """``raw.message_snapshots?.map(({ message }) => message) ?? []``."""
+    snapshots = raw.get("message_snapshots") or []
+    return [snap["message"] for snap in snapshots if isinstance(snap, dict) and isinstance(snap.get("message"), dict)]
 
 
 class DiscordAdapter:
@@ -360,7 +426,6 @@ class DiscordAdapter:
             return
 
         interaction_channel_id = interaction.get("channel_id")
-        guild_id = interaction.get("guild_id") or "@me"
         message = interaction.get("message", {})
         message_id = message.get("id") if message else None
 
@@ -368,23 +433,7 @@ class DiscordAdapter:
             self._logger.warn("Missing channel_id or message_id in interaction")
             return
 
-        # Detect if the interaction is inside a thread channel
-        channel = interaction.get("channel", {})
-        channel_type = channel.get("type", 0)
-        is_thread = channel_type in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD)
-        parent_channel_id = (
-            channel.get("parent_id", interaction_channel_id)
-            if is_thread and channel.get("parent_id")
-            else interaction_channel_id
-        )
-
-        thread_id = self.encode_thread_id(
-            DiscordThreadId(
-                guild_id=guild_id,
-                channel_id=parent_channel_id,
-                thread_id=interaction_channel_id if is_thread else None,
-            )
-        )
+        thread_id = self._encode_interaction_thread_id(interaction, interaction_channel_id)
 
         self._logger.debug(
             "Processing Discord button action",
@@ -446,23 +495,7 @@ class DiscordAdapter:
             self._logger.warn("Missing channel_id in application command interaction")
             return
 
-        guild_id = interaction.get("guild_id") or "@me"
-        channel = interaction.get("channel", {})
-        channel_type = channel.get("type", 0)
-        is_thread = channel_type in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD)
-        parent_channel_id = (
-            channel.get("parent_id", interaction_channel_id)
-            if is_thread and channel.get("parent_id")
-            else interaction_channel_id
-        )
-
-        channel_id = self.encode_thread_id(
-            DiscordThreadId(
-                guild_id=guild_id,
-                channel_id=parent_channel_id,
-                thread_id=interaction_channel_id if is_thread else None,
-            )
-        )
+        channel_id = self._encode_interaction_thread_id(interaction, interaction_channel_id)
 
         command, text = self._parse_slash_command(command_name, data.get("options"))
 
@@ -505,6 +538,35 @@ class DiscordAdapter:
         )
         event.channel_id = channel_id  # type: ignore[attr-defined]
         self._chat.process_slash_command(event, options)
+
+    def _encode_interaction_thread_id(
+        self,
+        interaction: DiscordInteraction,
+        interaction_channel_id: str,
+    ) -> str:
+        """Chat SDK thread id for the channel an interaction arrived in.
+
+        Port of upstream ``encodeInteractionThreadId``: a thread channel with
+        a known ``parent_id`` encodes as ``guild:parent:thread`` and its
+        parent is remembered, so later outbound calls skip the channel
+        lookup. A thread without a parent (or any other channel) encodes as
+        the channel alone.
+        """
+        guild_id = interaction.get("guild_id") or "@me"
+        channel = interaction.get("channel") or {}
+        is_thread = channel.get("type") in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD)
+        thread_parent_id = channel.get("parent_id") if is_thread else None
+        if not thread_parent_id:
+            return self.encode_thread_id(DiscordThreadId(guild_id=guild_id, channel_id=interaction_channel_id))
+
+        self._remember_thread_parent(interaction_channel_id, thread_parent_id)
+        return self.encode_thread_id(
+            DiscordThreadId(
+                guild_id=guild_id,
+                channel_id=thread_parent_id,
+                thread_id=interaction_channel_id,
+            )
+        )
 
     def _parse_slash_command(
         self,
@@ -684,9 +746,13 @@ class DiscordAdapter:
         parent_channel_id = channel_id
 
         thread = data.get("thread")
-        if thread:
-            discord_thread_id = thread.get("id")
-            parent_channel_id = thread.get("parent_id", channel_id)
+        # Upstream's forwarder always sends ``thread.parent_id``. Without it the
+        # parent is unknown, so fall back to the lookup below (or channel-only)
+        # instead of guessing a parent the outbound validation would reject.
+        if thread and thread.get("id") and thread.get("parent_id"):
+            discord_thread_id = thread["id"]
+            parent_channel_id = thread["parent_id"]
+            self._remember_thread_parent(discord_thread_id, parent_channel_id)
         elif data.get("channel_type") in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD):
             try:
                 response = await self._discord_fetch(f"/channels/{channel_id}", "GET")
@@ -694,6 +760,9 @@ class DiscordAdapter:
                 if channel_info.get("parent_id"):
                     discord_thread_id = channel_id
                     parent_channel_id = channel_info["parent_id"]
+                    # Upstream only logs here; caching the parent Discord just
+                    # returned saves the reply's own ``GET /channels/{thread}``.
+                    self._remember_thread_parent(channel_id, parent_channel_id)
             except Exception as error:
                 self._logger.error(
                     "Failed to fetch thread parent",
@@ -735,8 +804,11 @@ class DiscordAdapter:
         )
 
         author_data = data.get("author", {})
-        content = data.get("content", "")
-        attachments_data = data.get("attachments", [])
+        content, attachments_data = _flatten(
+            data.get("content", ""),
+            cast("list[dict[str, Any]]", data.get("attachments") or []),
+            _snapshot_messages(cast("dict[str, Any]", data)),
+        )
 
         chat_message = Message(
             id=data.get("id", ""),
@@ -756,16 +828,7 @@ class DiscordAdapter:
                 else datetime.now(timezone.utc),
                 edited=False,
             ),
-            attachments=[
-                Attachment(
-                    type=self._get_attachment_type(a.get("content_type")),
-                    url=a.get("url"),
-                    name=a.get("filename"),
-                    mime_type=a.get("content_type"),
-                    size=a.get("size"),
-                )
-                for a in attachments_data
-            ],
+            attachments=[self._build_attachment(a) for a in attachments_data],
             raw=data,
             # ``None`` (not ``False``) when unmentioned: the forwarded payload
             # only proves a mention, so Chat still falls back to text detection
@@ -801,35 +864,27 @@ class DiscordAdapter:
         discord_thread_id: str | None = None
         parent_channel_id = channel_id
 
-        channel_type = data.get("channel_type", 0)
-        if channel_type in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD):
-            cached = self._thread_parent_cache.get(channel_id)
-            import time
-
-            if cached and cached.get("expires_at", 0) > time.time():
+        # Use thread info if the forwarder resolved it, otherwise fall back to
+        # the cache and finally to a channel lookup.
+        thread = data.get("thread")
+        thread_info_id = thread.get("id") if thread else None
+        thread_info_parent = thread.get("parent_id") if thread else None
+        if thread_info_id and thread_info_parent:
+            discord_thread_id = thread_info_id
+            parent_channel_id = thread_info_parent
+            self._remember_thread_parent(discord_thread_id, parent_channel_id)
+        elif data.get("channel_type", 0) in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD):
+            cached_parent = self._cached_thread_parent(channel_id)
+            if cached_parent is not None:
                 discord_thread_id = channel_id
-                parent_channel_id = cached["parent_id"]
+                parent_channel_id = cached_parent
             else:
                 try:
                     channel_info = await self._discord_fetch(f"/channels/{channel_id}", "GET")
                     if channel_info.get("parent_id"):
                         discord_thread_id = channel_id
                         parent_channel_id = channel_info["parent_id"]
-                        self._thread_parent_cache[channel_id] = {
-                            "parent_id": channel_info["parent_id"],
-                            "expires_at": time.time() + THREAD_PARENT_CACHE_TTL,
-                        }
-                        # Prevent unbounded cache growth
-                        if len(self._thread_parent_cache) > 1000:
-                            now = time.time()
-                            expired = [k for k, v in self._thread_parent_cache.items() if v.get("expires_at", 0) <= now]
-                            for k in expired:
-                                del self._thread_parent_cache[k]
-                            # Hard limit: evict oldest if still over threshold
-                            if len(self._thread_parent_cache) > 1000:
-                                keys = list(self._thread_parent_cache.keys())
-                                for k in keys[: len(keys) - 1000]:
-                                    del self._thread_parent_cache[k]
+                        self._remember_thread_parent(channel_id, parent_channel_id)
                 except Exception as error:
                     self._logger.error(
                         "Failed to fetch thread parent for reaction",
@@ -894,7 +949,10 @@ class DiscordAdapter:
     ) -> RawMessage:
         """Post a message to a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
-        channel_id = decoded.thread_id if decoded.thread_id else decoded.channel_id
+        # Validated before the slash-command branch too (upstream resolves
+        # first as well), so a forged thread segment is refused even when a
+        # slash-command context is active.
+        channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
 
         # Build message payload
         payload: dict[str, Any] = {}
@@ -927,7 +985,9 @@ class DiscordAdapter:
         # --- Resolve deferred slash-command interaction if pending ---
         req_ctx = self._request_context.get()
         slash_ctx = req_ctx.slash_command if req_ctx else None
-        if slash_ctx and not slash_ctx.initial_response_sent:
+        # Upstream ``tryPostSlashResponse``: only a post to the interaction's
+        # own conversation answers it; posts elsewhere go to their channel.
+        if slash_ctx and slash_ctx.channel_id == thread_id and not slash_ctx.initial_response_sent:
             slash_ctx.initial_response_sent = True
             self._logger.debug(
                 "Discord API: PATCH deferred interaction response",
@@ -996,9 +1056,6 @@ class DiscordAdapter:
         message: AdapterPostableMessage,
     ) -> RawMessage:
         """Edit an existing Discord message."""
-        decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
-
         payload: dict[str, Any] = {}
         embeds: list[dict[str, Any]] = []
         components: list[DiscordActionRow] = []
@@ -1025,20 +1082,22 @@ class DiscordAdapter:
         if components:
             payload["components"] = components
 
-        self._logger.debug(
-            "Discord API: PATCH message",
-            {
-                "channelId": target_channel_id,
-                "messageId": message_id,
-                "contentLength": len(payload.get("content", "")),
-            },
-        )
+        async def patch(channel_id: str) -> Any:
+            self._logger.debug(
+                "Discord API: PATCH message",
+                {
+                    "channelId": channel_id,
+                    "messageId": message_id,
+                    "contentLength": len(payload.get("content", "")),
+                },
+            )
+            return await self._discord_fetch(
+                f"/channels/{channel_id}/messages/{message_id}",
+                "PATCH",
+                payload,
+            )
 
-        result = await self._discord_fetch(
-            f"/channels/{target_channel_id}/messages/{message_id}",
-            "PATCH",
-            payload,
-        )
+        result = await self._with_message_channel(thread_id, message_id, patch)
 
         self._logger.debug(
             "Discord API: PATCH message response",
@@ -1054,22 +1113,27 @@ class DiscordAdapter:
         )
 
     async def delete_message(self, thread_id: str, message_id: str) -> None:
-        """Delete a Discord message."""
-        decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
+        """Delete a Discord message.
 
-        self._logger.debug(
-            "Discord API: DELETE message",
-            {
-                "channelId": target_channel_id,
-                "messageId": message_id,
-            },
-        )
+        Deleting a text-channel thread's starter message (``message_id`` equal
+        to the thread segment) deletes it from the parent channel, which
+        Discord treats as deleting the thread.
+        """
 
-        await self._discord_fetch(
-            f"/channels/{target_channel_id}/messages/{message_id}",
-            "DELETE",
-        )
+        async def delete(channel_id: str) -> Any:
+            self._logger.debug(
+                "Discord API: DELETE message",
+                {
+                    "channelId": channel_id,
+                    "messageId": message_id,
+                },
+            )
+            return await self._discord_fetch(
+                f"/channels/{channel_id}/messages/{message_id}",
+                "DELETE",
+            )
+
+        await self._with_message_channel(thread_id, message_id, delete)
 
         self._logger.debug("Discord API: DELETE message response", {"ok": True})
 
@@ -1080,23 +1144,7 @@ class DiscordAdapter:
         emoji: EmojiValue | str,
     ) -> None:
         """Add a reaction to a Discord message."""
-        decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
-        emoji_encoded = self._encode_emoji(emoji)
-
-        self._logger.debug(
-            "Discord API: PUT reaction",
-            {
-                "channelId": target_channel_id,
-                "messageId": message_id,
-                "emoji": emoji_encoded,
-            },
-        )
-
-        await self._discord_fetch(
-            f"/channels/{target_channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
-            "PUT",
-        )
+        await self._with_reaction(thread_id, message_id, emoji, "PUT")
 
     async def remove_reaction(
         self,
@@ -1105,28 +1153,129 @@ class DiscordAdapter:
         emoji: EmojiValue | str,
     ) -> None:
         """Remove a reaction from a Discord message."""
-        decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
+        await self._with_reaction(thread_id, message_id, emoji, "DELETE")
+
+    async def _with_reaction(
+        self,
+        thread_id: str,
+        message_id: str,
+        emoji: EmojiValue | str,
+        method: Literal["PUT", "DELETE"],
+    ) -> None:
+        """PUT or DELETE the bot's reaction (upstream ``withReaction``)."""
         emoji_encoded = self._encode_emoji(emoji)
 
-        self._logger.debug(
-            "Discord API: DELETE reaction",
-            {
-                "channelId": target_channel_id,
-                "messageId": message_id,
-                "emoji": emoji_encoded,
-            },
-        )
+        async def react(channel_id: str) -> Any:
+            self._logger.debug(
+                f"Discord API: {method} reaction",
+                {
+                    "channelId": channel_id,
+                    "messageId": message_id,
+                    "emoji": emoji_encoded,
+                },
+            )
+            return await self._discord_fetch(
+                f"/channels/{channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
+                method,
+            )
 
-        await self._discord_fetch(
-            f"/channels/{target_channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
-            "DELETE",
-        )
+        await self._with_message_channel(thread_id, message_id, react)
+
+    async def _resolve_thread_channel_id(
+        self,
+        parent_channel_id: str,
+        discord_thread_id: str | None,
+    ) -> str:
+        """Channel to target for a decoded thread id, validating its parent.
+
+        Port of upstream ``resolveThreadChannelId`` (#875). A thread id's
+        thread segment is only trusted once Discord (or a fresh cache entry
+        learned from Discord) confirms its parent is the thread id's channel
+        segment, so ``discord:g:A:<thread in B>`` cannot reach channel B
+        through a guard scoped to A. Raises :class:`ValidationError` on a
+        mismatch; costs one ``GET /channels/{thread}`` per uncached thread.
+        """
+        if not discord_thread_id:
+            return parent_channel_id
+
+        cached_parent = self._cached_thread_parent(discord_thread_id)
+        if cached_parent is not None:
+            if cached_parent == parent_channel_id:
+                return discord_thread_id
+            raise ValidationError(
+                "discord",
+                f"Discord thread {discord_thread_id} does not belong to channel {parent_channel_id}",
+            )
+
+        channel = await self._discord_fetch(f"/channels/{quote(discord_thread_id, safe='')}", "GET")
+        actual_parent = channel.get("parent_id") if isinstance(channel, dict) else None
+        if actual_parent != parent_channel_id:
+            raise ValidationError(
+                "discord",
+                f"Discord thread {discord_thread_id} does not belong to channel {parent_channel_id}",
+            )
+
+        self._remember_thread_parent(discord_thread_id, parent_channel_id)
+        return discord_thread_id
+
+    def _cached_thread_parent(self, thread_id: str) -> str | None:
+        """Parent channel id from a fresh cache entry, else ``None``."""
+        cached = self._thread_parent_cache.get(thread_id)
+        if cached and cached.get("expires_at", 0) > time.time():
+            return cached["parent_id"]
+        return None
+
+    def _remember_thread_parent(self, thread_id: str, parent_id: str) -> None:
+        """Cache a thread's parent channel for ``THREAD_PARENT_CACHE_TTL``."""
+        cache = self._thread_parent_cache
+        # Re-insert so the dict's insertion order tracks recency for eviction.
+        cache.pop(thread_id, None)
+        cache[thread_id] = {
+            "parent_id": parent_id,
+            "expires_at": time.time() + THREAD_PARENT_CACHE_TTL,
+        }
+        # Prevent unbounded cache growth (upstream's Map is unbounded).
+        if len(cache) > THREAD_PARENT_CACHE_MAX:
+            now = time.time()
+            for key in [k for k, v in cache.items() if v.get("expires_at", 0) <= now]:
+                del cache[key]
+            # Hard limit: evict the oldest entries if still over threshold.
+            overflow = len(cache) - THREAD_PARENT_CACHE_MAX
+            for key in list(cache)[: max(overflow, 0)]:
+                del cache[key]
+
+    async def _with_message_channel(
+        self,
+        thread_id: str,
+        message_id: str,
+        operation: Callable[[str], Awaitable[_T]],
+    ) -> _T:
+        """Run a message-scoped *operation* against the right channel.
+
+        Port of upstream ``withMessageChannel`` (#815). A thread whose id
+        equals the message id is a starter message: forum/media posts keep it
+        inside the thread, text-channel threads keep it in the parent
+        channel. Try the thread first and fall back to the parent only on
+        Discord ``10008`` (Unknown Message); any other error propagates.
+        """
+        decoded = self.decode_thread_id(thread_id)
+        target_channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
+
+        if not (decoded.thread_id and decoded.thread_id == message_id):
+            return await operation(target_channel_id)
+
+        try:
+            return await operation(decoded.thread_id)
+        except NetworkError as error:
+            original = error.original_error
+            if not (isinstance(original, DiscordApiError) and original.code == DISCORD_UNKNOWN_MESSAGE):
+                raise
+        return await operation(decoded.channel_id)
 
     async def start_typing(self, thread_id: str, status: str | None = None) -> None:
         """Start typing indicator in a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
+        target_channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
 
         self._logger.debug(
             "Discord API: POST typing",
@@ -1147,7 +1296,7 @@ class DiscordAdapter:
             options = FetchOptions()
 
         decoded = self.decode_thread_id(thread_id)
-        target_channel_id = decoded.thread_id or decoded.channel_id
+        target_channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
 
         limit = options.limit if options.limit is not None else 50
         direction = options.direction or "backward"
@@ -1394,13 +1543,17 @@ class DiscordAdapter:
         is_bot = author.get("bot", False)
         is_me = author.get("id") == self._bot_user_id
 
-        attachments_data = msg.get("attachments", [])
+        content, attachments_data = _flatten(
+            msg.get("content", ""),
+            msg.get("attachments") or [],
+            _snapshot_messages(msg),
+        )
 
         return Message(
             id=msg.get("id", ""),
             thread_id=thread_id,
-            text=self._format_converter.extract_plain_text(msg.get("content", "")),
-            formatted=self._format_converter.to_ast(msg.get("content", "")),
+            text=self._format_converter.extract_plain_text(content),
+            formatted=self._format_converter.to_ast(content),
             raw=raw,
             author=Author(
                 user_id=author.get("id", ""),
@@ -1414,17 +1567,63 @@ class DiscordAdapter:
                 edited=msg.get("edited_timestamp") is not None,
                 edited_at=_parse_iso(msg["edited_timestamp"]) if msg.get("edited_timestamp") else None,
             ),
-            attachments=[
-                Attachment(
-                    type=self._get_attachment_type(att.get("content_type")),
-                    url=att.get("url"),
-                    name=att.get("filename"),
-                    mime_type=att.get("content_type"),
-                    size=att.get("size"),
-                )
-                for att in attachments_data
-            ],
+            attachments=[self._build_attachment(att) for att in attachments_data],
         )
+
+    def _build_attachment(self, att: dict[str, Any]) -> Attachment:
+        """Normalize a Discord API attachment, with a guarded ``fetch_data``.
+
+        ``fetch_metadata["url"]`` keeps the CDN URL verbatim (including the
+        signed ``ex``/``is``/``hm`` query) so :meth:`rehydrate_attachment`
+        can rebuild the download after a JSON round-trip.
+        """
+        url = att.get("url")
+        return self.rehydrate_attachment(
+            Attachment(
+                type=self._get_attachment_type(att.get("content_type")),
+                url=url,
+                name=att.get("filename"),
+                mime_type=att.get("content_type"),
+                size=att.get("size"),
+                width=att.get("width"),
+                height=att.get("height"),
+                fetch_metadata={"url": url} if url else None,
+            )
+        )
+
+    def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
+        """Rebuild ``fetch_data`` for a (possibly deserialized) attachment.
+
+        Port of upstream ``rehydrateAttachment`` (#679/#800): downloads
+        ``fetch_metadata["url"]`` (falling back to ``attachment.url``) through
+        the shared guarded downloader. Returns the attachment unchanged when
+        it has no URL.
+        """
+        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
+        meta_url = meta.get("url")
+        url = meta_url if meta_url is not None else attachment.url
+        if not url:
+            return attachment
+
+        async def fetch_data() -> bytes:
+            return await self._download_attachment(url)
+
+        return replace(attachment, fetch_data=fetch_data)
+
+    async def _download_attachment(self, url: str) -> bytes:
+        """Download an attachment URL via the shared guarded downloader.
+
+        HTTPS only, internal addresses refused (including after redirects),
+        25 MB cap and 30 s timeout; no Discord credentials are sent.
+        """
+        from chat_sdk.shared.download import download_attachment  # lazy: pulls in aiohttp
+
+        try:
+            return await download_attachment(url, adapter="discord")
+        except NetworkError:
+            raise
+        except Exception as error:
+            raise NetworkError("discord", "Failed to download Discord attachment", error) from error
 
     def _get_attachment_type(self, mime_type: str | None) -> Literal["audio", "file", "image", "video"]:
         """Determine attachment type from MIME type."""
@@ -1485,8 +1684,11 @@ class DiscordAdapter:
 
             return {"id": result.get("id", ""), "name": result.get("name", thread_name)}
         except NetworkError as error:
-            # Discord error 160004: "A thread has already been created for this message"
-            if "160004" in str(error):
+            # Discord error 160004: "A thread has already been created for this
+            # message". Match the parsed JSON ``code`` only: the number can
+            # appear elsewhere in a body (e.g. a 429's ``retry_after``).
+            original = error.original_error
+            if isinstance(original, DiscordApiError) and original.code == DISCORD_THREAD_ALREADY_CREATED:
                 self._logger.debug(
                     "Thread already exists for message, reusing existing thread",
                     {"channelId": channel_id, "messageId": message_id},
@@ -1555,6 +1757,7 @@ class DiscordAdapter:
                 raise NetworkError(
                     "discord",
                     f"Discord API error: {response.status} {error_text}",
+                    DiscordApiError(response.status, error_text),
                 )
 
             if response.status == 204:

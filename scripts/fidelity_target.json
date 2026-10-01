@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 832,
+    "matched_exact": 841,
     "matched_fuzzy": 72,
-    "missing": 160,
-    "extra": 493
+    "missing": 151,
+    "extra": 501
   },
   "absent_ts_files": [],
   "files": {
@@ -180,21 +180,11 @@
       "python_exists": true,
       "ts_tests": 45,
       "each_templates": 0,
-      "matched_exact": 36,
+      "matched_exact": 45,
       "matched_fuzzy": 0,
-      "missing_count": 9,
-      "extra_count": 3,
-      "missing": [
-        ["toAiMessages", "uses ArrayBuffer attachment data without Buffer conversion"],
-        ["toAiMessages", "keeps image-only messages that have no text"],
-        ["toAiMessages", "keeps interleaved text and image-only messages"],
-        ["toAiMessages", "keeps link-only messages that have no text"],
-        ["toAiMessages", "skips video-only messages with no text and reports the attachment"],
-        ["toAiMessages", "skips image-only messages with no text when fetchData is unavailable"],
-        ["toAiMessages", "keeps link-only assistant messages with no text"],
-        ["toAiMessages", "does not add a text part when an image-only message has no text"],
-        ["toAiMessages", "skips messages with no text, attachments, or links"]
-      ],
+      "missing_count": 0,
+      "extra_count": 8,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/ai/index.test.ts": {
@@ -206,7 +196,7 @@
       "matched_exact": 44,
       "matched_fuzzy": 13,
       "missing_count": 0,
-      "extra_count": 22,
+      "extra_count": 25,
       "missing": [],
       "fuzzy_matches": [
         ["returns the full toolset when no preset is supplied", "test_returns_full_toolset_when_no_preset_supplied"],

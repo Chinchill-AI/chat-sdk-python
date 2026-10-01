@@ -265,11 +265,14 @@ query CommentThreadChildren($commentId: String!, $first: Int, $last: Int) {
 # upstream itself uses elsewhere (``agentSession.issueId ?? agentSession.issue?.id``
 # at index.ts:959). The ``comment { ... }`` selection requests exactly the
 # sub-fields the author/metadata resolution (``_raw_message_from_source_comment``,
-# a faithful ``parseMessageFromComment``) reads off the root comment.
+# a faithful ``parseMessageFromComment``) reads off the root comment. ``url``
+# (``AgentSession.url: String``) is the ``agentSession.url`` the activities
+# fallback copies onto each message.
 _AGENT_SESSION_FETCH_QUERY = """
 query AgentSession($id: String!) {
     agentSession(id: $id) {
         id
+        url
         issue {
             id
         }
@@ -346,6 +349,83 @@ query AgentSessionComments(
 }
 """
 
+# Agent-session ACTIVITIES query (vercel/chat#885, chat@4.40.0). Ports
+# upstream's ``agentSession.activities({first, after} | {last, before})``, the
+# history source for a session created without a root comment. Schema-hardened
+# against the published ``schema.graphql``: ``AgentSession.activities(after:
+# String, before: String, first: Int, last: Int, ...): AgentActivityConnection!``;
+# ``AgentActivity`` has NO scalar ``sourceCommentId`` / ``userId`` (the SDK
+# derives both from the ``sourceComment: Comment`` and ``user: User!``
+# relations), so select ``sourceComment { id }`` and ``user { ... }`` inline
+# (one query, no per-activity follow-up). ``content`` is the
+# ``AgentActivityContent`` union: the prompt, response, thought, error and
+# elicitation members carry ``body: String!``; the action member carries
+# ``action: String!``, ``parameter: String!`` and ``result: String``. Every
+# member has ``type: AgentActivityType!`` (lowercase values, e.g. "prompt").
+_AGENT_SESSION_ACTIVITIES_QUERY = """
+query AgentSessionActivities(
+    $id: String!
+    $first: Int
+    $after: String
+    $last: Int
+    $before: String
+) {
+    agentSession(id: $id) {
+        activities(first: $first, after: $after, last: $last, before: $before) {
+            nodes {
+                id
+                createdAt
+                updatedAt
+                sourceComment {
+                    id
+                }
+                user {
+                    id
+                    displayName
+                    name
+                    email
+                    avatarUrl
+                }
+                content {
+                    ... on AgentActivityPromptContent {
+                        type
+                        body
+                    }
+                    ... on AgentActivityResponseContent {
+                        type
+                        body
+                    }
+                    ... on AgentActivityThoughtContent {
+                        type
+                        body
+                    }
+                    ... on AgentActivityErrorContent {
+                        type
+                        body
+                    }
+                    ... on AgentActivityElicitationContent {
+                        type
+                        body
+                    }
+                    ... on AgentActivityActionContent {
+                        type
+                        action
+                        parameter
+                        result
+                    }
+                }
+            }
+            pageInfo {
+                hasNextPage
+                hasPreviousPage
+                endCursor
+                startCursor
+            }
+        }
+    }
+}
+"""
+
 # Emoji mapping for Linear reactions (unicode)
 EMOJI_MAPPING: dict[str, str] = {
     "thumbs_up": "\U0001f44d",
@@ -363,6 +443,28 @@ EMOJI_MAPPING: dict[str, str] = {
     "hooray": "\U0001f389",
     "confused": "\U0001f615",
 }
+
+
+def _render_activity(content: dict[str, Any]) -> str:
+    """Render an agent activity's content as message text.
+
+    Faithful port of upstream ``renderActivity`` (index.ts:73). Body-bearing
+    content (prompt, response, thought, error, elicitation) renders its body.
+    An action renders ``"{action}: {parameter}"`` (or just the action when the
+    parameter is empty), plus ``"\n{result}"`` when there is a result. Trims
+    use the JS ``.trim()`` set (``_JS_WHITESPACE``), not ``str.strip()``.
+    ``action.trim() || "Action"`` is a truthy fallback: an action that is
+    empty after trimming renders as ``"Action"``.
+    """
+    if "body" in content:
+        return cast("str", content["body"])
+
+    action = cast("str", content.get("action") or "").strip(_JS_WHITESPACE) or "Action"
+    parameter = cast("str", content.get("parameter") or "").strip(_JS_WHITESPACE)
+    raw_result = content.get("result")
+    result = cast("str", raw_result).strip(_JS_WHITESPACE) if raw_result is not None else None
+    text = f"{action}: {parameter}" if parameter else action
+    return f"{text}\n{result}" if result else text
 
 
 def get_user_name_from_profile_url(url: str) -> str:
@@ -942,16 +1044,16 @@ class LinearAdapter:
     ) -> Message:
         """Build a ``Message`` from an agent-session raw message.
 
-        Faithful port of upstream ``parseMessage`` (index.ts:2026) for the
-        ``agent_session_comment`` branch. The existing :meth:`parse_message`
-        predates the upstream rewrite and does not reproduce the threadId
-        encode / ``is_mention`` / structured-author behavior, so the
-        agent-session path renders the ``Message`` here directly:
+        Faithful port of upstream ``parseMessage`` (index.ts:2386 @ chat@4.41.1)
+        for the ``agent_session_comment`` branch; :meth:`parse_message`
+        delegates here for that kind.
 
         - ``is_mention=True`` — agent-session comments directly target the bot,
           so upstream always treats them as mentions.
-        - ``thread_id`` is re-encoded from the raw comment so the session
-          segment (``:s:{agentSessionId}``) is present on the routed thread.
+        - ``thread_id`` is the stable session thread
+          ``linear:{issueId}:s:{agentSessionId}`` (vercel/chat#885). It carries
+          no comment segment, so every event in one session (created, prompted,
+          fetched, emitted) routes to the same thread.
         - ``author`` is read from the structured ``comment.user`` written by
           :meth:`_parse_message_from_agent_session_event` (display name, full
           name, ``is_bot`` from ``type == "bot"``, ``is_me`` from bot-user-id).
@@ -963,7 +1065,6 @@ class LinearAdapter:
         thread_id = self.encode_thread_id(
             LinearThreadId(
                 issue_id=cast("str", comment.get("issueId", "")),
-                comment_id=cast("str | None", comment.get("id")),
                 agent_session_id=raw["agentSessionId"],
             )
         )
@@ -1041,16 +1142,11 @@ class LinearAdapter:
                 )
                 return None
 
+            # `agentActivity.sourceCommentId ?? agentActivity.id` — nullish. A
+            # prompt with no source comment (vercel/chat#885) is identified by
+            # the activity itself; the thread id no longer depends on it.
             source_comment_id = agent_activity.get("sourceCommentId")
-            if not source_comment_id:
-                self._logger.warn(
-                    "Missing source comment ID for agent activity",
-                    {
-                        "agentSessionId": agent_session.get("id"),
-                        "agentActivityId": agent_activity.get("id"),
-                    },
-                )
-                return None
+            message_id = source_comment_id if source_comment_id is not None else agent_activity.get("id", "")
 
             content = agent_activity.get("content", {})
             activity_user = cast("AgentSessionUserChild", agent_activity.get("user", {}))
@@ -1062,7 +1158,7 @@ class LinearAdapter:
             prompted_session_comment = agent_session.get("comment")
             parent_id = prompted_session_comment.get("id") if prompted_session_comment is not None else None
             comment_data: LinearCommentData = {
-                "id": cast("str", source_comment_id),
+                "id": cast("str", message_id),
                 "body": cast("str", content.get("body", "")),
                 "issueId": cast("str", issue_id),
                 "user": {
@@ -1116,13 +1212,17 @@ class LinearAdapter:
                 )
                 return None
 
+            # `agentSession.comment ?? {id: `agent-session-${id}`, body:
+            # payload.promptContext ?? ""}` — nullish both times. A session
+            # created without a root comment (e.g. by an automation) is
+            # dispatched with its prompt context as the body (vercel/chat#885).
             session_comment = agent_session.get("comment")
-            if not session_comment:
-                self._logger.warn(
-                    "Missing comment for agent session",
-                    {"agentSessionId": agent_session.get("id")},
-                )
-                return None
+            if session_comment is None:
+                session_prompt_context = payload.get("promptContext")
+                session_comment = {
+                    "id": f"agent-session-{agent_session.get('id', '')}",
+                    "body": session_prompt_context if session_prompt_context is not None else "",
+                }
 
             creator = agent_session.get("creator")
             user: LinearActorData
@@ -1138,16 +1238,15 @@ class LinearAdapter:
                     **({"avatarUrl": cast("str", creator_avatar)} if creator_avatar is not None else {}),
                 }
             else:
-                # No creator → fall back to the bot author (upstream uses
-                # `this.botUserId` / `this.userName`). ``Author.user_id`` is a
-                # non-Optional ``str``, so coerce a None bot-user-id (not yet
-                # resolved by ``initialize``) to "" via ``is not None`` rather
-                # than truthiness (CLAUDE.md hazard).
+                # No creator → a distinct "Linear automation" author
+                # (vercel/chat#885). Attributing it to the bot itself made
+                # ``is_me`` true, so core dropped automation-created sessions
+                # as self-messages.
                 user = {
                     "type": "bot",
-                    "id": self._bot_user_id if self._bot_user_id is not None else "",
-                    "displayName": self._user_name,
-                    "fullName": self._user_name,
+                    "id": "linear-automation",
+                    "displayName": "Linear automation",
+                    "fullName": "Linear automation",
                 }
 
             comment_data = {
@@ -1519,15 +1618,12 @@ class LinearAdapter:
         # (no author field — unlike upstream's richer ``Message extends RawMessage``
         # return). The fully-parsed author/metadata live under ``raw`` and are
         # re-derived on read via :meth:`_parse_agent_session_message`. Encode the
-        # routed thread id (carrying the ``:s:{session}`` segment) so callers can
-        # round-trip it, matching the comment branch's ``thread_id`` semantics.
-        # Upstream ``parseMessage`` (index.ts:2033-2038) and the adapter's own
-        # read-path :meth:`_parse_agent_session_message` encode the source
-        # comment's OWN id (``commentId: raw.comment.id``) — NOT its parentId.
+        # stable session thread id ``linear:{issueId}:s:{agentSessionId}``, as
+        # upstream ``parseMessage`` does for the agent-session kind
+        # (vercel/chat#885) — no comment segment.
         thread_id = self.encode_thread_id(
             LinearThreadId(
                 issue_id=issue_id,
-                comment_id=cast("str | None", comment_data.get("id")),
                 agent_session_id=agent_session_id,
             )
         )
@@ -1731,8 +1827,9 @@ class LinearAdapter:
           B. The published schema has no scalar ``issueId`` on ``AgentSession``
           (only the ``issue`` relation), so we read the issue id off
           ``issue { id }`` — equivalent to upstream's ``agentSession.issueId``.
-        - ``root_comment = agentSession.comment`` — raise ``AdapterError`` when
-          the session has no root comment.
+        - ``root_comment = agentSession.comment``. A session with no root
+          comment (vercel/chat#885) reads its history from the session's
+          activities instead (:meth:`_fetch_agent_session_activities`).
         - children pagination is direction-driven: ``forward`` → ``first``,
           otherwise ``last`` (default limit 50), passing the
           ``{parent: {id: {eq: root_comment.id}}}`` filter.
@@ -1740,10 +1837,9 @@ class LinearAdapter:
           ``parseMessageFromComment(comment, issue_id, agent_session.id)``
           semantics — reusing L4's ``_raw_message_from_source_comment`` (author
           user-vs-botActor resolution) + ``_parse_agent_session_message`` (the
-          ``parseMessage`` agent-session branch). Each resulting message's
-          ``thread_id`` therefore encodes the comment's OWN id plus the session
-          segment: ``linear:{issue_id}:c:{comment.id}:s:{agent_session_id}`` —
-          NOT a single fixed thread_id shared across messages — and is a mention.
+          ``parseMessage`` agent-session branch). Every resulting message
+          carries the stable session thread id
+          ``linear:{issue_id}:s:{agent_session_id}`` and is a mention.
         - ``next_cursor = endCursor if hasNextPage else None`` (upstream's
           ``hasNextPage ? (endCursor ?? undefined) : undefined``; ``is not None``).
         """
@@ -1782,10 +1878,7 @@ class LinearAdapter:
 
         root_comment = agent_session.get("comment")
         if not root_comment:
-            raise AdapterError(
-                f"Linear agent session {thread.agent_session_id} is missing a root comment",
-                "linear",
-            )
+            return await self._fetch_agent_session_activities(agent_session, issue_id, options)
 
         agent_session_id = cast("str", agent_session.get("id", ""))
 
@@ -1809,8 +1902,7 @@ class LinearAdapter:
 
         # ``commentsToMessages([rootComment, ...children], issueId, agentSession.id)``
         # — each comment parsed via the ``parseMessageFromComment`` author logic
-        # (reused from L4) and the ``parseMessage`` agent-session branch, so each
-        # message encodes its OWN comment id in the thread id.
+        # (reused from L4) and the ``parseMessage`` agent-session branch.
         messages: list[Message] = []
         for node in [root_comment, *child_nodes]:
             raw_message = self._raw_message_from_source_comment(node, issue_id, agent_session_id)
@@ -1821,6 +1913,125 @@ class LinearAdapter:
             messages=messages,
             next_cursor=end_cursor if page_info.get("hasNextPage") and end_cursor is not None else None,
         )
+
+    async def _fetch_agent_session_activities(
+        self,
+        agent_session: dict[str, Any],
+        issue_id: str,
+        options: FetchOptions | None = None,
+    ) -> FetchResult:
+        """Fetch a rootless agent session's history from its activities.
+
+        Faithful port of upstream ``fetchAgentSessionActivities`` (index.ts:2109
+        @ chat@4.41.1, vercel/chat#885), over the raw
+        ``_AGENT_SESSION_ACTIVITIES_QUERY``.
+
+        - ``forward`` pages with ``first`` (plus ``after`` = the inbound
+          cursor); every other direction with ``last`` (plus ``before``).
+          Default limit 50. Unlike the children path, the inbound cursor IS
+          forwarded here, as upstream does. Only the variables upstream passes
+          are sent, so an unset cursor is omitted rather than sent as ``null``.
+        - Activities are sorted by parsed ``createdAt`` (stable sort).
+        - Each activity becomes an agent-session message: id
+          ``sourceComment.id ?? activity.id``, text from
+          :func:`_render_activity`. Prompts are authored by the user; every
+          other activity by the bot (``user.id ?? botUserId``, display-name
+          fallback ``userName``).
+        - ``next_cursor`` is ``endCursor`` when paging forward with
+          ``hasNextPage``, or ``startCursor`` when paging backward with
+          ``hasPreviousPage``.
+        """
+        forward = options is not None and options.direction == "forward"
+        limit = options.limit if (options is not None and options.limit is not None) else 50
+        cursor = options.cursor if options is not None else None
+        agent_session_id = cast("str", agent_session.get("id", ""))
+
+        # ``options?.cursor ? {after|before: cursor} : {}`` — truthy, so an
+        # empty cursor is not forwarded.
+        variables: dict[str, Any] = {"id": agent_session_id}
+        if forward:
+            variables["first"] = limit
+            if cursor:
+                variables["after"] = cursor
+        else:
+            variables["last"] = limit
+            if cursor:
+                variables["before"] = cursor
+
+        result = await self._graphql_query(_AGENT_SESSION_ACTIVITIES_QUERY, variables)
+        session_node = (result.get("data") or {}).get("agentSession") or {}
+        connection = session_node.get("activities") or {}
+        nodes: list[dict[str, Any]] = list(connection.get("nodes") or [])
+        nodes.sort(key=lambda node: _parse_iso(cast("str", node.get("createdAt", ""))))
+
+        # ``agentSession.url ?? undefined`` — nullish.
+        session_url = agent_session.get("url")
+        bot_user_id = self._bot_user_id if self._bot_user_id is not None else ""
+
+        messages: list[Message] = []
+        for activity in nodes:
+            content = cast("dict[str, Any]", activity.get("content") or {})
+            user = activity.get("user")
+            is_bot = content.get("type") != "prompt"
+            fallback = self._user_name if is_bot else "unknown"
+
+            # ``user?.id ?? activity.userId ?? (isBot ? botUserId : "unknown")``.
+            # The SDK's ``userId`` is derived from the same ``user`` relation, so
+            # the raw query has no separate scalar to fall back to.
+            user_id = user.get("id") if user is not None else None
+            display_name = user.get("displayName") if user is not None else None
+            name = user.get("name") if user is not None else None
+            email = user.get("email") if user is not None else None
+            avatar_url = user.get("avatarUrl") if user is not None else None
+            actor: LinearActorData = {
+                "type": "bot" if is_bot else "user",
+                "id": cast(
+                    "str",
+                    user_id if user_id is not None else (bot_user_id if is_bot else "unknown"),
+                ),
+                "displayName": cast(
+                    "str",
+                    display_name if display_name is not None else (name if name is not None else fallback),
+                ),
+                "fullName": cast(
+                    "str",
+                    name if name is not None else (display_name if display_name is not None else fallback),
+                ),
+                **({"email": cast("str", email)} if email is not None else {}),
+                **({"avatarUrl": cast("str", avatar_url)} if avatar_url is not None else {}),
+            }
+
+            # ``activity.sourceCommentId ?? activity.id`` — the SDK derives
+            # ``sourceCommentId`` from the ``sourceComment`` relation.
+            source_comment = activity.get("sourceComment")
+            source_comment_id = source_comment.get("id") if source_comment is not None else None
+            comment_data: LinearCommentData = {
+                "id": cast("str", source_comment_id if source_comment_id is not None else activity.get("id", "")),
+                "body": _render_activity(content),
+                "issueId": issue_id,
+                "user": actor,
+                "createdAt": cast("str", activity.get("createdAt", "")),
+                "updatedAt": cast("str", activity.get("updatedAt", "")),
+            }
+            if session_url is not None:
+                comment_data["url"] = cast("str", session_url)
+
+            raw: LinearAgentSessionCommentRawMessage = {
+                "kind": "agent_session_comment",
+                "organizationId": self._default_organization_id or "",
+                "comment": comment_data,
+                "agentSessionId": agent_session_id,
+            }
+            messages.append(self._parse_agent_session_message(raw))
+
+        page_info = connection.get("pageInfo") or {}
+        next_cursor: str | None = None
+        if forward and page_info.get("hasNextPage"):
+            next_cursor = page_info.get("endCursor")
+        elif not forward and page_info.get("hasPreviousPage"):
+            next_cursor = page_info.get("startCursor")
+
+        return FetchResult(messages=messages, next_cursor=next_cursor)
 
     async def _fetch_issue_comments(
         self,
@@ -2029,7 +2240,10 @@ class LinearAdapter:
         - Comment thread: linear:{issue_id}:c:{comment_id}
         - Agent-session issue: linear:{issue_id}:s:{agent_session_id}
         - Agent-session comment:
-          linear:{issue_id}:c:{comment_id}:s:{agent_session_id}
+          linear:{issue_id}:c:{comment_id}:s:{agent_session_id}. Since
+          vercel/chat#885 the adapter routes every session event to the
+          issue-session form; this form is still encoded and decoded (as
+          upstream), so stored pre-#885 thread ids keep working for posting.
 
         CRITICAL — cross-SDK state compat: the issue-level and comment-thread
         outputs are persisted (Redis/Postgres) and shared with the TS SDK, so
@@ -2104,7 +2318,19 @@ class LinearAdapter:
         aliases, producing `object | str`. Cast the string fields we know
         are strings at runtime so downstream constructors (`Author`,
         `_parse_iso`) receive `str` instead of `object`.
+
+        Agent-session comments delegate to :meth:`_parse_agent_session_message`
+        (``is_mention=True``, stable ``linear:{issue}:s:{session}`` thread id),
+        as upstream ``parseMessage`` does for that kind. Ordinary comments leave
+        ``is_mention`` unset (``None``) so core ``@mention`` text detection
+        still runs (vercel/chat#946). The ordinary-comment branch is otherwise
+        NOT at parity: it returns ``thread_id=""`` and an ``"unknown"`` author,
+        where upstream encodes ``linear:{issue}:c:{comment}`` and reads
+        ``comment.user`` (known divergence, tracked in #285).
         """
+        if raw.get("kind") == "agent_session_comment":
+            return self._parse_agent_session_message(cast("LinearAgentSessionCommentRawMessage", raw))
+
         comment = raw.get("comment", {})
         text = cast("str", comment.get("body", ""))
         user_id = cast("str", comment.get("userId") or comment.get("user_id", ""))
