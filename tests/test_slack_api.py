@@ -94,6 +94,13 @@ class _DictResponse(dict):
         self.data = data
 
 
+class _FakeSlackResponse:
+    """Non-dict stand-in for ``slack_sdk``'s ``(Async)SlackResponse``: body on ``.data``."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data = data
+
+
 class _FakeSlackApiError(Exception):
     """Mirror of ``slack_sdk.errors.SlackApiError`` for offline tests.
 
@@ -105,11 +112,14 @@ class _FakeSlackApiError(Exception):
     stand-in reproduces the attributes the adapter inspects: ``str(error)``
     contains the Slack error code and ``error.response`` is a dict carrying
     ``{"ok": False, "error": <code>}`` (matching ``SlackApiError``'s shape).
+    Pass a ``_FakeSlackResponse`` instead to mirror the real error, whose
+    ``response`` is a (non-dict) ``SlackResponse`` with the body on ``.data``.
     """
 
-    def __init__(self, message: str, response: dict[str, Any]) -> None:
+    def __init__(self, message: str, response: dict[str, Any] | _FakeSlackResponse) -> None:
         self.response = response
-        server_error = response.get("error")
+        body = response.data if isinstance(response, _FakeSlackResponse) else response
+        server_error = body.get("error")
         super().__init__(f"{message}\nThe server responded with: {{'ok': False, 'error': '{server_error}'}}")
 
 
@@ -2317,15 +2327,32 @@ class TestNativeStreamingFallback:
         assert _last_fallback_markdown(post_spy, edit_spy) == "**bold** and `code`"
 
     @pytest.mark.asyncio
-    async def test_latches_native_streaming_off_after_an_unsupported_method_platform_error(self):
+    @pytest.mark.parametrize("failing_call", ["append", "stop"])
+    @pytest.mark.parametrize("response_shape", ["slack-response", "dict"])
+    async def test_latches_native_streaming_off_after_an_unsupported_method_platform_error(
+        self, failing_call: str, response_shape: str
+    ):
         # Also the Python shape of the platform error: a ``SlackApiError``-like
-        # exception whose ``response["error"]`` is ``unknown_method``.
-        adapter, client, _, _ = _fallback_adapter()
-        platform_error = _FakeSlackApiError("unknown_method", {"ok": False, "error": "unknown_method"})
-        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=platform_error)))
+        # exception whose response body has ``error: "unknown_method"``. A real
+        # ``SlackApiError`` carries a ``SlackResponse`` (body on ``.data``);
+        # the dict shape is what ``_handle_slack_error`` also accepts.
+        # ``stop`` covers the common production path: a short reply stays
+        # buffered (append returns None), so ``stop()`` makes the first call.
+        adapter, client, post_spy, _ = _fallback_adapter()
+        body = {"ok": False, "error": "unknown_method"}
+        platform_error = _FakeSlackApiError(
+            "unknown_method", _FakeSlackResponse(body) if response_shape == "slack-response" else body
+        )
+        if failing_call == "append":
+            streamer = _streamer(AsyncMock(side_effect=platform_error))
+        else:
+            streamer = _streamer(AsyncMock(return_value=None), AsyncMock(side_effect=platform_error))
+        client.chat_stream = AsyncMock(return_value=streamer)
 
         await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello"))
         client.chat_stream.assert_awaited_once()
+        assert post_spy.call_args.args[1].markdown == "hello"
+        assert adapter._native_streaming_broken is True
 
         # The second stream skips the doomed native attempt entirely.
         stream, consumed = _untouched_stream()
@@ -2416,7 +2443,7 @@ class TestNativeStreamingFallback:
 
         import chat_sdk.adapters.slack.adapter as slack_adapter_module
 
-        clock = itertools.chain([0.0, 100.0, 600.0, 650.0], itertools.repeat(700.0))
+        clock = itertools.chain([0.0, 500.0, 600.0, 999.0], itertools.repeat(1100.0))
         monkeypatch.setattr(slack_adapter_module, "_monotonic_ms", lambda: next(clock))
         adapter, client, post_spy, edit_spy = _fallback_adapter()
         client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming"))))
@@ -2428,9 +2455,30 @@ class TestNativeStreamingFallback:
         )
 
         assert [call.args[1].markdown for call in post_spy.call_args_list] == ["a\n"]
-        # "b" at 100 ms is throttled; "c" at 600 ms edits; the end forces "d".
-        assert [call.args[2].markdown for call in edit_spy.call_args_list] == ["a\nb\nc\n", "a\nb\nc\nd"]
+        # "b" at exactly 500 ms edits (upstream ``now - lastFallbackEditAt >=
+        # updateIntervalMs``) and restarts the window, so "c" at 600 ms and
+        # the "d" step at 999 ms are throttled; the end forces "d". With ``>``
+        # instead of ``>=``, "b" would be skipped and "c" would edit instead.
+        assert [call.args[2].markdown for call in edit_spy.call_args_list] == ["a\nb\n", "a\nb\nc\nd"]
         assert all(call.args[1] == "fallback-ts" for call in edit_spy.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_fallback_throttle_defaults_to_1000_ms_without_options(self, monkeypatch: pytest.MonkeyPatch):
+        # Upstream ``options?.updateIntervalMs ?? 1000`` for direct calls.
+        import itertools
+
+        import chat_sdk.adapters.slack.adapter as slack_adapter_module
+
+        clock = itertools.chain([0.0, 999.0, 1000.0], itertools.repeat(1001.0))
+        monkeypatch.setattr(slack_adapter_module, "_monotonic_ms", lambda: next(clock))
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming"))))
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("a\n", "b\n", "c\n", "d"))
+
+        assert [call.args[1].markdown for call in post_spy.call_args_list] == ["a\n"]
+        # "b" at 999 ms is throttled; "c" at 1000 ms edits; the end forces "d".
+        assert [call.args[2].markdown for call in edit_spy.call_args_list] == ["a\nb\nc\n", "a\nb\nc\nd"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
