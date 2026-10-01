@@ -12,9 +12,17 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 import chat_sdk
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# CLAUDE.md is repository-only: the sdist allowlist (pyproject.toml) ships
+# /tests and /docs but not CLAUDE.md, so skip there instead of failing.
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "CLAUDE.md").is_file(), reason="CLAUDE.md is not shipped in the sdist (repository checkout only)"
+)
 
 _CLAUDE_ROW = re.compile(r"^- `(0\.\d+\.\d+(?:\.\d+)?)` = (.*)$")
 _SYNC_ROW = re.compile(r"^\| `(0\.\d+\.\d+[^`]*)` \| `(\d+\.\d+\.\d+)` \| (.*) \|$")
