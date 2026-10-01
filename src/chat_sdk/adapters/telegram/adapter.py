@@ -4067,6 +4067,18 @@ class TelegramAdapter:
 
     @staticmethod
     def _validate_attachment_media_group_types(attachments: list[Attachment]) -> None:
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md
+        # An unknown ``type`` is rejected here, before any download, with
+        # ``send_attachment``'s message (upstream's TS union rules it out at
+        # compile time; the dict lookup would raise KeyError).
+        for attachment in attachments:
+            if attachment.type not in ATTACHMENT_MEDIA_GROUP_TYPES:
+                raise ValidationError(
+                    "telegram",
+                    f"Unsupported attachment type: {attachment.type}. "
+                    f"Supported types: {', '.join(ATTACHMENT_MEDIA_GROUP_TYPES)}",
+                )
+
         categories = {
             "document" if attachment.type == "file" else "audio" if attachment.type == "audio" else "visual"
             for attachment in attachments

@@ -701,6 +701,34 @@ class TestPostMessageMediaGroups:
         ]
         assert _form_binary_field(retry_form, "media1")[0] == b"two"
 
+    @pytest.mark.asyncio
+    async def test_rejects_an_unsupported_attachment_type_in_a_media_group_before_downloading(self):
+        """Divergence from upstream: an out-of-set ``type`` raises ValidationError
+        (not ``KeyError``) before any ``fetch_data`` download.
+
+        ``Attachment.type`` is a ``Literal`` Python does not enforce; upstream's
+        TS union rules the value out at compile time (docs/UPSTREAM_SYNC.md).
+        """
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+        fetch_data = AsyncMock(return_value=b"payload")
+
+        with pytest.raises(ValidationError, match="Unsupported attachment type: sticker"):
+            await adapter.post_message(
+                "telegram:123",
+                PostableRaw(
+                    raw="",
+                    attachments=[
+                        Attachment(type="image", fetch_data=fetch_data),
+                        Attachment(type="sticker", data=b"x"),  # type: ignore[arg-type]
+                    ],
+                ),
+            )
+
+        fetch_data.assert_not_awaited()
+        adapter.telegram_fetch.assert_not_awaited()
+
 
 # =============================================================================
 # Tests -- edit_message
