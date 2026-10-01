@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from chat_sdk.callback_url import (
     CallbackContext,
@@ -28,6 +28,7 @@ from chat_sdk.callback_url import (
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.context import conversation
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
+from chat_sdk.history import HistoryApiImpl, UserHistoryApiImpl
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
     ThreadImpl,
@@ -37,10 +38,11 @@ from chat_sdk.thread import (
     has_chat_singleton,
     set_chat_singleton,
 )
-from chat_sdk.transcripts import TranscriptsApiImpl
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
+    AppContextChangedEvent,
+    AppContextChangedHandler,
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
@@ -54,13 +56,19 @@ from chat_sdk.types import (
     EmojiValue,
     IdentityContext,
     IdentityResolver,
+    InstallationEvent,
+    InstalledEvent,
+    InstalledHandler,
     Lock,
     LockScope,
     LockScopeContext,
     MemberJoinedChannelEvent,
     Message,
     MessageContext,
+    MessageDeletedEvent,
+    MessageDeletedHandler,
     MessageMetadata,
+    MessageUpdatedHandler,
     ModalCloseEvent,
     ModalResponse,
     ModalSubmitEvent,
@@ -72,6 +80,10 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StateAdapter,
     TranscriptsApi,
+    TranscriptsConfig,
+    UninstalledEvent,
+    UninstalledHandler,
+    UserHistoryConfig,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -546,25 +558,48 @@ class Chat:
             else None
         )
 
-        # -- Thread history (placeholder -- real impl would use ThreadHistoryCache)
-        # `config.message_history` is the deprecated alias; `thread_history`
-        # takes precedence when both are set (mirrors upstream
-        # `config.threadHistory ?? config.messageHistory`).
-        self._thread_history = _ThreadHistoryCache(
-            self._state_adapter,
-            config.thread_history if config.thread_history is not None else config.message_history,
-        )
+        # -- Thread history ----------------------------------------------------
+        # Precedence mirrors upstream
+        # `config.history?.thread ?? config.threadHistory ?? config.messageHistory`
+        # (`message_history` is the deprecated alias of `thread_history`).
+        history_config = config.history
+        thread_history_config = history_config.thread if history_config is not None else None
+        if thread_history_config is None:
+            thread_history_config = (
+                config.thread_history if config.thread_history is not None else config.message_history
+            )
+        self._thread_history = _ThreadHistoryCache(self._state_adapter, thread_history_config)
 
-        # -- Transcripts API (cross-platform per-user persistence) -------------
-        self._identity: IdentityResolver | None = config.identity
-        self._transcripts: TranscriptsApiImpl | None = None
-        if config.transcripts is not None:
-            if config.identity is None:
-                raise ValueError(
-                    "ChatConfig.transcripts requires ChatConfig.identity to be set "
-                    "— the cross-platform user key must be resolvable"
-                )
-            self._transcripts = TranscriptsApiImpl(self._state_adapter, config.transcripts)
+        # -- User history (cross-platform per-user persistence) ----------------
+        # `history.user` is merged over the legacy `transcripts` block field by
+        # field, so a migration that only moves the identity resolver keeps
+        # the retention / max_per_user settings still on the legacy block.
+        user_history_config = _merge_user_history_config(
+            config.transcripts, history_config.user if history_config is not None else None
+        )
+        history_user_identity = (
+            history_config.user.identity if history_config is not None and history_config.user is not None else None
+        )
+        resolved_identity = history_user_identity if history_user_identity is not None else config.identity
+        if user_history_config is not None and resolved_identity is None:
+            raise ValueError(
+                "ChatConfig requires an identity resolver when user history (or legacy `transcripts`) is "
+                "configured — set `history.user.identity` or the deprecated top-level `identity` field"
+            )
+        self._identity: IdentityResolver | None = resolved_identity
+
+        # -- Unified History API -----------------------------------------------
+        # The resolver closes over `self._adapters` so adapters registered
+        # after construction are seen at call time.
+        self._history = HistoryApiImpl(
+            lambda name: self._adapters.get(name),
+            cache=self._thread_history,
+            user=(
+                UserHistoryApiImpl(self._state_adapter, user_history_config)
+                if user_history_config is not None
+                else None
+            ),
+        )
 
         # -- Logger -----------------------------------------------------------
         if isinstance(config.logger, str):
@@ -588,7 +623,12 @@ class Chat:
         self._assistant_thread_started_handlers: list[AssistantThreadStartedHandler] = []
         self._assistant_context_changed_handlers: list[AssistantContextChangedHandler] = []
         self._app_home_opened_handlers: list[AppHomeOpenedHandler] = []
+        self._app_context_changed_handlers: list[AppContextChangedHandler] = []
         self._member_joined_channel_handlers: list[MemberJoinedChannelHandler] = []
+        self._message_updated_handlers: list[MessageUpdatedHandler] = []
+        self._message_deleted_handlers: list[MessageDeletedHandler] = []
+        self._installed_handlers: list[InstalledHandler] = []
+        self._uninstalled_handlers: list[UninstalledHandler] = []
 
         # -- Init state -------------------------------------------------------
         self._init_promise: asyncio.Task[None] | None = None
@@ -610,22 +650,30 @@ class Chat:
         self._logger.debug("Chat instance created", {"adapters": list(config.adapters.keys())})
 
     # ========================================================================
-    # Transcripts API
+    # History API
     # ========================================================================
 
     @property
-    def transcripts(self) -> TranscriptsApi:
-        """Cross-platform per-user transcript store.
+    def history(self) -> HistoryApiImpl:
+        """Unified History API.
 
-        Available only when ``transcripts`` is configured on the Chat
-        instance (and an ``identity`` resolver is set).  Raises on access
-        otherwise so callers fail loudly rather than silently no-op'ing.
+        - ``history.user``: cross-platform per-user transcript store (raises
+          on access if not configured)
+        - ``history.thread``: per-thread message listing
+        - ``history.channel``: channel-level messages and thread listings
         """
-        if self._transcripts is None:
-            raise ChatError(
-                "chat.transcripts is not configured — pass `transcripts` and `identity` to ChatConfig to enable it"
-            )
-        return self._transcripts
+        return self._history
+
+    @property
+    def transcripts(self) -> TranscriptsApi:
+        """Deprecated: use ``chat.history.user`` instead.
+
+        Available only when user history (``history.user`` or the legacy
+        ``transcripts``) is configured with an identity resolver.  Raises on
+        access otherwise so callers fail loudly rather than silently
+        no-op'ing.
+        """
+        return self.history.user
 
     # ========================================================================
     # Singleton management
@@ -1112,9 +1160,49 @@ class Chat:
         self._logger.debug("Registered app home opened handler")
         return handler
 
+    def on_app_context_changed(self, handler: AppContextChangedHandler) -> AppContextChangedHandler:
+        self._app_context_changed_handlers.append(handler)
+        self._logger.debug("Registered app context changed handler")
+        return handler
+
+    def on_installed(self, handler: InstalledHandler) -> InstalledHandler:
+        """Handle bot installation, including upgrades that add the bot (currently Teams only)."""
+        self._installed_handlers.append(handler)
+        return handler
+
+    def on_uninstalled(self, handler: UninstalledHandler) -> UninstalledHandler:
+        """Handle bot removal, including upgrades that remove the bot (currently Teams only)."""
+        self._uninstalled_handlers.append(handler)
+        return handler
+
     def on_member_joined_channel(self, handler: MemberJoinedChannelHandler) -> MemberJoinedChannelHandler:
         self._member_joined_channel_handlers.append(handler)
         self._logger.debug("Registered member joined channel handler")
+        return handler
+
+    # -- Message lifecycle events ---
+
+    def on_message_updated(self, handler: MessageUpdatedHandler) -> MessageUpdatedHandler:
+        """Register a handler for message edit/update events.
+
+        Called as ``handler(thread, message, previous_message)``. These
+        lifecycle events are dispatched directly by adapters and never route
+        through ``on_message`` / ``on_mention`` / ``on_subscribed_message``.
+        The bot's own edits are skipped.
+        """
+        self._message_updated_handlers.append(handler)
+        self._logger.debug("Registered message updated handler")
+        return handler
+
+    def on_message_deleted(self, handler: MessageDeletedHandler) -> MessageDeletedHandler:
+        """Register a handler for message delete events.
+
+        Delete events usually do not include the deleted message body;
+        handlers get a :class:`MessageDeletedEvent` with the normalized
+        platform IDs needed to update external storage.
+        """
+        self._message_deleted_handlers.append(handler)
+        self._logger.debug("Registered message deleted handler")
         return handler
 
     # ========================================================================
@@ -1244,6 +1332,75 @@ class Chat:
                 )
             )
             self._hand_to_wait_until(task, options, propagate=True)
+        return task
+
+    def process_message_updated(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message | Callable[[], Awaitable[Message]],
+        *,
+        previous_message: Message | Callable[[], Awaitable[Message]] | None = None,
+        options: WebhookOptions | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Process an incoming message update (edit) from an adapter.
+
+        ``message`` / ``previous_message`` are each a parsed :class:`Message`
+        or an async factory for lazy parsing. Updates bypass routing,
+        deduplication and locking, and the bot's own edits are skipped.
+        ``previous_message`` and ``options`` are keyword-only: in
+        :meth:`process_message` the fourth positional slot is ``options``, so a
+        positional call written by analogy would otherwise hand the
+        ``WebhookOptions`` to handlers as ``previous_message`` and skip
+        ``wait_until``. Returns the handler task (``None`` without a running loop); it raises
+        on handler failure, while ``wait_until`` always receives the
+        error-swallowing wrapper (upstream ``processMessageUpdated``).
+        """
+
+        async def _task() -> None:
+            msg = await message() if callable(message) else message
+            prev = await previous_message() if callable(previous_message) else previous_message
+            await self._handle_message_updated(adapter, thread_id, msg, prev)
+
+        task = _create_task(_task(), self._active_tasks)
+        if task is not None:
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error(
+                        "Message update processing error", {"thread_id": thread_id, "error": str(t.exception())}
+                    )
+                    if not t.cancelled() and t.exception()
+                    else None
+                )
+            )
+            self._hand_to_wait_until(task, options)
+        return task
+
+    def process_message_deleted(
+        self,
+        event: MessageDeletedEvent,
+        options: WebhookOptions | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Process an incoming message delete from an adapter.
+
+        Handlers receive the event with ``platform`` filled from the adapter
+        name when the adapter left it ``None``. No Thread is constructed.
+        Returns the handler task (``None`` without a running loop); see
+        :meth:`process_message_updated` for error and ``wait_until`` handling.
+        """
+        task = _create_task(self._handle_message_deleted(event), self._active_tasks)
+        if task is not None:
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error(
+                        "Message delete processing error",
+                        {"thread_id": event.thread_id, "message_id": event.message_id, "error": str(t.exception())},
+                    )
+                    if not t.cancelled() and t.exception()
+                    else None
+                )
+            )
+            self._hand_to_wait_until(task, options)
         return task
 
     def process_reaction(
@@ -1537,6 +1694,31 @@ class Chat:
             )
             self._hand_to_wait_until(task, options)
 
+    def process_app_context_changed(
+        self,
+        event: AppContextChangedEvent,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Dispatch a Slack agent_view ``app_context_changed`` event (upstream ``processAppContextChanged``)."""
+
+        async def _task() -> None:
+            with conversation(event.channel_id):
+                for h in self._app_context_changed_handlers:
+                    await self._invoke_handler(h, event)
+
+        task = _create_task(_task(), self._active_tasks)
+        if task is not None:
+            task.add_done_callback(
+                lambda t: (
+                    self._logger.error(
+                        "App context changed handler error", {"error": str(t.exception()), "user_id": event.user_id}
+                    )
+                    if not t.cancelled() and t.exception()
+                    else None
+                )
+            )
+            self._hand_to_wait_until(task, options)
+
     def process_member_joined_channel(
         self,
         event: MemberJoinedChannelEvent,
@@ -1556,6 +1738,49 @@ class Chat:
                     else None
                 )
             )
+            self._hand_to_wait_until(task, options)
+
+    def process_installed(self, event: InstalledEvent, options: WebhookOptions | None = None) -> None:
+        """Dispatch a bot-installed event (upstream ``processInstalled``)."""
+        self._run_installation_handlers("Installed", self._installed_handlers, event, options)
+
+    def process_uninstalled(self, event: UninstalledEvent, options: WebhookOptions | None = None) -> None:
+        """Dispatch a bot-uninstalled event (upstream ``processUninstalled``)."""
+        self._run_installation_handlers("Uninstalled", self._uninstalled_handlers, event, options)
+
+    def _run_installation_handlers(
+        self,
+        kind: Literal["Installed", "Uninstalled"],
+        handlers: list[Any],
+        event: InstallationEvent,
+        options: WebhookOptions | None,
+    ) -> None:
+        """Run installation handlers in order under the destination conversation.
+
+        Upstream ``runInstallationHandlers``: no task without handlers; a
+        handler error is logged (and, as upstream, stops the handlers after
+        it), so the task handed to ``wait_until`` always completes normally.
+        A ``None`` ``channel_id`` runs the handlers with no conversation set.
+        """
+        if not handlers:
+            return
+
+        async def _task() -> None:
+            try:
+                with conversation(event.channel_id):
+                    for h in handlers:
+                        await self._invoke_handler(h, event)
+            except Exception as error:
+                self._logger.error(
+                    f"{kind} handler error",
+                    {"error": error, "conversation_id": event.conversation_id, "activity_id": event.id},
+                )
+
+        task = _create_task(_task(), self._active_tasks)
+        if task is not None:
+            # Python-specific: hand over the shielded wrapper, like the other
+            # lifecycle dispatchers, so a host cancelling its wait_until task
+            # cannot cancel the handlers (a JS promise has no cancellation).
             self._hand_to_wait_until(task, options)
 
     # ========================================================================
@@ -2727,27 +2952,7 @@ class Chat:
         self._logger.debug("Subscription check", {"thread_id": thread_id, "is_subscribed": is_subscribed})
 
         thread = self._create_thread(adapter, thread_id, message, is_subscribed)
-
-        # Resolve cross-platform user key (Transcripts API). Cached on the
-        # Message instance so handlers and the Transcripts API see the same
-        # value without re-invoking the resolver.
-        if self._identity is not None and message.user_key is None:
-            try:
-                resolved = self._identity(IdentityContext(adapter=adapter.name, author=message.author, message=message))
-                if inspect.isawaitable(resolved):
-                    resolved = await resolved
-                if resolved:
-                    message.user_key = resolved
-            except Exception as err:
-                self._logger.warn(
-                    "Identity resolver threw; skipping userKey",
-                    {
-                        "error": err,
-                        "adapter": adapter.name,
-                        "thread_id": thread_id,
-                        "author_user_id": message.author.user_id,
-                    },
-                )
+        await self._resolve_message_identity(adapter, thread_id, message)
 
         # DM routing
         is_dm = (
@@ -2797,6 +3002,108 @@ class Chat:
 
         if not matched:
             self._logger.debug("No handlers matched message", {"thread_id": thread_id})
+
+    async def _resolve_message_identity(self, adapter: Adapter, thread_id: str, message: Message) -> None:
+        """Resolve the cross-platform user key (Transcripts API) onto *message*.
+
+        Cached on the Message instance so handlers and the Transcripts API see
+        the same value without re-invoking the resolver. Upstream
+        ``resolveMessageIdentity``; the resolver may be sync or async.
+        """
+        if self._identity is None or message.user_key is not None:
+            return
+        try:
+            resolved = self._identity(IdentityContext(adapter=adapter.name, author=message.author, message=message))
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            if resolved:
+                message.user_key = resolved
+        except Exception as err:
+            self._logger.warn(
+                "Identity resolver threw; skipping userKey",
+                {
+                    "error": err,
+                    "adapter": adapter.name,
+                    "thread_id": thread_id,
+                    "author_user_id": message.author.user_id,
+                },
+            )
+
+    # ========================================================================
+    # Message lifecycle (update / delete)
+    # ========================================================================
+
+    async def _handle_message_updated(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message,
+        previous_message: Message | None = None,
+    ) -> None:
+        """Dispatch a message update to ``on_message_updated`` handlers only.
+
+        Upstream ``handleMessageUpdated``: no dedupe, no lock, no routing.
+        """
+        # Upstream parity (chat@4.41.1 chat.ts:2503): only the current message
+        # is bound to the adapter; ``previous_message`` is passed through as the
+        # adapter built it (its ``subject`` resolves to None unless the adapter
+        # bound it, as upstream message.ts:191-198).
+        set_message_adapter(message, adapter)
+        self._logger.debug(
+            "Incoming message update",
+            {
+                "adapter": adapter.name,
+                "thread_id": thread_id,
+                "message_id": message.id,
+                "author": message.author.user_name,
+                "author_user_id": message.author.user_id,
+                "is_bot": message.author.is_bot,
+                "is_me": message.author.is_me,
+            },
+        )
+
+        # Skip the bot's own edits, matching process_message. Post-and-edit
+        # streaming edits the bot's reply repeatedly and Slack emits a
+        # message_changed for each one, so without this a single streamed
+        # reply would fire this handler once per delta.
+        if message.author.is_me:
+            self._logger.debug(
+                "Skipping message update from self (isMe=true)",
+                {"adapter": adapter.name, "thread_id": thread_id, "author": message.author.user_name},
+            )
+            return
+
+        is_subscribed = await self._state_adapter.is_subscribed(thread_id)
+        thread = self._create_thread(adapter, thread_id, message, is_subscribed)
+        await self._resolve_message_identity(adapter, thread_id, message)
+
+        with conversation(thread_id):
+            for h in self._message_updated_handlers:
+                await self._invoke_handler(h, thread, message, previous_message)
+
+    async def _handle_message_deleted(self, event: MessageDeletedEvent) -> None:
+        """Dispatch a normalized message delete (upstream ``handleMessageDeleted``).
+
+        Deletes often carry no message body, so no Thread is constructed.
+        """
+        if event.previous_message is not None:
+            set_message_adapter(event.previous_message, event.adapter)
+
+        self._logger.debug(
+            "Incoming message delete",
+            {
+                "adapter": event.adapter.name,
+                "thread_id": event.thread_id,
+                "message_id": event.message_id,
+                "channel_id": event.channel_id,
+            },
+        )
+
+        normalized = event if event.platform is not None else dataclasses.replace(event, platform=event.adapter.name)
+
+        with conversation(event.thread_id):
+            for h in self._message_deleted_handlers:
+                await self._invoke_handler(h, normalized)
 
     # ========================================================================
     # Thread creation
@@ -3163,6 +3470,34 @@ def _message_from_json(data: dict[str, Any]) -> Message:
             if isinstance(reply_to_raw, dict)
             else None
         ),
+    )
+
+
+def _merge_user_history_config(
+    transcripts: TranscriptsConfig | None,
+    user: UserHistoryConfig | None,
+) -> TranscriptsConfig | None:
+    """Merge ``history.user`` over the legacy ``transcripts`` block.
+
+    Upstream spreads ``{...transcripts, ...history.user}``. Dataclass fields
+    always exist, so the merge is field by field: a ``history.user`` field
+    wins unless it is ``None`` (unset). Returns ``None`` when neither block
+    is configured.
+    """
+    if transcripts is None and user is None:
+        return None
+
+    def pick(name: str) -> Any:
+        value = getattr(user, name) if user is not None else None
+        if value is not None:
+            return value
+        return getattr(transcripts, name) if transcripts is not None else None
+
+    store_formatted = pick("store_formatted")
+    return TranscriptsConfig(
+        max_per_user=pick("max_per_user"),
+        retention=pick("retention"),
+        store_formatted=store_formatted if store_formatted is not None else False,
     )
 
 

@@ -99,6 +99,11 @@ def _make_mock_chat() -> MagicMock:
     mock.process_assistant_context_changed = MagicMock()
     mock.process_app_home_opened = MagicMock()
     mock.process_member_joined_channel = MagicMock()
+    mock.process_message_updated = MagicMock()
+    mock.process_message_deleted = MagicMock()
+    mock.process_installed = MagicMock()
+    mock.process_uninstalled = MagicMock()
+    mock.process_app_context_changed = MagicMock()
     # get_state needed by some adapters. All StateAdapter methods are
     # async — configure them explicitly so adapter code paths that cache
     # lookups (e.g. Slack `_lookup_user`) don't await MagicMock results.

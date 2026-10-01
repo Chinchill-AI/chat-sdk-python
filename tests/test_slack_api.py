@@ -1460,6 +1460,46 @@ class TestRemoveReaction:
 # =============================================================================
 
 
+class TestSetSuggestedPrompts:
+    # TS: "omits thread_ts when not provided" (falsy covers None and "")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_ts", [None, ""])
+    async def test_omits_thread_ts_when_not_provided(self, thread_ts):
+        adapter, client, _ = await _init_adapter()
+
+        await adapter.set_suggested_prompts("C1", thread_ts, [{"title": "t", "message": "m"}])
+
+        # Sent through ``api_call``, never the generated helper, which
+        # requires ``thread_ts`` before slack-sdk 3.43.0.
+        assert client.get_calls("assistant_threads_setSuggestedPrompts") == []
+        assert client.get_calls("api_call") == [
+            {
+                "method": "api_call",
+                "kwargs": {
+                    "api_method": "assistant.threads.setSuggestedPrompts",
+                    "json": {"channel_id": "C1", "prompts": [{"title": "t", "message": "m"}]},
+                },
+            }
+        ]
+
+    # TS: "includes thread_ts when provided"
+    @pytest.mark.asyncio
+    async def test_includes_thread_ts_when_provided(self):
+        adapter, client, _ = await _init_adapter()
+
+        await adapter.set_suggested_prompts("C1", "111.222", [{"title": "t", "message": "m"}], title="Try")
+
+        calls = client.get_calls("api_call")
+        assert len(calls) == 1
+        assert calls[0]["kwargs"]["api_method"] == "assistant.threads.setSuggestedPrompts"
+        assert calls[0]["kwargs"]["json"] == {
+            "channel_id": "C1",
+            "prompts": [{"title": "t", "message": "m"}],
+            "thread_ts": "111.222",
+            "title": "Try",
+        }
+
+
 class TestStartTyping:
     @pytest.mark.asyncio
     async def test_sets_typing_status(self):
