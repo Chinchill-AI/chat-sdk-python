@@ -70,13 +70,27 @@ class TestToMarkdown:
 
     def test_deeply_nested_quotes_do_not_exhaust_the_stack(self):
         """Python-specific guard: ``&gt;`` now unescapes, so 1,100 quote
-        markers reach the recursive blockquote parser. Past 768 levels the
+        markers reach the recursive blockquote parser. Past 100 levels the
         rest stays literal text instead of raising ``RecursionError``."""
         ast = self.converter.to_ast("&gt;" * 1_100 + " hi")
-        assert ast_to_plain_text(ast) == ">" * (1_100 - 769) + " hi"
+        assert ast_to_plain_text(ast) == ">" * (1_100 - 101) + " hi"
         # A heading inside the quotes must not reset the nesting budget.
-        ast = self.converter.to_ast("&gt;" * 500 + " # h\n" + "&gt;" * 1_100 + " hi")
-        assert ast_to_plain_text(ast) == "h\n" + ">" * (1_100 - 769) + " hi"
+        ast = self.converter.to_ast("&gt;" * 50 + " # h\n" + "&gt;" * 1_100 + " hi")
+        assert ast_to_plain_text(ast) == "h\n" + ">" * (1_100 - 101) + " hi"
+        # Lists inside deep quotes keep their own stack room.
+        ast = self.converter.to_ast("&gt;" * 700 + "- " * 160 + "hi")
+        assert ast_to_plain_text(ast) == ">" * (700 - 101) + "- " * 160 + "hi"
+
+    def test_keeps_labelled_links_with_brackets_or_parens_readable(self):
+        """Shared parser fix: link text may hold balanced brackets and the
+        destination balanced parens (CommonMark), so the converter's
+        ``[label](url)`` output reads as upstream's plain text."""
+        ast = self.converter.to_ast("See <https://example.com|build [failed]>")
+        assert ast_to_plain_text(ast) == "See build [failed]"
+        ast = self.converter.to_ast("See <https://en.wikipedia.org/wiki/Foo_(bar)|Foo>")
+        assert ast_to_plain_text(ast) == "See Foo"
+        link = ast["children"][0]["children"][1]
+        assert (link["type"], link["url"]) == ("link", "https://en.wikipedia.org/wiki/Foo_(bar)")
 
     def test_keeps_trailing_text_after_a_code_block_as_a_paragraph(self):
         ast = self.converter.to_ast("```x``` &gt; note")

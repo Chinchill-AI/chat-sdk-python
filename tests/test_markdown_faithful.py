@@ -649,9 +649,12 @@ class TestToPlainText:
         assert ast_to_plain_text(table) == "\x1c\na"
 
     def test_deeply_nested_blockquote_does_not_overflow_the_stack(self):
-        # One frame per nesting level: a 600-deep blockquote (a ~600-byte
-        # inbound comment) parses fine, so extraction must not RecursionError.
-        assert ast_to_plain_text(parse_markdown(">" * 600 + " x")) == "x"
+        # Extraction walks iteratively, so a 600-deep blockquote AST must not
+        # RecursionError. (parse_markdown itself caps quote nesting at 100.)
+        node: Content = {"type": "paragraph", "children": [{"type": "text", "value": "x"}]}
+        for _ in range(600):
+            node = {"type": "blockquote", "children": [node]}
+        assert ast_to_plain_text({"type": "root", "children": [node]}) == "x"
 
     def test_deeply_nested_list_does_not_overflow_the_stack(self):
         text = "\n".join("  " * depth + "- a" for depth in range(300))

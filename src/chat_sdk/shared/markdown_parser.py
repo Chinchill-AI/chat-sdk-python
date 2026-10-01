@@ -316,7 +316,16 @@ _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
     ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'(?<!﷐)\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    # CommonMark allows balanced brackets in link text and balanced parens in
+    # the destination (one level here): ``[build [failed]](u)``,
+    # ``[Foo](https://en.wikipedia.org/wiki/Foo_(bar))``.
+    (
+        "link",
+        re.compile(
+            r"(?<!﷐)\[((?:[^\[\]﷐]|﷐.|\[(?:[^\[\]﷐]|﷐.)*\])*)\]"
+            r'\(((?:[^\s()]|\([^\s()]*\))+?)(?:\s+"([^"]*)")?\)'
+        ),
+    ),
     # Inline code: `code`
     ("inlineCode", re.compile(r"(?<!﷐)`([^`]+)`")),
     # Bold: **text**
@@ -693,10 +702,9 @@ def parse_markdown(text: str) -> Root:
 # Divergence from upstream -- see docs/UPSTREAM_SYNC.md. Blockquotes parse
 # recursively; past this depth the rest stays literal text so ``> > > ...``
 # from untrusted input cannot raise ``RecursionError`` (remark has no cap).
-# One frame per level: 768 keeps the 600-level guarantee of
-# ``test_deeply_nested_blockquote_does_not_overflow_the_stack`` with room under
-# Python's default recursion limit (1,000) for the caller's frames.
-_MAX_BLOCKQUOTE_DEPTH = 768
+# One frame per level; 100 (markdown-it's default ``maxNesting``) leaves most
+# of Python's default recursion limit (1,000) for nested lists inside the quote.
+_MAX_BLOCKQUOTE_DEPTH = 100
 
 
 def _parse_blocks(text: str, quote_depth: int) -> Root:
