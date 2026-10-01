@@ -1575,8 +1575,8 @@ Ports `aaeede70` (vercel/chat#899, chat@4.40.0) and the Teams handler half of
 Ports `629e6555` (vercel/chat#760, chat@4.37.0) and `91683e52`
 (vercel/chat#942, chat@4.41.0) in `adapters/telegram/adapter.py`. The core
 half of #942 (`WebhookOptions.deduplicate`, task-returning `process_*`)
-landed in #191. Outbound multi-file `sendMediaGroup` (`8d7ccdb1`, #605) is
-split out to #278.
+landed in #191. Outbound multi-file `sendMediaGroup` (`8d7ccdb1`, #605) was
+split out to #278 (see "Telegram outbound media groups" below).
 
 - `process_update` returns the list of dispatched handler tasks (message,
   album, slash command, action, reactions). The webhook path ignores it.
@@ -1643,6 +1643,34 @@ split out to #278.
   acknowledgement never reached Telegram (a crash before the next
   `getUpdates`) is delivered again, as upstream.
 
+### Telegram outbound media groups (chat@4.34, #278)
+
+Parity with `8d7ccdb1` (vercel/chat#605, chat@4.34.0) in
+`adapters/telegram/adapter.py`, plus the media-group half of `d5ebec12`
+(#833, `reply_parameters`).
+
+- `post_message` sends one file / attachment with `send_document` /
+  `send_attachment` as before, and 2+ with `_send_document_media_group` /
+  `_send_attachment_media_group` (one `sendMediaGroup`). Every returned
+  message is parsed and cached; the last one is returned.
+- Checks, in upstream order and before any `fetch_data` download: 2–10 items
+  (`TELEGRAM_MEDIA_GROUP_MIN` / `_MAX`), attachment categories (`file` →
+  document, `audio` → audio, `image`/`video` → visual; more than one
+  category raises), then no `reply_markup`.
+- Multipart body (`aiohttp.FormData`, rebuilt per attempt for the
+  MarkdownV2 → plain retry): `chat_id`, `message_thread_id`,
+  `reply_parameters` (JSON string), `media` (a JSON string of `InputMedia`
+  items, types from `ATTACHMENT_MEDIA_GROUP_TYPES`) and a `media{i}` file
+  part per binary payload, referenced as `attach://media{i}`. A URL-only
+  attachment puts its URL in `media` and has no part. Caption and
+  `parse_mode` go on item 0 only. Video `width` / `height` are included when
+  JS `Number.isInteger` would accept them (`_integral_update_id`: an
+  integral float counts, `bool` does not).
+- Tests: the four upstream media-group tests and "threads a media group to
+  its target" in `tests/test_telegram_api.py` (the adapter test file is not
+  fidelity-mapped, #78), plus Python-only tests for the inline-keyboard
+  rejection, the caption retry, and the 10-item audio album.
+
 ### Telegram replies (chat@4.38–4.39, #228)
 
 Parity with the Telegram halves of `0f24cc30` (vercel/chat#802, chat@4.38.0),
@@ -1671,8 +1699,7 @@ Parity with the Telegram halves of `0f24cc30` (vercel/chat#802, chat@4.38.0),
   `send_attachment` URL/upload paths: a dict in JSON bodies (omitted when
   there is no target), a JSON string in multipart bodies. A rich-endpoint
   `ValidationError` mentioning `reply_parameters` falls back to a regular
-  send. Outbound media groups (#278) are not ported yet, so they get
-  `reply_parameters` when #278 lands.
+  send. Outbound media groups (#278) carry it in their multipart body too.
 - **Message-id parsing.** Bare ids must fully match `[0-9]+` and composite ids
   `([^:]+):([0-9]+)` (`re.fullmatch`), the ASCII-digit, end-anchored meaning of
   upstream's `/^\d+$/` and `/^([^:]+):(\d+)$/`. Python's `\d` and `$` would
