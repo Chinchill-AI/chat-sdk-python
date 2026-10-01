@@ -2410,21 +2410,27 @@ class TestNativeStreamingFallback:
         assert all(call.args[1] == "fallback-ts" for call in edit_spy.call_args_list)
 
     @pytest.mark.asyncio
-    async def test_warns_that_stop_blocks_are_skipped_and_returns_an_empty_reply_marker(self):
-        # Python-specific: a fallback stream cannot attach stream-end blocks
-        # (warned, as upstream). An empty fallback reply returns a RawMessage
-        # with an empty id instead of upstream's null: the stream is already
+    @pytest.mark.parametrize(
+        ("config", "options", "warned"),
+        [
+            ({}, StreamOptions(stop_blocks=[{"type": "divider"}]), True),
+            ({"feedback_buttons": True}, None, True),
+            ({}, None, False),
+        ],
+        ids=["stop-blocks", "feedback-buttons", "no-blocks"],
+    )
+    async def test_warns_about_skipped_stream_blocks_and_returns_an_empty_reply_marker(self, config, options, warned):
+        # A fallback stream cannot attach stream-end blocks (``stop_blocks``
+        # or the #214 feedback buttons), so it warns, as upstream.
+        # Python-specific: an empty fallback reply returns a RawMessage with
+        # an empty id instead of upstream's null: the stream is already
         # consumed, so None would make core post its placeholder for nothing.
-        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        adapter, client, post_spy, edit_spy = _fallback_adapter(**config)
         adapter._logger = MagicMock()
         stop = AsyncMock(side_effect=RuntimeError("no streaming here"))
         client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(return_value=None), stop))
 
-        result = await adapter.stream(
-            _DM_STREAM_THREAD,
-            _text_stream(),
-            StreamOptions(stop_blocks=[{"type": "divider"}]),
-        )
+        result = await adapter.stream(_DM_STREAM_THREAD, _text_stream(), options)
 
         assert result is not None
         assert result.id == ""
@@ -2432,7 +2438,7 @@ class TestNativeStreamingFallback:
         post_spy.assert_not_awaited()
         edit_spy.assert_not_awaited()
         warnings = [call.args[0] for call in adapter._logger.warn.call_args_list]
-        assert any("stop_blocks" in message and "skipped" in message for message in warnings)
+        assert any("stream-end blocks" in message for message in warnings) is warned
 
     @pytest.mark.asyncio
     async def test_top_level_dm_thread_post_uses_placeholder_then_edits(self):

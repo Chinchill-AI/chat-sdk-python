@@ -27,6 +27,11 @@ from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs
 
+from chat_sdk.adapters.slack.agent_context import (
+    _js_truthy,
+    get_app_context,
+    normalize_app_context_entities,
+)
 from chat_sdk.adapters.slack.api import (
     _is_trusted_slack_response_url,
     is_slack_auth_url,
@@ -59,8 +64,11 @@ from chat_sdk.adapters.slack.types import (
     SlackAdapterMode,
     SlackBotToken,
     SlackBotTokenResolver,
+    SlackFeedbackButtonsOptions,
     SlackInstallation,
     SlackInstallationProvider,
+    SlackSuggestedPrompts,
+    SlackSuggestedPromptsContext,
     SlackThreadId,
     SlackWebhookVerifier,
 )
@@ -96,6 +104,7 @@ from chat_sdk.shared.mentions import mask_code_spans, replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
+    AppContextChangedEvent,
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
@@ -149,6 +158,54 @@ def _pin_task(task: asyncio.Task[Any]) -> None:
     """Pin a fire-and-forget task so the GC doesn't collect it."""
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+__all__ = [
+    "SlackAdapter",
+    "build_feedback_buttons_block",
+    "create_slack_adapter",
+    "get_app_context",
+    "normalize_app_context_entities",
+]
+
+
+def build_feedback_buttons_block(options: SlackFeedbackButtonsOptions | None = None) -> dict[str, Any]:
+    """Build a ``context_actions`` block with Slack's native feedback buttons.
+
+    Thumbs up/down on agent replies (vercel/chat ``0f743c9b`` #698). The
+    adapter appends this block to natively streamed replies when the
+    ``feedback_buttons`` config is set; use this helper to attach the same
+    block to non-streamed messages via raw blocks. Clicks dispatch to
+    ``chat.on_action`` with the configured ``action_id`` and value.
+    """
+    opts = options if options is not None else SlackFeedbackButtonsOptions()
+    return {
+        "type": "context_actions",
+        "elements": [
+            {
+                "type": "feedback_buttons",
+                "action_id": opts.action_id if opts.action_id is not None else "message_feedback",
+                "positive_button": {
+                    "text": {
+                        "type": "plain_text",
+                        "text": opts.positive_label if opts.positive_label is not None else "Good response",
+                    },
+                    "value": opts.positive_value if opts.positive_value is not None else "positive",
+                },
+                "negative_button": {
+                    "text": {
+                        "type": "plain_text",
+                        "text": opts.negative_label if opts.negative_label is not None else "Bad response",
+                    },
+                    "value": opts.negative_value if opts.negative_value is not None else "negative",
+                },
+            }
+        ],
+    }
+
+
+# Slack displays at most this many suggested prompts per thread.
+_MAX_SUGGESTED_PROMPTS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -670,18 +727,26 @@ class SlackAdapter:
                 "or provide a webhook_verifier.",
             )
 
-        # Auth fields: botToken presence selects single-workspace mode.
-        # Explicit ``is not None`` to mirror the truthiness-trap rule above:
-        # an explicit empty string for any of these should still count as
-        # "config provided" and disable the env-fallback path. ``app_token``
-        # also participates (so socket-mode-only configs disable env fallbacks
-        # for the other secrets the same way bot-token-only configs do).
+        # Auth fields: botToken presence selects single-workspace mode. Fall
+        # back to SLACK_BOT_TOKEN / SLACK_CLIENT_ID / SLACK_CLIENT_SECRET only
+        # when the caller passed no auth or verification field — upstream
+        # ``createSlackAdapter``'s ``noAuthConfig`` set (vercel/chat 1721fa01),
+        # so non-auth options (``agent_view``, ``mode``, ``app_token``,
+        # ``logger``, ...) keep env auth detection, while an explicit auth
+        # setup (including a signing_secret-only multi-workspace config) is
+        # never mixed with ambient env auth. Python has one env-fallback site
+        # (``create_slack_adapter`` is a thin wrapper), so this is also the
+        # constructor rule. Explicit ``is not None`` (not upstream's
+        # truthiness): an explicit empty string still counts as "config
+        # provided" (hazard #1).
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md
         zero_config = (
             config.signing_secret is None
             and config.bot_token is None
             and config.client_id is None
             and config.client_secret is None
-            and config.app_token is None
+            and config.installation_provider is None
+            and config.webhook_verifier is None
         )
 
         bot_token_config: SlackBotToken | None = config.bot_token
@@ -797,6 +862,17 @@ class SlackAdapter:
         # a read.
         self._socket_connect_timeout_s: float = config.connect_timeout_s
         self._logger: Logger = config.logger or ConsoleLogger("info")
+        # Agent messaging experience + declarative agent config (vercel/chat
+        # 1721fa01 #684, 0f743c9b #698). All default off.
+        self._agent_view: bool = config.agent_view
+        self._suggested_prompts: SlackSuggestedPrompts | None = config.suggested_prompts
+        self._loading_messages: list[str] | None = config.loading_messages
+        # Normalized feedback_buttons config (``True`` becomes the defaults).
+        self._feedback_buttons: SlackFeedbackButtonsOptions | None = None
+        if config.feedback_buttons:
+            self._feedback_buttons = (
+                SlackFeedbackButtonsOptions() if config.feedback_buttons is True else config.feedback_buttons
+            )
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
         self._bot_id: str | None = None  # Bot app ID (B_xxx)
@@ -2072,8 +2148,19 @@ class SlackAdapter:
             self._handle_assistant_thread_started(event, options)
         elif event_type == "assistant_thread_context_changed":
             self._handle_assistant_context_changed(event, options)
-        elif event_type == "app_home_opened" and event.get("tab") == "home":
-            self._handle_app_home_opened(event, options)
+        elif event_type == "app_context_changed":
+            self._handle_app_context_changed(event, options)
+        elif event_type == "app_home_opened":
+            # Under agent_view, app_home_opened is the DM-open signal and fires
+            # for every tab; otherwise only the Home tab is dispatched.
+            if self._agent_view or event.get("tab") == "home":
+                # ``authorizations[0].team_id || team_id`` (vercel/chat#889).
+                authorizations = payload.get("authorizations")
+                first_auth = authorizations[0] if isinstance(authorizations, list) and authorizations else None
+                team_id = (first_auth.get("team_id") if isinstance(first_auth, dict) else None) or payload.get(
+                    "team_id"
+                )
+                self._handle_app_home_opened(event, options, team_id or None)
         elif event_type == "member_joined_channel":
             self._handle_member_joined_channel(event, options)
         elif event_type == "user_change":
@@ -3031,16 +3118,110 @@ class SlackAdapter:
             )
             return
 
-        # See _thread_id_for_message_event for the DM/channel rule.
+        # See _thread_id_for_message_event for the DM/channel rule. Under
+        # agent_view a subscribed conversation-scoped open_dm ID takes over;
+        # see the bridge below.
+        is_dm = event.get("channel_type") == "im"
         thread_id = self._thread_id_for_message_event(event)
 
         # ``is_mention`` comes from the message content (``_detect_self_mention``):
         # Slack fires ``app_mention`` even for a bot id inside code, so the
         # event type alone is not trusted (upstream vercel/chat#947).
-        async def factory() -> Message:
-            return await self._parse_slack_message(event, thread_id)
+        def make_factory(target_thread_id: str) -> Callable[[], Awaitable[Message]]:
+            async def factory() -> Message:
+                return await self._parse_slack_message(event, target_thread_id)
 
-        self._chat.process_message(self, thread_id, factory, options)
+            return factory
+
+        # Under agent_view each top-level DM message is its own thread root,
+        # which would silently bypass subscriptions created on the
+        # conversation-scoped thread ID that open_dm() returns (slack:{D}:).
+        # Bridge: when that ID is subscribed, route the message to it so
+        # on_subscribed_message and per-thread state keep working.
+        if self._agent_view and is_dm and not event.get("thread_ts"):
+            self._bridge_agent_view_dm(event, thread_id, make_factory, options)
+            return
+
+        self._chat.process_message(self, thread_id, make_factory(thread_id), options)
+
+    def _bridge_agent_view_dm(
+        self,
+        event: dict[str, Any],
+        thread_id: str,
+        make_factory: Callable[[str], Callable[[], Awaitable[Message]]],
+        options: WebhookOptions | None,
+    ) -> None:
+        """Route a top-level agent_view DM to a subscribed ``slack:{D}:`` thread.
+
+        Port of upstream's bridge task in ``handleMessageEvent``
+        (vercel/chat 1721fa01, c21ccbc0). The task is created here,
+        synchronously, so it copies the current context (the multi-workspace
+        token ContextVar set by ``handle_webhook``); a shielded view of it is
+        handed to ``wait_until``.
+        """
+        chat = self._chat
+        if chat is None:
+            return
+        conversation_thread_id = self.encode_thread_id(SlackThreadId(channel=event["channel"], thread_ts=""))
+
+        async def _bridge() -> None:
+            routed_thread_id = thread_id
+            try:
+                if await chat.get_state().is_subscribed(conversation_thread_id):
+                    routed_thread_id = conversation_thread_id
+            except Exception as error:
+                self._logger.warn(
+                    "agent_view DM subscription check failed; using per-message thread",
+                    {"error": str(error), "threadId": thread_id},
+                )
+            try:
+                task = chat.process_message(self, routed_thread_id, make_factory(routed_thread_id), options)
+                if task is not None:
+                    await task
+            except Exception as error:
+                self._logger.warn(
+                    "Agent view DM processing failed",
+                    {"error": error, "threadId": routed_thread_id},
+                )
+                # vercel/chat c21ccbc0: re-raise only when the host opted in
+                # and has a wait_until to observe the failure.
+                if options is not None and options.propagate_handler_errors and options.wait_until is not None:
+                    raise
+            # Hook for #215 (Agent Sessions): upstream applies the configured
+            # session title here (``applyConfiguredSessionTitle``).
+
+        try:
+            bridge = asyncio.get_running_loop().create_task(_bridge())
+        except RuntimeError:
+            return  # No running event loop
+        # Upstream parity: like upstream's bridge promise (index.ts:3488-3527)
+        # and this adapter's other fire-and-forget tasks, the bridge is not
+        # tracked by ``disconnect()`` (upstream index.ts:3395-3401 only stops
+        # Socket Mode). If shutdown races it, ``process_message`` fails against
+        # the closed state and the error is logged above.
+        _pin_task(bridge)
+        bridge.add_done_callback(self._log_agent_view_bridge_result)
+        if options is not None and options.wait_until is not None:
+            # Python-specific: upstream's promise cannot be cancelled, an
+            # asyncio task can. wait_until gets a shielded view, so a host
+            # cancelling it (after the webhook already returned 200) cannot
+            # drop the DM before process_message runs. A handler error the
+            # bridge re-raises still reaches the host through it.
+            options.wait_until(asyncio.shield(bridge))
+
+    def _log_agent_view_bridge_result(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback for the agent_view DM bridge: retrieve and log its outcome.
+
+        The bridge only fails when it re-raises a handler error for a host
+        that set ``propagate_handler_errors`` (that host awaits it via
+        ``wait_until``); retrieving the exception here keeps asyncio from
+        reporting it as never retrieved.
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._logger.debug("Agent view DM bridge re-raised a handler error", {"error": str(error)})
 
     def _thread_id_for_message_event(self, event: dict[str, Any]) -> str:
         """Thread ID for a message-shaped event (upstream ``threadIdForMessageEvent``).
@@ -3049,16 +3230,19 @@ class SlackAdapter:
         onto a thread: they must agree, or an edit dispatches to a different
         thread than the message it edits.
 
-        DMs: top-level messages use an empty ``thread_ts`` (matching openDM
-        subscriptions); thread replies use ``thread_ts``. Channels: always
-        ``thread_ts`` or ``ts``. Upstream uses ``||`` here, so an empty
-        ``thread_ts`` falls through to ``ts`` (hence ``or``, not ``is not None``).
+        Channels: ``thread_ts`` or ``ts`` (per-thread IDs). DMs without
+        agent_view: ``thread_ts`` or ``""`` (top-level DMs share the
+        conversation-scoped ``slack:{D}:`` thread, matching openDM
+        subscriptions). DMs under agent_view follow Slack's new model, where
+        each user message is a thread root: ``thread_ts`` or ``ts``. Upstream
+        uses ``||`` here, so an empty ``thread_ts`` falls through to ``ts``
+        (hence ``or``, not ``is not None``).
         """
         is_dm = event.get("channel_type") == "im"
-        # agent_view hook (#214): upstream applies the DM rule only when
-        # ``!this.agentView``; under agent_view a DM uses ``thread_ts || ts``
-        # like a channel. Add that condition here when agent_view lands.
-        thread_ts = (event.get("thread_ts") or "") if is_dm else (event.get("thread_ts") or event.get("ts") or "")
+        if is_dm and not self._agent_view:
+            thread_ts = event.get("thread_ts") or ""
+        else:
+            thread_ts = event.get("thread_ts") or event.get("ts") or ""
         return self.encode_thread_id(SlackThreadId(channel=event.get("channel") or "", thread_ts=thread_ts))
 
     # ==================================================================
@@ -3179,6 +3363,21 @@ class SlackAdapter:
 
         thread_id = self.encode_thread_id(SlackThreadId(channel=channel_id, thread_ts=thread_ts))
 
+        # Apply configured suggested prompts for the new assistant thread
+        # (vercel/chat 0f743c9b). The task is created inside the request scope
+        # so the multi-workspace token context propagates; it catches
+        # internally, so it is safe without a wait_until.
+        self._schedule_configured_suggested_prompts(
+            SlackSuggestedPromptsContext(
+                channel_id=channel_id,
+                user_id=user_id,
+                enterprise_id=context.get("enterprise_id"),
+                team_id=context.get("team_id"),
+                thread_ts=thread_ts,
+            ),
+            options,
+        )
+
         self._chat.process_assistant_thread_started(
             AssistantThreadStartedEvent(
                 adapter=self,
@@ -3236,16 +3435,67 @@ class SlackAdapter:
     # App home / member joined
     # ==================================================================
 
-    def _handle_app_home_opened(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+    def _handle_app_home_opened(
+        self,
+        event: dict[str, Any],
+        options: WebhookOptions | None = None,
+        team_id: str | None = None,
+    ) -> None:
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring app_home_opened")
             return
+
+        # Upstream ``event.context ? {entities} : {}``: entities only when the
+        # event folds in a context (JS truthiness, so ``{}`` counts).
+        context = event.get("context")
+        entities = normalize_app_context_entities(context) if _js_truthy(context) else None
+
+        # Under agent_view, a Messages-tab open is the thread-open signal:
+        # apply configured suggested prompts without thread_ts (they pin at
+        # the top of the agent conversation). Legacy assistant_view prompts
+        # flow through assistant_thread_started instead.
+        if self._agent_view and event.get("tab") == "messages":
+            self._schedule_configured_suggested_prompts(
+                SlackSuggestedPromptsContext(
+                    channel_id=event.get("channel", ""),
+                    user_id=event.get("user", ""),
+                    team_id=team_id,
+                    # Normalized again, as upstream does (index.ts:4049-4062):
+                    # the resolver and the app_home_opened handlers must not
+                    # share (and so mutate) one entities list.
+                    entities=normalize_app_context_entities(context) if _js_truthy(context) else None,
+                ),
+                options,
+            )
 
         self._chat.process_app_home_opened(
             AppHomeOpenedEvent(
                 adapter=self,
                 user_id=event.get("user", ""),
                 channel_id=event.get("channel", ""),
+                tab=event.get("tab"),
+                entities=entities,
+            ),
+            options,
+        )
+
+    def _handle_app_context_changed(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Handle ``app_context_changed`` (Slack Agent messaging experience).
+
+        Reports the user's current active view via normalized entities; a
+        missing ``context`` yields ``[]``.
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring app_context_changed")
+            return
+
+        self._chat.process_app_context_changed(
+            AppContextChangedEvent(
+                adapter=self,
+                channel_id=event.get("channel", ""),
+                user_id=event.get("user", ""),
+                entities=normalize_app_context_entities(event.get("context")),
+                raw=event,
             ),
             options,
         )
@@ -3322,6 +3572,66 @@ class SlackAdapter:
         # older versions our ``slack-sdk>=3.27.0`` floor still allows).
         await client.api_call(api_method="assistant.threads.setSuggestedPrompts", json=payload)
 
+    def _schedule_configured_suggested_prompts(
+        self, context: SlackSuggestedPromptsContext, options: WebhookOptions | None
+    ) -> None:
+        """Start ``_apply_configured_suggested_prompts`` and hand it to ``wait_until``.
+
+        Called synchronously from the event handlers, so the task copies the
+        request context (multi-workspace token). As upstream, the task is
+        created (and handed to ``wait_until``) even when ``suggested_prompts``
+        is unset; it then returns immediately.
+        """
+        try:
+            task = asyncio.get_running_loop().create_task(self._apply_configured_suggested_prompts(context))
+        except RuntimeError:
+            return  # No running event loop
+        # Upstream parity: not tracked by ``disconnect()`` (see the bridge).
+        _pin_task(task)
+        if options is not None and options.wait_until is not None:
+            # Shielded, as for the agent_view DM bridge: a host cancelling its
+            # wait_until task must not cancel the (uncancellable upstream) work.
+            options.wait_until(asyncio.shield(task))
+
+    async def _apply_configured_suggested_prompts(self, context: SlackSuggestedPromptsContext) -> None:
+        """Resolve and apply the configured ``suggested_prompts`` for a newly opened thread.
+
+        Errors are logged, never raised: this runs on the webhook path,
+        where a failure must not turn into a 500.
+        """
+        configured = self._suggested_prompts
+        if configured is None:
+            return
+        try:
+            if callable(configured):
+                resolved = configured(context)
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+            else:
+                resolved = configured
+            # As upstream (``!resolved || resolved.prompts.length === 0``):
+            # ``None`` or an empty prompt list skips the thread.
+            if resolved is None or not resolved.prompts:
+                return
+            prompts = list(resolved.prompts)
+            if len(prompts) > _MAX_SUGGESTED_PROMPTS:
+                self._logger.warn(
+                    f"Slack shows at most {_MAX_SUGGESTED_PROMPTS} suggested prompts; dropping the rest",
+                    {"configured": len(prompts)},
+                )
+                prompts = prompts[:_MAX_SUGGESTED_PROMPTS]
+            await self.set_suggested_prompts(
+                context.channel_id,
+                context.thread_ts,
+                cast("list[dict[str, str]]", prompts),
+                resolved.title,
+            )
+        except Exception as error:
+            self._logger.warn(
+                "Failed to apply configured suggested prompts",
+                {"channelId": context.channel_id, "error": error},
+            )
+
     async def set_assistant_status(
         self,
         channel_id: str,
@@ -3329,15 +3639,20 @@ class SlackAdapter:
         status: str,
         loading_messages: list[str] | None = None,
     ) -> None:
-        """Set status/thinking indicator for an assistant thread."""
+        """Set status/thinking indicator for an assistant thread.
+
+        When ``loading_messages`` is omitted (``None``), falls back to the
+        adapter-level ``loading_messages`` config (vercel/chat 0f743c9b).
+        """
         client = self._get_client()
         kwargs: dict[str, Any] = {
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "status": status,
         }
-        if loading_messages:
-            kwargs["loading_messages"] = loading_messages
+        effective_loading_messages = loading_messages if loading_messages is not None else self._loading_messages
+        if effective_loading_messages:
+            kwargs["loading_messages"] = effective_loading_messages
         await client.assistant_threads_setStatus(**kwargs)
 
     async def set_assistant_title(self, channel_id: str, thread_ts: str, title: str) -> None:
@@ -4652,10 +4967,18 @@ class SlackAdapter:
             self._logger.debug("Slack: startTyping skipped - no thread context")
             return
 
-        status_text = status or "Typing..."
+        # Upstream (vercel/chat 0f743c9b): ``status ?? loadingMessages?.[0] ??
+        # "Typing..."`` and ``status ? [status] : (loadingMessages ??
+        # ["Typing..."])``. An explicit ``""`` is sent as-is (it clears the
+        # status) while the loading messages fall back to the defaults.
+        configured = self._loading_messages
+        default_status = configured[0] if configured else "Typing..."
+        status_text = status if status is not None else default_status
+        default_messages = configured if configured is not None else ["Typing..."]
+        loading_messages = [status] if status else default_messages
         self._logger.debug(
             "Slack API: assistant.threads.setStatus",
-            {"channel": channel, "threadTs": thread_ts, "status": status_text},
+            {"channel": channel, "threadTs": thread_ts, "status": status},
         )
         try:
             client = self._get_client()
@@ -4663,7 +4986,7 @@ class SlackAdapter:
                 channel_id=channel,
                 thread_ts=thread_ts,
                 status=status_text,
-                loading_messages=[status_text],
+                loading_messages=loading_messages,
             )
         except Exception as exc:
             self._logger.warn(
@@ -4867,9 +5190,9 @@ class SlackAdapter:
             )
 
         def finish_fallback() -> RawMessage:
-            if options is not None and options.stop_blocks:
+            if (options is not None and options.stop_blocks) or self._feedback_buttons is not None:
                 self._logger.warn(
-                    "Slack: stream-end blocks (stop_blocks) skipped - "
+                    "Slack: stream-end blocks (stop_blocks/feedback_buttons) skipped - "
                     "post-and-edit fallback cannot attach stream blocks",
                     {"channel": channel},
                 )
@@ -5008,9 +5331,15 @@ class SlackAdapter:
         if mode == "fallback":
             return finish_fallback()
 
+        # Caller blocks (StreamingPlan end_with) first, then the configured
+        # feedback buttons so they render at the very end of the reply
+        # (vercel/chat 0f743c9b).
+        stop_blocks: list[Any] = list(options.stop_blocks or []) if options is not None else []
+        if self._feedback_buttons is not None:
+            stop_blocks.append(build_feedback_buttons_block(self._feedback_buttons))
         stop_kwargs: dict[str, Any] = {"token": token}
-        if options is not None and options.stop_blocks:
-            stop_kwargs["blocks"] = options.stop_blocks
+        if stop_blocks:
+            stop_kwargs["blocks"] = stop_blocks
         try:
             result = await streamer.stop(**stop_kwargs)
         except Exception as exc:
