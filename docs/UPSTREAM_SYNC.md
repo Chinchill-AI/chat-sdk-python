@@ -792,7 +792,7 @@ chat@4.39.0), the `getUser` / `startTyping` / drain / link-fence parts of
   returns a message carrying the adapter-reported thread id instead of the
   channel id.
 - Out of scope here: the web half of `500b7e6d` (no `WebAdapter`; see the
-  `adapter-web` row), lifecycle and agent-session event wraps (#196, #201),
+  `adapter-web` row), agent-session event wraps (#201; the lifecycle wraps landed in #196),
   `chat.history`-backed read tools (#197), link-/attachment-only message
   retention (#198) and the thread `SentMessage.edit` thread id (#200).
 
@@ -856,6 +856,64 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
 - **Not ported:** the Slack agent-view bridge rethrow in `c21ccbc0` (#214) and
   the Teams `handleDialogOpen` parts of `c21ccbc0` / `91683e52` (see the Teams
   dialog-open row in the non-parity table).
+
+### Mentions and message model (chat@4.34–4.41, #192)
+
+Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
+(#711) and `80def3ab` (#707, chat@4.35.0), `b547f458` (#761, chat@4.36.0),
+`0f24cc30` (#802, chat@4.38.0) and `fcdc1c9e` (#946, chat@4.41.0).
+
+- **Tri-state `is_mention` (`fcdc1c9e`).** `_set_mention_flags` runs text
+  detection only when `is_mention is None` (upstream `??`), for the dispatched
+  message and each `context.skipped`. An adapter's `False` is now definitive.
+  The DM override (`is_mention = True` when no DM handler is registered) is a
+  routing rule and still overrides an adapter's `False`, as upstream.
+  - Discord forwarded messages report `True if is_mentioned else None`
+    (upstream `isMentioned || undefined`), so a literal `@botname` still routes
+    through text detection.
+  - The Teams adapter only ever sets `True` (from a mention entity), as
+    upstream, so the text fallback is unchanged. The SDK-free webhook primitive
+    keeps `TeamsMessagePayload.is_mention: bool` for parity with upstream
+    `isTeamsMention(): boolean`. Nothing outside `adapters/teams/webhook/` turns
+    that payload into a `Message`, so it does not affect routing.
+  - Telegram passes `is_bot_mentioned(...)` (a `bool`), as upstream, so a
+    Telegram `False` is definitive too. Slack's content-based `is_mention` is #209,
+    and Linear's ordinary comments are #232.
+- **Mention regex (`2531a422`, `b547f458`).** Upstream matches
+  `(?<!\w)@name(?![\w-])` with flag `i` and no `u`, where JS `\w` is ASCII-only.
+  Python's `\w` is Unicode, so the guards spell out `[A-Za-z0-9_]` and
+  `[A-Za-z0-9_-]`. So `é@bot` is a mention, as upstream. `re.ASCII` is not
+  used: it would make `IGNORECASE` ASCII-only, while JS `i` folds non-ASCII
+  names. The guards sit in case-sensitive scoped groups (`(?-i:…)`), so Python's
+  Unicode folding cannot widen `[A-Za-z]` to the Kelvin sign or long s. JS
+  non-`u` canonicalization never maps those onto ASCII either. One residual
+  difference is in the name itself, the same one the Telegram row describes:
+  Python's `IGNORECASE` equates `ſ`/`K` with `s`/`k`, so `@ſlack-bot` mentions
+  `slack-bot` in Python only. The Discord `<@!?id>` pattern is unchanged.
+- **`0701679e` (#706)** has no core change. Its regex cache is Telegram's
+  (#225). The abortable `sleep` does not apply: Python's `stop_polling` cancels
+  the polling task, which interrupts `asyncio.sleep` directly.
+- **`Author.email` / `Author.is_system`** are the last `Author` fields
+  (default `None`). `to_json` emits `email` and `isSystem` only when not
+  `None`. A `False` `isSystem` is still emitted, as upstream. `from_json`,
+  `_message_from_json` and the `_rehydrate_message` dict fallback read
+  `isSystem`, then `is_system`. `from_json_compat` reads snake_case first.
+  Population is per adapter: Teams email is #218, Slack `USLACK` is #209.
+- **`Message.reply_to` (`0f24cc30`)** is the last `Message` field, and is also
+  on `MessageData` and `SentMessage`. `to_json` emits `replyTo` only when set.
+  `from_json` / `from_json_compat` / `_message_from_json` recurse and pass an
+  already-revived `Message` through, because `json.loads(object_hook=…)`
+  revives bottom-up. `set_message_adapter` and `Chat._rehydrate_message`
+  (including `rehydrate_attachment`, and the dict fallback's `replyTo` /
+  `reply_to`) recurse too. Both history caches (`ThreadHistoryCache` and
+  `chat._ThreadHistoryCache`) null `raw` along the whole `replyTo` chain.
+  `create_sent_message_from_message` and the sent-message → history `Message`
+  copy carry `reply_to` (upstream `new Message(sent)`). There is no depth cap,
+  as upstream. Telegram population is #228.
+- **`_rehydrate_message` with a `Message` input is now parity.** `0f24cc30`
+  removed upstream's `if (raw instanceof Message) return raw;` early return, so
+  a `Message` falls through to the `rehydrateAttachment` pass, as Python
+  already did. The old non-parity row for this is gone.
 
 ### Slack data tables, charts and modal inputs (chat@4.34–4.41, #212)
 
@@ -1021,6 +1079,167 @@ split out to #278.
 - Delivery is now at-least-once: an update whose handler finished but whose
   acknowledgement never reached Telegram (a crash before the next
   `getUpdates`) is delivered again, as upstream.
+
+### Core lifecycle events: message update/delete, installation, app context (chat@4.34–4.41, #196)
+
+Parity, not a divergence. Ports the core halves of `4ac04551` (vercel/chat#788,
+chat@4.37.0), `2e2426d1` (#914, chat@4.41.0) and `1721fa01` (#684,
+chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
+
+- **Message updates.** `chat.on_message_updated(handler)` is called as
+  `handler(thread, message, previous_message)`; `previous_message` is `None`
+  when the platform did not send it (Python always passes the third argument,
+  where JS can omit it). `process_message_updated(adapter, thread_id, message, *,
+  previous_message=None, options=None)` replaces upstream's single
+  `{adapter, threadId, message, previousMessage?}` object with parameters
+  whose optional tail is keyword-only (in `process_message` the fourth
+  positional slot is `options`, so a positional `options` would otherwise
+  silently become `previous_message` and skip `wait_until`); each message is a `Message` or an async factory
+  (resolved with `await v() if callable(v) else v`). It binds the adapter,
+  skips `author.is_me` (post-and-edit streaming would otherwise fire once per
+  delta), builds the Thread with the real subscription flag, resolves the
+  identity key (`_resolve_message_identity`, factored out of
+  `_dispatch_to_handlers` and shared with it), then runs the handlers in order
+  under `conversation(thread_id)`. No dedupe, no lock, no routing: an update
+  never reaches `on_mention` / `on_subscribed_message` / `on_message`.
+- **Message deletes.** `MessageDeletedEvent(adapter, channel_id, message_id,
+  raw, thread_id, platform=None, deleted_at=None, previous_message=None)`.
+  `process_message_deleted(event, options=None)` binds the adapter to
+  `previous_message` when present, fills `platform` with `adapter.name` via
+  `dataclasses.replace` when it is `None` (upstream `??`; an adapter-supplied
+  platform is passed through and the handler gets the same object), builds no
+  Thread, and runs the handlers under `conversation(thread_id)`.
+- Both return the handler task (it raises on failure, logged as
+  `"Message update processing error"` / `"Message delete processing error"`);
+  `wait_until` always gets the error-swallowing wrapper, as upstream passes
+  `tracked`.
+- **Installation.** `InstallationAction` is a `Literal`; `InstallationEvent`
+  is a dataclass whose `InstalledEvent` / `UninstalledEvent` subclasses narrow
+  `action` (a `pyrefly: ignore[bad-override-mutable-attribute]` marks the
+  narrowing, which TS interfaces allow). `channel_id` is `None` (never `""`)
+  when the platform gave no destination; the handlers then run bare.
+  `process_installed` / `process_uninstalled` create no task when no handler is
+  registered; otherwise one task runs the handlers in order under
+  `conversation(event.channel_id)` and catches a handler error inside the
+  coroutine (logged as `"Installed handler error"` / `"Uninstalled handler
+  error"` with `conversation_id` and `activity_id`), so the task handed to
+  `wait_until` always completes normally. As upstream, a raising handler stops
+  the ones after it. Python-specific: `wait_until` gets the
+  `_hand_to_wait_until` shielded wrapper, as the other lifecycle dispatchers
+  do, so a host cancelling it cannot cancel the handlers (upstream hands over
+  the promise, which cannot be cancelled).
+- **`ChatInstance` Protocol.** Gains `process_message_updated`,
+  `process_message_deleted` and `process_app_context_changed`.
+  `process_installed` / `process_uninstalled` stay **off** the Protocol: they
+  are optional (`processInstalled?`) upstream so custom `ChatInstance`
+  implementations predating them keep working. `Chat` implements both and
+  adapters call them via `getattr(chat, "process_installed", None)` (#217).
+  New Protocol members change `isinstance(x, ChatInstance)` for third-party
+  fakes (the Protocol is `@runtime_checkable`).
+- **App context (agent_view).** Upstream's `AppContextEntity` discriminated
+  union of interfaces is one dataclass per variant — `AppContextChannelEntity`
+  (`channel_id`), `AppContextCanvasEntity` (`canvas_id`),
+  `AppContextListEntity` (`list_id`), `AppContextMessageEntity` (`channel_id`,
+  `message_ts`) and `AppContextUnknownEntity` (`type`, `value`) — each with a
+  `kind` `Literal` defaulting to its tag and the keyword-only
+  `enterprise_id` / `team_id` from `AppContextEntityBase`. `AppContextEntity`
+  is their union. `AppContextChangedEvent(adapter, channel_id, entities, raw,
+  user_id)`; `process_app_context_changed` mirrors `process_app_home_opened`
+  under `conversation(event.channel_id)`. `AppHomeOpenedEvent` gains
+  `entities` and `tab`, both defaulting to `None`.
+- **Slack `set_suggested_prompts(channel_id, thread_ts, prompts, title=None)`**:
+  `thread_ts` is `str | None` and is omitted from the request when falsy. The
+  request goes through `client.api_call(api_method="assistant.threads.setSuggestedPrompts",
+  json=...)`, the same request the generated helper sends, because
+  `AsyncWebClient.assistant_threads_setSuggestedPrompts` requires `thread_ts`
+  before slack-sdk 3.43.0 (and does not exist in the oldest versions the
+  `slack-sdk>=3.27.0` floor allows).
+- **Testing.** `chat_sdk.testing.create_mock_chat_instance(state=None,
+  logger=None, user_name="test-bot", overrides=None)` ports
+  `createMockChatInstance`. Processors are recording `MagicMock`s
+  (`AsyncMock` for `handle_incoming_message`, `process_options_load`,
+  `process_modal_submit`), including `process_installed` /
+  `process_uninstalled`. It returns a `SimpleNamespace`, so an unknown
+  attribute raises instead of auto-creating a mock. Upstream's `abortTurn`
+  and agent-session processors are absent until Python has them (#201).
+  `installation-matcher.test.ts` and `app-context-matcher.test.ts` test
+  upstream's `toHaveDispatched` matcher, which has no Python equivalent;
+  instead one test asserts the mock records both installation processors and
+  another that it records `process_app_context_changed`.
+
+### Unified History API (chat@4.39–4.41, #197)
+
+Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
+`056d8830` (#904, chat@4.41.0). No divergence-table rows.
+
+- **Package.** `chat_sdk.history` holds `HistoryApiImpl`,
+  `ThreadHistoryApiImpl`, `ChannelHistoryApiImpl`, `UserHistoryApiImpl`
+  (the old `transcripts.py` body), `to_prompt_entries` / `PromptEntry` and
+  the internal `require_adapter` / `persists_history` helpers.
+  `chat_sdk.transcripts.TranscriptsApiImpl` is the same class object as
+  `UserHistoryApiImpl`. `HistoryEntry` / `UserHistoryEntry` are the
+  `TranscriptEntry` class and `UserHistoryApi` is `TranscriptsApi`. The
+  state key prefixes `transcripts:user:` and `msg-history:` are unchanged.
+- **Python shapes.** `HistoryApiImpl(adapter_resolver, cache=None, user=None)`
+  takes the built user API rather than upstream's `{config, state}`.
+  `history.thread.collect(thread_id, *, limit=None)` and
+  `history.channel.list_threads_with_messages(channel_id, *, max_threads=None,
+  messages_per_thread=None, cursor=None)` take keyword arguments instead of
+  an options object (`max_threads=None` means 5). Results are the
+  `ThreadWithMessages` / `ListThreadsWithMessagesResult` dataclasses.
+- **Errors.** Upstream throws plain `Error`; Python raises `ChatError` with
+  upstream's text for an unregistered or missing adapter prefix, missing
+  capabilities, `history.thread.append` without a cache, and
+  `history.user` when unconfigured. The two construction-time and
+  `history.user.append` errors stay `ValueError`, as before.
+- **Config merge.** `ChatConfig.history = HistoryConfig(thread, user)`.
+  The thread cache config is `history.thread`, else `thread_history`, else
+  `message_history` (each `is not None`). Upstream spreads
+  `{...transcripts, ...history.user}`; dataclass fields always exist, so
+  Python merges field by field: a `UserHistoryConfig` field (all default
+  to `None`, "unset") wins unless it is `None`, else the legacy
+  `TranscriptsConfig` field applies (`store_formatted` defaults to
+  `False`). The identity resolver is `history.user.identity`, else
+  `identity`, and dispatch uses the resolved one. User history without
+  either raises at construction with upstream's message.
+- **`max_per_user`.** `int | Literal[False] | None` on both configs.
+  `False` is normalized first (`None if v is False else ...`, because
+  `bool` subclasses `int`) and reaches `append_to_list` as
+  `max_length=None` (no cap); `None` means 200. `max_per_user=0` is also
+  uncapped, because every bundled backend treats a falsy `max_length` as
+  "no trim" (as upstream's do). Documented, not changed.
+- **Capability rule.** Upstream tests `if (adapter.fetchChannelMessages)`
+  / `if (!adapter.listThreads)`. In Python an optional method is absent
+  when the attribute is `None` or is the unoverridden `BaseAdapter` stub
+  (which raises `ChatNotImplementedError`), so a persisting adapter
+  without its own `fetch_channel_messages` still reaches the
+  channel-keyed cache fallback. A call that still raises
+  `ChatNotImplementedError` is re-raised as the capability error, chained
+  (`from exc`), with no cache retry.
+- **Cursor and limit checks.** `list` substitutes the cache only when the
+  page is empty, `next_cursor is None`, no cursor was requested (upstream
+  `=== undefined`), a cache exists and the adapter persists history.
+  `collect` ends on upstream's falsy check (`not next_cursor` or an empty
+  page), so `""` also ends it; `limit=0` yields nothing without a fetch.
+  `collect` fetches each page only after the previous one is consumed, so
+  an early `break` leaves no request pending. `list_threads_with_messages`
+  runs `asyncio.gather` per slice of 4, preserving order.
+- **AI tools.** `fetchMessages`, `fetchChannelMessages` and `listThreads`
+  call `chat.history.thread.list` / `chat.history.channel.list_messages` /
+  `chat.history.channel.list_threads` after the scope guard (#195). They
+  now raise for unregistered adapter prefixes (`fetchMessages` no longer
+  goes through `chat.thread()` and its thread-ID shape check, as
+  upstream), return SDK-cached history
+  for persisting adapters (Telegram, WhatsApp, Twilio, Messenger), and use upstream's
+  error text (`history.channel.listMessages: adapter "x" does not support
+  fetching channel messages`, `history.channel.listThreads: adapter "x"
+  does not implement listThreads`). `ChatNotImplementedError` is still
+  turned into `ChatError` (now inside `history.channel`).
+- **Fidelity.** At the pin, `transcripts.test.ts` still holds the whole
+  user-history suite; from chat@4.39.0 it moved to `history/user.test.ts`
+  and `transcripts.test.ts` keeps only the alias test. Both rows map to
+  `tests/test_history_user.py`, so the strict pin check and the target
+  report both pass without duplicate tests.
 
 ## What to Port vs What to Adapt
 
@@ -1484,7 +1703,6 @@ stay explicit instead of being rediscovered in code review.
 | Messenger attachment download guard (vercel/chat 153bd964, chat@4.39.0; #234) | `MessengerAdapter._download_attachment` checks the URL with `_is_trusted_messenger_media_url` **before any I/O** and inside the download closure (so fresh and `rehydrate_attachment`-rebuilt closures are both covered; `attachment.url` and the `fetch_metadata={"url": ...}` shape are unchanged). Follows redirects manually (`allow_redirects=False`, at most 5, `Location` resolved against the current hop and re-validated; as upstream, the hop limit is checked before the `Location` is validated, so a 6th redirect always raises `"Too many attachment redirects"`), 25 MB cap (declared `Content-Length` rejected up front, streamed body aborted past the cap), 30 s deadline over every hop + body read (`asyncio.timeout`, plus a per-request `aiohttp.ClientTimeout(total=30)`), non-2xx → `NetworkError("messenger", "Failed to fetch file: {status} {reason}")`, any other failure → `NetworkError("messenger", "Failed to download Messenger attachment")`. **Three divergences:** (1) **weaker — no DNS / private-IP resolution check.** The host allowlist alone rejects IP literals (including decimal-integer hosts like `2130706433`) and non-Meta names, but a Meta-CDN hostname is not re-checked against private ranges after resolution. Connection-bound DNS checks arrive with the shared guarded downloader (SH1, #204); remove this divergence when Messenger migrates onto it (#239). (2) **stricter URL parsing** — also rejects userinfo (`user@host`), an explicit port other than 443, and any host that is not plain lowercase DNS labels (percent-encoded, non-ASCII — the raw authority must be ASCII, so e.g. U+212A KELVIN SIGN cannot fold to `k` via `str.lower()` — bracketed IPv6, empty label, trailing dot), plus whitespace/control characters and backslashes anywhere in the URL, so `urlsplit` and aiohttp/yarl cannot disagree about which host is contacted. (3) **error-message text for IP literals and unparseable URLs.** Every URL/`Location` the check rejects raises the single `"Refusing to fetch an untrusted attachment URL"`. Upstream instead raises `"Refusing to fetch an internal attachment URL"` for a private/internal IP literal (e.g. `https://127.0.0.1/file`, `https://169.254.169.254/...`) and, when WHATWG `new URL(...)` throws on an unparseable URL or `Location` (e.g. `not a url`, `https://[::1/file`), the generic `"Failed to download Messenger attachment"` wrapper from `fetch.ts`. Both sides raise `NetworkError("messenger", ...)` with no network I/O, so only the message differs (upstream's `fetch.test.ts` asserts only `toThrow(NetworkError)` for these). Disappears when Messenger moves onto the shared downloader (#239). | `packages/adapter-messenger/src/fetch.ts` `download()` → `@chat-adapter/shared` `downloadAttachment(url, {adapter: "messenger", hosts: ["fbsbx.com", "fbcdn.net"]})`: https-only, exact host or subdomain (case-insensitive), redirects revalidated (max 5), 25 MB decoded-body cap, 30 s deadline, private/internal IPs refused both as literals and after DNS resolution through a pinned resolver. | **Consumer-visible:** Messenger `fetch_data()` for `fallback`/link-share (or any other) attachments whose URL is not on a Meta CDN host now raises `NetworkError` instead of downloading; `attachment.url` is still populated for display. Regression coverage: `tests/test_messenger_fetch.py` (ports `fetch.test.ts` `describe("Messenger attachment fetch")` + Python-specific redirect/cap/deadline/parser-differential cases) and `tests/test_messenger_webhook.py` (`test_downloads_attachment_successfully`, `test_rejects_external_fallback_downloads_before_the_network`). |
 | Shared guarded downloader `shared/download.py` (vercel/chat `bb926884` #850, `153bd964` #856, `b6fa24c6` #865, shared slice of `6adca361` #916; #204) | `download_attachment(url, *, adapter, headers, hosts, limit=25 MB, on_response, redirects=5, timeout_ms=30_000, transport)` ports `downloadAttachment`: HTTPS only, the blocked IPv4/IPv6 range tables copied exactly, internal literals refused, manual redirects re-validated per hop, per-hop `headers` (mapping or function of the URL), `on_response` before the body, decoded-body cap, one deadline over every hop and the body read, upstream's error strings. **Resolver pinning:** the default transport is aiohttp (lazy import) with a per-request `TCPConnector(resolver=<pinned resolver>, force_close=True, use_dns_cache=False)`, `auto_decompress=False`, `trust_env=False`, `allow_redirects=False`. The pinned resolver (`create_resolver`) refuses the host when **any** answer is internal and hands aiohttp only the vetted addresses, so the socket connects to exactly what was checked (SNI and certificate checks still use the hostname). A caller-supplied transport skips the resolver; scheme, literal and allowlist checks still run every hop. **Three divergences:** (1) **stricter — credential stripping for a static `headers` mapping.** `authorization`, `cookie` and `proxy-authorization` from a mapping are dropped on any hop whose origin (scheme, host, port) differs from the first URL; the function form stays caller-controlled, as upstream. (2) **`br` only with a bounded Brotli.** `accept-encoding` advertises `br`, and `content-encoding: br` is decoded, only when `brotli` ≥ 1.2 (`Decompressor.can_accept_more_data`) is installed; otherwise a `br` body raises `"Unsupported attachment encoding: br"`. Older Brotli bindings cannot bound one step's output, so the cap could only apply after a large allocation. (3) **stricter — bytes after the end of a `br` stream raise** (`brotli.error`), where Node ignores them. The binding cannot report how much input a step consumed, so trailing bytes in the same chunk as the stream end cannot be skipped; bytes in a later chunk raise too, so the result never depends on how the body was chunked. **Python adaptations (same behavior, different mechanism):** the transport is `(url: str, headers: dict) -> Awaitable[AttachmentResponse]` with no `AbortSignal`; the deadline cancels the call and gives up without waiting, so a transport or body iterator that ignores cancellation cannot stall it (a late response is closed). `urllib.parse` does not canonicalize hosts like WHATWG `URL`, so hosts are percent-decoded, IDNA-mapped with UTS46 non-transitional processing and then parsed with the WHATWG IPv4 rules. The IDNA step uses the `idna` package, which is what WHATWG and yarl follow (`faß.de` → `xn--fa-hia.de`, not IDNA 2003's `fass.de`); without the package a non-ASCII host is refused. All of this runs before the checks, so forms such as `2130706433`, `0x7f.1`, `127.1` and full-width digits are caught. Hosts WHATWG rejects are refused as untrusted: a forbidden code point after percent-decoding (so `2606%3a4700%3a%3a1` is not read as an IPv6 literal), anything but an IPv6 address in brackets (IPvFuture such as `[v1.x]`, zone identifiers), an invalid IPv4 number, and an `xn--` label whose Punycode does not decode to a valid non-ASCII UTS46 label (`xn--zz`, `xn--a-ecp`). The `idna` package applies IDNA 2008 to non-ASCII input, which is stricter than UTS46 for some symbols (e.g. emoji), so such Unicode hosts are refused where Node would accept them (their valid `xn--` form is accepted). An IP literal matches a `hosts` entry only exactly, never as a suffix; upstream's string suffix match would let `1.2.3.4` match an entry `2.3.4`. Before parsing, a URL (and a redirect `Location`, before it is resolved against the current hop) gets WHATWG's clean-up that `urllib.parse` lacks: C0 controls and spaces are stripped from both ends, tab and newline are removed, `\` becomes `/` before the query, and any number of slashes after `https:` introduces the host. A redirect `Location` is then resolved with WHATWG's relative-reference rules, not `urljoin` (which collapses `a//b` and keeps the old query for `?`), so `/\host/x`, `///host/x` and `https:\\host/x` name another host as they do in Node, and that host is then validated. The returned URL is Node's `URL.href` minus the fragment: canonical host, default port 443 dropped, empty userinfo dropped, the userinfo, path and query percent-encoded with WHATWG's userinfo, path and special-query sets (existing escapes stay byte-for-byte), dot segments (including `%2e` forms) resolved, and an empty path serialized as `/`. The default transport sends that URL without requoting (`yarl.URL(url, encoded=True)`), so signed URLs survive, and it refuses the request if yarl's `raw_host` differs from the validated host. A slow async `close()` gets only the time left before the deadline and then finishes in the background, so cleanup cannot stretch the deadline. If the caller cancels the download, cleanup does not wait at all. Once the deadline has passed, no new hop, `on_response` await or body read starts, and a step that completes at or after it counts as timed out. A URL `new URL` would reject raises the "untrusted" `NetworkError` instead of a `TypeError`. A few URLs Node accepts are refused the same way (fail closed): a space or control character inside the authority, `[` or `]` in the userinfo (which `urlsplit` rejects). A bare string passed as `hosts` raises `TypeError` (TypeScript's `readonly string[]` rejects it at compile time; in Python it would iterate characters). `Content-Length` counts only as plain decimal digits. Some Node behavior is reproduced by hand: repeated `Content-Encoding` / `Content-Length` fields are joined with `", "`, so `gzip, gzip` is refused as unsupported; after a gzip member, zero padding is ignored, and any other byte must start a valid member; trailing data after a deflate stream is ignored. Each decompression step produces at most 64 KiB (Brotli rounds up to its next output block, under 128 KiB), so the cap applies before a small chunk can expand far. As upstream, transport, `on_response` and decoder errors propagate unchanged (adapters wrap them). | `@chat-adapter/shared` `download.ts` (chat@4.39.0–4.41.0): static `headers` sent on every hop; `br` always advertised and decoded via Node zlib; `AbortSignal` passed to the transport | (1) A static credential mapping is the easy call to write, and upstream's own docs tell callers to use the function form or `hosts` to keep credentials off redirects. Dropping them on a cross-origin hop removes that footgun without changing the function form. (2) Keeps the decoded-size cap meaningful: a small `br` chunk must not expand without bound before the cap applies. (3) A chunking-dependent result would be worse than either consistent choice, and ignoring the trailing bytes exactly would mean decoding every `br` body twice; well-formed servers never send them. **Consumer-visible:** none here, since no adapter calls it yet. Adapters that adopt it (#213, #218, #225, #239, #229) gain the 25 MB cap and 30 s deadline. Regression coverage: `tests/test_shared_download.py` (ports every `download.test.ts` case, plus `TestHostCanonicalization`, `TestStaticHeaderCredentials`, `TestBrotli`, `TestDeadlineAndCancellation`, `TestDefaultTransport`). |
 | Teams file attachment URL source (`_create_attachment`) | For a `application/vnd.microsoft.teams.file.download.info` attachment, prefers the nested `content.downloadUrl` (a short-lived pre-signed link) over the top-level `contentUrl`. Every other attachment type keeps the upstream `contentUrl`-first path (with `content.downloadUrl` only as a fallback when `contentUrl` is missing/falsy). | Reads `att.contentUrl` only — `createAttachment(att)`'s param type doesn't even include `content` (`adapter-teams/src/index.ts:833`, `const url = att.contentUrl`) | **Hard-UX-failure divergence.** A SharePoint/OneDrive file shared in a personal or group chat arrives as a `file.download.info` attachment that carries BOTH a top-level `contentUrl` (the SharePoint/OneDrive item, e.g. `https://contoso.sharepoint.com/.../file.txt`, which returns **403** to an anonymous GET because it needs a SharePoint auth context) AND a nested `content.downloadUrl` — a pre-authenticated link the [Bot Framework docs](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/bots-filesv4#message-activity-with-file-attachment-example) explicitly say to issue an `HTTP GET` against. Upstream (and our pre-fix adapter) read `contentUrl` only, so the attachment is **undownloadable** (`fetch_data` 403s). We prefer `content.downloadUrl` for this attachment type so the download actually works. The resulting URL still flows through the unchanged `_build_teams_fetch_data` / `rehydrate_attachment` SSRF allowlist (download hosts are SharePoint/OneDrive for Business → already covered by `*.sharepoint.com` / `*.onedrive.com` in the row above — no host added). To be filed as an upstream issue against vercel/chat. Supersedes stale PR #136. Regression coverage: `tests/test_teams_adapter.py::TestFileDownloadInfoAttachment`. |
-| `_rehydrate_message` with `Message` input | Falls through to the `rehydrate_attachment` pass even when the dequeued entry is already a `Message` instance | Early-returns on `raw instanceof Message` before rehydration | The Python port's Redis + Postgres `dequeue()` upgrade raw JSON to `Message.from_json(...)` before returning (upstream's dequeue returns the raw JSON.parse'd dict). Upstream's `instanceof Message` shortcut therefore only fires for in-memory state, but ours would fire for persistent backends too, leaving `fetch_data` stripped forever. The rehydrate pass still skips any attachment that already has `fetch_data`, so in-memory callers pay no cost. |
 | Postgres state schema error type (#240) | `PostgresStateAdapter.connect()` with `auto_create_schema=False` raises `chat_sdk.StateSchemaError` (a `ChatError`); the message matches upstream except that the hint names `auto_create_schema=True`; a probe failure is chained as `__cause__` | Plain `Error` with `{ cause }`; the hint names `autoCreateSchema: true` | Python-surface adaptation: callers can catch a dedicated exception type instead of matching message text. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_rejects_connect_when_a_migration_owned_table_is_missing`. |
 | Postgres state owned pool on a failed `connect()` (#240) | A pool the adapter created from a URL / env var is closed and reset as soon as that `connect()` attempt fails (or is cancelled); the next attempt creates a fresh pool. An injected pool is never closed | `disconnect()` is a no-op before a successful `connect()`; the lazy `pg.Pool` holds at most one idle client that times out | asyncpg opens `min_size` connections eagerly, so without this a startup retry loop leaked 10 connections per failed attempt. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_closes_the_owned_pool_when_connect_fails`. |
 | Postgres state concurrent `connect()` (#240) | Serialized on an `asyncio.Lock`: a caller queued behind a failed attempt retries it (and may succeed) | Concurrent callers share one in-flight promise and all reject with the same error | Predates #240 and kept: a queued caller retrying is harmless, and `connect()` stays idempotent. Pinned by `tests/test_state_postgres.py::TestPostgresStateSchemaInitialization::test_concurrent_connect_retries_after_a_failed_connectivity_check`; see [Postgres state: expired claims and migration-owned schemas](#postgres-state-expired-claims-and-migration-owned-schemas-chat435441-240). |

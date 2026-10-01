@@ -1273,6 +1273,7 @@ class ThreadImpl:
             links=message.links,
             is_mention=message.is_mention,
             raw=message.raw,
+            reply_to=message.reply_to,
             _edit=_edit,
             _delete=_delete,
             _add_reaction=_add_reaction,
@@ -1297,6 +1298,7 @@ def _to_message(sent: SentMessage) -> Message:
         links=sent.links,
         is_mention=sent.is_mention,
         raw=sent.raw,
+        reply_to=sent.reply_to,
     )
 
 

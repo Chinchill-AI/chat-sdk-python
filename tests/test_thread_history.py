@@ -155,20 +155,62 @@ class TestAppendAndGet:
         assert messages[1].text == "Second"
         assert messages[2].text == "Third"
 
-    # TS: "should strip raw field on storage"
+    # TS: "should strip raw fields on storage"
     @pytest.mark.asyncio
-    async def test_should_strip_raw_field_on_storage(self):
+    async def test_should_strip_raw_fields_on_storage(self):
         state = _make_mock_state()
         cache = ThreadHistoryCache(state)
 
-        msg = _make_message("With raw")
-        msg.raw = {"some": "data"}
+        reply_to = _make_message("Original", msg_id="m0")
+        reply_to.raw = {"secret": "reply data"}
+        msg = _make_message("Hello", msg_id="m1")
+        msg.reply_to = reply_to
+        msg.raw = {"secret": "data", "nested": {"deep": True}}
         await cache.append("thread-1", msg)
 
-        # The serialized value should have raw set to None
+        # The serialized value should have raw set to None along the replyTo chain
         call_args = state.append_to_list.call_args[0]
         serialized = call_args[1]
-        assert serialized.get("raw") is None
+        assert "raw" in serialized
+        assert serialized["raw"] is None
+        assert serialized["replyTo"]["raw"] is None
+        # The live message is untouched.
+        assert reply_to.raw == {"secret": "reply data"}
+
+    # Python-specific: ``chat._ThreadHistoryCache`` (the cache ``Chat`` itself
+    # uses) must strip the same way, and the replied-to message must come back
+    # from ``get_messages``.
+    @pytest.mark.asyncio
+    async def test_chat_history_cache_strips_raw_along_reply_chain(self):
+        from chat_sdk.chat import _ThreadHistoryCache
+
+        state = _make_mock_state()
+        cache = _ThreadHistoryCache(state)
+
+        root = _make_message("Root", msg_id="m-root")
+        root.raw = {"secret": "root"}
+        reply_to = _make_message("Original", msg_id="m0")
+        reply_to.raw = {"secret": "reply data"}
+        reply_to.reply_to = root
+        reply_to.author.email = "orig@example.com"
+        reply_to.author.is_system = False
+        msg = _make_message("Hello", msg_id="m1")
+        msg.raw = {"secret": "data"}
+        msg.reply_to = reply_to
+        await cache.append("thread-1", msg)
+
+        serialized = state.append_to_list.call_args[0][1]
+        assert serialized["raw"] is None
+        assert serialized["replyTo"]["raw"] is None
+        assert serialized["replyTo"]["replyTo"]["raw"] is None
+
+        [restored] = await cache.get_messages("thread-1")
+        assert restored.reply_to is not None
+        assert restored.reply_to.id == "m0"
+        assert restored.reply_to.author.email == "orig@example.com"
+        assert restored.reply_to.author.is_system is False
+        assert restored.reply_to.reply_to is not None
+        assert restored.reply_to.reply_to.id == "m-root"
 
 
 # ---------------------------------------------------------------------------

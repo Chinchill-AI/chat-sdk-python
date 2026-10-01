@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 781,
-    "matched_fuzzy": 76,
-    "missing": 207,
-    "extra": 460
+    "matched_exact": 832,
+    "matched_fuzzy": 72,
+    "missing": 160,
+    "extra": 493
   },
   "absent_ts_files": [],
   "files": {
@@ -18,35 +18,26 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 151,
+      "matched_exact": 160,
       "matched_fuzzy": 11,
-      "missing_count": 15,
-      "extra_count": 23,
+      "missing_count": 6,
+      "extra_count": 25,
       "missing": [
         ["Chat", "aborts an active thread signal from another Chat instance"],
-        ["Chat", "should dispatch message updates without normal message routing"],
-        ["Chat", "should dispatch message deletes with normalized event data"],
-        ["isMention property", "should not treat %s as a mention (%s)"],
-        ["isMention property", "should still detect %s as a mention (%s)"],
-        ["isMention property", "should keep a definitive non-mention reported by the adapter"],
-        ["isMention property", "should keep a definitive mention reported by the adapter"],
         ["Reactions", "should allow streaming from a reaction without message context"],
         ["Actions", "should allow streaming from an action without message context"],
         ["openDM", "should allow streaming to a DM thread"],
         ["thread", "should allow streaming to a thread handle"],
-        ["thread", "passes only explicit placeholder config to adapter streaming"],
-        ["getUser", "should return null when user is not found"],
-        ["getUser", "should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters"],
-        ["concurrency: queue", "should keep a definitive non-mention on skipped queued messages"]
+        ["thread", "passes only explicit placeholder config to adapter streaming"]
       ],
       "fuzzy_matches": [
         ["should return adapter by name", "test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals"],
-        ["should not trigger onNewMention when a bot with a hyphen-suffixed name is mentioned", "test_should_return_none_when_user_is_not_found"],
-        ["should not trigger onNewMention when a hyphen-suffixed user ID is mentioned", "test_should_throw_when_adapter_does_not_support_get_user"],
-        ["should throw when adapter does not support getUser", "test_should_throw_ambiguous_when_short_numeric_matches_telegram_and_github"],
+        ["should throw when adapter does not support getUser", "test_should_throw_when_adapter_does_not_support_get_user"],
+        ["should return null when user is not found", "test_should_return_none_when_user_is_not_found"],
         ["should infer telegram from numeric id when only telegram is registered", "test_should_infer_telegram_from_numeric_id_when_only_telegram_registered"],
         ["should infer github from numeric id when only github is registered", "test_should_infer_github_from_numeric_id_when_only_github_registered"],
         ["should infer discord for 17-19 digit snowflake when only discord is registered", "test_should_infer_discord_for_snowflake_when_only_discord_registered"],
+        ["should throw AMBIGUOUS_USER_ID when numeric id matches multiple registered adapters", "test_should_throw_ambiguous_when_short_numeric_matches_telegram_and_github"],
         ["should not match GitHub-style logins as Slack ids (case sensitivity)", "test_should_not_match_github_style_logins_as_slack_ids"],
         ["should provide openModal method that calls adapter.openModal", "test_slash_should_provide_openmodal_method_that_calls_adapteropenmodal"],
         ["should convert JSX Modal to ModalElement in openModal", "test_slash_should_convert_jsx_modal_to_modalelement_in_openmodal"],
@@ -150,10 +141,10 @@
       "python_exists": true,
       "ts_tests": 67,
       "each_templates": 7,
-      "matched_exact": 42,
-      "matched_fuzzy": 8,
+      "matched_exact": 43,
+      "matched_fuzzy": 7,
       "missing_count": 17,
-      "extra_count": 13,
+      "extra_count": 16,
       "missing": [
         ["%s", "uses the current Chat placeholder %s after lazy restoration"],
         ["%s", "restores the fallback edit interval with override %s"],
@@ -177,7 +168,6 @@
         ["should produce JSON-serializable output", "test_thread_should_produce_jsonserializable_output"],
         ["should handle undefined editedAt", "test_fromjson_should_handle_undefined_editedat"],
         ["should round-trip correctly", "test_should_roundtrip_and_restore_links_correctly"],
-        ["should round-trip replied-to message context", "test_should_roundtrip_message_correctly_preserving_author"],
         ["should be usable directly as JSON.parse second argument", "test_should_be_usable_directly_as_json_parse_second_argument"],
         ["should have WORKFLOW_SERIALIZE static method", "test_message_should_have_workflowserialize_static_method"],
         ["should have WORKFLOW_DESERIALIZE static method", "test_message_should_have_workflowdeserialize_static_method"],
@@ -216,7 +206,7 @@
       "matched_exact": 44,
       "matched_fuzzy": 13,
       "missing_count": 0,
-      "extra_count": 20,
+      "extra_count": 22,
       "missing": [],
       "fuzzy_matches": [
         ["returns the full toolset when no preset is supplied", "test_returns_full_toolset_when_no_preset_supplied"],
@@ -253,28 +243,24 @@
       "python_exists": true,
       "ts_tests": 8,
       "each_templates": 0,
-      "matched_exact": 7,
-      "matched_fuzzy": 1,
+      "matched_exact": 8,
+      "matched_fuzzy": 0,
       "missing_count": 0,
-      "extra_count": 7,
+      "extra_count": 8,
       "missing": [],
-      "fuzzy_matches": [
-        ["should strip raw fields on storage", "test_should_strip_raw_field_on_storage"]
-      ]
+      "fuzzy_matches": []
     },
     "packages/chat/src/transcripts.test.ts": {
-      "python": "tests/test_transcripts.py",
+      "python": "tests/test_history_user.py",
       "tier": "strict",
       "python_exists": true,
       "ts_tests": 1,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 1,
       "matched_fuzzy": 0,
-      "missing_count": 1,
-      "extra_count": 25,
-      "missing": [
-        ["TranscriptsApiImpl (deprecated alias)", "re-exports UserHistoryApiImpl under the legacy name"]
-      ],
+      "missing_count": 0,
+      "extra_count": 26,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/transcripts-wiring.test.ts": {
@@ -283,19 +269,12 @@
       "python_exists": true,
       "ts_tests": 15,
       "each_templates": 1,
-      "matched_exact": 10,
-      "matched_fuzzy": 1,
-      "missing_count": 4,
-      "extra_count": 0,
-      "missing": [
-        ["Chat — History API wiring", "throws at construction when history.user is set without identity"],
-        ["Chat — History API wiring", "chat.transcripts getter throws when user history was not configured"],
-        ["Chat — History API wiring", "chat.history.user returns the API instance when configured via history.user"],
-        ["Chat — History API wiring", "merges legacy maxPerUser=%s under history.user"]
-      ],
-      "fuzzy_matches": [
-        ["chat.history.user getter throws when user history was not configured", "test_chattranscripts_getter_throws_when_transcripts_was_not_configured"]
-      ]
+      "matched_exact": 15,
+      "matched_fuzzy": 0,
+      "missing_count": 0,
+      "extra_count": 4,
+      "missing": [],
+      "fuzzy_matches": []
     },
     "packages/chat/src/from-full-stream.test.ts": {
       "python": "tests/test_from_full_stream.py",
@@ -328,85 +307,55 @@
       ]
     },
     "packages/chat/src/history/user.test.ts": {
-      "python": "tests/test_transcripts.py",
+      "python": "tests/test_history_user.py",
       "tier": "target",
       "python_exists": true,
       "ts_tests": 26,
       "each_templates": 1,
-      "matched_exact": 25,
+      "matched_exact": 26,
       "matched_fuzzy": 0,
-      "missing_count": 1,
-      "extra_count": 0,
-      "missing": [
-        ["maxPerUser eviction", "retains $expected entries with maxPerUser=$maxPerUser"]
-      ],
+      "missing_count": 0,
+      "extra_count": 1,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/history/thread.test.ts": {
       "python": "tests/test_history_thread.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 15,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 15,
       "matched_fuzzy": 0,
-      "missing_count": 15,
-      "extra_count": 0,
-      "missing": [
-        ["ThreadHistoryApiImpl", "list delegates to adapter.fetchMessages when messages exist"],
-        ["ThreadHistoryApiImpl", "list throws for an unregistered adapter prefix"],
-        ["ThreadHistoryApiImpl", "list returns the adapter's empty page for non-persisting adapters"],
-        ["ThreadHistoryApiImpl", "list falls back to cache for adapters with persistThreadHistory"],
-        ["ThreadHistoryApiImpl", "list does not substitute the cache on a continuation page"],
-        ["ThreadHistoryApiImpl", "list cache fallback windows by direction: backward newest-N, forward oldest-N"],
-        ["ThreadHistoryApiImpl", "collect yields adapter messages when available"],
-        ["ThreadHistoryApiImpl", "collect throws for an unregistered adapter prefix"],
-        ["ThreadHistoryApiImpl", "collect stops when a page is empty even if the adapter echoes a cursor"],
-        ["ThreadHistoryApiImpl", "collect falls back to cache for adapters with persistThreadHistory"],
-        ["ThreadHistoryApiImpl", "collect does not fall back to cache for non-persisting adapters"],
-        ["ThreadHistoryApiImpl", "collect cache fallback yields the oldest N, matching the adapter path"],
-        ["ThreadHistoryApiImpl", "append writes to the thread history cache"],
-        ["ThreadHistoryApiImpl", "collect returns immediately when limit is 0"],
-        ["ThreadHistoryApiImpl", "append throws when no cache was provided"]
-      ],
+      "missing_count": 0,
+      "extra_count": 5,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/history/channel.test.ts": {
       "python": "tests/test_history_channel.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 8,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 8,
       "matched_fuzzy": 0,
-      "missing_count": 8,
-      "extra_count": 0,
-      "missing": [
-        ["ChannelHistoryApiImpl", "listMessages uses fetchChannelMessages when available"],
-        ["ChannelHistoryApiImpl", "listMessages throws when fetchChannelMessages is absent"],
-        ["ChannelHistoryApiImpl", "listMessages throws for an unregistered adapter prefix"],
-        ["ChannelHistoryApiImpl", "listMessages serves persisting adapters from the channel-keyed cache"],
-        ["ChannelHistoryApiImpl", "listThreads delegates to adapter.listThreads"],
-        ["ChannelHistoryApiImpl", "listThreads throws when adapter does not implement listThreads"],
-        ["ChannelHistoryApiImpl", "listThreadsWithMessages fetches messages for each thread"],
-        ["ChannelHistoryApiImpl", "listThreadsWithMessages bounds per-thread fetch concurrency"]
-      ],
+      "missing_count": 0,
+      "extra_count": 4,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/history/to-prompt.test.ts": {
       "python": "tests/test_history_to_prompt.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 2,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 2,
       "matched_fuzzy": 0,
-      "missing_count": 2,
+      "missing_count": 0,
       "extra_count": 0,
-      "missing": [
-        ["toPromptEntries", "maps transcript entries to prompt entries preserving order"],
-        ["toPromptEntries", "skips entries with empty text"]
-      ],
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/agent-session.test.ts": {
@@ -428,34 +377,27 @@
     "packages/chat/src/app-context.test.ts": {
       "python": "tests/test_app_context.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 1,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 1,
       "matched_fuzzy": 0,
-      "missing_count": 1,
-      "extra_count": 0,
-      "missing": [
-        ["onAppContextChanged", "dispatches app_context_changed events to registered handlers"]
-      ],
+      "missing_count": 0,
+      "extra_count": 2,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/installation-events.test.ts": {
       "python": "tests/test_installation_events.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 4,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 4,
       "matched_fuzzy": 0,
-      "missing_count": 4,
-      "extra_count": 0,
-      "missing": [
-        ["on%s", "runs registered handlers in order with the destination context"],
-        ["on%s", "waits for asynchronous handlers, including events without a destination"],
-        ["on%s", "logs handler errors and resolves the background task"],
-        ["on%s", "does nothing without handlers and runs without waitUntil"]
-      ],
+      "missing_count": 0,
+      "extra_count": 4,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/adapter-shared/src/download.test.ts": {
@@ -624,10 +566,10 @@
       "python_exists": true,
       "ts_tests": 22,
       "each_templates": 0,
-      "matched_exact": 3,
-      "matched_fuzzy": 6,
-      "missing_count": 13,
-      "extra_count": 33,
+      "matched_exact": 6,
+      "matched_fuzzy": 5,
+      "missing_count": 11,
+      "extra_count": 37,
       "missing": [
         ["constructor", "should assign all properties"],
         ["constructor", "should assign isMention when provided"],
@@ -636,8 +578,6 @@
         ["toJSON()", "should strip data and fetchData from attachments"],
         ["toJSON()", "should preserve fetchMetadata through full JSON.stringify/parse roundtrip"],
         ["toJSON()", "should include isMention flag"],
-        ["toJSON()", "should leave author.isSystem absent for non-system authors"],
-        ["toJSON()", "should preserve author email through serialization"],
         ["fromJSON()", "should convert ISO strings back to Dates"],
         ["fromJSON()", "should handle missing editedAt"],
         ["WORKFLOW_SERIALIZE / WORKFLOW_DESERIALIZE", "should serialize via static method"],
@@ -645,7 +585,6 @@
       ],
       "fuzzy_matches": [
         ["should preserve fetchMetadata in attachments", "test_data_bytes_preserved_through_coerce_attachments"],
-        ["should preserve author.isSystem through a full JSON roundtrip", "test_data_bytes_preserved_through_from_json"],
         ["should preserve all fields", "test_all_fields"],
         ["should return null when no adapter is set", "test_returns_none_when_no_adapter_is_set"],
         ["should return null when adapter has no fetchSubject", "test_returns_none_when_adapter_has_no_fetch_subject"],

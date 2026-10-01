@@ -745,6 +745,50 @@ class TestParseMessageExtended:
 
 
 # ---------------------------------------------------------------------------
+# Mention fallback (tri-state is_mention, upstream vercel/chat#946)
+# ---------------------------------------------------------------------------
+
+
+class TestMentionTextFallback:
+    # The Teams adapter only ever reports ``True`` (from a mention entity), as
+    # upstream; without one it leaves ``is_mention`` unset, so Chat still
+    # routes a literal ``@<bot user_name>`` in a channel to ``on_mention``.
+    @pytest.mark.asyncio
+    async def test_channel_message_without_mention_entity_routes_by_text(self):
+        import asyncio
+
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import MockLogger, create_mock_state
+        from chat_sdk.types import ChatConfig, WebhookOptions
+
+        adapter = _make_adapter(app_id="bot-app-id", user_name="mybot")
+        chat = Chat(
+            ChatConfig(user_name="mybot", adapters={"teams": adapter}, state=create_mock_state(), logger=MockLogger())
+        )
+        adapter._chat = chat
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        tasks: list[Any] = []
+        activity = {
+            "type": "message",
+            "id": "msg-text-mention",
+            "text": "hey @mybot can you help",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "entities": [],
+        }
+        await adapter._handle_message_activity(activity, WebhookOptions(wait_until=tasks.append))
+        await asyncio.gather(*tasks)
+
+        mention_handler.assert_awaited_once()
+        message = mention_handler.await_args.args[1]
+        assert message.id == "msg-text-mention"
+        assert message.is_mention is True
+
+
+# ---------------------------------------------------------------------------
 # Message action (Action.Submit in message activity)
 # ---------------------------------------------------------------------------
 

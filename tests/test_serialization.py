@@ -387,6 +387,120 @@ class TestRoundTrip:
         assert restored.links[1].site_name == "Vercel"
         assert restored.links[0].fetch_message is None
 
+    # TS: "should round-trip replied-to message context"
+    def test_should_roundtrip_repliedto_message_context(self):
+        reply_to = create_test_message(
+            "msg-original",
+            "Original message",
+            raw={"platformId": "original-1"},
+            author=Author(
+                user_id="U456",
+                user_name="original-author",
+                full_name="Original Author",
+                is_bot=False,
+                is_me=False,
+            ),
+            metadata=MessageMetadata(
+                date_sent=datetime(2024, 1, 14, 10, 30, 0, tzinfo=timezone.utc),
+                edited=False,
+            ),
+            attachments=[
+                Attachment(type="file", name="original.pdf", fetch_metadata={"fileId": "file-1"}),
+            ],
+        )
+        original = create_test_message("msg-reply", "Reply", reply_to=reply_to)
+
+        restored = Message.from_json(original.to_json())
+
+        assert isinstance(restored.reply_to, Message)
+        assert restored.reply_to.id == "msg-original"
+        assert restored.reply_to.text == "Original message"
+        assert restored.reply_to.author.user_name == "original-author"
+        assert restored.reply_to.raw == {"platformId": "original-1"}
+        assert restored.reply_to.metadata.date_sent == datetime(2024, 1, 14, 10, 30, 0, tzinfo=timezone.utc)
+        assert restored.reply_to.attachments == [
+            Attachment(type="file", name="original.pdf", fetch_metadata={"fileId": "file-1"}),
+        ]
+
+    # Python-specific: ``to_json`` emits ``replyTo`` only when set, and
+    # ``json.loads(object_hook=...)`` revives bottom-up, so the outer dict
+    # reaches ``Message.from_json`` / the Chat reviver with ``replyTo``
+    # already a ``Message`` -- both must pass it through.
+    # The authors also check that both revivers read ``email`` / ``isSystem``,
+    # with a ``False`` ``isSystem`` kept as ``False`` (not ``None``).
+    def test_reply_to_survives_bottom_up_object_hook_revival(self, mock_adapter, mock_state):
+        reply_author = Author(
+            user_id="USLACK", user_name="Slack", full_name="Slack", is_bot=False, is_me=False, is_system=True
+        )
+        reply_to = create_test_message("msg-original", "Original", raw={"r": 1}, author=reply_author)
+        outer_author = Author(
+            user_id="U1",
+            user_name="a",
+            full_name="A",
+            is_bot=False,
+            is_me=False,
+            email="a@b.c",
+            is_system=False,
+        )
+        original = create_test_message("msg-reply", "Reply", reply_to=reply_to, author=outer_author)
+        assert "replyTo" not in reply_to.to_json()
+        payload = json.dumps({"message": original.to_json()})
+
+        standalone = json.loads(payload, object_hook=reviver)["message"]
+
+        chat = Chat(user_name="test-bot", adapters={"slack": mock_adapter}, state=mock_state, logger="silent")
+        chat_reviver = chat.reviver()
+        bound = json.loads(payload, object_hook=lambda d: chat_reviver("", d))["message"]
+
+        for revived in (standalone, bound):
+            assert isinstance(revived, Message)
+            assert isinstance(revived.reply_to, Message)
+            assert revived.reply_to.id == "msg-original"
+            assert revived.reply_to.raw == {"r": 1}
+            assert revived.reply_to.reply_to is None
+            assert revived.author.email == "a@b.c"
+            assert revived.author.is_system is False
+            assert revived.reply_to.author.is_system is True
+            assert revived.reply_to.author.email is None
+
+    # Python-specific: ``from_json_compat`` prefers snake_case keys and
+    # recurses into ``reply_to`` (also accepting an already-revived Message).
+    def test_from_json_compat_reads_snake_case_reply_to_and_author_fields(self):
+        already_revived = create_test_message("msg-0", "Revived")
+        data = {
+            "id": "msg-1",
+            "thread_id": "slack:C1:1.1",
+            "text": "Reply",
+            "author": {
+                "user_id": "USLACK",
+                "user_name": "Slack",
+                "full_name": "Slack",
+                "is_bot": False,
+                "is_me": False,
+                "is_system": True,
+                "email": "slack@example.com",
+            },
+            "metadata": {"date_sent": "2024-01-15T10:30:00+00:00", "edited": False},
+            "reply_to": {
+                "id": "msg-orig",
+                "thread_id": "slack:C1:1.1",
+                "text": "Original",
+                "author": {"user_id": "U1", "user_name": "u", "full_name": "U", "is_bot": False, "is_me": False},
+                "metadata": {"date_sent": "2024-01-14T10:30:00+00:00", "edited": False},
+                "reply_to": already_revived,
+            },
+        }
+
+        restored = Message.from_json_compat(data)
+
+        assert restored.author.is_system is True
+        assert restored.author.email == "slack@example.com"
+        assert restored.reply_to is not None
+        assert restored.reply_to.id == "msg-orig"
+        assert restored.reply_to.author.is_system is None
+        assert restored.reply_to.reply_to is already_revived
+        assert Message.from_json_compat(already_revived) is already_revived
+
     def test_should_roundtrip_correctly_complete(self):
         """Ensure the data survives JSON.stringify/parse equivalent."""
         original = create_test_message("msg-1", "Serializable test")
