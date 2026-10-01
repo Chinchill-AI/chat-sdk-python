@@ -746,13 +746,13 @@ class DiscordAdapter:
         parent_channel_id = channel_id
 
         thread = data.get("thread")
-        if thread:
-            discord_thread_id = thread.get("id")
-            parent_channel_id = thread.get("parent_id", channel_id)
-            # Only cache a parent Discord actually sent; the ``channel_id``
-            # fallback above is a guess, so leave it to the outbound GET.
-            if discord_thread_id and thread.get("parent_id"):
-                self._remember_thread_parent(discord_thread_id, thread["parent_id"])
+        # Upstream's forwarder always sends ``thread.parent_id``. Without it the
+        # parent is unknown, so fall back to the lookup below (or channel-only)
+        # instead of guessing a parent the outbound validation would reject.
+        if thread and thread.get("id") and thread.get("parent_id"):
+            discord_thread_id = thread["id"]
+            parent_channel_id = thread["parent_id"]
+            self._remember_thread_parent(discord_thread_id, parent_channel_id)
         elif data.get("channel_type") in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD):
             try:
                 response = await self._discord_fetch(f"/channels/{channel_id}", "GET")

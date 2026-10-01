@@ -978,14 +978,28 @@ class TestThreadParentValidation:
         adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
 
     @pytest.mark.asyncio
-    async def test_forwarded_thread_without_parent_id_is_not_cached(self):
-        # The ``channel_id`` fallback is a guess, not a parent Discord sent,
-        # so the next outbound call must still verify it with a GET.
+    @pytest.mark.parametrize(
+        ("extra", "lookups", "expected_thread_id"),
+        [
+            # Thread channel type: the parent is looked up, not guessed.
+            (
+                {"channel_type": 11},
+                [{"id": "thread789", "parent_id": "channel456"}],
+                "discord:guild1:channel456:thread789",
+            ),
+            # No channel type either: the channel itself is the conversation.
+            ({}, [], "discord:guild1:thread789"),
+        ],
+        ids=["thread-channel-type", "no-channel-type"],
+    )
+    async def test_forwarded_thread_without_parent_id_still_gets_replies(self, extra, lookups, expected_thread_id):
+        # A ``thread`` without ``parent_id`` used to encode as
+        # ``discord:g:T:T``, a parent the outbound validation then rejects.
         adapter = _make_adapter(logger=_make_logger())
         mock_chat = MagicMock()
         mock_chat.handle_incoming_message = AsyncMock()
         await adapter.initialize(mock_chat)
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[*lookups, None])
 
         await adapter._handle_forwarded_message(
             {
@@ -997,11 +1011,17 @@ class TestThreadParentValidation:
                 "mentions": [],
                 "thread": {"id": "thread789"},
                 "timestamp": "2021-01-01T00:00:00.000Z",
+                **extra,
             }
         )
+        thread_id = mock_chat.handle_incoming_message.call_args[0][1]
+        await adapter.start_typing(thread_id)
 
-        assert adapter._thread_parent_cache == {}
-        adapter._discord_fetch.assert_not_called()
+        assert thread_id == expected_thread_id
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            *(("/channels/thread789", "GET") for _ in lookups),
+            ("/channels/thread789/typing", "POST"),
+        ]
 
     @pytest.mark.asyncio
     async def test_forwarded_thread_parent_looked_up_from_discord_is_remembered(self):

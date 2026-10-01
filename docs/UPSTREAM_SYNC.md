@@ -1040,6 +1040,13 @@ the Discord half of `b6fa24c6` (#865), `c4f709fe` (#815), the Discord part of
 - **Interaction thread ids.** A thread interaction with no `channel.parent_id`
   now encodes as the channel alone (`discord:g:T`), as upstream does. It used
   to encode as `discord:g:T:T`, which the new validation would reject.
+  Likewise a forwarded message's `thread` is used only when it carries
+  `parent_id` (upstream's forwarder always sends it); without one the adapter
+  looks the parent up for a thread `channel_type`, else encodes the channel
+  alone, instead of guessing the parent as before.
+- **Slash-command responses** (upstream `tryPostSlashResponse`): only a post
+  to the interaction's own conversation answers the deferred `@original`
+  response; a post to another thread or channel goes there instead.
 - **Starter messages** (`_with_message_channel`, upstream `withMessageChannel`).
   When the message id equals the thread segment, the operation tries the
   thread first and retries in the parent channel only on Discord error
