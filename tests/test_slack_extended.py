@@ -35,7 +35,6 @@ try:
     from chat_sdk.adapters.slack.adapter import (
         SLACK_MESSAGE_URL_PATTERN,
         SlackAdapter,
-        _find_next_mention,
     )
     from chat_sdk.adapters.slack.types import (
         SlackAdapterConfig,
@@ -401,30 +400,6 @@ class TestChannelVisibility:
         adapter = _make_adapter()
         vis = adapter.get_channel_visibility("slack:X123:ts")
         assert vis == "unknown"
-
-
-# ---------------------------------------------------------------------------
-# _find_next_mention helper
-# ---------------------------------------------------------------------------
-
-
-class TestFindNextMention:
-    def test_at_mention(self):
-        assert _find_next_mention("Hello <@U123>") == 6
-
-    def test_channel_mention(self):
-        assert _find_next_mention("See <#C123>") == 4
-
-    def test_no_mention(self):
-        assert _find_next_mention("No mentions here") == -1
-
-    def test_at_before_hash(self):
-        result = _find_next_mention("<@U1> and <#C2>")
-        assert result == 0
-
-    def test_hash_before_at(self):
-        result = _find_next_mention("<#C2> and <@U1>")
-        assert result == 0
 
 
 # ---------------------------------------------------------------------------
