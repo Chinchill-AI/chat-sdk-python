@@ -100,6 +100,7 @@ from chat_sdk.errors import (
     StateSchemaError,
 )
 from chat_sdk.from_full_stream import from_full_stream
+from chat_sdk.history import HistoryApiImpl, PromptEntry, to_prompt_entries
 from chat_sdk.logger import ConsoleLogger, Logger, LogLevel
 
 # Deprecated aliases — renamed to ThreadHistoryCache / ThreadHistoryConfig.
@@ -188,6 +189,7 @@ from chat_sdk.types import (
     Author,
     BaseAdapter,
     Channel,
+    ChannelHistoryApi,
     ChannelInfo,
     ChannelVisibility,
     ChatConfig,
@@ -206,6 +208,9 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    HistoryApi,
+    HistoryConfig,
+    HistoryEntry,
     IdentityContext,
     IdentityResolver,
     InstallationAction,
@@ -257,6 +262,7 @@ from chat_sdk.types import (
     TaskUpdateChunk,
     ThinkingChunk,
     Thread,
+    ThreadHistoryApi,
     ThreadInfo,
     ThreadSummary,
     TranscriptEntry,
@@ -265,6 +271,9 @@ from chat_sdk.types import (
     TranscriptsConfig,
     UninstalledEvent,
     UninstalledHandler,
+    UserHistoryApi,
+    UserHistoryConfig,
+    UserHistoryEntry,
     UserInfo,
     WebhookOptions,
     WellKnownEmoji,
@@ -443,6 +452,9 @@ __all__ = [
     # Streaming
     "StreamingMarkdownRenderer",
     "from_full_stream",
+    "HistoryApiImpl",
+    "PromptEntry",
+    "to_prompt_entries",
     # Types
     "ActionEvent",
     "Adapter",
@@ -465,6 +477,7 @@ __all__ = [
     "Author",
     "BaseAdapter",
     "Channel",
+    "ChannelHistoryApi",
     "ChannelInfo",
     "ChannelVisibility",
     "ChatConfig",
@@ -483,6 +496,9 @@ __all__ = [
     "FetchResult",
     "FileUpload",
     "FormattedContent",
+    "HistoryApi",
+    "HistoryConfig",
+    "HistoryEntry",
     "IdentityContext",
     "IdentityResolver",
     "InstallationAction",
@@ -535,6 +551,7 @@ __all__ = [
     "TaskUpdateChunk",
     "ThinkingChunk",
     "Thread",
+    "ThreadHistoryApi",
     "ThreadInfo",
     "ThreadSummary",
     "TranscriptEntry",
@@ -543,6 +560,9 @@ __all__ = [
     "TranscriptsConfig",
     "UninstalledEvent",
     "UninstalledHandler",
+    "UserHistoryApi",
+    "UserHistoryConfig",
+    "UserHistoryEntry",
     "UserInfo",
     "WebhookOptions",
     "WellKnownEmoji",

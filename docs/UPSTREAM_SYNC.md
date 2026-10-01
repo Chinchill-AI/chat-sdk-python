@@ -1100,6 +1100,80 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   instead one test asserts the mock records both installation processors and
   another that it records `process_app_context_changed`.
 
+### Unified History API (chat@4.39–4.41, #197)
+
+Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
+`056d8830` (#904, chat@4.41.0). No divergence-table rows.
+
+- **Package.** `chat_sdk.history` holds `HistoryApiImpl`,
+  `ThreadHistoryApiImpl`, `ChannelHistoryApiImpl`, `UserHistoryApiImpl`
+  (the old `transcripts.py` body), `to_prompt_entries` / `PromptEntry` and
+  the internal `require_adapter` / `persists_history` helpers.
+  `chat_sdk.transcripts.TranscriptsApiImpl` is the same class object as
+  `UserHistoryApiImpl`. `HistoryEntry` / `UserHistoryEntry` are the
+  `TranscriptEntry` class and `UserHistoryApi` is `TranscriptsApi`. The
+  state key prefixes `transcripts:user:` and `msg-history:` are unchanged.
+- **Python shapes.** `HistoryApiImpl(adapter_resolver, cache=None, user=None)`
+  takes the built user API rather than upstream's `{config, state}`.
+  `history.thread.collect(thread_id, *, limit=None)` and
+  `history.channel.list_threads_with_messages(channel_id, *, max_threads=None,
+  messages_per_thread=None, cursor=None)` take keyword arguments instead of
+  an options object (`max_threads=None` means 5). Results are the
+  `ThreadWithMessages` / `ListThreadsWithMessagesResult` dataclasses.
+- **Errors.** Upstream throws plain `Error`; Python raises `ChatError` with
+  upstream's text for an unregistered or missing adapter prefix, missing
+  capabilities, `history.thread.append` without a cache, and
+  `history.user` when unconfigured. The two construction-time and
+  `history.user.append` errors stay `ValueError`, as before.
+- **Config merge.** `ChatConfig.history = HistoryConfig(thread, user)`.
+  The thread cache config is `history.thread`, else `thread_history`, else
+  `message_history` (each `is not None`). Upstream spreads
+  `{...transcripts, ...history.user}`; dataclass fields always exist, so
+  Python merges field by field: a `UserHistoryConfig` field (all default
+  to `None`, "unset") wins unless it is `None`, else the legacy
+  `TranscriptsConfig` field applies (`store_formatted` defaults to
+  `False`). The identity resolver is `history.user.identity`, else
+  `identity`, and dispatch uses the resolved one. User history without
+  either raises at construction with upstream's message.
+- **`max_per_user`.** `int | Literal[False] | None` on both configs.
+  `False` is normalized first (`None if v is False else ...`, because
+  `bool` subclasses `int`) and reaches `append_to_list` as
+  `max_length=None` (no cap); `None` means 200. `max_per_user=0` is also
+  uncapped, because every bundled backend treats a falsy `max_length` as
+  "no trim" (as upstream's do). Documented, not changed.
+- **Capability rule.** Upstream tests `if (adapter.fetchChannelMessages)`
+  / `if (!adapter.listThreads)`. In Python an optional method is absent
+  when the attribute is `None` or is the unoverridden `BaseAdapter` stub
+  (which raises `ChatNotImplementedError`), so a persisting adapter
+  without its own `fetch_channel_messages` still reaches the
+  channel-keyed cache fallback. A call that still raises
+  `ChatNotImplementedError` is re-raised as the capability error, chained
+  (`from exc`), with no cache retry.
+- **Cursor and limit checks.** `list` substitutes the cache only when the
+  page is empty, `next_cursor is None`, no cursor was requested (upstream
+  `=== undefined`), a cache exists and the adapter persists history.
+  `collect` ends on upstream's falsy check (`not next_cursor` or an empty
+  page), so `""` also ends it; `limit=0` yields nothing without a fetch.
+  `collect` fetches each page only after the previous one is consumed, so
+  an early `break` leaves no request pending. `list_threads_with_messages`
+  runs `asyncio.gather` per slice of 4, preserving order.
+- **AI tools.** `fetchMessages`, `fetchChannelMessages` and `listThreads`
+  call `chat.history.thread.list` / `chat.history.channel.list_messages` /
+  `chat.history.channel.list_threads` after the scope guard (#195). They
+  now raise for unregistered adapter prefixes (`fetchMessages` no longer
+  goes through `chat.thread()` and its thread-ID shape check, as
+  upstream), return SDK-cached history
+  for persisting adapters (Telegram, WhatsApp, Twilio, Messenger), and use upstream's
+  error text (`history.channel.listMessages: adapter "x" does not support
+  fetching channel messages`, `history.channel.listThreads: adapter "x"
+  does not implement listThreads`). `ChatNotImplementedError` is still
+  turned into `ChatError` (now inside `history.channel`).
+- **Fidelity.** At the pin, `transcripts.test.ts` still holds the whole
+  user-history suite; from chat@4.39.0 it moved to `history/user.test.ts`
+  and `transcripts.test.ts` keeps only the alias test. Both rows map to
+  `tests/test_history_user.py`, so the strict pin check and the target
+  report both pass without duplicate tests.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
