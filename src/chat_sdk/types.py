@@ -1832,9 +1832,51 @@ class BaseAdapter:
         thread_id: str,
         user_id: str,
         message: AdapterPostableMessage,
-    ) -> EphemeralMessage:
-        """Post an ephemeral message visible only to a specific user."""
+        *,
+        options: PostEphemeralOptions | None = None,
+    ) -> EphemeralMessage | None:
+        """Post a message visible only to a specific user, natively or via an explicit fallback.
+
+        ``options`` is the caller's :class:`PostEphemeralOptions`. Returns an
+        :class:`EphemeralMessage` (``used_fallback`` says whether delivery was
+        private), or ``None`` when the adapter has no private delivery path;
+        ``Thread.post_ephemeral`` returns that ``None`` unchanged. Platforms
+        with targeted messages (e.g. Teams) implement this natively.
+
+        The SDK passes ``options=`` only to implementations whose signature
+        accepts it, so overrides written without the parameter keep working.
+        """
         raise ChatNotImplementedError(self.name, "postEphemeral")
+
+    async def reply(
+        self,
+        thread_id: str,
+        message_id: str,
+        message: AdapterPostableMessage,
+    ) -> RawMessage:
+        """Post ``message`` as a native reply to ``message_id`` (quote, threaded reply).
+
+        Optional: ``Thread.reply()`` raises
+        :class:`~chat_sdk.errors.ChatNotImplementedError` (``"replies"``) when
+        an adapter does not provide it.
+        """
+        raise ChatNotImplementedError(self.name, "replies")
+
+    async def mark_as_read(
+        self,
+        thread_id: str,
+        message_id: str,
+        message: Message | None = None,
+    ) -> None:
+        """Send a read receipt for an inbound message.
+
+        Optional: ``Thread.mark_as_read()`` raises
+        :class:`~chat_sdk.errors.ChatNotImplementedError` (``"read-receipts"``)
+        when an adapter does not provide it. ``message`` is the full message
+        when the caller has one, so adapters can read platform data off
+        ``message.raw`` instead of resolving the ID themselves.
+        """
+        raise ChatNotImplementedError(self.name, "read-receipts")
 
     async def schedule_message(
         self,
@@ -2277,6 +2319,29 @@ class Thread(Postable, Protocol):
 
     async def get_participants(self) -> list[Author]:
         """Return unique non-bot, non-self authors who've posted in the thread."""
+        ...
+
+    async def reply(
+        self,
+        target: str | Message,
+        message: AdapterPostableMessage | AsyncIterable[Any],
+    ) -> SentMessage:
+        """Reply to a specific message with the platform's native reply.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError` on adapters
+        without native reply support. A ``Message`` target is checked against
+        this thread and carried to ``SentMessage.reply_to``; a raw ID is
+        resolved only against messages the thread already holds (never
+        fetched). Streams are buffered and posted as one message.
+        """
+        ...
+
+    async def mark_as_read(self, message: str | Message | None = None) -> None:
+        """Send a read receipt; defaults to the message being handled.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError` when the
+        adapter does not support read receipts.
+        """
         ...
 
     def create_sent_message_from_message(self, message: Message) -> SentMessage:

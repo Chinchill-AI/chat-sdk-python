@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 869,
-    "matched_fuzzy": 77,
-    "missing": 118,
-    "extra": 514
+    "matched_exact": 885,
+    "matched_fuzzy": 75,
+    "missing": 104,
+    "extra": 526
   },
   "absent_ts_files": [],
   "files": {
@@ -45,34 +45,18 @@
       "python_exists": true,
       "ts_tests": 159,
       "each_templates": 1,
-      "matched_exact": 137,
-      "matched_fuzzy": 7,
-      "missing_count": 15,
-      "extra_count": 30,
+      "matched_exact": 153,
+      "matched_fuzzy": 5,
+      "missing_count": 1,
+      "extra_count": 41,
       "missing": [
-        ["startTyping", "passes the initiating user and clears processing after posting"],
-        ["markAsRead", "marks the current message when no target is provided"],
-        ["markAsRead", "marks an explicit message id"],
-        ["markAsRead", "marks an explicit message"],
-        ["markAsRead", "rejects a message from another thread"],
-        ["markAsRead", "requires a target outside a message handler"],
-        ["markAsRead", "throws when the adapter does not support read receipts"],
-        ["markAsRead", "preserves the current message through serialization"],
-        ["reply()", "throws when the adapter does not support replies"],
-        ["reply()", "accepts a Message and preserves it on the result"],
-        ["reply()", "rejects a Message from another thread"],
-        ["reply()", "converts JSX cards before delegating"],
-        ["reply()", "buffers streams into one markdown reply"],
-        ["reply()", "resolves a message id against messages the thread knows"],
-        ["reply()", "leaves replyTo undefined for an unknown message id"]
+        ["startTyping", "passes the initiating user and clears processing after posting"]
       ],
       "fuzzy_matches": [
         ["should pass stream options from Slack current message context via $label", "test_should_pass_stream_options_from_current_message_context"],
         ["should forward structured stream chunks to adapter.stream from an action-created thread", "test_should_forward_structured_stream_chunks_to_adapter_stream_from_an_action_created_thread"],
         ["should still update last in_progress task when no ID provided", "test_should_still_update_last_in_progress_task_when_no_id_provided"],
         ["should not error when adapter has no onThreadSubscribe", "test_not_error_when_no_on_thread_subscribe"],
-        ["delegates a message id and content to the adapter", "test_sent_message_reflects_stranded_placeholder_on_strict_adapter"],
-        ["falls back to a space when a stream produces no text", "test_should_clear_placeholder_when_stream_is_whitespace_only"],
         ["should resolve a JSX Card and its children before scheduling", "test_should_convert_card_jsx_with_children_to_cardelement"]
       ]
     },
@@ -85,7 +69,7 @@
       "matched_exact": 66,
       "matched_fuzzy": 1,
       "missing_count": 0,
-      "extra_count": 9,
+      "extra_count": 10,
       "missing": [],
       "fuzzy_matches": [
         ["should resolve a JSX Card and its children before scheduling", "test_should_convert_jsx_card_elements_to_cardelement"]
