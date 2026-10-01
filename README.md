@@ -67,13 +67,14 @@ Expose chat actions to an LLM agent as tools (`chat/ai` parity, vercel/chat#492)
 from chat_sdk.ai import create_chat_tools, to_ai_messages
 
 tools = create_chat_tools(chat, preset="messenger", require_approval=True)
-# {"postMessage": ChatTool(description=..., input_schema={...}, execute=..., needs_approval=True), ...}
+# {"postMessage": ChatTool(description=..., input_schema={...}, execute=..., needs_approval=True, name="postMessage"), ...}
 ```
 
-Each `ChatTool` is SDK-agnostic: `input_schema` is a JSON-Schema dict you can
-hand to any agent runtime (Anthropic tool use, OpenAI tools, pydantic-ai, ...),
-`execute` is the async implementation, and `needs_approval` flags write tools
-for human-in-the-loop gating. Presets: `reader`, `messenger`, `moderator`.
+Each `ChatTool` is SDK-agnostic: `name` is the tool id (same as its dict key),
+`input_schema` is a JSON-Schema dict you can hand to any agent runtime
+(Anthropic tool use, OpenAI tools, pydantic-ai, ...), `execute` is the async
+implementation, and `needs_approval` flags write tools for human-in-the-loop
+gating. Presets: `reader`, `messenger`, `moderator`.
 `to_ai_messages(thread)` converts thread history into model-ready messages.
 Runnable demo: [`examples/ai_tools_example.py`](examples/ai_tools_example.py).
 

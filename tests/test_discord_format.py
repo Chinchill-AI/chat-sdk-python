@@ -66,6 +66,97 @@ class TestFromAst:
         result = converter.from_ast(ast)
         assert "<@someone>" in result
 
+    # -- links (vercel/chat #567, #726) ------------------------------------
+
+    def test_should_render_a_bare_url_as_a_bare_url_not_a_masked_link(self, converter: DiscordFormatConverter):
+        # The Python parser has no GFM autolinks, so build the link node
+        # upstream's parser would produce for a bare URL (label == url).
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "children": [{"type": "text", "value": "https://example.com"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        assert converter.from_ast(ast) == "https://example.com"
+        assert converter.from_ast(converter.to_ast("https://example.com")) == "https://example.com"
+
+    def test_should_preserve_angle_brackets_on_an_autolink_to_suppress_its_embed(
+        self, converter: DiscordFormatConverter
+    ):
+        ast = converter.to_ast("<https://example.com>")
+        assert converter.from_ast(ast) == "<https://example.com>"
+
+    def test_should_preserve_angle_brackets_in_a_masked_link_destination(self, converter: DiscordFormatConverter):
+        ast = converter.to_ast("[link text](<https://example.com>)")
+        assert converter.from_ast(ast) == "[link text](<https://example.com>)"
+
+    def test_should_preserve_a_masked_link_whose_label_matches_its_url(self, converter: DiscordFormatConverter):
+        source = "[https://example.com](<https://example.com>)"
+        assert converter.from_ast(converter.to_ast(source)) == source
+
+    def test_suppressed_masked_link_url_has_no_angle_brackets_in_the_ast(self, converter: DiscordFormatConverter):
+        # The style lives in ``data``; the URL other adapters read is clean.
+        link = converter.to_ast("[t](<https://example.com/a>)")["children"][0]["children"][0]
+        assert link["url"] == "https://example.com/a"
+        assert link["data"] == {"discordLinkStyle": "suppressed-masked-link"}
+
+    def test_titled_or_non_http_angle_destinations_are_not_marked(self, converter: DiscordFormatConverter):
+        # Upstream's source regex needs ``>)`` at the end and an http(s) URL.
+        assert converter.from_ast(converter.to_ast('[t](<https://x.com> "ti")')) == "[t](https://x.com)"
+        assert converter.from_ast(converter.to_ast("[t](<mailto:a@b.co>)")) == "[t](mailto:a@b.co)"
+
+    def test_suppressed_autolink_style_renders_angle_brackets(self, converter: DiscordFormatConverter):
+        # An AST carrying upstream's autolink style (e.g. built by TS) renders
+        # the preview-suppressed form even though our parser never sets it.
+        ast = {
+            "type": "root",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "children": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com",
+                            "data": {"discordLinkStyle": "suppressed-autolink"},
+                            "children": [{"type": "text", "value": "https://example.com"}],
+                        }
+                    ],
+                }
+            ],
+        }
+        assert converter.from_ast(ast) == "<https://example.com>"
+
+    # -- mentions (vercel/chat #651, #652) ---------------------------------
+
+    def test_should_not_turn_email_addresses_into_mentions(self, converter: DiscordFormatConverter):
+        result = converter.from_ast(converter.to_ast("Contact me at user@example.com"))
+        assert result == "Contact me at user@example.com"
+
+    def test_should_still_convert_a_bare_mention_that_follows_a_period(self, converter: DiscordFormatConverter):
+        result = converter.from_ast(converter.to_ast("read the docs.@everyone please"))
+        assert result == "read the docs.<@everyone> please"
+
+    def test_should_not_mangle_an_handle_inside_a_url(self, converter: DiscordFormatConverter):
+        result = converter.render_postable({"markdown": "see https://github.com/@vercel here"})
+        assert result == "see https://github.com/@vercel here"
+
+    def test_should_not_mangle_a_mention_inside_an_inline_code_span(self, converter: DiscordFormatConverter):
+        result = converter.render_postable({"markdown": "run `ping @here`"})
+        assert result == "run `ping @here`"
+
+    def test_userinfo_url_and_fenced_code_are_left_alone(self, converter: DiscordFormatConverter):
+        text = "fetch https://user@host.example/x and\n```\n@bot run\n```\nthen @ops"
+        assert converter.render_postable({"raw": text}) == text.replace("then @ops", "then <@ops>")
+
     def test_blockquotes(self, converter: DiscordFormatConverter):
         ast = converter.to_ast("> quoted text")
         result = converter.from_ast(ast)
@@ -186,9 +277,26 @@ class TestRenderPostable:
         result = converter.render_postable("Hello @user")
         assert result == "Hello <@user>"
 
-    def test_raw_message_with_mention(self, converter: DiscordFormatConverter):
+    def test_should_convert_a_bare_mention_in_raw_text(self, converter: DiscordFormatConverter):
         result = converter.render_postable({"raw": "Hello @user"})
         assert result == "Hello <@user>"
+
+    def test_should_preserve_a_preview_suppressed_link_in_markdown(self, converter: DiscordFormatConverter):
+        assert converter.render_postable({"markdown": "<https://example.com>"}) == "<https://example.com>"
+
+    def test_should_preserve_a_preview_suppressed_masked_link_in_markdown(self, converter: DiscordFormatConverter):
+        result = converter.render_postable({"markdown": "[link text](<https://example.com>)"})
+        assert result == "[link text](<https://example.com>)"
+
+    def test_should_not_double_wrap_an_already_formatted_mention_in_raw_text(self, converter: DiscordFormatConverter):
+        result = converter.render_postable({"raw": "ping <@123> <@!456> <#789> now"})
+        assert result == "ping <@123> <@!456> <#789> now"
+
+    def test_should_leave_email_addresses_in_raw_text_untouched(self, converter: DiscordFormatConverter):
+        assert converter.render_postable({"raw": "email support@vercel.com"}) == "email support@vercel.com"
+
+    def test_should_not_mangle_an_handle_inside_a_url_in_raw_text(self, converter: DiscordFormatConverter):
+        assert converter.render_postable({"raw": "see twitter.com/@jack"}) == "see twitter.com/@jack"
 
     def test_markdown_message(self, converter: DiscordFormatConverter):
         result = converter.render_postable({"markdown": "Hello **world** @user"})

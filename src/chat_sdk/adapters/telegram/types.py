@@ -804,6 +804,8 @@ class TelegramMessage(TypedDict, total=False):
     game: TelegramGame
     invoice: TelegramInvoice
     location: TelegramLocation
+    # Album (media group) id shared by every part of one album.
+    media_group_id: str
     message_id: int  # required
     message_thread_id: int
     photo: list[TelegramPhotoSize]
