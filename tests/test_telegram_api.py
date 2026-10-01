@@ -11,6 +11,7 @@ Mocks telegram_fetch to intercept all Bot API calls without network access.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,6 +33,8 @@ from chat_sdk.shared.errors import (
     AuthenticationError,
     ValidationError,
 )
+from chat_sdk.shared.mock_adapter import create_mock_state
+from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
 from chat_sdk.types import Attachment, FileUpload, PostableMarkdown, PostableRaw
 
 # =============================================================================
@@ -1734,6 +1737,14 @@ class TestDecodeCompositeMessageId:
         with pytest.raises(ValidationError, match="mismatch"):
             adapter.decode_composite_message_id(f"wrong:{MESSAGE_ID_INT}", CHAT_ID)
 
+    # Python-specific: ``re.$`` matches before a trailing newline and ``\d``
+    # matches non-ASCII digits; upstream's JS pattern accepts neither.
+    @pytest.mark.parametrize("message_id", ["123:7\n", "123:７", "123:٧"])
+    def test_rejects_composite_ids_upstream_would_not_match(self, message_id: str):
+        adapter = _make_adapter()
+        with pytest.raises(ValidationError, match="<chatId>:<messageId> format"):
+            adapter.decode_composite_message_id(message_id)
+
 
 # =============================================================================
 # Tests -- throw_telegram_api_error additional branches
@@ -2185,3 +2196,246 @@ class TestChatDisplayName:
     def test_none_fallback(self):
         adapter = _make_adapter()
         assert adapter.chat_display_name({"id": 1, "type": "private"}) is None
+
+
+# =============================================================================
+# Tests -- native replies (vercel/chat#833, #228)
+# =============================================================================
+
+REPLY_THREAD_ID = "telegram:123"
+EXPECTED_REPLY_PARAMETERS = {"message_id": 7, "allow_sending_without_reply": True}
+
+
+def _reply_adapter(*responses: Any) -> TelegramAdapter:
+    """``createReplyAdapter`` with ``telegram_fetch`` answering *responses* in order."""
+    adapter = _make_adapter(user_name="mybot")
+    _init_adapter(adapter)
+    adapter.telegram_fetch = AsyncMock(  # type: ignore[method-assign]
+        side_effect=list(responses) or [_make_telegram_message(chat_id="123", message_id=11)]
+    )
+    return adapter
+
+
+def _only_call(adapter: TelegramAdapter) -> tuple[str, Any]:
+    """The single Bot API call a reply made."""
+    adapter.telegram_fetch.assert_awaited_once()  # type: ignore[attr-defined]
+    method, payload = adapter.telegram_fetch.await_args.args  # type: ignore[attr-defined]
+    return method, payload
+
+
+class TestReply:
+    """Ports of ``describe("reply")``: every send path carries ``reply_parameters``."""
+
+    @pytest.mark.asyncio
+    async def test_threads_a_rich_text_message_to_its_target(self):
+        adapter = _reply_adapter()
+
+        await adapter.reply(REPLY_THREAD_ID, "123:7", {"markdown": "hello"})
+
+        method, payload = _only_call(adapter)
+        assert method == "sendRichMessage"
+        assert payload["reply_parameters"] == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_threads_a_plain_string_message_through_send_message(self):
+        adapter = _reply_adapter()
+
+        await adapter.reply(REPLY_THREAD_ID, "123:7", "hello")
+
+        method, payload = _only_call(adapter)
+        assert method == "sendMessage"
+        assert payload["reply_parameters"] == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_threads_a_document_upload_to_its_target(self):
+        adapter = _reply_adapter()
+
+        await adapter.reply(
+            REPLY_THREAD_ID,
+            "123:7",
+            PostableRaw(raw="", files=[FileUpload(data=b"doc", filename="doc.txt")]),
+        )
+
+        method, form_data = _only_call(adapter)
+        assert method == "sendDocument"
+        assert json.loads(_form_fields(form_data)["reply_parameters"]) == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_threads_a_url_attachment_without_an_inline_keyboard(self):
+        adapter = _reply_adapter()
+
+        await adapter.reply(
+            REPLY_THREAD_ID,
+            "123:7",
+            PostableMarkdown(
+                markdown="picture",
+                attachments=[
+                    Attachment(
+                        type="image",
+                        mime_type="image/png",
+                        name="pic.png",
+                        url="https://cdn.example.com/pic.png",
+                    )
+                ],
+            ),
+        )
+
+        method, payload = _only_call(adapter)
+        assert method == "sendPhoto"
+        assert payload["reply_parameters"] == EXPECTED_REPLY_PARAMETERS
+        assert "reply_markup" not in payload
+
+    @pytest.mark.asyncio
+    async def test_threads_a_buffer_attachment_to_its_target(self):
+        adapter = _reply_adapter()
+
+        await adapter.reply(
+            REPLY_THREAD_ID,
+            "123:7",
+            PostableMarkdown(
+                markdown="picture",
+                attachments=[Attachment(type="image", data=b"payload", mime_type="image/png", name="pic.png")],
+            ),
+        )
+
+        method, form_data = _only_call(adapter)
+        assert method == "sendPhoto"
+        assert json.loads(_form_fields(form_data)["reply_parameters"]) == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_regular_send_when_the_rich_endpoint_rejects_reply_parameters(self):
+        # The error a 400 from the Bot API maps to.
+        with pytest.raises(ValidationError) as rejected:
+            _make_adapter().throw_telegram_api_error(
+                "sendRichMessage",
+                400,
+                {"ok": False, "error_code": 400, "description": "Bad Request: unknown field reply_parameters"},
+            )
+        adapter = _reply_adapter(rejected.value, _make_telegram_message(chat_id="123", message_id=11))
+
+        await adapter.reply(REPLY_THREAD_ID, "123:7", {"markdown": "hello"})
+
+        calls = adapter.telegram_fetch.await_args_list  # type: ignore[attr-defined]
+        assert [call.args[0] for call in calls] == ["sendRichMessage", "sendMessage"]
+        assert calls[1].args[1]["reply_parameters"] == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_leaves_a_plain_post_message_unthreaded(self):
+        adapter = _reply_adapter()
+
+        await adapter.post_message(REPLY_THREAD_ID, {"markdown": "hello"})
+
+        _method, payload = _only_call(adapter)
+        assert "reply_parameters" not in payload
+
+    # Python-specific: upstream's ``JSON.stringify`` drops ``undefined``; here the
+    # ``is not None`` guards are what keep ``reply_parameters`` off upload paths.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("message", "expected_method"),
+        [
+            pytest.param(
+                PostableMarkdown(
+                    markdown="picture",
+                    attachments=[
+                        Attachment(
+                            type="image",
+                            mime_type="image/png",
+                            name="pic.png",
+                            url="https://cdn.example.com/pic.png",
+                        )
+                    ],
+                ),
+                "sendPhoto",
+                id="url-attachment",
+            ),
+            pytest.param(
+                PostableMarkdown(
+                    markdown="picture",
+                    attachments=[Attachment(type="image", data=b"payload", mime_type="image/png", name="pic.png")],
+                ),
+                "sendPhoto",
+                id="bytes-attachment",
+            ),
+            pytest.param(
+                PostableRaw(raw="", files=[FileUpload(data=b"doc", filename="doc.txt")]),
+                "sendDocument",
+                id="file-upload",
+            ),
+        ],
+    )
+    async def test_leaves_plain_post_message_uploads_unthreaded(self, message: Any, expected_method: str):
+        adapter = _reply_adapter()
+
+        await adapter.post_message(REPLY_THREAD_ID, message)
+
+        method, body = _only_call(adapter)
+        assert method == expected_method
+        fields = body if isinstance(body, dict) else _form_fields(body)
+        assert "reply_parameters" not in fields
+        # Guard against a vacuous pass: the body really is the upload request.
+        assert fields["chat_id"] in ("123", 123)
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_target_that_belongs_to_another_chat(self):
+        adapter = _reply_adapter()
+        # Python-specific: the target is checked before any attachment download.
+        fetch_data = AsyncMock(return_value=b"payload")
+
+        with pytest.raises(ValidationError, match="chat mismatch"):
+            await adapter.reply(
+                REPLY_THREAD_ID,
+                "999:7",
+                PostableMarkdown(markdown="hello", attachments=[Attachment(type="image", fetch_data=fetch_data)]),
+            )
+
+        adapter.telegram_fetch.assert_not_awaited()  # type: ignore[attr-defined]
+        fetch_data.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["7abc", "7.9", " 7"])
+    async def test_rejects_the_malformed_bare_message_id(self, target: str):
+        adapter = _reply_adapter()
+
+        with pytest.raises(ValidationError, match="Invalid Telegram message ID"):
+            await adapter.reply(REPLY_THREAD_ID, target, {"markdown": "hello"})
+
+        adapter.telegram_fetch.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # Python-specific: ``int()`` accepts these, upstream's ``/^\d+$/`` does not.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["+7", "1_0", "７", "7\n", "123:7\n"])
+    async def test_rejects_ids_that_python_int_would_accept(self, target: str):
+        adapter = _reply_adapter()
+
+        with pytest.raises(ValidationError, match="Invalid Telegram message ID"):
+            await adapter.reply(REPLY_THREAD_ID, target, {"markdown": "hello"})
+
+        adapter.telegram_fetch.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # Python-specific: the ``Thread.reply`` -> adapter hook path end to end.
+    @pytest.mark.asyncio
+    async def test_thread_reply_sends_one_threaded_call_and_post_stays_unthreaded(self):
+        adapter = _reply_adapter(
+            _make_telegram_message(chat_id="123", message_id=11),
+            _make_telegram_message(chat_id="123", message_id=12),
+        )
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id=REPLY_THREAD_ID,
+                adapter=adapter,  # type: ignore[arg-type]
+                state_adapter=create_mock_state(),
+                channel_id="telegram:123",
+            )
+        )
+        target = adapter.parse_message(_make_telegram_message(chat_id="123", message_id=7, text="question"))
+
+        sent = await thread.reply(target, "answer")
+        await thread.post("not a reply")
+
+        calls = adapter.telegram_fetch.await_args_list  # type: ignore[attr-defined]
+        assert [call.args[0] for call in calls] == ["sendMessage", "sendMessage"]
+        assert calls[0].args[1]["reply_parameters"] == EXPECTED_REPLY_PARAMETERS
+        assert "reply_parameters" not in calls[1].args[1]
+        assert sent.id == "123:11"
+        assert sent.reply_to is target
