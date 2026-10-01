@@ -394,8 +394,16 @@ class TestTeamsFixtureReplay:
         expected_text_fragment: str | None = None,
     ) -> tuple[Any, str]:
         """Send a fixture payload and assert process_message was called."""
+        from microsoft_teams.api import TeamsChannelAccount
+
         adapter = self._make_adapter(fixture)
         mock_chat = _make_mock_chat()
+        # Senders with ``aadObjectId`` are looked up on the activity's
+        # connector before dispatch (#218); answer that call in memory.
+        self.member_lookup = AsyncMock(
+            return_value=TeamsChannelAccount.model_validate({"id": "member", "email": "replay-user@contoso.com"})
+        )
+        adapter._get_conversation_member = self.member_lookup  # type: ignore[method-assign]
 
         body = json.dumps(fixture[payload_key])
         request = _teams_request(body)
@@ -460,6 +468,13 @@ class TestTeamsFixtureReplay:
         fixture = load_fixture("channel/teams.json")
         message, thread_id = await self._send_and_assert_message(fixture, "mention", "Hey")
         assert message.author.user_id == fixture["mention"]["from"]["id"]
+        # The sender's email is hydrated from the conversation member before
+        # dispatch, through the real webhook -> SDK -> handler path.
+        assert message.author.email == "replay-user@contoso.com"
+        self.member_lookup.assert_awaited_once()
+        activity, user_id = self.member_lookup.await_args.args
+        assert user_id == fixture["mention"]["from"]["id"]
+        assert activity["from"]["aadObjectId"] == fixture["mention"]["from"]["aadObjectId"]
 
     # --- dm/teams.json ---
 
