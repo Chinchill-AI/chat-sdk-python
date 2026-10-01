@@ -1604,6 +1604,186 @@ class TestMessageLifecyclePythonSpecific:
         )
 
         assert not chat.process_message_deleted.called
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_edit_inherits_channel_type_from_the_outer_event(self):
+        # Real message_changed payloads carry channel_type only on the outer
+        # event; the inner message must inherit it so a top-level DM edit maps
+        # to the same "slack:D...:" thread as the original message.
+        adapter, chat, _ = await self._init()
+        before = {"type": "message", "user": "U_USER", "text": "hello", "ts": "1111.0001"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1111.0002",
+                    "message": {**before, "text": "edited", "edited": {"ts": "1111.0002"}},
+                    "previous_message": before,
+                }
+            )
+        )
+
+        assert chat.process_message_updated.call_args.args[1] == "slack:D_DM:"
+
+    @pytest.mark.parametrize(
+        "inner_changes",
+        [
+            pytest.param({"edited": {"ts": "1234567891.111111"}}, id="edited-ts-only"),
+            pytest.param({"text": "after"}, id="text-only"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_hidden_edit_is_dispatched_when_only_one_of_edited_ts_or_text_changes(
+        self, inner_changes: dict[str, Any]
+    ):
+        adapter, chat, _ = await self._init()
+        before = {"type": "message", "user": "U_USER", "text": "before", "ts": "1234567890.111111"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": True,
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**before, **inner_changes},
+                    "previous_message": before,
+                }
+            )
+        )
+
+        chat.process_message_updated.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hidden_flag_must_be_boolean_true_to_suppress_an_edit(self):
+        # Upstream checks ``event.hidden === true``: a non-boolean truthy value
+        # does not mark the event as an unfurl-only update.
+        adapter, chat, _ = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": "true",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {"type": "message", "user": "U_USER", "text": "after", "ts": "1234567890.111111"},
+                }
+            )
+        )
+
+        chat.process_message_updated.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_message_deleted_prefers_deleted_ts_and_event_ts(self):
+        adapter, chat, _ = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "C_CHAN",
+                    "deleted_ts": "1.1",
+                    "ts": "5.5",
+                    "event_ts": "6.6",
+                    "previous_message": {"type": "message", "user": "U_USER", "text": "x", "ts": "2.2"},
+                }
+            )
+        )
+
+        deleted = chat.process_message_deleted.call_args.args[0]
+        assert deleted.message_id == "1.1"
+        assert deleted.deleted_at is not None
+        assert deleted.deleted_at.timestamp() == pytest.approx(6.6)
+
+    @pytest.mark.asyncio
+    async def test_edit_and_delete_inherit_team_channel_and_type_from_the_outer_event(self):
+        # team / team_id matter for multi-workspace attachment rehydration.
+        adapter, chat, _ = await self._init()
+        bare = {"user": "U_USER", "text": "before", "ts": "1234567890.111111"}
+        outer = {"channel": "C_CHAN", "channel_type": "channel", "team": "T_OUTER", "team_id": "T_OUTER_ID"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    **outer,
+                    "ts": "1234567891.111111",
+                    "message": {**bare, "text": "after"},
+                    "previous_message": bare,
+                }
+            )
+        )
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    **outer,
+                    "deleted_ts": "1234567890.111111",
+                    "previous_message": bare,
+                }
+            )
+        )
+
+        inherited = {**outer, "type": "message"}
+        call = chat.process_message_updated.call_args
+        msg = await call.args[2]()
+        assert {k: msg.raw.get(k) for k in inherited} == inherited
+        # Upstream parity: the pre-edit snapshot inherits channel /
+        # channel_type / type only (adapter-slack index.ts handleMessageChanged).
+        previous = await call.kwargs["previous_message"]()
+        assert {k: previous.raw.get(k) for k in inherited} == {
+            "channel": "C_CHAN",
+            "channel_type": "channel",
+            "team": None,
+            "team_id": None,
+            "type": "message",
+        }
+        deleted_previous = chat.process_message_deleted.call_args.args[0].previous_message
+        assert {k: deleted_previous.raw.get(k) for k in inherited} == inherited
+
+    @pytest.mark.asyncio
+    async def test_inherited_keys_absent_from_both_events_are_not_added_to_raw(self):
+        # Upstream's ``inner.channel_type ?? event.channel_type`` yields
+        # ``undefined`` (dropped from the payload), not an explicit null.
+        adapter, chat, _ = await self._init()
+        bare = {"type": "message", "user": "U_USER", "text": "before", "ts": "1234567890.111111"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**bare, "text": "after"},
+                    "previous_message": bare,
+                }
+            )
+        )
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "C_CHAN",
+                    "deleted_ts": "1234567890.111111",
+                    "previous_message": bare,
+                }
+            )
+        )
+
+        call = chat.process_message_updated.call_args
+        msg = await call.args[2]()
+        previous = await call.kwargs["previous_message"]()
+        deleted_previous = chat.process_message_deleted.call_args.args[0].previous_message
+        for raw in (msg.raw, previous.raw, deleted_previous.raw):
+            assert raw["channel"] == "C_CHAN"
+            assert "channel_type" not in raw
+            assert "team" not in raw
         assert not chat.process_message.called
 
 

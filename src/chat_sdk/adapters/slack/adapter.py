@@ -236,6 +236,23 @@ def _edited_ts(message: dict[str, Any]) -> Any:
     return edited.get("ts") if isinstance(edited, dict) else None
 
 
+def _with_inherited(message: dict[str, Any], **fallbacks: Any) -> dict[str, Any]:
+    """Upstream ``{...message, key: message.key ?? fallback}`` for each fallback.
+
+    A key whose resolved value is ``None`` is not added: upstream's ``??``
+    yields ``undefined`` there, which never reaches the serialized payload, so
+    ``Message.raw`` must not gain ``None`` keys Slack never sent.
+    """
+    out = dict(message)
+    for key, fallback in fallbacks.items():
+        value = message.get(key)
+        if value is None:
+            value = fallback
+        if value is not None:
+            out[key] = value
+    return out
+
+
 # Link-unfurl wait window: Slack delivers unfurled attachments via a
 # separate `message_changed` event ~100-2000ms after the original. We
 # poll briefly so the message handler sees enriched links instead of
@@ -3323,16 +3340,14 @@ class SlackAdapter:
         if not (isinstance(inner, dict) and channel):
             return
 
-        normalized: dict[str, Any] = {
-            **inner,
-            "channel": inner.get("channel") if inner.get("channel") is not None else channel,
-            "channel_type": (
-                inner.get("channel_type") if inner.get("channel_type") is not None else event.get("channel_type")
-            ),
-            "team": inner.get("team") if inner.get("team") is not None else event.get("team"),
-            "team_id": inner.get("team_id") if inner.get("team_id") is not None else event.get("team_id"),
-            "type": inner.get("type") if inner.get("type") is not None else "message",
-        }
+        normalized = _with_inherited(
+            inner,
+            channel=channel,
+            channel_type=event.get("channel_type"),
+            team=event.get("team"),
+            team_id=event.get("team_id"),
+            type="message",
+        )
 
         # Slack does not document ``tombstone`` and upstream has no captured
         # payload for it, so it is not claimed to mean "deleted". It arrives
@@ -3391,18 +3406,12 @@ class SlackAdapter:
             # the snapshot inherits only channel / channel_type / type, not
             # team / team_id (unlike ``normalized`` and the delete path).
             async def _parse_previous() -> Message:
-                snapshot: dict[str, Any] = {
-                    **before,
-                    "channel": before.get("channel")
-                    if before.get("channel") is not None
-                    else normalized.get("channel"),
-                    "channel_type": (
-                        before.get("channel_type")
-                        if before.get("channel_type") is not None
-                        else normalized.get("channel_type")
-                    ),
-                    "type": before.get("type") if before.get("type") is not None else "message",
-                }
+                snapshot = _with_inherited(
+                    before,
+                    channel=normalized.get("channel"),
+                    channel_type=normalized.get("channel_type"),
+                    type="message",
+                )
                 try:
                     return await self._parse_slack_message(snapshot, thread_id)
                 except Exception as exc:
@@ -3508,26 +3517,20 @@ class SlackAdapter:
 
         previous: dict[str, Any] | None = None
         if isinstance(previous_raw, dict):
-            previous = {
-                **previous_raw,
-                "channel": previous_raw.get("channel") if previous_raw.get("channel") is not None else channel,
-                "channel_type": (
-                    previous_raw.get("channel_type")
-                    if previous_raw.get("channel_type") is not None
-                    else event.get("channel_type")
-                ),
-                "team": previous_raw.get("team") if previous_raw.get("team") is not None else event.get("team"),
-                "team_id": (
-                    previous_raw.get("team_id") if previous_raw.get("team_id") is not None else event.get("team_id")
-                ),
-                "type": previous_raw.get("type") if previous_raw.get("type") is not None else "message",
-            }
+            previous = _with_inherited(
+                previous_raw,
+                channel=channel,
+                channel_type=event.get("channel_type"),
+                team=event.get("team"),
+                team_id=event.get("team_id"),
+                type="message",
+            )
 
         previous_ts = previous.get("ts") if previous is not None else None
         thread_id = self._thread_id_for_message_event(
             {
                 "channel": channel,
-                "channel_type": previous["channel_type"] if previous is not None else event.get("channel_type"),
+                "channel_type": previous.get("channel_type") if previous is not None else event.get("channel_type"),
                 "thread_ts": previous.get("thread_ts") if previous is not None else None,
                 "ts": previous_ts if previous_ts is not None else deleted_ts,
             }
