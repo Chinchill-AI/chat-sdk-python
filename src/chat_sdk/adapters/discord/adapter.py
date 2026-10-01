@@ -118,7 +118,9 @@ def _parse_discord_error_code(body: str) -> int | None:
     """Discord's numeric ``code`` from a JSON error body, else ``None``."""
     try:
         data = json.loads(body)
-    except (ValueError, TypeError):
+    # ``RecursionError``: a deeply nested body must not escape the error
+    # wrapper (upstream's bare ``catch`` around ``JSON.parse`` swallows it).
+    except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -747,8 +749,10 @@ class DiscordAdapter:
         if thread:
             discord_thread_id = thread.get("id")
             parent_channel_id = thread.get("parent_id", channel_id)
-            if discord_thread_id and parent_channel_id:
-                self._remember_thread_parent(discord_thread_id, parent_channel_id)
+            # Only cache a parent Discord actually sent; the ``channel_id``
+            # fallback above is a guess, so leave it to the outbound GET.
+            if discord_thread_id and thread.get("parent_id"):
+                self._remember_thread_parent(discord_thread_id, thread["parent_id"])
         elif data.get("channel_type") in (CHANNEL_TYPE_PUBLIC_THREAD, CHANNEL_TYPE_PRIVATE_THREAD):
             try:
                 response = await self._discord_fetch(f"/channels/{channel_id}", "GET")
@@ -941,8 +945,9 @@ class DiscordAdapter:
     ) -> RawMessage:
         """Post a message to a Discord channel or thread."""
         decoded = self.decode_thread_id(thread_id)
-        # Validated before the slash-command branch too, so a forged thread
-        # segment is refused on every path (upstream resolves first as well).
+        # Validated before the slash-command branch too (upstream resolves
+        # first as well), so a forged thread segment is refused even when a
+        # slash-command context is active.
         channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
 
         # Build message payload
@@ -976,7 +981,9 @@ class DiscordAdapter:
         # --- Resolve deferred slash-command interaction if pending ---
         req_ctx = self._request_context.get()
         slash_ctx = req_ctx.slash_command if req_ctx else None
-        if slash_ctx and not slash_ctx.initial_response_sent:
+        # Upstream ``tryPostSlashResponse``: only a post to the interaction's
+        # own conversation answers it; posts elsewhere go to their channel.
+        if slash_ctx and slash_ctx.channel_id == thread_id and not slash_ctx.initial_response_sent:
             slash_ctx.initial_response_sent = True
             self._logger.debug(
                 "Discord API: PATCH deferred interaction response",

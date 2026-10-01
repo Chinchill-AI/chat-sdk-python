@@ -825,6 +825,34 @@ class TestThreadParentValidation:
         assert slash.initial_response_sent is False
 
     @pytest.mark.asyncio
+    async def test_slash_context_for_another_conversation_does_not_capture_the_post(self):
+        # Upstream ``tryPostSlashResponse``: only a post to the interaction's
+        # own conversation answers it; a post elsewhere goes to its channel.
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "m1"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild1:channelA",
+            initial_response_sent=False,
+            interaction_token="tok",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        await adapter.post_message("discord:guild1:channelB", "for B")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/channelB/messages", "POST", {"content": "for B"}, files=None)
+        assert slash.initial_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_thread_segment_is_url_quoted_in_the_parent_lookup(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "a/b", "parent_id": "other"})
+
+        with pytest.raises(ValidationError):
+            await adapter.start_typing("discord:guild1:channel456:a/b")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/a%2Fb", "GET")
+
+    @pytest.mark.asyncio
     async def test_parentless_channel_lookup_is_rejected(self):
         # A non-thread channel (no parent_id) can never be a thread segment.
         adapter = _make_adapter(logger=_make_logger())
@@ -946,6 +974,59 @@ class TestThreadParentValidation:
         await adapter.start_typing("discord:guild1:channel456:thread789")
 
         adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
+
+    @pytest.mark.asyncio
+    async def test_forwarded_thread_without_parent_id_is_not_cached(self):
+        # The ``channel_id`` fallback is a guess, not a parent Discord sent,
+        # so the next outbound call must still verify it with a GET.
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        await adapter._handle_forwarded_message(
+            {
+                "id": "m1",
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "content": "hi",
+                "author": {"id": "u1", "username": "user"},
+                "mentions": [],
+                "thread": {"id": "thread789"},
+                "timestamp": "2021-01-01T00:00:00.000Z",
+            }
+        )
+
+        assert adapter._thread_parent_cache == {}
+        adapter._discord_fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_forwarded_thread_parent_looked_up_from_discord_is_remembered(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock(side_effect=[{"id": "thread789", "parent_id": "channel456"}, None])
+
+        await adapter._handle_forwarded_message(
+            {
+                "id": "m1",
+                "channel_id": "thread789",
+                "channel_type": 11,
+                "guild_id": "guild1",
+                "content": "hi",
+                "author": {"id": "u1", "username": "user"},
+                "mentions": [],
+                "timestamp": "2021-01-01T00:00:00.000Z",
+            }
+        )
+        await adapter.start_typing("discord:guild1:channel456:thread789")
+
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+        ]
 
     @pytest.mark.asyncio
     async def test_uses_forwarded_thread_info_without_fetching_the_channel(self):
@@ -1078,8 +1159,9 @@ class TestDiscordApiError:
             ('{"code": "10008"}', None),
             ('{"code": true}', None),
             ("[10008]", None),
+            ("[" * 200_000, None),
         ],
-        ids=["json", "html", "empty", "string-code", "bool-code", "non-object"],
+        ids=["json", "html", "empty", "string-code", "bool-code", "non-object", "deeply-nested"],
     )
     def test_parses_only_a_numeric_json_code(self, body, code):
         error = DiscordApiError(500, body)
