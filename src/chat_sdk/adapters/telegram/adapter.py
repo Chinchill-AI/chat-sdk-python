@@ -1300,6 +1300,8 @@ class TelegramAdapter:
             # ``asyncio.wait`` rather than ``await task``: the loop's own
             # cancellation is expected, but cancelling *this* caller must
             # still propagate (``suppress(CancelledError)`` would swallow it).
+            # Upstream parity: like ``stopPolling``, this waits for in-flight
+            # handlers, so a polled handler must not await it (deadlock).
             await asyncio.wait({task})
             if not task.cancelled():
                 task.result()
@@ -1410,6 +1412,10 @@ class TelegramAdapter:
                 return
             # The checkpoint, not core dedupe, deduplicates polled updates: a
             # retried update must not be dropped as a duplicate (#942).
+            # Upstream parity: with the "queue" / "debounce" strategies a
+            # message's task settles once it is enqueued, and a queued
+            # handler's failure surfaces on the task that drains the queue, so
+            # the retry is attributed to that update (same in ``chat.ts``).
             await self._await_update_tasks(self.process_update(update, WebhookOptions(deduplicate=False)))
 
         async def run_group(group: list[TelegramUpdate]) -> list[tuple[TelegramUpdate, Exception | None]]:
@@ -1916,6 +1922,8 @@ class TelegramAdapter:
                     appended = True
                     remaining_settle_ms = TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS
                 elif not entries:
+                    # Already dispatched by another part, or (upstream parity)
+                    # the buffer expired after a stall longer than its TTL.
                     return
                 else:
                     newest_received_at = max(entry["receivedAt"] for entry in entries)
