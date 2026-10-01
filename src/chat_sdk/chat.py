@@ -2927,18 +2927,10 @@ class Chat:
         attachment that lost its ``fetch_data`` closure so downstream
         handlers can still download bytes.
         """
-        # Diverges from upstream: upstream TS has
-        # ``if (raw instanceof Message) return raw;`` because its Redis /
-        # Postgres ``dequeue()`` returns the raw ``JSON.parse(value)`` —
-        # never a ``Message`` instance.  Our Python port's Redis +
-        # Postgres ``dequeue()`` already upgrade the raw dict to
-        # ``Message.from_json(...)`` before returning (see
-        # ``state/redis.py`` and ``state/postgres.py``).  An early return
-        # here would therefore skip ``rehydrate_attachment`` for every
-        # dequeued Message in a persistent backend, leaving
-        # ``fetch_data`` stripped.  We fall through and apply the
-        # rehydrate pass; attachments that still have ``fetch_data``
-        # (e.g. in-memory state) are filtered out below.
+        # A ``Message`` input falls through to the rehydrate pass, as upstream
+        # has done since vercel/chat#802 (chat@4.38.0). Our Redis / Postgres
+        # ``dequeue()`` already return ``Message`` instances, so this is the
+        # common case; attachments that still have ``fetch_data`` are skipped.
         pending_reply_to: Any = None
         if isinstance(raw, Message):
             msg = raw

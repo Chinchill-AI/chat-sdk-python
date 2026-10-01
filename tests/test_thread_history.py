@@ -192,6 +192,8 @@ class TestAppendAndGet:
         reply_to = _make_message("Original", msg_id="m0")
         reply_to.raw = {"secret": "reply data"}
         reply_to.reply_to = root
+        reply_to.author.email = "orig@example.com"
+        reply_to.author.is_system = False
         msg = _make_message("Hello", msg_id="m1")
         msg.raw = {"secret": "data"}
         msg.reply_to = reply_to
@@ -205,6 +207,8 @@ class TestAppendAndGet:
         [restored] = await cache.get_messages("thread-1")
         assert restored.reply_to is not None
         assert restored.reply_to.id == "m0"
+        assert restored.reply_to.author.email == "orig@example.com"
+        assert restored.reply_to.author.is_system is False
         assert restored.reply_to.reply_to is not None
         assert restored.reply_to.reply_to.id == "m-root"
 

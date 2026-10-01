@@ -3553,6 +3553,58 @@ class TestConcurrencyQueueAttachmentRehydration:
         assert queued_attachments is not None
         assert queued_attachments[0].fetch_data is mock_fetch_data
 
+    # Python-specific: the plain-dict fallback (no ``_type`` envelope) reads
+    # ``replyTo`` then ``reply_to``, recurses into it with the same
+    # ``rehydrate_attachment`` pass, and reads ``email`` plus ``isSystem``
+    # then ``is_system`` on the author, keeping ``False`` as ``False``.
+    @pytest.mark.parametrize(
+        ("reply_key", "system_key", "system_value"),
+        [("replyTo", "isSystem", True), ("reply_to", "is_system", False)],
+    )
+    async def test_plain_dict_fallback_reads_reply_to_and_author_fields(self, reply_key, system_key, system_value):
+        adapter = create_mock_adapter("slack")
+        rehydrated: list[str | None] = []
+
+        async def fetched() -> bytes:
+            return b"data"
+
+        def rehydrate(att: Attachment) -> Attachment:
+            rehydrated.append(att.name)
+            return Attachment(type=att.type, name=att.name, fetch_data=fetched)
+
+        adapter.rehydrate_attachment = rehydrate  # type: ignore[attr-defined]
+        chat, _, _ = await _init_chat(adapter=adapter)
+
+        def author(**extra: Any) -> dict[str, Any]:
+            return {"user_id": "U1", "user_name": "u", "full_name": "U", "is_bot": False, "is_me": False, **extra}
+
+        raw = {
+            "id": "msg-1",
+            "thread_id": "slack:C123:1234.5678",
+            "text": "Reply",
+            "author": author(email="a@b.c", **{system_key: system_value}),
+            "metadata": {"date_sent": "2024-01-15T10:30:00+00:00", "edited": False},
+            reply_key: {
+                "id": "msg-0",
+                "thread_id": "slack:C123:1234.5678",
+                "text": "Original",
+                "author": author(),
+                "metadata": {"date_sent": "2024-01-14T10:30:00+00:00", "edited": False},
+                "attachments": [{"type": "file", "name": "reply.pdf"}],
+            },
+        }
+
+        msg = chat._rehydrate_message(raw, adapter)
+
+        assert msg.author.email == "a@b.c"
+        assert msg.author.is_system is system_value
+        assert isinstance(msg.reply_to, Message)
+        assert msg.reply_to.id == "msg-0"
+        assert msg.reply_to.author.email is None
+        assert msg.reply_to.author.is_system is None
+        assert rehydrated == ["reply.pdf"]
+        assert msg.reply_to.attachments[0].fetch_data is fetched
+
 
 # ============================================================================
 # 20. concurrency: debounce (tests 84-85)

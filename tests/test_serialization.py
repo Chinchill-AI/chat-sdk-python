@@ -426,9 +426,23 @@ class TestRoundTrip:
     # ``json.loads(object_hook=...)`` revives bottom-up, so the outer dict
     # reaches ``Message.from_json`` / the Chat reviver with ``replyTo``
     # already a ``Message`` -- both must pass it through.
+    # The authors also check that both revivers read ``email`` / ``isSystem``,
+    # with a ``False`` ``isSystem`` kept as ``False`` (not ``None``).
     def test_reply_to_survives_bottom_up_object_hook_revival(self, mock_adapter, mock_state):
-        reply_to = create_test_message("msg-original", "Original", raw={"r": 1})
-        original = create_test_message("msg-reply", "Reply", reply_to=reply_to)
+        reply_author = Author(
+            user_id="USLACK", user_name="Slack", full_name="Slack", is_bot=False, is_me=False, is_system=True
+        )
+        reply_to = create_test_message("msg-original", "Original", raw={"r": 1}, author=reply_author)
+        outer_author = Author(
+            user_id="U1",
+            user_name="a",
+            full_name="A",
+            is_bot=False,
+            is_me=False,
+            email="a@b.c",
+            is_system=False,
+        )
+        original = create_test_message("msg-reply", "Reply", reply_to=reply_to, author=outer_author)
         assert "replyTo" not in reply_to.to_json()
         payload = json.dumps({"message": original.to_json()})
 
@@ -444,6 +458,10 @@ class TestRoundTrip:
             assert revived.reply_to.id == "msg-original"
             assert revived.reply_to.raw == {"r": 1}
             assert revived.reply_to.reply_to is None
+            assert revived.author.email == "a@b.c"
+            assert revived.author.is_system is False
+            assert revived.reply_to.author.is_system is True
+            assert revived.reply_to.author.email is None
 
     # Python-specific: ``from_json_compat`` prefers snake_case keys and
     # recurses into ``reply_to`` (also accepting an already-revived Message).
