@@ -27,6 +27,7 @@ wire-format / throttle-internal assertions from the hand-rolled era are dropped.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -38,7 +39,7 @@ from chat_sdk.adapters.teams.types import TeamsAdapterConfig, TeamsThreadId
 from chat_sdk.chat import Chat
 from chat_sdk.testing import MockLogger, create_mock_state
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
-from chat_sdk.types import ChatConfig, Message, RawMessage
+from chat_sdk.types import UNSET, ChatConfig, Message, RawMessage, StreamOptions
 
 
 def _make_adapter() -> TeamsAdapter:
@@ -107,6 +108,10 @@ class FakeStreamer:
         raise_cancel_after: int | None = None,
     ) -> None:
         self.emitted: list[str] = []
+        # Status texts passed to ``update()``, and the order of ``update`` /
+        # ``emit`` calls (``("update", text)`` / ``("emit", text)``).
+        self.updates: list[str] = []
+        self.call_order: list[tuple[str, str]] = []
         self._canceled = canceled
         self.closed = False
         self.close_calls = 0
@@ -128,8 +133,11 @@ class FakeStreamer:
     def on_close(self, handler: Any) -> None:  # pragma: no cover - parity shim
         pass
 
-    def update(self, text: str) -> None:  # pragma: no cover - parity shim
-        pass
+    def update(self, text: str) -> None:
+        # Synchronous, like the SDK ``HttpStream.update`` (which queues an
+        # informative typing activity through ``emit``).
+        self.updates.append(text)
+        self.call_order.append(("update", text))
 
     def clear_text(self) -> None:  # pragma: no cover - parity shim
         pass
@@ -151,6 +159,7 @@ class FakeStreamer:
 
         text = activity if isinstance(activity, str) else getattr(activity, "text", "")
         self.emitted.append(text)
+        self.call_order.append(("emit", text))
 
         # Fire on_chunk for the FIRST emitted chunk only, like the SDK
         # (the first stream activity returns the assigned message id).
@@ -538,6 +547,567 @@ class TestBufferedFallback:
         send.assert_not_called()
         assert result.id == ""
         assert result.raw["text"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Placeholder-aware streaming (upstream describe "streaming", vercel/chat#709)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceholderStreaming:
+    @pytest.mark.asyncio
+    async def test_uses_core_fallback_for_an_explicit_group_chat_placeholder(self):
+        adapter = _make_adapter()
+        consumed = False
+
+        async def source():
+            nonlocal consumed
+            consumed = True
+            yield "Done"
+
+        result = await adapter.stream(
+            _channel_thread_id(adapter),
+            source(),
+            StreamOptions(fallback_streaming_placeholder_text="Working..."),
+        )
+
+        assert result is None
+        assert consumed is False
+
+    @pytest.mark.asyncio
+    async def test_an_empty_string_placeholder_also_uses_core_fallback(self):
+        """``""`` is an explicit placeholder (a ``str``), not "unset"."""
+        adapter = _make_adapter()
+        consumed = False
+
+        async def source():
+            nonlocal consumed
+            consumed = True
+            yield "Done"
+
+        result = await adapter.stream(
+            _channel_thread_id(adapter),
+            source(),
+            StreamOptions(fallback_streaming_placeholder_text=""),
+        )
+
+        assert result is None
+        assert consumed is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "options",
+        [None, StreamOptions(), StreamOptions(fallback_streaming_placeholder_text=None)],
+        ids=["no-options", "unset", "none"],
+    )
+    async def test_preserves_buffered_group_chat_streaming_for_placeholder(self, options: StreamOptions | None):
+        """No options, ``UNSET`` and ``None`` all keep the single buffered post."""
+        adapter = _make_adapter()
+        tid = _channel_thread_id(adapter)
+        post_message = AsyncMock(return_value=RawMessage(id="answer-id", thread_id=tid, raw={}))
+        adapter.post_message = post_message  # type: ignore[method-assign]
+
+        async def gen():
+            yield "Do"
+            yield "ne"
+
+        result = await adapter.stream(tid, gen(), options)
+
+        post_message.assert_awaited_once()
+        posted_tid, postable = post_message.call_args.args
+        assert posted_tid == tid
+        assert postable.markdown == "Done"
+        assert result is not None
+        assert result.id == "answer-id"
+
+    @pytest.mark.asyncio
+    async def test_a_canceled_dm_streamer_buffers_even_with_a_placeholder(self):
+        """Upstream returns ``null`` only when there is no streamer at all; a
+        canceled one falls through to the buffered post."""
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        await _register_streamer(adapter, tid, FakeStreamer(canceled=True))
+        post_message = AsyncMock(return_value=RawMessage(id="buffered-1", thread_id=tid, raw={}))
+        adapter.post_message = post_message  # type: ignore[method-assign]
+
+        async def gen():
+            yield "late"
+
+        result = await adapter.stream(tid, gen(), StreamOptions(fallback_streaming_placeholder_text="Working..."))
+
+        assert result is not None
+        assert result.id == "buffered-1"
+        assert post_message.call_args.args[1].markdown == "late"
+
+    @pytest.mark.asyncio
+    async def test_sends_an_explicit_placeholder_as_native_status_before_the_first_chunk(self):
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer(chunk_id="answer-id")
+
+        async def gen():
+            yield "Do"
+            yield "ne"
+
+        result = await adapter._stream_via_emit(tid, gen(), streamer, "Working...")  # type: ignore[arg-type]
+
+        assert streamer.updates == ["Working..."]
+        assert streamer.call_order == [("update", "Working..."), ("emit", "Do"), ("emit", "ne")]
+        assert result.id == "answer-id"
+        assert result.thread_id == tid
+
+    @pytest.mark.asyncio
+    async def test_stream_forwards_the_placeholder_to_the_active_dm_streamer(self):
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer(chunk_id="dm-1")
+        await _register_streamer(adapter, tid, streamer)
+
+        async def gen():
+            yield "hi"
+
+        result = await adapter.stream(tid, gen(), StreamOptions(fallback_streaming_placeholder_text=""))
+
+        assert streamer.call_order == [("update", ""), ("emit", "hi")]
+        assert result is not None
+        assert result.id == "dm-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder", [UNSET, None], ids=["unset", "none"])
+    async def test_unset_or_none_placeholder_sends_no_native_status(self, placeholder: Any):
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer(chunk_id="dm-2")
+        await _register_streamer(adapter, tid, streamer)
+
+        async def gen():
+            yield "hi"
+
+        result = await adapter.stream(tid, gen(), StreamOptions(fallback_streaming_placeholder_text=placeholder))
+
+        assert streamer.updates == []
+        assert streamer.call_order == [("emit", "hi")]
+        assert result is not None
+        assert result.id == "dm-2"
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_raised_by_the_status_update_is_swallowed(self):
+        """``update`` goes through ``emit`` on the SDK streamer, so a stream
+        canceled between the check and the update raises ``StreamCancelledError``
+        there; it is handled like a cancel during iteration."""
+        from microsoft_teams.apps import StreamCancelledError
+
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = FakeStreamer()
+        streamer.update = MagicMock(side_effect=StreamCancelledError("Stream has been cancelled."))  # type: ignore[method-assign]
+        pulled = False
+
+        async def gen():
+            nonlocal pulled
+            pulled = True
+            yield "never"
+
+        result = await adapter._stream_via_emit(tid, gen(), streamer, "Working...")  # type: ignore[arg-type]
+
+        assert result.id == ""
+        assert streamer.emitted == []
+        assert pulled is False
+
+    @pytest.mark.asyncio
+    async def test_group_chat_placeholder_posts_then_edits_through_thread(self):
+        """End to end through ``ThreadImpl``: an explicit placeholder in a group
+        chat is posted by core and then edited to the final text."""
+        adapter = _make_adapter()
+        tid = _channel_thread_id(adapter)
+        adapter.post_message = AsyncMock(return_value=RawMessage(id="ph-1", thread_id=tid, raw={}))  # type: ignore[method-assign]
+        adapter.edit_message = AsyncMock(return_value=RawMessage(id="ph-1", thread_id=tid, raw={}))  # type: ignore[method-assign]
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id=tid,
+                channel_id="19:abc@thread.tacv2",
+                adapter=adapter,  # type: ignore[arg-type]
+                state_adapter=MagicMock(),
+                fallback_streaming_placeholder_text="Working...",
+                streaming_update_interval_ms=0,
+            )
+        )
+
+        async def gen():
+            yield "Do"
+            yield "ne"
+
+        sent = await thread.post(gen())
+
+        adapter.post_message.assert_awaited_once_with(tid, "Working...")
+        assert adapter.edit_message.await_args_list[-1].args[:2] == (tid, "ph-1")
+        assert sent.id == "ph-1"
+        assert sent.text == "Done"
+
+
+def _sdk_has_terminal_stream_errors() -> bool:
+    """``microsoft-teams-apps`` 2.0.16+ raises ``StreamNotAllowedError`` /
+    ``TerminalStreamError`` for a non-cancel 403; 2.0.13.4 marks every 403 as
+    a cancel."""
+    from microsoft_teams.apps.plugins import streamer
+
+    return hasattr(streamer, "StreamNotAllowedError")
+
+
+def _real_sdk_adapter(handler: Any) -> TeamsAdapter:
+    """An adapter whose real SDK clients (``App.api`` on 2.1, and the 2.0.x
+    ``ActivitySender`` that builds streams and sends) talk to ``handler``
+    through an in-memory ``httpx`` transport."""
+    import httpx
+    from microsoft_teams.api import ApiClient
+    from microsoft_teams.common import Client, ClientOptions
+
+    client = Client(ClientOptions(token="bot-token"))
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = _make_adapter()
+    adapter._app.api = ApiClient("https://smba.trafficmanager.net/teams", client)  # type: ignore[method-assign]
+    sender = getattr(adapter._app, "activity_sender", None)
+    if sender is not None:
+        sender._client = client
+    return adapter
+
+
+def _is_stream_activity(body: dict[str, Any]) -> bool:
+    return any(e.get("type") == "streaminfo" for e in body.get("entities") or [])
+
+
+class TestFirstChunkIdWait:
+    """Python-only bound on the first-chunk wait: with ``microsoft-teams-apps``
+    2.0.16+, a terminal 403 on the first flush neither emits ``chunk`` nor
+    sets ``canceled``, so an unbounded wait would hang the handler. On expiry
+    the stream is settled with ``close()`` before anything else is sent."""
+
+    @staticmethod
+    def _silent_streamer(close_result: Any) -> FakeStreamer:
+        streamer = FakeStreamer()
+        streamer.on_chunk = MagicMock()  # type: ignore[method-assign]  # never fires
+        streamer.close = AsyncMock(return_value=close_result)  # type: ignore[method-assign]
+        return streamer
+
+    @pytest.mark.asyncio
+    async def test_posts_the_reply_when_no_chunk_is_ever_delivered(self, monkeypatch: pytest.MonkeyPatch):
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = self._silent_streamer(None)
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
+        async def gen():
+            yield "hello"
+
+        await _register_streamer(adapter, tid, streamer)
+        result = await asyncio.wait_for(adapter.stream(tid, gen()), 2)
+
+        # close() reported nothing delivered, so the accumulated text is
+        # delivered with one buffered post instead of being dropped.
+        assert streamer.emitted == ["hello"]
+        streamer.close.assert_awaited_once()
+        send.assert_awaited_once()
+        activity, ref = send.call_args.args
+        assert activity.text == "hello"
+        assert ref.conversation.id == "a:1Abc-DM-conversation-id"
+        assert result is not None and result.id == "fallback-1"
+        adapter._logger.warn.assert_called_once()
+        # The failed streamer is retired (the SDK keeps the posted text in its
+        # buffer), so a second post in the same handler does not reuse it.
+        assert tid not in adapter._active_streams
+
+        async def gen2():
+            yield "again"
+
+        await adapter.stream(tid, gen2())
+        assert streamer.emitted == ["hello"]
+        assert [c.args[0].text for c in send.await_args_list] == ["hello", "again"]
+
+    @pytest.mark.asyncio
+    async def test_uses_the_settled_stream_when_the_first_chunk_arrives_late(self, monkeypatch: pytest.MonkeyPatch):
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        # The fake never fires ``chunk``, so the settled result's id is used.
+        monkeypatch.setattr(adapter_module, "STREAM_SETTLED_CHUNK_ID_TIMEOUT_S", 0.05)
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = self._silent_streamer(_SentActivity("late-stream-1"))
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
+        async def gen():
+            yield "hello"
+
+        await _register_streamer(adapter, tid, streamer)
+        result = await asyncio.wait_for(adapter.stream(tid, gen()), 2)
+
+        send.assert_not_awaited()
+        assert result is not None
+        assert result.id == "late-stream-1"
+        assert result.raw == {"text": "hello"}
+        # The finalized streamer is retired, so a second post in the same
+        # handler is sent as a plain message instead of reusing it.
+        assert tid not in adapter._active_streams
+
+        async def gen2():
+            yield "again"
+
+        second = await adapter.stream(tid, gen2())
+        assert second is not None and second.id == "fallback-1"
+        assert streamer.emitted == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_sends_nothing_more_when_the_user_cancels_during_the_wait(self, monkeypatch: pytest.MonkeyPatch):
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = self._silent_streamer(None)
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
+        async def gen():
+            yield "hello"
+
+        task = asyncio.ensure_future(adapter._stream_via_emit(tid, gen(), streamer))  # type: ignore[arg-type]
+        await asyncio.sleep(0)
+        streamer._canceled = True  # the SDK marks a cancel 403 on the background flush
+        result = await asyncio.wait_for(task, 2)
+
+        streamer.close.assert_not_awaited()
+        send.assert_not_awaited()
+        assert result.id == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _sdk_has_terminal_stream_errors(), reason="this SDK treats every streaming 403 as a cancel")
+    async def test_real_sdk_stream_refused_with_a_terminal_403_posts_the_reply(self, monkeypatch: pytest.MonkeyPatch):
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        stream_requests: list[dict[str, Any]] = []
+        plain_posts: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            if _is_stream_activity(body):
+                stream_requests.append(body)
+                return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
+            plain_posts.append(body)
+            return httpx.Response(200, json={"id": "fallback-post-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        # The streamed chunk was refused, so the reply arrives as one plain post.
+        assert len(stream_requests) == 1
+        assert [p["text"] for p in plain_posts] == ["hello"]
+        assert result.id == "fallback-post-1"
+        assert result.raw["text"] == "hello"
+        # The handler's later close() sends nothing more.
+        assert await stream.close() is None
+        assert len(stream_requests) == 1 and len(plain_posts) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _sdk_has_terminal_stream_errors(), reason="this SDK treats every streaming 403 as a cancel")
+    async def test_real_sdk_chunk_stranded_by_a_failed_flush_is_posted(self, monkeypatch: pytest.MonkeyPatch):
+        """A chunk emitted while the first flush awaits its 403 stays queued
+        with no flush scheduled: that is not an in-flight send, so the whole
+        reply is posted."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        stream_requests: list[dict[str, Any]] = []
+        plain_posts: list[dict[str, Any]] = []
+        first_flush_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            if _is_stream_activity(body):
+                stream_requests.append(body)
+                first_flush_started.set()
+                await asyncio.sleep(0.1)
+                return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
+            plain_posts.append(body)
+            return httpx.Response(200, json={"id": "fallback-post-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        stream._total_wait_timeout = 0.05  # type: ignore[attr-defined]  # the SDK's 30 s close() wait
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
+
+        async def gen():
+            yield "hello"
+            await first_flush_started.wait()
+            yield " world"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert len(stream_requests) == 1
+        assert stream.count == 1  # " world" stranded in the SDK queue
+        assert [p["text"] for p in plain_posts] == ["hello world"]
+        assert result.id == "fallback-post-1"
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_stream_canceled_on_the_first_flush_posts_nothing(self, monkeypatch: pytest.MonkeyPatch):
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if _is_stream_activity(body):
+                return httpx.Response(403, json={"error": {"message": "Content stream was cancelled by user"}})
+            return httpx.Response(200, json={"id": "fallback-post-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert stream.canceled is True
+        assert [_is_stream_activity(r) for r in requests] == [True]
+        assert result.id == ""
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_cancel_while_settling_returns_normally(self, monkeypatch: pytest.MonkeyPatch):
+        """The slow first flush succeeds, then the user cancels while the
+        stream is being finalized: the cancel is swallowed like every other
+        native-stream cancel, and nothing is posted."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await asyncio.sleep(0.3)
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            return httpx.Response(403, json={"error": {"message": "Content stream was cancelled by user"}})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert stream.canceled is True
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
+        assert result.id == ""
+        assert result.raw == {"text": "hello"}
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_slow_first_flush_is_not_duplicated(self, monkeypatch: pytest.MonkeyPatch):
+        """The first flush is still in flight when the bound expires: the
+        reply is finalized as a stream, never also posted, and keeps the id
+        Teams assigned to the first chunk."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await asyncio.sleep(0.3)
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            # Teams returns the id only on the first streaming response.
+            return httpx.Response(200, json={})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        # One streaming chunk, then the stream's final message; no plain post.
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
+        assert [r.get("text") for r in requests] == ["hello", "hello"]
+        assert result.id == "stream-msg-1"
+        assert await stream.close() is not None
+        assert len(requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_flush_outlasting_close_is_not_also_posted(self, monkeypatch: pytest.MonkeyPatch):
+        """The first flush is still in flight after both the first-chunk bound
+        and ``close()``'s own wait: no buffered post is sent, because the SDK
+        can still deliver the stream (the SDK client has no request timeout),
+        and the handler's later ``close()`` finalizes it."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+        release = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await release.wait()
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            return httpx.Response(200, json={})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        stream._total_wait_timeout = 0.05  # type: ignore[attr-defined]  # the SDK's 30 s close() wait
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert [_is_stream_activity(r) for r in requests] == [True]
+        assert result.id == ""
+        # The flush completes later; the handler's close() finalizes the stream.
+        release.set()
+        stream._total_wait_timeout = 5  # type: ignore[attr-defined]
+        assert await stream.close() is not None
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
 
 
 # ---------------------------------------------------------------------------

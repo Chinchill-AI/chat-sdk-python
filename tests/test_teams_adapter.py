@@ -1567,6 +1567,8 @@ class TestOutboundServiceUrlRouting:
             "edit_message",
             "delete_message",
             "start_typing",
+            "add_reaction",
+            "remove_reaction",
         ],
     )
     async def test_every_outbound_op_rejects_a_disallowed_thread_url_before_sending(
@@ -1600,6 +1602,8 @@ class TestOutboundServiceUrlRouting:
             "edit_message": lambda: adapter.edit_message(thread_id, "m-1", "hi"),
             "delete_message": lambda: adapter.delete_message(thread_id, "m-1"),
             "start_typing": lambda: adapter.start_typing(thread_id),
+            "add_reaction": lambda: adapter.add_reaction(thread_id, "m-1", "like"),
+            "remove_reaction": lambda: adapter.remove_reaction(thread_id, "m-1", "like"),
         }
 
         if operation == "start_typing":
@@ -2214,24 +2218,552 @@ class TestStartTyping:
 
 
 # ---------------------------------------------------------------------------
-# addReaction / removeReaction (not supported)
+# addReaction / removeReaction (upstream describe "reactions", vercel/chat#734)
 # ---------------------------------------------------------------------------
+
+_GROUP_THREAD = TeamsThreadId(
+    conversation_id="19:abc@thread.tacv2",
+    service_url="https://smba.trafficmanager.net/teams/",
+)
+
+
+class _SdkStatusError(Exception):
+    """An SDK-style error carrying an HTTP status on ``.status_code``."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _reaction_test_adapter() -> tuple[TeamsAdapter, AsyncMock, AsyncMock, str]:
+    """Upstream ``createReactionTestAdapter``: ``App.api`` exposes only
+    ``conversations.add_reaction`` / ``delete_reaction`` (the 2.0.16+ SDK shape)."""
+    adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+    add_reaction = AsyncMock(return_value=None)
+    delete_reaction = AsyncMock(return_value=None)
+    adapter._app.api = SimpleNamespace(  # type: ignore[method-assign]
+        service_url="https://smba.trafficmanager.net/teams",
+        conversations=SimpleNamespace(add_reaction=add_reaction, delete_reaction=delete_reaction),
+    )
+    return adapter, add_reaction, delete_reaction, adapter.encode_thread_id(_GROUP_THREAD)
 
 
 class TestReactions:
     @pytest.mark.asyncio
-    async def test_add_reaction_warns_instead_of_raising(self):
-        logger = _make_logger()
-        adapter = _make_adapter(logger=logger)
-        await adapter.add_reaction("tid", "mid", "emoji")
-        assert logger.warn.call_count == 1
+    async def test_should_add_a_raw_teams_reaction_id(self):
+        adapter, add_reaction, _delete, thread_id = _reaction_test_adapter()
+
+        await adapter.add_reaction(thread_id, "message-1", "think")
+
+        add_reaction.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", "think")
 
     @pytest.mark.asyncio
-    async def test_remove_reaction_warns_instead_of_raising(self):
-        logger = _make_logger()
-        adapter = _make_adapter(logger=logger)
-        await adapter.remove_reaction("tid", "mid", "emoji")
-        assert logger.warn.call_count == 1
+    @pytest.mark.parametrize(
+        ("name", "teams_id"),
+        [
+            ("check", "2705_whiteheavycheckmark"),
+            ("eyes", "1f440_eyes"),
+            ("pin", "1f4cc_pushpin"),
+            ("rocket", "launch"),
+            ("thinking", "think"),
+            ("thumbs_up", "like"),
+            ("x", "274c_crossmark"),
+        ],
+    )
+    async def test_should_map_name_to_the_teams_reaction_id(self, name: str, teams_id: str):
+        from chat_sdk.emoji import get_emoji
+
+        adapter, add_reaction, _delete, thread_id = _reaction_test_adapter()
+
+        await adapter.add_reaction(thread_id, "message-1", get_emoji(name))
+
+        add_reaction.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", teams_id)
+
+    @pytest.mark.asyncio
+    async def test_should_remove_a_reaction_with_the_teams_conversation_api(self):
+        from chat_sdk.emoji import get_emoji
+
+        adapter, add_reaction, delete_reaction, thread_id = _reaction_test_adapter()
+
+        await adapter.remove_reaction(thread_id, "message-1", get_emoji("check"))
+
+        delete_reaction.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", "2705_whiteheavycheckmark")
+        add_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_should_translate_teams_api_failures(self):
+        from chat_sdk.shared.errors import AuthenticationError
+
+        adapter, add_reaction, _delete, thread_id = _reaction_test_adapter()
+        add_reaction.side_effect = _SdkStatusError(401, "Unauthorized")
+
+        with pytest.raises(AuthenticationError, match="addReaction"):
+            await adapter.add_reaction(thread_id, "message-1", "like")
+
+    @pytest.mark.asyncio
+    async def test_remove_failure_is_reported_as_remove_reaction(self):
+        from chat_sdk.shared.errors import AuthenticationError
+
+        adapter, _add, delete_reaction, thread_id = _reaction_test_adapter()
+        delete_reaction.side_effect = _SdkStatusError(401, "Unauthorized")
+
+        with pytest.raises(AuthenticationError, match="removeReaction"):
+            await adapter.remove_reaction(thread_id, "message-1", "like")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["like/../../x", "like?x=1", "like#x", "", "like\n", "%2e%2e", "lik e"])
+    async def test_rejects_a_reaction_name_that_is_not_path_safe_before_any_call(self, name: str):
+        """Python-only: the SDK puts the reaction type into the URL path unescaped."""
+        adapter, add_reaction, delete_reaction, thread_id = _reaction_test_adapter()
+
+        with pytest.raises(ValidationError, match="Invalid Teams reaction type"):
+            await adapter.add_reaction(thread_id, "message-1", name)
+        with pytest.raises(ValidationError, match="Invalid Teams reaction type"):
+            await adapter.remove_reaction(thread_id, "message-1", name)
+
+        add_reaction.assert_not_called()
+        delete_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_hyphenated_reaction_id(self):
+        adapter, add_reaction, _delete, thread_id = _reaction_test_adapter()
+
+        await adapter.add_reaction(thread_id, "message-1", "yes-tone1")
+
+        add_reaction.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", "yes-tone1")
+
+    @pytest.mark.asyncio
+    async def test_uses_the_reactions_client_on_sdks_without_conversation_reactions(self):
+        """``microsoft-teams-api`` 2.0.13 has only ``ApiClient.reactions``."""
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        add = AsyncMock(return_value=None)
+        delete = AsyncMock(return_value=None)
+        adapter._app.api = SimpleNamespace(  # type: ignore[method-assign]
+            service_url="https://smba.trafficmanager.net/teams",
+            conversations=SimpleNamespace(),
+            reactions=SimpleNamespace(add=add, delete=delete),
+        )
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+
+        await adapter.add_reaction(thread_id, "message-1", "thumbs_up")
+        await adapter.remove_reaction(thread_id, "message-1", "thumbs_up")
+
+        add.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", "like")
+        delete.assert_awaited_once_with("19:abc@thread.tacv2", "message-1", "like")
+
+    @pytest.mark.asyncio
+    async def test_reaction_hits_the_wire_on_the_threads_service_url(self):
+        """The real SDK client issues ``PUT``/``DELETE`` on the thread's service URL."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        from microsoft_teams.api import ApiClient
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._app.api = ApiClient("https://smba.trafficmanager.net/teams", _bot_http_client(handler))  # type: ignore[method-assign]
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url="https://smba.trafficmanager.net/emea/",
+            )
+        )
+
+        await adapter.add_reaction(thread_id, "1700000000000", "eyes")
+        await adapter.remove_reaction(thread_id, "1700000000000", "eyes")
+
+        assert [(r.method, str(r.url)) for r in requests] == [
+            (
+                "PUT",
+                "https://smba.trafficmanager.net/emea/v3/conversations/19:abc@thread.tacv2"
+                "/activities/1700000000000/reactions/1f440_eyes",
+            ),
+            (
+                "DELETE",
+                "https://smba.trafficmanager.net/emea/v3/conversations/19:abc@thread.tacv2"
+                "/activities/1700000000000/reactions/1f440_eyes",
+            ),
+        ]
+        assert requests[0].headers["authorization"] == "Bearer bot-token"
+
+
+# ---------------------------------------------------------------------------
+# postEphemeral (upstream describe "postEphemeral", vercel/chat#737)
+# ---------------------------------------------------------------------------
+
+
+class TestPostEphemeral:
+    @pytest.mark.asyncio
+    async def test_should_send_a_targeted_text_message_to_the_requested_user(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "targeted-msg-123")
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", {"markdown": "Only you can see this"})
+
+        assert result.id == "targeted-msg-123"
+        assert result.thread_id == thread_id
+        assert result.used_fallback is False
+        send.assert_awaited_once()
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
+        assert activity.recipient.id == "29:target-user"
+        assert activity.recipient.name == "29:target-user"
+        assert activity.recipient.is_targeted is True
+        assert activity.recipient.role == "user"
+        assert activity.text == "Only you can see this"
+        assert activity.text_format == "markdown"
+        wire = activity.model_dump(by_alias=True, exclude_none=True)
+        assert wire["recipient"] == {
+            "id": "29:target-user",
+            "name": "29:target-user",
+            "role": "user",
+            "isTargeted": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_should_send_targeted_adaptive_cards(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "targeted-card-123")
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+
+        result = await adapter.post_ephemeral(
+            thread_id,
+            "29:target-user",
+            {"card": {"type": "card", "title": "Private card", "children": []}},
+        )
+
+        assert result.id == "targeted-card-123"
+        assert result.used_fallback is False
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
+        assert [a.content_type for a in activity.attachments] == ["application/vnd.microsoft.card.adaptive"]
+        assert activity.recipient.id == "29:target-user"
+        assert activity.recipient.is_targeted is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["text", "card"])
+    async def test_targeted_messages_carry_file_attachments(self, kind: str):
+        """Python-only coverage (upstream's postEphemeral tests send no files):
+        files ride on the targeted activity as data-URI attachments, after the
+        adaptive card when there is one, and the activity stays targeted."""
+        from chat_sdk.cards import Card
+        from chat_sdk.types import FileUpload, PostableCard, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "targeted-file-1")
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+        files = [FileUpload(data=b"a,b\n1,2\n", filename="report.csv", mime_type="text/csv")]
+        message = (
+            PostableMarkdown(markdown="your report", files=files)
+            if kind == "text"
+            else PostableCard(card=Card(title="Results"), files=files)
+        )
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", message)
+
+        assert result.used_fallback is False
+        activity, _ref = send.call_args.args
+        wire = activity.model_dump(by_alias=True, exclude_none=True)
+        content_types = [a["contentType"] for a in wire["attachments"]]
+        if kind == "text":
+            assert wire["text"] == "your report"
+            assert content_types == ["text/csv"]
+        else:
+            assert content_types == ["application/vnd.microsoft.card.adaptive", "text/csv"]
+        file_att = wire["attachments"][-1]
+        assert file_att["name"] == "report.csv"
+        assert file_att["contentUrl"] == "data:text/csv;base64,YSxiCjEsMgo="
+        assert wire["recipient"]["isTargeted"] is True
+        assert wire["recipient"]["id"] == "29:target-user"
+
+    @pytest.mark.asyncio
+    async def test_should_handle_targeted_send_failure_by_calling_handle_teams_error(self):
+        from chat_sdk.shared.errors import AuthenticationError
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter)
+        send.side_effect = _SdkStatusError(401, "Unauthorized")
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+
+        with pytest.raises(AuthenticationError, match="postEphemeral"):
+            await adapter.post_ephemeral(thread_id, "29:target-user", "Private")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_normal_post_in_a_1_1_chat_instead_of_a_targeted_send(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "personal-msg-123")
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:1personal-chat-id",
+                service_url="https://smba.trafficmanager.net/teams/",
+            )
+        )
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", {"markdown": "Only you can see this"})
+
+        assert result.id == "personal-msg-123"
+        assert result.used_fallback is True
+        activity, _ref = send.call_args.args
+        assert activity.recipient is None
+        assert activity.text == "Only you can see this"
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_personal_type_falls_back_even_with_a_19_id(self):
+        """``is_dm`` honours the thread ID's explicit type, so the SDK's
+        personal-chat guard on targeted sends is never reached."""
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "personal-msg-2")
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:personal@unq.gbl.spaces",
+                service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="personal",
+            )
+        )
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+
+        assert result.used_fallback is True
+        activity, ref = send.call_args.args
+        assert activity.recipient is None
+        assert ref.conversation.conversation_type == "personal"
+
+    @pytest.mark.asyncio
+    async def test_an_a_prefixed_group_chat_gets_a_targeted_send(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "targeted-group-1")
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:group-chat",
+                service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="groupChat",
+            )
+        )
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+
+        assert result.used_fallback is False
+        activity, _ref = send.call_args.args
+        assert activity.recipient.is_targeted is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_disallowed_service_url_before_sending(self):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter)
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url="https://evil.example.com/")
+        )
+
+        with pytest.raises(NetworkError):
+            await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+        send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_targeted_send_edit_and_delete_hit_the_targeted_endpoints_on_the_wire(self):
+        """Real SDK clients over an in-memory transport: the targeted create, the
+        later edit and the delete all carry ``isTargetedActivity=true``. The send
+        goes through 2.1's ``send_or_update_activity`` (2.0.x's
+        ``ActivitySender`` builds its own client, so that half needs 2.1)."""
+        pytest.importorskip("microsoft_teams.apps.activity_send")
+        import json as _json
+
+        from microsoft_teams.api import ApiClient
+
+        from chat_sdk.testing import create_mock_chat_instance
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "DELETE":
+                return httpx.Response(200)
+            return httpx.Response(200, json={"id": "targeted-wire-1"})
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        adapter._chat = create_mock_chat_instance()  # type: ignore[assignment]
+        adapter._app.api = ApiClient("https://smba.trafficmanager.net/teams", _bot_http_client(handler))  # type: ignore[method-assign]
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+        await adapter.edit_message(thread_id, result.id, "edited")
+        await adapter.delete_message(thread_id, result.id)
+
+        base = "https://smba.trafficmanager.net/teams/v3/conversations/19:abc@thread.tacv2/activities"
+        assert [(r.method, str(r.url)) for r in requests] == [
+            ("POST", f"{base}?isTargetedActivity=true"),
+            ("PUT", f"{base}/targeted-wire-1?isTargetedActivity=true"),
+            ("DELETE", f"{base}/targeted-wire-1?isTargetedActivity=true"),
+        ]
+        sent = _json.loads(requests[0].content)
+        assert sent["recipient"] == {
+            "id": "29:target-user",
+            "name": "29:target-user",
+            "role": "user",
+            "isTargeted": True,
+        }
+        assert sent["text"] == "hi"
+        assert "recipient" not in _json.loads(requests[1].content)
+
+
+# ---------------------------------------------------------------------------
+# Targeted message mutation (upstream describe "targeted message mutation",
+# vercel/chat#951)
+# ---------------------------------------------------------------------------
+
+
+def _targeted_adapter(state: Any = None) -> tuple[TeamsAdapter, SimpleNamespace, str, Any]:
+    """Upstream ``createTargetedAdapter``: a Chat with mock state, a sender that
+    returns ``targeted-msg-1`` and activity ops for both endpoints."""
+    from chat_sdk.testing import create_mock_chat_instance, create_mock_state
+
+    adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+    resolved_state = state if state is not None else create_mock_state()
+    adapter._chat = create_mock_chat_instance(state=resolved_state)  # type: ignore[assignment]
+    calls = SimpleNamespace(
+        update=AsyncMock(return_value=_SentActivity("targeted-msg-1")),
+        update_targeted=AsyncMock(return_value=_SentActivity("targeted-msg-1")),
+        delete=AsyncMock(return_value=None),
+        delete_targeted=AsyncMock(return_value=None),
+    )
+    _mock_app_send(adapter, "targeted-msg-1")
+    adapter._app.api = SimpleNamespace(  # type: ignore[method-assign]
+        service_url="https://smba.trafficmanager.net/teams",
+        conversations=SimpleNamespace(activities=MagicMock(return_value=calls)),
+    )
+    return adapter, calls, adapter.encode_thread_id(_GROUP_THREAD), resolved_state
+
+
+class TestTargetedMessageMutation:
+    @pytest.mark.asyncio
+    async def test_deletes_a_message_it_sent_targeted_through_the_targeted_endpoint(self):
+        adapter, calls, thread_id, _state = _targeted_adapter()
+        await adapter.post_ephemeral(thread_id, "29:target-user", {"markdown": "Only you can see this"})
+
+        await adapter.delete_message(thread_id, "targeted-msg-1")
+
+        calls.delete_targeted.assert_awaited_once_with("targeted-msg-1")
+        calls.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edits_a_message_it_sent_targeted_through_the_targeted_endpoint(self):
+        adapter, calls, thread_id, _state = _targeted_adapter()
+        await adapter.post_ephemeral(thread_id, "29:target-user", {"markdown": "Only you can see this"})
+
+        await adapter.edit_message(thread_id, "targeted-msg-1", {"markdown": "Updated"})
+
+        calls.update_targeted.assert_awaited_once()
+        message_id, activity = calls.update_targeted.call_args.args
+        assert message_id == "targeted-msg-1"
+        assert activity.text == "Updated"
+        calls.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_leaves_a_message_it_did_not_send_targeted_on_the_plain_endpoint(self):
+        adapter, calls, thread_id, _state = _targeted_adapter()
+
+        await adapter.delete_message(thread_id, "public-msg-1")
+        await adapter.edit_message(thread_id, "public-msg-1", {"markdown": "Updated"})
+
+        calls.delete.assert_awaited_once_with("public-msg-1")
+        assert calls.update.await_count == 1
+        calls.delete_targeted.assert_not_called()
+        calls.update_targeted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stops_treating_a_targeted_message_as_targeted_once_it_is_deleted(self):
+        adapter, calls, thread_id, _state = _targeted_adapter()
+        await adapter.post_ephemeral(thread_id, "29:target-user", {"markdown": "Only you can see this"})
+
+        await adapter.delete_message(thread_id, "targeted-msg-1")
+        await adapter.delete_message(thread_id, "targeted-msg-1")
+
+        assert calls.delete_targeted.await_count == 1
+        assert calls.delete.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_plain_endpoint_when_the_state_adapter_cannot_be_read(self):
+        from chat_sdk.testing import create_mock_state
+
+        state = create_mock_state()
+        state.get = AsyncMock(side_effect=RuntimeError("state unavailable"))  # type: ignore[method-assign]
+        adapter, calls, thread_id, _state = _targeted_adapter(state)
+
+        await adapter.delete_message(thread_id, "msg-1")
+
+        calls.delete.assert_awaited_once_with("msg-1")
+        calls.delete_targeted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_records_the_targeted_id_under_the_cross_sdk_key_with_a_24h_ttl(self):
+        from chat_sdk.testing import create_mock_state
+
+        state = create_mock_state()
+        state.set = AsyncMock(wraps=state.set)  # type: ignore[method-assign]
+        adapter, _calls, thread_id, _state = _targeted_adapter(state)
+
+        await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+
+        state.set.assert_awaited_once_with(
+            "teams:targetedActivity:19:abc@thread.tacv2:targeted-msg-1", "1", 24 * 60 * 60 * 1000
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_state_write_failure_does_not_fail_the_targeted_send(self):
+        from chat_sdk.testing import create_mock_state
+
+        state = create_mock_state()
+        state.set = AsyncMock(side_effect=RuntimeError("state unavailable"))  # type: ignore[method-assign]
+        adapter, _calls, thread_id, _state = _targeted_adapter(state)
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+
+        assert result.id == "targeted-msg-1"
+        assert result.used_fallback is False
+
+    @pytest.mark.asyncio
+    async def test_a_state_delete_failure_does_not_fail_the_targeted_delete(self):
+        adapter, calls, thread_id, state = _targeted_adapter()
+        await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+        state.delete = AsyncMock(side_effect=RuntimeError("state unavailable"))
+
+        await adapter.delete_message(thread_id, "targeted-msg-1")
+
+        calls.delete_targeted.assert_awaited_once_with("targeted-msg-1")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_targeted_delete_keeps_the_record(self):
+        """The record is forgotten only after Teams accepts the delete, so a
+        retry still uses the targeted endpoint."""
+        from chat_sdk.shared.errors import AuthenticationError
+
+        adapter, calls, thread_id, state = _targeted_adapter()
+        await adapter.post_ephemeral(thread_id, "29:target-user", "hi")
+        calls.delete_targeted.side_effect = [_SdkStatusError(401, "Unauthorized"), None]
+
+        with pytest.raises(AuthenticationError):
+            await adapter.delete_message(thread_id, "targeted-msg-1")
+        await adapter.delete_message(thread_id, "targeted-msg-1")
+
+        assert calls.delete_targeted.await_count == 2
+        calls.delete.assert_not_called()
+        assert "teams:targetedActivity:19:abc@thread.tacv2:targeted-msg-1" not in state.cache
+
+    @pytest.mark.asyncio
+    async def test_a_1_1_fallback_post_is_not_recorded_as_targeted(self):
+        adapter, calls, _thread_id, state = _targeted_adapter()
+        dm_thread = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:1personal-chat-id", service_url="https://smba.trafficmanager.net/teams/")
+        )
+
+        await adapter.post_ephemeral(dm_thread, "29:target-user", "hi")
+        await adapter.delete_message(dm_thread, "targeted-msg-1")
+
+        assert state.cache == {}
+        calls.delete.assert_awaited_once_with("targeted-msg-1")
+        calls.delete_targeted.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
