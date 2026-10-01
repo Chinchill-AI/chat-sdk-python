@@ -1429,6 +1429,95 @@ class AppHomeOpenedEvent:
     adapter: Adapter
     channel_id: str
     user_id: str
+    # Folded active-view context (Slack agent_view only); ``None`` otherwise.
+    entities: list[AppContextEntity] | None = None
+    # The opened tab as reported by the platform (Slack: ``"home"`` or
+    # ``"messages"``). Under agent_view the event fires for every tab, so use
+    # this to tell a Home-tab open from the Messages-tab DM-open signal.
+    tab: str | None = None
+
+
+# -- App context (Slack agent_view) -------------------------------------------
+#
+# Upstream models ``AppContextEntity`` as a TS discriminated union of
+# interfaces keyed on ``kind``. Python uses one dataclass per variant with a
+# ``kind`` Literal default, so ``match entity.kind`` / ``isinstance`` both
+# narrow. Fields are snake_case; adapters map platform JSON into them.
+
+
+@dataclass(kw_only=True)
+class AppContextEntityBase:
+    """Fields shared by every app-context entity (upstream ``AppContextEntityBase``)."""
+
+    enterprise_id: str | None = None
+    team_id: str | None = None
+
+
+@dataclass
+class AppContextChannelEntity(AppContextEntityBase):
+    """The user is viewing a channel."""
+
+    channel_id: str
+    kind: Literal["channel"] = "channel"
+
+
+@dataclass
+class AppContextCanvasEntity(AppContextEntityBase):
+    """The user is viewing a canvas."""
+
+    canvas_id: str
+    kind: Literal["canvas"] = "canvas"
+
+
+@dataclass
+class AppContextListEntity(AppContextEntityBase):
+    """The user is viewing a list."""
+
+    list_id: str
+    kind: Literal["list"] = "list"
+
+
+@dataclass
+class AppContextMessageEntity(AppContextEntityBase):
+    """The user is viewing a specific message."""
+
+    channel_id: str
+    message_ts: str
+    kind: Literal["message"] = "message"
+
+
+@dataclass
+class AppContextUnknownEntity(AppContextEntityBase):
+    """An entity type the SDK does not model; ``type``/``value`` are passed through."""
+
+    type: str
+    value: Any
+    kind: Literal["unknown"] = "unknown"
+
+
+AppContextEntity = (
+    AppContextChannelEntity
+    | AppContextCanvasEntity
+    | AppContextListEntity
+    | AppContextMessageEntity
+    | AppContextUnknownEntity
+)
+
+
+@dataclass
+class AppContextChangedEvent:
+    """Reports what the user is currently viewing (Slack ``app_context_changed``, agent_view only)."""
+
+    adapter: Adapter
+    # The agent conversation channel.
+    channel_id: str
+    # Entities the user is viewing, ordered by relevance. Empty when Slack
+    # sends ``context: {}``.
+    entities: list[AppContextEntity]
+    # Platform-specific raw payload (escape hatch).
+    raw: Any
+    # The user whose active view changed.
+    user_id: str
 
 
 @dataclass
@@ -1439,6 +1528,81 @@ class MemberJoinedChannelEvent:
     channel_id: str
     user_id: str
     inviter_id: str | None = None
+
+
+# -- Message lifecycle ----------------------------------------------------------
+
+
+@dataclass
+class MessageDeletedEvent:
+    """A platform reported that a message was deleted.
+
+    The deleted message body is usually unavailable; adapters set
+    ``previous_message`` when the platform supplied enough data to parse it.
+    ``platform`` may be left ``None`` by adapters: :class:`~chat_sdk.chat.Chat`
+    fills it with the adapter name before handlers run, so handlers always see
+    a ``str``.
+    """
+
+    adapter: Adapter
+    # Platform/channel identifier from the adapter event.
+    channel_id: str
+    # The deleted platform-native message ID.
+    message_id: str
+    # Platform-specific raw delete event.
+    raw: Any
+    # Thread containing the deleted message.
+    thread_id: str
+    # Adapter name, e.g. ``"slack"``. ``None`` → filled with ``adapter.name``.
+    platform: str | None = None
+    # When the delete happened (aware UTC), if supplied by the platform.
+    deleted_at: datetime | None = None
+    # Previous message snapshot, if supplied by the platform.
+    previous_message: Message | None = None
+
+
+# -- Installation lifecycle -----------------------------------------------------
+
+# ``add-upgrade`` / ``remove-upgrade`` are sent when an app upgrade adds or
+# removes the bot from its manifest.
+InstallationAction = Literal["add", "add-upgrade", "remove", "remove-upgrade"]
+
+
+@dataclass
+class InstallationEvent:
+    """Installation lifecycle metadata. Currently emitted by the Teams adapter."""
+
+    action: InstallationAction
+    adapter: Adapter
+    # Platform conversation ID identifying the installation location.
+    conversation_id: str
+    # Platform activity ID, useful for application-level idempotency.
+    id: str
+    raw: Any
+    # Normalized Chat destination for the installation location, usable with
+    # ``chat.channel(channel_id)`` and safe to persist for later proactive
+    # sends. ``None`` only when the platform supplied no way to reach the
+    # conversation (handlers then run with no active conversation).
+    channel_id: str | None = None
+    locale: str | None = None
+    tenant_id: str | None = None
+    # Actor who installed or removed the bot, distinct from the bot itself.
+    user_id: str | None = None
+
+
+@dataclass
+class InstalledEvent(InstallationEvent):
+    """The bot was installed (``add``) or added by an app upgrade (``add-upgrade``)."""
+
+    # Narrows the parent's action like upstream's `interface InstalledEvent extends`.
+    action: Literal["add", "add-upgrade"]  # pyrefly: ignore[bad-override-mutable-attribute]
+
+
+@dataclass
+class UninstalledEvent(InstallationEvent):
+    """The bot was removed (``remove``) or dropped by an app upgrade (``remove-upgrade``)."""
+
+    action: Literal["remove", "remove-upgrade"]  # pyrefly: ignore[bad-override-mutable-attribute]
 
 
 # =============================================================================
@@ -1809,9 +1973,28 @@ class ChatInstance(Protocol):
         self, event: AssistantContextChangedEvent, options: WebhookOptions | None = None
     ) -> None: ...
     def process_app_home_opened(self, event: AppHomeOpenedEvent, options: WebhookOptions | None = None) -> None: ...
+    def process_app_context_changed(
+        self, event: AppContextChangedEvent, options: WebhookOptions | None = None
+    ) -> None: ...
     def process_member_joined_channel(
         self, event: MemberJoinedChannelEvent, options: WebhookOptions | None = None
     ) -> None: ...
+    def process_message_updated(
+        self,
+        adapter: Adapter,
+        thread_id: str,
+        message: Message | Callable[[], Awaitable[Message]],
+        previous_message: Message | Callable[[], Awaitable[Message]] | None = None,
+        options: WebhookOptions | None = None,
+    ) -> asyncio.Task[None] | None: ...
+    def process_message_deleted(
+        self, event: MessageDeletedEvent, options: WebhookOptions | None = None
+    ) -> asyncio.Task[None] | None: ...
+
+    # ``process_installed`` / ``process_uninstalled`` are deliberately NOT
+    # declared here: they are optional on upstream's ``ChatInstance`` so
+    # custom implementations predating them keep working. ``Chat`` implements
+    # both; adapters call them via ``getattr(chat, "process_installed", None)``.
 
     # Cross-platform per-user transcript store.  Raises on access when
     # ``transcripts`` is not configured on the Chat instance — callers should
@@ -2010,6 +2193,27 @@ class IdentityContext:
 # message, or the bot itself).  The SDK fails loudly rather than silently
 # falling back to a platform-specific ID.  May be sync or async.
 IdentityResolver = Callable[[IdentityContext], "str | None | Awaitable[str | None]"]
+
+# -- Lifecycle handlers ----------------------------------------------------------
+#
+# Handlers may be sync or async (``Chat`` awaits the result only when it is
+# awaitable), the same as every other ``Chat`` handler type.
+
+# ``chat.on_message_updated``: called as ``handler(thread, message,
+# previous_message)``. The bot's own edits are filtered out, and updates never
+# reach ``on_mention`` / ``on_subscribed_message`` / pattern handlers.
+# ``previous_message`` is the message as it read before the edit, or ``None``
+# when the platform did not send it.
+MessageUpdatedHandler = Callable[[Thread, Message, "Message | None"], "Awaitable[None] | None"]
+
+# ``chat.on_message_deleted``: receives the normalized event rather than
+# ``(thread, message)`` — a delete usually has no message body. Call
+# ``chat.thread(event.thread_id)`` when you need a Thread.
+MessageDeletedHandler = Callable[[MessageDeletedEvent], "Awaitable[None] | None"]
+
+InstalledHandler = Callable[[InstalledEvent], "Awaitable[None] | None"]
+UninstalledHandler = Callable[[UninstalledEvent], "Awaitable[None] | None"]
+AppContextChangedHandler = Callable[[AppContextChangedEvent], "Awaitable[None] | None"]
 
 # Role tag on a stored message.
 #

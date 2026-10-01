@@ -792,7 +792,7 @@ chat@4.39.0), the `getUser` / `startTyping` / drain / link-fence parts of
   returns a message carrying the adapter-reported thread id instead of the
   channel id.
 - Out of scope here: the web half of `500b7e6d` (no `WebAdapter`; see the
-  `adapter-web` row), lifecycle and agent-session event wraps (#196, #201),
+  `adapter-web` row), agent-session event wraps (#201; the lifecycle wraps landed in #196),
   `chat.history`-backed read tools (#197), link-/attachment-only message
   retention (#198) and the thread `SentMessage.edit` thread id (#200).
 
@@ -954,6 +954,82 @@ SDK-free cards-primitives surface, so upstream's two table converters (and the
   core `DateInput` / `NumberInput`. The Python adapter never converts core
   modals to cards (see the "Teams dialog/modal inbound" row in the non-parity
   table), so only the primitive gains the new children.
+
+### Core lifecycle events: message update/delete, installation, app context (chat@4.34–4.41, #196)
+
+Parity, not a divergence. Ports the core halves of `4ac04551` (vercel/chat#788,
+chat@4.37.0), `2e2426d1` (#914, chat@4.41.0) and `1721fa01` (#684,
+chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
+
+- **Message updates.** `chat.on_message_updated(handler)` is called as
+  `handler(thread, message, previous_message)`; `previous_message` is `None`
+  when the platform did not send it (Python always passes the third argument,
+  where JS can omit it). `process_message_updated(adapter, thread_id, message,
+  previous_message=None, options=None)` replaces upstream's single
+  `{adapter, threadId, message, previousMessage?}` object with
+  keyword-callable parameters; each message is a `Message` or an async factory
+  (resolved with `await v() if callable(v) else v`). It binds the adapter,
+  skips `author.is_me` (post-and-edit streaming would otherwise fire once per
+  delta), builds the Thread with the real subscription flag, resolves the
+  identity key (`_resolve_message_identity`, factored out of
+  `_dispatch_to_handlers` and shared with it), then runs the handlers in order
+  under `conversation(thread_id)`. No dedupe, no lock, no routing: an update
+  never reaches `on_mention` / `on_subscribed_message` / `on_message`.
+- **Message deletes.** `MessageDeletedEvent(adapter, channel_id, message_id,
+  raw, thread_id, platform=None, deleted_at=None, previous_message=None)`.
+  `process_message_deleted(event, options=None)` binds the adapter to
+  `previous_message` when present, fills `platform` with `adapter.name` via
+  `dataclasses.replace` when it is `None` (upstream `??`; an adapter-supplied
+  platform is passed through and the handler gets the same object), builds no
+  Thread, and runs the handlers under `conversation(thread_id)`.
+- Both return the handler task (it raises on failure, logged as
+  `"Message update processing error"` / `"Message delete processing error"`);
+  `wait_until` always gets the error-swallowing wrapper, as upstream passes
+  `tracked`.
+- **Installation.** `InstallationAction` is a `Literal`; `InstallationEvent`
+  is a dataclass whose `InstalledEvent` / `UninstalledEvent` subclasses narrow
+  `action` (a `pyrefly: ignore[bad-override-mutable-attribute]` marks the
+  narrowing, which TS interfaces allow). `channel_id` is `None` (never `""`)
+  when the platform gave no destination; the handlers then run bare.
+  `process_installed` / `process_uninstalled` create no task when no handler is
+  registered; otherwise one task runs the handlers in order under
+  `conversation(event.channel_id)` and catches a handler error inside the
+  coroutine (logged as `"Installed handler error"` / `"Uninstalled handler
+  error"` with `conversation_id` and `activity_id`), so the task handed to
+  `wait_until` always completes normally. As upstream, a raising handler stops
+  the ones after it.
+- **`ChatInstance` Protocol.** Gains `process_message_updated`,
+  `process_message_deleted` and `process_app_context_changed`.
+  `process_installed` / `process_uninstalled` stay **off** the Protocol: they
+  are optional (`processInstalled?`) upstream so custom `ChatInstance`
+  implementations predating them keep working. `Chat` implements both and
+  adapters call them via `getattr(chat, "process_installed", None)` (#217).
+  New Protocol members change `isinstance(x, ChatInstance)` for third-party
+  fakes (the Protocol is `@runtime_checkable`).
+- **App context (agent_view).** Upstream's `AppContextEntity` discriminated
+  union of interfaces is one dataclass per variant — `AppContextChannelEntity`
+  (`channel_id`), `AppContextCanvasEntity` (`canvas_id`),
+  `AppContextListEntity` (`list_id`), `AppContextMessageEntity` (`channel_id`,
+  `message_ts`) and `AppContextUnknownEntity` (`type`, `value`) — each with a
+  `kind` `Literal` defaulting to its tag and the keyword-only
+  `enterprise_id` / `team_id` from `AppContextEntityBase`. `AppContextEntity`
+  is their union. `AppContextChangedEvent(adapter, channel_id, entities, raw,
+  user_id)`; `process_app_context_changed` mirrors `process_app_home_opened`
+  under `conversation(event.channel_id)`. `AppHomeOpenedEvent` gains
+  `entities` and `tab`, both defaulting to `None`.
+- **Slack `set_suggested_prompts(channel_id, thread_ts, prompts, title=None)`**:
+  `thread_ts` is `str | None` and is omitted from the request when falsy.
+- **Testing.** `chat_sdk.testing.create_mock_chat_instance(state=None,
+  logger=None, user_name="test-bot", overrides=None)` ports
+  `createMockChatInstance`. Processors are recording `MagicMock`s
+  (`AsyncMock` for `handle_incoming_message`, `process_options_load`,
+  `process_modal_submit`), including `process_installed` /
+  `process_uninstalled`. It returns a `SimpleNamespace`, so an unknown
+  attribute raises instead of auto-creating a mock. Upstream's `abortTurn`
+  and agent-session processors are absent until Python has them (#201).
+  `installation-matcher.test.ts` tests upstream's `toHaveDispatched` matcher,
+  which has no Python equivalent; one test asserts the mock records both
+  installation processors instead.
 
 ## What to Port vs What to Adapt
 
