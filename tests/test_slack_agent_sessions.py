@@ -16,7 +16,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -252,9 +252,19 @@ class TestAgentSessionStatus:
         await adapter.end_typing("slack:D1:1.2", "active")
         await adapter.set_assistant_status("D1", "1.2", "")
         await adapter.set_assistant_title("D1", "1.2", "Title")
+        await adapter.set_assistant_status("D1", "1.2", "Working...")
 
         client.api_call.assert_not_awaited()
-        assert [c.kwargs["status"] for c in client.assistant_threads_setStatus.await_args_list] == ["Typing...", "", ""]
+        assert [c.kwargs["status"] for c in client.assistant_threads_setStatus.await_args_list] == [
+            "Typing...",
+            "",
+            "",
+            "Working...",
+        ]
+        # The ``[status]`` loading_messages fallback is agent_view-only.
+        assert client.assistant_threads_setStatus.await_args_list[-1] == call(
+            channel_id="D1", thread_ts="1.2", status="Working..."
+        )
         client.assistant_threads_setTitle.assert_awaited_once_with(channel_id="D1", thread_ts="1.2", title="Title")
         assert adapter.supports_turn_cancellation is False
 
@@ -398,6 +408,28 @@ class TestStreamCancellation:
         assert result is not None
         assert result.id == "fallback-ts"
         streamer.stop.assert_not_awaited()
+        assert _api_calls(client, SET_STATUS) == [{"channel_id": "D1", "thread_ts": "1.2", "status": "suspended"}]
+
+    # Short replies can buffer every delta, so stop() is the first real API
+    # call; when it fails the reply falls back to post+edit and still ends
+    # the agent session (upstream index.ts:6471-6484).
+    async def test_first_stop_failure_fallback_ends_the_agent_session(self):
+        adapter, client, _ = _adapter(agent_view=True)
+        streamer = _streaming(adapter, client)
+        streamer.append = AsyncMock(return_value=None)  # buffered, no API call
+        streamer.stop = AsyncMock(side_effect=RuntimeError("no streaming here"))
+        adapter.post_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="fallback-ts", thread_id="slack:D1:1.2", raw={})
+        )
+
+        async def chunks() -> AsyncIterator[str]:
+            yield "short reply"
+
+        result = await adapter.stream("slack:D1:1.2", chunks(), StreamOptions(session_status="suspended"))
+
+        assert result is not None
+        assert result.id == "fallback-ts"
+        streamer.stop.assert_awaited_once_with(token=TOKEN, session_status="suspended")
         assert _api_calls(client, SET_STATUS) == [{"channel_id": "D1", "thread_ts": "1.2", "status": "suspended"}]
 
 
@@ -557,13 +589,20 @@ class TestAutomaticSessionTitles:
         assert _api_calls(client, RENAME) == []
 
     # Python-specific: first line only, trimmed, cut to 80 characters.
-    async def test_uses_the_trimmed_first_line_cut_to_80_characters(self):
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("  Summarize this  \nmore detail", "Summarize this"),
+            ("   " + "x" * 100 + "  \nsecond line", "x" * 80),
+        ],
+    )
+    async def test_uses_the_trimmed_first_line_cut_to_80_characters(self, text, expected):
         adapter, client, _ = _adapter(agent_view=True)
         await _init(adapter)
 
-        await _dispatch(adapter, _dm_message(text="   " + "x" * 100 + "  \nsecond line"))
+        await _dispatch(adapter, _dm_message(text=text))
 
-        assert _api_calls(client, RENAME) == [{"channel_id": "D1", "thread_ts": "1771.99", "title": "x" * 80}]
+        assert _api_calls(client, RENAME) == [{"channel_id": "D1", "thread_ts": "1771.99", "title": expected}]
 
     @pytest.mark.parametrize("is_async", [False, True])
     async def test_uses_a_sync_or_async_resolver(self, is_async):
@@ -606,7 +645,7 @@ class TestAutomaticSessionTitles:
         assert [c[0] for c in logger.warn.calls] == ["Failed to set Slack agent session title"]
         assert _api_calls(client, RENAME) == []
 
-    @pytest.mark.parametrize("extra", [{"bot_id": "B1"}, {"text": ""}])
+    @pytest.mark.parametrize("extra", [{"bot_id": "B1"}, {"text": ""}, {"subtype": "file_share"}])
     async def test_skips_bot_and_empty_messages(self, extra):
         adapter, client, _ = _adapter(agent_view=True)
         await _init(adapter)
