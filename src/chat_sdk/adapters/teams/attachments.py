@@ -98,6 +98,8 @@ def _connector_origin(url: Any) -> str | None:
     if scheme == "https":
         default_port = 443
     elif scheme == "http" and _LOOPBACK_HOST_PATTERN.fullmatch(host):
+        # Upstream parity (``getConnectorOrigin``, ``attachments.ts``): any
+        # loopback port can carry the token, so the local Emulator works.
         default_port = 80
     else:
         return None

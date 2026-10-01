@@ -768,6 +768,38 @@ class TestTeamsGetUser:
         assert user.user_name == "bob@contoso.com"
 
     @pytest.mark.asyncio
+    async def test_successful_graph_lookup_is_cached_for_an_hour(self):
+        """Upstream #711: a resolved user is cached as camelCase ``UserInfo`` JSON
+        under ``teams:userInfo:{aadObjectId}`` for 1 h and served from it next time."""
+        import asyncio
+        import json
+
+        adapter = self._make_adapter()
+        state = self._seed_chat_state(adapter, {"teams:aadObjectId:29:user-123": "aad-object-id-456"})
+        adapter._get_graph_token = AsyncMock(return_value="graph-token")  # type: ignore[method-assign]
+        session = self._graph_session(
+            {"displayName": "Bob Jones", "mail": "bob@contoso.com", "userPrincipalName": "bob@contoso.com"}
+        )
+        adapter._get_http_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+
+        assert await adapter.get_user("29:user-123") is not None
+        await asyncio.sleep(0)  # the cache write is fire-and-forget
+        state.set.assert_awaited_once()
+        key, value, ttl = state.set.await_args.args
+        assert (key, ttl) == ("teams:userInfo:aad-object-id-456", 60 * 60 * 1000)
+        assert json.loads(value) == {
+            "userId": "29:user-123",
+            "userName": "bob@contoso.com",
+            "fullName": "Bob Jones",
+            "isBot": False,
+            "email": "bob@contoso.com",
+        }
+
+        again = await adapter.get_user("29:user-123")
+        assert again is not None and again.email == "bob@contoso.com"
+        assert len(session.urls) == 1
+
+    @pytest.mark.asyncio
     async def test_failed_graph_lookup_is_cached_as_unresolvable_for_five_minutes(self):
         """Upstream #711: a failure writes the negative sentinel, and a cached
         sentinel answers ``None`` without calling Graph again."""

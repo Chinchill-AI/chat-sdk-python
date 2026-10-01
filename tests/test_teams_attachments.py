@@ -7,6 +7,7 @@ fetch helper ``fetch_with_bot_token``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from unittest.mock import AsyncMock
@@ -427,3 +428,20 @@ class TestFetchWithBotToken:
 
         with pytest.raises(NetworkError, match="Failed to fetch authenticated file: 403"):
             await fetch_with_bot_token(_SdkClient(handler), CONNECTOR_ATTACHMENT)
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_body_hits_the_deadline(self):
+        """The SDK's ``httpx`` client has no timeout by default; the deadline is the only bound."""
+
+        async def stalled():
+            yield b"x"
+            await asyncio.get_running_loop().create_future()  # never resolves
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=stalled())
+
+        # The outer bound only keeps a regression from hanging the suite: it
+        # raises ``TimeoutError``, not ``NetworkError``, so the test still fails.
+        with pytest.raises(NetworkError, match="Timed out fetching the attachment"):
+            async with asyncio.timeout(5):
+                await fetch_with_bot_token(_SdkClient(handler), CONNECTOR_ATTACHMENT, timeout_ms=10)

@@ -1845,7 +1845,10 @@ class TeamsAdapter:
         """
         # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the token goes
         # only to an allow-listed Bot Framework connector, so a tampered
-        # ``connectorOrigin`` in rehydrated metadata cannot redirect it.
+        # ``connectorOrigin`` in rehydrated metadata cannot send it to a
+        # non-Bot-Framework host. Plain-``http`` loopback stays accepted for
+        # the Emulator (upstream parity: ``getConnectorOrigin`` in
+        # ``attachments.ts`` accepts it too).
         if not is_trusted_teams_service_url(url):
             raise NetworkError("teams", BOT_TOKEN_REFUSAL)
         try:
