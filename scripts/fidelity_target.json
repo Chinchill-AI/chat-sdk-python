@@ -8,7 +8,7 @@
     "matched_exact": 793,
     "matched_fuzzy": 73,
     "missing": 198,
-    "extra": 469
+    "extra": 470
   },
   "absent_ts_files": [],
   "files": {
@@ -21,7 +21,7 @@
       "matched_exact": 158,
       "matched_fuzzy": 11,
       "missing_count": 8,
-      "extra_count": 24,
+      "extra_count": 25,
       "missing": [
         ["Chat", "aborts an active thread signal from another Chat instance"],
         ["Chat", "should dispatch message updates without normal message routing"],
