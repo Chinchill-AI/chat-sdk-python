@@ -590,12 +590,15 @@ class TestWithTokenEnterpriseContextInjection:
         client = MagicMock()
         client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "2.2"})
         client.conversations_info = AsyncMock(return_value={"ok": True, "channel": {"name": "x"}})
+        client.api_call = AsyncMock(return_value={"ok": True})
         adapter._get_client = lambda token=None: client  # type: ignore[method-assign]
 
         tok = adapter._request_context.set(resolved)
         try:
             await adapter.post_message("slack:C1:1.1", "hello")  # type: ignore[arg-type]
             await adapter.fetch_channel_info("slack:C_OTHER")
+            # ``api_call`` path: the ``json`` body is what goes through withToken.
+            await adapter.set_suggested_prompts("C1", None, [{"title": "t", "message": "m"}])
         finally:
             adapter._request_context.reset(tok)
 
@@ -603,6 +606,11 @@ class TestWithTokenEnterpriseContextInjection:
         assert (post_kwargs["team_id"], post_kwargs["client_context_team_id"]) == ("T_GRID_1", "T_AWAY_HOST")
         info_kwargs = client.conversations_info.await_args.kwargs
         assert info_kwargs == {"channel": "C_OTHER", "team_id": "T_GRID_1"}
+        assert client.api_call.await_args.kwargs["json"] == {
+            "channel_id": "C1",
+            "prompts": [{"title": "t", "message": "m"}],
+            "team_id": "T_GRID_1",
+        }
 
 
 # ---------------------------------------------------------------------------
