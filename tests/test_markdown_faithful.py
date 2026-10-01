@@ -1522,6 +1522,10 @@ class TestCommonMarkRulesExposedBySlackText:
             # Links never nest: the inner link wins, outer brackets stay text.
             ("[[a](https://x.com) b](https://y.com)", "[a b](https://y.com)"),
             ("[a [b](https://x.com)](https://y.com)", "[a b](https://y.com)"),
+            # Code spans bind tighter than link brackets.
+            ("[`[`](https://example.com)", "["),
+            ("[a `]` b](https://e.com)", "a ] b"),
+            ("[`a` [b] `c`](https://u.com)", "a [b] c"),
             # A thematic break repeats one marker; mixed markers are text.
             ("-_-", "-_-"),
             ("ok\n-_-", "ok\n-_-"),
@@ -1542,6 +1546,16 @@ class TestCommonMarkRulesExposedBySlackText:
     )
     def test_plain_text_matches_remark(self, markdown: str, expected: str):
         assert ast_to_plain_text(parse_markdown(markdown)) == expected
+
+    def test_code_span_with_a_bracket_stays_inside_its_link(self):
+        para = parse_markdown("[`[`](https://example.com)")["children"][0]
+        assert para["children"] == [
+            {"type": "link", "url": "https://example.com", "children": [{"type": "inlineCode", "value": "["}]}
+        ]
+
+    def test_crlf_thematic_break_is_still_a_break(self):
+        types = [c["type"] for c in parse_markdown("before\r\n***\r\nafter")["children"]]
+        assert types == ["paragraph", "thematicBreak", "paragraph"]
 
     def test_nested_link_label_keeps_only_the_inner_link(self):
         para = parse_markdown("[[a](https://x.com) b](https://y.com)")["children"][0]

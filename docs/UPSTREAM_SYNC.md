@@ -1330,7 +1330,9 @@ chat@4.41.1).
   instead of leaking `[…](…)` syntax or a stray `)` into `message.text`.
   CommonMark-invalid cases (an unbalanced `(` in the URL, a bare `[` inside
   the label) no longer form a link, as in remark. Escaped `\(` / `\)` in a
-  destination are consumed whole and never count toward the balance.
+  destination are consumed whole and never count toward the balance. A
+  closed code span in the label is opaque (code spans bind tighter than link
+  brackets), so ``[`[`](u)`` stays a link with an `inlineCode` child.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 

@@ -312,6 +312,8 @@ def _restore_escapes_as_literal_pair(text: str) -> str:
 # future surface ever feeds untrusted markdown with adversarial
 # bracket counts, switch to a character-level walker for link/image
 # content (the rest of `_parse_inline` is bounded by message size).
+_LINK_LABEL_ATOM = r"[^\[\]﷐`]|﷐.|`[^`]*`|`(?![^`]*`)"
+
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
     ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
@@ -322,10 +324,13 @@ _INLINE_PATTERNS = [
     # pairs (``\(`` / ``\)``) are consumed whole, so they never balance.
     # A nested ``[...]`` directly followed by ``(`` is an inner link, and links
     # never nest: ``[[a](u) b](v)`` is the inner link with literal brackets.
+    # Code spans bind tighter than link brackets, so a closed `` `...` `` in
+    # the label is opaque (``[`[`](u)`` is a link); a backtick with no closer
+    # is literal. The alternatives are mutually exclusive (no backtracking).
     (
         "link",
         re.compile(
-            r"(?<!﷐)\[((?:[^\[\]﷐]|﷐.|\[(?:[^\[\]﷐]|﷐.)*\](?!\())*)\]"
+            r"(?<!﷐)\[((?:" + _LINK_LABEL_ATOM + r"|\[(?:" + _LINK_LABEL_ATOM + r")*\](?!\())*)\]"
             r'\(((?:﷐\S|[^\s()﷐]|\((?:﷐\S|[^\s()﷐])*\))+?)(?:\s+"([^"]*)")?\)'
         ),
     ),
@@ -542,7 +547,8 @@ def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Conten
 # Patterns used by the block parser
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 # CommonMark: three or more of the *same* marker (``-_-`` is text, not a break).
-_THEMATIC_BREAK_RE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+# Lines are split on ``\n`` only, so a CRLF line keeps a trailing ``\r``.
+_THEMATIC_BREAK_RE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}[ \t]*\r?$")
 # CommonMark: a backtick fence's info string may not contain a backtick, so
 # "```npm test```" on one line is a (code span) paragraph, not a fence.
 _FENCED_CODE_START_RE = re.compile(r"^(`{3,}(?=[^`]*$)|~{3,})(.*)")
