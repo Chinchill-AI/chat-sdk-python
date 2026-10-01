@@ -540,7 +540,7 @@ class DiscordAdapter:
         if not (context and self._interaction_flags):
             return None
         try:
-            return self._interaction_flags(context)
+            result: Any = self._interaction_flags(context)
         except Exception as error:
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream
             # lets the callback throw, which fails the interaction ACK. The
@@ -550,6 +550,18 @@ class DiscordAdapter:
                 {"error": str(error), "command": context.command},
             )
             return None
+        if result is None or (isinstance(result, int) and not isinstance(result, bool)):
+            return result
+        # Same divergence: an ``async def`` callback (or a non-int result such
+        # as ``True``) cannot be serialized as flags. Close a coroutine so it
+        # is not left un-awaited, then defer without flags.
+        if inspect.iscoroutine(result):
+            result.close()
+        self._logger.error(
+            "Discord interaction_flags callback failed; deferring without flags",
+            {"error": f"expected int or None, got {type(result).__name__}", "command": context.command},
+        )
+        return None
 
     def _handle_application_command_interaction(
         self,

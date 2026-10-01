@@ -9,7 +9,9 @@ and packages/adapter-discord/src/gateway.test.ts.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import warnings
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2252,10 +2254,49 @@ class TestInteractionFlags:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["async", "bool"])
+    async def test_async_or_non_int_flags_callback_still_acks_without_flags(self, kind):
+        # Same divergence: an ``async def`` callback's coroutine (or ``True``)
+        # is not a flag value. The coroutine is closed, never left un-awaited.
+        logger = _make_logger()
+        awaited: list[bool] = []
+
+        async def async_flags(_ctx: DiscordInteractionFlagsContext) -> int:
+            awaited.append(True)
+            return DiscordInteractionResponseFlag.EPHEMERAL
+
+        callback: Any = async_flags if kind == "async" else (lambda _ctx: True)
+        adapter = _make_adapter(logger=logger, interaction_flags=callback)
+        adapter._verify_signature = AsyncMock(return_value=True)
+        seen: list[Any] = []
+        adapter._chat = MagicMock()
+        adapter._chat.process_slash_command = MagicMock(
+            side_effect=lambda *_: seen.append(adapter._request_context.get())
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            response = await adapter.handle_webhook(_signed_request(_slash_payload()))
+            gc.collect()
+
+        assert response["status"] == 200
+        assert json.loads(response["body"]) == {"type": 5}
+        assert seen[0].slash_command.initial_response_flags is None
+        assert awaited == []
+        assert [w for w in caught if "never awaited" in str(w.message)] == []
+        assert [c.args[0] for c in logger.error.call_args_list] == [
+            "Discord interaction_flags callback failed; deferring without flags"
+        ]
+
+    @pytest.mark.asyncio
     async def test_sets_gateway_deferred_slash_command_interaction_flags_from_config(self):
         interaction_flags = MagicMock(return_value=DiscordInteractionResponseFlag.EPHEMERAL)
         adapter = _make_adapter(logger=_make_logger(), interaction_flags=interaction_flags)
+        seen: list[Any] = []
         adapter._chat = MagicMock()
+        adapter._chat.process_slash_command = MagicMock(
+            side_effect=lambda *_: seen.append(adapter._request_context.get())
+        )
         adapter._discord_fetch = AsyncMock(return_value=None)
         interaction = _slash_payload(
             channel={"id": "channel456", "type": 0},
@@ -2280,6 +2321,22 @@ class TestInteractionFlags:
         )
         slash = adapter._chat.process_slash_command.call_args.args[0]
         assert slash.text == "status"
+        # Stored for the handler task, so follow-ups stay ephemeral too.
+        assert seen[0].slash_command.initial_response_flags == 64
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("returned", "expected"), [(None, {"type": 5}), (0, {"type": 5, "data": {"flags": 0}})])
+    async def test_gateway_flags_are_sent_unless_the_callback_returns_none(self, returned, expected):
+        adapter = _make_adapter(logger=_make_logger(), interaction_flags=lambda _ctx: returned)
+        adapter._chat = MagicMock()
+        adapter._discord_fetch = AsyncMock(return_value=None)
+        envelope = {"type": "GATEWAY_INTERACTION_CREATE", "timestamp": 1, "data": _slash_payload()}
+
+        await adapter.handle_webhook(_gateway_request(json.dumps(envelope)))
+
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/interactions/interaction123/interaction-token/callback", "POST", expected
+        )
 
     @pytest.mark.asyncio
     async def test_ephemeral_flag_sticks_to_the_deferred_edit_and_every_follow_up(self):
@@ -2334,6 +2391,51 @@ class TestInteractionFlags:
             files=None,
         )
         assert result.id == "followup123"
+
+    @pytest.mark.asyncio
+    async def test_payload_flags_are_ored_into_the_initial_flags(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "followup123"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_flags=DiscordInteractionResponseFlag.EPHEMERAL,
+            initial_response_sent=True,
+            interaction_token="interaction-token",
+        )
+
+        await adapter._post_slash_command_response(
+            slash, "discord:guild123:channel456", {"content": "x", "flags": 4}, []
+        )
+
+        assert adapter._discord_fetch.await_args.args[2] == {"content": "x", "flags": 68}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_posts_edit_original_once_then_follow_up(self):
+        # The first-response flag is set before the PATCH is awaited
+        # (upstream index.ts:1483-1486), so a concurrent post follows up.
+        adapter = _make_adapter(logger=_make_logger())
+
+        async def fetch(path: str, method: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(0)
+            return {"id": method}
+
+        adapter._discord_fetch = AsyncMock(side_effect=fetch)
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_sent=False,
+            interaction_token="interaction-token",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        await asyncio.gather(
+            adapter.post_message("discord:guild123:channel456", "a"),
+            adapter.post_message("discord:guild123:channel456", "b"),
+        )
+
+        assert [c.args[:2] for c in adapter._discord_fetch.await_args_list] == [
+            ("/webhooks/test-app-id/interaction-token/messages/@original", "PATCH"),
+            ("/webhooks/test-app-id/interaction-token?wait=true", "POST"),
+        ]
 
     @pytest.mark.asyncio
     async def test_unflagged_follow_up_goes_to_the_interaction_webhook_without_flags(self):

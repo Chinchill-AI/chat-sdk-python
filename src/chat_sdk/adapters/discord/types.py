@@ -50,7 +50,8 @@ class DiscordAdapterConfig:
     # callers of the fields above are not shifted.
     # Flags for the initial deferred slash-command response, e.g.
     # ``DiscordInteractionResponseFlag.EPHEMERAL``. Called synchronously with a
-    # :class:`DiscordInteractionFlagsContext`; ``None`` sends no flags. The
+    # :class:`DiscordInteractionFlagsContext` (an ``async def`` callback is not
+    # supported); ``None`` sends no flags. The
     # flags also apply to every follow-up response to that command.
     interaction_flags: Callable[[DiscordInteractionFlagsContext], int | None] | None = None
     # Parent channel IDs whose non-bot messages, including messages in their
