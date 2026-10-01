@@ -2848,7 +2848,8 @@ class TeamsAdapter:
         ``HttpStream`` owns the Bot Framework streaming wire format
         (``streamType``/``streamSequence``/``streamId``), the per-flush
         throttle (~500ms between flushes), and 429 retry/backoff. We never
-        touch its internals and we never call ``stream.close()`` — the SDK
+        touch its internals and we call ``stream.close()`` only after the
+        first-chunk wait below times out — normally the SDK
         sends the ``streamType: 'final'`` message after the handler returns
         (see :meth:`_handle_message_activity`'s ``finally`` block, which plays
         the lifecycle-owner role the SDK App otherwise would).
@@ -2867,8 +2868,10 @@ class TeamsAdapter:
         is also bounded by ``STREAM_FIRST_CHUNK_ID_TIMEOUT_S`` (Python-only):
         ``microsoft-teams-apps`` 2.0.16+ leaves ``canceled`` unset when the
         first flush fails terminally (e.g. a 403 that is not a cancel), so no
-        chunk ever arrives. The accumulated text is then sent with one
-        buffered ``post_message`` so the reply is not lost.
+        chunk ever arrives. The stream is then settled with ``close()``; if
+        nothing was delivered and the user did not cancel, the accumulated
+        text is sent with one buffered ``post_message`` so the reply is not
+        lost.
 
         Mirrors upstream ``streamViaEmit`` in
         ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``).
@@ -2941,16 +2944,24 @@ class TeamsAdapter:
                     {"threadId": thread_id},
                 )
             except asyncio.TimeoutError:
-                # No chunk reached the user (e.g. the first flush got a terminal
-                # 403 such as StreamNotAllowedError). Deliver the text with one
-                # buffered post, as the no-streamer path does, instead of
-                # returning a message nobody received. Python-only: see the
-                # first-chunk row in docs/UPSTREAM_SYNC.md.
-                self._logger.warn(
-                    "Teams stream delivered no chunk; posting the reply as one message",
-                    {"threadId": thread_id},
-                )
-                return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
+                # Python-only (see the first-chunk row in docs/UPSTREAM_SYNC.md).
+                # The first flush may have failed terminally (e.g. a 403
+                # StreamNotAllowedError), or may still be retrying. ``close()``
+                # settles it: it waits for an in-flight flush and finalizes a
+                # stream that did get through, and returns ``None`` when nothing
+                # was delivered. The handler's own ``close()`` is then a no-op.
+                if not stream.canceled:
+                    settled = await stream.close()
+                    if settled is not None:
+                        message_id = getattr(settled, "id", "") or ""
+                    elif not stream.canceled:
+                        # Nothing reached the user: deliver the text with one
+                        # buffered post instead of dropping the reply.
+                        self._logger.warn(
+                            "Teams stream delivered no chunk; posting the reply as one message",
+                            {"threadId": thread_id},
+                        )
+                        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
         return RawMessage(id=message_id, thread_id=thread_id, raw={"text": accumulated})
 

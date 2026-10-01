@@ -745,32 +745,70 @@ class TestPlaceholderStreaming:
         assert sent.text == "Done"
 
 
+def _sdk_has_terminal_stream_errors() -> bool:
+    """``microsoft-teams-apps`` 2.0.16+ raises ``StreamNotAllowedError`` /
+    ``TerminalStreamError`` for a non-cancel 403; 2.0.13.4 marks every 403 as
+    a cancel."""
+    from microsoft_teams.apps.plugins import streamer
+
+    return hasattr(streamer, "StreamNotAllowedError")
+
+
+def _real_sdk_adapter(handler: Any) -> TeamsAdapter:
+    """An adapter whose real SDK clients (``App.api`` on 2.1, and the 2.0.x
+    ``ActivitySender`` that builds streams and sends) talk to ``handler``
+    through an in-memory ``httpx`` transport."""
+    import httpx
+    from microsoft_teams.api import ApiClient
+    from microsoft_teams.common import Client, ClientOptions
+
+    client = Client(ClientOptions(token="bot-token"))
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = _make_adapter()
+    adapter._app.api = ApiClient("https://smba.trafficmanager.net/teams", client)  # type: ignore[method-assign]
+    sender = getattr(adapter._app, "activity_sender", None)
+    if sender is not None:
+        sender._client = client
+    return adapter
+
+
+def _is_stream_activity(body: dict[str, Any]) -> bool:
+    return any(e.get("type") == "streaminfo" for e in body.get("entities") or [])
+
+
 class TestFirstChunkIdWait:
+    """Python-only bound on the first-chunk wait: with ``microsoft-teams-apps``
+    2.0.16+, a terminal 403 on the first flush neither emits ``chunk`` nor
+    sets ``canceled``, so an unbounded wait would hang the handler. On expiry
+    the stream is settled with ``close()`` before anything else is sent."""
+
+    @staticmethod
+    def _silent_streamer(close_result: Any) -> FakeStreamer:
+        streamer = FakeStreamer()
+        streamer.on_chunk = MagicMock()  # type: ignore[method-assign]  # never fires
+        streamer.close = AsyncMock(return_value=close_result)  # type: ignore[method-assign]
+        return streamer
+
     @pytest.mark.asyncio
-    async def test_returns_without_an_id_when_no_chunk_is_ever_delivered(self, monkeypatch: pytest.MonkeyPatch):
-        """Python-only bound: with ``microsoft-teams-apps`` 2.0.16+, a terminal
-        403 on the first flush neither emits ``chunk`` nor sets ``canceled``,
-        so an unbounded wait would hang the handler."""
+    async def test_posts_the_reply_when_no_chunk_is_ever_delivered(self, monkeypatch: pytest.MonkeyPatch):
         from chat_sdk.adapters.teams import adapter as adapter_module
 
         monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
         adapter = _make_adapter()
         tid = _dm_thread_id(adapter)
-        streamer = FakeStreamer()
-        streamer._chunk_handlers = []
-        streamer.on_chunk = MagicMock()  # type: ignore[method-assign]  # never fires
+        streamer = self._silent_streamer(None)
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
 
         async def gen():
             yield "hello"
 
-        send = AsyncMock(return_value=_SentActivity("fallback-1"))
-        adapter._app.activity_sender = SimpleNamespace(send=send)
-
         result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), streamer), 2)  # type: ignore[arg-type]
 
-        # Nothing reached the user through the stream, so the accumulated
-        # text is delivered with one buffered post instead of being dropped.
+        # close() reported nothing delivered, so the accumulated text is
+        # delivered with one buffered post instead of being dropped.
         assert streamer.emitted == ["hello"]
+        streamer.close.assert_awaited_once()
         send.assert_awaited_once()
         activity, ref = send.call_args.args
         assert activity.text == "hello"
@@ -779,12 +817,52 @@ class TestFirstChunkIdWait:
         adapter._logger.warn.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_real_sdk_stream_with_a_terminal_403_does_not_hang(self, monkeypatch: pytest.MonkeyPatch):
-        """A real SDK ``HttpStream`` whose first flush gets a 403 that is not a
-        cancel: ``_stream_via_emit`` returns once the bound elapses."""
+    async def test_uses_the_settled_stream_when_the_first_chunk_arrives_late(self, monkeypatch: pytest.MonkeyPatch):
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = self._silent_streamer(_SentActivity("late-stream-1"))
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), streamer), 2)  # type: ignore[arg-type]
+
+        send.assert_not_awaited()
+        assert result.id == "late-stream-1"
+        assert result.raw == {"text": "hello"}
+
+    @pytest.mark.asyncio
+    async def test_sends_nothing_more_when_the_user_cancels_during_the_wait(self, monkeypatch: pytest.MonkeyPatch):
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+        adapter = _make_adapter()
+        tid = _dm_thread_id(adapter)
+        streamer = self._silent_streamer(None)
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
+        async def gen():
+            yield "hello"
+
+        task = asyncio.ensure_future(adapter._stream_via_emit(tid, gen(), streamer))  # type: ignore[arg-type]
+        await asyncio.sleep(0)
+        streamer._canceled = True  # the SDK marks a cancel 403 on the background flush
+        result = await asyncio.wait_for(task, 2)
+
+        streamer.close.assert_not_awaited()
+        send.assert_not_awaited()
+        assert result.id == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _sdk_has_terminal_stream_errors(), reason="this SDK treats every streaming 403 as a cancel")
+    async def test_real_sdk_stream_refused_with_a_terminal_403_posts_the_reply(self, monkeypatch: pytest.MonkeyPatch):
         import httpx
-        from microsoft_teams.api import ApiClient
-        from microsoft_teams.common import Client, ClientOptions
 
         from chat_sdk.adapters.teams import adapter as adapter_module
 
@@ -793,20 +871,16 @@ class TestFirstChunkIdWait:
 
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content or b"{}")
-            if any(e.get("type") == "streaminfo" for e in body.get("entities") or []):
+            if _is_stream_activity(body):
                 stream_requests.append(body)
                 return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
             plain_posts.append(body)
             return httpx.Response(200, json={"id": "fallback-post-1"})
 
-        client = Client(ClientOptions(token="bot-token"))
-        client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        adapter = _make_adapter()
-        adapter._app.api = ApiClient("https://smba.trafficmanager.net/teams", client)  # type: ignore[method-assign]
+        adapter = _real_sdk_adapter(handler)
         tid = _dm_thread_id(adapter)
         stream = adapter._create_streamer(_dm_activity(), tid)
         assert stream is not None
-
         monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
 
         async def gen():
@@ -819,9 +893,74 @@ class TestFirstChunkIdWait:
         assert [p["text"] for p in plain_posts] == ["hello"]
         assert result.id == "fallback-post-1"
         assert result.raw["text"] == "hello"
-        # The handler's later close() sends nothing more (no chunk was delivered).
+        # The handler's later close() sends nothing more.
         assert await stream.close() is None
         assert len(stream_requests) == 1 and len(plain_posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_stream_canceled_on_the_first_flush_posts_nothing(self, monkeypatch: pytest.MonkeyPatch):
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if _is_stream_activity(body):
+                return httpx.Response(403, json={"error": {"message": "Content stream was cancelled by user"}})
+            return httpx.Response(200, json={"id": "fallback-post-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert stream.canceled is True
+        assert [_is_stream_activity(r) for r in requests] == [True]
+        assert result.id == ""
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_slow_first_flush_is_not_duplicated(self, monkeypatch: pytest.MonkeyPatch):
+        """The first flush is still in flight when the bound expires: the
+        reply is finalized as a stream, never also posted."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await asyncio.sleep(0.3)
+            return httpx.Response(200, json={"id": "stream-msg-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        # One streaming chunk, then the stream's final message; no plain post.
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
+        assert [r.get("text") for r in requests] == ["hello", "hello"]
+        assert result.id == "stream-msg-1"
+        assert await stream.close() is not None
+        assert len(requests) == 2
 
 
 # ---------------------------------------------------------------------------
