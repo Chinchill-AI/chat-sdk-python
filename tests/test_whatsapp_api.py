@@ -1333,22 +1333,115 @@ class TestOutboundMediaPythonSpecific:
         assert session.calls == []
 
     @pytest.mark.asyncio
-    async def test_link_attachment_size_is_checked_and_zero_is_allowed(self):
+    async def test_link_attachment_declared_size_is_checked_before_any_send(self):
         adapter, session = _media_adapter()
         too_big = Attachment(type="image", url="https://example.com/a.png", size=5 * 1024 * 1024 + 1)
 
         with pytest.raises(ValidationError, match=_WHATSAPP_IMAGE_SIZE_LIMIT_PATTERN):
             await adapter.post_message(THREAD_ID, {"attachments": [too_big]})
 
-        await adapter.post_message(
-            THREAD_ID, {"attachments": [Attachment(type="image", url="https://example.com/a.png", size=0)]}
-        )
-        assert session.message_bodies()[0]["image"] == {"link": "https://example.com/a.png"}
+        assert session.calls == []
 
-    def test_validate_file_size_allows_exactly_the_limit(self):
-        validate_file_size("audio", 16 * 1024 * 1024)
-        with pytest.raises(ValidationError, match="File size 16777217 bytes exceeds WhatsApp audio limit"):
-            validate_file_size("audio", 16 * 1024 * 1024 + 1)
+    @pytest.mark.parametrize(
+        ("media_type", "limit"),
+        [
+            ("image", 5 * 1024 * 1024),
+            ("audio", 16 * 1024 * 1024),
+            ("video", 16 * 1024 * 1024),
+            ("document", 100 * 1024 * 1024),
+        ],
+    )
+    def test_validate_file_size_allows_exactly_the_limit(self, media_type: str, limit: int):
+        validate_file_size(media_type, limit)
+        with pytest.raises(ValidationError, match=f"File size {limit + 1} bytes exceeds WhatsApp {media_type} limit"):
+            validate_file_size(media_type, limit + 1)
+
+    @pytest.mark.asyncio
+    async def test_upload_filename_is_serialized_like_whatwg_form_data(self):
+        # Node's FormData escapes only LF, CR and '"'; spaces and non-ASCII stay
+        # raw. aiohttp's default quoting would percent-encode them, and a raw
+        # CR/LF (or other control char) would make it raise a bare ValueError.
+        adapter, session = _media_adapter()
+        filename = 'my réport "q"\r\n\x01.pdf'
+
+        result = await adapter.post_message(
+            THREAD_ID,
+            {"files": [FileUpload(data=b"%PDF", filename=filename, mime_type="application/pdf")]},
+        )
+
+        serialized = session.media_calls()[0]["data"]().decode()
+        assert 'Content-Disposition: form-data; name="file"; filename="my réport %22q%22%0D%0A%01.pdf"' in serialized
+        # The document message carries the original, unescaped name.
+        assert session.message_bodies()[0]["document"] == {"id": "media-1", "filename": filename}
+        assert result.id == "wamid.msg1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mime_type", "part_content_type"),
+        [
+            ("Application/PDF", "application/pdf"),
+            ("application/pdf\r\nX-Injected: 1", "application/octet-stream"),
+            ("application/péf", "application/octet-stream"),
+        ],
+    )
+    async def test_upload_part_content_type_follows_blob_type_rules(self, mime_type: str, part_content_type: str):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID, {"files": [FileUpload(data=b"%PDF", filename="r.pdf", mime_type=mime_type)]}
+        )
+
+        assert _form_fields(session.media_calls()[0]["data"])[1]["content_type"] == part_content_type
+        assert session.message_bodies()[0]["type"] == "document"
+
+    @pytest.mark.asyncio
+    async def test_empty_text_fallback_card_is_sent_as_text_after_uncaptioned_media(self):
+        # A button without an id cannot be a reply button, so the card falls
+        # back to text; its caption fallback is empty, so the card text follows
+        # the media as its own message.
+        adapter, session = _media_adapter()
+        card = {
+            "type": "card",
+            "children": [{"type": "actions", "children": [{"type": "button", "label": "{{emoji:fire}} Go"}]}],
+        }
+
+        result = await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        image_message, text_message = session.message_bodies()
+        assert image_message["image"] == {"id": "media-1"}
+        assert text_message["text"]["body"] == "[\U0001f525 Go]"
+        assert result.id == "wamid.msg2"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_after_media_converts_emoji_placeholders(self):
+        adapter, session = _media_adapter()
+        card = {
+            "type": "card",
+            "title": "Approve {{emoji:fire}}",
+            "children": [{"type": "actions", "children": [{"type": "button", "id": "yes", "label": "Yes"}]}],
+        }
+
+        await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        interactive_message = session.message_bodies()[1]
+        assert interactive_message["interactive"]["header"]["text"] == "Approve \U0001f525"
+
+    @pytest.mark.asyncio
+    async def test_text_fallback_card_caption_converts_emoji_placeholders(self):
+        adapter, session = _media_adapter()
+        card = _link_card(title="Shipped {{emoji:fire}}")
+
+        await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["image"]["caption"] == "*Shipped \U0001f525*\nTrack: https://example.com/track"
 
     def test_media_type_ignores_parameters_and_case(self):
         assert get_whatsapp_media_type(" Image/PNG ; charset=binary") == "image"

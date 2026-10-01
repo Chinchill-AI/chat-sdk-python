@@ -539,6 +539,43 @@ class TestCtaUrlPythonSpecific:
         assert result["type"] == "interactive"
         assert result["interactive"]["action"]["parameters"]["url"] == "HTTPS://example.com/x"
 
+    def test_url_scheme_check_does_not_fold_non_ascii_letters(self):
+        # Without ``re.ASCII``, IGNORECASE folds U+017F (long s) to "s"; the JS
+        # regex has no ``u`` flag, so upstream keeps the deliverable text fallback.
+        card = {
+            "type": "card",
+            "children": [
+                {
+                    "type": "actions",
+                    "children": [{"type": "link-button", "url": "http\u017f://example.com", "label": "Go"}],
+                }
+            ],
+        }
+        assert card_to_whatsapp(card) == {"type": "text", "text": "Go: http\u017f://example.com"}
+
+    def test_image_nested_in_a_section_keeps_the_text_fallback(self):
+        # The body-fit check recurses into sections; promoting this card would
+        # silently drop the image from the cta_url body.
+        card = {
+            "type": "card",
+            "children": [
+                {
+                    "type": "section",
+                    "children": [
+                        {"type": "image", "url": "https://example.com/i.png", "alt": "pic"},
+                        {
+                            "type": "actions",
+                            "children": [{"type": "link-button", "url": "https://example.com/go", "label": "Go"}],
+                        },
+                    ],
+                }
+            ],
+        }
+        assert card_to_whatsapp(card) == {
+            "type": "text",
+            "text": "pic: https://example.com/i.png\nGo: https://example.com/go",
+        }
+
     def test_card_link_button_lines_walks_every_actions_row_and_section(self):
         card = {
             "type": "card",

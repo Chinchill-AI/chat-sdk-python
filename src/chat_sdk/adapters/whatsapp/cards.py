@@ -31,8 +31,10 @@ from chat_sdk.shared._js_compat import JS_WHITESPACE
 CALLBACK_DATA_PREFIX = "chat:"
 
 # cta_url URLs must be web links -- Meta rejects other schemes.
-# ``re.match`` anchors at the start like JS ``/^https?:\/\//i``.
-_HTTP_URL_REGEX = re.compile(r"https?://", re.IGNORECASE)
+# ``re.match`` anchors at the start like JS ``/^https?:\/\//i``. ``re.ASCII``
+# matters: without it Python's IGNORECASE folds U+017F (long s) to ``s``, which
+# a JS regex without the ``u`` flag never does.
+_HTTP_URL_REGEX = re.compile(r"https?://", re.IGNORECASE | re.ASCII)
 
 # Maximum number of reply buttons WhatsApp allows
 MAX_REPLY_BUTTONS = 3

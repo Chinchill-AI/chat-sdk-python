@@ -615,7 +615,8 @@ Ports upstream `8bd8a575` (vercel/chat#537, chat@4.34.0; outbound files and
 attachments), `09b72e9d` (vercel/chat#736, chat@4.35.0; no duplicate card
 title on Card + file posts) and `6abf4807` (vercel/chat#781, chat@4.37.0;
 `cta_url` link buttons), as they stand at chat@4.41.1 (with the
-`...recipient()` spread from `3e6e866a`). No behavioral divergence.
+`...recipient()` spread from `3e6e866a`). One narrow divergence, in the
+multipart filename (see **Upload**); otherwise no behavioral divergence.
 
 - **Names.** `getWhatsAppMediaType` / `validateFileSize` / `WhatsAppMediaType`
   are `get_whatsapp_media_type` / `validate_file_size` / `WhatsAppMediaType`,
@@ -633,7 +634,17 @@ title on Card + file posts) and `6abf4807` (vercel/chat#781, chat@4.37.0;
   `file` with the filename and MIME type) is posted through
   `_graph_fetch_json`; aiohttp writes the multipart `Content-Type` and
   boundary. Media resolve concurrently (`asyncio.gather`, like
-  `Promise.all`) and are sent one at a time, in order.
+  `Promise.all`) and are sent one at a time, in order. The part is
+  serialized like Node's WHATWG `FormData`: `FormData(quote_fields=False)`
+  keeps spaces and non-ASCII raw (aiohttp's default would percent-encode
+  them), the filename has only LF / CR / `"` escaped as `%0A` / `%0D` /
+  `%22`, and the part `Content-Type` follows `Blob` type rules (lowercased;
+  any character outside U+0020–U+007E gives `application/octet-stream`). The
+  document message keeps the unescaped filename. **Divergence:** aiohttp
+  rejects every other C0 control and DEL in a part header with a bare
+  `ValueError`, where Node sends them raw, so those are percent-escaped too;
+  and aiohttp writes a backslash as `\\` (quoted-string form) where Node
+  writes it raw.
 - **Truthiness.** Upstream's `Buffer` is truthy even when empty, so
   `FileUpload(data=b"")` is still uploaded, and `Attachment(data=b"")` is
   uploaded rather than falling back to its URL (`is None` checks, not
@@ -644,7 +655,9 @@ title on Card + file posts) and `6abf4807` (vercel/chat#781, chat@4.37.0;
 - **JS string semantics.** The 1024 caption limit compares the UTF-16 length
   (`text.length`), so astral characters count twice. The `cta_url` blank-label
   check strips the JS `trim` whitespace set (`JS_WHITESPACE`, which includes
-  U+FEFF), and the `http(s)` scheme test is case-insensitive.
+  U+FEFF), and the `http(s)` scheme test is ASCII case-insensitive
+  (`re.IGNORECASE | re.ASCII`; without `re.ASCII` Python folds U+017F to `s`,
+  which a JS regex without the `u` flag does not).
 - **Types.** `WhatsAppInteractiveMessage` stays one `total=False` TypedDict
   (`type` is `"button" | "list" | "cta_url"`) rather than upstream's union
   discriminated on `type`, because pyrefly does not narrow TypedDict unions on

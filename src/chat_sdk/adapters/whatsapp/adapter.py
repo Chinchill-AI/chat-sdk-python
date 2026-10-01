@@ -111,6 +111,35 @@ EXTENSION_MIME_TYPES: dict[str, str] = {
     ".webp": "image/webp",
 }
 
+# A multipart part's filename is serialized like WHATWG ``FormData`` (what
+# upstream's ``uploadMedia`` relies on): only LF, CR and ``"`` are
+# percent-escaped, and spaces / non-ASCII stay raw UTF-8.
+# See https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data
+_MULTIPART_FILENAME_ESCAPES = str.maketrans({"\n": "%0A", "\r": "%0D", '"': "%22"})
+# aiohttp refuses (bare ``ValueError``) any other C0 control or DEL in a part
+# header, where Node would send it raw; percent-escape those too so the upload
+# still goes out.
+_FORBIDDEN_HEADER_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _multipart_filename(filename: str) -> str:
+    """Escape a filename for a multipart ``Content-Disposition`` header."""
+    escaped = filename.translate(_MULTIPART_FILENAME_ESCAPES)
+    return _FORBIDDEN_HEADER_CHARS.sub(lambda match: f"%{ord(match.group()):02X}", escaped)
+
+
+def _blob_content_type(mime_type: str) -> str:
+    """The part ``Content-Type`` Node sends for ``new Blob([...], {type})``.
+
+    A Blob type containing any character outside U+0020-U+007E is dropped,
+    and FormData then labels the part ``application/octet-stream``; a valid
+    type is ASCII-lowercased.
+    """
+    if mime_type and all(" " <= char <= "~" for char in mime_type):
+        return mime_type.lower()
+    return "application/octet-stream"
+
+
 # Business-scoped user ID shape (e.g. ``US.13491208655302741918`` or the
 # parent form ``US.ENT.11815799212886844830``). Used with ``fullmatch`` so a
 # trailing newline does not match, like JS ``/^...$/`` without the ``m`` flag.
@@ -1395,9 +1424,18 @@ class WhatsAppAdapter:
         """
         import aiohttp
 
-        form = aiohttp.FormData()
+        # ``quote_fields=False`` keeps aiohttp from percent-encoding spaces and
+        # non-ASCII in the filename; ``_multipart_filename`` applies the WHATWG
+        # escapes instead. (aiohttp still writes a backslash as ``\\``, the
+        # quoted-string form, where Node sends it raw.)
+        form = aiohttp.FormData(quote_fields=False)
         form.add_field("messaging_product", "whatsapp")
-        form.add_field("file", data, filename=filename, content_type=mime_type)
+        form.add_field(
+            "file",
+            data,
+            filename=_multipart_filename(filename),
+            content_type=_blob_content_type(mime_type),
+        )
 
         response = cast(
             WhatsAppMediaUploadResponse,
