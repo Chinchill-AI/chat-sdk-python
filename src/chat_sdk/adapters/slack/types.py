@@ -17,6 +17,9 @@ from chat_sdk.shared.download import AttachmentTransport
 if TYPE_CHECKING:
     import httpx
 
+    from chat_sdk.adapters.slack.agent_context import SlackAppContext
+    from chat_sdk.types import AppContextEntity
+
 # ---------------------------------------------------------------------------
 # Bot token resolver
 # ---------------------------------------------------------------------------
@@ -35,6 +38,79 @@ SlackBotToken: TypeAlias = str | SlackBotTokenResolver
 # events via signed HTTP POSTs from Slack. ``"socket"`` opens a long-lived
 # WebSocket via Slack's Socket Mode and ACKs each event over the socket.
 SlackAdapterMode = Literal["webhook", "socket"]
+
+# =============================================================================
+# Agent configuration (vercel/chat 0f743c9b #698)
+# =============================================================================
+
+
+@dataclass
+class SlackFeedbackButtonsOptions:
+    """Options for the feedback buttons appended to streamed replies.
+
+    Every field defaults (``None``) to upstream's value: ``action_id``
+    ``"message_feedback"``, labels ``"Good response"`` / ``"Bad response"``,
+    values ``"positive"`` / ``"negative"``.
+    """
+
+    # ``action_id`` dispatched to ``chat.on_action`` when a button is clicked.
+    action_id: str | None = None
+    # Label for the negative button.
+    negative_label: str | None = None
+    # Action value dispatched for negative clicks.
+    negative_value: str | None = None
+    # Label for the positive button.
+    positive_label: str | None = None
+    # Action value dispatched for positive clicks.
+    positive_value: str | None = None
+
+
+class SlackSuggestedPrompt(TypedDict):
+    """A single suggested prompt shown in an assistant/agent thread (wire shape)."""
+
+    # Full prompt text sent as the user's message when the prompt is clicked.
+    message: str
+    # Short label shown on the prompt button.
+    title: str
+
+
+@dataclass
+class SlackSuggestedPromptsOptions:
+    """Suggested prompts payload applied when an assistant/agent thread opens."""
+
+    # The prompts to display. Slack shows at most 4; extras are dropped with a warning.
+    prompts: list[SlackSuggestedPrompt]
+    # Optional heading shown above the prompts.
+    title: str | None = None
+
+
+@dataclass
+class SlackSuggestedPromptsContext:
+    """Context passed to a dynamic ``suggested_prompts`` resolver."""
+
+    # The DM channel the assistant/agent thread lives in.
+    channel_id: str
+    # The user who opened the thread.
+    user_id: str
+    # Enterprise the user opened the thread from (legacy assistant_view).
+    enterprise_id: str | None = None
+    # Active-view context entities (agent_view, when Slack folds context in).
+    entities: list[AppContextEntity] | None = None
+    # Workspace the thread belongs to (assistant_thread context, or the
+    # ``app_home_opened`` envelope's ``authorizations[0].team_id`` / ``team_id``).
+    team_id: str | None = None
+    # Assistant thread root (legacy assistant_view; ``None`` under agent_view).
+    thread_ts: str | None = None
+
+
+# Suggested prompts configuration: a static payload, or a resolver (sync or
+# async) invoked each time an assistant/agent thread opens. Return ``None``
+# from the resolver to skip setting prompts for that thread.
+SlackSuggestedPromptsResolver = Callable[
+    [SlackSuggestedPromptsContext],
+    "SlackSuggestedPromptsOptions | None | Awaitable[SlackSuggestedPromptsOptions | None]",
+]
+SlackSuggestedPrompts: TypeAlias = SlackSuggestedPromptsOptions | SlackSuggestedPromptsResolver
 
 # =============================================================================
 # Configuration
@@ -169,6 +245,31 @@ class SlackAdapterConfig:
     connect_timeout_s: float = 30.0
     # Override bot username (optional)
     user_name: str | None = None
+    # Enable Slack's Agent messaging experience (``agent_view`` manifest mode).
+    # With it on, ``app_home_opened`` fires for every tab (it is the DM-open
+    # signal), each top-level DM message is its own thread root
+    # (``slack:{D}:{ts}``; a subscribed ``slack:{D}:`` from ``open_dm`` still
+    # receives top-level DMs), and configured ``suggested_prompts`` are
+    # applied on a Messages-tab open without ``thread_ts``. Defaults to False.
+    agent_view: bool = False
+    # Suggested prompts pinned automatically when an assistant/agent thread
+    # opens: on ``assistant_thread_started`` (legacy assistant_view) and on a
+    # Messages-tab ``app_home_opened`` when ``agent_view`` is on. A static
+    # :class:`SlackSuggestedPromptsOptions` or a sync/async resolver taking a
+    # :class:`SlackSuggestedPromptsContext`. Failures are logged, never raised.
+    suggested_prompts: SlackSuggestedPrompts | None = None
+    # Default rotating loading messages for the assistant thinking indicator
+    # (``assistant.threads.setStatus`` ``loading_messages``). Used by
+    # ``start_typing`` and ``set_assistant_status`` when no explicit
+    # status/messages are passed.
+    loading_messages: list[str] | None = None
+    # Append Slack's native feedback buttons (a ``context_actions`` block with
+    # a ``feedback_buttons`` element) to every natively streamed reply when the
+    # stream stops, after any caller ``stop_blocks``. Clicks dispatch to
+    # ``chat.on_action``. ``True`` uses the defaults; pass
+    # :class:`SlackFeedbackButtonsOptions` to customize labels, values and the
+    # action id. See ``build_feedback_buttons_block`` for non-streamed messages.
+    feedback_buttons: bool | SlackFeedbackButtonsOptions | None = None
 
 
 # =============================================================================
@@ -340,6 +441,8 @@ class SlackAppHomeOpenedEvent(TypedDict, total=False):
     """Slack app_home_opened event payload."""
 
     channel: str
+    # Folded active-view context (agent_view only).
+    context: SlackAppContext
     event_ts: str
     tab: str
     type: str  # "app_home_opened"
