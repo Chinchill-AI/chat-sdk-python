@@ -1961,6 +1961,55 @@ class TestStream:
         assert captured["recipient_team_id"] == "T_GRID_WS"
 
     @pytest.mark.asyncio
+    async def test_stream_keeps_the_recipient_team_id_under_an_org_wide_context(self):
+        """#95 under an Enterprise Grid org-wide request context (#268).
+
+        Org-wide contexts inject the event's ``team_id`` into Web API calls
+        (``_with_token_kwargs``), but ``chat_stream`` is not routed through
+        it (as upstream's ``chatStream``), so the #95 ``team_id`` stays the
+        ``recipient_team_id`` and no ``client_context_team_id`` is added.
+        """
+        from chat_sdk.adapters.slack.types import RequestContext
+
+        adapter, client, _ = await _init_adapter()
+        captured: dict[str, Any] = {}
+        streamer = MagicMock()
+        streamer.append = AsyncMock(return_value={"ok": True})
+        streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.951951"})
+
+        async def chat_stream(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return streamer
+
+        client.chat_stream = AsyncMock(side_effect=chat_stream)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "streamed hello on grid"
+
+        tok = adapter._request_context.set(
+            RequestContext(
+                token="xoxb-org",
+                is_enterprise_install=True,
+                installation_id="E_ORG",
+                team_id="T_EVENT_WS",
+                context_team_id="T_AWAY",
+                context_channel="C_GRID",
+            )
+        )
+        try:
+            result = await adapter.stream(
+                "slack:C_GRID:1234567890.000000",
+                text_gen(),
+                StreamOptions(recipient_user_id="U_GRID", recipient_team_id="T_GRID_WS"),
+            )
+        finally:
+            adapter._request_context.reset(tok)
+
+        assert result.id == "1234567890.951951"
+        assert captured["team_id"] == "T_GRID_WS"
+        assert "client_context_team_id" not in captured
+
+    @pytest.mark.asyncio
     async def test_stream_raises_team_not_found_without_team_id_on_grid(self):
         """Mutation guard for issue #95: prove the Grid simulation actually
         fails when ``team_id`` is missing.

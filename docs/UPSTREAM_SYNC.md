@@ -955,6 +955,79 @@ SDK-free cards-primitives surface, so upstream's two table converters (and the
   modals to cards (see the "Teams dialog/modal inbound" row in the non-parity
   table), so only the primitive gains the new children.
 
+### Slack Enterprise Grid: org-wide installs, `authorizations[]`, retry marker (chat@4.35, #268)
+
+Parity with the non-cache half of upstream `907450d7` (vercel/chat#724,
+chat@4.35.0); the installation-scoped caches landed in #205. Code is in
+`slack/adapter.py` and `slack/types.py`.
+
+- **OAuth.** `handle_oauth_callback` keys an org-wide install
+  (`is_enterprise_install`, `team: null`) by `enterprise.id` and raises
+  `AuthenticationError("Slack OAuth failed: missing access_token or
+  enterprise.id")` without it. The result gains `enterprise_id` and
+  `is_enterprise_install`; `team_id` is always the storage key.
+  `SlackInstallation` gains `enterprise_id` / `is_enterprise_install`, stored
+  as `enterpriseId` / `isEnterpriseInstall` only when set (upstream's spread
+  drops undefined keys), so a plain install's stored shape is unchanged.
+- **Event routing.** `_resolve_event_request_context(payload)` returns a
+  `RequestContext`, `"not-applicable"` or `"unresolved"` and is shared by the
+  HTTP and Socket Mode `events_api` paths. It prefers `authorizations[0]`
+  (`is_enterprise_install` via `??`, ids via `||`) over the top-level fields
+  and records `team_id`, `context_team_id` (an envelope field) and
+  `context_channel` (`event.channel`). Slash commands go through
+  `_run_slash_command` on both paths, and Socket Mode interactive payloads
+  through `_extract_installation_from_interactive_payload`, so all three
+  resolve org-wide installs by enterprise ID. Socket slash fields that arrive
+  as JSON booleans become `"true"` / `"false"` (JS `String(v)`). The socket
+  `events_api` envelope now keeps `authorizations`, `context_team_id`, the
+  enterprise fields and `is_ext_shared_channel`, as upstream, so shared
+  channels seen over Socket Mode are marked external too.
+- **`team_id` / `client_context_team_id`.** `_with_token_kwargs(**kwargs)`
+  (upstream `withToken`; the token is already bound to the client) adds
+  `team_id` under an org-wide context and `client_context_team_id` on calls
+  whose `channel` is the event's channel. Keys the caller set (not `None`)
+  win. It wraps the same call sites as upstream; `chat_stream`,
+  `chat_scheduleMessage` / `chat_deleteScheduledMessage`, `files_upload_v2`
+  and `oauth_v2_access` stay unwrapped as upstream, so the #95 `chat_stream`
+  `team_id` (`recipient_team_id`) is unchanged under an org-wide context.
+- **Retry marker.** `_process_event_payload` writes
+  `slack:event-delivered:{event_id}` (24 h TTL) as a fire-and-forget task (a
+  pinned reference plus a done-callback that logs at debug).
+  `_is_duplicate_event_delivery(payload, retry_num)` reads it only when
+  `retry_num > 0` (HTTP `x-slack-retry-num`, a malformed header counts as 0;
+  socket `retry_attempt`; forwarded `retryNum`), and a state read error means
+  "process".
+- **`W…` user ids.** `SLACK_USER_ID_EXACT_PATTERN` is `^[UW][A-Z0-9]+$`.
+- **`with_bot_token(token, fn, *, installation_id=None)`** and
+  `with_bot_token_async(...)` set `RequestContext.installation_id`. Upstream
+  passes an async function to `withBotToken`; in Python a coroutine returned
+  by the sync form runs after the context is reset, so async work belongs in
+  `with_bot_token_async` (the ported cache tests use it).
+
+Python-specific notes:
+
+- **Socket retries before #209.** `_on_socket_request` still acks and skips
+  envelopes with `retry_attempt > 0`, so on a live socket the marker only
+  sees first deliveries; it already covers HTTP retries and forwarded socket
+  events. #209 removes the skip, after which `retry_attempt` reaches the
+  marker unchanged.
+- **Flag normalization.** `is_enterprise_install` counts only as `True` or
+  `"true"` everywhere (upstream's event path uses `Boolean(...)`, so a
+  `"false"` string would count there). Slack sends booleans in event JSON, so
+  this differs only for malformed payloads.
+- **`with_token` scope.** Only the adapter's own calls are wrapped; the
+  public `web_client` / `current_client` are plain clients, as upstream's
+  `webClient`.
+
+Regression coverage: `tests/test_slack_enterprise_grid.py` (ports the
+`handleOAuthCallback` Grid cases, `socket mode - multi-workspace token
+resolution`, `withToken enterprise context injection`, `event delivery
+deduplication`, `W-prefixed enterprise user IDs` and `event routing via
+authorizations[]`), the two `withBotToken` cases in
+`tests/test_slack_webhook.py::TestInstallationScopedCaches`, and
+`tests/test_slack_api.py::TestStream::test_stream_keeps_the_recipient_team_id_under_an_org_wide_context`
+for #95.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
@@ -1395,7 +1468,7 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat image rendering | Images emit as `{alt} ({url})` or bare `url` | No image branch — falls through to default which concatenates children only, dropping the URL | Upstream silently drops image URLs when rendering to Google Chat text. We preserve the URL so the message content isn't lost. |
 | Fallback streaming stream-exception capture (non-Teams adapters) | `_fallback_stream` captures exceptions from the stream iterator, flushes whatever content was already rendered, awaits `pending_edit`, and re-raises after cleanup | `try/finally` only — exception propagates immediately, `pendingEdit` is un-awaited, and the placeholder is stranded as `"..."` | Upstream leaves a hard UX failure when streams crash mid-flight (common: LLM connection drops): placeholder visible forever, orphan background task. We flush + clean up before re-raising so the caller still sees the original error and users see the partial content instead of a spinner. This divergence does not apply to Teams: Teams DMs stream natively through the SDK `IStreamer` (`_stream_via_emit`), and a non-cancel iterator exception propagates straight to the caller while the SDK closes the streamer after the handler returns. |
 | Slack `stream()` to a top-level DM (empty `thread_ts`) | Normalizes the empty `thread_ts` to `None` and degrades to a single accumulated `post_message` call so the streamed reply still lands (chat-sdk-python#94) | Passes the empty `thread_ts` straight to `chat.startStream` (`adapter-slack/src/index.ts` `stream()`), which Slack rejects (`invalid_thread_ts`) — the streamed DM reply is silently dropped | Top-level DM messages intentionally encode `threadTs=""` on both sides (`_handle_message_event` / `handleMessageEvent`, "matches openDM subscriptions") — that part is faithful to upstream and **not** a bug. The bug is that upstream's `stream()` never reconciled that legitimate value with `startStream`'s requirement for a non-empty `thread_ts`; `postMessage` accepts no `thread_ts` for DMs, so we degrade instead of erroring. Tracked for contribution upstream — remove this divergence once vercel/chat fixes `stream()` to handle empty-`thread_ts` DM thread ids. |
-| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. |
+| Slack `stream()` on Enterprise Grid (`chat.startStream` `team_not_found`) | Threads the workspace `team_id` into `client.chat_stream(...)` (= `options.recipient_team_id`, the `team.id` extracted on the inbound path), which slack_sdk forwards into `_stream_args` → `chat.startStream`. `chat.appendStream`/`chat.stopStream` don't receive `_stream_args` and don't need `team_id`. Harmless on non-Grid workspaces — a correct `team_id` is always valid. (chat-sdk-python#95) | Builds the `chat.startStream` args from `channel`/`threadTs`/`recipientUserId`/`recipientTeamId`/`taskDisplayMode` only (`adapter-slack/src/index.ts` `stream()`); never passes a workspace `team_id`. On Grid orgs `chat.startStream` then fails with `team_not_found` (the per-workspace bot token alone isn't sufficient to disambiguate the team), even though `chat.postMessage` on the same workspace succeeds without it. | Upstream has the same gap — its `stream()` never threads `team_id`, so streaming is broken on Grid while non-streaming posts work. `chat.startStream` requires `team_id` for Grid disambiguation; `chat.postMessage` does not, which is why only streaming regresses. We source `team_id` from the already-plumbed `recipient_team_id` (the workspace where the interaction happened = the streaming target workspace). Live verification needs a real Grid workspace; the unit regression (`tests/test_slack_api.py::TestStream::test_stream_threads_team_id_to_chat_stream_for_grid` + the `team_not_found` mutation guard) simulates Grid by raising `team_not_found` from the streamer's lazy `chat.startStream` when `team_id` is absent. Tracked for contribution upstream. Re-checked for #268: upstream 4.35+ injects an org-wide event's `team_id` through `withToken`, but its `chatStream` call does not go through `withToken`, and ours does not go through `_with_token_kwargs`, so `chat_stream` keeps `team_id = recipient_team_id` and gets no `client_context_team_id` under an org-wide context (`test_stream_keeps_the_recipient_team_id_under_an_org_wide_context`). |
 | Fallback streaming final SentMessage content (non-Teams adapters) | SentMessage + final edit carry `final_content` (remend'd — inline markers auto-closed) | SentMessage + final edit carry raw `accumulated` | Narrow UX refinement. If a stream ends with an unclosed `*`/`~~`/etc., upstream ships the unclosed marker; we run `_remend` so the user sees a clean final message. Not observable in the common case where streams close their own markers. Teams DMs stream through the SDK `IStreamer` and the Teams accumulate-and-post path ships raw `accumulated` via `post_message`, matching upstream; this divergence applies only to the remaining adapters that still route through `_fallback_stream`. |
 | Teams group-chat / channel streaming via accumulate-and-post | `TeamsAdapter.stream` accumulates the full text and issues a single `post_message` (SDK-backed) instead of post+edit, even for group chats and channel threads | Same (`@chat-adapter/teams@4.30.0`: `if (activeStream && !activeStream.canceled) … else { accumulate; postMessage }`) — no divergence at the adapter level | Documented for clarity: the Python port matches upstream's behavior of avoiding the post+edit flicker where Teams doesn't support native streaming. The buffered fallback routes through the same SDK `App.send` path as a normal `post_message`. |
 | Teams native streaming via the SDK `IStreamer` (DMs) | `TeamsAdapter._handle_message_activity` captures a Teams SDK `IStreamer` (`microsoft_teams.apps.StreamerProtocol` / `HttpStream`) for DMs via `app.activity_sender.create_stream(ref)` on `microsoft-teams-apps` 2.0.x, or `HttpStream(app.api.from_service_url(ref.service_url), ref)` on 2.1.x, which removed `ActivitySender` (#250), registers it in `_active_streams`, and `await`s a `processing_done` gate (a wrapped `wait_until` shim) so the streamer stays alive while the handler streams. The shim builds its options with `dataclasses.replace(options or WebhookOptions(), wait_until=...)`, so `propagate_handler_errors` / `deduplicate` reach `Chat.process_message` (upstream `{ ...baseOptions, waitUntil }`). Since #191 `wait_until` receives Chat's error-swallowing wrapper Task by default (the raw handler task with `propagate_handler_errors=True`). The gate's `add_done_callback` hooks the handler task that `process_message` returns, not the handed wrapper: a host can cancel the wrapper while the shielded handler keeps streaming, whereas upstream's `.catch` promise cannot be cancelled and always settles with the handler. The handed task is only the fallback when `process_message` returns no Task (pinned by `tests/test_teams_native_streaming.py::TestHandleMessageActivityWithRealChat`). `stream()` → `_stream_via_emit` calls `stream.emit(text)` per chunk and NEVER calls `close()`; the adapter's `_handle_message_activity` `finally` calls `stream.close()` once (the lifecycle-owner role the SDK App's `process_activity` plays upstream). | `@chat-adapter/teams@4.30.0` `index.ts` does exactly this: `this.activeStreams.set(threadId, ctx.stream)`, build `processingDone` + wrapped `waitUntil`, `await processingDone`, `streamViaEmit` calls `stream.emit(text)` and never `close()` (the SDK App auto-closes after the handler returns). | **No adapter-level divergence.** The only mechanical difference is the close call site: upstream lets the SDK `App` auto-close `ctx.stream` because the SDK owns dispatch; our bridge overrides `server.on_request`, so we own dispatch and reproduce the close in `_handle_message_activity`'s `finally`. The SDK `HttpStream.close` no-ops when the stream was canceled or had no content, so closing in both success and cancel paths is safe (matching the SDK App, which closes in both its success and `StreamCancelledError` branches). Cancellation is detected via `stream.canceled` (checked before each emit) and by catching `StreamCancelledError` (other exceptions re-raise). The first chunk id is captured via `on_chunk` and awaited only when text was emitted and the stream was not canceled. Replaces the prior hand-rolled wire format, the 1500ms emit throttle, and the `RawMessage.text` / `update_interval_ms` divergences (all unwound in #93 PR 3). |
