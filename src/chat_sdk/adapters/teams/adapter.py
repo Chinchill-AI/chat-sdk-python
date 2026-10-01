@@ -18,7 +18,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from urllib.parse import quote, urlparse
 
 if TYPE_CHECKING:
@@ -38,6 +38,7 @@ from chat_sdk.adapters.teams.attachments import (
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID, card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
+from chat_sdk.adapters.teams.installation import is_install_action, parse_installation_action
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
     TeamsChannelContext,
@@ -78,9 +79,11 @@ from chat_sdk.types import (
     FetchResult,
     FileUpload,
     FormattedContent,
+    InstalledEvent,
     ListThreadsOptions,
     ListThreadsResult,
     LockScope,
+    MemberJoinedChannelEvent,
     Message,
     MessageMetadata,
     PostableMarkdown,
@@ -90,6 +93,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    UninstalledEvent,
     Unset,
     UserInfo,
     WebhookOptions,
@@ -435,6 +439,27 @@ def _conversation_type_from_activity(activity: dict[str, Any]) -> TeamsConversat
     return None
 
 
+def _account_id(account: Any) -> str | None:
+    """The non-empty string ``id`` of an activity account / conversation dict, else ``None``."""
+    value = account.get("id") if isinstance(account, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _tenant_id_from_activity(activity: dict[str, Any]) -> str | None:
+    """Tenant from the conversation, else Teams ``channelData`` (team and group payloads).
+
+    Port of upstream ``tenantIdFromActivity`` (``thread-id.ts``): the
+    conversation's ``tenantId`` wins whenever it is present (``??``).
+    """
+    conversation = activity.get("conversation")
+    tenant_id = conversation.get("tenantId") if isinstance(conversation, dict) else None
+    if tenant_id is None:
+        channel_data = activity.get("channelData")
+        tenant = channel_data.get("tenant") if isinstance(channel_data, dict) else None
+        tenant_id = tenant.get("id") if isinstance(tenant, dict) else None
+    return tenant_id if isinstance(tenant_id, str) else None
+
+
 def _is_dm_conversation(conversation_id: str, conversation_type: TeamsConversationType | None) -> bool:
     """Whether a conversation is a 1:1 chat.
 
@@ -697,10 +722,10 @@ class TeamsAdapter:
 
     @property
     def bot_user_id(self) -> str | None:
-        # Derived from the (possibly lazily resolved) app id; ``None`` until a
-        # callable ``app_id`` has been resolved. The bare-id format is tracked
-        # separately (#217).
-        return self._app_id or None
+        # ``28:{app_id}``, the id Teams gives the bot in ``from`` /
+        # ``recipient`` (upstream ``botUserId``, chat@4.40.0). ``None`` while
+        # no app id is configured or a callable ``app_id`` is unresolved.
+        return f"28:{self._app_id}" if self._app_id else None
 
     @property
     def lock_scope(self) -> LockScope | None:
@@ -1031,7 +1056,8 @@ class TeamsAdapter:
         the HTTP response. Card actions (``invoke``) return the Bot Framework
         invoke acknowledgement; everything else returns ``200`` with no body.
         """
-        if not self._is_bot_framework_token(getattr(event, "token", None)):
+        token = getattr(event, "token", None)
+        if not self._is_bot_framework_token(token):
             return {"status": 401, "body": {"error": "Unauthorized"}}
 
         activity = self._activity_to_dict(event)
@@ -1048,6 +1074,17 @@ class TeamsAdapter:
             await self._handle_message_activity(activity, options)
         elif activity_type == "messageReaction":
             self._handle_reaction_activity(activity, options)
+        elif activity_type == "conversationUpdate":
+            self._handle_conversation_update(activity, options)
+        elif activity_type == "installationUpdate":
+            # Upstream reads ``ctx.ref.serviceUrl``: the activity's own
+            # serviceUrl, else the one from the validated token.
+            token_service_url = getattr(token, "service_url", None)
+            self._handle_installation_update(
+                activity,
+                token_service_url if isinstance(token_service_url, str) else None,
+                options,
+            )
         elif activity_type == "invoke":
             # Adaptive card actions (Action.Execute → invoke). Upstream's
             # ``card.action`` handler acknowledges every ``adaptiveCard/action``
@@ -1229,13 +1266,163 @@ class TeamsAdapter:
     async def _on_sdk_install(self, ctx: Any) -> None:
         await self._cache_user_context(self._activity_to_dict(ctx))
 
+    def _handle_installation_update(
+        self,
+        activity: dict[str, Any],
+        token_service_url: str | None,
+        options: WebhookOptions | None,
+    ) -> None:
+        """Dispatch an ``installationUpdate`` to ``on_installed`` / ``on_uninstalled``.
+
+        Port of upstream ``handleInstallationUpdate`` (chat@4.41.0). The wire
+        ``action`` is checked against the four documented values, and the
+        recipient must be this bot. ``channel_id`` encodes the activity's
+        ``serviceUrl``, else ``token_service_url`` (upstream's SDK reference
+        URL), and is ``None`` when neither gives one.
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring installationUpdate")
+            return
+        recipient_id = _account_id(activity.get("recipient"))
+        if not (recipient_id and self._is_bot_account_id(recipient_id)):
+            self._logger.debug("Ignoring installationUpdate: recipient is not this bot")
+            return
+        conversation_id = _account_id(activity.get("conversation"))
+        if not conversation_id:
+            self._logger.debug("Ignoring installationUpdate: missing conversation id")
+            return
+        action = parse_installation_action(activity.get("action"))
+        if action is None:
+            self._logger.debug("Ignoring installationUpdate: unknown action", {"action": activity.get("action")})
+            return
+        # Message thread IDs encode the raw activity serviceUrl, so prefer it
+        # for consistency, as upstream does.
+        service_url = activity.get("serviceUrl")
+        if not (isinstance(service_url, str) and service_url):
+            service_url = token_service_url or None
+            if service_url:
+                # The SDK token strips one trailing slash, which turns a
+                # root-path endpoint into a bare ``https://host``; the
+                # allow-list (and the inbound wire form) want ``host/``.
+                if not urlparse(service_url).path:
+                    service_url += "/"
+                # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the
+                # token fallback is SSRF-checked before it is persisted.
+                try:
+                    _validate_service_url(service_url)
+                except ValidationError:
+                    self._logger.warn("Ignoring disallowed token serviceUrl", {"serviceUrl": token_service_url})
+                    service_url = None
+        channel_id = (
+            self.encode_thread_id(
+                TeamsThreadId(
+                    conversation_id=conversation_id,
+                    service_url=service_url,
+                    conversation_type=_conversation_type_from_activity(activity),
+                )
+            )
+            if service_url
+            else None
+        )
+        locale = activity.get("locale")
+        fields: dict[str, Any] = {
+            "adapter": self,
+            "id": activity.get("id") or "",
+            "conversation_id": conversation_id,
+            "channel_id": channel_id,
+            "user_id": _account_id(activity.get("from")),
+            "tenant_id": _tenant_id_from_activity(activity),
+            "locale": locale if isinstance(locale, str) else None,
+            "raw": activity,
+        }
+        # ``process_installed`` / ``process_uninstalled`` are optional on
+        # ``ChatInstance`` (upstream ``processInstalled?.``), so a custom chat
+        # without them drops the event.
+        if is_install_action(action):
+            process_installed = getattr(self._chat, "process_installed", None)
+            if process_installed is not None:
+                process_installed(InstalledEvent(action=action, **fields), options)
+        else:
+            process_uninstalled = getattr(self._chat, "process_uninstalled", None)
+            if process_uninstalled is not None:
+                # ``TypeGuard`` (3.12) cannot narrow the negative branch.
+                removal = cast("Literal['remove', 'remove-upgrade']", action)
+                process_uninstalled(UninstalledEvent(action=removal, **fields), options)
+
+    def _handle_conversation_update(self, activity: dict[str, Any], options: WebhookOptions | None) -> None:
+        """Dispatch the bot's own channel / group-chat join to ``on_member_joined_channel``.
+
+        Port of upstream ``handleConversationUpdate`` (chat@4.40.0).
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring conversationUpdate")
+            return
+        user_id = self.bot_user_id
+        if not user_id:
+            self._logger.warn(
+                "Teams app ID is not configured, ignoring conversationUpdate. "
+                "Set appId or TEAMS_APP_ID to receive bot join events."
+            )
+            return
+        join, reason = self._resolve_bot_join(activity)
+        if join is None:
+            self._logger.debug("Ignoring conversationUpdate", {"activityId": activity.get("id"), "reason": reason})
+            return
+        self._chat.process_member_joined_channel(
+            MemberJoinedChannelEvent(
+                adapter=self,
+                channel_id=self.encode_thread_id(join),
+                user_id=user_id,
+                inviter_id=_account_id(activity.get("from")),
+            ),
+            options,
+        )
+
+    def _resolve_bot_join(self, activity: dict[str, Any]) -> tuple[TeamsThreadId | None, str]:
+        """Return the thread to dispatch a bot join on, or ``None`` and the reason to skip.
+
+        Port of upstream ``resolveBotJoin``. Teams sends the bot's own ID as
+        ``recipient.id``, so ``membersAdded`` is compared against that
+        platform-supplied value rather than a locally built one; the
+        recipient itself is matched case-insensitively against the app ID.
+        """
+        recipient_id = _account_id(activity.get("recipient"))
+        if not (recipient_id and self._is_bot_account_id(recipient_id)):
+            return None, "recipient is not this bot"
+        members_added = activity.get("membersAdded")
+        if not (
+            isinstance(members_added, list) and any(_account_id(member) == recipient_id for member in members_added)
+        ):
+            return None, "bot was not among the added members"
+        conversation_id = _account_id(activity.get("conversation"))
+        if not conversation_id:
+            return None, "missing conversation id"
+        service_url = activity.get("serviceUrl")
+        if not (isinstance(service_url, str) and service_url):
+            return None, "missing serviceUrl"
+        conversation_type = _conversation_type_from_activity(activity)
+        if _is_dm_conversation(conversation_id, conversation_type):
+            return None, "personal conversation"
+        return (
+            TeamsThreadId(
+                conversation_id=conversation_id,
+                service_url=service_url,
+                conversation_type=conversation_type,
+            ),
+            "",
+        )
+
     async def _cache_user_context(self, activity: dict[str, Any]) -> None:
         """Cache serviceUrl, tenantId, and channel context from activity metadata."""
         if not self._chat:
             return
 
-        from_user = activity.get("from", {})
-        user_id = from_user.get("id")
+        # Explicit JSON ``null`` survives ``_activity_to_dict``, so guard each
+        # nested lookup the way upstream's optional chaining (``?.``) does.
+        from_user = activity.get("from")
+        if not isinstance(from_user, dict):
+            return
+        user_id = _account_id(from_user)
         if not user_id:
             return
 
@@ -1257,9 +1444,10 @@ class TeamsAdapter:
                 await state.set(f"teams:serviceUrl:{user_id}", service_url, ttl)
 
         # Cache tenantId
-        channel_data = activity.get("channelData", {})
-        conversation = activity.get("conversation", {})
-        tenant_id = conversation.get("tenantId") or channel_data.get("tenant", {}).get("id")
+        channel_data = activity.get("channelData")
+        if not isinstance(channel_data, dict):
+            channel_data = {}
+        tenant_id = _tenant_id_from_activity(activity)
         if tenant_id and state:
             await state.set(f"teams:tenantId:{user_id}", tenant_id, ttl)
 
@@ -1272,18 +1460,27 @@ class TeamsAdapter:
             await state.set(f"teams:aadObjectId:{user_id}", aad_object_id, ttl)
 
         # Cache channel context
-        team_aad_group_id = channel_data.get("team", {}).get("aadGroupId")
-        conversation_id = conversation.get("id", "")
+        team = channel_data.get("team")
+        team_aad_group_id = team.get("aadGroupId") if isinstance(team, dict) else None
+        conversation_id = _account_id(activity.get("conversation")) or ""
         base_channel_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
 
-        if team_aad_group_id and channel_data.get("channel", {}).get("id") and state:
+        # Team-scoped conversationUpdate payloads (bot added to a team) carry
+        # team.aadGroupId but no channelData.channel; the conversation itself
+        # is the channel the bot was installed into (upstream chat@4.40.0).
+        channel = channel_data.get("channel")
+        team_channel_id = channel.get("id") if isinstance(channel, dict) else None
+        if team_channel_id is None and base_channel_id.startswith("19:"):
+            team_channel_id = base_channel_id
+
+        if team_aad_group_id and team_channel_id and state:
             # Wire-shape parity with upstream TS (#403): the channel branch
             # omits the discriminator. ``_chat_id_from_context`` and
             # ``_get_graph_context`` treat ``type != "dm"`` as channel, so
             # the missing key is unambiguous.
             context: TeamsChannelContext = {
                 "team_id": team_aad_group_id,
-                "channel_id": channel_data["channel"]["id"],
+                "channel_id": team_channel_id,
             }
             await state.set(f"teams:channelContext:{base_channel_id}", json.dumps(context), ttl)
 
@@ -1957,12 +2154,20 @@ class TeamsAdapter:
 
     def _is_message_from_self(self, activity: dict[str, Any]) -> bool:
         """Check if the activity is from the bot."""
-        from_id = activity.get("from", {}).get("id")
-        if not (from_id and self._app_id):
+        from_id = _account_id(activity.get("from"))
+        return self._is_bot_account_id(from_id) if from_id else False
+
+    def _is_bot_account_id(self, account_id: str) -> bool:
+        """Whether a Teams account ID (``28:<appId>`` or a bare app ID) is this bot.
+
+        GUID casing differs between configuration and Teams payloads, so the
+        comparison is case-insensitive (upstream ``isBotAccountId``).
+        """
+        app_id = self._app_id.lower()
+        if not app_id:
             return False
-        if from_id == self._app_id:
-            return True
-        return bool(from_id.endswith(f":{self._app_id}"))
+        normalized = account_id.lower()
+        return normalized == app_id or normalized.endswith(f":{app_id}")
 
     async def _files_to_attachments(self, files: list[FileUpload]) -> list[dict[str, Any]]:
         """Convert ``FileUpload`` objects to Bot Framework data-URI attachments.

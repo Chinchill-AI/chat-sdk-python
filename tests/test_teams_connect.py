@@ -264,7 +264,7 @@ class TestLazyTeamsIdentity:
         await adapter.initialize(chat)
 
         app_id.assert_awaited_once()
-        assert adapter.bot_user_id == "lazy-app"
+        assert adapter.bot_user_id == "28:lazy-app"
         assert adapter._app.id == "lazy-app"
         assert adapter.register_count == 1
         assert adapter.parse_message({**_ACTIVITY, "from": {"id": "28:lazy-app"}}).author.is_me is True
@@ -272,7 +272,7 @@ class TestLazyTeamsIdentity:
     async def test_supports_synchronous_resolvers(self) -> None:
         adapter = _make_adapter(app_id=lambda: "sync-app")
         await adapter.initialize(_make_chat())
-        assert adapter.bot_user_id == "sync-app"
+        assert adapter.bot_user_id == "28:sync-app"
 
     async def test_retries_a_failed_resolver_through_initialize(self) -> None:
         app_id = AsyncMock(side_effect=[RuntimeError("metadata unavailable"), "retry-app"])
@@ -284,7 +284,7 @@ class TestLazyTeamsIdentity:
         await adapter.initialize(chat)
 
         assert app_id.await_count == 2
-        assert adapter.bot_user_id == "retry-app"
+        assert adapter.bot_user_id == "28:retry-app"
 
     @pytest.mark.parametrize("value", ["", "   ", None, 123])
     async def test_rejects_invalid_resolved_identity(self, value: Any) -> None:
@@ -324,9 +324,9 @@ class TestLazyTeamsIdentity:
     def test_preserves_immediate_bot_identity_for_string_and_environment_configuration(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        assert _make_adapter().bot_user_id == "test-app"
+        assert _make_adapter().bot_user_id == "28:test-app"
         monkeypatch.setenv("TEAMS_APP_ID", "env-app")
-        assert _make_adapter(app_id=None).bot_user_id == "env-app"
+        assert _make_adapter(app_id=None).bot_user_id == "28:env-app"
 
     async def test_reports_initialization_required_for_lazy_outbound_operations(self) -> None:
         adapter = _make_adapter(app_id=AsyncMock(return_value="lazy-app"))
@@ -359,7 +359,7 @@ class TestLazyTeamsIdentity:
         gate.set()
         await second
 
-        assert adapter.bot_user_id == "lazy-app"
+        assert adapter.bot_user_id == "28:lazy-app"
         assert adapter.register_count == 1
 
 

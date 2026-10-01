@@ -960,8 +960,7 @@ class ThreadImpl:
                     await self._thread_history.append(self._id, _to_message(sent))
                 return sent
             # ``None`` means the adapter delegated back to the SDK's built-in
-            # post+edit fallback for this thread (vercel/chat#340 — e.g. the
-            # Telegram adapter only natively streams DMs). The contract
+            # post+edit fallback for this thread (vercel/chat#340). The contract
             # requires adapters to return ``None`` BEFORE consuming any
             # chunks, so ``text_stream`` is still fully intact for the
             # fallback below. Close the unused wrapper so a partially
