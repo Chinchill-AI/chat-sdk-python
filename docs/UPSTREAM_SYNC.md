@@ -1997,6 +1997,79 @@ from `21dc60c3` (#935, chat@4.41.0), and the `messages.test.ts` case of
   asserting the same `data:image/png;base64,AQID` part. As before, an
   unnamed attachment gets `filename=""` (upstream leaves it `undefined`).
 
+### Thread replies, read receipts and ephemeral options (chat@4.35–4.41, #200)
+
+Parity with `83ede7ea` (vercel/chat#819) and `18d4a230` (#820, chat@4.38.0),
+the doc-only core part of `160140e3` (#737, chat@4.35.0), and the core slice
+of `bfee00af` (#939, chat@4.41.0). One divergence-table row (the
+`post_ephemeral` signature probe). Adapter implementations come later:
+Telegram replies #228, WhatsApp/Messenger reply and read receipts #239, Teams
+targeted ephemeral #219, Gmail #241.
+
+- **`Thread.reply(target, message)` (`83ede7ea`).** Steps, in upstream
+  order: check for the hook, resolve the target, check the thread, buffer a
+  stream, process callback URLs, call `adapter.reply(thread_id,
+  target_id, postable)`, build the `SentMessage` with `reply_to`, append it
+  to thread history. A string target is resolved by
+  `_find_known_message` against the current message and then
+  `recent_messages`. It is never fetched. An unknown ID is still sent, with
+  `reply_to=None` and no cross-thread check. Streams go through
+  `from_full_stream`. Text and `markdown_text` chunks are kept and
+  `task_update` / `plan_update` chunks are dropped. A stream with no visible
+  text posts `PostableMarkdown(" ")`, as upstream. Python has no JSX, so a
+  `CardElement` dict is passed through, and the upstream JSX test checks that.
+- **`Thread.mark_as_read(message=None)` (`18d4a230`).** Errors come in
+  upstream order: no hook, then `MESSAGE_REQUIRED`, then `THREAD_MISMATCH`.
+  `None` means the current message, checked with `is None`. An explicit `""`
+  is rejected as `MESSAGE_REQUIRED`, as upstream (`"" ?? current` keeps `""`,
+  then `!target` throws). The adapter receives
+  `(thread_id, message_id, message_or_None)`.
+- **Optional hooks.** `reply` and `mark_as_read` are documented on
+  `BaseAdapter` (a comment block with their signatures) but have no default
+  method there, and they are not on the `Adapter` Protocol, where they would
+  become required. `Thread` finds the hooks with `getattr(adapter, name,
+  None)`, so an adapter without them, `BaseAdapter` subclasses included,
+  raises `ChatNotImplementedError` (`"replies"` / `"read-receipts"`) before
+  any other work, as upstream's `if (!this.adapter.reply)`: no stream is
+  consumed, no callback token is minted, and `mark_as_read()` outside a
+  handler reports the missing hook rather than `MESSAGE_REQUIRED`. A raising
+  default would have made every subclass look capable. The empty-stream
+  check strips with `JS_WHITESPACE` (JS `trim()`), not `str.strip()`.
+  The shared mock adapter has a recording `mark_as_read` `AsyncMock` by
+  default, as upstream's mock does, and no `reply`.
+- **Errors.** Python's `ChatError` has no `code`, so `MESSAGE_REQUIRED` and
+  `THREAD_MISMATCH` are `ChatError`s with upstream's exact messages.
+  Upstream's cross-thread reply check throws a plain `Error`. Python raises
+  `ChatError` with the same message, as the History API does (#197). No
+  `code` attribute is added. `NotImplementedError.feature` is
+  `ChatNotImplementedError.method`.
+- **`SentMessage.edit()` keeps the thread ID and target.** `_create_sent_message`
+  takes `reply_to`. Its `edit` now returns
+  `_create_sent_message(id, content, thread_id, reply_to=reply_to)`, as
+  upstream's `createSentMessage(messageId, postable, threadId, replyTo)`
+  does. Before this change, an edit of a message posted under a
+  `thread_id_override` went back to `self._id`. `create_sent_message_from_message`
+  passes `message.reply_to` the same way.
+- **`post_ephemeral` options (`bfee00af`).** `BaseAdapter.post_ephemeral`
+  is now `(thread_id, user_id, message, *, options=None) -> EphemeralMessage
+  | None`. `Thread` and `Channel` pass the caller's `PostEphemeralOptions`
+  as `options=`, and an adapter's `None` comes back unchanged with no DM
+  fallback, as upstream. Slack and Google Chat accept `options` and ignore
+  it. JavaScript drops extra arguments; Python raises `TypeError`. So
+  `options=` is passed only when `chat_sdk._compat.accepts_kwarg` reports
+  that the implementation takes it: a parameter named `options` that is
+  positional-or-keyword or keyword-only, or `**kwargs`. The check is cached
+  per function, and bound methods are checked through `__func__`. A callable
+  that cannot be introspected gets `options=`, as upstream always passes it.
+  This is the divergence row. #201 (`start_typing(options=)`) can reuse it.
+- **WhatsApp.** Until #239, `WhatsAppAdapter.mark_as_read(message_id)` keeps
+  its one-argument signature, so `thread.mark_as_read()` on WhatsApp raises
+  `TypeError`.
+- **Fidelity.** All 16 `[markAsRead]` / `[reply()]` tests are ported under
+  their exact names: `thread.test.ts` 15 → 1 missing at `chat@4.41.1`. The
+  remaining test, `startTyping`, belongs to #201. The `postEphemeral`
+  assertions in `thread.test.ts` / `channel.test.ts` now expect `options=`.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
@@ -2418,6 +2491,7 @@ stay explicit instead of being rediscovered in code review.
 | Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #283 while clicks carry the message ts, a Slack DM click carries no ts even after #283 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
+| `post_ephemeral` signature probe (4.41 wave, #200) | `Thread`/`Channel.post_ephemeral` pass `options=` to `adapter.post_ephemeral` only when `chat_sdk._compat.accepts_kwarg` finds an `options` parameter (positional-or-keyword or keyword-only) or `**kwargs`; an implementation with the older `(thread_id, user_id, message)` signature is called with three arguments | `adapter.postEphemeral(threadId, userId, postable, options)` always | JavaScript drops extra arguments, while Python raises `TypeError`, so passing `options=` unconditionally would break third-party adapters written against the pre-4.41 signature. In-repo adapters all accept it. Regression tests: `tests/test_thread_faithful.py::TestPostEphemeral::test_three_argument_custom_post_ephemeral_still_works`, `tests/test_channel_faithful.py::TestChannelPostEphemeral::test_three_argument_custom_post_ephemeral_still_works_from_a_channel` and `tests/test_compat.py::test_accepts_kwarg`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
 | `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
 | `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |

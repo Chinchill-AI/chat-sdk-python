@@ -134,6 +134,7 @@ from chat_sdk.types import (
     ModalSubmitEvent,
     OptionsLoadEvent,
     PostableMarkdown,
+    PostEphemeralOptions,
     RawMessage,
     ReactionEvent,
     ScheduledMessage,
@@ -5891,8 +5892,14 @@ class SlackAdapter:
         thread_id: str,
         user_id: str,
         message: AdapterPostableMessage,
+        *,
+        options: PostEphemeralOptions | None = None,
     ) -> EphemeralMessage:
-        """Post an ephemeral (user-only visible) message."""
+        """Post an ephemeral (user-only visible) message.
+
+        ``options`` is accepted for the adapter contract and unused: delivery
+        is always native.
+        """
         message = await self._resolve_message_mentions(message, thread_id)
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
