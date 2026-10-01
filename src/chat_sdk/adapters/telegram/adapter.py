@@ -89,6 +89,7 @@ from chat_sdk.types import (
     EmojiValue,
     FetchOptions,
     FetchResult,
+    FileUpload,
     FormattedContent,
     LockScope,
     Message,
@@ -141,6 +142,15 @@ ATTACHMENT_UPLOADS: dict[str, dict[str, str]] = {
     "image": {"field": "photo", "method": "sendPhoto"},
     "video": {"field": "video", "method": "sendVideo"},
 }
+# Map a normalized Attachment.type to its ``InputMedia`` type inside a
+# ``sendMediaGroup`` album. Port of upstream ATTACHMENT_MEDIA_GROUP_TYPES
+# (vercel/chat#605).
+ATTACHMENT_MEDIA_GROUP_TYPES: dict[str, str] = {
+    "audio": "audio",
+    "file": "document",
+    "image": "photo",
+    "video": "video",
+}
 LEADING_AT_PATTERN = re.compile(r"^@+")
 EMOJI_PLACEHOLDER_PATTERN = re.compile(r"^\{\{emoji:([a-z0-9_]+)\}\}$", re.IGNORECASE)
 EMOJI_NAME_PATTERN = re.compile(r"^[a-z0-9_+-]+$", re.IGNORECASE)
@@ -164,7 +174,9 @@ TELEGRAM_INCOMING_MEDIA_GROUP_BUFFER_TTL_MS = 30_000
 TELEGRAM_INCOMING_MEDIA_GROUP_LOCK_TTL_MS = 5_000
 TELEGRAM_INCOMING_MEDIA_GROUP_RETRY_MS = 50
 TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS = 1_000
-# Albums hold at most 10 items; the incoming buffer keeps the newest 10.
+# Albums hold 2-10 items: ``sendMediaGroup`` accepts that range and the
+# incoming buffer keeps the newest 10 parts.
+TELEGRAM_MEDIA_GROUP_MIN = 2
 TELEGRAM_MEDIA_GROUP_MAX = 10
 # Upper bound for both the request-failure backoff and the per-update retry
 # backoff of the polling loop (vercel/chat#942).
@@ -569,6 +581,19 @@ def _integral_update_id(value: Any) -> int | None:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return None
+
+
+@dataclass
+class _TelegramMediaGroupPart:
+    """One ``InputMedia`` item of an outbound ``sendMediaGroup`` album."""
+
+    media: str
+    type: str
+    data: bytes | None = None
+    filename: str | None = None
+    mime_type: str | None = None
+    width: int | None = None
+    height: int | None = None
 
 
 def _js_number_str(value: Any) -> str:
@@ -2299,18 +2324,7 @@ class TelegramAdapter:
         )
 
         files = extract_files(message)
-        if len(files) > 1:
-            raise ValidationError(
-                "telegram",
-                "Telegram adapter supports a single file upload per message",
-            )
-
         attachments = extract_postable_attachments(message)
-        if len(attachments) > 1:
-            raise ValidationError(
-                "telegram",
-                "Telegram adapter supports a single attachment upload per message",
-            )
 
         if files and attachments:
             raise ValidationError(
@@ -2319,27 +2333,50 @@ class TelegramAdapter:
             )
 
         rich = self.resolve_rich_message(message, card, len(files), len(attachments))
-        raw_message: TelegramMessage
+        raw_messages: list[TelegramMessage]
 
-        if len(files) == 1:
+        if files:
             file = files[0]
             if not file:
                 raise ValidationError("telegram", "File upload payload is empty")
-            raw_message = await self.send_document(
-                parsed_thread, file, text, plain_text, reply_markup, parse_mode, reply_parameters
+            # 2+ files go out as one album (vercel/chat#605).
+            raw_messages = (
+                [
+                    await self.send_document(
+                        parsed_thread, file, text, plain_text, reply_markup, parse_mode, reply_parameters
+                    )
+                ]
+                if len(files) == 1
+                else await self._send_document_media_group(
+                    parsed_thread, files, text, plain_text, reply_markup, parse_mode, reply_parameters
+                )
             )
-        elif len(attachments) == 1:
+        elif attachments:
             attachment = attachments[0]
             if not attachment:
                 raise ValidationError("telegram", "Attachment upload payload is empty")
-            raw_message = await self.send_attachment(
-                parsed_thread,
-                attachment,
-                text,
-                plain_text,
-                reply_markup,
-                parse_mode,
-                reply_parameters,
+            raw_messages = (
+                [
+                    await self.send_attachment(
+                        parsed_thread,
+                        attachment,
+                        text,
+                        plain_text,
+                        reply_markup,
+                        parse_mode,
+                        reply_parameters,
+                    )
+                ]
+                if len(attachments) == 1
+                else await self._send_attachment_media_group(
+                    parsed_thread,
+                    attachments,
+                    text,
+                    plain_text,
+                    reply_markup,
+                    parse_mode,
+                    reply_parameters,
+                )
             )
         else:
             if not text.strip():
@@ -2370,37 +2407,48 @@ class TelegramAdapter:
                         rich_body["reply_parameters"] = reply_parameters
                     return await self.telegram_fetch("sendRichMessage", rich_body)
 
-                raw_message = await self.with_telegram_rich_fallback(
-                    _send_rich,
-                    _send_regular,
-                    method="sendRichMessage",
-                    thread_id=thread_id,
-                )
+                raw_messages = [
+                    await self.with_telegram_rich_fallback(
+                        _send_rich,
+                        _send_regular,
+                        method="sendRichMessage",
+                        thread_id=thread_id,
+                    )
+                ]
             else:
-                raw_message = await _send_regular()
-
-        resulting_thread_id = self.encode_thread_id(
-            TelegramThreadId(
-                chat_id=str(raw_message["chat"]["id"]),
-                message_thread_id=(
-                    raw_message.get("message_thread_id")
-                    if raw_message.get("message_thread_id") is not None
-                    else parsed_thread.message_thread_id
-                ),
-            )
-        )
+                raw_messages = [await _send_regular()]
 
         # Reuse the locally pre-rendered AST/text when the rich path produced
         # the message, so Telegram's echo isn't re-parsed (upstream passes
         # ``{ formatted, text }`` into ``parseTelegramMessage``).
         parsed_content = TelegramParsedContent(formatted=rich.formatted, text=rich.text) if rich is not None else None
-        parsed_message = self.parse_telegram_message(raw_message, resulting_thread_id, parsed_content)
-        self.cache_message(parsed_message)
+        # A media group returns every sent message: all are cached and the
+        # last one is returned, as upstream.
+        parsed_messages: list[Message] = []
+        for raw_message in raw_messages:
+            resulting_thread_id = self.encode_thread_id(
+                TelegramThreadId(
+                    chat_id=str(raw_message["chat"]["id"]),
+                    message_thread_id=(
+                        raw_message.get("message_thread_id")
+                        if raw_message.get("message_thread_id") is not None
+                        else parsed_thread.message_thread_id
+                    ),
+                )
+            )
+            parsed_messages.append(self.parse_telegram_message(raw_message, resulting_thread_id, parsed_content))
+
+        for parsed_message in parsed_messages:
+            self.cache_message(parsed_message)
+
+        if not parsed_messages:
+            raise NetworkError("telegram", "Telegram postMessage did not return any sent messages")
+        sent_message = parsed_messages[-1]
 
         return RawMessage(
-            id=parsed_message.id,
-            thread_id=parsed_message.thread_id,
-            raw=raw_message,
+            id=sent_message.id,
+            thread_id=sent_message.thread_id,
+            raw=sent_message.raw,
         )
 
     async def post_channel_message(
@@ -3834,6 +3882,213 @@ class TelegramAdapter:
             method=upload["method"],
             thread_id=self.encode_thread_id(thread),
         )
+
+    async def _send_document_media_group(
+        self,
+        thread: TelegramThreadId,
+        files: list[FileUpload],
+        text: str,
+        plain_text: str,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+        reply_parameters: TelegramReplyParameters | None = None,
+    ) -> list[TelegramMessage]:
+        """Send 2-10 file uploads as one ``sendMediaGroup`` album of documents.
+
+        Port of upstream ``sendDocumentMediaGroup`` (vercel/chat#605).
+        """
+        self._validate_media_group_length(len(files))
+
+        if reply_markup:
+            raise ValidationError("telegram", "Telegram media groups do not support inline keyboards")
+
+        parts: list[_TelegramMediaGroupPart] = []
+        for index, file in enumerate(files):
+            data: Any = file.data
+            if isinstance(data, memoryview) or not isinstance(data, bytes):
+                data = bytes(data)
+            parts.append(
+                _TelegramMediaGroupPart(
+                    data=data,
+                    filename=file.filename,
+                    media=f"attach://media{index}",
+                    mime_type=file.mime_type,
+                    type="document",
+                )
+            )
+
+        return await self._send_media_group(thread, parts, text, plain_text, parse_mode, reply_parameters)
+
+    async def _send_attachment_media_group(
+        self,
+        thread: TelegramThreadId,
+        attachments: list[Attachment],
+        text: str,
+        plain_text: str,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+        reply_parameters: TelegramReplyParameters | None = None,
+    ) -> list[TelegramMessage]:
+        """Send 2-10 typed attachments as one ``sendMediaGroup`` album.
+
+        Port of upstream ``sendAttachmentMediaGroup`` (vercel/chat#605).
+        Binary payloads (``data`` or ``fetch_data``) become ``media{i}``
+        multipart parts referenced as ``attach://media{i}``; URL-only
+        attachments pass their URL as ``media``.
+        """
+        self._validate_media_group_length(len(attachments))
+        self._validate_attachment_media_group_types(attachments)
+
+        if reply_markup:
+            raise ValidationError("telegram", "Telegram media groups do not support inline keyboards")
+
+        parts: list[_TelegramMediaGroupPart] = []
+        for index, attachment in enumerate(attachments):
+            data: Any = attachment.data
+            if data is None and attachment.fetch_data is not None:
+                data = await attachment.fetch_data()
+
+            if data is None and not attachment.url:
+                raise ValidationError(
+                    "telegram",
+                    f"Attachment data or URL required for {attachment.type}",
+                )
+
+            if data is not None and (isinstance(data, memoryview) or not isinstance(data, bytes)):
+                data = bytes(data)
+
+            parts.append(
+                _TelegramMediaGroupPart(
+                    data=data,
+                    filename=attachment.name if attachment.name is not None else f"attachment-{index}",
+                    height=attachment.height,
+                    # ``url`` is non-empty here whenever ``data`` is None.
+                    media=f"attach://media{index}" if data is not None else cast(str, attachment.url),
+                    mime_type=attachment.mime_type,
+                    type=ATTACHMENT_MEDIA_GROUP_TYPES[attachment.type],
+                    width=attachment.width,
+                )
+            )
+
+        return await self._send_media_group(thread, parts, text, plain_text, parse_mode, reply_parameters)
+
+    async def _send_media_group(
+        self,
+        thread: TelegramThreadId,
+        parts: list[_TelegramMediaGroupPart],
+        text: str,
+        plain_text: str,
+        parse_mode: str | None,
+        reply_parameters: TelegramReplyParameters | None,
+    ) -> list[TelegramMessage]:
+        """Call ``sendMediaGroup`` with the MarkdownV2 -> plain caption retry."""
+
+        async def _send(resolved_parse_mode: str | None, resolved_text: str) -> list[TelegramMessage]:
+            # FormData is rebuilt per attempt — see send_document.
+            return await self.telegram_fetch(
+                "sendMediaGroup",
+                self._create_telegram_media_group_form_data(
+                    thread, parts, resolved_text, resolved_parse_mode, reply_parameters
+                ),
+            )
+
+        return await self.with_telegram_markdown_fallback(
+            parse_mode,
+            _send,
+            initial_text=text,
+            fallback_text=plain_text,
+            method="sendMediaGroup",
+            thread_id=self.encode_thread_id(thread),
+        )
+
+    def _create_telegram_media_group_form_data(
+        self,
+        thread: TelegramThreadId,
+        parts: list[_TelegramMediaGroupPart],
+        text: str,
+        parse_mode: str | None,
+        reply_parameters: TelegramReplyParameters | None = None,
+    ) -> Any:
+        """Build the multipart body for ``sendMediaGroup``.
+
+        ``media`` is a JSON string of ``InputMedia`` items; binary parts follow
+        as ``media{i}`` file fields.
+        """
+        import aiohttp
+
+        form_data = aiohttp.FormData()
+        form_data.add_field("chat_id", thread.chat_id)
+        if isinstance(thread.message_thread_id, int):
+            form_data.add_field("message_thread_id", str(thread.message_thread_id))
+        self._append_reply_parameters(form_data, reply_parameters)
+
+        # Telegram shows an album's caption from the first item that carries
+        # one; on a later item it renders under that media instead of the
+        # whole group.
+        caption_index = 0
+        media: list[dict[str, Any]] = []
+        for index, part in enumerate(parts):
+            item: dict[str, Any] = {"media": part.media, "type": part.type}
+
+            if index == caption_index and text.strip():
+                item["caption"] = self.truncate_caption(text, parse_mode)
+                if parse_mode:
+                    item["parse_mode"] = parse_mode
+
+            if part.type == "video":
+                # Upstream's ``Number.isInteger`` check, the same rule as the
+                # webhook ``update_id`` (an integral float counts, bool does not).
+                width = _integral_update_id(part.width)
+                if width is not None:
+                    item["width"] = width
+                height = _integral_update_id(part.height)
+                if height is not None:
+                    item["height"] = height
+
+            media.append(item)
+        form_data.add_field("media", json.dumps(media))
+
+        for index, part in enumerate(parts):
+            if part.data is None:
+                continue
+            form_data.add_field(
+                f"media{index}",
+                part.data,
+                filename=part.filename if part.filename is not None else f"media-{index}",
+                content_type=part.mime_type if part.mime_type is not None else "application/octet-stream",
+            )
+
+        return form_data
+
+    @staticmethod
+    def _validate_media_group_length(count: int) -> None:
+        if count < TELEGRAM_MEDIA_GROUP_MIN or count > TELEGRAM_MEDIA_GROUP_MAX:
+            raise ValidationError("telegram", "Telegram media groups support 2-10 files")
+
+    @staticmethod
+    def _validate_attachment_media_group_types(attachments: list[Attachment]) -> None:
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md
+        # An unknown ``type`` is rejected here, before any download, with
+        # ``send_attachment``'s message (upstream's TS union rules it out at
+        # compile time; the dict lookup would raise KeyError).
+        for attachment in attachments:
+            if attachment.type not in ATTACHMENT_MEDIA_GROUP_TYPES:
+                raise ValidationError(
+                    "telegram",
+                    f"Unsupported attachment type: {attachment.type}. "
+                    f"Supported types: {', '.join(ATTACHMENT_MEDIA_GROUP_TYPES)}",
+                )
+
+        categories = {
+            "document" if attachment.type == "file" else "audio" if attachment.type == "audio" else "visual"
+            for attachment in attachments
+        }
+        if len(categories) > 1:
+            raise ValidationError(
+                "telegram",
+                "Telegram media groups can mix photos and videos, but documents and audio files "
+                "must be grouped only with the same type",
+            )
 
     # -- Message caching -----------------------------------------------------
 
