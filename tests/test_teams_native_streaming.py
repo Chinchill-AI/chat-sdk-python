@@ -832,11 +832,23 @@ class TestFirstChunkIdWait:
         async def gen():
             yield "hello"
 
-        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), streamer), 2)  # type: ignore[arg-type]
+        await _register_streamer(adapter, tid, streamer)
+        result = await asyncio.wait_for(adapter.stream(tid, gen()), 2)
 
         send.assert_not_awaited()
+        assert result is not None
         assert result.id == "late-stream-1"
         assert result.raw == {"text": "hello"}
+        # The finalized streamer is retired, so a second post in the same
+        # handler is sent as a plain message instead of reusing it.
+        assert tid not in adapter._active_streams
+
+        async def gen2():
+            yield "again"
+
+        second = await adapter.stream(tid, gen2())
+        assert second is not None and second.id == "fallback-1"
+        assert streamer.emitted == ["hello"]
 
     @pytest.mark.asyncio
     async def test_sends_nothing_more_when_the_user_cancels_during_the_wait(self, monkeypatch: pytest.MonkeyPatch):
@@ -898,6 +910,49 @@ class TestFirstChunkIdWait:
         # The handler's later close() sends nothing more.
         assert await stream.close() is None
         assert len(stream_requests) == 1 and len(plain_posts) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not _sdk_has_terminal_stream_errors(), reason="this SDK treats every streaming 403 as a cancel")
+    async def test_real_sdk_chunk_stranded_by_a_failed_flush_is_posted(self, monkeypatch: pytest.MonkeyPatch):
+        """A chunk emitted while the first flush awaits its 403 stays queued
+        with no flush scheduled: that is not an in-flight send, so the whole
+        reply is posted."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        stream_requests: list[dict[str, Any]] = []
+        plain_posts: list[dict[str, Any]] = []
+        first_flush_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            if _is_stream_activity(body):
+                stream_requests.append(body)
+                first_flush_started.set()
+                await asyncio.sleep(0.1)
+                return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
+            plain_posts.append(body)
+            return httpx.Response(200, json={"id": "fallback-post-1"})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        stream._total_wait_timeout = 0.05  # type: ignore[attr-defined]  # the SDK's 30 s close() wait
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.5)
+
+        async def gen():
+            yield "hello"
+            await first_flush_started.wait()
+            yield " world"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert len(stream_requests) == 1
+        assert stream.count == 1  # " world" stranded in the SDK queue
+        assert [p["text"] for p in plain_posts] == ["hello world"]
+        assert result.id == "fallback-post-1"
 
     @pytest.mark.asyncio
     async def test_real_sdk_stream_canceled_on_the_first_flush_posts_nothing(self, monkeypatch: pytest.MonkeyPatch):

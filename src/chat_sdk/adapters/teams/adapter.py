@@ -149,17 +149,20 @@ _background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def _stream_send_in_flight(stream: Any) -> bool:
-    """Whether the SDK ``HttpStream`` still has queued or in-flight content.
+    """Whether the SDK ``HttpStream`` has a flush running or scheduled.
 
-    The SDK exposes no public flag for an in-flight flush, so this reads
-    ``HttpStream._lock`` (held for the whole flush, including retries; present
-    on every supported ``microsoft-teams-apps`` version). A streamer without
-    it counts as idle.
+    The SDK exposes no public flag for this, so it reads ``HttpStream``
+    internals present on every supported ``microsoft-teams-apps`` version:
+    ``_lock`` (held for the whole flush, including retries), ``_pending`` (a
+    flush task not yet started) and ``_timeout`` (the next flush's timer).
+    Queued content alone does not count: after a flush fails, the SDK leaves
+    later chunks queued with nothing scheduled to send them. A streamer
+    without these attributes counts as idle.
     """
-    if getattr(stream, "count", 0):
-        return True
     lock = getattr(stream, "_lock", None)
-    return isinstance(lock, asyncio.Lock) and lock.locked()
+    if isinstance(lock, asyncio.Lock) and lock.locked():
+        return True
+    return getattr(stream, "_pending", None) is not None or getattr(stream, "_timeout", None) is not None
 
 
 def _resolve_teams_reaction_type(emoji: EmojiValue | str) -> str:
@@ -2991,6 +2994,11 @@ class TeamsAdapter:
                         )
                         return RawMessage(id="", thread_id=thread_id, raw={"text": accumulated})
                     if settled is not None:
+                        # The stream is finalized, so a later post in this
+                        # handler must not reuse it (2.0.13.4 does not reopen a
+                        # closed stream on emit); it takes the no-streamer path.
+                        if self._active_streams.get(thread_id) is stream:
+                            self._active_streams.pop(thread_id, None)
                         # A settled stream means the first chunk was delivered,
                         # and its id is the message id (the final response may
                         # carry none). The SDK runs async ``chunk`` handlers as a
