@@ -2088,9 +2088,9 @@ Python-only #94 row is retired.
   `thread.post` end to end. The #95 mutation guard now asserts the
   `team_not_found` reply falls back to post+edit.
 
-### Slack native stream rotation (chat@4.41, #208)
+### Slack native stream rotation (chat@4.40, #208)
 
-Ports `d4a1f03a` (vercel/chat#884, chat@4.41.0). Slack expires a native
+Ports `d4a1f03a` (vercel/chat#884, chat@4.40.0). Slack expires a native
 stream about five minutes after it starts, so `stream()` now finalizes the
 current stream (a "segment") and continues the reply in a new message.
 
