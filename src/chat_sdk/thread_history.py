@@ -68,9 +68,13 @@ class ThreadHistoryCache:
         """
         key = f"{KEY_PREFIX}{thread_id}"
 
-        # Serialize with raw nulled out to save storage
+        # Omit raw payloads to keep history storage bounded -- along the whole
+        # ``replyTo`` chain (upstream vercel/chat#802).
         serialized = message.to_json()
-        serialized["raw"] = None
+        current: dict[str, Any] | None = serialized
+        while current is not None:
+            current["raw"] = None
+            current = current.get("replyTo")
 
         await self._state.append_to_list(
             key,
