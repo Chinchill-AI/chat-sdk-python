@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 from pathlib import Path
 
 from chat_sdk.adapters.teams.format import (
@@ -24,14 +25,24 @@ from chat_sdk.adapters.teams.format import (
     format_teams_mention,
     markdown_to_teams_html,
     safe_link_href,
+    strip_html_tags,
     teams_html_to_markdown,
     teams_mention_to_plain_text,
     unescape_teams_text,
 )
 
+_HTML_TAG = re.compile(r"<[^>]+>")
+
 
 class TestTeamsFormatPrimitives:
     """Direct ports of the upstream ``Teams format primitives`` suite."""
+
+    def test_strips_tags_and_leaves_no_complete_tag_on_nested_input(self):
+        assert strip_html_tags("<b>hi</b>") == "hi"
+        assert strip_html_tags("a<img src=x>b") == "ab"
+        assert strip_html_tags("plain") == "plain"
+        assert strip_html_tags("<<script>>") == ">"
+        assert _HTML_TAG.search(strip_html_tags("<<script>>")) is None
 
     def test_escapes_and_unescapes_teams_text(self):
         escaped = escape_teams_text('<hello & "world">')
@@ -61,6 +72,29 @@ class TestTeamsFormatPrimitives:
 
     def test_converts_common_emoji_placeholders(self):
         assert convert_teams_emoji_placeholders(":white_check_mark: done") == "✅ done"
+
+
+class TestStripHtmlTagsBounds:
+    """``strip_html_tags`` bounds each tag body to 2048 characters and loops
+    until stable (upstream chat@4.37.0)."""
+
+    def test_long_run_of_unclosed_tags_completes_unchanged(self):
+        text = "<a" * 20_000  # 40k chars, no ``>``: nothing is a tag
+        assert strip_html_tags(text) == text
+
+    def test_tag_longer_than_the_bound_stays_as_text(self):
+        assert strip_html_tags("<" + "x" * 2048 + ">") == ""
+        too_long = "<" + "x" * 2049 + ">"
+        assert strip_html_tags(too_long) == too_long
+
+    def test_repeats_until_a_tag_revealed_by_a_pass_is_gone(self):
+        # Pass 1 cannot match from index 0 (body would exceed the bound) and
+        # removes the inner ``<b>``; that joins a 2047-char tag pass 2 strips.
+        assert strip_html_tags("<" + "x" * 2047 + "<b>>done") == "done"
+
+    def test_html_to_markdown_and_mentions_use_the_bounded_stripper(self):
+        assert teams_html_to_markdown("<p>" + "<" + "x" * 2047 + "<b>>done</p>") == "done"
+        assert teams_mention_to_plain_text("<at><b>Ada</b></at>") == "@Ada"
 
 
 class TestTeamsFormatAdversarial:

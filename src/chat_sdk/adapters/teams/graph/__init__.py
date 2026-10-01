@@ -60,6 +60,7 @@ from chat_sdk.adapters.teams.api import (
 from chat_sdk.adapters.teams.api import (
     _response_status as _response_status,  # noqa: PLC2701
 )
+from chat_sdk.adapters.teams.format import strip_html_tags
 
 __all__ = [
     "GetTeamsChannelMessageOptions",
@@ -421,12 +422,14 @@ def to_graph_message(message: Mapping[str, Any]) -> TeamsGraphMessage:
 def extract_text_from_graph_message(message: Mapping[str, Any]) -> str:
     """Convert a Graph message's HTML body to plain text.
 
-    Port of upstream ``extractTextFromGraphMessage``: a single ordered regex
-    pass — ``<at>`` mentions become ``@name``, ``<br>`` becomes a newline, a
-    ``</p><p>`` boundary becomes a blank line, remaining tags are stripped, then
-    the named entities are decoded. ``&amp;`` is decoded **last** so an encoded
-    ``&lt;`` in the source never becomes ``<`` then gets mistaken for a tag, and
-    a literal ``&amp;lt;`` decodes to ``&lt;`` rather than ``<``.
+    Port of upstream ``extractTextFromGraphMessage``: an ordered regex pass —
+    ``<at>`` mentions become ``@name``, ``<br>`` becomes a newline, a
+    ``</p><p>`` boundary becomes a blank line, remaining tags are stripped with
+    :func:`~chat_sdk.adapters.teams.format.strip_html_tags` (bounded, repeated
+    until stable; chat@4.37.0), then the named entities are decoded. ``&amp;``
+    is decoded **last** so an encoded ``&lt;`` in the source never becomes
+    ``<`` then gets mistaken for a tag, and a literal ``&amp;lt;`` decodes to
+    ``&lt;`` rather than ``<``.
     """
     body = message.get("body")
     content = body.get("content") if isinstance(body, Mapping) else None
@@ -435,7 +438,7 @@ def extract_text_from_graph_message(message: Mapping[str, Any]) -> str:
     content = re.sub(r"<at\b[^>]*>(.*?)</at>", r"@\1", content, flags=re.IGNORECASE | re.DOTALL)
     content = re.sub(r"<br\s*/?>", "\n", content, flags=re.IGNORECASE)
     content = re.sub(r"</p>\s*<p[^>]*>", "\n\n", content, flags=re.IGNORECASE)
-    content = re.sub(r"<[^>]+>", "", content)
+    content = strip_html_tags(content)
     content = content.replace("&nbsp;", " ")
     content = content.replace("&lt;", "<")
     content = content.replace("&gt;", ">")
