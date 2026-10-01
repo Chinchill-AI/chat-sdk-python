@@ -6039,7 +6039,11 @@ class SlackAdapter:
             if fence is not None and sent.endswith("\n") and _closes_fence(fence, tail):
                 # The pending partial line is the closing delimiter: finish
                 # the block in the old segment instead of reopening it in the
-                # new one.
+                # new one. Upstream parity (chat@4.41.1 index.ts:6270-6277,
+                # pinned by the ported "treats a pending partial closing fence
+                # as the block's end" test): the partial line is not held for
+                # its newline, so a literal ```js line split right after its
+                # backticks at a forced cut is taken as the closer, as upstream.
                 head += tail
                 sent += tail
                 tail = ""
