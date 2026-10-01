@@ -100,6 +100,7 @@ from chat_sdk.types import (
     StreamInput,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
 )
@@ -2624,7 +2625,9 @@ class TelegramAdapter:
 
     # -- Typing --------------------------------------------------------------
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Send a ``typing`` chat action."""
         parsed_thread = self._resolve_thread_id(thread_id)
         await self.telegram_fetch(

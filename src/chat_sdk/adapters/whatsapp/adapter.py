@@ -75,6 +75,7 @@ from chat_sdk.types import (
     StreamInput,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
 )
@@ -1934,7 +1935,9 @@ class WhatsAppAdapter:
             },
         )
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Start typing indicator.
 
         WhatsApp typing indicators require the most recent inbound message ID.

@@ -1846,7 +1846,8 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   `process_modal_submit`), including `process_installed` /
   `process_uninstalled`. It returns a `SimpleNamespace`, so an unknown
   attribute raises instead of auto-creating a mock. Upstream's `abortTurn`
-  and agent-session processors are absent until Python has them (#201).
+  and agent-session processors landed with #201 (`abort_turn` is an
+  `AsyncMock`).
   `installation-matcher.test.ts` and `app-context-matcher.test.ts` test
   upstream's `toHaveDispatched` matcher, which has no Python equivalent;
   instead one test asserts the mock records both installation processors and
@@ -2328,6 +2329,142 @@ from `21dc60c3` (#935, chat@4.41.0), and the `messages.test.ts` case of
   ported under its own name with `bytearray` and `memoryview` data,
   asserting the same `data:image/png;base64,AQID` part. As before, an
   unnamed attachment gets `filename=""` (upstream leaves it `undefined`).
+
+### Turn cancellation, typing lifecycle, agent-session events (chat@4.39, #201)
+
+Core half of `2ce2be00` (vercel/chat#862, chat@4.39.0). The Slack emitter
+(`agents.sessions.*`, native stop, auto titles, `end_typing`) is #214/#215.
+No divergence-table rows. The adaptations below keep upstream's results;
+the one observable difference is that an abort interrupts the source's
+in-flight `anext()` (Python cancels it, upstream leaves its `next()`
+running unobserved), see `_take_until_aborted`.
+
+- **`AbortSignal` → `TurnSignal`** (`chat_sdk.types`, exported). `aborted`,
+  `async wait()`, `add_listener(cb)` / `remove_listener(cb)`; `_abort()` is
+  internal (only `Chat` aborts a turn, as only `chat.ts` holds the
+  `AbortController`). `wait()` uses a per-call future, so a signal created
+  outside a loop (the thread default) never binds to one. Unlike a DOM
+  `abort` listener, a listener added after the abort runs immediately
+  instead of never; listener exceptions are suppressed.
+  Not thread-safe (abort and wait on the same loop). Upstream shares one
+  never-aborted signal across threads; Python gives each thread without a
+  turn its own, so a caller cannot abort every thread through one object.
+- **`thread.signal`** (`ThreadImpl.signal`, and on the `Thread` Protocol):
+  the turn's signal for dispatched messages, passed through
+  `_ThreadImplConfig.signal` and `_create_thread(..., signal=None)`; a
+  thread built anywhere else (`chat.thread()`, `from_json`, event threads)
+  gets a signal that is never aborted, as upstream. The Python-only
+  idempotent rebind (`ThreadImpl.from_json(existing_thread, chat=...)`)
+  resets the signal and the typing flag with the other binding state. A
+  turn aborted before the first chunk is pulled closes the unstarted
+  normalizer without touching the caller's stream, as upstream. `StreamOptions.signal`
+  carries it to `adapter.stream`; `StreamOptions` also gains
+  `session_status` (`AgentSessionStatus`), and `StreamingPlanOptions`
+  gains `session_status`, mapped like the other plan options (`is not
+  None`).
+- **`_take_until_aborted`** wraps the normalized stream. Upstream races
+  `iterator.next()` against an abort promise and fires `iterator.return()`
+  without awaiting. Python keeps `anext()` in the consumer's own task (a
+  helper task per chunk would break sources that rely on their task across
+  `yield`, e.g. `asyncio.timeout` or a `TaskGroup` spanning a yield): the
+  wait runs under `asyncio.timeout(None)` and the abort reschedules that
+  timeout to now, so the pending `anext()` is cancelled and
+  `asyncio.timeout`'s uncancel bookkeeping keeps a real cancellation of the
+  consumer propagating. `expired()` decides what an exception means: once
+  the abort expired the scope, anything the source raises (`TimeoutError`,
+  or its own error wrapping the cancellation) ends the stream cleanly, as
+  upstream's race ignores the pending `next()`; without an abort, the
+  source's errors (its own `TimeoutError` too) propagate. The source is then closed
+  with `aclose()` (errors suppressed, as upstream's `.catch`), so a
+  generator's `finally` has run by the time the stream ends.
+- **`from_full_stream` closes its source on early exit.** Upstream's
+  `fromFullStream` is an `async function*` whose `for await` calls the
+  source's `return()` when the consumer stops early; Python's `async for`
+  does not. `from_full_stream` now closes the source iterator (`aclose()`,
+  errors suppressed) when it is closed or fails before the source is
+  exhausted, so an abort between chunks also closes the caller's generator.
+  Nothing is closed after normal exhaustion. Both close sites use
+  `chat_sdk._compat.aclose_quietly`, which also absorbs the
+  `BaseExceptionGroup([GeneratorExit()])` a generator holding a `TaskGroup`
+  across `yield` raises when closed (cancellation still propagates).
+- **Typing lifecycle.** `start_typing` passes
+  `TypingOptions(initiator_user_id=…)` when the current message's author
+  has a truthy `user_id` (upstream truthiness), then marks typing started.
+  `post()` (around `post_message`), postable objects and the post+edit
+  fallback call `_finish_typing` in `finally`; it runs once per
+  `start_typing` and awaits `adapter.end_typing(thread_id, status)` with
+  `status` defaulting to `"active"` (the fallback passes
+  `options.session_status`). A native `adapter.stream` that returns a
+  message clears the flag without `end_typing`; one that raises calls it.
+- **`start_typing` signature probe (Python-only compatibility layer).**
+  Upstream adds a third `options` argument; JS ignores extra arguments,
+  Python raises `TypeError` on a two-argument adapter. `Thread.start_typing`
+  passes `options=` (keyword) only when
+  `chat_sdk._compat.accepts_kwarg(adapter.start_typing, "options")` is true
+  (the same helper and rules #200 uses for `post_ephemeral(options=)`:
+  a positional-or-keyword or keyword-only parameter of that name, or
+  `**kwargs`; `*options` and positional-only do not count). All ten
+  in-repo adapters and the mock declare `start_typing(self, thread_id,
+  status=None, *, options: TypingOptions | None = None)`. The `Adapter`
+  Protocol keeps the two-argument form so existing adapters still match it.
+  This extends #200's "Adapter hook signature probe" row in the non-parity
+  table rather than adding one.
+- **Optional adapter members** live on `BaseAdapter` only, per the
+  Protocol convention: `supports_turn_cancellation` (property, default
+  `False`) and `end_typing(thread_id, status=None)` (no-op default). `Chat`
+  reads the flag with `getattr(adapter, "supports_turn_cancellation",
+  False) is True`: upstream tests truthiness, but a `MagicMock` adapter's
+  auto-attribute is truthy and would silently turn on polling. The thread
+  reads `getattr(adapter, "end_typing", None)`.
+- **Turns in `Chat`.** `_dispatch_to_handlers` is now the turn wrapper
+  (upstream `dispatchToHandlers`) around `_dispatch_to_handlers_with_signal`:
+  a `str(uuid.uuid4())` turn id (correlation id, not a secret) and a fresh
+  `TurnSignal` registered in `_active_turn_signals[thread_id][turn_id]`.
+  Only for opted-in adapters: publish `active-turn:{thread_id}` (TTL
+  `ACTIVE_TURN_TTL_MS` = 3_600_000 ms; a failed write is a warning), start
+  `_monitor_turn_abort`, which reads `abort-turn:{thread_id}` every
+  `ABORT_POLL_INTERVAL_MS` (250) and aborts on a match (a state error logs
+  "Could not poll turn cancellation state" and ends polling), and afterwards
+  `_clear_turn_markers`, which deletes each key only if it still holds this
+  turn's id (a `get` then a `delete`, not atomic, as upstream:
+  `StateAdapter` has no compare-and-delete). Keys are byte-identical to upstream so SDKs can share a state
+  backend. Python-specific: registration, publish and monitor start sit
+  inside the `try` whose `finally` unregisters the signal, cancels and
+  awaits the monitor (`asyncio.gather(..., return_exceptions=True)`, so
+  only the monitor's cancellation is absorbed) and, in a nested `finally`,
+  clears the markers even if the task is cancelled during that join. JS
+  cannot be interrupted between those steps; a cancelled Python task can.
+  Cost for opted-in adapters: one state `get` per 250 ms per running turn.
+- **`chat.abort_turn(thread_id)`** aborts this process's signals for the
+  thread, then copies `active-turn:` into `abort-turn:` (same TTL) when a
+  turn is published. Like upstream it does not initialize the Chat first.
+- **Agent-session events.** `AgentSessionStoppedEvent(adapter, channel_id,
+  streaming_message_ts, thread_id, thread_ts, user_id)`,
+  `AgentSessionTitleChangedEvent(adapter, channel_id, thread_id, thread_ts,
+  title, user_id, previous_title=None)` (`previous_title` moves last because
+  it has a default), handler aliases, `on_agent_session_stopped` /
+  `on_agent_session_title_changed` (decorator-returning) and
+  `process_agent_session_stopped` / `process_agent_session_title_changed`.
+  Each runs the handlers in order in one task under
+  `conversation(event.thread_id)` (upstream `runInConversation`), takes no
+  lock (the stopped turn holds it), logs a handler error ("Agent session
+  stopped handler error" / "Agent session title changed handler error" with
+  `thread_id`) and hands `wait_until` the error-swallowing wrapper.
+- **`ChatInstance` Protocol** gains `abort_turn`,
+  `process_agent_session_stopped` and `process_agent_session_title_changed`
+  (all required upstream, per the #196 convention).
+  `create_mock_chat_instance` records them (`abort_turn` is an
+  `AsyncMock`).
+- **Mock adapter.** `MockAdapter._start_typing_options` records each
+  call's `options` alongside `_start_typing_calls`, whose 2-tuples are
+  unchanged. Like upstream's mock it has no `end_typing`; tests opt in with
+  `adapter.end_typing = AsyncMock()`.
+- **Tests.** Upstream: `chat.test.ts` "aborts an active thread signal from
+  another Chat instance" (two `Chat`s sharing a `MockStateAdapter`),
+  `thread.test.ts` "passes the initiating user and clears processing after
+  posting" plus the `sessionStatus` assertion in the StreamingPlan options
+  test, and `agent-session.test.ts` (new `tests/test_agent_session.py`).
+  Python-specific: `tests/test_turn_cancellation.py`.
 
 ### Thread replies, read receipts and ephemeral options (chat@4.35–4.41, #200)
 
@@ -2823,7 +2960,7 @@ stay explicit instead of being rediscovered in code review.
 | Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #283 while clicks carry the message ts, a Slack DM click carries no ts even after #283 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
-| `post_ephemeral` signature probe (4.41 wave, #200) | `Thread`/`Channel.post_ephemeral` pass `options=` to `adapter.post_ephemeral` only when `chat_sdk._compat.accepts_kwarg` finds an `options` parameter (positional-or-keyword or keyword-only) or `**kwargs`; an implementation with the older `(thread_id, user_id, message)` signature is called with three arguments | `adapter.postEphemeral(threadId, userId, postable, options)` always | JavaScript drops extra arguments, while Python raises `TypeError`, so passing `options=` unconditionally would break third-party adapters written against the pre-4.41 signature. In-repo adapters all accept it. Regression tests: `tests/test_thread_faithful.py::TestPostEphemeral::test_three_argument_custom_post_ephemeral_still_works`, `tests/test_channel_faithful.py::TestChannelPostEphemeral::test_three_argument_custom_post_ephemeral_still_works_from_a_channel` and `tests/test_compat.py::test_accepts_kwarg`. |
+| Adapter hook signature probe (4.41 wave, #200, #201) | `Thread.start_typing` passes `options=TypingOptions(...)` to `adapter.start_typing` under the same rule (a two-argument `start_typing(thread_id, status)` is called with two arguments). `Thread`/`Channel.post_ephemeral` pass `options=` to `adapter.post_ephemeral` only when `chat_sdk._compat.accepts_kwarg` finds an `options` parameter (positional-or-keyword or keyword-only) or `**kwargs`; an implementation with the older `(thread_id, user_id, message)` signature is called with three arguments | `adapter.postEphemeral(threadId, userId, postable, options)` and `adapter.startTyping(threadId, status, { initiatorUserId })` always | JavaScript drops extra arguments, while Python raises `TypeError`, so passing `options=` unconditionally would break third-party adapters written against the pre-4.41 signature. In-repo adapters all accept it. Regression tests: `tests/test_thread_faithful.py::TestPostEphemeral::test_three_argument_custom_post_ephemeral_still_works`, `tests/test_channel_faithful.py::TestChannelPostEphemeral::test_three_argument_custom_post_ephemeral_still_works_from_a_channel` and `tests/test_compat.py::test_accepts_kwarg`; for `start_typing`, `tests/test_turn_cancellation.py::TestThreadAbortAndTyping::test_two_argument_custom_start_typing_still_works`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
 | `_remend` streaming repair | Parity-based emphasis closing | `remend` npm package | Simplified; handles common cases |
 | `walkAst` | Deep-copies the tree (immutable) | Mutates the tree in place | Python convention; safer |

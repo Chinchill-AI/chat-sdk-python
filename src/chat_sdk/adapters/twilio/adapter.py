@@ -88,6 +88,7 @@ from chat_sdk.types import (
     StreamInput,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
 )
@@ -326,7 +327,9 @@ class TwilioAdapter:
         """Twilio does not support message reactions — raises."""
         raise ChatNotImplementedError("twilio", "removeReaction")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """No-op: SMS has no typing indicator (mirrors upstream)."""
 
     async def stream(

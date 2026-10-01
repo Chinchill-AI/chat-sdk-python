@@ -30,6 +30,7 @@ from chat_sdk.types import (
     QueueEntry,
     RawMessage,
     ThreadInfo,
+    TypingOptions,
     WebhookOptions,
 )
 
@@ -97,6 +98,10 @@ class MockAdapter:
         self._add_reaction_calls: list[tuple[str, str, Any]] = []
         self._remove_reaction_calls: list[tuple[str, str, Any]] = []
         self._start_typing_calls: list[tuple[str, str | None]] = []
+        # ``options=`` of each ``start_typing`` call, parallel to
+        # ``_start_typing_calls``. Like upstream's mock there is no
+        # ``end_typing``: tests opt in with ``adapter.end_typing = AsyncMock()``.
+        self._start_typing_options: list[TypingOptions | None] = []
         self._fetch_calls: list[tuple[str, FetchOptions | None]] = []
         self._initialize_calls: list[Any] = []
 
@@ -138,8 +143,11 @@ class MockAdapter:
     async def remove_reaction(self, thread_id: str, message_id: str, emoji: EmojiValue | str) -> None:
         self._remove_reaction_calls.append((thread_id, message_id, emoji))
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         self._start_typing_calls.append((thread_id, status))
+        self._start_typing_options.append(options)
 
     async def fetch_messages(self, thread_id: str, options: FetchOptions | None = None) -> FetchResult:
         self._fetch_calls.append((thread_id, options))
@@ -412,9 +420,12 @@ _MOCK_CHAT_SYNC_PROCESSORS = (
     "process_assistant_thread_started",
     "process_assistant_context_changed",
     "process_app_context_changed",
+    "process_agent_session_stopped",
+    "process_agent_session_title_changed",
 )
 # Processors adapters await (they return a value to the platform).
 _MOCK_CHAT_ASYNC_PROCESSORS = (
+    "abort_turn",
     "handle_incoming_message",
     "process_options_load",
     "process_modal_submit",
@@ -433,7 +444,7 @@ def create_mock_chat_instance(
     Port of upstream ``createMockChatInstance`` (``packages/tests``). Every
     ``process_*`` hook is a recording mock — ``MagicMock`` for the
     fire-and-forget ones, ``AsyncMock`` (resolving to ``None``) for
-    ``handle_incoming_message``, ``process_options_load`` and
+    ``abort_turn``, ``handle_incoming_message``, ``process_options_load`` and
     ``process_modal_submit`` — so tests can assert an adapter dispatched
     through the right hook. Includes the optional ``process_installed`` /
     ``process_uninstalled``. ``get_state()`` / ``get_user_name()`` /

@@ -207,7 +207,7 @@ def test_mock_chat_instance_records_installation_processors():
     chat.process_installed.assert_called_once_with(installed)
     chat.process_uninstalled.assert_called_once_with(uninstalled)
     # Not a bare MagicMock: unknown processors are absent, like on a real Chat.
-    assert getattr(chat, "process_agent_session_stopped", None) is None
+    assert getattr(chat, "process_not_a_real_event", None) is None
 
 
 # Python-specific: the create_mock_chat_instance contract adapters rely on
@@ -218,6 +218,8 @@ async def test_mock_chat_instance_async_processors_overrides_and_accessors():
     chat = create_mock_chat_instance(state=state, user_name="helper-bot", overrides={"process_message": sentinel})
 
     assert await chat.handle_incoming_message("adapter", "thread", "message") is None
+    assert await chat.abort_turn("slack:C1:1.2") is None
+    chat.abort_turn.assert_awaited_once_with("slack:C1:1.2")
     assert await chat.process_options_load("event") is None
     assert await chat.process_modal_submit("event") is None
     chat.handle_incoming_message.assert_awaited_once_with("adapter", "thread", "message")

@@ -74,6 +74,7 @@ from chat_sdk.types import (
     StreamInput,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
 )
@@ -631,7 +632,9 @@ class MessengerAdapter:
         """Messenger Send API does not expose reaction send — raises."""
         raise ValidationError("messenger", "Messenger does not support reactions via API")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Send a ``typing_on`` sender_action via the Send API."""
         recipient_id = self._resolve_thread_id(thread_id).recipient_id
         await self._graph_api_fetch(

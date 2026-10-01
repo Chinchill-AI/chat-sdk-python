@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 885,
+    "matched_exact": 889,
     "matched_fuzzy": 75,
-    "missing": 104,
-    "extra": 528
+    "missing": 100,
+    "extra": 530
   },
   "absent_ts_files": [],
   "files": {
@@ -18,13 +18,11 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 165,
+      "matched_exact": 166,
       "matched_fuzzy": 11,
-      "missing_count": 1,
+      "missing_count": 0,
       "extra_count": 28,
-      "missing": [
-        ["Chat", "aborts an active thread signal from another Chat instance"]
-      ],
+      "missing": [],
       "fuzzy_matches": [
         ["should return adapter by name", "test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals"],
         ["should throw when adapter does not support getUser", "test_should_throw_when_adapter_does_not_support_get_user"],
@@ -45,13 +43,11 @@
       "python_exists": true,
       "ts_tests": 159,
       "each_templates": 1,
-      "matched_exact": 153,
+      "matched_exact": 154,
       "matched_fuzzy": 5,
-      "missing_count": 1,
+      "missing_count": 0,
       "extra_count": 43,
-      "missing": [
-        ["startTyping", "passes the initiating user and clears processing after posting"]
-      ],
+      "missing": [],
       "fuzzy_matches": [
         ["should pass stream options from Slack current message context via $label", "test_should_pass_stream_options_from_current_message_context"],
         ["should forward structured stream chunks to adapter.stream from an action-created thread", "test_should_forward_structured_stream_chunks_to_adapter_stream_from_an_action_created_thread"],
@@ -305,17 +301,14 @@
     "packages/chat/src/agent-session.test.ts": {
       "python": "tests/test_agent_session.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 2,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 2,
       "matched_fuzzy": 0,
-      "missing_count": 2,
-      "extra_count": 0,
-      "missing": [
-        ["agent session events", "dispatches stop events to registered handlers"],
-        ["agent session events", "dispatches title changes to registered handlers"]
-      ],
+      "missing_count": 0,
+      "extra_count": 2,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/app-context.test.ts": {

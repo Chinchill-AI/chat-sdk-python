@@ -6,6 +6,7 @@ Python port of Vercel Chat SDK types.ts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
@@ -1142,6 +1143,95 @@ receive the stream type-check against it — but it is deliberately kept out of
 """
 
 
+# Lifecycle states supported by Slack Agent Sessions (upstream ``AgentSessionStatus``).
+AgentSessionStatus = Literal["active", "closed", "processing", "suspended"]
+
+
+@dataclass
+class TypingOptions:
+    """Context supplied when an adapter starts a typing/processing indicator."""
+
+    # User who initiated the current turn, when known.
+    initiator_user_id: str | None = None
+
+
+class TurnSignal:
+    """Cancellation signal for one message-handling turn.
+
+    Python stand-in for the ``AbortSignal`` upstream exposes as
+    ``thread.signal``. :class:`~chat_sdk.chat.Chat` aborts it when
+    :meth:`~chat_sdk.chat.Chat.abort_turn` is called for the turn's thread
+    (or, for adapters with ``supports_turn_cancellation``, from another
+    process sharing the state backend). Streams posted from the turn stop
+    being consumed once it is aborted; pass it to model APIs so generation
+    stops too, e.g. ``await signal.wait()`` raced against the model call, or
+    ``signal.add_listener(task.cancel)``.
+
+    A signal that nothing aborts never fires. Waiting does not bind the
+    signal to an event loop (each :meth:`wait` call uses its own future), but
+    the signal is not thread-safe: abort and wait on the same loop.
+    """
+
+    __slots__ = ("_aborted", "_listeners", "_waiters")
+
+    def __init__(self) -> None:
+        self._aborted = False
+        self._waiters: set[asyncio.Future[None]] = set()
+        self._listeners: list[Callable[[], Any]] = []
+
+    @property
+    def aborted(self) -> bool:
+        """Whether the turn has been aborted."""
+        return self._aborted
+
+    async def wait(self) -> None:
+        """Return once the signal is aborted (immediately if it already is)."""
+        if self._aborted:
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            self._waiters.discard(waiter)
+
+    def add_listener(self, callback: Callable[[], Any]) -> None:
+        """Call ``callback()`` once on abort; immediately if already aborted.
+
+        Exceptions raised by the callback are suppressed so one listener
+        cannot stop the others (as with DOM ``abort`` listeners).
+        """
+        if self._aborted:
+            _run_signal_listener(callback)
+            return
+        self._listeners.append(callback)
+
+    def remove_listener(self, callback: Callable[[], Any]) -> None:
+        """Remove a listener added with :meth:`add_listener` (no-op if absent)."""
+        with contextlib.suppress(ValueError):
+            self._listeners.remove(callback)
+
+    def _abort(self) -> None:
+        """Abort the signal. Internal: only the owning ``Chat`` aborts turns."""
+        if self._aborted:
+            return
+        self._aborted = True
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+        listeners, self._listeners = self._listeners, []
+        for callback in listeners:
+            _run_signal_listener(callback)
+
+    def __repr__(self) -> str:
+        return f"<TurnSignal aborted={self._aborted}>"
+
+
+def _run_signal_listener(callback: Callable[[], Any]) -> None:
+    with contextlib.suppress(Exception):  # a failing listener must not stop the abort
+        callback()
+
+
 @dataclass
 class StreamOptions:
     """Options for streaming messages."""
@@ -1157,6 +1247,12 @@ class StreamOptions:
     # vercel/chat#709. Adapters compare with ``is UNSET``. Last, so
     # positional construction binds the same fields as before.
     fallback_streaming_placeholder_text: str | None | Unset = UNSET
+    # Slack: Agent session state after the stream stops; ``None`` means
+    # ``"active"``. Appended after the existing fields for the same reason.
+    session_status: AgentSessionStatus | None = None
+    # The turn's signal. ``Thread`` already stops feeding the stream once it
+    # is aborted; adapters may also use it to stop platform work early.
+    signal: TurnSignal | None = None
 
 
 # =============================================================================
@@ -1488,6 +1584,32 @@ class SlashCommandEvent:
 
 
 @dataclass
+class AgentSessionStoppedEvent:
+    """The user stopped an agent session's active turn (Slack native stop)."""
+
+    adapter: Adapter
+    channel_id: str
+    # Timestamps of the messages that were streaming when the user stopped.
+    streaming_message_ts: list[str]
+    thread_id: str
+    thread_ts: str
+    user_id: str
+
+
+@dataclass
+class AgentSessionTitleChangedEvent:
+    """An agent session's title changed."""
+
+    adapter: Adapter
+    channel_id: str
+    thread_id: str
+    thread_ts: str
+    title: str
+    user_id: str
+    previous_title: str | None = None
+
+
+@dataclass
 class AssistantThreadStartedEvent:
     """Slack Assistant thread started event."""
 
@@ -1738,6 +1860,13 @@ class Adapter(Protocol):
 
     async def add_reaction(self, thread_id: str, message_id: str, emoji: EmojiValue | str) -> None: ...
     async def remove_reaction(self, thread_id: str, message_id: str, emoji: EmojiValue | str) -> None: ...
+    # Upstream adds a third ``options?: TypingOptions`` parameter. Python
+    # keeps the two-argument form here so existing adapters still match the
+    # Protocol; ``Thread.start_typing`` passes ``options=`` (keyword) only to
+    # adapters whose signature accepts it (``chat_sdk._compat.accepts_kwarg``).
+    # In-repo adapters declare ``*, options: TypingOptions | None = None``.
+    # ``end_typing`` and ``supports_turn_cancellation`` are optional and live
+    # on ``BaseAdapter`` only (read via ``getattr``).
     async def start_typing(self, thread_id: str, status: str | None = None) -> None: ...
 
     def render_formatted(self, content: FormattedContent) -> str: ...
@@ -1802,6 +1931,27 @@ class BaseAdapter:
 
     @property
     def persist_thread_history(self) -> bool | None:
+        return None
+
+    @property
+    def supports_turn_cancellation(self) -> bool:
+        """Whether active turns are published for cross-process cancellation.
+
+        When ``True``, :class:`~chat_sdk.chat.Chat` records each turn in the
+        state backend and polls it so :meth:`~chat_sdk.chat.Chat.abort_turn`
+        from another process aborts ``thread.signal``. Default ``False``: no
+        extra state reads or writes.
+        """
+        return False
+
+    async def end_typing(self, thread_id: str, status: AgentSessionStatus | None = None) -> None:
+        """Clear a typing/processing indicator after a reply finishes.
+
+        Optional: most platforms clear typing indicators automatically, so the
+        default does nothing. Agent-session platforms can override it to move
+        the session back to ``status`` (``"active"`` when the thread passes
+        nothing else).
+        """
         return None
 
     # -- Optional methods with default (not-implemented) --------------------
@@ -2089,6 +2239,10 @@ class ChatConfig:
 class ChatInstance(Protocol):
     """Internal interface for Chat instance passed to adapters."""
 
+    async def abort_turn(self, thread_id: str) -> None:
+        """Abort active work for a thread, including work in other processes sharing the state backend."""
+        ...
+
     def get_logger(self, prefix: str | None = None) -> Logger: ...
     def get_state(self) -> StateAdapter: ...
     def get_user_name(self) -> str: ...
@@ -2111,6 +2265,12 @@ class ChatInstance(Protocol):
     ) -> Awaitable[OptionsLoadResult | None]: ...
     def process_modal_close(
         self, event: Any, context_id: str | None = None, options: WebhookOptions | None = None
+    ) -> None: ...
+    def process_agent_session_stopped(
+        self, event: AgentSessionStoppedEvent, options: WebhookOptions | None = None
+    ) -> None: ...
+    def process_agent_session_title_changed(
+        self, event: AgentSessionTitleChangedEvent, options: WebhookOptions | None = None
     ) -> None: ...
     def process_assistant_thread_started(
         self, event: AssistantThreadStartedEvent, options: WebhookOptions | None = None
@@ -2274,6 +2434,15 @@ class Thread(Postable, Protocol):
     @property
     def recent_messages(self) -> list[Message]: ...
 
+    @property
+    def signal(self) -> TurnSignal:
+        """Aborted when the platform or application stops the active turn.
+
+        Pass it to AI/model APIs so cancellation stops upstream generation,
+        not only message delivery. Never aborted outside a message handler.
+        """
+        ...
+
     def messages(self) -> AsyncIterable[Message]:
         """Iterate messages newest first (backward from most recent).
 
@@ -2388,6 +2557,11 @@ MessageDeletedHandler = Callable[[MessageDeletedEvent], "Awaitable[None] | None"
 InstalledHandler = Callable[[InstalledEvent], "Awaitable[None] | None"]
 UninstalledHandler = Callable[[UninstalledEvent], "Awaitable[None] | None"]
 AppContextChangedHandler = Callable[[AppContextChangedEvent], "Awaitable[None] | None"]
+
+# ``chat.on_agent_session_stopped`` / ``chat.on_agent_session_title_changed``.
+# Stop handlers run without the thread lock: the turn being stopped holds it.
+AgentSessionStoppedHandler = Callable[[AgentSessionStoppedEvent], "Awaitable[None] | None"]
+AgentSessionTitleChangedHandler = Callable[[AgentSessionTitleChangedEvent], "Awaitable[None] | None"]
 
 # Role tag on a stored message.
 #
