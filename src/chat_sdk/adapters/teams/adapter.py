@@ -86,6 +86,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -2291,7 +2292,9 @@ class TeamsAdapter:
         """Remove a reaction (not supported by Teams Bot Framework API)."""
         self._logger.warn("removeReaction is not supported by the Teams Bot Framework API")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Send typing indicator to a Teams conversation."""
         from microsoft_teams.api import TypingActivityInput
 

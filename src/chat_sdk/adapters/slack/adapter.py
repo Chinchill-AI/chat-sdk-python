@@ -133,6 +133,7 @@ from chat_sdk.types import (
     ThinkingChunk,
     ThreadInfo,
     ThreadSummary,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
 )
@@ -4603,7 +4604,9 @@ class SlackAdapter:
     # Typing indicator
     # ==================================================================
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Show typing / status indicator in the thread.
 
         Uses Slack's ``assistant.threads.setStatus`` API when available.

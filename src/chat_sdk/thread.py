@@ -8,12 +8,14 @@ ephemeral messages, scheduled messages, thread subscription, and state managemen
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from chat_sdk._compat import accepts_kwarg
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.from_full_stream import from_full_stream
@@ -25,6 +27,7 @@ from chat_sdk.types import (
     UNSET,
     Adapter,
     AdapterPostableMessage,
+    AgentSessionStatus,
     Attachment,
     Author,
     Channel,
@@ -46,6 +49,8 @@ from chat_sdk.types import (
     StateAdapter,
     StreamInput,
     StreamOptions,
+    TurnSignal,
+    TypingOptions,
     Unset,
     set_message_adapter,
 )
@@ -209,6 +214,59 @@ def _is_async_iterable(value: Any) -> bool:
     return value is not None and hasattr(value, "__aiter__")
 
 
+async def _take_until_aborted[T](source: AsyncIterable[T], signal: TurnSignal) -> AsyncGenerator[T, None]:
+    """Yield from ``source`` until ``signal`` is aborted (upstream ``takeUntilAborted``).
+
+    On abort the stream simply ends, so the adapter (or the post+edit
+    fallback) finalizes whatever it already has. An abort that lands while
+    waiting for the next chunk interrupts that wait instead of waiting for
+    the chunk.
+
+    Python-specific: ``anext()`` runs in the consumer's own task (never a
+    helper task, so a source that relies on its task across ``yield`` keeps
+    working). The wait is wrapped in ``asyncio.timeout(None)`` and the abort
+    reschedules that timeout to "now": the pending ``anext()`` is cancelled
+    and ``asyncio.timeout`` turns that cancellation into ``TimeoutError``,
+    which its own uncancel bookkeeping tells apart from a cancellation aimed
+    at the consumer. The source is then closed; upstream's
+    ``iterator.return()`` is likewise best-effort.
+    """
+    iterator = aiter(source)
+    active: asyncio.Timeout | None = None
+
+    def _on_abort() -> None:
+        if active is None:
+            return
+        with contextlib.suppress(RuntimeError):  # the wait already finished or expired
+            active.reschedule(asyncio.get_running_loop().time())
+
+    signal.add_listener(_on_abort)
+    try:
+        while not signal.aborted:
+            wait_scope = asyncio.timeout(None)
+            try:
+                async with wait_scope:
+                    active = wait_scope
+                    value = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                if wait_scope.expired():
+                    return
+                raise  # the source's own timeout
+            finally:
+                active = None
+            if wait_scope.expired() or signal.aborted:
+                return
+            yield value
+    finally:
+        signal.remove_listener(_on_abort)
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):  # closing is best-effort, as upstream
+                await aclose()
+
+
 def _extract_slack_recipient_team_id(raw: Any) -> str | None:
     """Resolve the Slack workspace ID from a ``currentMessage.raw`` payload.
 
@@ -352,6 +410,10 @@ class _ThreadImplConfig:
     # Owning Chat for lazy resolution (upstream ``ThreadImplConfigLazy.chat``)
     chat: _ChatSingleton | None = None
 
+    # The turn's cancellation signal (set by ``Chat`` for dispatched
+    # messages). ``None`` gives the thread a signal that is never aborted.
+    signal: TurnSignal | None = None
+
 
 class ThreadImpl:
     """Concrete Thread implementation.
@@ -372,6 +434,11 @@ class ThreadImpl:
         self._streaming_update_interval_ms = config.streaming_update_interval_ms
         self._fallback_streaming_placeholder_text = config.fallback_streaming_placeholder_text
         self._emit_thinking = config.emit_thinking
+        # Upstream shares one never-aborted signal; a fresh one per thread
+        # behaves the same and cannot be aborted through another thread.
+        self._signal = config.signal if config.signal is not None else TurnSignal()
+        # True between ``start_typing`` and the reply that ends it.
+        self._typing_started = False
 
         # Recent messages cache
         self._recent_messages: list[Message] = []
@@ -407,6 +474,15 @@ class ThreadImpl:
     @property
     def channel_visibility(self) -> ChannelVisibility:
         return self._channel_visibility
+
+    @property
+    def signal(self) -> TurnSignal:
+        """Aborted when the platform or application stops the active turn.
+
+        Pass it to AI/model APIs so cancellation stops generation, not only
+        message delivery. Never aborted outside a message handler.
+        """
+        return self._signal
 
     @property
     def adapter(self) -> Adapter:
@@ -640,6 +716,7 @@ class ThreadImpl:
                     group_tasks = getattr(plan_options, "group_tasks", None)
                     end_with = getattr(plan_options, "end_with", None)
                     update_interval_ms = getattr(plan_options, "update_interval_ms", None)
+                    session_status = getattr(plan_options, "session_status", None)
                     # Port Rule #1: use `is not None` so explicit falsy values
                     # (``end_with=[]``, ``update_interval_ms=0``) still
                     # propagate to the adapter/fallback instead of being
@@ -651,6 +728,8 @@ class ThreadImpl:
                         extra.stop_blocks = end_with
                     if update_interval_ms is not None:
                         extra.update_interval_ms = update_interval_ms
+                    if session_status is not None:
+                        extra.session_status = session_status
                 await self._handle_stream(stream_iter, extra_options=extra)
                 return message
             raw = await self._handle_postable_object(message)
@@ -668,7 +747,10 @@ class ThreadImpl:
 
         postable: AdapterPostableMessage = message  # type: ignore[assignment]
         postable = await self._process_callback_urls(postable)
-        raw_msg = await self.adapter.post_message(self._id, postable)
+        try:
+            raw_msg = await self.adapter.post_message(self._id, postable)
+        finally:
+            await self._finish_typing()
         result = self._create_sent_message(raw_msg.id, postable, raw_msg.thread_id, raw=raw_msg.raw)
 
         if self._thread_history is not None:
@@ -678,13 +760,16 @@ class ThreadImpl:
 
     async def _handle_postable_object(self, obj: Any) -> Any:
         """Post a PostableObject using native adapter support or fallback."""
-        return await post_postable_object(
-            obj,
-            self.adapter,
-            self._id,
-            lambda thread_id, message: self.adapter.post_message(thread_id, message),
-            self._logger,
-        )
+        try:
+            return await post_postable_object(
+                obj,
+                self.adapter,
+                self._id,
+                lambda thread_id, message: self.adapter.post_message(thread_id, message),
+                self._logger,
+            )
+        finally:
+            await self._finish_typing()
 
     async def post_ephemeral(
         self,
@@ -796,7 +881,10 @@ class ThreadImpl:
         # Python-only, default-off divergence: when enabled, raw reasoning
         # parts become ``ThinkingChunk`` objects; when off (the default) the
         # stream is byte-for-byte upstream.
-        text_stream = _from_full_stream(raw_stream, emit_thinking=self._emit_thinking)
+        text_stream = _take_until_aborted(
+            _from_full_stream(raw_stream, emit_thinking=self._emit_thinking),
+            self._signal,
+        )
         adapter = self.adapter
         # Restored threads use their owning Chat's streaming settings
         # (vercel/chat#967); a directly constructed thread has no binding.
@@ -815,7 +903,7 @@ class ThreadImpl:
             interval_ms = defaults.update_interval_ms
         else:
             interval_ms = 500
-        options = StreamOptions(update_interval_ms=interval_ms)
+        options = StreamOptions(update_interval_ms=interval_ms, signal=self._signal)
         # The placeholder is forwarded only when the thread or its owning
         # Chat set one; ``UNSET`` stays absent so adapters keep their own
         # default (vercel/chat#709). ``None`` and ``""`` are explicit values.
@@ -839,6 +927,8 @@ class ThreadImpl:
                 options.task_display_mode = extra_options.task_display_mode
             if extra_options.stop_blocks is not None:
                 options.stop_blocks = extra_options.stop_blocks
+            if extra_options.session_status is not None:
+                options.session_status = extra_options.session_status
 
         # Use adapter-provided streaming if available.
         if hasattr(adapter, "stream") and adapter.stream:  # type: ignore[union-attr]
@@ -856,8 +946,14 @@ class ThreadImpl:
                     yield chunk
 
             wrapped_stream = _wrapped_stream()
-            raw_result = await adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
+            try:
+                raw_result = await adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
+            except BaseException:
+                await self._finish_typing()
+                raise
             if raw_result is not None:
+                # A successful native stream ends the indicator itself.
+                self._typing_started = False
                 # Record the locally-accumulated text. Matches upstream
                 # thread.ts, which builds the ``SentMessage`` from the text
                 # collected by the wrapping iterator (``accumulated``), not
@@ -904,11 +1000,18 @@ class ThreadImpl:
         text_stream: Any,
         options: StreamOptions | None = None,
     ) -> SentMessage:
-        """Fallback streaming using post + edit.
+        """Fallback streaming using post + edit, then end the typing indicator."""
+        try:
+            return await self._run_fallback_stream(text_stream, options)
+        finally:
+            await self._finish_typing(options.session_status if options is not None else None)
 
-        Posts an initial placeholder, then edits the message at intervals as
-        new text arrives from the stream.
-        """
+    async def _run_fallback_stream(
+        self,
+        text_stream: Any,
+        options: StreamOptions | None = None,
+    ) -> SentMessage:
+        """Post an initial placeholder, then edit it as new text arrives."""
         # ``_handle_stream`` already resolved both settings into ``options``.
         # ``is not None`` so explicit ``update_interval_ms=0`` (edit-on-every-
         # chunk) from ``StreamingPlan`` is honored.
@@ -1108,7 +1211,29 @@ class ThreadImpl:
     # -- Typing indicator ----------------------------------------------------
 
     async def start_typing(self, status: str | None = None) -> None:
-        await self.adapter.start_typing(self._id, status)
+        adapter = self.adapter
+        # Upstream truthiness: an empty user id sends no options.
+        initiator_user_id = self._current_message.author.user_id if self._current_message is not None else None
+        if initiator_user_id and accepts_kwarg(adapter.start_typing, "options"):
+            options = TypingOptions(initiator_user_id=initiator_user_id)
+            await adapter.start_typing(self._id, status, options=options)  # type: ignore[call-arg]
+        else:
+            # Adapters predating ``options`` get the two-argument call.
+            await adapter.start_typing(self._id, status)
+        self._typing_started = True
+
+    async def _finish_typing(self, status: AgentSessionStatus | None = None) -> None:
+        """End the indicator ``start_typing`` began (upstream ``finishTyping``).
+
+        Runs at most once per ``start_typing``; ``status`` defaults to
+        ``"active"``. Adapters without ``end_typing`` are skipped.
+        """
+        if not self._typing_started:
+            return
+        self._typing_started = False
+        end_typing = getattr(self.adapter, "end_typing", None)
+        if end_typing is not None:
+            await end_typing(self._id, status if status is not None else "active")
 
     # -- Refresh -------------------------------------------------------------
 

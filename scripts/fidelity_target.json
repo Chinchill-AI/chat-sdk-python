@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 869,
+    "matched_exact": 873,
     "matched_fuzzy": 77,
-    "missing": 118,
-    "extra": 514
+    "missing": 114,
+    "extra": 516
   },
   "absent_ts_files": [],
   "files": {
@@ -18,13 +18,11 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 165,
+      "matched_exact": 166,
       "matched_fuzzy": 11,
-      "missing_count": 1,
+      "missing_count": 0,
       "extra_count": 28,
-      "missing": [
-        ["Chat", "aborts an active thread signal from another Chat instance"]
-      ],
+      "missing": [],
       "fuzzy_matches": [
         ["should return adapter by name", "test_slash_should_return_undefined_from_openmodal_when_adapter_does_not_support_modals"],
         ["should throw when adapter does not support getUser", "test_should_throw_when_adapter_does_not_support_get_user"],
@@ -45,12 +43,11 @@
       "python_exists": true,
       "ts_tests": 159,
       "each_templates": 1,
-      "matched_exact": 137,
+      "matched_exact": 138,
       "matched_fuzzy": 7,
-      "missing_count": 15,
+      "missing_count": 14,
       "extra_count": 30,
       "missing": [
-        ["startTyping", "passes the initiating user and clears processing after posting"],
         ["markAsRead", "marks the current message when no target is provided"],
         ["markAsRead", "marks an explicit message id"],
         ["markAsRead", "marks an explicit message"],
@@ -321,17 +318,14 @@
     "packages/chat/src/agent-session.test.ts": {
       "python": "tests/test_agent_session.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 2,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 2,
       "matched_fuzzy": 0,
-      "missing_count": 2,
-      "extra_count": 0,
-      "missing": [
-        ["agent session events", "dispatches stop events to registered handlers"],
-        ["agent session events", "dispatches title changes to registered handlers"]
-      ],
+      "missing_count": 0,
+      "extra_count": 2,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/app-context.test.ts": {

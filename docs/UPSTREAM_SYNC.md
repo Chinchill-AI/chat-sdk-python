@@ -1492,7 +1492,8 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   `process_modal_submit`), including `process_installed` /
   `process_uninstalled`. It returns a `SimpleNamespace`, so an unknown
   attribute raises instead of auto-creating a mock. Upstream's `abortTurn`
-  and agent-session processors are absent until Python has them (#201).
+  and agent-session processors landed with #201 (`abort_turn` is an
+  `AsyncMock`).
   `installation-matcher.test.ts` and `app-context-matcher.test.ts` test
   upstream's `toHaveDispatched` matcher, which has no Python equivalent;
   instead one test asserts the mock records both installation processors and
@@ -1772,6 +1773,120 @@ from `21dc60c3` (#935, chat@4.41.0), and the `messages.test.ts` case of
   ported under its own name with `bytearray` and `memoryview` data,
   asserting the same `data:image/png;base64,AQID` part. As before, an
   unnamed attachment gets `filename=""` (upstream leaves it `undefined`).
+
+### Turn cancellation, typing lifecycle, agent-session events (chat@4.39, #201)
+
+Core half of `2ce2be00` (vercel/chat#862, chat@4.39.0). The Slack emitter
+(`agents.sessions.*`, native stop, auto titles, `end_typing`) is #214/#215.
+No divergence-table rows; the adaptations below are not observable as
+behavior differences.
+
+- **`AbortSignal` → `TurnSignal`** (`chat_sdk.types`, exported). `aborted`,
+  `async wait()`, `add_listener(cb)` / `remove_listener(cb)`; `_abort()` is
+  internal (only `Chat` aborts a turn, as only `chat.ts` holds the
+  `AbortController`). `wait()` uses a per-call future, so a signal created
+  outside a loop (the thread default) never binds to one. Unlike a DOM
+  `abort` listener, a listener added after the abort runs immediately
+  instead of never; listener exceptions are suppressed.
+  Not thread-safe (abort and wait on the same loop). Upstream shares one
+  never-aborted signal across threads; Python gives each thread without a
+  turn its own, so a caller cannot abort every thread through one object.
+- **`thread.signal`** (`ThreadImpl.signal`, and on the `Thread` Protocol):
+  the turn's signal for dispatched messages, passed through
+  `_ThreadImplConfig.signal` and `_create_thread(..., signal=None)`; a
+  thread built anywhere else (`chat.thread()`, `from_json`, event threads)
+  gets a signal that is never aborted, as upstream. `StreamOptions.signal`
+  carries it to `adapter.stream`; `StreamOptions` also gains
+  `session_status` (`AgentSessionStatus`), and `StreamingPlanOptions`
+  gains `session_status`, mapped like the other plan options (`is not
+  None`).
+- **`_take_until_aborted`** wraps the normalized stream. Upstream races
+  `iterator.next()` against an abort promise and fires `iterator.return()`
+  without awaiting. Python keeps `anext()` in the consumer's own task (a
+  helper task per chunk would break sources that rely on their task across
+  `yield`, e.g. `asyncio.timeout` or a `TaskGroup` spanning a yield): the
+  wait runs under `asyncio.timeout(None)` and the abort reschedules that
+  timeout to now, so the pending `anext()` is cancelled and
+  `asyncio.timeout`'s uncancel bookkeeping keeps a real cancellation of the
+  consumer propagating. A `TimeoutError` raised by the source itself is not
+  mistaken for an abort (`expired()` decides). The source is then closed
+  with `aclose()` (errors suppressed, as upstream's `.catch`), so a
+  generator's `finally` has run by the time the stream ends.
+- **Typing lifecycle.** `start_typing` passes
+  `TypingOptions(initiator_user_id=…)` when the current message's author
+  has a truthy `user_id` (upstream truthiness), then marks typing started.
+  `post()` (around `post_message`), postable objects and the post+edit
+  fallback call `_finish_typing` in `finally`; it runs once per
+  `start_typing` and awaits `adapter.end_typing(thread_id, status)` with
+  `status` defaulting to `"active"` (the fallback passes
+  `options.session_status`). A native `adapter.stream` that returns a
+  message clears the flag without `end_typing`; one that raises calls it.
+- **`start_typing` signature probe (Python-only compatibility layer).**
+  Upstream adds a third `options` argument; JS ignores extra arguments,
+  Python raises `TypeError` on a two-argument adapter. `Thread.start_typing`
+  passes `options=` (keyword) only when
+  `chat_sdk._compat.accepts_kwarg(adapter.start_typing, "options")` is true
+  (the parameter exists and is not positional-only, or the hook takes
+  `**kwargs`; an uninspectable callable counts as not accepting). Results
+  are cached per underlying function in a `WeakKeyDictionary`. All ten
+  in-repo adapters and the mock declare `start_typing(self, thread_id,
+  status=None, *, options: TypingOptions | None = None)`. The `Adapter`
+  Protocol keeps the two-argument form so existing adapters still match it.
+  `#200` (`post_ephemeral(options=)`) reuses the helper.
+- **Optional adapter members** live on `BaseAdapter` only, per the
+  Protocol convention: `supports_turn_cancellation` (property, default
+  `False`) and `end_typing(thread_id, status=None)` (no-op default). `Chat`
+  reads the flag with `getattr(adapter, "supports_turn_cancellation",
+  False) is True`: upstream tests truthiness, but a `MagicMock` adapter's
+  auto-attribute is truthy and would silently turn on polling. The thread
+  reads `getattr(adapter, "end_typing", None)`.
+- **Turns in `Chat`.** `_dispatch_to_handlers` is now the turn wrapper
+  (upstream `dispatchToHandlers`) around `_dispatch_to_handlers_with_signal`:
+  a `str(uuid.uuid4())` turn id (correlation id, not a secret) and a fresh
+  `TurnSignal` registered in `_active_turn_signals[thread_id][turn_id]`.
+  Only for opted-in adapters: publish `active-turn:{thread_id}` (TTL
+  `ACTIVE_TURN_TTL_MS` = 3_600_000 ms; a failed write is a warning), start
+  `_monitor_turn_abort`, which reads `abort-turn:{thread_id}` every
+  `ABORT_POLL_INTERVAL_MS` (250) and aborts on a match (a state error logs
+  "Could not poll turn cancellation state" and ends polling), and afterwards
+  `_clear_turn_markers`, which deletes each key only if it still holds this
+  turn's id. Keys are byte-identical to upstream so SDKs can share a state
+  backend. Python-specific: registration, publish and monitor start sit
+  inside the `try` whose `finally` cancels and awaits the monitor
+  (`asyncio.gather(..., return_exceptions=True)`, so only the monitor's
+  cancellation is absorbed), unregisters the signal and clears markers;
+  JS cannot be interrupted between those steps, a cancelled Python task can.
+  Cost for opted-in adapters: one state `get` per 250 ms per running turn.
+- **`chat.abort_turn(thread_id)`** aborts this process's signals for the
+  thread, then copies `active-turn:` into `abort-turn:` (same TTL) when a
+  turn is published. Like upstream it does not initialize the Chat first.
+- **Agent-session events.** `AgentSessionStoppedEvent(adapter, channel_id,
+  streaming_message_ts, thread_id, thread_ts, user_id)`,
+  `AgentSessionTitleChangedEvent(adapter, channel_id, thread_id, thread_ts,
+  title, user_id, previous_title=None)` (`previous_title` moves last because
+  it has a default), handler aliases, `on_agent_session_stopped` /
+  `on_agent_session_title_changed` (decorator-returning) and
+  `process_agent_session_stopped` / `process_agent_session_title_changed`.
+  Each runs the handlers in order in one task under
+  `conversation(event.thread_id)` (upstream `runInConversation`), takes no
+  lock (the stopped turn holds it), logs a handler error ("Agent session
+  stopped handler error" / "Agent session title changed handler error" with
+  `thread_id`) and hands `wait_until` the error-swallowing wrapper.
+- **`ChatInstance` Protocol** gains `abort_turn`,
+  `process_agent_session_stopped` and `process_agent_session_title_changed`
+  (all required upstream, per the #196 convention).
+  `create_mock_chat_instance` records them (`abort_turn` is an
+  `AsyncMock`).
+- **Mock adapter.** `MockAdapter._start_typing_options` records each
+  call's `options` alongside `_start_typing_calls`, whose 2-tuples are
+  unchanged. Like upstream's mock it has no `end_typing`; tests opt in with
+  `adapter.end_typing = AsyncMock()`.
+- **Tests.** Upstream: `chat.test.ts` "aborts an active thread signal from
+  another Chat instance" (two `Chat`s sharing a `MockStateAdapter`),
+  `thread.test.ts` "passes the initiating user and clears processing after
+  posting" plus the `sessionStatus` assertion in the StreamingPlan options
+  test, and `agent-session.test.ts` (new `tests/test_agent_session.py`).
+  Python-specific: `tests/test_turn_cancellation.py`.
 
 ## What to Port vs What to Adapt
 

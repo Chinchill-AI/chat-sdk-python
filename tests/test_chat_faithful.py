@@ -531,6 +531,52 @@ class TestSkipSelf:
         assert len(calls) == 0
 
 
+class TestTurnCancellation:
+    # TS: "aborts an active thread signal from another Chat instance"
+    async def test_aborts_an_active_thread_signal_from_another_chat_instance(self):
+        shared_state = create_mock_state()
+        cancellable_adapter = create_mock_adapter("slack")
+        cancellable_adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        processing_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"slack": cancellable_adapter},
+                state=shared_state,
+                logger=MockLogger(),
+            )
+        )
+        stopping_adapter = create_mock_adapter("slack")
+        stopping_adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        stopping_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"slack": stopping_adapter},
+                state=shared_state,
+                logger=MockLogger(),
+            )
+        )
+        thread_id = "slack:C123:agent-stop.1"
+        signals: list[Any] = []
+        started = asyncio.Event()
+
+        @processing_chat.on_mention
+        async def _handler(thread, message, context=None):
+            signals.append(thread.signal)
+            started.set()
+            await thread.signal.wait()
+
+        message = create_test_message("agent-stop-message", "@testbot stop")
+        message.is_mention = True
+        processing = processing_chat.process_message(cancellable_adapter, thread_id, message)
+        await started.wait()
+
+        await stopping_chat.abort_turn(thread_id)
+        await processing
+
+        assert len(signals) == 1
+        assert signals[0].aborted is True
+
+
 class TestMessageLifecycleEvents:
     # TS: "should dispatch message updates without normal message routing"
     async def test_should_dispatch_message_updates_without_normal_message_routing(self):
