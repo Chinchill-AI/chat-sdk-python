@@ -20,6 +20,7 @@ from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
@@ -779,8 +780,9 @@ class ThreadImpl:
                     markdown += chunk.get("text", "")
             # A stream can finish without producing text (tool calls only, or
             # just task_update/plan_update chunks). Platforms reject empty
-            # bodies, so fall back to a single space as upstream does.
-            postable = PostableMarkdown(markdown=markdown if markdown.strip() else " ")
+            # bodies, so fall back to a single space as upstream does. JS
+            # ``trim()`` whitespace set, not ``str.strip()``'s.
+            postable = PostableMarkdown(markdown=markdown if markdown.strip(JS_WHITESPACE) else " ")
         else:
             postable = message  # type: ignore[assignment]
 

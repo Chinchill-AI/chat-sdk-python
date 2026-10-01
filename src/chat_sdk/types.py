@@ -1771,7 +1771,9 @@ class BaseAdapter:
     Concrete adapters should inherit from this class and override methods
     they support.  Required methods (from :class:`Adapter`) must still be
     implemented by the subclass.  Optional methods raise
-    :class:`~chat_sdk.errors.ChatNotImplementedError` by default.
+    :class:`~chat_sdk.errors.ChatNotImplementedError` by default, except
+    the optional ``reply`` and ``mark_as_read`` hooks, which have no default
+    (see the comment above ``schedule_message``).
     """
 
     # -- Required properties (must be overridden) ----------------------------
@@ -1848,35 +1850,26 @@ class BaseAdapter:
         """
         raise ChatNotImplementedError(self.name, "postEphemeral")
 
-    async def reply(
-        self,
-        thread_id: str,
-        message_id: str,
-        message: AdapterPostableMessage,
-    ) -> RawMessage:
-        """Post ``message`` as a native reply to ``message_id`` (quote, threaded reply).
-
-        Optional: ``Thread.reply()`` raises
-        :class:`~chat_sdk.errors.ChatNotImplementedError` (``"replies"``) when
-        an adapter does not provide it.
-        """
-        raise ChatNotImplementedError(self.name, "replies")
-
-    async def mark_as_read(
-        self,
-        thread_id: str,
-        message_id: str,
-        message: Message | None = None,
-    ) -> None:
-        """Send a read receipt for an inbound message.
-
-        Optional: ``Thread.mark_as_read()`` raises
-        :class:`~chat_sdk.errors.ChatNotImplementedError` (``"read-receipts"``)
-        when an adapter does not provide it. ``message`` is the full message
-        when the caller has one, so adapters can read platform data off
-        ``message.raw`` instead of resolving the ID themselves.
-        """
-        raise ChatNotImplementedError(self.name, "read-receipts")
+    # -- Optional hooks without a default -----------------------------------
+    #
+    # ``reply`` and ``mark_as_read`` are deliberately NOT defined here.
+    # ``Thread.reply()`` / ``Thread.mark_as_read()`` look them up with
+    # ``getattr(adapter, name, None)`` and raise ``ChatNotImplementedError``
+    # (``"replies"`` / ``"read-receipts"``) *before* any other work when they
+    # are absent, as upstream's ``if (!this.adapter.reply)`` does. A raising
+    # default here would make every subclass look capable, so ``reply()``
+    # would drain the caller's stream and mint callback tokens before
+    # failing. Subclasses that support them define:
+    #
+    #   async def reply(self, thread_id: str, message_id: str,
+    #                   message: AdapterPostableMessage) -> RawMessage
+    #       Post ``message`` as a native reply to ``message_id``.
+    #
+    #   async def mark_as_read(self, thread_id: str, message_id: str,
+    #                          message: Message | None = None) -> None
+    #       Send a read receipt. ``message`` is the full message when the
+    #       caller has one, so adapters can read platform data off
+    #       ``message.raw`` instead of resolving the ID themselves.
 
     async def schedule_message(
         self,

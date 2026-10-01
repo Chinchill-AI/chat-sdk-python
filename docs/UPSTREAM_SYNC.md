@@ -1969,13 +1969,17 @@ targeted ephemeral #219, Gmail #241.
   is rejected as `MESSAGE_REQUIRED`, as upstream (`"" ?? current` keeps `""`,
   then `!target` throws). The adapter receives
   `(thread_id, message_id, message_or_None)`.
-- **Optional hooks.** `reply` and `mark_as_read` are declared on
-  `BaseAdapter` with defaults that raise `ChatNotImplementedError` with
-  `"replies"` / `"read-receipts"`, the same features `Thread` raises. They
-  are not on the `Adapter` Protocol, where they would become required.
-  `Thread` finds the hooks with `getattr(adapter, name, None)`. A
-  `BaseAdapter` subclass without an override therefore reaches the default,
-  which raises the same error after buffering and callback processing.
+- **Optional hooks.** `reply` and `mark_as_read` are documented on
+  `BaseAdapter` (a comment block with their signatures) but have no default
+  method there, and they are not on the `Adapter` Protocol, where they would
+  become required. `Thread` finds the hooks with `getattr(adapter, name,
+  None)`, so an adapter without them, `BaseAdapter` subclasses included,
+  raises `ChatNotImplementedError` (`"replies"` / `"read-receipts"`) before
+  any other work, as upstream's `if (!this.adapter.reply)`: no stream is
+  consumed, no callback token is minted, and `mark_as_read()` outside a
+  handler reports the missing hook rather than `MESSAGE_REQUIRED`. A raising
+  default would have made every subclass look capable. The empty-stream
+  check strips with `JS_WHITESPACE` (JS `trim()`), not `str.strip()`.
   The shared mock adapter has a recording `mark_as_read` `AsyncMock` by
   default, as upstream's mock does, and no `reply`.
 - **Errors.** Python's `ChatError` has no `code`, so `MESSAGE_REQUIRED` and

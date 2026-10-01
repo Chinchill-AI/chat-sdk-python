@@ -8,7 +8,7 @@
     "matched_exact": 885,
     "matched_fuzzy": 75,
     "missing": 104,
-    "extra": 526
+    "extra": 528
   },
   "absent_ts_files": [],
   "files": {
@@ -48,7 +48,7 @@
       "matched_exact": 153,
       "matched_fuzzy": 5,
       "missing_count": 1,
-      "extra_count": 41,
+      "extra_count": 43,
       "missing": [
         ["startTyping", "passes the initiating user and clears processing after posting"]
       ],

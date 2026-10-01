@@ -3090,6 +3090,21 @@ class TestCreateSentMessageFromMessage:
         sent = thread.create_sent_message_from_message(msg)
         assert sent.is_mention is True
 
+    # Python-specific: ``edit()`` on the wrapped message keeps its
+    # ``reply_to`` (upstream ``createSentMessage(..., threadId, replyTo)``).
+    @pytest.mark.asyncio
+    async def test_edit_of_a_wrapped_message_keeps_reply_to(self):
+        adapter = create_mock_adapter()
+        thread = _make_thread(adapter)
+        original = create_test_message("msg-0", "Question")
+        msg = create_test_message("msg-1", "Answer", reply_to=original)
+
+        edited = await thread.create_sent_message_from_message(msg).edit("Better answer")
+
+        assert edited.reply_to is original
+        assert edited.text == "Better answer"
+        assert adapter._edit_calls == [("slack:C123:1234.5678", "msg-1", "Better answer")]
+
     # it("should provide toJSON that delegates to the original message")
     # Note: Python SentMessage doesn't have to_json; skipping or adapting
     # We test via the underlying Message.to_json behavior
@@ -3366,6 +3381,26 @@ class TestReply:
 
         adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
             "slack:C123:1234.5678", "original", PostableMarkdown(markdown=" ")
+        )
+
+    # Python-specific: the empty-stream check uses JS ``trim()``'s whitespace
+    # set. Whitespace-only text (and U+FEFF, which JS trims) posts " ";
+    # U+001C, which ``str.strip()`` would drop but JS keeps, is sent as is.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("chunks", "expected"),
+        [(["  ", "\n"], " "), (["\ufeff"], " "), (["\x1c"], "\x1c")],
+        ids=["spaces-and-newline", "bom", "file-separator"],
+    )
+    async def test_whitespace_only_stream_uses_js_trim(self, chunks: list[str], expected: str):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        await thread.reply("original", _create_text_stream(chunks))
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown=expected)
         )
 
     # it("resolves a message id against messages the thread knows")
