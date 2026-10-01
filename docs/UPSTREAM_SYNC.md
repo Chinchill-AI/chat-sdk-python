@@ -445,16 +445,16 @@ The channel-edit divergence exists because the thread id reported for a
 channel post often never equals a click's thread id:
 - Teams and Google Chat `post_channel_message` return the channel id as the
   thread id (upstream too);
-- Slack `post_channel_message` returns the synthetic `slack:C…:` until #209
+- Slack `post_channel_message` returns the synthetic `slack:C…:` until #283
   ports upstream `92530dd3` (vercel/chat#720), while a click reports
-  `slack:C…:<message_ts>`. After #209 a Slack *DM* post reports
+  `slack:C…:<message_ts>`. After #283 a Slack *DM* post reports
   `slack:D…:<ts>`, but a DM click reports `slack:D…:` (Python's DM
   `_handle_block_actions` divergence), so a thread scope would still miss;
 - chained edits (`sent = await sent.edit(...)` twice), whose returned
   `SentMessage` dropped the thread-id override before #195 ported `16ea171e`
   (it now keeps it, so this reason no longer applies on its own).
 
-Binding to the channel resolves all of these, independent of #209's merge
+Binding to the channel resolves all of these, independent of #283's merge
 order, because every click on the message derives the same channel id.
 
 **Breaking for `callback_url` users:** tokens minted before the upgrade stop
@@ -903,7 +903,7 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   `None` and resolves with `is not None` (upstream `??`). Before this change the
   dataclass default `300000` always won and `0` fell through `or` to the
   constant. `0` now reaches the state adapter, and the bundled backends treat a
-  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #209.
+  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #283 (split from #209).
 - **`wait_until` and handler errors (`c21ccbc0`, `91683e52`).** Upstream hands
   `waitUntil` a `task.catch(log)` promise that fulfils when the handler fails.
   Python passed the raw task, so a host that awaited it saw handler errors
@@ -951,7 +951,7 @@ Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
     `isTeamsMention(): boolean`. Nothing outside `adapters/teams/webhook/` turns
     that payload into a `Message`, so it does not affect routing.
   - Telegram passes `is_bot_mentioned(...)` (a `bool`), as upstream, so a
-    Telegram `False` is definitive too. Slack's content-based `is_mention` is #209.
+    Telegram `False` is definitive too. Slack's content-based `is_mention` landed in #209.
   - Linear (#232): agent-session messages report `True`; ordinary comments
     (webhook, fetch and `parse_message`) leave `is_mention` unset, so a
     `@name` in a comment body still routes through text detection.
@@ -974,7 +974,7 @@ Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
   `None`. A `False` `isSystem` is still emitted, as upstream. `from_json`,
   `_message_from_json` and the `_rehydrate_message` dict fallback read
   `isSystem`, then `is_system`. `from_json_compat` reads snake_case first.
-  Population is per adapter: Teams email is #218, Slack `USLACK` is #209.
+  Population is per adapter: Teams email is #218; Slack `email` / `USLACK` landed in #209.
 - **`Message.reply_to` (`0f24cc30`)** is the last `Message` field, and is also
   on `MessageData` and `SentMessage`. `to_json` emits `replyTo` only when set.
   `from_json` / `from_json_compat` / `_message_from_json` recurse and pass an
@@ -1045,6 +1045,50 @@ Slack half of upstream `4717a384` (chat@4.34.0), `0153a39f` (chat@4.36.0) and
   "invalid_blocks")` with the original error as `__cause__`. Upstream throws a
   plain `Error` with `cause`; `AdapterError` is this SDK's adapter error base.
   Only the card path of `post_message` is wrapped, as upstream.
+
+### Slack inbound mentions and authors (chat@4.35–4.41, #209)
+
+Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
+`bb7cd124` (#716) and `80def3ab` (#707, chat@4.35.0), `51322dde` (#891) and
+`c2b6bff0` (#883, chat@4.40.0), and `683eadc1` (#947, chat@4.41.0). Part (b)
+(the mrkdwn normalization from `e71bfead` / `44423bdc` / `c3118279`, the
+`92530dd3` channel-post id and the `0b63791b` Socket Mode retries) is #283.
+
+- **Self mention (`51322dde`).** `_resolve_inline_mentions` no longer skips
+  the bot's id. `<@U_BOT>` resolves through `_lookup_user_name` like any other
+  user and falls back to the id when `users.info` fails. `skip_self_mention`
+  is gone from `_parse_slack_message`.
+- **Content-based `is_mention` (`683eadc1`).** `_detect_self_mention` runs on
+  the raw event before resolution, in both parse paths. The `app_mention`
+  override in `_handle_message_event` is gone. Blocks win over `text`.
+  Non-unfurl attachments are classified from their blocks, or else from their
+  legacy parts (`pretext` / `title` / `text` / `fields` / `fallback`); a part is
+  mrkdwn only when `mrkdwn_in` names it. With the bot id unknown, the result is
+  `True` for `app_mention` and `None` otherwise. This tri-state is never
+  collapsed with `or`. The bot id comes from the `bot_user_id` property, so a
+  multi-workspace request uses its `RequestContext.bot_user_id`. The attachment
+  extractor is a minimal private port of `attachmentContent` (blocks and
+  parts, no tables). Upstream builds the parts when `tables.length === 0`;
+  with no tables extracted that gate is always open, so parts are built even
+  beside blocks (detection ignores them there). #210 extends it for rendering
+  and restores the tables gate.
+- **Author (`c2b6bff0`, `bb7cd124`, `80def3ab`).** `user_id` is `user`, then
+  `bot_profile.user_id`, then `bot_id`. `_is_message_from_self` matches the bot
+  user id against `user or bot_profile.user_id`. `email` comes from the
+  `users.info` cache, in the async path only (as upstream). `is_system` is
+  `user == "USLACK"`. A non-dict `bot_profile` is ignored.
+- **Sync path.** `parse_message` classifies `is_mention` exactly as the async
+  path does. It does no lookups, so mentions stay `@U…` and `email` is unset,
+  as in upstream's sync path.
+- **Linear-time matching (an implementation detail, not a divergence).**
+  Results match upstream's. The mention token `/<@!?id(?:\|[^>]*)?>/i` is
+  matched as a prefix regex plus a tail check, because the single regex
+  backtracks quadratically on a run of unclosed `<@id|` tokens (about 1.3 s on
+  50k characters). `re.ASCII` limits `IGNORECASE` to ASCII folding, as JS `i`
+  does without `u`. The block walk uses an explicit stack, so deep nesting
+  cannot raise `RecursionError`.
+- **Known gap.** Table blocks do not render into `text` yet (#210), so two
+  ported table tests assert only `is_mention`.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
@@ -1858,7 +1902,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
-| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #209 while clicks carry the message ts, a Slack DM click carries no ts even after #209 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #209), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
+| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #283 while clicks carry the message ts, a Slack DM click carries no ts even after #283 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
 | Markdown parser | Subset of CommonMark (no setext headings, indented code, HTML, escaped chars, backtick spans >1) | Full CommonMark via remark | See [DECISIONS.md](DECISIONS.md#why-hand-rolled-markdown-parser) |
