@@ -1446,8 +1446,14 @@ Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
 Parity with `438f5513` (vercel/chat#633) and `2e473511` (#632, chat@4.32.0),
 `93a58af5` (#709, chat@4.35.0), `dc2a7775` (#934, chat@4.41.0) and the core of
 `6f17495b` (#967, chat@4.41.1). One divergence-table row (eager ownership).
-The adapter halves are elsewhere: Slack `stream()` returning `None` is #207,
-Teams informative status is #219.
+Of the adapter halves, only Slack's no-recipient guard is ported here:
+`SlackAdapter.stream()` returns `None` before consuming the stream when
+`recipient_user_id` or `recipient_team_id` is missing, so message-less
+threads (`chat.thread(id)`, `open_dm`, action/reaction threads) reply through
+core's post+edit fallback instead of raising `ValidationError`. The rest of
+Slack's half (DMs streaming natively without recipient ids, `native_streaming`,
+the mid-stream fallback, retiring the #94 branch) is #207. Teams informative
+status is #219.
 
 - **Lightweight threads (`438f5513`).** `_create_thread` takes
   `Message | None`. `chat.thread(id)` without `current_message`, `open_dm`,

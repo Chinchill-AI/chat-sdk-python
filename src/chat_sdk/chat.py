@@ -2050,11 +2050,10 @@ class Chat:
             is_subscribed = False
             # Without a message id there is no message context: the thread
             # gets `current_message=None` rather than a stub (vercel/chat#633).
-            # Upstream parity (chat.ts processAction, chat@4.41.1). Slack's
-            # `stream()` falling back to post+edit when the recipient context
-            # is missing is the adapter half of the same change (#207, which
-            # merges with this one); Slack only reports an action thread
-            # without a message ts when `container.thread_ts` is set alone.
+            # Upstream parity (chat.ts processAction, chat@4.41.1). Such a
+            # thread has no recipient context, so Slack's `stream()` returns
+            # None and core's post+edit fallback replies (the adapter half of
+            # the same change; the rest of it is #207).
             message_for_thread = (
                 Message(
                     id=event.message_id,
