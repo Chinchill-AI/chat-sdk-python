@@ -964,10 +964,12 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
 - **Message updates.** `chat.on_message_updated(handler)` is called as
   `handler(thread, message, previous_message)`; `previous_message` is `None`
   when the platform did not send it (Python always passes the third argument,
-  where JS can omit it). `process_message_updated(adapter, thread_id, message,
+  where JS can omit it). `process_message_updated(adapter, thread_id, message, *,
   previous_message=None, options=None)` replaces upstream's single
-  `{adapter, threadId, message, previousMessage?}` object with
-  keyword-callable parameters; each message is a `Message` or an async factory
+  `{adapter, threadId, message, previousMessage?}` object with parameters
+  whose optional tail is keyword-only (in `process_message` the fourth
+  positional slot is `options`, so a positional `options` would otherwise
+  silently become `previous_message` and skip `wait_until`); each message is a `Message` or an async factory
   (resolved with `await v() if callable(v) else v`). It binds the adapter,
   skips `author.is_me` (post-and-edit streaming would otherwise fire once per
   delta), builds the Thread with the real subscription flag, resolves the
@@ -1035,9 +1037,10 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   `process_uninstalled`. It returns a `SimpleNamespace`, so an unknown
   attribute raises instead of auto-creating a mock. Upstream's `abortTurn`
   and agent-session processors are absent until Python has them (#201).
-  `installation-matcher.test.ts` tests upstream's `toHaveDispatched` matcher,
-  which has no Python equivalent; one test asserts the mock records both
-  installation processors instead.
+  `installation-matcher.test.ts` and `app-context-matcher.test.ts` test
+  upstream's `toHaveDispatched` matcher, which has no Python equivalent;
+  instead one test asserts the mock records both installation processors and
+  another that it records `process_app_context_changed`.
 
 ## What to Port vs What to Adapt
 

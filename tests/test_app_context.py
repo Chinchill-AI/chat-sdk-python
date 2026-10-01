@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 from chat_sdk.chat import Chat
 from chat_sdk.context import active_conversation
-from chat_sdk.testing import MockLogger, create_mock_adapter, create_mock_state
+from chat_sdk.testing import MockLogger, create_mock_adapter, create_mock_chat_instance, create_mock_state
 from chat_sdk.types import (
     AppContextChangedEvent,
     AppContextChannelEntity,
@@ -66,3 +66,17 @@ class TestOnAppContextChanged:
 
         assert seen == ["D1"]
         assert logger.error.calls == [("App context changed handler error", {"error": "boom", "user_id": "U1"})]
+
+
+# Replaces upstream ``packages/tests/src/app-context-matcher.test.ts``
+# ("recognizes a dispatched app_context_changed"), whose ``toHaveDispatched``
+# matcher has no Python equivalent.
+def test_mock_chat_instance_records_app_context_changed():
+    chat = create_mock_chat_instance()
+    event = AppContextChangedEvent(
+        adapter=create_mock_adapter("slack"), channel_id="D1", user_id="U1", entities=[], raw={}
+    )
+
+    chat.process_app_context_changed(event)
+
+    chat.process_app_context_changed.assert_called_once_with(event)

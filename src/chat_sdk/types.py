@@ -1984,6 +1984,7 @@ class ChatInstance(Protocol):
         adapter: Adapter,
         thread_id: str,
         message: Message | Callable[[], Awaitable[Message]],
+        *,
         previous_message: Message | Callable[[], Awaitable[Message]] | None = None,
         options: WebhookOptions | None = None,
     ) -> asyncio.Task[None] | None: ...

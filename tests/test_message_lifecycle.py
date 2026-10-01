@@ -17,7 +17,7 @@ import pytest
 from chat_sdk.chat import Chat
 from chat_sdk.context import active_conversation
 from chat_sdk.testing import MockLogger, create_mock_adapter, create_mock_state, create_test_message
-from chat_sdk.types import Author, ChatConfig, MessageDeletedEvent, WebhookOptions
+from chat_sdk.types import Author, ChatConfig, MessageDeletedEvent, MessageSubject, WebhookOptions
 
 THREAD_ID = "slack:C123:1234.5678"
 
@@ -67,7 +67,7 @@ class TestMessageUpdated:
         message_factory = AsyncMock(return_value=message)
         previous_factory = AsyncMock(return_value=previous)
 
-        await chat.process_message_updated(adapter, THREAD_ID, message_factory, previous_factory)
+        await chat.process_message_updated(adapter, THREAD_ID, message_factory, previous_message=previous_factory)
 
         message_factory.assert_awaited_once_with()
         previous_factory.assert_awaited_once_with()
@@ -128,6 +128,33 @@ class TestMessageUpdated:
 
         assert keys == ["key:U123"]
 
+    async def test_binds_adapter_so_message_subject_resolves(self):
+        chat, adapter, _, _ = await _init_chat()
+        subject = MessageSubject(id="ISSUE-1", type="issue")
+        adapter.fetch_subject = AsyncMock(return_value=subject)
+        seen: list[Any] = []
+
+        async def handler(_thread: Any, message: Any, _previous: Any) -> None:
+            seen.append(await message.subject)
+
+        chat.on_message_updated(handler)
+        message = create_test_message("m1", "edited")
+
+        await chat.process_message_updated(adapter, THREAD_ID, message)
+
+        assert seen == [subject]
+        adapter.fetch_subject.assert_awaited_once_with(message.raw)
+
+    async def test_optional_tail_is_keyword_only(self):
+        chat, adapter, _, _ = await _init_chat()
+        # process_message's fourth positional slot is ``options``; here a
+        # positional WebhookOptions must fail loudly, not become previous_message.
+        with pytest.raises(TypeError):
+            chat.process_message_updated(  # type: ignore[misc]
+                adapter, THREAD_ID, create_test_message("m1", "edited"), WebhookOptions(wait_until=lambda _t: None)
+            )
+        assert chat._active_tasks == set()
+
     async def test_handler_error_raises_from_task_but_wait_until_task_completes(self):
         chat, adapter, _, logger = await _init_chat()
 
@@ -172,6 +199,24 @@ class TestMessageDeleted:
 
         handler.assert_awaited_once()
         assert handler.await_args.args[0] is event
+
+    async def test_binds_adapter_so_previous_message_subject_resolves(self):
+        chat, adapter, _, _ = await _init_chat()
+        subject = MessageSubject(id="PR-7", type="pull_request")
+        adapter.fetch_subject = AsyncMock(return_value=subject)
+        seen: list[Any] = []
+
+        async def handler(event: MessageDeletedEvent) -> None:
+            assert event.previous_message is not None
+            seen.append(await event.previous_message.subject)
+
+        chat.on_message_deleted(handler)
+        previous = create_test_message("1234.5678", "original")
+
+        await chat.process_message_deleted(_delete_event(adapter, previous_message=previous))
+
+        assert seen == [subject]
+        adapter.fetch_subject.assert_awaited_once_with(previous.raw)
 
     async def test_handler_error_is_logged_and_wait_until_task_completes(self):
         chat, adapter, _, logger = await _init_chat()

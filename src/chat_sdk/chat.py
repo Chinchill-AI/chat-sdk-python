@@ -1306,6 +1306,7 @@ class Chat:
         adapter: Adapter,
         thread_id: str,
         message: Message | Callable[[], Awaitable[Message]],
+        *,
         previous_message: Message | Callable[[], Awaitable[Message]] | None = None,
         options: WebhookOptions | None = None,
     ) -> asyncio.Task[None] | None:
@@ -1314,7 +1315,11 @@ class Chat:
         ``message`` / ``previous_message`` are each a parsed :class:`Message`
         or an async factory for lazy parsing. Updates bypass routing,
         deduplication and locking, and the bot's own edits are skipped.
-        Returns the handler task (``None`` without a running loop); it raises
+        ``previous_message`` and ``options`` are keyword-only: in
+        :meth:`process_message` the fourth positional slot is ``options``, so a
+        positional call written by analogy would otherwise hand the
+        ``WebhookOptions`` to handlers as ``previous_message`` and skip
+        ``wait_until``. Returns the handler task (``None`` without a running loop); it raises
         on handler failure, while ``wait_until`` always receives the
         error-swallowing wrapper (upstream ``processMessageUpdated``).
         """
