@@ -2517,8 +2517,8 @@ class TestInstallationScopedCaches:
     the resolved installation so data fetched with one workspace's token is
     never served to another. Single-workspace mode keeps unscoped keys.
 
-    The two ``withBotToken`` cases belong to #213 (they need
-    ``with_bot_token(..., installation_id=...)``).
+    The two ``withBotToken`` cases use ``with_bot_token_async(...,
+    installation_id=...)`` (#268).
 
     What to fix if this fails: ``_installation_cache_scope`` /
     ``_unfurl_cache_key`` in ``src/chat_sdk/adapters/slack/adapter.py``
@@ -2633,6 +2633,41 @@ class TestInstallationScopedCaches:
 
         assert (await state.get("slack:user:U1"))["display_name"] == "Alice"
         assert await state.get("slack:user::U1") is None
+
+    @pytest.mark.asyncio
+    async def test_scopes_the_cache_under_with_bot_token_when_installation_id_is_passed(self):
+        # Upstream passes an async fn to ``withBotToken``; AsyncLocalStorage
+        # carries the store into the promise. A Python coroutine created in
+        # the sync ``with_bot_token`` would run after the context is reset,
+        # so the async variant is the faithful translation here.
+        adapter, state, client = await self._make_cache_adapter()
+
+        await adapter.with_bot_token_async("xoxb-team-a", lambda: adapter._lookup_user("U1"), installation_id="T_A")
+
+        assert client.users_info.await_count == 1
+        assert (await state.get("slack:user:T_A:U1"))["display_name"] == "Alice"
+        assert await state.get("slack:user:U1") is None
+
+    @pytest.mark.asyncio
+    async def test_uses_unscoped_keys_under_with_bot_token_without_installation_id(self):
+        adapter, state, _ = await self._make_cache_adapter()
+
+        await adapter.with_bot_token_async("xoxb-token", lambda: adapter._lookup_user("U1"))
+
+        assert (await state.get("slack:user:U1"))["display_name"] == "Alice"
+
+    @pytest.mark.asyncio
+    async def test_sync_with_bot_token_scopes_by_installation_id(self):
+        adapter, _, _ = await self._make_cache_adapter()
+
+        observed = adapter.with_bot_token(
+            "xoxb-team-a",
+            lambda: (adapter.current_token, adapter._installation_cache_scope()),
+            installation_id="T_A",
+        )
+
+        assert observed == ("xoxb-team-a", "T_A:")
+        assert adapter._request_context.get() is None
 
     @pytest.mark.asyncio
     async def test_scopes_the_display_name_reverse_index_by_installation(self):
