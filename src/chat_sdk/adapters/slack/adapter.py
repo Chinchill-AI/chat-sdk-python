@@ -3709,7 +3709,12 @@ class SlackAdapter:
             # dedupe drop an already-handled duplicate, while a genuinely
             # missed event is recovered instead of being lost (upstream
             # vercel/chat#667). slack_sdk names upstream's ``retry_num``
-            # ``retry_attempt``.
+            # ``retry_attempt``. Upstream-parity choice: like upstream
+            # ``startSocketMode`` / ``routeSocketEvent`` (adapter-slack
+            # index.ts:3038-3058, 3087-3135), only ``events_api`` consults the
+            # event-id marker; ``interactive`` / ``slash_commands`` envelopes
+            # are routed as-is (Slack's retry_attempt/retry_reason describe
+            # Events API redelivery).
             self._logger.info(
                 "Processing socket mode retry",
                 {

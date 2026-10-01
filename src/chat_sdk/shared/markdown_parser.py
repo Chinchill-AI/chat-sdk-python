@@ -527,7 +527,9 @@ def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Conten
 # Patterns used by the block parser
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 _THEMATIC_BREAK_RE = re.compile(r"^([-*_]\s*){3,}\s*$")
-_FENCED_CODE_START_RE = re.compile(r"^(`{3,}|~{3,})(.*)")
+# CommonMark: a backtick fence's info string may not contain a backtick, so
+# "```npm test```" on one line is a (code span) paragraph, not a fence.
+_FENCED_CODE_START_RE = re.compile(r"^(`{3,}(?=[^`]*$)|~{3,})(.*)")
 _BLOCKQUOTE_RE = re.compile(r"^>\s?(.*)")
 _ORDERED_LIST_RE = re.compile(r"^(\d+)[.)]\s+(.*)")
 _UNORDERED_LIST_RE = re.compile(r"^[-*+]\s+(.*)")

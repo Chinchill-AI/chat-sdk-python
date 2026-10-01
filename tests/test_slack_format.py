@@ -57,6 +57,17 @@ class TestToMarkdown:
         # inline text inside the blockquote rather than becoming a code block.
         assert ast_to_plain_text(ast).replace("`", "") == "a c b"
 
+    def test_keeps_a_line_leading_quoted_fence_as_text(self):
+        """Python parser fix: CommonMark forbids a backtick in a backtick
+        fence's info string, so a quote that starts with ```npm test``` is a
+        paragraph (remark: a code span), not an empty code block that drops
+        the command from ``message.text``."""
+        ast = self.converter.to_ast("&gt; ```npm test```")
+        assert [node["type"] for node in ast["children"]] == ["blockquote"]
+        assert [node["type"] for node in ast["children"][0]["children"]] == ["paragraph"]
+        # Upstream: "npm test" (multi-backtick code span, a shared-parser gap).
+        assert ast_to_plain_text(ast).replace("`", "") == "npm test"
+
     def test_keeps_trailing_text_after_a_code_block_as_a_paragraph(self):
         ast = self.converter.to_ast("```x``` &gt; note")
         assert ast["children"][0]["type"] == "code"

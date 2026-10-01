@@ -1289,6 +1289,14 @@ chat@4.41.1).
   also quadratic on some inputs (about 2.4 s for 20k characters of `` `x ``);
   this predates the port, since `to_ast` always ran it on every inbound
   message, and is tracked separately.
+- **Shared parser fix (CommonMark fence rule).** A backtick fence's info
+  string may not contain a backtick, so `parse_markdown` no longer opens a
+  code block on a line like ```` ```npm test``` ````. The Slack normalizer
+  leaves a quoted fence literal (as upstream), and without this rule
+  `&gt; ```npm test```` parsed to an empty code block and dropped the command
+  from `message.text`. It now stays text in the quote (backticks kept, the
+  multi-backtick gap above). A line-leading *unpaired* ```` ```npm test ````
+  still opens an empty code block, as in upstream (remark does the same).
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 

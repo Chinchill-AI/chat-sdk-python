@@ -305,7 +305,12 @@ def _convert_mrkdwn_with_code_fences(mrkdwn: str) -> str:
         content_start = cursor + len(_CODE_FENCE)
         content_end = mrkdwn.find(_CODE_FENCE, content_start)
         if content_end == -1 or _is_on_blockquote_line(mrkdwn, cursor):
-            # Slack renders an unpaired or quoted ``` literally.
+            # Slack renders an unpaired or quoted ``` literally. Upstream-parity
+            # choice: the fence is left as is (adapter-slack format/index.ts
+            # convertMrkdwnWithCodeFences), so a line-leading unpaired
+            # "```npm test" still opens an empty CommonMark code block there
+            # too. A quoted "```c```" is no fence opener (its info string has a
+            # backtick); ``parse_markdown`` follows that rule.
             cursor = content_start
             continue
 
