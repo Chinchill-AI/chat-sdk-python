@@ -253,6 +253,18 @@ class TestTelegramConstructorEnvVars:
         with pytest.raises(ValidationError, match="secret_token is required in webhook mode"):
             TelegramAdapter(TelegramAdapterConfig(bot_token="token", mode="webhook", secret_token=""))
 
+    # -- Python-specific: dataclass positional back-compat (#228) -----------
+
+    def test_mention_on_reply_does_not_shift_existing_positional_fields(self):
+        # ``mention_on_reply`` is keyword-only, so a caller passing every
+        # pre-existing field positionally keeps its streaming settings.
+        config = TelegramAdapterConfig(None, "token", None, None, None, None, None, None, None, True, 0)
+        assert config.native_streaming is True
+        assert config.streaming_edit_interval_ms == 0
+        assert config.mention_on_reply is None
+        with pytest.raises(TypeError):
+            TelegramAdapterConfig(None, "token", None, None, None, None, None, None, None, True, 0, True)  # type: ignore[misc]
+
 
 # ---------------------------------------------------------------------------
 # Thread ID encode / decode

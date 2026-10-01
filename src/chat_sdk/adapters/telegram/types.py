@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias, TypedDict
 
 from chat_sdk.logger import Logger
@@ -97,17 +97,6 @@ class TelegramAdapterConfig:
     carry no acting user (e.g. anonymous channel posts) are dropped.
     """
 
-    mention_on_reply: bool | None = None
-    """Treat a reply to one of the bot's own messages as a mention.
-
-    Telegram users continue a conversation by replying rather than repeating
-    the handle, so a bot that only reacts to ``@name`` looks unresponsive in a
-    group. Off by default: turning it on changes which messages report
-    ``is_mention``. Defaults to the ``TELEGRAM_MENTION_ON_REPLY`` env var,
-    where only the exact string ``"true"`` opts in. An explicit ``False`` here
-    wins over the env var.
-    """
-
     native_streaming: bool | None = None
     """Stream private chats (DMs) through Telegram's native draft bubble
     (``sendMessageDraft`` / ``sendRichMessageDraft``). Defaults to ``False``:
@@ -122,6 +111,18 @@ class TelegramAdapterConfig:
     a floor: a lower Chat-level ``streaming_update_interval_ms`` is raised to
     this value. ``0`` edits on every chunk. Negative values clamp to ``0``;
     non-numeric or non-finite values are ignored (vercel/chat#822).
+    """
+
+    # Keyword-only so adding it does not shift existing positional callers.
+    mention_on_reply: bool | None = field(default=None, kw_only=True)
+    """Treat a reply to one of the bot's own messages as a mention.
+
+    Telegram users continue a conversation by replying rather than repeating
+    the handle, so a bot that only reacts to ``@name`` looks unresponsive in a
+    group. Off by default: turning it on changes which messages report
+    ``is_mention``. Defaults to the ``TELEGRAM_MENTION_ON_REPLY`` env var,
+    where only the exact string ``"true"`` opts in. An explicit ``False`` here
+    wins over the env var.
     """
 
 

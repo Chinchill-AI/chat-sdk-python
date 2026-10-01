@@ -1434,6 +1434,7 @@ Parity with the Telegram halves of `0f24cc30` (vercel/chat#802, chat@4.38.0),
   object). The Bot API never nests a further `reply_to_message`, so the
   recursion is one level deep. `TelegramMessage` gains `reply_to_message`.
 - **`mention_on_reply` (`26a06ca5`).** `TelegramAdapterConfig.mention_on_reply`
+  (keyword-only, so positional callers of the existing fields are unaffected)
   or `TELEGRAM_MENTION_ON_REPLY` (exact `"true"`; an explicit `False` wins over
   the env var, `??` semantics). `is_bot_mentioned` checks it before the
   empty-text guard: a known bot id, a replied-to message from the bot, a
