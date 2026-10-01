@@ -1087,6 +1087,108 @@ Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
   `tests/test_history_user.py`, so the strict pin check and the target
   report both pass without duplicate tests.
 
+### Streaming and thread API (chat@4.32–4.41.1, #199)
+
+Parity with `438f5513` (vercel/chat#633) and `2e473511` (#632, chat@4.32.0),
+`93a58af5` (#709, chat@4.35.0), `dc2a7775` (#934, chat@4.41.0) and the core of
+`6f17495b` (#967, chat@4.41.1). One divergence-table row (eager ownership).
+The adapter halves are elsewhere: Slack `stream()` returning `None` is #207,
+Teams informative status is #219.
+
+- **Lightweight threads (`438f5513`).** `_create_thread` takes
+  `Message | None`. `chat.thread(id)` without `current_message`, `open_dm`,
+  reactions without `event.message`, and actions with a falsy `message_id`
+  pass `None`, so `current_message` is `None` and `recent_messages` is
+  empty. Python used to pass an `Author(user_id="")` stub, so
+  `get_participants()` returned an empty-id author and native streaming got
+  `recipient_user_id=""`. The reaction path also used to build a stub from
+  `event.message_id` and `event.user`; upstream passes `event.message`, and so
+  does Python now. An action with a message id still gets the synthetic
+  message, as upstream.
+- **Placeholder sentinel (`93a58af5`).** TS tells `undefined` (not configured)
+  from `null` (no placeholder). Python's `None` already means "no
+  placeholder", so "not configured" is `UNSET` (`chat_sdk.UNSET`, type
+  `chat_sdk.Unset`). It is the single member of the enum `_Unset`. Enum
+  members keep their identity through `copy.deepcopy`, pickling and
+  `dataclasses.replace`, while a bare `object()` does not survive pickling.
+  Compare with `is UNSET`. It is falsy, so a truthiness check never reads it as
+  text. `ChatConfig`, `_ThreadImplConfig` and the new
+  `StreamOptions.fallback_streaming_placeholder_text` default to `UNSET`.
+  `UNSET` left on `StreamOptions` is the Python form of upstream's absent key.
+  It is never serialized: `to_json` carries no streaming settings, as upstream.
+  `""` is an explicit placeholder and is posted, as upstream.
+- **Stream-time settings (`6f17495b`).** `_handle_stream` resolves the interval
+  as caller (`StreamingPlan`) > thread > owning Chat > 500, with `is not None`
+  so `0` is kept. The placeholder is the thread's, else the owning Chat's, and
+  stays `UNSET` when neither set one. `_fallback_stream` now reads both only
+  from `options` (`UNSET` → `"..."`), as upstream. A caller that passes its own
+  `StreamOptions()` gets 500 ms and `"..."`. `_ThreadImplConfig.streaming_update_interval_ms`
+  defaults to `None`. Threads that Chat creates still carry the Chat's values.
+  New `Chat.get_streaming_options()` (a `StreamOptions` with the two fields)
+  and `Chat.owns_adapter()`. `owns_adapter` compares with `is` over the
+  registered values, because the key an adapter is registered under may differ
+  from `adapter.name`. Both are on the `_ChatSingleton` protocol.
+- **Ownership (`6f17495b`).** `_ChatBinding` ports upstream `ChatBinding`. Only
+  lazily resolved threads and channels (an `adapter_name` config, or
+  `from_json`) carry one. A directly constructed thread never takes another
+  Chat's settings or state. Once an owner is found it is kept. Without an
+  explicit Chat, each active Chat (ContextVar, then global) is checked once.
+  State is cached only from the owner. An unowned explicit adapter uses the
+  active Chat's state, uncached, as upstream. A directly constructed thread
+  with no state adapter still falls back to the active Chat's state (upstream
+  throws "Thread has no state adapter configured"). That behavior predates this
+  change and is unchanged. An idempotent `from_json(instance, adapter=…/chat=…)`
+  (Python only) replaces the binding and clears the thread-level interval and
+  placeholder, which a Chat-created thread copied from its Chat. The previous
+  owner's state and settings therefore do not leak, as in a fresh restore.
+- **Eager vs lazy ownership (divergence row).** Upstream resolves ownership on
+  first access. Python's `from_json` resolves what it can at once, because
+  `chat.activate()` is scoped to a `contextvars.Context`. A thread restored
+  inside the `with` block and used after it would otherwise find no Chat, or a
+  different one.
+  - An explicit `chat` with an explicit `adapter` it did not register raises
+    `RuntimeError` in `from_json`, before anything is built or mutated, with
+    upstream's text (`Adapter "x" does not belong to this Chat instance.
+    Restore with bot.reviver().`).
+    Upstream raises the same text on the first state access. This repo adopts
+    the raise (the previous Python behavior bound the stray adapter and took the
+    Chat's state). No caller in this repo, or in the downstream consumer, passes
+    a non-owning pair.
+  - An explicit `chat` resolves the adapter by name at once, and raises if it is
+    missing. This predates this change. Upstream's test "does not fall back to
+    another Chat's adapter" therefore expects the raise while decoding.
+  - An explicit `adapter` alone is checked against the active Chat at once, and
+    again on later access, as upstream.
+  - With neither, the thread binds to the active Chat when that Chat has the
+    adapter. The eager bind predates this change; it now records the owner and
+    skips an instance that is already bound.
+  - Modal-context restore passes `chat=self` only when the event's adapter is
+    registered under its own name. Otherwise it keeps the previous restore
+    instead of raising inside `process_modal_submit`.
+- **Reviver.** `chat.reviver()` binds each revived `Message` to that Chat's
+  adapter with `set_message_adapter` (which recurses into `reply_to`), and
+  `from_json(..., chat=…)` binds `current_message`. Python's reviver still does
+  not register the Chat as the singleton (resolver design, see Chat resolver).
+- **Plan (`2e473511`).** `AddTaskOptions.auto_complete_previous: bool = True`.
+  `False` leaves existing `in_progress` tasks running.
+- **AG-UI streams (`dc2a7775`).** `from_full_stream` takes text from
+  `TEXT_MESSAGE_CONTENT` (`delta`) and arms the `"\n\n"` separator on
+  `TEXT_MESSAGE_END`. Matching is on the event type, so `TOOL_CALL_ARGS` and
+  `STATE_DELTA` deltas are skipped. Python producers (`ag-ui-protocol`,
+  pydantic-ai) type events with a `str` Enum, so the type is read through
+  `.value`, and a non-string type is skipped. `THINKING_*` / `REASONING_*`
+  events are not mapped to `ThinkingChunk`, even with `emit_thinking=True`.
+  The duplicate normalizer in `thread.py` is now an alias of
+  `from_full_stream`, so `thread.post` and `channel.post` share it. That also
+  brings `thread.post` to upstream for an empty-string text delta: it now counts
+  as emitted text, so a later step is preceded by `"\n\n"`, as upstream.
+- **Fidelity.** `chat.test.ts` 8 → 3, `thread.test.ts` 17 → 15,
+  `serialization.test.ts` 17 → 0 and `from-full-stream.test.ts` 9 → 0 missing
+  at `chat@4.41.1`. The `it.each` / `describe.each` rows are parametrized
+  tests. Python has no `WORKFLOW_DESERIALIZE`, so the `workflow` restore method
+  maps to `from_json`. A fake-timer interval check records the edit loop's
+  `wait_for` timeout instead.
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
@@ -1521,6 +1623,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams dialog-open action options (4.41 wave, #191) | N/A: dialog-open inbound is not ported (see the row above), so there is no `process_action` call with `on_open_modal` to spread `WebhookOptions` into or to guard against a rejected action task | `c21ccbc0` spreads `...webhookOptions` into `handleDialogOpen`'s `processAction` call; `91683e52` resolves the empty dialog response when that action rejects | Lands with the dialog inbound wave of the #93 migration. The DM message path does spread the caller's options (see the native streaming row). |
 | Fallback streaming with whitespace-only streams (non-Teams adapters) | Placeholder cleared to `" "` on final edit | Placeholder left visible (`"..."` stuck) | Upstream 4.26 guards against empty edits but leaves the placeholder stranded on the message. We issue one final `edit_message(" ")` so the placeholder disappears when no real content was produced. Teams does not route through `_fallback_stream` (DMs stream natively through the SDK `IStreamer`; group chats accumulate-and-post), so this divergence applies only to Slack / Discord / GitHub / Telegram / Google Chat / Linear / WhatsApp. |
 | Google Chat `<url\|text>` round-trip | `to_ast()` / `extract_plain_text()` parse the custom-label syntax back to a link node / bare label | `toAst()` / `extractPlainText()` leave `<url\|text>` as raw text (or parse the whole string as an autolink with a malformed URL) | Upstream 4.26 emits `<url\|text>` in `from_ast` but never taught the reverse direction to parse it. A message posted with `[label](url)` then read back through `fetch_messages` comes back as unstructured text (or worse, a link node with the full `url\|text` as its URL) in upstream. We close the round-trip via an AST placeholder substitution: each `<url\|text>` is extracted to a private-use sentinel, Markdown is parsed on the rest, and link nodes are injected where the sentinels landed. This avoids the Markdown parser's incomplete handling of balanced-parens link destinations, so URLs like `https://en.wikipedia.org/wiki/Foo_(bar)` round-trip intact. |
+| Restored thread/channel ownership (4.41 wave, #199) | `ThreadImpl.from_json` / `ChannelImpl.from_json` resolve ownership when called: an explicit `chat` with an explicit `adapter` it did not register raises `RuntimeError` ("does not belong to this Chat instance") before anything is built; an explicit `adapter` alone is matched against the active Chat at once (and again on access); modal-context restore passes `chat=self` only when the adapter is registered under its own name | `ChatBinding` resolves ownership on first access: the same error is thrown by the first state read or write, and the singleton is consulted only then | `chat.activate()` is scoped to a `contextvars.Context`, so a thread restored inside the block and used after it would find no Chat, or a different one, if ownership were resolved lazily. Raising in `from_json` also leaves an existing instance untouched on an idempotent rebind. Regression tests: `tests/test_chat_resolver.py::TestContextVarActivation::test_explicit_adapter_restored_inside_activate_keeps_its_owner`, `tests/test_serialization.py::TestThreadFromJsonFaithful::test_should_raise_before_rebinding_when_chat_does_not_own_the_adapter` and `::TestRestoredRuntimeOwnershipFixes::test_throws_for_an_explicit_chat_that_does_not_own_the_explicit_adapter`. |
 | `from_json(data, adapter=X)` → `_adapter_name` | Updated to `X.name` so `to_json()` reflects the bound adapter | Kept at `json.adapterName`, so re-serialization can emit a name that no longer matches the actual adapter | Upstream TS has the same gap but only exposes it via the `fromJSON(json, adapter?)` overload. In Python we lean on this API more (explicit `chat=` / explicit `adapter=` is preferred over the singleton). We sync the name on rebind so runtime and serialize agree. |
 | Google Chat link labels with `\|` / `>` / `]` / newline, empty labels, URLs without a scheme, or URLs containing `\|` / `>` | Fall back to `text (url)` (or bare URL for empty labels) when the `<url\|text>` form can't round-trip safely | Always `<url\|text>`, producing malformed or un-parseable output | Google Chat's `<url\|text>` has no escape for `\|` or `>`; `]` breaks our own `to_ast()` regex (which converts `<url\|text>` to Markdown `[text](url)`, and Markdown closes the label at the first `]`); newline breaks the single-line form; schemeless URLs and URLs containing `\|`/`>` don't match our reverse parser. Upstream emits the malformed form regardless; we fall back to the pre-4.26 `text (url)` form (or the bare URL for empty labels) so the label/URL stays intact and Google Chat's auto-link detection still fires for http(s). |
 | Google Chat heading rendering | `#`-headings emit as `*text*` (bold) so they're visually distinct | Falls through to default node-to-text (plain concatenation) | Google Chat has no heading syntax; emitting plain text loses the visual hierarchy. Bold is the closest approximation the platform supports. |

@@ -2,12 +2,17 @@
 
 Python port of from-full-stream.ts.
 
-Handles three stream types automatically:
+Handles these stream types automatically:
 
 - **Text streams** (``AsyncIterable[str]``) -- passed through as-is.
-- **Full streams** (``AsyncIterable[object]``) -- extracts ``text-delta``
-  events and injects ``"\\n\\n"`` separators between steps so that
-  multi-step agent output reads naturally.
+- **AI SDK full streams** (``AsyncIterable[object]``) -- extracts
+  ``text-delta`` events and injects ``"\\n\\n"`` separators after each
+  ``finish-step`` so that multi-step agent output reads naturally.
+- **AG-UI streams** (e.g. TanStack AI ``chat()``, or the Python
+  ``ag-ui-protocol`` event models) -- extracts ``TEXT_MESSAGE_CONTENT``
+  deltas and injects ``"\\n\\n"`` separators after each
+  ``TEXT_MESSAGE_END``, since every model turn in a tool loop is its own
+  text message. Tool-call, reasoning, state and lifecycle events are skipped.
 - **StreamChunk objects** (``task_update``, ``plan_update``,
   ``markdown_text``) -- passed through as-is for adapters with native
   structured chunk support.
@@ -28,6 +33,13 @@ from collections.abc import AsyncIterable, AsyncIterator
 from chat_sdk.types import StreamInput, ThinkingChunk
 
 _STREAM_CHUNK_TYPES = frozenset({"markdown_text", "task_update", "plan_update"})
+
+# Text-carrying events: AI SDK ``text-delta`` and AG-UI ``TEXT_MESSAGE_CONTENT``
+# (vercel/chat#934). Matching on the type (not on the presence of ``delta``)
+# keeps AG-UI ``TOOL_CALL_ARGS`` / ``STATE_DELTA`` deltas out of the text.
+_TEXT_DELTA_TYPES = frozenset({"text-delta", "TEXT_MESSAGE_CONTENT"})
+# Step boundaries that arm the ``"\n\n"`` separator before the next text.
+_STEP_END_TYPES = frozenset({"finish-step", "TEXT_MESSAGE_END"})
 
 # AI-SDK v5/v6 reasoning part types, plus pydantic-ai's ``thinking`` part kind.
 # These are only consulted when ``emit_thinking=True``; otherwise they fall
@@ -89,7 +101,10 @@ async def from_full_stream(
         else:
             continue
 
-        if not event_type:
+        # Python AG-UI producers (``ag-ui-protocol``, pydantic-ai) type events
+        # with a ``str`` Enum; compare on its value.
+        event_type = getattr(event_type, "value", event_type)
+        if not event_type or not isinstance(event_type, str):
             continue
 
         # Pass through canonical StreamChunk objects. (Pre-built ThinkingChunk
@@ -109,15 +124,15 @@ async def from_full_stream(
                     yield ThinkingChunk(content=content)
             continue
 
-        # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
+        # AI SDK v6 uses "text", v5 uses "textDelta"; AG-UI uses "delta".
         # Priority: text > delta > textDelta > text_delta (matches TS)
         text_content = _pick(event, _TEXT_KEYS)
 
-        if event_type == "text-delta" and isinstance(text_content, str):
+        if event_type in _TEXT_DELTA_TYPES and isinstance(text_content, str):
             if needs_separator and has_emitted_text:
                 yield "\n\n"
             needs_separator = False
             has_emitted_text = True
             yield text_content
-        elif event_type == "finish-step":
+        elif event_type in _STEP_END_TYPES:
             needs_separator = True

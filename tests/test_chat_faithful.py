@@ -31,6 +31,7 @@ from chat_sdk.testing import (
     create_test_message,
 )
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     AppHomeOpenedEvent,
     Attachment,
@@ -44,8 +45,10 @@ from chat_sdk.types import (
     ModalResponse,
     ModalSubmitEvent,
     QueueEntry,
+    RawMessage,
     ReactionEvent,
     SlashCommandEvent,
+    StreamOptions,
     WebhookOptions,
 )
 from tests._fake_clock import FakeClock, install_token_lock_mock
@@ -58,6 +61,10 @@ ANY_REGEX = re.compile(r".*")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _chunks():
+    yield "Hello"
 
 
 def _make_chat(
@@ -326,6 +333,37 @@ class TestChatInit:
 
 
 class TestFallbackStreamingPlaceholder:
+    def test_unset_placeholder_sentinel_keeps_its_identity(self):
+        """Adapters compare the placeholder with ``is UNSET``; the sentinel
+        must survive the copies a config or options object goes through."""
+        import copy
+        import dataclasses
+        import pickle
+
+        options = StreamOptions(update_interval_ms=0)
+        assert options.fallback_streaming_placeholder_text is UNSET
+        assert copy.deepcopy(options).fallback_streaming_placeholder_text is UNSET
+        assert pickle.loads(pickle.dumps(options)).fallback_streaming_placeholder_text is UNSET
+        assert dataclasses.replace(options).fallback_streaming_placeholder_text is UNSET
+        assert (
+            ChatConfig(adapters={}, state=create_mock_state(), user_name="b").fallback_streaming_placeholder_text
+            is UNSET
+        )
+        # Falsy, so a truthiness check never treats it as placeholder text.
+        assert not UNSET
+
+    async def test_explicit_empty_placeholder_is_posted_and_forwarded(self):
+        """``""`` is an explicit placeholder, distinct from ``None`` (none)
+        and ``UNSET`` (default ``"..."``)."""
+        chat, adapter, state = _make_chat(fallback_streaming_placeholder_text="")
+        await chat.thread("slack:C123:1234.5678").post(_chunks())
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "")
+
+        stream = AsyncMock(return_value=RawMessage(id="m", thread_id="slack:C123:1234.5678", raw={}))
+        adapter.stream = stream  # type: ignore[attr-defined]
+        await chat.thread("slack:C123:1234.5678").post(_chunks())
+        assert stream.await_args.args[2].fallback_streaming_placeholder_text == ""
+
     # TS: "should preserve null fallback streaming placeholder config"
     async def test_should_preserve_null_fallback_streaming_placeholder_config(self):
         adapter = create_mock_adapter("slack")
@@ -1227,6 +1265,25 @@ class TestReactions:
             for tid, content in adapter._post_calls
         )
 
+    # TS: "should allow streaming from a reaction without message context"
+    async def test_should_allow_streaming_from_a_reaction_without_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+            await event.thread.post(_chunks())
+
+        chat.on_reaction(_handler)
+
+        chat.process_reaction(_make_reaction_event(adapter))
+        await asyncio.sleep(0.02)
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        # No stub message built from the reaction (vercel/chat#633).
+        assert threads[0]._current_message is None
+        assert threads[0].recent_messages == []
+
 
 # ============================================================================
 # 12. Actions (tests 40-50)
@@ -1234,6 +1291,41 @@ class TestReactions:
 
 
 class TestActions:
+    # TS: "should allow streaming from an action without message context"
+    async def test_should_allow_streaming_from_an_action_without_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+            await event.thread.post(_chunks())
+
+        chat.on_action(_handler)
+
+        chat.process_action(_make_action_event(adapter, message_id=""))
+        await asyncio.sleep(0.02)
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        assert threads[0]._current_message is None
+        assert threads[0].recent_messages == []
+
+    async def test_action_with_message_id_keeps_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+
+        chat.on_action(_handler)
+
+        chat.process_action(_make_action_event(adapter, message_id="msg-9"))
+        await asyncio.sleep(0.02)
+
+        current = threads[0]._current_message
+        assert current is not None
+        assert current.id == "msg-9"
+        assert current.author.user_id == "U123"
+
     # TS: "should call onAction handler for all actions"
     async def test_should_call_onaction_handler_for_all_actions(self):
         chat, adapter, state = await _init_chat()
@@ -1712,6 +1804,18 @@ class TestOpenDM:
 
         assert any(tid == "slack:DU123456:" and content == "Hello via DM!" for tid, content in adapter._post_calls)
 
+    # TS: "should allow streaming to a DM thread"
+    async def test_should_allow_streaming_to_a_dm_thread(self):
+        chat, adapter, state = await _init_chat()
+        thread = await chat.open_dm("U123456")
+
+        await thread.post(_chunks())
+
+        assert adapter._edit_calls[-1][:2] == ("slack:DU123456:", "msg-1")
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        assert thread._current_message is None
+        assert thread.recent_messages == []
+
 
 # ============================================================================
 # 13b. getUser (vercel/chat#391)
@@ -2063,6 +2167,43 @@ class TestThreadFactory:
             tid == "slack:C123:1234.5678" and content == "Hello from outside a webhook!"
             for tid, content in adapter._post_calls
         )
+
+    # TS: "should allow streaming to a thread handle"
+    async def test_should_allow_streaming_to_a_thread_handle(self):
+        chat, adapter, state = await _init_chat()
+        thread = chat.thread("slack:C123:1234.5678")
+
+        await thread.post(_chunks())
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+
+    # TS: it.each "passes only explicit placeholder config to adapter streaming"
+    @pytest.mark.parametrize(
+        ("placeholder_config", "expected"),
+        [
+            ({}, UNSET),
+            ({"fallback_streaming_placeholder_text": "Working..."}, "Working..."),
+            ({"fallback_streaming_placeholder_text": None}, None),
+        ],
+    )
+    async def test_passes_only_explicit_placeholder_config_to_adapter_streaming(self, placeholder_config, expected):
+        adapter = create_mock_adapter("teams")
+        stream = AsyncMock(return_value=RawMessage(id="answer-id", thread_id="teams:C123:1234.5678", raw={}))
+        adapter.stream = stream  # type: ignore[attr-defined]
+        custom_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"teams": adapter},
+                state=create_mock_state(),
+                logger=MockLogger(),
+                **placeholder_config,
+            )
+        )
+
+        await custom_chat.thread("teams:C123:1234.5678").post(_chunks())
+
+        options = stream.await_args.args[2]
+        assert options.fallback_streaming_placeholder_text is expected
 
     # TS: "should throw for an invalid thread ID"
     async def test_should_throw_for_an_invalid_thread_id(self):

@@ -12,15 +12,17 @@ import contextvars
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
+from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
+    UNSET,
     Adapter,
     AdapterPostableMessage,
     Attachment,
@@ -31,10 +33,8 @@ from chat_sdk.types import (
     EphemeralMessage,
     FetchOptions,
     FormattedContent,
-    MarkdownTextChunk,
     Message,
     MessageMetadata,
-    PlanUpdateChunk,
     PostableCard,
     PostableMarkdown,
     PostableMessage,
@@ -46,8 +46,8 @@ from chat_sdk.types import (
     StateAdapter,
     StreamInput,
     StreamOptions,
-    TaskUpdateChunk,
-    ThinkingChunk,
+    Unset,
+    set_message_adapter,
 )
 
 if TYPE_CHECKING:
@@ -74,6 +74,8 @@ class _ChatSingleton(Protocol):
 
     def get_adapter(self, name: str) -> Adapter | None: ...
     def get_state(self) -> StateAdapter: ...
+    def get_streaming_options(self) -> StreamOptions: ...
+    def owns_adapter(self, adapter: Adapter) -> bool: ...
 
 
 def set_chat_singleton(chat: _ChatSingleton) -> None:
@@ -106,6 +108,70 @@ def clear_chat_singleton() -> None:
     global _default_chat
     _default_chat = None
     _active_chat.set(None)
+
+
+class _ChatBinding:
+    """Tracks which Chat owns a restored thread or channel.
+
+    Port of upstream ``ChatBinding`` (chat-singleton.ts, vercel/chat#967).
+    Once an owner is found it is kept, even if the active or global Chat
+    changes later. Shared by :class:`ThreadImpl` and ``ChannelImpl``.
+    """
+
+    __slots__ = ("_checked", "_explicit", "_owner")
+
+    def __init__(self, chat: _ChatSingleton | None = None) -> None:
+        self._explicit = chat
+        self._owner: _ChatSingleton | None = None
+        self._checked: _ChatSingleton | None = None
+
+    def bind(self, chat: _ChatSingleton) -> None:
+        """Record ``chat`` as the owner (eager binding in ``from_json``)."""
+        self._owner = chat
+
+    def resolve_adapter(self, name: str) -> Adapter:
+        """Resolve a lazily restored adapter by name and bind to its Chat."""
+        chat = self._explicit if self._explicit is not None else get_chat_singleton()
+        adapter = chat.get_adapter(name)
+        if adapter is None:
+            where = "instance" if self._explicit is not None else "singleton"
+            raise RuntimeError(f'Adapter "{name}" not found in Chat {where}')
+        self._owner = chat
+        return adapter
+
+    def resolve_owner(self, adapter: Adapter) -> _ChatSingleton | None:
+        """Return the Chat that registered this exact adapter, if any.
+
+        Without an explicit Chat, each active/global Chat is checked once.
+        """
+        if self._owner is not None:
+            return self._owner
+        if self._explicit is not None:
+            chat: _ChatSingleton | None = self._explicit
+        else:
+            chat = get_chat_singleton() if has_chat_singleton() else None
+        if chat is not None and chat is not self._checked:
+            self._checked = chat
+            if chat.owns_adapter(adapter):
+                self._owner = chat
+        return self._owner
+
+    def resolve_state(self, adapter: Adapter) -> tuple[bool, StateAdapter]:
+        """Return ``(owned, state)`` for ``adapter``.
+
+        An adapter passed without an explicit Chat falls back to the active
+        Chat's state when no Chat owns it; that state is not cached.
+        """
+        owner = self.resolve_owner(adapter)
+        if owner is not None:
+            return True, owner.get_state()
+        if self._explicit is not None:
+            raise RuntimeError(_not_owned_message(adapter))
+        return False, get_chat_singleton().get_state()
+
+
+def _not_owned_message(adapter: Adapter) -> str:
+    return f'Adapter "{adapter.name}" does not belong to this Chat instance. Restore with bot.reviver().'
 
 
 # ---------------------------------------------------------------------------
@@ -261,12 +327,15 @@ class _ThreadImplConfig:
     channel_id: str = ""
     channel_visibility: ChannelVisibility = "unknown"
     current_message: Message | None = None
-    fallback_streaming_placeholder_text: str | None = "..."
+    # ``UNSET`` defers to the owning Chat, then to ``"..."`` in the
+    # fallback; ``None`` disables the placeholder (vercel/chat#709, #967).
+    fallback_streaming_placeholder_text: str | None | Unset = UNSET
     initial_message: Message | None = None
     is_dm: bool = False
     is_subscribed_context: bool = False
     logger: Logger | None = None
-    streaming_update_interval_ms: int = 500
+    # ``None`` defers to the owning Chat, then to 500 ms (vercel/chat#967).
+    streaming_update_interval_ms: int | None = None
     # Python-only divergence (default-off). When True, raw AI-SDK
     # ``reasoning`` / ``reasoning-delta`` parts passed to ``post()`` are
     # surfaced as ``ThinkingChunk`` objects for adapters that render thinking.
@@ -280,6 +349,8 @@ class _ThreadImplConfig:
 
     # Lazy resolution mode
     adapter_name: str | None = None
+    # Owning Chat for lazy resolution (upstream ``ThreadImplConfigLazy.chat``)
+    chat: _ChatSingleton | None = None
 
 
 class ThreadImpl:
@@ -307,9 +378,12 @@ class ThreadImpl:
         if config.initial_message is not None:
             self._recent_messages = [config.initial_message]
 
-        # Direct vs lazy
+        # Direct vs lazy. Only lazily resolved threads carry a binding, so a
+        # directly constructed thread never inherits another Chat's
+        # streaming settings or state (vercel/chat#967).
         self._adapter: Adapter | None = config.adapter
         self._adapter_name: str | None = config.adapter_name
+        self._binding: _ChatBinding | None = _ChatBinding(config.chat) if config.adapter is None else None
         self._state_adapter_instance: StateAdapter | None = config.state_adapter
         self._thread_history: Any = config.thread_history
 
@@ -337,27 +411,33 @@ class ThreadImpl:
     @property
     def adapter(self) -> Adapter:
         if self._adapter is not None:
+            if self._binding is not None:
+                self._binding.resolve_owner(self._adapter)
             return self._adapter
 
-        if not self._adapter_name:
+        if not self._adapter_name or self._binding is None:
             raise RuntimeError("Thread has no adapter configured")
 
-        chat = get_chat_singleton()
-        adapter = chat.get_adapter(self._adapter_name)
-        if adapter is None:
-            raise RuntimeError(f'Adapter "{self._adapter_name}" not found in Chat singleton')
-
-        self._adapter = adapter
-        return adapter
+        # Lazy resolution (cached for subsequent accesses)
+        self._adapter = self._binding.resolve_adapter(self._adapter_name)
+        return self._adapter
 
     @property
     def _state_adapter(self) -> StateAdapter:
         if self._state_adapter_instance is not None:
             return self._state_adapter_instance
 
-        chat = get_chat_singleton()
-        self._state_adapter_instance = chat.get_state()
-        return self._state_adapter_instance
+        if self._binding is None:
+            # Directly constructed without a state adapter: keep the
+            # pre-existing active-Chat fallback.
+            self._state_adapter_instance = get_chat_singleton().get_state()
+            return self._state_adapter_instance
+
+        # Only cache state from the Chat that owns the adapter.
+        owned, state = self._binding.resolve_state(self.adapter)
+        if owned:
+            self._state_adapter_instance = state
+        return state
 
     @property
     def recent_messages(self) -> list[Message]:
@@ -711,16 +791,32 @@ class ThreadImpl:
         # parts become ``ThinkingChunk`` objects; when off (the default) the
         # stream is byte-for-byte upstream.
         text_stream = _from_full_stream(raw_stream, emit_thinking=self._emit_thinking)
+        adapter = self.adapter
+        # Restored threads use their owning Chat's streaming settings
+        # (vercel/chat#967); a directly constructed thread has no binding.
+        owner = self._binding.resolve_owner(adapter) if self._binding is not None else None
+        defaults = owner.get_streaming_options() if owner is not None else None
 
-        # Build streaming options from current message context + caller
-        # options. Upstream parity (vercel/chat#340): seed
-        # ``update_interval_ms`` with the thread-level default
-        # (``self._streaming_update_interval_ms``) before merging caller
-        # options, so adapters always see a concrete interval. The Teams
-        # adapter now delegates throttling to the SDK ``IStreamer`` (it no
-        # longer owns a quota throttle), so the seed is harmless there —
-        # matching upstream, whose Teams adapter ignores the field.
-        options = StreamOptions(update_interval_ms=self._streaming_update_interval_ms)
+        # Interval precedence: caller (StreamingPlan) > thread > owning Chat
+        # > 500. ``is not None`` keeps an explicit 0. Adapters always see a
+        # concrete interval (vercel/chat#340).
+        caller_interval = extra_options.update_interval_ms if extra_options is not None else None
+        if caller_interval is not None:
+            interval_ms = caller_interval
+        elif self._streaming_update_interval_ms is not None:
+            interval_ms = self._streaming_update_interval_ms
+        elif defaults is not None and defaults.update_interval_ms is not None:
+            interval_ms = defaults.update_interval_ms
+        else:
+            interval_ms = 500
+        options = StreamOptions(update_interval_ms=interval_ms)
+        # The placeholder is forwarded only when the thread or its owning
+        # Chat set one; ``UNSET`` stays absent so adapters keep their own
+        # default (vercel/chat#709). ``None`` and ``""`` are explicit values.
+        placeholder = self._fallback_streaming_placeholder_text
+        if placeholder is UNSET and defaults is not None:
+            placeholder = defaults.fallback_streaming_placeholder_text
+        options.fallback_streaming_placeholder_text = placeholder
         if self._current_message is not None:
             options.recipient_user_id = self._current_message.author.user_id
             # recipient_team_id is only consumed by the Slack adapter; other
@@ -737,11 +833,9 @@ class ThreadImpl:
                 options.task_display_mode = extra_options.task_display_mode
             if extra_options.stop_blocks is not None:
                 options.stop_blocks = extra_options.stop_blocks
-            if extra_options.update_interval_ms is not None:
-                options.update_interval_ms = extra_options.update_interval_ms
 
         # Use adapter-provided streaming if available.
-        if hasattr(self.adapter, "stream") and self.adapter.stream:  # type: ignore[union-attr]
+        if hasattr(adapter, "stream") and adapter.stream:  # type: ignore[union-attr]
             accumulated = ""
 
             async def _wrapped_stream() -> AsyncGenerator[StreamInput, None]:
@@ -756,7 +850,7 @@ class ThreadImpl:
                     yield chunk
 
             wrapped_stream = _wrapped_stream()
-            raw_result = await self.adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
+            raw_result = await adapter.stream(self._id, wrapped_stream, options)  # type: ignore[union-attr]
             if raw_result is not None:
                 # Record the locally-accumulated text. Matches upstream
                 # thread.ts, which builds the ``SentMessage`` from the text
@@ -809,16 +903,16 @@ class ThreadImpl:
         Posts an initial placeholder, then edits the message at intervals as
         new text arrives from the stream.
         """
+        # ``_handle_stream`` already resolved both settings into ``options``.
         # ``is not None`` so explicit ``update_interval_ms=0`` (edit-on-every-
-        # chunk) from ``StreamingPlan`` is honored rather than silently reset
-        # to the thread default by a truthiness check.
-        interval_ms = (
-            options.update_interval_ms
-            if options is not None and options.update_interval_ms is not None
-            else self._streaming_update_interval_ms
-        )
+        # chunk) from ``StreamingPlan`` is honored.
+        if options is None:
+            options = StreamOptions()
+        interval_ms = options.update_interval_ms if options.update_interval_ms is not None else 500
         interval_s = interval_ms / 1000.0
-        placeholder_text = self._fallback_streaming_placeholder_text
+        configured = options.fallback_streaming_placeholder_text
+        # Unset -> "..." (vercel/chat#709); ``None`` disables; ``""`` is kept.
+        placeholder_text: str | None = "..." if configured is UNSET else configured
 
         msg: RawMessage | None = None
         if placeholder_text is not None:
@@ -1064,8 +1158,14 @@ class ThreadImpl:
             Explicit adapter to use. Skips singleton lookup for adapter resolution.
         chat:
             Explicit Chat instance. If provided, adapter and state are resolved
-            from this instance instead of the singleton. Useful in multi-chat
-            or test scenarios.
+            from this instance instead of the singleton, and the thread uses
+            its streaming settings. Useful in multi-chat or test scenarios.
+
+        The restored thread is bound to the Chat that owns its adapter
+        (vercel/chat#967): the explicit ``chat``, else the active Chat if it
+        registered the adapter (checked now and again on access). Raises
+        ``RuntimeError`` if ``chat`` and ``adapter`` are both given and
+        ``chat`` did not register that adapter instance.
 
         Idempotent: if ``data`` is already a :class:`ThreadImpl`, it is
         reused (not reconstructed) but any ``adapter``/``chat`` arguments
@@ -1073,6 +1173,12 @@ class ThreadImpl:
         ``json.loads(..., object_hook=reviver)`` while still respecting
         explicit rebinding.
         """
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md (eager
+        # ownership). Upstream raises when the state is first used; Python
+        # raises here, before anything is built or mutated.
+        if chat is not None and adapter is not None and not chat.owns_adapter(adapter):
+            raise RuntimeError(_not_owned_message(adapter))
+
         if isinstance(data, ThreadImpl):
             thread = data
             # Invalidate caches derived from the previous binding so the
@@ -1105,12 +1211,20 @@ class ThreadImpl:
             # old chat — a thread rebound to a new context shouldn't
             # claim it's still inside a subscribed handler). The rebind
             # block re-resolves each as needed.
+            # `_binding` holds the previous owning Chat, and a Chat-created
+            # thread carries that Chat's streaming values as thread-level
+            # settings, which would outrank the new owner's. Reset both, as a
+            # fresh restore from JSON (which carries no streaming settings)
+            # would.
             if adapter is not None or chat is not None:
                 thread._state_adapter_instance = None
                 thread._channel_cache = None
                 thread._thread_history = None
                 thread._recent_messages = []
                 thread._is_subscribed_context = False
+                thread._binding = _ChatBinding(chat)
+                thread._streaming_update_interval_ms = None
+                thread._fallback_streaming_placeholder_text = UNSET
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
@@ -1134,13 +1248,12 @@ class ThreadImpl:
                     channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
                     current_message=current_msg,
                     is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                    chat=chat,
                 )
             )
-        # `adapter` and `chat` are orthogonal: if both are passed we apply
-        # both (explicit adapter + chat's state). If only one is passed,
-        # the other's effects are left lazy. An earlier `elif chat` branch
-        # silently dropped chat's state when adapter was also passed,
-        # creating a split-routing bug.
+        binding = thread._binding
+        # With both `adapter` and `chat`, the explicit adapter is bound and
+        # state comes from `chat` (which was checked above to own it).
         if adapter is not None:
             thread._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
@@ -1160,18 +1273,32 @@ class ThreadImpl:
                         raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
                     thread._adapter = resolved
                     thread._adapter_name = lookup_name
-            # State always comes from chat when chat is explicitly passed.
+            # State and streaming settings come from chat when it is passed.
+            if binding is not None:
+                binding.bind(chat)
             thread._state_adapter_instance = chat.get_state()
-        elif adapter is None and has_chat_singleton() and thread._adapter_name:
-            # Singleton fallback only fires when neither adapter nor chat
-            # were explicitly passed. Eagerly bind from the active/global
-            # chat so the thread doesn't lazily re-resolve later (which
-            # could hit a different chat).
+            # Bind the restored message so `message.subject` resolves
+            # through this Chat's adapter (upstream fromJSON).
+            if thread._adapter is not None and thread._current_message is not None:
+                set_message_adapter(thread._current_message, thread._adapter)
+        elif adapter is not None:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md (eager
+            # ownership). Bind now if the active Chat registered this exact
+            # adapter, so a scoped `chat.activate()` still owns it after the
+            # block exits; otherwise ownership is re-checked on access.
+            if binding is not None:
+                binding.resolve_owner(adapter)
+        elif binding is not None and thread._adapter is None and thread._adapter_name and has_chat_singleton():
+            # Neither adapter nor chat passed: eagerly bind from the active
+            # Chat so the thread does not lazily re-resolve later (which
+            # could hit a different Chat). Divergence from upstream (eager
+            # ownership) — see docs/UPSTREAM_SYNC.md.
             active = get_chat_singleton()
             resolved = active.get_adapter(thread._adapter_name)
             if resolved is not None:
                 thread._adapter = resolved
-            thread._state_adapter_instance = active.get_state()
+                binding.bind(active)
+                thread._state_adapter_instance = active.get_state()
         return thread
 
     @classmethod
@@ -1306,116 +1433,11 @@ def _to_message(sent: SentMessage) -> Message:
 # Helper: normalise async stream (mirrors from-full-stream.ts)
 # ---------------------------------------------------------------------------
 
-
-async def _from_full_stream(
-    raw_stream: Any,
-    *,
-    emit_thinking: bool = False,
-) -> AsyncIterator[StreamInput]:
-    """Normalise a raw async iterable into str or StreamChunk items.
-
-    Handles plain strings, AI SDK fullStream events, and StreamChunk objects.
-    Mirrors from-full-stream.ts: tracks ``finish-step`` events so that a
-    ``"\n\n"`` separator is emitted between consecutive steps.
-
-    ``emit_thinking`` is a Python-only, default-off divergence. When ``False``
-    (the default) the output is byte-for-byte upstream: AI-SDK ``reasoning`` /
-    ``reasoning-delta`` parts are dropped and pre-built ``ThinkingChunk``
-    objects are *not* forwarded. When ``True``, reasoning parts are surfaced as
-    ``ThinkingChunk`` objects and pre-built ``ThinkingChunk`` objects pass
-    through (for adapters that render thinking). Either way thinking is never
-    accumulated into the posted message text.
-    """
-    needs_separator = False
-    has_emitted_text = False
-
-    async for item in raw_stream:
-        if isinstance(item, str):
-            yield item
-            continue
-
-        if hasattr(item, "type"):
-            # StreamChunk or StreamEvent
-            item_type = item.type
-
-            # Pass through known StreamChunk types
-            if item_type in ("markdown_text", "task_update", "plan_update"):
-                yield item
-                continue
-
-            # Opt-in reasoning surfacing (default-off => dropped as upstream).
-            if item_type in ("reasoning", "reasoning-delta", "thinking"):
-                if emit_thinking:
-                    content = next(
-                        (
-                            v
-                            for k in ("content", "text", "delta", "textDelta", "text_delta")
-                            if (v := getattr(item, k, None)) is not None
-                        ),
-                        "",
-                    )
-                    if isinstance(content, str) and content:
-                        yield ThinkingChunk(content=content)
-                continue
-
-            # AI SDK v6 uses "text", v5 uses "textDelta"; also accept "delta"
-            if item_type == "text-delta":
-                text_content = next(
-                    (
-                        v
-                        for k in ("text", "delta", "textDelta", "text_delta")
-                        if (v := getattr(item, k, None)) is not None
-                    ),
-                    "",
-                )
-                if isinstance(text_content, str) and text_content:
-                    if needs_separator and has_emitted_text:
-                        yield "\n\n"
-                    needs_separator = False
-                    has_emitted_text = True
-                    yield text_content
-            elif item_type == "finish-step":
-                needs_separator = True
-
-        elif isinstance(item, dict):
-            t = item.get("type")
-
-            # Pass through known StreamChunk dict types. The `t` check
-            # narrows at runtime to one of the three StreamChunk TypedDicts,
-            # but pyrefly doesn't narrow through tag-string comparisons, so
-            # cast to the declared yield union.
-            if t in ("markdown_text", "task_update", "plan_update"):
-                yield cast("MarkdownTextChunk | PlanUpdateChunk | TaskUpdateChunk", item)
-                continue
-
-            # Opt-in reasoning surfacing (default-off => dropped as upstream).
-            if t in ("reasoning", "reasoning-delta", "thinking"):
-                if emit_thinking:
-                    content = next(
-                        (
-                            v
-                            for k in ("content", "text", "delta", "textDelta", "text_delta")
-                            if (v := item.get(k)) is not None
-                        ),
-                        "",
-                    )
-                    if isinstance(content, str) and content:
-                        yield ThinkingChunk(content=content)
-                continue
-
-            if t == "text-delta":
-                text_content = next(
-                    (v for k in ("text", "delta", "textDelta", "text_delta") if (v := item.get(k)) is not None),
-                    "",
-                )
-                if isinstance(text_content, str) and text_content:
-                    if needs_separator and has_emitted_text:
-                        yield "\n\n"
-                    needs_separator = False
-                    has_emitted_text = True
-                    yield text_content
-            elif t == "finish-step":
-                needs_separator = True
+# ``thread.post()`` / ``channel.post()`` normalise through the same
+# implementation as the public ``from_full_stream`` (upstream has one
+# ``fromFullStream``). Kept under its historical private name for
+# ``channel.py`` and existing imports.
+_from_full_stream = from_full_stream
 
 
 # ---------------------------------------------------------------------------
