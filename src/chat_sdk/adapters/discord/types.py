@@ -242,6 +242,8 @@ class DiscordGatewayAttachment(TypedDict, total=False):
     filename: str
     content_type: str
     size: int
+    width: int
+    height: int
 
 
 class DiscordGatewayThread(TypedDict, total=False):
@@ -249,6 +251,19 @@ class DiscordGatewayThread(TypedDict, total=False):
 
     id: str
     parent_id: str
+
+
+class DiscordGatewayMessageSnapshotMessage(TypedDict, total=False):
+    """The forwarded message inside a ``message_snapshots`` entry."""
+
+    attachments: list[DiscordGatewayAttachment]
+    content: str
+
+
+class DiscordGatewayMessageSnapshot(TypedDict, total=False):
+    """A forwarded message snapshot (``message_snapshots[i]``)."""
+
+    message: DiscordGatewayMessageSnapshotMessage
 
 
 class DiscordGatewayMention(TypedDict):
@@ -271,6 +286,7 @@ class DiscordGatewayMessageData(TypedDict, total=False):
     is_mention: bool
     mention_roles: list[str]
     mentions: list[DiscordGatewayMention]
+    message_snapshots: list[DiscordGatewayMessageSnapshot]
     thread: DiscordGatewayThread
     timestamp: str
 
@@ -306,6 +322,9 @@ class DiscordGatewayReactionData(TypedDict, total=False):
     guild_id: str | None
     member: DiscordGatewayReactionMember
     message_id: str
+    # Thread info resolved by the forwarder (upstream 4.41 ``61b98fca``);
+    # preferred over the parent cache and the channel lookup.
+    thread: DiscordGatewayThread
     user: DiscordGatewayReactionUser
     user_id: str
 

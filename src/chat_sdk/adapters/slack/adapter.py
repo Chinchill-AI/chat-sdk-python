@@ -3215,20 +3215,30 @@ class SlackAdapter:
     async def set_suggested_prompts(
         self,
         channel_id: str,
-        thread_ts: str,
+        thread_ts: str | None,
         prompts: list[dict[str, str]],
         title: str | None = None,
     ) -> None:
-        """Set suggested prompts for an assistant thread."""
+        """Set suggested prompts for an assistant thread.
+
+        ``thread_ts`` is optional under the Agent messaging experience
+        (agent_view), where prompts sit at the top of the agent conversation
+        without a thread; it is omitted from the request when falsy.
+        """
         client = self._get_client()
-        kwargs: dict[str, Any] = {
+        payload: dict[str, Any] = {
             "channel_id": channel_id,
-            "thread_ts": thread_ts,
             "prompts": prompts,
         }
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
         if title:
-            kwargs["title"] = title
-        await client.assistant_threads_setSuggestedPrompts(**kwargs)
+            payload["title"] = title
+        # Python-specific: go through ``api_call`` (what the generated
+        # ``assistant_threads_setSuggestedPrompts`` sends) because that helper
+        # requires ``thread_ts`` before slack-sdk 3.43.0 (and is absent in
+        # older versions our ``slack-sdk>=3.27.0`` floor still allows).
+        await client.api_call(api_method="assistant.threads.setSuggestedPrompts", json=payload)
 
     async def set_assistant_status(
         self,
