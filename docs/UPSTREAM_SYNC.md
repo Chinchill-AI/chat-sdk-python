@@ -997,7 +997,10 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   coroutine (logged as `"Installed handler error"` / `"Uninstalled handler
   error"` with `conversation_id` and `activity_id`), so the task handed to
   `wait_until` always completes normally. As upstream, a raising handler stops
-  the ones after it.
+  the ones after it. Python-specific: `wait_until` gets the
+  `_hand_to_wait_until` shielded wrapper, as the other lifecycle dispatchers
+  do, so a host cancelling it cannot cancel the handlers (upstream hands over
+  the promise, which cannot be cancelled).
 - **`ChatInstance` Protocol.** Gains `process_message_updated`,
   `process_message_deleted` and `process_app_context_changed`.
   `process_installed` / `process_uninstalled` stay **off** the Protocol: they
@@ -1018,7 +1021,12 @@ chat@4.34.0). The Slack/Teams emitters are #211, #214 and #217.
   under `conversation(event.channel_id)`. `AppHomeOpenedEvent` gains
   `entities` and `tab`, both defaulting to `None`.
 - **Slack `set_suggested_prompts(channel_id, thread_ts, prompts, title=None)`**:
-  `thread_ts` is `str | None` and is omitted from the request when falsy.
+  `thread_ts` is `str | None` and is omitted from the request when falsy. The
+  request goes through `client.api_call(api_method="assistant.threads.setSuggestedPrompts",
+  json=...)`, the same request the generated helper sends, because
+  `AsyncWebClient.assistant_threads_setSuggestedPrompts` requires `thread_ts`
+  before slack-sdk 3.43.0 (and does not exist in the oldest versions the
+  `slack-sdk>=3.27.0` floor allows).
 - **Testing.** `chat_sdk.testing.create_mock_chat_instance(state=None,
   logger=None, user_name="test-bot", overrides=None)` ports
   `createMockChatInstance`. Processors are recording `MagicMock`s

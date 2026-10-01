@@ -153,6 +153,29 @@ class TestInstallationEvents:
         await asyncio.gather(*s.chat._active_tasks)
         handler.assert_called_once_with(s.event)
 
+    # Python-specific: cancelling the task wait_until received (a host timeout)
+    # must not cancel the handlers; a JS promise cannot be cancelled.
+    async def test_cancelling_wait_until_task_does_not_cancel_handlers(self, kind: str):
+        s = _Setup(kind)
+        gate = asyncio.Event()
+        completed = False
+
+        async def handler(_event: Any) -> None:
+            nonlocal completed
+            await gate.wait()
+            completed = True
+
+        s.on(handler)
+        options, tasks = _collecting_options()
+        s.process(options)
+        await asyncio.sleep(0)
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+        gate.set()
+        await asyncio.gather(*s.chat._active_tasks)
+        assert completed is True
+
     # Python-specific: as upstream, a raising handler stops the handlers after it.
     async def test_handler_error_stops_later_handlers(self, kind: str):
         s = _Setup(kind)

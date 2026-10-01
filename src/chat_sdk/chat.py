@@ -1721,7 +1721,7 @@ class Chat:
 
         Upstream ``runInstallationHandlers``: no task without handlers; a
         handler error is logged (and, as upstream, stops the handlers after
-        it) but the task handed to ``wait_until`` always completes normally.
+        it), so the task handed to ``wait_until`` always completes normally.
         A ``None`` ``channel_id`` runs the handlers with no conversation set.
         """
         if not handlers:
@@ -1739,8 +1739,11 @@ class Chat:
                 )
 
         task = _create_task(_task(), self._active_tasks)
-        if task is not None and options is not None and options.wait_until:
-            options.wait_until(task)
+        if task is not None:
+            # Python-specific: hand over the shielded wrapper, like the other
+            # lifecycle dispatchers, so a host cancelling its wait_until task
+            # cannot cancel the handlers (a JS promise has no cancellation).
+            self._hand_to_wait_until(task, options)
 
     # ========================================================================
     # Slash command handling

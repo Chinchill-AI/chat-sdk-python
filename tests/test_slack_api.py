@@ -1469,11 +1469,16 @@ class TestSetSuggestedPrompts:
 
         await adapter.set_suggested_prompts("C1", thread_ts, [{"title": "t", "message": "m"}])
 
-        calls = client.get_calls("assistant_threads_setSuggestedPrompts")
-        assert calls == [
+        # Sent through ``api_call``, never the generated helper, which
+        # requires ``thread_ts`` before slack-sdk 3.43.0.
+        assert client.get_calls("assistant_threads_setSuggestedPrompts") == []
+        assert client.get_calls("api_call") == [
             {
-                "method": "assistant_threads_setSuggestedPrompts",
-                "kwargs": {"channel_id": "C1", "prompts": [{"title": "t", "message": "m"}]},
+                "method": "api_call",
+                "kwargs": {
+                    "api_method": "assistant.threads.setSuggestedPrompts",
+                    "json": {"channel_id": "C1", "prompts": [{"title": "t", "message": "m"}]},
+                },
             }
         ]
 
@@ -1484,10 +1489,15 @@ class TestSetSuggestedPrompts:
 
         await adapter.set_suggested_prompts("C1", "111.222", [{"title": "t", "message": "m"}], title="Try")
 
-        calls = client.get_calls("assistant_threads_setSuggestedPrompts")
+        calls = client.get_calls("api_call")
         assert len(calls) == 1
-        assert calls[0]["kwargs"]["thread_ts"] == "111.222"
-        assert calls[0]["kwargs"]["title"] == "Try"
+        assert calls[0]["kwargs"]["api_method"] == "assistant.threads.setSuggestedPrompts"
+        assert calls[0]["kwargs"]["json"] == {
+            "channel_id": "C1",
+            "prompts": [{"title": "t", "message": "m"}],
+            "thread_ts": "111.222",
+            "title": "Try",
+        }
 
 
 class TestStartTyping:
