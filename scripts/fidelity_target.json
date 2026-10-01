@@ -8,7 +8,7 @@
     "matched_exact": 889,
     "matched_fuzzy": 75,
     "missing": 100,
-    "extra": 530
+    "extra": 531
   },
   "absent_ts_files": [],
   "files": {
@@ -80,7 +80,7 @@
       "matched_exact": 125,
       "matched_fuzzy": 5,
       "missing_count": 0,
-      "extra_count": 86,
+      "extra_count": 87,
       "missing": [],
       "fuzzy_matches": [
         ["handles empty AST", "test_fromast_handles_empty_ast"],

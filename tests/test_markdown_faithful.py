@@ -269,6 +269,16 @@ class TestEscapedCharacters:
         assert len(link_nodes2) == 1
         assert link_nodes2[0]["url"] == "u*r*l"
 
+    def test_link_url_keeps_escaped_and_balanced_parens(self):
+        # An escaped `(` never needs a partner; a bare one must be balanced.
+        for text, url in [
+            (r"[manual](https://example.com/a\(b)", "https://example.com/a(b"),
+            ("[Foo](https://en.wikipedia.org/wiki/Foo_(bar))", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+        ]:
+            links = [c for c in self._para_children(text) if c.get("type") == "link"]
+            assert [link["url"] for link in links] == [url]
+        assert [c["type"] for c in self._para_children("[x](https://a.com/a(b)")] == ["text"]
+
     def test_inline_code_contents_are_not_unescaped(self):
         # Per CommonMark, backslash inside `code` is literal.
         children = self._para_children(r"a `\*literal\*` b")

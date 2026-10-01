@@ -1315,7 +1315,8 @@ chat@4.41.1).
   `build [failed]` and a Wikipedia URL ending in `_(bar)` keeps its `)`
   instead of leaking `[…](…)` syntax or a stray `)` into `message.text`.
   CommonMark-invalid cases (an unbalanced `(` in the URL, a bare `[` inside
-  the label) no longer form a link, as in remark.
+  the label) no longer form a link, as in remark. Escaped `\(` / `\)` in a
+  destination are consumed whole and never count toward the balance.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 

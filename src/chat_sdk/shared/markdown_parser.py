@@ -318,12 +318,13 @@ _INLINE_PATTERNS = [
     # Links: [text](url) or [text](url "title")
     # CommonMark allows balanced brackets in link text and balanced parens in
     # the destination (one level here): ``[build [failed]](u)``,
-    # ``[Foo](https://en.wikipedia.org/wiki/Foo_(bar))``.
+    # ``[Foo](https://en.wikipedia.org/wiki/Foo_(bar))``. Escape-sentinel
+    # pairs (``\(`` / ``\)``) are consumed whole, so they never balance.
     (
         "link",
         re.compile(
             r"(?<!﷐)\[((?:[^\[\]﷐]|﷐.|\[(?:[^\[\]﷐]|﷐.)*\])*)\]"
-            r'\(((?:[^\s()]|\([^\s()]*\))+?)(?:\s+"([^"]*)")?\)'
+            r'\(((?:﷐\S|[^\s()﷐]|\((?:﷐\S|[^\s()﷐])*\))+?)(?:\s+"([^"]*)")?\)'
         ),
     ),
     # Inline code: `code`
