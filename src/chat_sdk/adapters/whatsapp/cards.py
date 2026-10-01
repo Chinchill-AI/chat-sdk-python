@@ -1,8 +1,9 @@
 """Convert CardElement to WhatsApp interactive messages or text fallback.
 
-WhatsApp supports two types of interactive messages:
+WhatsApp supports interactive messages including:
 - Reply buttons: up to 3 buttons (title max 20 chars)
 - List messages: up to 10 rows across sections (title max 24 chars)
+- CTA URL: a single link button mapped to interactive.type "cta_url"
 
 Cards that exceed these limits fall back to formatted text messages.
 
@@ -12,6 +13,7 @@ See: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactiv
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal, TypedDict, cast
 
 from chat_sdk.adapters.whatsapp.types import WhatsAppInteractiveMessage
@@ -21,10 +23,16 @@ from chat_sdk.cards import (
     CardChild,
     CardElement,
     FieldsElement,
+    LinkButtonElement,
     TextElement,
 )
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 
 CALLBACK_DATA_PREFIX = "chat:"
+
+# cta_url URLs must be web links -- Meta rejects other schemes.
+# ``re.match`` anchors at the start like JS ``/^https?:\/\//i``.
+_HTTP_URL_REGEX = re.compile(r"https?://", re.IGNORECASE)
 
 # Maximum number of reply buttons WhatsApp allows
 MAX_REPLY_BUTTONS = 3
@@ -34,6 +42,9 @@ MAX_BUTTON_TITLE_LENGTH = 20
 
 # Maximum character length for the body text
 MAX_BODY_LENGTH = 1024
+
+# Maximum character length for a text header
+MAX_HEADER_LENGTH = 60
 
 
 class _WhatsAppCardActionPayload(TypedDict, total=False):
@@ -98,25 +109,31 @@ def decode_whatsapp_callback_data(data: str | None = None) -> dict[str, str | No
     return {"action_id": data, "value": data}
 
 
-def card_to_whatsapp(card: CardElement) -> WhatsAppCardResult:
+def card_to_whatsapp(card: CardElement, *, allow_cta_url: bool = True) -> WhatsAppCardResult:
     """Convert a CardElement to a WhatsApp message payload.
 
     If the card has action buttons that fit WhatsApp's constraints
     (max 3 buttons, titles max 20 chars), produces an interactive
-    button message. Otherwise, produces a text fallback.
+    button message. A card whose only interactive element is a single
+    LinkButton with an http(s) URL -- and whose content the interactive
+    body can carry without loss -- becomes a native ``cta_url`` message.
+    Otherwise, produces a text fallback.
+
+    ``allow_cta_url=False`` disables the ``cta_url`` promotion. The media
+    path uses it: there the text fallback doubles as the media caption, and
+    an extra interactive send would change the delivery shape.
     """
     actions = _find_actions(card.get("children", []))
     action_buttons = _extract_reply_buttons(actions) if actions else None
 
-    # If we have valid buttons, produce an interactive message
-    if action_buttons and len(action_buttons) > 0:
-        body_text = _build_body_text(card)
+    if action_buttons is not None:
+        # Link buttons can't be WhatsApp reply buttons and cta_url can't mix
+        # with them -- keep their URLs reachable by appending them to the body.
+        body_text = "\n".join(part for part in [_build_body_text(card), *card_link_button_lines(card)] if part)
 
         interactive: dict[str, Any] = {
             "type": "button",
-            "body": {
-                "text": _truncate(body_text or "Please choose an option", MAX_BODY_LENGTH),
-            },
+            **_build_interactive_envelope(card, body_text or "Please choose an option"),
             "action": {
                 "buttons": [
                     {
@@ -130,12 +147,23 @@ def card_to_whatsapp(card: CardElement) -> WhatsAppCardResult:
                 ],
             },
         }
+        return {"type": "interactive", "interactive": cast(WhatsAppInteractiveMessage, interactive)}
 
-        title = card.get("title")
-        if title:
-            interactive["header"] = {"type": "text", "text": _truncate(title, 60)}
-
-        return {"type": "interactive", "interactive": interactive}  # type: ignore[typeddict-item]
+    if allow_cta_url:
+        cta_link = _find_promotable_cta_link(card)
+        if cta_link is not None:
+            cta_interactive: dict[str, Any] = {
+                "type": "cta_url",
+                **_build_interactive_envelope(card, _build_body_text(card) or "Open link"),
+                "action": {
+                    "name": "cta_url",
+                    "parameters": {
+                        "display_text": _truncate(cta_link["label"], MAX_BUTTON_TITLE_LENGTH),
+                        "url": cta_link["url"],
+                    },
+                },
+            }
+            return {"type": "interactive", "interactive": cast(WhatsAppInteractiveMessage, cta_interactive)}
 
     # Fallback to text
     return {"type": "text", "text": card_to_whatsapp_text(card)}
@@ -177,6 +205,17 @@ def card_to_whatsapp_text(card: CardElement) -> str:
                 lines.append("")
 
     return "\n".join(lines)
+
+
+def card_link_button_lines(card: CardElement) -> list[str]:
+    """Render ``"Label: url"`` lines for every LinkButton in a card.
+
+    Includes link buttons nested inside sections. Caption/fallback text
+    excludes action elements, so these lines keep link URLs reachable.
+    """
+    return [
+        f"{link.get('label', '')}: {link.get('url', '')}" for link in _collect_link_buttons(card.get("children", []))
+    ]
 
 
 def card_to_plain_text(card: CardElement) -> str:
@@ -302,6 +341,9 @@ def _find_actions(children: list[CardChild]) -> ActionsElement | None:
 def _extract_reply_buttons(actions: ActionsElement) -> list[ButtonElement] | None:
     """Extract reply buttons from an ActionsElement, only if they fit
     WhatsApp constraints (max 3 buttons, each with an ID).
+
+    Returns ``None`` (never ``[]``) when there are no reply buttons, so the
+    caller's ``is not None`` check matches upstream's ``if (actionButtons)``.
     """
     buttons: list[ButtonElement] = []
 
@@ -315,6 +357,92 @@ def _extract_reply_buttons(actions: ActionsElement) -> list[ButtonElement] | Non
 
     # WhatsApp allows max 3 reply buttons -- take the first 3
     return buttons[:MAX_REPLY_BUTTONS]
+
+
+def _build_interactive_envelope(card: CardElement, body_text: str) -> dict[str, Any]:
+    """Build the header/body envelope shared by all interactive messages."""
+    envelope: dict[str, Any] = {}
+    title = card.get("title")
+    if title:
+        envelope["header"] = {"type": "text", "text": _truncate(title, MAX_HEADER_LENGTH)}
+    envelope["body"] = {"text": _truncate(body_text, MAX_BODY_LENGTH)}
+    return envelope
+
+
+def _find_promotable_cta_link(card: CardElement) -> LinkButtonElement | None:
+    """Find a LinkButton that can be promoted to a native cta_url message.
+
+    Meta CTA URL messages support exactly one URL button and cannot mix
+    with reply buttons, selects, or radio selects, so promotion requires
+    the card's only interactive element (across every actions row) to be
+    a single LinkButton. The URL must be http(s) and the label non-empty,
+    or the Cloud API rejects the send with a 400 -- anything else keeps
+    the always-deliverable text fallback.
+    """
+    if card.get("image_url"):
+        return None
+
+    interactive_children = [
+        child for actions in _collect_actions(card.get("children", [])) for child in actions.get("children", [])
+    ]
+    if len(interactive_children) != 1:
+        return None
+
+    candidate = interactive_children[0]
+    if candidate.get("type") != "link-button":
+        return None
+
+    url = candidate.get("url")
+    label = candidate.get("label")
+    # ``strip(JS_WHITESPACE)`` mirrors JS ``String.prototype.trim``.
+    if not (
+        isinstance(url, str) and _HTTP_URL_REGEX.match(url) and isinstance(label, str) and label.strip(JS_WHITESPACE)
+    ):
+        return None
+
+    if not _children_fit_cta_body(card.get("children", [])):
+        return None
+
+    return cast(LinkButtonElement, candidate)
+
+
+def _children_fit_cta_body(children: list[CardChild]) -> bool:
+    """Whether ``_build_body_text`` can carry every child without loss.
+
+    Images, tables, charts, and inline links would be silently dropped from
+    an interactive body, so cards containing them keep the text fallback.
+    """
+    for child in children:
+        child_type = child.get("type")
+        if child_type == "section":
+            if not _children_fit_cta_body(child.get("children", [])):  # type: ignore[union-attr]
+                return False
+        elif child_type not in ("actions", "divider", "fields", "text"):
+            return False
+    return True
+
+
+def _collect_actions(children: list[CardChild]) -> list[ActionsElement]:
+    """Collect every ActionsElement in a list of card children, including
+    those nested inside sections.
+    """
+    found: list[ActionsElement] = []
+    for child in children:
+        if child.get("type") == "actions":
+            found.append(child)  # type: ignore[arg-type]
+        elif child.get("type") == "section":
+            found.extend(_collect_actions(child.get("children", [])))  # type: ignore[union-attr]
+    return found
+
+
+def _collect_link_buttons(children: list[CardChild]) -> list[LinkButtonElement]:
+    """Collect every LinkButton across all actions rows in a card."""
+    return [
+        child
+        for actions in _collect_actions(children)
+        for child in actions.get("children", [])
+        if child.get("type") == "link-button"
+    ]
 
 
 def _build_body_text(card: CardElement) -> str:

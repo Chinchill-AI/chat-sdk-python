@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from chat_sdk.adapters.whatsapp.cards import (
     WhatsAppCardResultInteractive,
     WhatsAppCardResultText,
+    card_link_button_lines,
     card_to_whatsapp,
     decode_whatsapp_callback_data,
 )
@@ -36,6 +37,7 @@ from chat_sdk.adapters.whatsapp.types import (
     WhatsAppContact,
     WhatsAppInboundMessage,
     WhatsAppInteractiveMessage,
+    WhatsAppMediaUploadResponse,
     WhatsAppRawMessage,
     WhatsAppTemplateComponent,
     WhatsAppTemplateMessage,
@@ -45,7 +47,10 @@ from chat_sdk.adapters.whatsapp.types import (
 )
 from chat_sdk.emoji import convert_emoji_placeholders, emoji_to_unicode, get_emoji
 from chat_sdk.logger import ConsoleLogger, Logger
-from chat_sdk.shared.adapter_utils import extract_card
+from chat_sdk.shared._js_compat import JS_WHITESPACE
+from chat_sdk.shared.adapter_utils import extract_card, extract_files, extract_postable_attachments
+from chat_sdk.shared.buffer_utils import to_buffer
+from chat_sdk.shared.card_utils import card_to_fallback_text
 from chat_sdk.shared.errors import AdapterError, NetworkError, ValidationError
 from chat_sdk.shared.log_utils import utf8_byte_length
 from chat_sdk.thread_history import ThreadHistoryCache
@@ -58,6 +63,7 @@ from chat_sdk.types import (
     EmojiValue,
     FetchOptions,
     FetchResult,
+    FileUpload,
     FormattedContent,
     LockScope,
     Message,
@@ -77,6 +83,33 @@ DEFAULT_API_VERSION = "v25.0"
 
 # Maximum message length for WhatsApp Cloud API
 WHATSAPP_MESSAGE_LIMIT = 4096
+
+# Maximum caption length for WhatsApp media messages
+WHATSAPP_CAPTION_LIMIT = 1024
+
+# WhatsApp media message types supported for outbound sends
+WhatsAppMediaType = Literal["image", "document", "video", "audio"]
+
+# Per-type upload size limits (bytes) from WhatsApp Cloud API
+WHATSAPP_MEDIA_SIZE_LIMITS: dict[WhatsAppMediaType, int] = {
+    "image": 5 * 1024 * 1024,
+    "audio": 16 * 1024 * 1024,
+    "video": 16 * 1024 * 1024,
+    "document": 100 * 1024 * 1024,
+}
+
+# Filename-extension fallback when a file carries no MIME type
+EXTENSION_MIME_TYPES: dict[str, str] = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".ogg": "audio/ogg",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 # Business-scoped user ID shape (e.g. ``US.13491208655302741918`` or the
 # parent form ``US.ENT.11815799212886844830``). Used with ``fullmatch`` so a
@@ -158,6 +191,81 @@ def _convert_template_component_emoji(component: WhatsAppTemplateComponent) -> W
         for parameter in source
     ]
     return cast(WhatsAppTemplateComponent, {**component, "parameters": parameters})
+
+
+def get_whatsapp_media_type(mime_type: str) -> WhatsAppMediaType:
+    """Map a MIME type to a WhatsApp outbound media message type.
+
+    JPEG and PNG are images; other ``image/*`` types (GIF, WebP, ...) go out
+    as documents because the Cloud API rejects them as images. MP4 and 3GPP
+    are videos, any ``audio/*`` is audio, and everything else is a document.
+    """
+    normalized = mime_type.lower().split(";")[0].strip(JS_WHITESPACE)
+
+    if normalized in ("image/jpeg", "image/png"):
+        return "image"
+
+    if normalized.startswith("image/"):
+        return "document"
+
+    if normalized in ("video/mp4", "video/3gpp"):
+        return "video"
+
+    if normalized.startswith("audio/"):
+        return "audio"
+
+    return "document"
+
+
+def validate_file_size(media_type: WhatsAppMediaType, size: int | float) -> None:
+    """Validate a binary size against WhatsApp's per-type upload limits.
+
+    Raises:
+        ValidationError: When ``size`` exceeds the limit for ``media_type``.
+    """
+    limit = WHATSAPP_MEDIA_SIZE_LIMITS[media_type]
+
+    if size > limit:
+        raise ValidationError(
+            "whatsapp",
+            f"File size {size} bytes exceeds WhatsApp {media_type} limit of {limit} bytes",
+        )
+
+
+def _infer_mime_type(filename: str, mime_type: str | None = None) -> str:
+    """Return ``mime_type`` if set, else a guess from the filename extension."""
+    if mime_type:
+        return mime_type
+
+    extension = filename[filename.rfind(".") :].lower() if "." in filename else ""
+
+    return EXTENSION_MIME_TYPES.get(extension, "application/octet-stream")
+
+
+def _attachment_to_whatsapp_type(attachment: Attachment) -> WhatsAppMediaType:
+    """WhatsApp media type for an attachment: its MIME type, else its kind."""
+    if attachment.mime_type:
+        return get_whatsapp_media_type(attachment.mime_type)
+
+    if attachment.type in ("image", "video", "audio"):
+        return attachment.type
+    return "document"
+
+
+def _js_length(text: str) -> int:
+    """``text.length`` in JavaScript: the UTF-16 code unit count."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+@dataclass(frozen=True)
+class _ResolvedWhatsAppMedia:
+    """A file or attachment resolved to a sendable WhatsApp media payload."""
+
+    caption_eligible: bool
+    mime_type: str
+    payload: dict[str, str]  # {"id": media_id} or {"link": https_url}
+    type: WhatsAppMediaType
+    filename: str | None = None
 
 
 def split_message(text: str) -> list[str]:
@@ -1130,12 +1238,29 @@ class WhatsAppAdapter:
         thread_id: str,
         message: AdapterPostableMessage,
     ) -> RawMessage:
-        """Send a message to a WhatsApp user."""
+        """Send a message to a WhatsApp user.
+
+        Files and attachments go out as media messages (see
+        :meth:`_post_message_with_media`).
+        """
         decoded = self.decode_thread_id(thread_id)
         user_wa_id = decoded.user_wa_id
         # Resolve the route once per logical post; the send helpers reuse it
         # across chunked and multi-part sends.
         recipient = await self._recipient(thread_id, user_wa_id)
+
+        media_items: list[FileUpload | Attachment] = [
+            *extract_files(message),
+            *extract_postable_attachments(message),
+        ]
+        if len(media_items) > 0:
+            return await self._post_message_with_media(
+                thread_id,
+                user_wa_id,
+                message,
+                media_items,
+                recipient=recipient,
+            )
 
         # Check if this is a card with interactive buttons
         card = extract_card(message)
@@ -1162,6 +1287,264 @@ class WhatsAppAdapter:
             "whatsapp",
         )
         return await self._send_text_message(thread_id, user_wa_id, body, recipient)
+
+    async def _post_message_with_media(
+        self,
+        thread_id: str,
+        user_wa_id: str,
+        message: AdapterPostableMessage,
+        media_items: list[FileUpload | Attachment],
+        *,
+        recipient: _WhatsAppRecipient | None = None,
+    ) -> RawMessage:
+        """Send one or more media messages, optionally followed by a card.
+
+        The message text captions the first media when it fits (at most
+        1024 characters, and the media is not audio); otherwise it goes out
+        first as its own text message. Media are sent in order, then the
+        card: an interactive card is sent after the media and never captions
+        them, while a text-fallback card (plus its link-button lines) is the
+        caption.
+        """
+        card = extract_card(message)
+        # cta_url promotion is disabled alongside media: the text fallback
+        # captions the media in a single send, whereas an interactive
+        # message would strip the caption and cost a second API send.
+        card_result = card_to_whatsapp(card, allow_cta_url=False) if card else None
+
+        text = ""
+
+        if card:
+            if card_result is not None and card_result.get("type") != "interactive":
+                # The shared fallback excludes action elements, so append link
+                # button URLs to keep them reachable from the caption.
+                fallback = "\n".join(
+                    part for part in [card_to_fallback_text(card), *card_link_button_lines(card)] if part
+                )
+                text = convert_emoji_placeholders(fallback, "whatsapp")
+        else:
+            text = convert_emoji_placeholders(self._render_postable_text(message), "whatsapp")
+
+        # Resolve (and upload) concurrently like upstream's ``Promise.all``;
+        # the sends below stay sequential so messages arrive in order.
+        resolved = await asyncio.gather(*(self._resolve_media(item) for item in media_items))
+
+        first_media = resolved[0]
+        # ``_js_length`` counts UTF-16 code units, like upstream's ``text.length``.
+        use_separate_text = len(text) > 0 and (
+            _js_length(text) > WHATSAPP_CAPTION_LIMIT or first_media.type == "audio" or not first_media.caption_eligible
+        )
+
+        if use_separate_text:
+            await self._send_text_message(thread_id, user_wa_id, text, recipient)
+
+        result: RawMessage | None = None
+
+        for index, media in enumerate(resolved):
+            caption = (
+                text if index == 0 and not use_separate_text and len(text) > 0 and media.caption_eligible else None
+            )
+
+            result = await self._send_media_message(
+                thread_id,
+                user_wa_id,
+                media.type,
+                media.payload,
+                caption=caption,
+                filename=media.filename,
+                recipient=recipient,
+            )
+
+        if card_result is not None:
+            if card_result.get("type") == "interactive":
+                interactive_raw = cast(WhatsAppCardResultInteractive, card_result)["interactive"]
+                interactive = json.loads(convert_emoji_placeholders(json.dumps(interactive_raw), "whatsapp"))
+                result = await self._send_interactive_message(thread_id, user_wa_id, interactive, recipient)
+            elif len(text) == 0:
+                result = await self._send_text_message(
+                    thread_id,
+                    user_wa_id,
+                    convert_emoji_placeholders(cast(WhatsAppCardResultText, card_result)["text"], "whatsapp"),
+                    recipient,
+                )
+
+        if result is None:
+            raise RuntimeError("WhatsApp media message did not return a result")
+
+        return result
+
+    def _render_postable_text(self, message: AdapterPostableMessage) -> str:
+        """Render optional text from a postable message (empty for files-only payloads)."""
+        if isinstance(message, str):
+            return message
+
+        if isinstance(message, dict):
+            if "markdown" in message or "raw" in message or "ast" in message:
+                return self._format_converter.render_postable(message)
+            return ""
+
+        if hasattr(message, "markdown") or hasattr(message, "raw") or hasattr(message, "ast"):
+            return self._format_converter.render_postable(message)
+
+        return ""
+
+    async def _upload_media(self, data: bytes, filename: str, mime_type: str) -> str:
+        """Upload binary media to the Cloud API and return its media ID.
+
+        See: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media#upload-media
+        """
+        import aiohttp
+
+        form = aiohttp.FormData()
+        form.add_field("messaging_product", "whatsapp")
+        form.add_field("file", data, filename=filename, content_type=mime_type)
+
+        response = cast(
+            WhatsAppMediaUploadResponse,
+            await self._graph_api_upload(f"/{self._phone_number_id}/media", form),
+        )
+
+        media_id = response.get("id") if isinstance(response, dict) else None
+        if not media_id:
+            raise RuntimeError("WhatsApp API did not return a media ID for upload")
+
+        return media_id
+
+    async def _send_media_message(
+        self,
+        thread_id: str,
+        to: str,
+        media_type: WhatsAppMediaType,
+        payload: dict[str, str],
+        *,
+        caption: str | None = None,
+        filename: str | None = None,
+        recipient: _WhatsAppRecipient | None = None,
+    ) -> RawMessage:
+        """Send a media message (image, document, video, or audio)."""
+        media_object: dict[str, str] = {}
+
+        if payload.get("id"):
+            media_object["id"] = payload["id"]
+
+        if payload.get("link"):
+            media_object["link"] = payload["link"]
+
+        if caption and media_type != "audio":
+            media_object["caption"] = caption
+
+        if filename and media_type == "document":
+            media_object["filename"] = filename
+
+        addressing = recipient if recipient is not None else await self._recipient(thread_id, to)
+        response = await self._graph_api_request(
+            f"/{self._phone_number_id}/messages",
+            {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                **addressing,
+                "type": media_type,
+                media_type: media_object,
+            },
+        )
+
+        messages = response.get("messages") or []
+        if not messages or not messages[0].get("id"):
+            raise RuntimeError(f"WhatsApp API did not return a message ID for {media_type} message")
+
+        message_id = messages[0]["id"]
+        return RawMessage(
+            id=message_id,
+            thread_id=thread_id,
+            raw={
+                "message": {
+                    "id": message_id,
+                    "from": self._phone_number_id,
+                    "timestamp": str(int(time.time())),
+                    "type": media_type,
+                },
+                "phone_number_id": self._phone_number_id,
+            },
+        )
+
+    async def _resolve_media(self, item: FileUpload | Attachment) -> _ResolvedWhatsAppMedia:
+        """Normalize a FileUpload or Attachment into a WhatsApp media payload.
+
+        Binary sources (``FileUpload.data``, ``Attachment.data``, then
+        ``Attachment.fetch_data``) are size-checked and uploaded; otherwise an
+        HTTPS ``Attachment.url`` is passed to WhatsApp as a ``link``.
+        """
+        if isinstance(item, FileUpload):
+            mime_type = _infer_mime_type(item.filename, item.mime_type)
+            media_type = get_whatsapp_media_type(mime_type)
+            buffer = await to_buffer(item.data, "whatsapp")
+
+            # ``is None``, not truthiness: an empty upload is still sent, as
+            # upstream's (always truthy) Buffer is.
+            if buffer is None:
+                raise ValidationError("whatsapp", "File upload data is empty")
+
+            validate_file_size(media_type, len(buffer))
+
+            media_id = await self._upload_media(buffer, item.filename, mime_type)
+
+            return _ResolvedWhatsAppMedia(
+                caption_eligible=media_type != "audio",
+                filename=item.filename,
+                mime_type=mime_type,
+                payload={"id": media_id},
+                type=media_type,
+            )
+
+        media_type = _attachment_to_whatsapp_type(item)
+        filename = item.name if item.name is not None else "attachment"
+        mime_type = _infer_mime_type(filename, item.mime_type)
+
+        data: bytes | None = item.data
+        if data is None and item.fetch_data is not None:
+            data = await item.fetch_data()
+
+        if data is not None:
+            buffer = await to_buffer(data, "whatsapp")
+
+            if buffer is None:
+                raise ValidationError("whatsapp", "Attachment data is empty")
+
+            validate_file_size(media_type, len(buffer))
+
+            media_id = await self._upload_media(buffer, filename, mime_type)
+
+            return _ResolvedWhatsAppMedia(
+                caption_eligible=media_type != "audio",
+                filename=filename,
+                mime_type=mime_type,
+                payload={"id": media_id},
+                type=media_type,
+            )
+
+        if not item.url:
+            raise ValidationError(
+                "whatsapp",
+                "Attachment requires data, fetchData, or a public HTTPS url",
+            )
+
+        if not item.url.startswith("https://"):
+            raise ValidationError(
+                "whatsapp",
+                "Attachment URL must use HTTPS for WhatsApp link passthrough",
+            )
+
+        # A size of 0 is valid, so test the type rather than truthiness.
+        if isinstance(item.size, (int, float)) and not isinstance(item.size, bool):
+            validate_file_size(media_type, item.size)
+
+        return _ResolvedWhatsAppMedia(
+            caption_eligible=media_type != "audio",
+            filename=filename,
+            mime_type=mime_type,
+            payload={"link": item.url},
+            type=media_type,
+        )
 
     async def _send_single_text_message(
         self,
@@ -1595,6 +1978,21 @@ class WhatsAppAdapter:
             },
             json_body=body,
             label="WhatsApp API error",
+            context={"path": path},
+        )
+
+    async def _graph_api_upload(self, path: str, form: Any) -> Any:
+        """Make a multipart upload request to the Meta Graph API.
+
+        ``form`` is an ``aiohttp.FormData``; aiohttp sets the multipart
+        ``Content-Type`` (with its boundary), so none is passed here.
+        """
+        return await self._graph_fetch_json(
+            "POST",
+            f"{self._graph_api_url}{path}",
+            headers={"Authorization": f"Bearer {self._access_token}"},
+            data=form,
+            label="WhatsApp API upload error",
             context={"path": path},
         )
 
