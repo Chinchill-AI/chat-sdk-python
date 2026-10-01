@@ -1704,14 +1704,15 @@ class TestMessageWorkflowSerde:
 # Restored runtime ownership and streaming settings (vercel/chat#967)
 # ============================================================================
 #
-# Python has no ``WORKFLOW_DESERIALIZE``; its equivalent is ``from_json`` on
-# a JSON round-trip (see ``TestThreadWorkflowSerde``), so the ``workflow``
-# restore method maps there. ``chat.reviver()`` does not register the Chat
+# Python has no ``WORKFLOW_DESERIALIZE``. Upstream's is literally
+# ``fromJSON(data)`` (thread.ts / channel.ts at chat@4.41.1), so its
+# ``workflow`` restore method would run exactly the ``json`` case here and
+# is omitted rather than duplicated (CLAUDE.md principle 3). ``chat.reviver()`` does not register the Chat
 # as the singleton in Python, so tests that relied on that side effect
 # register it explicitly.
 
 _THREAD_ID = "slack:C123:1234.5678"
-_RESTORE_METHODS = ["json", "reviver", "standalone", "workflow", "adapter"]
+_RESTORE_METHODS = ["json", "reviver", "standalone", "adapter"]
 
 
 @pytest.fixture
@@ -1744,7 +1745,7 @@ def _dumps(value: Any) -> str:
 
 def _restore(chat: Chat, method: str, adapter: Any) -> ThreadImpl:
     data = chat.thread(_THREAD_ID).to_json()
-    if method in ("json", "workflow"):
+    if method == "json":
         return ThreadImpl.from_json(json.loads(json.dumps(data)))
     if method == "reviver":
         return _decode(json.dumps(data), chat)
@@ -1989,6 +1990,77 @@ class TestRevivedStreamingConfiguration:
         assert options.update_interval_ms == 1200
         assert options.fallback_streaming_placeholder_text is None
 
+    @pytest.mark.parametrize("method", ["submit", "close"])
+    async def test_modal_context_for_an_adapter_under_a_custom_key_stays_with_its_chat(self, method):
+        # Python-specific: the event's adapter is registered under a key
+        # other than `adapter.name`. The restore must still bind to this
+        # Chat, never to the active singleton that registered another
+        # adapter under the plain name (cross-bot routing, vercel/chat#967).
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        owner = _bot(
+            {"slack-main": adapter},
+            state,
+            user_name="owner",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1200,
+        )
+        other_adapter = create_mock_adapter("slack")
+        other = _bot({"slack": other_adapter}, user_name="other")
+        await state.set(
+            "modal-context:slack:context",
+            {
+                "thread": {
+                    "_type": "chat:Thread",
+                    "id": _THREAD_ID,
+                    "channelId": "slack:C123",
+                    "adapterName": "slack",
+                    "isDM": False,
+                },
+                "channel": {"_type": "chat:Channel", "id": "slack:C123", "adapterName": "slack", "isDM": False},
+            },
+        )
+        restored: list[Any] = []
+
+        async def _handler(event: Any) -> None:
+            restored.append(event)
+
+        owner.on_modal_submit("modal", _handler)
+        owner.on_modal_close("modal", _handler)
+        other.register_singleton()
+        user = create_test_message("message", "Hello").author
+        if method == "submit":
+            await owner.process_modal_submit(
+                ModalSubmitEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", values={}, raw={}),
+                "context",
+            )
+        else:
+            tasks: list[Any] = []
+            owner.process_modal_close(
+                ModalCloseEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", raw={}),
+                "context",
+                WebhookOptions(wait_until=tasks.append),
+            )
+            await asyncio.gather(*tasks)
+
+        assert len(restored) == 1
+        thread = restored[0].related_thread
+        channel = restored[0].related_channel
+        assert thread.adapter is adapter
+        assert channel.adapter is adapter
+        await thread.set_state({"owner": "owner"})
+        await channel.set_state({"owner": "owner"})
+        assert await state.get(f"thread-state:{_THREAD_ID}") == {"owner": "owner"}
+        assert await state.get("channel-state:slack:C123") == {"owner": "owner"}
+        assert await other.thread(_THREAD_ID).get_state() is None
+        assert await other.channel("slack:C123").get_state() is None
+        await thread.post(_hello())
+        assert adapter._post_calls[0] == (_THREAD_ID, PostableMarkdown(markdown="Hello"))
+        assert other_adapter._post_calls == []
+        stream = _native_stream(adapter, None)
+        await thread.post(_hello())
+        assert stream.await_args.args[2].update_interval_ms == 1200
+
 
 def _restore_pair(method: str, data: dict[str, Any], adapter: Any) -> tuple[ThreadImpl, ChannelImpl]:
     if method == "standalone":
@@ -2007,7 +2079,7 @@ class TestRestoredRuntimeOwnership:
 
     @pytest.mark.parametrize("singleton", ["replaced", "cleared"])
     @pytest.mark.parametrize("access", ["adapter", "state", "stream"])
-    @pytest.mark.parametrize("method", ["json", "standalone", "workflow", "adapter"])
+    @pytest.mark.parametrize("method", ["json", "standalone", "adapter"])
     async def test_retains_the_runtime_after_resolving_first_with_the_singleton(self, method, access, singleton):
         adapter = create_mock_adapter("slack")
         first = _bot(
@@ -2168,6 +2240,29 @@ class TestRestoredRuntimeOwnershipFixes:
         restored = _decode(_dumps({"message": create_test_message("message", "Hello")}), bot)
 
         assert await restored["message"].subject == subject
+        adapter.fetch_subject.assert_awaited_once()
+
+    async def test_from_json_with_chat_binds_the_restored_current_message_to_its_adapter(self):
+        # Python-specific: a plain dict (no reviver) so only
+        # `ThreadImpl.from_json(..., chat=bot)` can bind `current_message`
+        # (upstream thread.ts fromJSON: setMessageAdapter on _currentMessage).
+        adapter = create_mock_adapter("slack")
+        subject = MessageSubject(id="issue-1", type="issue", title="Bug", raw={})
+        adapter.fetch_subject = AsyncMock(return_value=subject)  # type: ignore[attr-defined]
+        bot = _bot({"slack": adapter})
+        data = {
+            "_type": "chat:Thread",
+            "id": _THREAD_ID,
+            "channelId": "slack:C123",
+            "adapterName": "slack",
+            "isDM": False,
+            "currentMessage": create_test_message("message", "Hello").to_json(),
+        }
+
+        thread = ThreadImpl.from_json(json.loads(json.dumps(data)), chat=bot)
+
+        assert thread._current_message is not None
+        assert await thread._current_message.subject == subject
         adapter.fetch_subject.assert_awaited_once()
 
 

@@ -204,7 +204,7 @@ Sync wave from `chat@4.31.0` to `chat@4.41.1` (tracking #184). `UPSTREAM_PARITY`
   - `AddTaskOptions.auto_complete_previous` (default `True`): pass `False` to keep earlier `in_progress` tasks running.
   - `thread.post()` / `channel.post()` / `from_full_stream` accept AG-UI streams (TanStack AI `chat()`, `ag-ui-protocol` events, `str` Enum types included): `TEXT_MESSAGE_CONTENT` deltas become text, `TEXT_MESSAGE_END` separates turns with `"\n\n"`, other events are skipped. `thread.post` now uses the same normalizer as `from_full_stream`, so an empty-string text delta followed by a step boundary now yields a separator, as upstream.
   - **Python-specific (divergence from upstream):** `from_json` resolves ownership when it is called (upstream: on first access), so the non-owning `adapter`/`chat` raise happens in `from_json`, and a thread restored inside `chat.activate()` keeps its owner after the block. See `docs/UPSTREAM_SYNC.md`.
-  - Fidelity at `chat@4.41.1`: `chat.test.ts` 8 → 3, `thread.test.ts` 17 → 15, `serialization.test.ts` 17 → 0, `from-full-stream.test.ts` 9 → 0 missing.
+  - Fidelity at `chat@4.41.1`: `chat.test.ts` 6 → 1, `thread.test.ts` 17 → 15, `serialization.test.ts` 17 → 0, `from-full-stream.test.ts` 9 → 0 missing.
 
 ### Google Chat: webhook JWT verification bound to configured identities (#222, security)
 

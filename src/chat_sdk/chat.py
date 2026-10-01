@@ -1529,7 +1529,7 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> ModalResponse | None:
         """Process a modal form submission. Returns optional response."""
-        related = await self._retrieve_modal_context(event.adapter.name, context_id)
+        related = await self._retrieve_modal_context(event.adapter, context_id)
         callback_url = related.get("callback_url")
 
         full_event = ModalSubmitEvent(
@@ -1600,7 +1600,7 @@ class Chat:
         """Process a modal close event."""
 
         async def _task() -> None:
-            related = await self._retrieve_modal_context(event.adapter.name, context_id)
+            related = await self._retrieve_modal_context(event.adapter, context_id)
 
             full_event = ModalCloseEvent(
                 adapter=event.adapter,
@@ -1915,9 +1915,10 @@ class Chat:
 
     async def _retrieve_modal_context(
         self,
-        adapter_name: str,
+        adapter: Adapter,
         context_id: str | None,
     ) -> dict[str, Any]:
+        adapter_name = adapter.name
         if not context_id:
             return {
                 "callback_url": None,
@@ -1937,14 +1938,16 @@ class Chat:
                 "related_channel": None,
             }
 
-        adapter = self._adapters.get(adapter_name)
-
-        # Bind restored objects to this Chat (vercel/chat#967). `adapter` is
-        # looked up by `adapter.name`; when it is registered under another
-        # key, keep the previous unbound restore, because an explicit `chat`
-        # resolves the adapter eagerly and would raise here. Divergence from
-        # upstream (eager ownership) — see docs/UPSTREAM_SYNC.md.
-        owner = self if adapter is not None else None
+        # Bind restored objects to this Chat (vercel/chat#967). Upstream looks
+        # the adapter up by `adapter.name` and always passes `this`; we bind
+        # the event's own adapter instead, so an adapter registered under a
+        # custom key still restores into this Chat (an explicit `chat`
+        # resolves eagerly here, so a by-name miss would raise). Never fall
+        # back to the active singleton: it may be another bot's Chat. An
+        # adapter this Chat did not register is matched only against the
+        # Chat that owns that exact instance. Divergence from upstream
+        # (eager ownership) — see docs/UPSTREAM_SYNC.md.
+        owner = self if self.owns_adapter(adapter) else None
 
         related_thread = None
         if stored.get("thread"):
