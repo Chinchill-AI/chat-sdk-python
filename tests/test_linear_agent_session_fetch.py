@@ -20,9 +20,14 @@ The session's issue must match the thread's issue (chat@4.41.1,
 vercel/chat#974): a missing or foreign ``issue.id`` raises ``ValidationError``
 before the root comment or the children are loaded.
 
+Since vercel/chat#885 (chat@4.40.0) every session message carries the stable
+``linear:{issue}:s:{session}`` thread id, and a session without a root comment
+reads its history from ``agentSession.activities`` (``first``/``after`` forward,
+``last``/``before`` otherwise).
+
 Each test pins behaviour so a regression — a forward/backward (first↔last) swap,
-a per-comment-id → fixed-thread-id collapse, a dropped ownership check, a
-missing append-only guard, or a ``hasNextPage`` cursor-logic flip — fails the
+a per-comment thread id coming back, a dropped ownership check, a missing
+append-only guard, or a ``hasNextPage`` cursor-logic flip — fails the
 assertion. The append-only edit/delete guards (index.ts:1408 / 1464) are
 covered here too.
 """
@@ -34,7 +39,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chat_sdk.adapters.linear.adapter import LinearAdapter
+from chat_sdk.adapters.linear.adapter import LinearAdapter, _render_activity
 from chat_sdk.adapters.linear.types import LinearAdapterAPIKeyConfig, LinearAgentSessionThreadId
 from chat_sdk.shared.errors import AdapterError, ValidationError
 from chat_sdk.types import FetchOptions
@@ -198,16 +203,9 @@ class TestFetchAgentSessionMessagesHappyPath:
         assert [m.id for m in result.messages] == ["comment-root", "comment-a", "comment-b"]
         assert [m.text for m in result.messages] == ["root prompt", "first reply", "second reply"]
 
-        # PER-COMMENT thread_id proof: each message encodes its OWN comment id
-        # plus the session segment — NOT a single fixed thread_id shared by all.
-        # A regression that passed one fixed thread_id (e.g. the root's) to every
-        # message would collapse these to identical strings.
-        assert [m.thread_id for m in result.messages] == [
-            "linear:issue-123:c:comment-root:s:session-789",
-            "linear:issue-123:c:comment-a:s:session-789",
-            "linear:issue-123:c:comment-b:s:session-789",
-        ]
-        assert len({m.thread_id for m in result.messages}) == 3
+        # Stable session thread (vercel/chat#885): every message shares
+        # ``linear:{issue}:s:{session}``; no per-comment ``:c:`` segment.
+        assert [m.thread_id for m in result.messages] == [_SESSION_THREAD] * 3
 
         # Agent-session comments directly target the bot → every message is a
         # mention (upstream ``parseMessage`` sets ``isMention`` for the
@@ -372,14 +370,14 @@ class TestAgentSessionOwnership:
         assert "comment" not in agent_session.reads
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("issue_id", ["issue-private", None])
+    @pytest.mark.parametrize("issue_id", ["issue-private", None, "issue-public"])
     async def test_validates_agent_session_ownership_through_the_transport(self, issue_id: str | None) -> None:
         # Ported: it.each("validates agent session ownership through the Linear
-        # SDK: %s") — the reject cases. Upstream stubs ``fetch`` beneath the SDK;
-        # the Python equivalent stubs the aiohttp session beneath the REAL
+        # SDK: %s"). Upstream stubs ``fetch`` beneath the SDK; the Python
+        # equivalent stubs the aiohttp session beneath the REAL
         # ``_graphql_query``, so the JSON → ``issue { id }`` mapping is exercised
-        # end to end. (The ``issue-public`` + ``comment: null`` case resolves via
-        # the activities fallback, which lands with #232.)
+        # end to end. The owned, rootless session resolves via the activities
+        # query; the others are rejected after the session lookup alone.
         adapter = _make_adapter()
         http = _FakeLinearHttp(
             {
@@ -391,16 +389,32 @@ class TestAgentSessionOwnership:
                     }
                 }
             },
-            {"data": {"comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}},
+            {
+                "data": {
+                    "agentSession": {
+                        "activities": {
+                            "nodes": [],
+                            "pageInfo": {"hasPreviousPage": False, "startCursor": None},
+                        }
+                    }
+                }
+            },
         )
         adapter._get_http_session = AsyncMock(return_value=http)  # type: ignore[method-assign]
 
-        with pytest.raises(ValidationError) as exc_info:
-            await adapter.fetch_messages("linear:issue-public:s:session-1")
-
-        assert str(exc_info.value) == "Agent session does not belong to this issue"
-        # Exactly one request went out, and it selected the session's issue id.
-        assert len(http.requests) == 1
+        if issue_id == "issue-public":
+            result = await adapter.fetch_messages("linear:issue-public:s:session-1")
+            assert result.messages == []
+            assert result.next_cursor is None
+            assert len(http.requests) == 2
+            assert "activities(" in http.requests[1]["query"]
+            assert http.requests[1]["variables"] == {"id": "session-1", "last": 50}
+        else:
+            with pytest.raises(ValidationError) as exc_info:
+                await adapter.fetch_messages("linear:issue-public:s:session-1")
+            assert str(exc_info.value) == "Agent session does not belong to this issue"
+            # Exactly one request went out, and it selected the session's issue id.
+            assert len(http.requests) == 1
         assert http.requests[0]["variables"] == {"id": "session-1"}
         assert "issue {" in http.requests[0]["query"]
 
@@ -426,14 +440,234 @@ class TestAgentSessionOwnership:
         assert str(exc_info.value) == "Agent session does not belong to this issue"
         assert adapter._graphql_query.await_count == 1
 
-    @pytest.mark.asyncio
-    async def test_raises_when_root_comment_missing(self) -> None:
-        adapter = _make_adapter()
-        adapter._graphql_query = AsyncMock(return_value=_session_return(root_comment=None))
 
-        with pytest.raises(AdapterError) as exc_info:
-            await adapter.fetch_messages(_SESSION_THREAD)
-        assert "missing a root comment" in str(exc_info.value)
+# ===========================================================================
+# _fetch_agent_session_activities — rootless sessions (vercel/chat#885)
+# ===========================================================================
+
+
+def _activity(
+    *,
+    activity_id: str,
+    created_at: str,
+    content: dict[str, Any],
+    user: dict[str, Any] | None = None,
+    source_comment_id: str | None = None,
+) -> dict[str, Any]:
+    """An ``AgentActivity`` node as the raw activities query returns it."""
+    return {
+        "id": activity_id,
+        "createdAt": created_at,
+        "updatedAt": created_at,
+        "sourceComment": {"id": source_comment_id} if source_comment_id is not None else None,
+        "user": user,
+        "content": content,
+    }
+
+
+def _activities_return(
+    nodes: list[dict[str, Any]],
+    page_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if page_info is None:
+        page_info = {"hasNextPage": False, "hasPreviousPage": False, "endCursor": None, "startCursor": None}
+    return {"data": {"agentSession": {"activities": {"nodes": nodes, "pageInfo": page_info}}}}
+
+
+def _rootless_session(*, issue_id: str = "issue-123", session_id: str = "session-789") -> dict[str, Any]:
+    session = _session_return(issue_id=issue_id, root_comment=None, session_id=session_id)
+    session["data"]["agentSession"]["url"] = f"https://linear.app/session/{session_id}"
+    return session
+
+
+class TestFetchAgentSessionActivities:
+    @pytest.mark.asyncio
+    async def test_should_fetch_activities_for_agent_sessions_without_a_root_comment(self) -> None:
+        # Ported: "should fetch activities for agent sessions without a root
+        # comment". Nodes arrive out of order and are sorted by createdAt.
+        adapter = _make_adapter()
+        adapter._bot_user_id = "bot-id"
+        adapter._default_organization_id = "org-xyz"
+        bot_user = {"id": "bot-id", "displayName": "Test Bot", "name": "Test Bot"}
+        adapter._graphql_query = _query_router(  # type: ignore[method-assign]
+            _rootless_session(issue_id="issue-abc"),
+            _activities_return(
+                [
+                    _activity(
+                        activity_id="response-activity",
+                        created_at="2025-06-01T10:02:00.000Z",
+                        content={"type": "response", "body": "Agent response"},
+                        user=bot_user,
+                    ),
+                    _activity(
+                        activity_id="prompt-activity",
+                        created_at="2025-06-01T10:00:00.000Z",
+                        content={"type": "prompt", "body": "User prompt"},
+                        user={"id": "user-1", "displayName": "Alice", "name": "Alice Smith"},
+                    ),
+                    _activity(
+                        activity_id="action-activity",
+                        created_at="2025-06-01T10:01:00.000Z",
+                        content={
+                            "type": "action",
+                            "action": "Searching",
+                            "parameter": "Chat SDK",
+                            "result": "Found documentation",
+                        },
+                        user=bot_user,
+                    ),
+                ]
+            ),
+        )
+
+        result = await adapter.fetch_messages("linear:issue-abc:s:session-789")
+
+        activities_query, activities_vars = adapter._graphql_query.call_args_list[1][0]
+        assert "activities(" in activities_query
+        assert activities_vars == {"id": "session-789", "last": 50}
+        assert [m.text for m in result.messages] == [
+            "User prompt",
+            "Searching: Chat SDK\nFound documentation",
+            "Agent response",
+        ]
+        assert [m.id for m in result.messages] == ["prompt-activity", "action-activity", "response-activity"]
+        assert result.messages[0].author.is_bot is False
+        assert result.messages[0].author.is_me is False
+        assert result.messages[1].author.is_bot is True
+        assert result.messages[1].author.is_me is True
+        assert all(m.thread_id == "linear:issue-abc:s:session-789" for m in result.messages)
+        assert all(m.is_mention is True for m in result.messages)
+        assert result.messages[0].raw["organizationId"] == "org-xyz"
+        assert result.messages[0].raw["comment"]["url"] == "https://linear.app/session/session-789"
+        assert result.next_cursor is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("options", "expected_vars", "page_info", "expected_cursor"),
+        [
+            pytest.param(
+                FetchOptions(direction="forward", limit=10, cursor="cursor-in"),
+                {"id": "session-789", "first": 10, "after": "cursor-in"},
+                {"hasNextPage": True, "hasPreviousPage": True, "endCursor": "end", "startCursor": "start"},
+                "end",
+                id="forward-after-endCursor",
+            ),
+            pytest.param(
+                FetchOptions(direction="backward", limit=10, cursor="cursor-in"),
+                {"id": "session-789", "last": 10, "before": "cursor-in"},
+                {"hasNextPage": True, "hasPreviousPage": True, "endCursor": "end", "startCursor": "start"},
+                "start",
+                id="backward-before-startCursor",
+            ),
+            pytest.param(
+                FetchOptions(direction="forward", cursor=""),
+                {"id": "session-789", "first": 50},
+                {"hasNextPage": False, "hasPreviousPage": True, "endCursor": "end", "startCursor": "start"},
+                None,
+                id="forward-no-next-page",
+            ),
+            pytest.param(
+                FetchOptions(direction="backward"),
+                {"id": "session-789", "last": 50},
+                {"hasNextPage": True, "hasPreviousPage": False, "endCursor": "end", "startCursor": "start"},
+                None,
+                id="backward-no-previous-page",
+            ),
+        ],
+    )
+    async def test_activities_cursor_forwarding_and_next_cursor(
+        self,
+        options: FetchOptions,
+        expected_vars: dict[str, Any],
+        page_info: dict[str, Any],
+        expected_cursor: str | None,
+    ) -> None:
+        # Unlike the children path, the activities fallback forwards the
+        # inbound cursor (``after`` forward, ``before`` otherwise; an empty
+        # cursor is not sent) and returns the cursor for the paging direction.
+        adapter = _make_adapter()
+        adapter._graphql_query = _query_router(  # type: ignore[method-assign]
+            _rootless_session(),
+            _activities_return([], page_info),
+        )
+
+        result = await adapter.fetch_messages(_SESSION_THREAD, options)
+
+        _, activities_vars = adapter._graphql_query.call_args_list[1][0]
+        assert activities_vars == expected_vars
+        assert result.next_cursor == expected_cursor
+
+    @pytest.mark.asyncio
+    async def test_activity_authors_and_ids_fall_back(self) -> None:
+        # ``user?.id ?? (isBot ? botUserId : "unknown")``, display-name fallback
+        # ``isBot ? userName : "unknown"``, and ``sourceCommentId ?? id``.
+        adapter = _make_adapter()
+        adapter._graphql_query = _query_router(  # type: ignore[method-assign]
+            _rootless_session(),
+            _activities_return(
+                [
+                    _activity(
+                        activity_id="prompt-activity",
+                        created_at="2025-06-01T10:00:00.000Z",
+                        content={"type": "prompt", "body": "hi"},
+                        source_comment_id="source-comment-1",
+                    ),
+                    _activity(
+                        activity_id="thought-activity",
+                        created_at="2025-06-01T10:01:00.000Z",
+                        content={"type": "thought", "body": "thinking"},
+                    ),
+                ]
+            ),
+        )
+
+        result = await adapter.fetch_messages(_SESSION_THREAD)
+
+        prompt, thought = result.messages
+        assert prompt.id == "source-comment-1"
+        assert (prompt.author.user_id, prompt.author.user_name, prompt.author.full_name) == (
+            "unknown",
+            "unknown",
+            "unknown",
+        )
+        assert prompt.author.is_bot is False
+        assert thought.id == "thought-activity"
+        assert (thought.author.user_id, thought.author.user_name, thought.author.full_name) == (
+            "bot-user-id",
+            "test-bot",
+            "test-bot",
+        )
+        assert thought.author.is_bot is True
+        assert thought.author.is_me is True
+
+
+class TestRenderActivity:
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param({"type": "error", "body": "  kept as is  "}, "  kept as is  ", id="body-verbatim"),
+            pytest.param({"type": "action", "action": "Read", "parameter": "file.py"}, "Read: file.py", id="no-result"),
+            pytest.param(
+                {"type": "action", "action": " \u3000 ", "parameter": "", "result": None},
+                "Action",
+                id="empty-after-trim-action",
+            ),
+            pytest.param(
+                {"type": "action", "action": " Run ", "parameter": "  ", "result": " \ufeff "},
+                "Run",
+                id="blank-parameter-and-result-dropped",
+            ),
+            pytest.param(
+                {"type": "action", "action": "\x1cRun", "parameter": "x", "result": "done\x85"},
+                "\x1cRun: x\ndone\x85",
+                id="js-trim-set-keeps-non-js-whitespace",
+            ),
+        ],
+    )
+    def test_render_activity(self, content: dict[str, Any], expected: str) -> None:
+        # JS ``.trim()`` (``_JS_WHITESPACE``), not ``str.strip()``: U+3000 and
+        # the BOM are stripped, U+001C and U+0085 are kept.
+        assert _render_activity(content) == expected
 
 
 # ===========================================================================
@@ -615,11 +849,9 @@ class TestFetchDispatchOrdering:
         # to ``_fetch_comment_thread``.
         assert "comment(id: $commentId)" not in first_query
         assert "comment(id: $commentId)" not in second_query
-        # The session path re-encodes each comment's OWN id plus the :s: segment.
-        assert [m.thread_id for m in result.messages] == [
-            "linear:issue-123:c:comment-root:s:session-789",
-            "linear:issue-123:c:comment-a:s:session-789",
-        ]
+        # Session messages carry the stable session thread, not the requested
+        # per-comment form.
+        assert [m.thread_id for m in result.messages] == [_SESSION_THREAD] * 2
 
 
 # ===========================================================================

@@ -262,6 +262,13 @@ Ports upstream `32687038` (vercel/chat#830, chat@4.38.1), the Google Chat part o
   - New exports from `chat_sdk.ai`: `ChatApprovalToolName`, `ReadScope`; `ToolOptions.guard`; `ChatToolsOptions.scope` / `strict_scope`.
   - **Python-specific (divergence from upstream):** link-metadata bounds count code points, not UTF-16 code units, so a field with emoji keeps up to the limit in code points and never ends on a lone surrogate. See `docs/UPSTREAM_SYNC.md`.
   - Fidelity: `ai/index.test.ts` 26 → 0 missing, `ai/messages.test.ts` 10 → 9 at `chat@4.41.1`.
+- **BREAKING (Linear agent-session thread ids) — one stable thread per agent session** (#232; ports vercel/chat `3d2cb22a` #885, chat@4.40.0, and the Linear half of `fcdc1c9e` #946, chat@4.41.0).
+  - **Breaking:** every agent-session message (created and prompted webhooks, fetched history, and the messages returned by `post_message` / `stream`) now uses `linear:{issueId}:s:{agentSessionId}`. It used to be `linear:{issueId}:c:{commentId}:s:{agentSessionId}`, a new thread per source comment. **Migration:** subscriptions and state stored under the old ids no longer match new events. Re-subscribe, or map each stored id by dropping its `:c:{commentId}` segment. Old-form ids still decode, so posting to a stored one still reaches its session.
+  - **Consumer-visible:** a session created without a creator (for example by a Linear automation) is authored by `Author(user_id="linear-automation", user_name="Linear automation", is_bot=True, is_me=False)` and reaches your handlers. It used to be authored as the bot itself and dropped as a self-message.
+  - **Consumer-visible:** a session created without a root comment is dispatched with id `agent-session-{sessionId}` and the prompt context as its text, and a prompt with no source comment uses the activity id. Both used to be dropped with a warning.
+  - **Consumer-visible:** `fetch_messages` on a session with no root comment reads the session's activities instead of raising `AdapterError`. Forward paging sends `first`/`after`, backward sends `last`/`before`, and `next_cursor` is the end or start cursor for that direction. Actions render as `"{action}: {parameter}"` plus the result on a new line.
+  - `LinearAdapter.parse_message` now handles the `agent_session_comment` kind (a mention on the stable thread). Ordinary comments leave `is_mention` unset, so core `@mention` text detection still runs on them.
+  - Tests: ported the seven `adapter-linear` cases named in #232 plus the rootless `issue-public` case of "validates agent session ownership through the Linear SDK". `adapter-linear` is not fidelity-mapped (#78), so the target report is unchanged (198 → 198).
 
 ## 0.4.31.3
 

@@ -8,8 +8,9 @@ Covers:
 - mode-gating (AgentSessionEvent only in agent-sessions mode; Comment only in
   comments mode), including the inversion both ways;
 - ``_parse_message_from_agent_session_event`` for the ``created`` and
-  ``prompted`` actions, the null-return + warn paths, and the bot-author
-  fallback;
+  ``prompted`` actions, the null-return + warn paths, the stable
+  ``linear:{issue}:s:{session}`` thread id, rootless sessions, prompts without
+  a source comment, and the "Linear automation" author (vercel/chat#885);
 - app-ownership guard (own bot vs. foreign bot);
 - ``createdAt`` carried as a raw string;
 - no-auto-acknowledge (process_message routed, but no outbound API call);
@@ -113,7 +114,8 @@ def _signed_request(payload: dict[str, Any]) -> _FakeRequest:
 
 
 # Sentinel distinguishing "key absent" from "value is None" for the creator /
-# sourceCommentId overrides (mirrors upstream's ``"creator" in overrides``).
+# sourceCommentId / comment overrides (mirrors upstream's
+# ``"creator" in overrides``).
 _UNSET = object()
 
 
@@ -121,7 +123,9 @@ def _create_agent_session_payload(
     *,
     action: str = "created",
     activity_body: str = "Hello from app actor",
+    activity_id: str = "agent-activity-1",
     app_user_id: str = "bot-user-id",
+    comment: Any = _UNSET,
     comment_id: str = "comment-root",
     creator: Any = _UNSET,
     issue_id: str = "issue-123",
@@ -161,23 +165,35 @@ def _create_agent_session_payload(
             "issueId": issue_id,
             "commentId": comment_id,
             "sourceCommentId": resolved_source_comment_id,
-            "comment": {
-                "id": comment_id,
-                "body": source_comment_body,
-                "userId": resolved_creator["id"] if resolved_creator else None,
-            },
+            "comment": (
+                {
+                    "id": comment_id,
+                    "body": source_comment_body,
+                    "userId": resolved_creator["id"] if resolved_creator else None,
+                }
+                if comment is _UNSET
+                else comment
+            ),
             "creator": resolved_creator,
             "status": "active",
             "summary": "Help with the issue",
             "url": session_url,
         },
         "agentActivity": {
-            "id": "agent-activity-1",
+            "id": activity_id,
+            "sourceCommentId": resolved_source_comment_id,
             "createdAt": "2025-06-01T12:00:00.000Z",
             "updatedAt": "2025-06-01T12:00:00.000Z",
             "content": {
                 "type": "prompt",
                 "body": activity_body,
+            },
+            "user": {
+                "id": "user-456",
+                "name": "Test User",
+                "email": None,
+                "avatarUrl": None,
+                "url": "https://linear.app/test/profiles/test-user",
             },
         },
         "actor": {
@@ -357,7 +373,7 @@ class TestCreatedAction:
         assert response["status"] == 200
         chat.process_message.assert_called_once()
         message = chat.process_message.call_args[0][2]
-        assert message.thread_id == "linear:issue-123:c:comment-root:s:agent-session-1"
+        assert message.thread_id == "linear:issue-123:s:agent-session-1"
         assert message.author.user_id == "user-456"
         # userName comes from the creator's profile URL (.../profiles/test-user).
         assert message.author.user_name == "test-user"
@@ -388,11 +404,14 @@ class TestCreatedAction:
 
         routed_thread_id = chat.process_message.call_args[0][1]
         message = chat.process_message.call_args[0][2]
-        assert routed_thread_id == "linear:issue-123:c:comment-root:s:agent-session-1"
+        assert routed_thread_id == "linear:issue-123:s:agent-session-1"
         assert routed_thread_id == message.thread_id
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_bot_author_when_created_session_has_no_creator(self):
+    async def test_uses_an_automation_author_when_a_created_session_has_no_creator(self):
+        # Ported: "uses an automation author when a created session has no
+        # creator". The old bot-author fallback made ``is_me`` true, so core
+        # dropped automation-created sessions as self-messages.
         adapter = _make_webhook_adapter("agent-sessions")
         chat = _make_chat()
         adapter._chat = chat
@@ -401,10 +420,29 @@ class TestCreatedAction:
 
         chat.process_message.assert_called_once()
         message = chat.process_message.call_args[0][2]
-        assert message.author.user_id == "bot-user-id"
-        assert message.author.user_name == "test-bot"
+        assert message.author.user_id == "linear-automation"
+        assert message.author.user_name == "Linear automation"
+        assert message.author.full_name == "Linear automation"
         assert message.author.is_bot is True
-        assert message.author.is_me is True
+        assert message.author.is_me is False
+
+    @pytest.mark.asyncio
+    async def test_dispatches_created_sessions_without_a_root_comment(self):
+        # Ported: "dispatches created sessions without a root comment". The
+        # message is synthesized from the session id and the prompt context.
+        adapter = _make_webhook_adapter("agent-sessions")
+        chat = _make_chat()
+        adapter._chat = chat
+
+        response = await adapter.handle_webhook(_signed_request(_create_agent_session_payload(comment=None)))
+
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+        message = chat.process_message.call_args[0][2]
+        assert message.id == "agent-session-agent-session-1"
+        assert message.text == "Issue TEST-1\n\n@get-bot Hello there"
+        assert message.thread_id == "linear:issue-123:s:agent-session-1"
+        assert message.is_mention is True
 
     @pytest.mark.asyncio
     async def test_ignores_created_events_that_belong_to_another_bot(self):
@@ -465,37 +503,15 @@ class TestCreatedAction:
 
 class TestPromptedAction:
     @pytest.mark.asyncio
-    async def test_prompted_without_activity_source_comment_id_returns_null(self):
-        # The default agent-activity payload has NO ``sourceCommentId`` on the
-        # activity (only the session carries one). The prompted branch warns
-        # and returns null → no dispatch. Mirrors index.test.ts:1286.
-        logger = _make_logger()
-        adapter = _make_webhook_adapter("agent-sessions", logger)
-        chat = _make_chat()
-        adapter._chat = chat
-
-        response = await adapter.handle_webhook(
-            _signed_request(_create_agent_session_payload(action="prompted", activity_body="Can you elaborate?"))
-        )
-
-        assert response["status"] == 200
-        chat.process_message.assert_not_called()
-        logger.warn.assert_any_call(
-            "Missing source comment ID for agent activity",
-            {"agentSessionId": "agent-session-1", "agentActivityId": "agent-activity-1"},
-        )
-
-    @pytest.mark.asyncio
-    async def test_prompted_with_source_comment_id_dispatches(self):
-        # When the activity DOES carry a sourceCommentId, the prompted branch
-        # builds a message (no mention flag inversion — it's still a mention).
-        logger = _make_logger()
-        adapter = _make_webhook_adapter("agent-sessions", logger)
+    async def test_routes_prompted_events_to_the_same_stable_session_thread(self):
+        # Ported: "routes prompted events to the same stable session thread".
+        # The prompt's source comment id is the message id, but no longer part
+        # of the thread id, so the follow-up lands in the created event's thread.
+        adapter = _make_webhook_adapter("agent-sessions")
         chat = _make_chat()
         adapter._chat = chat
 
         payload = _create_agent_session_payload(action="prompted", activity_body="Can you elaborate?")
-        payload["agentActivity"]["sourceCommentId"] = "activity-comment-99"
         payload["agentActivity"]["user"] = {
             "id": "user-789",
             "name": "Prompter",
@@ -504,18 +520,41 @@ class TestPromptedAction:
             "url": "https://linear.app/test/profiles/prompter",
         }
 
-        await adapter.handle_webhook(_signed_request(payload))
+        response = await adapter.handle_webhook(_signed_request(payload))
 
+        assert response["status"] == 200
         chat.process_message.assert_called_once()
         message = chat.process_message.call_args[0][2]
-        assert message.id == "activity-comment-99"
+        assert message.id == "comment-source"
         assert message.text == "Can you elaborate?"
+        assert message.thread_id == "linear:issue-123:s:agent-session-1"
         assert message.author.user_id == "user-789"
         assert message.author.user_name == "prompter"
         assert message.is_mention is True
-        # parse_message encodes the thread comment segment from the raw
-        # comment's id, which for "prompted" is the activity's sourceCommentId.
-        assert message.thread_id == "linear:issue-123:c:activity-comment-99:s:agent-session-1"
+
+    @pytest.mark.asyncio
+    async def test_routes_prompted_events_without_a_source_comment(self):
+        # Ported: "routes prompted events without a source comment".
+        # ``sourceCommentId ?? agentActivity.id``: the activity id identifies
+        # the message instead of the event being dropped.
+        adapter = _make_webhook_adapter("agent-sessions")
+        chat = _make_chat()
+        adapter._chat = chat
+
+        payload = _create_agent_session_payload(
+            action="prompted",
+            activity_body="Can you elaborate?",
+            activity_id="agent-activity-without-comment",
+            source_comment_id=None,
+        )
+        response = await adapter.handle_webhook(_signed_request(payload))
+
+        assert response["status"] == 200
+        chat.process_message.assert_called_once()
+        message = chat.process_message.call_args[0][2]
+        assert message.id == "agent-activity-without-comment"
+        assert message.text == "Can you elaborate?"
+        assert message.thread_id == "linear:issue-123:s:agent-session-1"
 
     @pytest.mark.asyncio
     async def test_prompted_without_agent_activity_returns_null(self):
@@ -581,25 +620,7 @@ class TestNullReturnPaths:
 
         chat.process_message.assert_called_once()
         message = chat.process_message.call_args[0][2]
-        assert message.thread_id == "linear:issue-from-nested:c:comment-root:s:agent-session-1"
-
-    @pytest.mark.asyncio
-    async def test_missing_comment_for_created_session_returns_null(self):
-        logger = _make_logger()
-        adapter = _make_webhook_adapter("agent-sessions", logger)
-        chat = _make_chat()
-        adapter._chat = chat
-
-        payload = _create_agent_session_payload()
-        del payload["agentSession"]["comment"]
-
-        await adapter.handle_webhook(_signed_request(payload))
-
-        chat.process_message.assert_not_called()
-        logger.warn.assert_any_call(
-            "Missing comment for agent session",
-            {"agentSessionId": "agent-session-1"},
-        )
+        assert message.thread_id == "linear:issue-from-nested:s:agent-session-1"
 
     @pytest.mark.asyncio
     async def test_unsupported_action_returns_null_and_warns(self):
