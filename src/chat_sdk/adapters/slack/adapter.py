@@ -118,6 +118,7 @@ from chat_sdk.types import (
     LockScope,
     MemberJoinedChannelEvent,
     Message,
+    MessageDeletedEvent,
     MessageMetadata,
     ModalCloseEvent,
     ModalResponse,
@@ -207,11 +208,11 @@ def _make_slack_lookup_failed(user_id: str) -> SlackUserCacheEntry:
 
 
 # Ignored message subtypes (system/meta events).
-# `message_changed` is NOT in this set — it is routed to
-# `_handle_message_changed` so we can capture link unfurl metadata.
+# `message_changed` / `message_deleted` are NOT in this set — they are routed
+# to `_handle_message_changed` / `_handle_message_deleted` (unfurl caching and
+# the `on_message_updated` / `on_message_deleted` lifecycle handlers).
 _IGNORED_SUBTYPES = frozenset(
     {
-        "message_deleted",
         "message_replied",
         "channel_join",
         "channel_leave",
@@ -231,6 +232,30 @@ _IGNORED_SUBTYPES = frozenset(
         "tombstone",
     }
 )
+
+
+def _edited_ts(message: dict[str, Any]) -> Any:
+    """``message.edited?.ts`` (``None`` when ``edited`` is missing or not an object)."""
+    edited = message.get("edited")
+    return edited.get("ts") if isinstance(edited, dict) else None
+
+
+def _with_inherited(message: dict[str, Any], **fallbacks: Any) -> dict[str, Any]:
+    """Upstream ``{...message, key: message.key ?? fallback}`` for each fallback.
+
+    A key whose resolved value is ``None`` is not added: upstream's ``??``
+    yields ``undefined`` there, which never reaches the serialized payload, so
+    ``Message.raw`` must not gain ``None`` keys Slack never sent.
+    """
+    out = dict(message)
+    for key, fallback in fallbacks.items():
+        value = message.get(key)
+        if value is None:
+            value = fallback
+        if value is not None:
+            out[key] = value
+    return out
+
 
 # Link-unfurl wait window: Slack delivers unfurled attachments via a
 # separate `message_changed` event ~100-2000ms after the original. We
@@ -3312,6 +3337,9 @@ class SlackAdapter:
         if subtype == "message_changed":
             self._handle_message_changed(event, options)
             return
+        if subtype == "message_deleted":
+            self._handle_message_deleted(event, options)
+            return
         if subtype and subtype in _IGNORED_SUBTYPES:
             self._logger.debug("Ignoring message subtype", {"subtype": subtype})
             return
@@ -3323,10 +3351,8 @@ class SlackAdapter:
             )
             return
 
-        # DMs: top-level messages use empty threadTs
-        is_dm = event.get("channel_type") == "im"
-        thread_ts = (event.get("thread_ts") or "") if is_dm else (event.get("thread_ts") or event.get("ts", ""))
-        thread_id = self.encode_thread_id(SlackThreadId(channel=event["channel"], thread_ts=thread_ts))
+        # See _thread_id_for_message_event for the DM/channel rule.
+        thread_id = self._thread_id_for_message_event(event)
 
         # ``is_mention`` comes from the message content (``_detect_self_mention``):
         # Slack fires ``app_mention`` even for a bot id inside code, so the
@@ -3335,6 +3361,25 @@ class SlackAdapter:
             return await self._parse_slack_message(event, thread_id)
 
         self._chat.process_message(self, thread_id, factory, options)
+
+    def _thread_id_for_message_event(self, event: dict[str, Any]) -> str:
+        """Thread ID for a message-shaped event (upstream ``threadIdForMessageEvent``).
+
+        Single source of truth for how message, edit and delete events map
+        onto a thread: they must agree, or an edit dispatches to a different
+        thread than the message it edits.
+
+        DMs: top-level messages use an empty ``thread_ts`` (matching openDM
+        subscriptions); thread replies use ``thread_ts``. Channels: always
+        ``thread_ts`` or ``ts``. Upstream uses ``||`` here, so an empty
+        ``thread_ts`` falls through to ``ts`` (hence ``or``, not ``is not None``).
+        """
+        is_dm = event.get("channel_type") == "im"
+        # agent_view hook (#214): upstream applies the DM rule only when
+        # ``!this.agentView``; under agent_view a DM uses ``thread_ts || ts``
+        # like a channel. Add that condition here when agent_view lands.
+        thread_ts = (event.get("thread_ts") or "") if is_dm else (event.get("thread_ts") or event.get("ts") or "")
+        return self.encode_thread_id(SlackThreadId(channel=event.get("channel") or "", thread_ts=thread_ts))
 
     # ==================================================================
     # Reaction events
@@ -3829,29 +3874,128 @@ class SlackAdapter:
             fetch_message=preview.fetch_message,
         )
 
-    def _handle_message_changed(self, event: dict[str, Any], _options: WebhookOptions | None = None) -> None:
-        """Cache unfurl metadata from ``message_changed`` events.
+    def _handle_message_changed(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Handle a ``message_changed`` event (upstream ``handleMessageChanged``).
 
-        Slack delivers link unfurls asynchronously by editing the original
-        message and dispatching ``message_changed``. We extract any unfurl
-        attachments and store them keyed by the inner message ``ts`` so
-        :meth:`_enrich_links` can pick them up for the original event.
+        Caches link-unfurl metadata as a side step (Slack delivers unfurls by
+        editing the original message), then dispatches real edits to
+        ``process_message_updated``. Unfurl-only updates, hidden thread
+        metadata updates, language-detection updates with no content change
+        and ``tombstone`` replacements are not reported as edits.
         """
         inner = event.get("message")
         channel = event.get("channel")
-        if not (inner and channel and isinstance(inner, dict)):
+        if not (isinstance(inner, dict) and channel):
             return
 
-        attachments = inner.get("attachments") or []
+        normalized = _with_inherited(
+            inner,
+            channel=channel,
+            channel_type=event.get("channel_type"),
+            team=event.get("team"),
+            team_id=event.get("team_id"),
+            type="message",
+        )
+
+        # Slack does not document ``tombstone`` and upstream has no captured
+        # payload for it, so it is not claimed to mean "deleted". It arrives
+        # with a ``previous_message`` and changed text, so it would otherwise
+        # pass the hidden-edit check below.
+        if inner.get("subtype") == "tombstone":
+            self._logger.debug("Ignoring tombstone message_changed")
+            return
+
+        self._cache_unfurls_from_message_changed(channel, inner)
+
+        previous = event.get("previous_message")
+        has_previous = isinstance(previous, dict)
+        is_hidden_message_edit = isinstance(previous, dict) and (
+            _edited_ts(inner) != _edited_ts(previous) or inner.get("text") != previous.get("text")
+        )
+
+        # Slack link unfurls arrive as hidden message_changed events. Some
+        # real edits are hidden too, but they carry a previous snapshot and
+        # changed content/edit metadata. Hidden thread metadata updates after
+        # deletes carry neither change, so they are ignored here.
+        if event.get("hidden") is True and not is_hidden_message_edit:
+            return
+
+        # Slack's automatic language detection updates locale metadata and
+        # dispatches message_changed without touching the message.
+        if has_previous and not is_hidden_message_edit:
+            self._logger.debug("Ignoring message_changed with no content change")
+            return
+
+        if not (self._chat and normalized.get("channel") and normalized.get("ts")):
+            return
+
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Core skips the
+        # bot's own edits only after resolving the message factory (user
+        # lookup, participant write, up to _UNFURL_WAIT_MS of unfurl polling),
+        # and post+edit / native streaming emit one message_changed per
+        # update. The same check core applies (``author.is_me`` comes from
+        # ``_is_message_from_self``) is made here first; handlers see the same.
+        if self._is_message_from_self(normalized):
+            self._logger.debug("Skipping message_changed from self")
+            return
+
+        thread_id = self._thread_id_for_message_event(normalized)
+
+        async def parse_message() -> Message:
+            return await self._parse_slack_message(normalized, thread_id)
+
+        parse_previous: Callable[[], Awaitable[Message]] | None = None
+        if isinstance(previous, dict):
+            before = previous
+
+            # Parse the pre-edit snapshot through the same async path as the
+            # new message so mentions render identically on both sides.
+            # Upstream parity (chat@4.41.1 adapter-slack index.ts:3670-3675):
+            # the snapshot inherits only channel / channel_type / type, not
+            # team / team_id (unlike ``normalized`` and the delete path).
+            async def _parse_previous() -> Message:
+                snapshot = _with_inherited(
+                    before,
+                    channel=normalized.get("channel"),
+                    channel_type=normalized.get("channel_type"),
+                    type="message",
+                )
+                try:
+                    return await self._parse_slack_message(snapshot, thread_id)
+                except Exception as exc:
+                    # Never let a lookup failure on the old snapshot drop the
+                    # edit. ``Exception`` lets ``CancelledError`` propagate.
+                    self._logger.warn(
+                        "Falling back to sync parse for pre-edit message",
+                        {"error": exc, "threadId": thread_id},
+                    )
+                    return self._parse_slack_message_sync(snapshot, thread_id)
+
+            parse_previous = _parse_previous
+
+        self._chat.process_message_updated(
+            self,
+            thread_id,
+            parse_message,
+            previous_message=parse_previous,
+            options=options,
+        )
+
+    def _cache_unfurls_from_message_changed(self, channel: str, inner: dict[str, Any]) -> None:
+        """Cache link-unfurl metadata carried by a ``message_changed`` inner message.
+
+        Stored keyed by installation, channel and inner ``ts`` so
+        :meth:`_enrich_links` can pick it up for the original message. A side
+        step only: ``_handle_message_changed`` continues either way.
+        """
+        attachments = inner.get("attachments")
+        if not isinstance(attachments, list):
+            return
         has_unfurls = any(
             isinstance(att, dict) and (att.get("from_url") or att.get("original_url")) for att in attachments
         )
-        if not has_unfurls:
-            self._logger.debug("Ignoring message_changed without unfurl data")
-            return
-
         ts = inner.get("ts")
-        if not (self._chat and ts):
+        if not (has_unfurls and self._chat and ts):
             return
 
         self._logger.debug(
@@ -3900,6 +4044,62 @@ class SlackAdapter:
         except RuntimeError:
             # No running loop (sync test context) — skip silently.
             self._logger.debug("No running loop; skipping unfurl cache write")
+
+    def _handle_message_deleted(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Dispatch a ``message_deleted`` event to ``process_message_deleted``.
+
+        Upstream ``handleMessageDeleted``. The deleted ts is the first
+        non-``None`` of ``deleted_ts``, ``message.ts`` and
+        ``previous_message.ts`` (upstream ``??``).
+        """
+        inner = event.get("message")
+        previous_raw = event.get("previous_message")
+        deleted_ts = event.get("deleted_ts")
+        if deleted_ts is None and isinstance(inner, dict):
+            deleted_ts = inner.get("ts")
+        if deleted_ts is None and isinstance(previous_raw, dict):
+            deleted_ts = previous_raw.get("ts")
+        channel = event.get("channel")
+        if not (self._chat and channel and deleted_ts):
+            return
+
+        previous: dict[str, Any] | None = None
+        if isinstance(previous_raw, dict):
+            previous = _with_inherited(
+                previous_raw,
+                channel=channel,
+                channel_type=event.get("channel_type"),
+                team=event.get("team"),
+                team_id=event.get("team_id"),
+                type="message",
+            )
+
+        previous_ts = previous.get("ts") if previous is not None else None
+        thread_id = self._thread_id_for_message_event(
+            {
+                "channel": channel,
+                "channel_type": previous.get("channel_type") if previous is not None else event.get("channel_type"),
+                "thread_ts": previous.get("thread_ts") if previous is not None else None,
+                "ts": previous_ts if previous_ts is not None else deleted_ts,
+            }
+        )
+        event_ts = event.get("event_ts")
+        deleted_at = self._parse_slack_timestamp(event_ts if event_ts is not None else event.get("ts"))
+
+        self._chat.process_message_deleted(
+            MessageDeletedEvent(
+                adapter=self,
+                channel_id=channel,
+                deleted_at=deleted_at,
+                message_id=deleted_ts,
+                previous_message=(
+                    self._parse_slack_message_sync(previous, thread_id) if previous is not None else None
+                ),
+                raw=event,
+                thread_id=thread_id,
+            ),
+            options,
+        )
 
     async def _enrich_links(
         self,
@@ -4388,6 +4588,20 @@ class SlackAdapter:
             else:
                 children.append({"type": "text", "value": ast_to_plain_text({"type": "root", "children": [node]})})
         return children
+
+    @staticmethod
+    def _parse_slack_timestamp(ts: str | None) -> datetime | None:
+        """Parse a Slack ``ts`` (``"1700000000.123456"``) into an aware UTC datetime.
+
+        Upstream ``parseSlackTimestamp``: ``None`` for a missing, empty or
+        non-numeric value (JS ``NaN`` -> ``undefined``).
+        """
+        if not ts:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
 
     def _create_attachment(self, file: dict[str, Any], team_id: str | None = None) -> Attachment:
         """Create an Attachment from a Slack file object.

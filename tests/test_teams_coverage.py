@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -103,12 +104,16 @@ class _SentActivity:
 
 
 def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
-    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+    """Replace the SDK activity sender with an AsyncMock returning a SentActivity.
 
-    The migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    Outbound send/typing paths go through ``TeamsAdapter._send_to``, which hands
+    ``(activity, ConversationReference)`` to ``App.activity_sender.send`` when the
+    App has one (the 2.0.x shape, set here on every SDK line). Mirrors upstream's
+    ``vi.spyOn(app.activitySender, "send")``. Returns the mock so tests can
+    assert call count / arguments.
     """
     send = AsyncMock(return_value=_SentActivity(sent_id))
-    adapter._app.send = send  # type: ignore[method-assign]
+    adapter._app.activity_sender = SimpleNamespace(send=send)
     return send
 
 
@@ -133,6 +138,8 @@ def _mock_app_activities(
     ops.update = update
     ops.delete = delete
     api = MagicMock()
+    # The SDK default service URL: threads on it use ``App.api`` itself.
+    api.service_url = "https://smba.trafficmanager.net/teams"
     api.conversations.activities = MagicMock(return_value=ops)
     adapter._app.api = api  # type: ignore[method-assign]
     return update, delete
@@ -738,6 +745,42 @@ class TestOpenDM:
 
         assert [u for u in call_urls if "oauth2" not in u] == ["http://localhost:58453/v3/conversations"]
 
+    async def test_open_dm_pins_api_url_and_returns_a_personal_thread(self):
+        """An explicit ``api_url`` pins the create call (upstream ``apiFor`` in
+        ``openDM``, chat@4.41.0) while the thread keeps the user's service URL,
+        and the thread is typed ``personal`` (chat@4.36.0): a ``19:`` DM ID
+        gains the ``:personal`` segment and routes as a DM."""
+        gateway = "https://gateway.example/teams"
+        adapter = _make_adapter(logger=_make_logger(), api_url=gateway)
+        state = _make_mock_state()
+        state._cache["teams:serviceUrl:user-789"] = "https://smba.trafficmanager.net/emea/"
+        await adapter.initialize(_make_mock_chat(state))
+
+        token_resp = _mock_aiohttp_response({"access_token": "t", "expires_in": 3600})
+        conv_resp = _mock_aiohttp_response({"id": "19:dm-conv@unq.gbl.spaces"})
+        mock_session = _MockSession(default_response=conv_resp)
+        original_post = mock_session.post
+        call_urls = []
+
+        def routed_post(url, **kwargs):
+            call_urls.append(url)
+            if "oauth2" in url:
+                return mock_session._make_cm(token_resp)
+            return original_post(url, **kwargs)
+
+        mock_session.post = routed_post
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            thread_id = await adapter.open_dm("user-789")
+
+        assert [u for u in call_urls if "oauth2" not in u] == [f"{gateway}/v3/conversations"]
+        assert adapter.decode_thread_id(thread_id) == TeamsThreadId(
+            conversation_id="19:dm-conv@unq.gbl.spaces",
+            service_url="https://smba.trafficmanager.net/emea/",
+            conversation_type="personal",
+        )
+        assert adapter.is_dm(thread_id) is True
+
 
 # ---------------------------------------------------------------------------
 # _cache_user_context
@@ -949,7 +992,7 @@ class TestTeamsSDKOperations:
         )
         assert result.id == "card-msg-1"
         # SDK App.send received a MessageActivityInput carrying the adaptive card
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         assert dumped["type"] == "message"
         assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
@@ -1061,7 +1104,7 @@ class TestTeamsSDKOperations:
         )
         await adapter.start_typing(tid)
         send.assert_called_once()
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         assert activity.type == "typing"
 
     async def test_start_typing_failure_swallowed(self):
@@ -1919,26 +1962,56 @@ class TestGraphDmConversationIdResolution:
             f"semantics."
         )
 
-    async def test_fetch_messages_uses_graph_chat_id_for_dm(self):
-        """End-to-end: a cached DM context must redirect ``fetch_messages``
-        to the canonical ``19:{aadId}_{botId}@unq.gbl.spaces`` chat ID,
-        not the opaque Bot Framework conversation ID.
-
-        What to fix if this fails: ``fetch_messages`` is calling
-        ``_graph_list_chat_messages`` with the raw ``base_conversation_id``
-        instead of the resolved Graph chat ID. Graph returns 404 in
-        production for every DM in this state. Confirm
-        ``_chat_id_from_context`` is invoked and its result threads through
-        the chat-id parameter.
+    @pytest.mark.parametrize(
+        ("conversation_id", "conversation_type", "context", "expected_chat_id"),
+        [
+            pytest.param(
+                "a:opaque-conversation-id",
+                "personal",
+                {"type": "dm", "graph_chat_id": "19:user-aad-id_bot-id@unq.gbl.spaces"},
+                "19:user-aad-id_bot-id@unq.gbl.spaces",
+                id="resolves an opaque DM conversation through stored Graph context",
+            ),
+            pytest.param(
+                "19:group-chat@thread.v2",
+                "groupChat",
+                None,
+                "19:group-chat@thread.v2",
+                id="uses a group conversation ID without stored context",
+            ),
+            pytest.param(
+                "a:opaque-conversation-id",
+                None,
+                {"type": "dm", "graph_chat_id": "19:user-aad-id_bot-id@unq.gbl.spaces"},
+                "19:user-aad-id_bot-id@unq.gbl.spaces",
+                id="legacy untyped DM thread still uses stored Graph context",
+            ),
+            pytest.param(
+                "a:group-chat-id",
+                "groupChat",
+                {"type": "dm", "graph_chat_id": "19:stale-personal-chat@unq.gbl.spaces"},
+                "a:group-chat-id",
+                id="explicit group chat ignores a stale stored DM context",
+            ),
+        ],
+    )
+    async def test_fetch_messages_graph_routing(
+        self,
+        conversation_id: str,
+        conversation_type: Any,
+        context: dict[str, str] | None,
+        expected_chat_id: str,
+    ):
+        """Port of upstream ``graph-api.test.ts`` › "TeamsAdapter.fetchMessages
+        Graph routing" (``it.each``, chat@4.36.0), plus the legacy untyped DM
+        and stale-context cases. A cached DM context redirects to the
+        canonical ``19:{aadId}_{botId}@unq.gbl.spaces`` chat ID (vercel/chat
+        #403); an explicit group chat never consults stored context.
         """
-        from chat_sdk.adapters.teams.adapter import TeamsAdapter as _TA
-
-        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-id")
         state = _make_mock_state()
-        # Cache the DM context as if a previous activity had landed.
-        state._cache["teams:channelContext:a:opaque-dm-id"] = json.dumps(
-            {"type": "dm", "graph_chat_id": "19:user-aad_bot-app-id@unq.gbl.spaces"}
-        )
+        if context is not None:
+            state._cache[f"teams:channelContext:{conversation_id}"] = json.dumps(context)
         chat = _make_mock_chat(state)
         await adapter.initialize(chat)
 
@@ -1946,65 +2019,170 @@ class TestGraphDmConversationIdResolution:
 
         async def fake_list(chat_id: str, params: Any) -> list[dict[str, Any]]:
             called_with.append(chat_id)
-            return [
-                {
-                    "id": "msg-1",
-                    "createdDateTime": "2024-06-01T12:00:00Z",
-                    "body": {"contentType": "text", "content": "Hi"},
-                    "from": {"user": {"id": "user-aad", "displayName": "Alice"}},
-                }
-            ]
+            return [{"id": "message-1", "body": {"contentType": "text", "content": "Hello"}}]
 
         adapter._graph_list_chat_messages = fake_list  # type: ignore[method-assign]
-        adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]
 
         tid = adapter.encode_thread_id(
             TeamsThreadId(
-                conversation_id="a:opaque-dm-id",
+                conversation_id=conversation_id,
                 service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type=conversation_type,
             )
         )
-
         result = await adapter.fetch_messages(tid)
 
-        assert called_with == ["19:user-aad_bot-app-id@unq.gbl.spaces"], (
-            "fetch_messages must dispatch DM Graph calls to the resolved "
-            "graph_chat_id, not the opaque Bot Framework conversation ID. "
-            f"Saw chat_id={called_with!r}."
+        assert called_with == [expected_chat_id]
+        assert [(m.id, m.text) for m in result.messages] == [("message-1", "Hello")]
+
+
+class TestConversationTypeGraphContext:
+    """Graph context follows the explicit conversation type (chat@4.36.0 /
+    chat@4.40.0): DM context is cached only for personal chats, and an
+    explicit group chat never reads stored context."""
+
+    @pytest.mark.parametrize(
+        ("conversation", "cached"),
+        [
+            ({"id": "a:group-chat-id", "conversationType": "groupChat"}, False),
+            ({"id": "a:group-chat-id", "isGroup": True}, False),
+            ({"id": "19:personal-chat@unq.gbl.spaces", "conversationType": "personal"}, True),
+            ({"id": "19:personal-chat@unq.gbl.spaces", "isGroup": False}, True),
+            ({"id": "a:legacy-dm"}, True),
+        ],
+    )
+    async def test_dm_context_is_cached_only_for_personal_chats(self, conversation: dict[str, Any], cached: bool):
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        await adapter.initialize(_make_mock_chat(state))
+
+        await adapter._cache_user_context(
+            {
+                "type": "message",
+                "from": {"id": "29:1xUser", "aadObjectId": "00000000-0000-0000-0000-aaaaaaaaaaaa"},
+                "conversation": conversation,
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            }
         )
-        assert len(result.messages) == 1
-        # Silence unused-import warning if the helper above is removed.
-        assert _TA is TeamsAdapter
 
-    async def test_fetch_messages_falls_back_to_raw_id_when_no_dm_context(self):
-        """Pre-#403 behavior preservation: when no DM context is cached
-        (e.g. a group chat conversation, or an installation that hasn't
-        seen an activity yet), fall back to the raw conversation ID. This
-        keeps group chats working as before.
-        """
-        adapter = _make_adapter(logger=_make_logger())
-        state = _make_mock_state()  # empty
-        chat = _make_mock_chat(state)
-        await adapter.initialize(chat)
+        raw = state._cache.get(f"teams:channelContext:{conversation['id']}")
+        if cached:
+            assert json.loads(raw) == {
+                "graph_chat_id": "19:00000000-0000-0000-0000-aaaaaaaaaaaa_bot-app-id@unq.gbl.spaces",
+                "type": "dm",
+            }
+        else:
+            assert raw is None
 
+    async def test_list_threads_preserves_an_explicit_group_chat_conversation_type(self):
+        """Port of upstream ``graph-api.test.ts`` › listThreads "preserves an
+        explicit group-chat conversation type"."""
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:a:group-chat-id"] = json.dumps(
+            {"type": "dm", "graph_chat_id": "19:stale-personal-chat@unq.gbl.spaces"}
+        )
+        await adapter.initialize(_make_mock_chat(state))
         called_with: list[str] = []
 
-        async def fake_list(chat_id: str, params: Any) -> list[dict[str, Any]]:
+        async def fake_chat_list(chat_id: str, params: Any):
             called_with.append(chat_id)
-            return []
+            return [{"id": "message-1", "body": {"contentType": "text", "content": "Hello"}}]
 
-        adapter._graph_list_chat_messages = fake_list  # type: ignore[method-assign]
-        adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]
-
-        tid = adapter.encode_thread_id(
+        adapter._graph_list_chat_messages = fake_chat_list  # type: ignore[method-assign]
+        channel_id = adapter.encode_thread_id(
             TeamsThreadId(
-                conversation_id="19:group-chat@thread.v2",
+                conversation_id="a:group-chat-id",
                 service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="groupChat",
             )
         )
-        await adapter.fetch_messages(tid)
 
-        assert called_with == ["19:group-chat@thread.v2"]
+        result = await adapter.list_threads(channel_id)
+
+        assert called_with == ["a:group-chat-id"]
+        thread_id = result.threads[0].id
+        assert adapter.decode_thread_id(thread_id).conversation_type == "groupChat"
+        assert adapter.is_dm(thread_id) is False
+
+    async def test_fetch_channel_messages_ignores_stale_dm_context_for_an_explicit_group_chat(self):
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:a:group-chat-id"] = json.dumps(
+            {"type": "dm", "graph_chat_id": "19:stale-personal-chat@unq.gbl.spaces"}
+        )
+        await adapter.initialize(_make_mock_chat(state))
+        called_with: list[str] = []
+
+        async def fake_chat_list(chat_id: str, params: Any):
+            called_with.append(chat_id)
+            return [{"id": "message-1", "body": {"contentType": "text", "content": "Hello"}}]
+
+        adapter._graph_list_chat_messages = fake_chat_list  # type: ignore[method-assign]
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:group-chat-id",
+                service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="groupChat",
+            )
+        )
+
+        result = await adapter.fetch_channel_messages(channel_id)
+
+        assert called_with == ["a:group-chat-id"]
+        assert [m.text for m in result.messages] == ["Hello"]
+
+    async def test_list_threads_marks_dm_context_children_personal(self):
+        """A legacy (untyped) ID with a stored DM context lists personal
+        children; for a ``19:`` personal chat that adds the ``:personal``
+        segment so the children route as DMs."""
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:19:personal@unq.gbl.spaces"] = json.dumps(
+            {"type": "dm", "graph_chat_id": "19:personal@unq.gbl.spaces"}
+        )
+        await adapter.initialize(_make_mock_chat(state))
+
+        async def fake_chat_list(chat_id: str, params: Any):
+            return [{"id": "7", "body": {"contentType": "text", "content": "Hi"}}]
+
+        adapter._graph_list_chat_messages = fake_chat_list  # type: ignore[method-assign]
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:personal@unq.gbl.spaces", service_url="https://smba.trafficmanager.net/teams/"
+            )
+        )
+
+        result = await adapter.list_threads(channel_id)
+
+        thread_id = result.threads[0].id
+        assert thread_id.endswith(":personal")
+        assert adapter.is_dm(thread_id) is True
+
+    async def test_fetch_channel_info_treats_an_explicit_group_chat_as_non_dm(self):
+        # Any context stored for the ID is skipped for an explicit group chat
+        # (upstream graph-api.ts fetchChannelInfo → getGraphContext); a stale
+        # *channel* context would otherwise trigger a Graph teams/channels GET.
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:a:group-chat-id"] = json.dumps(
+            {"team_id": "stale-team", "channel_id": "19:stale@thread.tacv2"}
+        )
+        await adapter.initialize(_make_mock_chat(state))
+        adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:group-chat-id",
+                service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="groupChat",
+            )
+        )
+
+        info = await adapter.fetch_channel_info(channel_id)
+
+        assert info.is_dm is False
+        assert info.metadata == {"conversation_id": "a:group-chat-id"}
+        adapter._get_graph_token.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2276,7 +2454,7 @@ class TestPostChannelMessage:
         # threadId echoes the input channel_id (index.ts:1422).
         assert result.thread_id == channel_id
         # Sent to the base conversation — the messageid suffix is stripped.
-        assert send.call_args.args[0] == "19:chan@thread.tacv2"
+        assert send.call_args.args[1].conversation.id == "19:chan@thread.tacv2"
 
     async def test_card_posts_adaptive_card_to_base_conversation(self):
         adapter = _make_adapter(logger=_make_logger())
@@ -2294,7 +2472,7 @@ class TestPostChannelMessage:
         )
 
         assert result.id == "ch-card-1"
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         assert dumped["attachments"][0]["contentType"] == "application/vnd.microsoft.card.adaptive"
 
