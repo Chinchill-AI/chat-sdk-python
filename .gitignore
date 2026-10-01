@@ -17,6 +17,7 @@ build/
 uv.lock
 .claude/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 AGENTS.md
