@@ -1531,6 +1531,10 @@ class TelegramAdapter:
                     if all(entry["update"]["update_id"] < acknowledged for entry in entries)
                 ]
                 ready = [entries for entries in eligible if deadline(entries) <= self._now_ms()]
+                if not self._polling_active:
+                    # Stopped during the checkpoint read: dispatch nothing new
+                    # (``disconnect`` has already cancelled settling albums).
+                    return
                 if ready and not drained:
                     results = await self._process_polling_updates(
                         [entry["update"] for entries in ready for entry in entries],

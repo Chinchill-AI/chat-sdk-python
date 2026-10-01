@@ -3095,6 +3095,43 @@ class TestTelegramPollingShutdownPythonEdges:
         assert [(entry["update"]["update_id"], entry["attempts"]) for entry in saved["pending"]] == [(1, 1), (2, 1)]
 
     @pytest.mark.asyncio
+    async def test_stop_during_the_checkpoint_read_dispatches_no_saved_retry(self):
+        state = MemoryStateAdapter()
+        await state.connect()
+        saved = {"offset": 2, "pending": [{"update": _polled_message(1), "receivedAt": 0, "attempts": 1, "retryAt": 0}]}
+        await state.set(_POLLING_CHECKPOINT, saved)
+        fixture = _PollingFixture([], state=state)
+        read_started = asyncio.Event()
+        release: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        read = state.get
+
+        async def slow_get(key: str) -> Any:
+            if key == _POLLING_CHECKPOINT:
+                read_started.set()
+                await release
+            return await read(key)
+
+        state.get = slow_get  # type: ignore[method-assign]
+        handler = AsyncMock()
+        fixture.chat.on_mention(handler)
+        try:
+            await fixture.start()
+            await read_started.wait()
+            stopping = asyncio.create_task(fixture.adapter.stop_polling())
+            await _flush()
+            release.set_result(None)
+            await stopping
+
+            handler.assert_not_awaited()
+            assert fixture.api.polls == []
+            state.get = read  # type: ignore[method-assign]
+            assert await fixture.checkpoint() == saved
+        finally:
+            if not release.done():
+                release.set_result(None)
+            await fixture.stop()
+
+    @pytest.mark.asyncio
     async def test_stop_polling_waits_for_an_in_flight_handler(self):
         fixture = _PollingFixture([_polled_message(1)])
         gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
