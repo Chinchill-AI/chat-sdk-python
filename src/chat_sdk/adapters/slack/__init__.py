@@ -13,9 +13,18 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chat_sdk.adapters.slack.adapter import SlackAdapter as SlackAdapter
+    from chat_sdk.adapters.slack.adapter import build_feedback_buttons_block as build_feedback_buttons_block
     from chat_sdk.adapters.slack.adapter import create_slack_adapter as create_slack_adapter
+    from chat_sdk.adapters.slack.adapter import get_app_context as get_app_context
+    from chat_sdk.adapters.slack.adapter import normalize_app_context_entities as normalize_app_context_entities
 
-__all__ = ["SlackAdapter", "create_slack_adapter"]
+__all__ = [
+    "SlackAdapter",
+    "build_feedback_buttons_block",
+    "create_slack_adapter",
+    "get_app_context",
+    "normalize_app_context_entities",
+]
 
 
 def __getattr__(name: str) -> object:
