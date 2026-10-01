@@ -848,9 +848,12 @@ class TestDeadlineAndCancellation:
         assert hanging.close_calls >= 1
 
         done = SlowClose("ok")
+        # The hanging close holds the download until the deadline, so this half
+        # takes the whole budget; 500ms (not 50ms) keeps a GC pause on a slow
+        # CI runner from expiring it before the instant send/read completes.
         result = await asyncio.wait_for(
             download_attachment(
-                "https://files.example.com/file", adapter="test", timeout_ms=50, transport=FakeTransport(done)
+                "https://files.example.com/file", adapter="test", timeout_ms=500, transport=FakeTransport(done)
             ),
             timeout=2,
         )
