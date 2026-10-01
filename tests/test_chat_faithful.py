@@ -351,6 +351,10 @@ class TestFallbackStreamingPlaceholder:
         )
         # Falsy, so a truthiness check never treats it as placeholder text.
         assert not UNSET
+        # Appended last: positional construction binds the same fields.
+        positional = StreamOptions("T123", "U123")
+        assert (positional.recipient_team_id, positional.recipient_user_id) == ("T123", "U123")
+        assert positional.fallback_streaming_placeholder_text is UNSET
 
     async def test_explicit_empty_placeholder_is_posted_and_forwarded(self):
         """``""`` is an explicit placeholder, distinct from ``None`` (none)

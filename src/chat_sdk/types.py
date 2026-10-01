@@ -1146,16 +1146,17 @@ receive the stream type-check against it — but it is deliberately kept out of
 class StreamOptions:
     """Options for streaming messages."""
 
-    # Placeholder for post+edit fallback streaming, present only when the
-    # bot or thread configured one: text, ``None`` (no placeholder), or
-    # ``UNSET`` (not configured; the fallback then posts ``"..."``).
-    # vercel/chat#709. Adapters compare with ``is UNSET``.
-    fallback_streaming_placeholder_text: str | None | Unset = UNSET
     recipient_team_id: str | None = None
     recipient_user_id: str | None = None
     stop_blocks: list[Any] | None = None
     task_display_mode: Literal["timeline", "plan"] | None = None
     update_interval_ms: int | None = None
+    # Placeholder for post+edit fallback streaming, present only when the
+    # bot or thread configured one: text, ``None`` (no placeholder), or
+    # ``UNSET`` (not configured; the fallback then posts ``"..."``).
+    # vercel/chat#709. Adapters compare with ``is UNSET``. Last, so
+    # positional construction binds the same fields as before.
+    fallback_streaming_placeholder_text: str | None | Unset = UNSET
 
 
 # =============================================================================
