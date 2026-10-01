@@ -120,12 +120,19 @@ async def receive(
     body: dict[str, Any],
     options: WebhookOptions | None = None,
     token: str | None = None,
+    *,
+    keep_nulls: bool = False,
 ) -> dict[str, Any]:
-    """POST ``body`` through ``adapter.handle_webhook`` (the real bridge)."""
+    """POST ``body`` through ``adapter.handle_webhook`` (the real bridge).
+
+    ``None`` values are dropped (``undefined``) unless ``keep_nulls`` sends
+    them as explicit JSON ``null``.
+    """
     headers = {"content-type": "application/json"}
     if token is not None:
         headers["authorization"] = f"Bearer {token}"
-    return await adapter.handle_webhook(_Request(json.dumps(_drop_none(body)), headers), options)
+    payload = body if keep_nulls else _drop_none(body)
+    return await adapter.handle_webhook(_Request(json.dumps(payload), headers), options)
 
 
 def spy_activity_sender(adapter: TeamsAdapter) -> AsyncMock:

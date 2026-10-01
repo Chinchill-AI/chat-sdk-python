@@ -1372,8 +1372,12 @@ class TeamsAdapter:
         if not self._chat:
             return
 
-        from_user = activity.get("from", {})
-        user_id = from_user.get("id")
+        # Explicit JSON ``null`` survives ``_activity_to_dict``, so guard each
+        # nested lookup the way upstream's optional chaining (``?.``) does.
+        from_user = activity.get("from")
+        if not isinstance(from_user, dict):
+            return
+        user_id = _account_id(from_user)
         if not user_id:
             return
 
@@ -1395,9 +1399,10 @@ class TeamsAdapter:
                 await state.set(f"teams:serviceUrl:{user_id}", service_url, ttl)
 
         # Cache tenantId
-        channel_data = activity.get("channelData", {})
-        conversation = activity.get("conversation", {})
-        tenant_id = conversation.get("tenantId") or channel_data.get("tenant", {}).get("id")
+        channel_data = activity.get("channelData")
+        if not isinstance(channel_data, dict):
+            channel_data = {}
+        tenant_id = _tenant_id_from_activity(activity)
         if tenant_id and state:
             await state.set(f"teams:tenantId:{user_id}", tenant_id, ttl)
 
@@ -1410,14 +1415,16 @@ class TeamsAdapter:
             await state.set(f"teams:aadObjectId:{user_id}", aad_object_id, ttl)
 
         # Cache channel context
-        team_aad_group_id = channel_data.get("team", {}).get("aadGroupId")
-        conversation_id = conversation.get("id", "")
+        team = channel_data.get("team")
+        team_aad_group_id = team.get("aadGroupId") if isinstance(team, dict) else None
+        conversation_id = _account_id(activity.get("conversation")) or ""
         base_channel_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
 
         # Team-scoped conversationUpdate payloads (bot added to a team) carry
         # team.aadGroupId but no channelData.channel; the conversation itself
         # is the channel the bot was installed into (upstream chat@4.40.0).
-        team_channel_id = channel_data.get("channel", {}).get("id")
+        channel = channel_data.get("channel")
+        team_channel_id = channel.get("id") if isinstance(channel, dict) else None
         if team_channel_id is None and base_channel_id.startswith("19:"):
             team_channel_id = base_channel_id
 

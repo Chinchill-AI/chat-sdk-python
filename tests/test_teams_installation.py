@@ -149,6 +149,20 @@ class TestTeamsInstallationLifecycle:
         messages = [c.args[0] for c in s.logger.debug.call_args_list]
         assert any(m.startswith("Ignoring installationUpdate: ") for m in messages), messages
 
+    async def test_prefers_the_conversation_tenant_over_channel_data(self) -> None:
+        # Upstream ``tenantIdFromActivity``: ``conversation.tenantId ?? channelData.tenant.id``.
+        s = await _Setup().init()
+        body = activity()
+        await s.receive(
+            {
+                **body,
+                "conversation": {**body["conversation"], "tenantId": "conv-tenant"},
+                "channelData": {"tenant": {"id": "cd-tenant"}},
+            }
+        )
+        s.chat.process_installed.assert_called_once()
+        assert s.chat.process_installed.call_args.args[0].tenant_id == "conv-tenant"
+
     # TS: it.each "preserves %s location, tenant, and classification"
     @pytest.mark.parametrize("conversation_type", ["channel", "groupChat"])
     async def test_preserves_s_location_tenant_and_classification(self, conversation_type: str) -> None:

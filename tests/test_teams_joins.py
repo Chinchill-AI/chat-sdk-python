@@ -130,6 +130,34 @@ class TestTeamsBotJoins:
             CACHE_TTL_MS,
         )
 
+    @pytest.mark.parametrize(
+        ("channel_data_overrides", "expected_context"),
+        [
+            # ``channel: null`` falls back to the base conversation id, as
+            # upstream's ``channelData?.channel?.id ?? ...`` does.
+            ({"channel": None}, {"team_id": "team-aad", "channel_id": CONVERSATION_ID}),
+            ({"channel": {"id": None}}, {"team_id": "team-aad", "channel_id": CONVERSATION_ID}),
+            ({"team": None}, None),
+        ],
+    )
+    async def test_explicit_null_channel_data_fields_still_dispatch_the_join(
+        self, channel_data_overrides: dict[str, Any], expected_context: dict[str, str] | None
+    ) -> None:
+        # Explicit JSON nulls survive ``_activity_to_dict``; the user-context
+        # cache runs before dispatch, so it must not crash on them.
+        s = await _Setup().init()
+        body = activity()
+        response = await receive(
+            s.adapter,
+            {**body, "channelData": {**body["channelData"], **channel_data_overrides}},
+            s.options,
+            keep_nulls=True,
+        )
+        assert response["status"] == 200
+        assert len(s.joins()) == 1
+        cached = s.state.cache.get(f"teams:channelContext:{CONVERSATION_ID}")
+        assert (json.loads(cached) if cached is not None else None) == expected_context
+
     async def test_does_not_cache_team_context_for_a_non_channel_conversation_id(self) -> None:
         # The fallback is only the base ``19:`` conversation id (upstream).
         s = await _Setup().init()
@@ -183,6 +211,9 @@ class TestTeamsBotJoins:
             {"membersAdded": []},
             {"membersAdded": None, "membersRemoved": [{"id": BOT_ID}]},
             {"recipient": {"id": "28:other-app"}},
+            # Another bot that is both the recipient and the added member:
+            # only the recipient-is-this-bot guard rejects this one.
+            {"recipient": {"id": "28:other-app"}, "membersAdded": [{"id": "28:other-app"}]},
             {"conversation": {"id": "personal", "conversationType": "personal"}},
             {"conversation": {"id": "a:unknown"}},
             {"conversation": {"id": "", "conversationType": "channel"}},
@@ -293,7 +324,8 @@ class TestTeamsBotIdentity:
         }
         for from_id in (BOT_ID, BOT_ID.upper(), APP_ID.upper(), f"28:{APP_ID.upper()}"):
             assert adapter.parse_message({**base, "from": {"id": from_id}}).author.is_me is True, from_id
-        for from_id in ("29:user", f"28:{APP_ID}-other", APP_ID[:-1]):
+        # ``evil<appId>`` ends with the app id but not at a ``:`` boundary.
+        for from_id in ("29:user", f"28:{APP_ID}-other", APP_ID[:-1], f"evil{APP_ID}", f"28x{APP_ID.upper()}"):
             assert adapter.parse_message({**base, "from": {"id": from_id}}).author.is_me is False, from_id
 
     async def test_text_mention_detection_uses_the_28_prefixed_id(self) -> None:
