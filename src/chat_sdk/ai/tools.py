@@ -40,7 +40,7 @@ from typing import Any, Literal
 
 from chat_sdk.ai.scope import ReadScope, ScopeGuard, create_scope_guard
 from chat_sdk.chat import Chat
-from chat_sdk.errors import ChatError, ChatNotImplementedError
+from chat_sdk.errors import ChatError
 from chat_sdk.types import (
     Author,
     FetchOptions,
@@ -674,11 +674,10 @@ def fetch_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTo
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         if guard is not None:
             guard(args["threadId"])
-        thread = chat.thread(args["threadId"])
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         direction = args.get("direction", "backward")
-        result = await thread.adapter.fetch_messages(
+        result = await chat.history.thread.list(
             args["threadId"],
             FetchOptions(limit=limit, cursor=cursor, direction=direction),
         )
@@ -728,22 +727,15 @@ def fetch_channel_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -
         channel_id: str = args["channelId"]
         if guard is not None:
             guard(channel_id)
-        adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
-        adapter = chat.get_adapter(adapter_name) if adapter_name else None
-        fetch_method = getattr(adapter, "fetch_channel_messages", None) if adapter is not None else None
-        if fetch_method is None:
-            raise ChatError(f'Adapter "{adapter_name}" does not support fetching channel messages')
-
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         direction = args.get("direction", "backward")
-        try:
-            result = await fetch_method(
-                channel_id,
-                FetchOptions(limit=limit, cursor=cursor, direction=direction),
-            )
-        except ChatNotImplementedError as exc:
-            raise ChatError(f'Adapter "{adapter_name}" does not support fetching channel messages') from exc
+        # history.channel raises ChatError for an unregistered adapter and for
+        # a missing capability (including a ChatNotImplementedError stub).
+        result = await chat.history.channel.list_messages(
+            channel_id,
+            FetchOptions(limit=limit, cursor=cursor, direction=direction),
+        )
         return {
             "messages": [_project_message(m) for m in result.messages],
             "nextCursor": result.next_cursor,
@@ -811,18 +803,9 @@ def list_threads(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool
         channel_id: str = args["channelId"]
         if guard is not None:
             guard(channel_id)
-        adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
-        adapter = chat.get_adapter(adapter_name) if adapter_name else None
-        list_method = getattr(adapter, "list_threads", None) if adapter is not None else None
-        if list_method is None:
-            raise ChatError(f'Adapter "{adapter_name}" does not support listing threads')
-
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
-        try:
-            result = await list_method(channel_id, options=ListThreadsOptions(limit=limit, cursor=cursor))
-        except ChatNotImplementedError as exc:
-            raise ChatError(f'Adapter "{adapter_name}" does not support listing threads') from exc
+        result = await chat.history.channel.list_threads(channel_id, ListThreadsOptions(limit=limit, cursor=cursor))
         return {
             "threads": [
                 {
