@@ -1343,6 +1343,74 @@ the Discord half of `b6fa24c6` (#865), `c4f709fe` (#815), the Discord part of
   reaction prefers `data["thread"]` (`id`, `parent_id`) over the cache and the
   channel lookup, and remembers it.
 
+### Discord features (chat@4.32–4.41, #230)
+
+Parity with upstream `adapter-discord` at chat@4.41.1 for the webhook
+adapter, apart from the flags-callback row in the non-parity table. Ports
+`022a5027` (#514), `5341f909` (#701), `6c2a3918` (#693), the action-value
+part of `0fdb9029` (#678), `26c05225` (#715), the slash-flags part of
+`b7c9316b` (#875) and the `is_mention` part of `61b98fca` (#927).
+
+- **Ephemeral slash responses.** `DiscordAdapterConfig.interaction_flags`
+  (upstream `interactionFlags`) is called synchronously with a
+  `DiscordInteractionFlagsContext(channel_id, command, interaction, text,
+  user)`. A non-`None` result (`0` included) is sent as `data.flags` on the
+  type-5 deferral, both on the HTTP response body and on the forwarded
+  `GATEWAY_INTERACTION_CREATE` callback (`POST /interactions/{id}/{token}/callback`,
+  the wire call discord.js `deferReply({flags})` makes). It is stored as
+  `DiscordSlashCommandContext.initial_response_flags` and OR'd into every
+  response to the command: `flags = initial | payload flags` (`0` when the payload has none).
+  `DiscordInteractionResponseFlag.EPHEMERAL = 64` is the only flag.
+  `_handle_application_command_interaction` is split as upstream into
+  `_build_application_command_context(interaction)` (upstream
+  `getApplicationCommandContext`), `_get_interaction_flags(context)` and
+  `_handle_application_command_interaction(context, initial_response_flags, options)`.
+- **Slash follow-ups (parity fix).** `_post_slash_command_response` (upstream
+  `postSlashCommandResponse`, present since before chat@4.31): the first post
+  to the interaction's conversation edits `@original`; later ones are
+  follow-ups, `POST /webhooks/{app}/{token}?wait=true`. The port used to send
+  them to the channel as ordinary bot messages, which could never be
+  ephemeral. Also parity, and deliberately kept: the first-response flag is
+  set before the PATCH is awaited (concurrent posts are not serialized), and
+  `edit_message` / `delete_message` (and the post-then-edit streaming path)
+  still use `/channels/{id}/messages/{id}`, which cannot reach an ephemeral
+  response. Upstream `editMessage` / `deleteMessage` do the same.
+- **Slash request context is scoped** like upstream's
+  `requestContext.run(...)`: `_handle_application_command_interaction` resets
+  the `ContextVar` once `process_slash_command` has created the handler task
+  (which copies the context). It used to stay set on the caller's task, so
+  with follow-ups a later event handled on that task (a forwarded-event
+  listener loop) would have answered through the old interaction.
+- **Select menus.** A component action's value is `data.values[0]` when
+  `values` is a non-empty list and that entry is not `None` (an empty string
+  counts), else the custom id's value, else the action id (upstream
+  `values[0] ?? decoded.value ?? actionId`).
+- **Channel allowlist.** `respond_to_channel_ids` (upstream
+  `respondToChannelIds`) resolves as the config value when it is not `None`
+  (an explicit `[]` wins), else `DISCORD_RESPOND_TO_CHANNEL_IDS` split on `,`
+  and stripped, else `[]`. Python drops blank env entries (upstream keeps
+  them; a blank id never names a channel). A forwarded message from a
+  non-bot author whose **parent** channel is listed counts as a mention, so
+  messages in its threads qualify and a top-level message gets a thread.
+- **Global mentions.** `respond_to_global_mentions` (default `False`) makes
+  `mention_everyone is True` (strict, as `=== true`) count as a mention.
+- **Forwarder `is_mention` is ignored** (upstream `61b98fca`): the mention is
+  derived from `mentions`, `mention_roles`, `mention_everyone` and the
+  allowlist only. A custom forwarder that set `is_mention` itself (for
+  example from discord.js `mentions.has`, which also matches `@everyone`)
+  must forward the raw dispatch fields instead. `DiscordGatewayMessageData`
+  drops `is_mention` and gains `mention_everyone`.
+- **Thread renames.** `set_thread_title(thread_id, title)` (upstream
+  `setThreadTitle`) does nothing without a thread segment; otherwise it
+  validates the parent (`_resolve_thread_channel_id`, #229) and sends
+  `PATCH /channels/{thread}` `{"name": title}`.
+- **Deferred to #189:** the Components V2 card renderer from `0fdb9029`
+  (`content_format` / `DiscordContentFormat`, V2 select rendering, and the
+  40-component / 4000-character validation). Cards still render as embeds.
+  Not applicable (#57): the discord.js listener halves of `5341f909` and
+  `26c05225` (legacy gateway `mentions.everyone`, the raw-packet allowlist
+  path for uncached threads).
+
 ### Core lifecycle events: message update/delete, installation, app context (chat@4.34–4.41, #196)
 
 Parity, not a divergence. Ports the core halves of `4ac04551` (vercel/chat#788,
@@ -2110,6 +2178,8 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat outbound file delivery | Inbound attachment parsing implemented — `_create_attachment` builds a full `Attachment` (type detection, `fetch_data` download closure, `fetch_metadata`) for every `message.attachment` entry. Outbound file delivery logs "File uploads are not yet supported for Google Chat" and ignores files (posts text/cards only, no media upload). | **Same** — logs "File uploads are not yet supported for Google Chat" and leaves a `media.upload` TODO (`adapter-gchat/src/index.ts:1282-1289`). | **Parity — neither SDK implements Google Chat outbound file delivery.** A Python-only enhancement attempt (PR #112) exists but is unmerged; landing it would be a divergence (upstream lacks it), gated on real need. |
 | Discord Gateway WebSocket | HTTP interactions only | Both HTTP and Gateway | Gateway requires persistent connection |
 | Discord preview-suppressed links (4.41 wave, #229) | `DiscordFormatConverter` recognizes `[text](<https://…>)` from the parsed destination: `<…>` delimiters are stripped from `url` and `data["discordLinkStyle"] = "suppressed-masked-link"` is set when the bracketed URL is http(s) and the link has no title. `<https://…>` stays a text node (the Python parser has no autolinks), so its brackets render verbatim and `Message.text` keeps them | `markDiscordLinkStyles` reads each link node's source span (mdast `position`) and marks both `<https://…>` (an autolink node, plain text `https://…`) and `[text](<https://…>)` | Rendered output is identical for both forms (`tests/test_discord_format.py::TestFromAst::test_should_preserve_angle_brackets_on_an_autolink_to_suppress_its_embed`, `::test_should_preserve_angle_brackets_in_a_masked_link_destination`). The Python parser keeps no source positions; autolink parsing is a core-parser limitation (CLAUDE.md Known Limitations), not a Discord change. `from_ast` still honors `suppressed-autolink` on an AST that carries it. Regression test: `::test_suppressed_masked_link_url_has_no_angle_brackets_in_the_ast`. |
+| Discord `interaction_flags` callback errors (4.41 wave, #230) | A callback that raises, or returns something other than an `int` or `None` (an `async def` callback's coroutine, which is closed rather than left un-awaited, or a `bool`), is logged (`"Discord interaction_flags callback failed; deferring without flags"`, `{error, command}`) and the command is deferred and dispatched without flags | `getInteractionFlags` lets the exception propagate, so the HTTP interaction gets no ACK (Discord shows "The application did not respond") and the gateway path skips `deferReply` | A config callback bug should not make every slash command fail. Breadcrumb at `DiscordAdapter._get_interaction_flags`; regression tests `tests/test_discord_extended.py::TestInteractionFlags::test_raising_flags_callback_still_acks_without_flags` and `::test_async_or_non_int_flags_callback_still_acks_without_flags`. |
+| Discord Components V2 (`contentFormat`, upstream `0fdb9029`, chat@4.34; #230) | Not ported; cards render as embeds + action rows only, and no 40-component / 4000-character V2 validation runs | `DiscordContentFormat.ComponentsV2` renders cards as V2 components, including string selects | Deferred to #189. Select-menu **inbound** values (`data.values[0]`) are ported, so V2 selects sent by other code still report their choice. |
 | Discord gateway-only interactions (vercel/chat#490) | Handled on the forwarded-event surface: a `GATEWAY_INTERACTION_CREATE` envelope (raw INTERACTION_CREATE dispatch payload in `data`) is deferred via `POST /interactions/{id}/{token}/callback` (type 5 slash / type 6 component) and routed through the existing HTTP interaction handlers; a malformed forward missing `id`/`token` is logged and skipped | Upstream handles `Events.InteractionCreate` directly on the resident discord.js client via `deferReply()`/`deferUpdate()`; the upstream forwarder never forwards interactions | Python has no resident Gateway client (row above), so gateway-only deployments run an external listener shim that forwards raw dispatch payloads (`x-discord-gateway-token`). Observable wire behavior is identical — same callback REST calls, same handler routing, same `@original` deferred-response resolution. |
 | Teams `User-Agent: Vercel.ChatSDK` outbound header | Not set on `aiohttp` calls | Propagated by `botbuilder` 2.0.8 | Python Teams adapter doesn't use `botbuilder` (raw `aiohttp`). Upstream's vercel/chat#415 was a JS-only `botbuilder` SDK bump that flipped `X-User-Agent` → `User-Agent`. No equivalent dependency to bump on the Python side. Setting a `User-Agent` on the ~9 outbound `aiohttp` call sites would be a defense-in-depth nice-to-have; deferred to a follow-up. |
 | Teams adapter on `microsoft-teams-apps` (official MS Python SDK) | Inbound webhook + JWT auth, outbound send/edit/delete/typing, and native DM streaming all delegate to the official `microsoft-teams-apps` SDK `App`; Graph reads stay hand-rolled over `aiohttp` | `@microsoft/teams.apps` owns the wire format, throttling, and activity routing | **Delivered in 0.4.30** (issue #93, PRs 1–4). The migration shipped as four PRs: inbound + auth (#143), outbound (#144), native streaming via the SDK `IStreamer` (#145), and this release cut. The 3.12 floor bump (#111) — the migration's prerequisite — landed in 0.4.29. The residual adapter-level divergences (we keep the SDK as auth + transport but route the authenticated activity ourselves; close the streamer in our own `finally` because our bridge owns dispatch) are documented in the Teams divergence rows above. Graph stays hand-rolled (no `msgraph-sdk` / `[graph]` extra). |

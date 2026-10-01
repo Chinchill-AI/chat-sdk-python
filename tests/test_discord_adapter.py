@@ -795,8 +795,19 @@ class TestThreadParentValidation:
             lambda a, t: a.fetch_messages(t),
             # A starter-message id must not bypass the check either.
             lambda a, t: a.edit_message(t, "thread789", "hi"),
+            lambda a, t: a.set_thread_title(t, "renamed"),
         ],
-        ids=["post", "edit", "delete", "add_reaction", "remove_reaction", "typing", "fetch", "edit_starter"],
+        ids=[
+            "post",
+            "edit",
+            "delete",
+            "add_reaction",
+            "remove_reaction",
+            "typing",
+            "fetch",
+            "edit_starter",
+            "rename",
+        ],
     )
     async def test_every_outbound_thread_operation_rejects_a_mismatched_parent(self, call):
         adapter = _make_adapter(logger=_make_logger())
@@ -939,15 +950,17 @@ class TestThreadParentValidation:
         mock_chat = MagicMock()
         await adapter.initialize(mock_chat)
         adapter._handle_application_command_interaction(
-            {
-                "type": 2,
-                "channel_id": "thread789",
-                "guild_id": "guild1",
-                "channel": {"id": "thread789", "type": 11},
-                "member": {"user": {"id": "u1", "username": "user"}},
-                "data": {"name": "help"},
-                "token": "tok",
-            }
+            adapter._build_application_command_context(
+                {
+                    "type": 2,
+                    "channel_id": "thread789",
+                    "guild_id": "guild1",
+                    "channel": {"id": "thread789", "type": 11},
+                    "member": {"user": {"id": "u1", "username": "user"}},
+                    "data": {"name": "help"},
+                    "token": "tok",
+                }
+            )
         )
         event = mock_chat.process_slash_command.call_args[0][0]
         assert event.channel_id == "discord:guild1:thread789"
