@@ -27,6 +27,7 @@ wire-format / throttle-internal assertions from the hand-rolled era are dropped.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -762,11 +763,19 @@ class TestFirstChunkIdWait:
         async def gen():
             yield "hello"
 
+        send = AsyncMock(return_value=_SentActivity("fallback-1"))
+        adapter._app.activity_sender = SimpleNamespace(send=send)
+
         result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), streamer), 2)  # type: ignore[arg-type]
 
-        assert result.id == ""
-        assert result.raw == {"text": "hello"}
+        # Nothing reached the user through the stream, so the accumulated
+        # text is delivered with one buffered post instead of being dropped.
         assert streamer.emitted == ["hello"]
+        send.assert_awaited_once()
+        activity, ref = send.call_args.args
+        assert activity.text == "hello"
+        assert ref.conversation.id == "a:1Abc-DM-conversation-id"
+        assert result.id == "fallback-1"
         adapter._logger.warn.assert_called_once()
 
     @pytest.mark.asyncio
@@ -779,8 +788,16 @@ class TestFirstChunkIdWait:
 
         from chat_sdk.adapters.teams import adapter as adapter_module
 
+        stream_requests: list[dict[str, Any]] = []
+        plain_posts: list[dict[str, Any]] = []
+
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
+            body = json.loads(request.content or b"{}")
+            if any(e.get("type") == "streaminfo" for e in body.get("entities") or []):
+                stream_requests.append(body)
+                return httpx.Response(403, json={"error": {"message": "Content stream is not allowed"}})
+            plain_posts.append(body)
+            return httpx.Response(200, json={"id": "fallback-post-1"})
 
         client = Client(ClientOptions(token="bot-token"))
         client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -797,8 +814,14 @@ class TestFirstChunkIdWait:
 
         result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
 
-        assert result.id == ""
-        assert result.raw == {"text": "hello"}
+        # The streamed chunk was refused, so the reply arrives as one plain post.
+        assert len(stream_requests) == 1
+        assert [p["text"] for p in plain_posts] == ["hello"]
+        assert result.id == "fallback-post-1"
+        assert result.raw["text"] == "hello"
+        # The handler's later close() sends nothing more (no chunk was delivered).
+        assert await stream.close() is None
+        assert len(stream_requests) == 1 and len(plain_posts) == 1
 
 
 # ---------------------------------------------------------------------------

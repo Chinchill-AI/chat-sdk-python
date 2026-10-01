@@ -2867,7 +2867,8 @@ class TeamsAdapter:
         is also bounded by ``STREAM_FIRST_CHUNK_ID_TIMEOUT_S`` (Python-only):
         ``microsoft-teams-apps`` 2.0.16+ leaves ``canceled`` unset when the
         first flush fails terminally (e.g. a 403 that is not a cancel), so no
-        chunk ever arrives; the id is then ``""``.
+        chunk ever arrives. The accumulated text is then sent with one
+        buffered ``post_message`` so the reply is not lost.
 
         Mirrors upstream ``streamViaEmit`` in
         ``packages/adapter-teams/src/index.ts`` (``@chat-adapter/teams@4.30.0``).
@@ -2940,10 +2941,16 @@ class TeamsAdapter:
                     {"threadId": thread_id},
                 )
             except asyncio.TimeoutError:
+                # No chunk reached the user (e.g. the first flush got a terminal
+                # 403 such as StreamNotAllowedError). Deliver the text with one
+                # buffered post, as the no-streamer path does, instead of
+                # returning a message nobody received. Python-only: see the
+                # first-chunk row in docs/UPSTREAM_SYNC.md.
                 self._logger.warn(
-                    "Teams stream delivered no chunk; returning without a message id",
+                    "Teams stream delivered no chunk; posting the reply as one message",
                     {"threadId": thread_id},
                 )
+                return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
 
         return RawMessage(id=message_id, thread_id=thread_id, raw={"text": accumulated})
 

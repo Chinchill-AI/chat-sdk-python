@@ -1567,6 +1567,8 @@ class TestOutboundServiceUrlRouting:
             "edit_message",
             "delete_message",
             "start_typing",
+            "add_reaction",
+            "remove_reaction",
         ],
     )
     async def test_every_outbound_op_rejects_a_disallowed_thread_url_before_sending(
@@ -1600,6 +1602,8 @@ class TestOutboundServiceUrlRouting:
             "edit_message": lambda: adapter.edit_message(thread_id, "m-1", "hi"),
             "delete_message": lambda: adapter.delete_message(thread_id, "m-1"),
             "start_typing": lambda: adapter.start_typing(thread_id),
+            "add_reaction": lambda: adapter.add_reaction(thread_id, "m-1", "like"),
+            "remove_reaction": lambda: adapter.remove_reaction(thread_id, "m-1", "like"),
         }
 
         if operation == "start_typing":
@@ -2438,6 +2442,42 @@ class TestPostEphemeral:
         assert [a.content_type for a in activity.attachments] == ["application/vnd.microsoft.card.adaptive"]
         assert activity.recipient.id == "29:target-user"
         assert activity.recipient.is_targeted is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["text", "card"])
+    async def test_targeted_messages_carry_file_attachments(self, kind: str):
+        """Python-only coverage (upstream's postEphemeral tests send no files):
+        files ride on the targeted activity as data-URI attachments, after the
+        adaptive card when there is one, and the activity stays targeted."""
+        from chat_sdk.cards import Card
+        from chat_sdk.types import FileUpload, PostableCard, PostableMarkdown
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter, "targeted-file-1")
+        thread_id = adapter.encode_thread_id(_GROUP_THREAD)
+        files = [FileUpload(data=b"a,b\n1,2\n", filename="report.csv", mime_type="text/csv")]
+        message = (
+            PostableMarkdown(markdown="your report", files=files)
+            if kind == "text"
+            else PostableCard(card=Card(title="Results"), files=files)
+        )
+
+        result = await adapter.post_ephemeral(thread_id, "29:target-user", message)
+
+        assert result.used_fallback is False
+        activity, _ref = send.call_args.args
+        wire = activity.model_dump(by_alias=True, exclude_none=True)
+        content_types = [a["contentType"] for a in wire["attachments"]]
+        if kind == "text":
+            assert wire["text"] == "your report"
+            assert content_types == ["text/csv"]
+        else:
+            assert content_types == ["application/vnd.microsoft.card.adaptive", "text/csv"]
+        file_att = wire["attachments"][-1]
+        assert file_att["name"] == "report.csv"
+        assert file_att["contentUrl"] == "data:text/csv;base64,YSxiCjEsMgo="
+        assert wire["recipient"]["isTargeted"] is True
+        assert wire["recipient"]["id"] == "29:target-user"
 
     @pytest.mark.asyncio
     async def test_should_handle_targeted_send_failure_by_calling_handle_teams_error(self):
