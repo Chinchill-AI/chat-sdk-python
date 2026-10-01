@@ -8,7 +8,11 @@ and packages/adapter-discord/src/gateway.test.ts.
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
+import warnings
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,7 +24,14 @@ from chat_sdk.adapters.discord.adapter import (
     DiscordAdapter,
     DiscordApiError,
 )
-from chat_sdk.adapters.discord.types import DiscordAdapterConfig, DiscordThreadId
+from chat_sdk.adapters.discord.types import (
+    DiscordAdapterConfig,
+    DiscordInteractionFlagsContext,
+    DiscordInteractionResponseFlag,
+    DiscordRequestContext,
+    DiscordSlashCommandContext,
+    DiscordThreadId,
+)
 from chat_sdk.shared.errors import NetworkError, ValidationError
 
 # ---------------------------------------------------------------------------
@@ -2095,8 +2106,11 @@ class TestDeferredSlashCommandResponse:
         adapter = _make_adapter(logger=_make_logger())
         adapter._verify_signature = AsyncMock(return_value=True)
 
+        seen: list[Any] = []
         mock_chat = MagicMock()
-        mock_chat.process_slash_command = MagicMock()
+        # Chat copies the context into the handler task when
+        # process_slash_command creates it, so capture what it sees then.
+        mock_chat.process_slash_command = MagicMock(side_effect=lambda *_: seen.append(adapter._request_context.get()))
         adapter._chat = mock_chat
 
         body = json.dumps(
@@ -2118,6 +2132,503 @@ class TestDeferredSlashCommandResponse:
 
         await adapter.handle_webhook(request)
 
-        ctx = adapter._request_context.get()
-        assert ctx is not None
-        assert ctx.slash_command.interaction_token == "interaction-token-xyz"
+        assert len(seen) == 1
+        assert seen[0].slash_command.interaction_token == "interaction-token-xyz"
+        assert seen[0].slash_command.initial_response_flags is None
+        # Scoped like upstream ``requestContext.run``: nothing leaks into the
+        # caller's context once the handler task has been created.
+        assert adapter._request_context.get() is None
+
+
+# ============================================================================
+# 4.41 sync (#230): ephemeral slash responses, select values, channel
+# allowlist, global mentions opt-in, thread renames.
+# ============================================================================
+
+
+def _signed_request(payload: dict[str, Any]) -> _FakeRequest:
+    return _FakeRequest(
+        json.dumps(payload),
+        {"x-signature-ed25519": "valid", "x-signature-timestamp": "12345"},
+    )
+
+
+def _slash_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": 2,
+        "id": "interaction123",
+        "application_id": "test-app-id",
+        "token": "interaction-token",
+        "version": 1,
+        "guild_id": "guild123",
+        "channel_id": "channel456",
+        "member": {
+            "user": {"id": "user789", "username": "testuser", "discriminator": "0001"},
+            "roles": ["role123"],
+            "joined_at": "2021-01-01T00:00:00.000Z",
+        },
+        "data": {"id": "cmd123", "name": "test", "type": 1},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _forwarded_message(**data: Any) -> _FakeRequest:
+    message: dict[str, Any] = {
+        "id": "msg123",
+        "channel_id": "channel456",
+        "guild_id": "guild1",
+        "content": "No mention needed",
+        "timestamp": "2021-01-01T00:00:00.000Z",
+        "author": {"id": "user789", "username": "testuser", "bot": False},
+        "mentions": [],
+        "attachments": [],
+    }
+    message.update(data)
+    return _gateway_request(json.dumps({"type": "GATEWAY_MESSAGE_CREATE", "timestamp": 1234567890, "data": message}))
+
+
+def _incoming_chat() -> MagicMock:
+    chat = MagicMock()
+    chat.handle_incoming_message = AsyncMock()
+    return chat
+
+
+class TestInteractionFlags:
+    @pytest.mark.asyncio
+    async def test_sets_initial_deferred_slash_command_interaction_flags_from_config(self):
+        interaction_flags = MagicMock(return_value=DiscordInteractionResponseFlag.EPHEMERAL)
+        adapter = _make_adapter(logger=_make_logger(), interaction_flags=interaction_flags)
+        adapter._verify_signature = AsyncMock(return_value=True)
+        adapter._chat = MagicMock()
+
+        response = await adapter.handle_webhook(_signed_request(_slash_payload()))
+
+        assert response["status"] == 200
+        assert json.loads(response["body"]) == {"type": 5, "data": {"flags": 64}}
+        interaction_flags.assert_called_once()
+        context = interaction_flags.call_args.args[0]
+        assert isinstance(context, DiscordInteractionFlagsContext)
+        assert context.channel_id == "discord:guild123:channel456"
+        assert context.command == "/test"
+        assert context.text == ""
+        assert context.interaction["id"] == "interaction123"
+        assert context.interaction["member"]["roles"] == ["role123"]
+        assert context.user["id"] == "user789"
+        slash = adapter._chat.process_slash_command.call_args.args[0]
+        assert slash.channel_id == "discord:guild123:channel456"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("returned", "expected"), [(None, {"type": 5}), (0, {"type": 5, "data": {"flags": 0}})])
+    async def test_flags_are_sent_unless_the_callback_returns_none(self, returned, expected):
+        # ``0`` is a real flag value (upstream ``flags === undefined`` check).
+        adapter = _make_adapter(logger=_make_logger(), interaction_flags=lambda _ctx: returned)
+        adapter._verify_signature = AsyncMock(return_value=True)
+        adapter._chat = MagicMock()
+
+        response = await adapter.handle_webhook(_signed_request(_slash_payload()))
+
+        assert json.loads(response["body"]) == expected
+
+    @pytest.mark.asyncio
+    async def test_raising_flags_callback_still_acks_without_flags(self):
+        # Divergence from upstream (which lets it throw): log, ACK, dispatch.
+        logger = _make_logger()
+
+        def boom(_ctx: DiscordInteractionFlagsContext) -> int:
+            raise RuntimeError("bad callback")
+
+        adapter = _make_adapter(logger=logger, interaction_flags=boom)
+        adapter._verify_signature = AsyncMock(return_value=True)
+        adapter._chat = MagicMock()
+
+        response = await adapter.handle_webhook(_signed_request(_slash_payload()))
+
+        assert response["status"] == 200
+        assert json.loads(response["body"]) == {"type": 5}
+        adapter._chat.process_slash_command.assert_called_once()
+        slash = adapter._chat.process_slash_command.call_args.args[0]
+        assert slash.command == "/test"
+        assert [c.args[0] for c in logger.error.call_args_list] == [
+            "Discord interaction_flags callback failed; deferring without flags"
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["async", "bool"])
+    async def test_async_or_non_int_flags_callback_still_acks_without_flags(self, kind):
+        # Same divergence: an ``async def`` callback's coroutine (or ``True``)
+        # is not a flag value. The coroutine is closed, never left un-awaited.
+        logger = _make_logger()
+        awaited: list[bool] = []
+
+        async def async_flags(_ctx: DiscordInteractionFlagsContext) -> int:
+            awaited.append(True)
+            return DiscordInteractionResponseFlag.EPHEMERAL
+
+        callback: Any = async_flags if kind == "async" else (lambda _ctx: True)
+        adapter = _make_adapter(logger=logger, interaction_flags=callback)
+        adapter._verify_signature = AsyncMock(return_value=True)
+        seen: list[Any] = []
+        adapter._chat = MagicMock()
+        adapter._chat.process_slash_command = MagicMock(
+            side_effect=lambda *_: seen.append(adapter._request_context.get())
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            response = await adapter.handle_webhook(_signed_request(_slash_payload()))
+            gc.collect()
+
+        assert response["status"] == 200
+        assert json.loads(response["body"]) == {"type": 5}
+        assert seen[0].slash_command.initial_response_flags is None
+        assert awaited == []
+        assert [w for w in caught if "never awaited" in str(w.message)] == []
+        assert [c.args[0] for c in logger.error.call_args_list] == [
+            "Discord interaction_flags callback failed; deferring without flags"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_sets_gateway_deferred_slash_command_interaction_flags_from_config(self):
+        interaction_flags = MagicMock(return_value=DiscordInteractionResponseFlag.EPHEMERAL)
+        adapter = _make_adapter(logger=_make_logger(), interaction_flags=interaction_flags)
+        seen: list[Any] = []
+        adapter._chat = MagicMock()
+        adapter._chat.process_slash_command = MagicMock(
+            side_effect=lambda *_: seen.append(adapter._request_context.get())
+        )
+        adapter._discord_fetch = AsyncMock(return_value=None)
+        interaction = _slash_payload(
+            channel={"id": "channel456", "type": 0},
+            data={"name": "test", "type": 1, "options": [{"name": "topic", "type": 3, "value": "status"}]},
+        )
+
+        await adapter.handle_webhook(
+            _gateway_request(json.dumps({"type": "GATEWAY_INTERACTION_CREATE", "timestamp": 1, "data": interaction}))
+        )
+
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/interactions/interaction123/interaction-token/callback",
+            "POST",
+            {"type": 5, "data": {"flags": 64}},
+        )
+        context = interaction_flags.call_args.args[0]
+        assert (context.channel_id, context.command, context.text, context.user["id"]) == (
+            "discord:guild123:channel456",
+            "/test",
+            "status",
+            "user789",
+        )
+        slash = adapter._chat.process_slash_command.call_args.args[0]
+        assert slash.text == "status"
+        # Stored for the handler task, so follow-ups stay ephemeral too.
+        assert seen[0].slash_command.initial_response_flags == 64
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("returned", "expected"), [(None, {"type": 5}), (0, {"type": 5, "data": {"flags": 0}})])
+    async def test_gateway_flags_are_sent_unless_the_callback_returns_none(self, returned, expected):
+        adapter = _make_adapter(logger=_make_logger(), interaction_flags=lambda _ctx: returned)
+        adapter._chat = MagicMock()
+        adapter._discord_fetch = AsyncMock(return_value=None)
+        envelope = {"type": "GATEWAY_INTERACTION_CREATE", "timestamp": 1, "data": _slash_payload()}
+
+        await adapter.handle_webhook(_gateway_request(json.dumps(envelope)))
+
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/interactions/interaction123/interaction-token/callback", "POST", expected
+        )
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_flag_sticks_to_the_deferred_edit_and_every_follow_up(self):
+        adapter = _make_adapter(
+            logger=_make_logger(), interaction_flags=lambda _ctx: DiscordInteractionResponseFlag.EPHEMERAL
+        )
+        adapter._verify_signature = AsyncMock(return_value=True)
+        adapter._discord_fetch = AsyncMock(side_effect=[{"id": "original"}, {"id": "followup1"}])
+        tasks: list[asyncio.Task[None]] = []
+
+        def run_handler(event: Any, options: Any = None) -> None:
+            async def handler() -> None:
+                await adapter.post_message(event.channel_id, "first")
+                await adapter.post_message(event.channel_id, "second")
+
+            tasks.append(asyncio.get_running_loop().create_task(handler()))
+
+        adapter._chat = MagicMock()
+        adapter._chat.process_slash_command = MagicMock(side_effect=run_handler)
+
+        await adapter.handle_webhook(_signed_request(_slash_payload()))
+        await tasks[0]
+
+        assert [c.args for c in adapter._discord_fetch.await_args_list] == [
+            (
+                "/webhooks/test-app-id/interaction-token/messages/@original",
+                "PATCH",
+                {"content": "first", "flags": 64},
+            ),
+            ("/webhooks/test-app-id/interaction-token?wait=true", "POST", {"content": "second", "flags": 64}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_keeps_slash_command_follow_up_responses_ephemeral(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "followup123"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_flags=DiscordInteractionResponseFlag.EPHEMERAL,
+            initial_response_sent=True,
+            interaction_token="interaction-token",
+        )
+
+        result = await adapter._post_slash_command_response(
+            slash, "discord:guild123:channel456", {"content": "Private follow-up"}, []
+        )
+
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/webhooks/test-app-id/interaction-token?wait=true",
+            "POST",
+            {"content": "Private follow-up", "flags": 64},
+            files=None,
+        )
+        assert result.id == "followup123"
+
+    @pytest.mark.asyncio
+    async def test_payload_flags_are_ored_into_the_initial_flags(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "followup123"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_flags=DiscordInteractionResponseFlag.EPHEMERAL,
+            initial_response_sent=True,
+            interaction_token="interaction-token",
+        )
+
+        await adapter._post_slash_command_response(
+            slash, "discord:guild123:channel456", {"content": "x", "flags": 4}, []
+        )
+
+        assert adapter._discord_fetch.await_args.args[2] == {"content": "x", "flags": 68}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_posts_edit_original_once_then_follow_up(self):
+        # The first-response flag is set before the PATCH is awaited
+        # (upstream index.ts:1483-1486), so a concurrent post follows up.
+        adapter = _make_adapter(logger=_make_logger())
+
+        async def fetch(path: str, method: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(0)
+            return {"id": method}
+
+        adapter._discord_fetch = AsyncMock(side_effect=fetch)
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_sent=False,
+            interaction_token="interaction-token",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        await asyncio.gather(
+            adapter.post_message("discord:guild123:channel456", "a"),
+            adapter.post_message("discord:guild123:channel456", "b"),
+        )
+
+        assert [c.args[:2] for c in adapter._discord_fetch.await_args_list] == [
+            ("/webhooks/test-app-id/interaction-token/messages/@original", "PATCH"),
+            ("/webhooks/test-app-id/interaction-token?wait=true", "POST"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unflagged_follow_up_goes_to_the_interaction_webhook_without_flags(self):
+        # Without ``interaction_flags`` the payload is unchanged; a second
+        # post is still an interaction follow-up, not a channel message.
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "followup123"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild123:channel456",
+            initial_response_sent=True,
+            interaction_token="interaction-token",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        await adapter.post_message("discord:guild123:channel456", "public follow-up")
+
+        adapter._discord_fetch.assert_awaited_once_with(
+            "/webhooks/test-app-id/interaction-token?wait=true",
+            "POST",
+            {"content": "public follow-up"},
+            files=None,
+        )
+
+
+class TestSelectMenuValues:
+    def _select_interaction(self, values: Any) -> dict[str, Any]:
+        return {
+            "type": 3,
+            "id": "interaction123",
+            "token": "interaction-token",
+            "guild_id": "guild123",
+            "channel_id": "channel456",
+            "channel": {"id": "channel456", "type": 0},
+            "member": {"user": {"id": "user789", "username": "testuser"}},
+            "message": {"id": "message123", "channel_id": "channel456"},
+            "data": {"custom_id": "priority", "component_type": 3, "values": values},
+        }
+
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            (["high"], "high"),
+            # An empty-string choice is a real value.
+            ([""], ""),
+            # No choice falls back to the custom_id's action id.
+            ([], "priority"),
+        ],
+        ids=["selected", "empty_string", "no_values"],
+    )
+    def test_uses_selected_values_from_select_interactions(self, values, expected):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._chat = MagicMock()
+
+        adapter._handle_component_interaction(self._select_interaction(values))
+
+        event = adapter._chat.process_action.call_args.args[0]
+        assert event.action_id == "priority"
+        assert event.value == expected
+
+
+class TestRespondToChannelIds:
+    def test_should_resolve_respond_to_channel_ids_from_discord_respond_to_channel_ids_env_var(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_RESPOND_TO_CHANNEL_IDS", "channel1, channel2,")
+        adapter = _make_adapter()
+        assert adapter._respond_to_channel_ids == ["channel1", "channel2"]
+
+    def test_explicit_empty_list_beats_the_env_var(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_RESPOND_TO_CHANNEL_IDS", "channel1")
+        adapter = _make_adapter(respond_to_channel_ids=[])
+        assert adapter._respond_to_channel_ids == []
+
+    @pytest.mark.asyncio
+    async def test_keeps_allowlisted_forwarded_messages_in_their_discord_thread(self):
+        adapter = _make_adapter(logger=_make_logger(), respond_to_channel_ids=["channel456"])
+        adapter._discord_fetch = AsyncMock(return_value={"id": "thread789", "name": "Thread"})
+        chat = _incoming_chat()
+        adapter._chat = chat
+        in_thread = {"channel_id": "thread789", "thread": {"id": "thread789", "parent_id": "channel456"}}
+
+        await adapter.handle_webhook(_forwarded_message(id="msg123"))
+        await adapter.handle_webhook(_forwarded_message(id="msg456", **in_thread))
+        await adapter.handle_webhook(
+            _forwarded_message(
+                id="msg789", author={"id": "other-bot", "username": "other-bot", "bot": True}, **in_thread
+            )
+        )
+
+        # Only the top-level message creates a thread.
+        adapter._discord_fetch.assert_awaited_once()
+        assert adapter._discord_fetch.await_args.args[:2] == ("/channels/channel456/messages/msg123/threads", "POST")
+        calls = chat.handle_incoming_message.call_args_list
+        assert [(c.args[1], c.args[2].is_mention) for c in calls] == [
+            ("discord:guild1:channel456:thread789", True),
+            ("discord:guild1:channel456:thread789", True),
+            # Bot authors never count as allowlisted.
+            ("discord:guild1:channel456:thread789", None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unlisted_channel_is_not_a_mention(self):
+        adapter = _make_adapter(logger=_make_logger(), respond_to_channel_ids=["other"])
+        adapter._discord_fetch = AsyncMock()
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(_forwarded_message())
+
+        adapter._discord_fetch.assert_not_awaited()
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is None
+
+
+class TestRespondToGlobalMentionsHandling:
+    @pytest.mark.asyncio
+    async def test_ignores_everyone_in_forwarded_gateway_messages_by_default(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "new-thread", "name": "Thread"})
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(_forwarded_message(content="@everyone big announcement", mention_everyone=True))
+
+        adapter._discord_fetch.assert_not_awaited()
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is None
+
+    @pytest.mark.asyncio
+    async def test_treats_everyone_in_forwarded_gateway_messages_as_a_mention_when_respond_to_global_mentions_is_true(
+        self,
+    ):
+        adapter = _make_adapter(logger=_make_logger(), respond_to_global_mentions=True)
+        adapter._discord_fetch = AsyncMock(return_value={"id": "new-thread", "name": "Thread"})
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(_forwarded_message(content="@everyone big announcement", mention_everyone=True))
+
+        assert adapter._discord_fetch.await_args.args[:2] == ("/channels/channel456/messages/msg123/threads", "POST")
+        assert chat.handle_incoming_message.call_args.args[1] == "discord:guild1:channel456:new-thread"
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is True
+
+    @pytest.mark.asyncio
+    async def test_still_detects_direct_user_mentions_when_everyone_is_ignored(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "new-thread", "name": "Thread"})
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(
+            _forwarded_message(
+                content="@everyone <@test-app-id>",
+                mention_everyone=True,
+                mentions=[{"id": "test-app-id", "username": "bot"}],
+            )
+        )
+
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is True
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_mention_everyone_is_ignored_even_when_opted_in(self):
+        # Strict ``=== true``: a truthy non-bool from a forwarder is not a ping.
+        adapter = _make_adapter(logger=_make_logger(), respond_to_global_mentions=True)
+        adapter._discord_fetch = AsyncMock()
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(_forwarded_message(mention_everyone="true"))
+
+        adapter._discord_fetch.assert_not_awaited()
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is None
+
+    @pytest.mark.asyncio
+    async def test_forwarder_supplied_is_mention_is_ignored(self):
+        # Upstream 61b98fca: the mention comes from the dispatch payload only.
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock()
+        chat = _incoming_chat()
+        adapter._chat = chat
+
+        await adapter.handle_webhook(_forwarded_message(is_mention=True))
+
+        adapter._discord_fetch.assert_not_awaited()
+        assert chat.handle_incoming_message.call_args.args[2].is_mention is None
+
+
+class TestSetThreadTitle:
+    @pytest.mark.asyncio
+    async def test_renames_discord_thread_channels(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(side_effect=[{"id": "thread789", "parent_id": "channel456"}, None])
+
+        await adapter.set_thread_title("discord:guild1:channel456:thread789", "New thread title")
+        await adapter.set_thread_title("discord:guild1:channel456", "Ignored channel title")
+
+        assert [c.args for c in adapter._discord_fetch.await_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789", "PATCH", {"name": "New thread title"}),
+        ]

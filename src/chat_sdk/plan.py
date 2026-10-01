@@ -72,6 +72,10 @@ class AddTaskOptions:
 
     title: PlanContent
     children: PlanContent | None = None
+    # When True (default), mark existing in_progress tasks complete before
+    # adding. Pass False for parallel steps and target each task with
+    # ``update_task(UpdateTaskInput(id=...))`` (vercel/chat#632).
+    auto_complete_previous: bool = True
 
 
 @dataclass
@@ -338,14 +342,17 @@ class Plan:
     async def add_task(self, options: AddTaskOptions) -> PlanTask | None:
         """Add a new task to the plan.
 
-        Marks all in-progress tasks as complete and adds a new in-progress task.
+        Marks all in-progress tasks as complete (unless
+        ``options.auto_complete_previous`` is ``False``) and adds a new
+        in-progress task.
         """
         if not self._can_mutate():
             return None
         title = _content_to_plain_text(options.title) or "Task"
-        for task in self._model.tasks:
-            if task.status == "in_progress":
-                task.status = "complete"
+        if options.auto_complete_previous:
+            for task in self._model.tasks:
+                if task.status == "in_progress":
+                    task.status = "complete"
         next_task = PlanModelTask(
             id=str(uuid.uuid4()),
             title=title,

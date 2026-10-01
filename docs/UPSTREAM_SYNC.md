@@ -927,7 +927,8 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   False` (`None` dedupes). Telegram polling adopts it in #227. The bypass
   runs inside `conversation(thread_id)`, as upstream's `runInConversation`
   (#195).
-- **Not ported:** the Slack agent-view bridge rethrow in `c21ccbc0` (#214) and
+- **Not ported here:** the Slack agent-view bridge rethrow in `c21ccbc0` (ported
+  in #214, see "Slack agent_view and declarative agent config") and
   the Teams `handleDialogOpen` parts of `c21ccbc0` / `91683e52` (see the Teams
   dialog-open row in the non-parity table).
 
@@ -1413,6 +1414,74 @@ the Discord half of `b6fa24c6` (#865), `c4f709fe` (#815), the Discord part of
   reaction prefers `data["thread"]` (`id`, `parent_id`) over the cache and the
   channel lookup, and remembers it.
 
+### Discord features (chat@4.32–4.41, #230)
+
+Parity with upstream `adapter-discord` at chat@4.41.1 for the webhook
+adapter, apart from the flags-callback row in the non-parity table. Ports
+`022a5027` (#514), `5341f909` (#701), `6c2a3918` (#693), the action-value
+part of `0fdb9029` (#678), `26c05225` (#715), the slash-flags part of
+`b7c9316b` (#875) and the `is_mention` part of `61b98fca` (#927).
+
+- **Ephemeral slash responses.** `DiscordAdapterConfig.interaction_flags`
+  (upstream `interactionFlags`) is called synchronously with a
+  `DiscordInteractionFlagsContext(channel_id, command, interaction, text,
+  user)`. A non-`None` result (`0` included) is sent as `data.flags` on the
+  type-5 deferral, both on the HTTP response body and on the forwarded
+  `GATEWAY_INTERACTION_CREATE` callback (`POST /interactions/{id}/{token}/callback`,
+  the wire call discord.js `deferReply({flags})` makes). It is stored as
+  `DiscordSlashCommandContext.initial_response_flags` and OR'd into every
+  response to the command: `flags = initial | payload flags` (`0` when the payload has none).
+  `DiscordInteractionResponseFlag.EPHEMERAL = 64` is the only flag.
+  `_handle_application_command_interaction` is split as upstream into
+  `_build_application_command_context(interaction)` (upstream
+  `getApplicationCommandContext`), `_get_interaction_flags(context)` and
+  `_handle_application_command_interaction(context, initial_response_flags, options)`.
+- **Slash follow-ups (parity fix).** `_post_slash_command_response` (upstream
+  `postSlashCommandResponse`, present since before chat@4.31): the first post
+  to the interaction's conversation edits `@original`; later ones are
+  follow-ups, `POST /webhooks/{app}/{token}?wait=true`. The port used to send
+  them to the channel as ordinary bot messages, which could never be
+  ephemeral. Also parity, and deliberately kept: the first-response flag is
+  set before the PATCH is awaited (concurrent posts are not serialized), and
+  `edit_message` / `delete_message` (and the post-then-edit streaming path)
+  still use `/channels/{id}/messages/{id}`, which cannot reach an ephemeral
+  response. Upstream `editMessage` / `deleteMessage` do the same.
+- **Slash request context is scoped** like upstream's
+  `requestContext.run(...)`: `_handle_application_command_interaction` resets
+  the `ContextVar` once `process_slash_command` has created the handler task
+  (which copies the context). It used to stay set on the caller's task, so
+  with follow-ups a later event handled on that task (a forwarded-event
+  listener loop) would have answered through the old interaction.
+- **Select menus.** A component action's value is `data.values[0]` when
+  `values` is a non-empty list and that entry is not `None` (an empty string
+  counts), else the custom id's value, else the action id (upstream
+  `values[0] ?? decoded.value ?? actionId`).
+- **Channel allowlist.** `respond_to_channel_ids` (upstream
+  `respondToChannelIds`) resolves as the config value when it is not `None`
+  (an explicit `[]` wins), else `DISCORD_RESPOND_TO_CHANNEL_IDS` split on `,`
+  and stripped, else `[]`. Python drops blank env entries (upstream keeps
+  them; a blank id never names a channel). A forwarded message from a
+  non-bot author whose **parent** channel is listed counts as a mention, so
+  messages in its threads qualify and a top-level message gets a thread.
+- **Global mentions.** `respond_to_global_mentions` (default `False`) makes
+  `mention_everyone is True` (strict, as `=== true`) count as a mention.
+- **Forwarder `is_mention` is ignored** (upstream `61b98fca`): the mention is
+  derived from `mentions`, `mention_roles`, `mention_everyone` and the
+  allowlist only. A custom forwarder that set `is_mention` itself (for
+  example from discord.js `mentions.has`, which also matches `@everyone`)
+  must forward the raw dispatch fields instead. `DiscordGatewayMessageData`
+  drops `is_mention` and gains `mention_everyone`.
+- **Thread renames.** `set_thread_title(thread_id, title)` (upstream
+  `setThreadTitle`) does nothing without a thread segment; otherwise it
+  validates the parent (`_resolve_thread_channel_id`, #229) and sends
+  `PATCH /channels/{thread}` `{"name": title}`.
+- **Deferred to #189:** the Components V2 card renderer from `0fdb9029`
+  (`content_format` / `DiscordContentFormat`, V2 select rendering, and the
+  40-component / 4000-character validation). Cards still render as embeds.
+  Not applicable (#57): the discord.js listener halves of `5341f909` and
+  `26c05225` (legacy gateway `mentions.everyone`, the raw-packet allowlist
+  path for uncached threads).
+
 ### Core lifecycle events: message update/delete, installation, app context (chat@4.34–4.41, #196)
 
 Parity, not a divergence. Ports the core halves of `4ac04551` (vercel/chat#788,
@@ -1513,10 +1582,10 @@ self-edit short-circuit).
   check. The top-level `tombstone` subtype stays ignored, as upstream.
 - **One thread-id rule.** `_thread_id_for_message_event(event)` (upstream
   `threadIdForMessageEvent`) is used by new messages, edits and deletes, so
-  all three resolve to the same thread: DM → `thread_ts or ""`, otherwise
-  `thread_ts or ts or ""`. Upstream uses `||` here, so an empty `thread_ts`
-  falls through. The agent_view condition (`!this.agentView`) is a marked
-  hook that #214 fills in.
+  all three resolve to the same thread: DM without agent_view →
+  `thread_ts or ""`, otherwise `thread_ts or ts or ""`. Upstream uses `||`
+  here, so an empty `thread_ts` falls through. #214 added the agent_view
+  condition (`!this.agentView`).
 - **Edits.** `_handle_message_changed` builds a `normalized` inner message
   that inherits `channel` / `channel_type` / `team` / `team_id` from the
   outer event (`is not None`, upstream `??`) with `type` defaulting to
@@ -1619,6 +1688,203 @@ Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
   and `transcripts.test.ts` keeps only the alias test. Both rows map to
   `tests/test_history_user.py`, so the strict pin check and the target
   report both pass without duplicate tests.
+
+### Slack agent_view and declarative agent config (chat@4.34–4.41, #214)
+
+Ports the Slack halves of `1721fa01` (vercel/chat#684), `0f743c9b` (#698)
+without native-streaming fallback, `78021c09` (#889) and the Slack bridge part
+of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
+
+- **`agent_view=False`.** When on, `app_home_opened` is dispatched for every
+  tab (it is the DM-open signal), and `AppHomeOpenedEvent` carries `tab` and
+  `entities`. `entities` is set only when the event has a `context`; as with
+  upstream's JS truthiness, `{}` counts and gives `[]`. `app_context_changed`
+  is routed to `chat.process_app_context_changed` whatever the flag, with `[]`
+  for a missing `context`.
+- **Threading.** `_thread_id_for_message_event` ports `threadIdForMessageEvent`.
+  Channels use `thread_ts or ts`. DMs without agent_view use `thread_ts or ""`.
+  DMs under agent_view use `thread_ts or ts`, because each user message is a
+  thread root. Edits and deletes adopt the helper in #211.
+- **open_dm bridge.** A top-level agent_view DM (no `thread_ts`) goes through a
+  task that checks `state.is_subscribed("slack:{D}:")` and routes to that ID
+  when it is subscribed. If the check fails, it warns and keeps the per-message
+  ID. The task then calls `process_message` and awaits the handler task. On
+  failure it logs `"Agent view DM processing failed"` and re-raises only when
+  `propagate_handler_errors` and `wait_until` are both set. The task is created
+  synchronously inside the webhook's copied context, so it sees the
+  multi-workspace token. It is pinned and has a done-callback that retrieves
+  its exception. `CancelledError` propagates. The Agent Sessions title hook
+  (#215) goes at the end of the task. Python-specific: `wait_until` gets
+  `asyncio.shield(bridge)`, not the task itself. Upstream's promise cannot be
+  cancelled, but an asyncio task can, so a host that cancels its `wait_until`
+  awaitable after the 200 would otherwise drop the DM before `process_message`
+  runs. A re-raised handler error still reaches the host through the shield.
+  The configured suggested-prompts task is handed over the same way.
+- **`suggested_prompts`.** Either a `SlackSuggestedPromptsOptions(prompts, title=None)`
+  or a sync or async resolver (`inspect.isawaitable`) that takes a
+  `SlackSuggestedPromptsContext`. It is applied on `assistant_thread_started`
+  (with `thread_ts`, `team_id` and `enterprise_id`) and, under agent_view, on a
+  Messages-tab `app_home_opened`, without `thread_ts` and with
+  `team_id = authorizations[0].team_id or team_id` and `entities`. As upstream,
+  `None` or an empty `prompts` list skips the thread, and more than 4 prompts
+  are cut to 4 with a warning. Resolver and API errors are logged and never
+  reach the webhook response. Each application runs as its own task, handed to
+  `wait_until`. `SlackSuggestedPrompt` is a `TypedDict` (`title`, `message`),
+  the request's wire shape.
+- **`loading_messages`.** `start_typing` sends `status if status is not None
+  else (configured[0] if configured else "Typing...")`, with
+  `loading_messages=[status] if status else (configured if configured is not None
+  else ["Typing..."])` (upstream `??`). `set_assistant_status` uses the
+  explicit `loading_messages` when it is not `None`, otherwise the config.
+  As before, the field is omitted when it is empty. Upstream's agent-view
+  status branches belong to #215.
+- **`feedback_buttons: bool | SlackFeedbackButtonsOptions | None`.** `True`
+  normalizes to `SlackFeedbackButtonsOptions()`. `build_feedback_buttons_block(options=None)`
+  builds the `context_actions` block (`message_feedback`, `"Good response"` /
+  `"Bad response"`, `positive` / `negative`). Native `stream()` appends it to
+  the `chat.stopStream` blocks after the caller's `stop_blocks`. The warning
+  for skipping it in the post-and-edit fallback is #207's, which has not
+  landed.
+- **Env auth fallback.** `SlackAdapter.__init__` is Python's only env-fallback
+  site (`create_slack_adapter` is a thin wrapper). It now uses upstream
+  `createSlackAdapter`'s `noAuthConfig` set (`signing_secret`, `bot_token`,
+  `client_id`, `client_secret`, `installation_provider`, `webhook_verifier`)
+  for both entry points, compared with `is not None`. `app_token` no longer
+  counts, so a socket-mode config that passes only `app_token` now reads
+  `SLACK_BOT_TOKEN` / `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`. Upstream's
+  `SlackAdapter` constructor uses a narrower set without the provider or the
+  verifier (see the non-parity table).
+- **Exports.** `chat_sdk.adapters.slack` exports `build_feedback_buttons_block`,
+  `get_app_context` and `normalize_app_context_entities` (from the new
+  `adapters/slack/agent_context.py`). The new types are in
+  `chat_sdk.adapters.slack.types`, and the wire `TypedDict`s
+  (`SlackAppContext`, `SlackAppContextEntity`, `SlackAppContextChangedEvent`)
+  are in `agent_context`.
+- **Tests.** `tests/test_slack_agent_context.py` ports `agent-context.test.ts`.
+  `tests/test_slack_agent_view.py` ports the named `index.test.ts` cases and
+  the Slack cases of `integration-tests/src/webhook.test.ts` ("tracks delayed
+  Slack agent-view handlers", "keeps Slack failures handled without a
+  waitUntil callback"). Neither file is fidelity-mapped. The "a threaded
+  agent_view DM" case of "routes the message, its edit, and its delete to one
+  thread id in %s" is a parametrized case in `tests/test_slack_webhook.py`
+  next to #211's flat-DM case. Under agent_view, edits and deletes of a
+  top-level DM use the per-message thread and are not bridged to a subscribed
+  `slack:{D}:` thread, as upstream (`handleMessageChanged` /
+  `handleMessageDeleted` call `threadIdForMessageEvent` directly). Not
+  ported: the session-title / session-status cases in the same describe
+  blocks (#215).
+
+### Streaming and thread API (chat@4.32–4.41.1, #199)
+
+Parity with `438f5513` (vercel/chat#633) and `2e473511` (#632, chat@4.32.0),
+`93a58af5` (#709, chat@4.35.0), `dc2a7775` (#934, chat@4.41.0) and the core of
+`6f17495b` (#967, chat@4.41.1). One divergence-table row (eager ownership).
+Of the adapter halves, only Slack's no-recipient guard is ported here:
+`SlackAdapter.stream()` returns `None` before consuming the stream when
+`recipient_user_id` or `recipient_team_id` is missing, so message-less
+threads (`chat.thread(id)`, `open_dm`, action/reaction threads) reply through
+core's post+edit fallback instead of raising `ValidationError`. The rest of
+Slack's half (DMs streaming natively without recipient ids, `native_streaming`,
+the mid-stream fallback, retiring the #94 branch) is #207. Teams informative
+status is #219.
+
+- **Lightweight threads (`438f5513`).** `_create_thread` takes
+  `Message | None`. `chat.thread(id)` without `current_message`, `open_dm`,
+  reactions without `event.message`, and actions with a falsy `message_id`
+  pass `None`, so `current_message` is `None` and `recent_messages` is
+  empty. Python used to pass an `Author(user_id="")` stub, so
+  `get_participants()` returned an empty-id author and native streaming got
+  `recipient_user_id=""`. The reaction path also used to build a stub from
+  `event.message_id` and `event.user`; upstream passes `event.message`, and so
+  does Python now. An action with a message id still gets the synthetic
+  message, as upstream.
+- **Placeholder sentinel (`93a58af5`).** TS tells `undefined` (not configured)
+  from `null` (no placeholder). Python's `None` already means "no
+  placeholder", so "not configured" is `UNSET` (`chat_sdk.UNSET`, type
+  `chat_sdk.Unset`). It is the single member of the enum `_Unset`. Enum
+  members keep their identity through `copy.deepcopy`, pickling and
+  `dataclasses.replace`, while a bare `object()` does not survive pickling.
+  Compare with `is UNSET`. It is falsy, so a truthiness check never reads it as
+  text. `ChatConfig`, `_ThreadImplConfig` and the new
+  `StreamOptions.fallback_streaming_placeholder_text` default to `UNSET`.
+  `UNSET` left on `StreamOptions` is the Python form of upstream's absent key.
+  It is never serialized: `to_json` carries no streaming settings, as upstream.
+  `""` is an explicit placeholder and is posted, as upstream.
+- **Stream-time settings (`6f17495b`).** `_handle_stream` resolves the interval
+  as caller (`StreamingPlan`) > thread > owning Chat > 500, with `is not None`
+  so `0` is kept. The placeholder is the thread's, else the owning Chat's, and
+  stays `UNSET` when neither set one. `_fallback_stream` now reads both only
+  from `options` (`UNSET` → `"..."`), as upstream. A caller that passes its own
+  `StreamOptions()` gets 500 ms and `"..."`. `_ThreadImplConfig.streaming_update_interval_ms`
+  defaults to `None`. Threads that Chat creates still carry the Chat's values.
+  New `Chat.get_streaming_options()` (a `StreamOptions` with the two fields)
+  and `Chat.owns_adapter()`. `owns_adapter` compares with `is` over the
+  registered values, because the key an adapter is registered under may differ
+  from `adapter.name`. Both are on the `_ChatSingleton` protocol.
+- **Ownership (`6f17495b`).** `_ChatBinding` ports upstream `ChatBinding`. Only
+  lazily resolved threads and channels (an `adapter_name` config, or
+  `from_json`) carry one. A directly constructed thread never takes another
+  Chat's settings or state. Once an owner is found it is kept. Without an
+  explicit Chat, each active Chat (ContextVar, then global) is checked once.
+  State is cached only from the owner. An unowned explicit adapter uses the
+  active Chat's state, uncached, as upstream. A directly constructed thread
+  with no state adapter still falls back to the active Chat's state (upstream
+  throws "Thread has no state adapter configured"). That behavior predates this
+  change and is unchanged. An idempotent `from_json(instance, adapter=…/chat=…)`
+  (Python only) replaces the binding and clears the thread-level interval and
+  placeholder, which a Chat-created thread copied from its Chat. The previous
+  owner's state and settings therefore do not leak, as in a fresh restore.
+- **Eager vs lazy ownership (divergence row).** Upstream resolves ownership on
+  first access. Python's `from_json` resolves what it can at once, because
+  `chat.activate()` is scoped to a `contextvars.Context`. A thread restored
+  inside the `with` block and used after it would otherwise find no Chat, or a
+  different one.
+  - An explicit `chat` with an explicit `adapter` it did not register raises
+    `RuntimeError` in `from_json`, before anything is built or mutated, with
+    upstream's text (`Adapter "x" does not belong to this Chat instance.
+    Restore with bot.reviver().`).
+    Upstream raises the same text on the first state access. This repo adopts
+    the raise (the previous Python behavior bound the stray adapter and took the
+    Chat's state). No caller in this repo, or in the downstream consumer, passes
+    a non-owning pair.
+  - An explicit `chat` resolves the adapter by name at once, and raises if it is
+    missing. This predates this change. Upstream's test "does not fall back to
+    another Chat's adapter" therefore expects the raise while decoding.
+  - An explicit `adapter` alone is checked against the active Chat at once, and
+    again on later access, as upstream.
+  - With neither, the thread binds to the active Chat when that Chat has the
+    adapter. The eager bind predates this change; it now records the owner and
+    skips an instance that is already bound.
+  - Modal-context restore binds the event's own adapter with `chat=self`
+    whenever this Chat registered it (by identity, so a custom registration
+    key works). Upstream looks the adapter up by `adapter.name` and would
+    throw on first access for a custom key; Python resolves eagerly, so that
+    lookup would raise inside `process_modal_submit`. It never falls back to
+    the active singleton, which may be another bot's Chat.
+- **Reviver.** `chat.reviver()` binds each revived `Message` to that Chat's
+  adapter with `set_message_adapter` (which recurses into `reply_to`), and
+  `from_json(..., chat=…)` binds `current_message`. Python's reviver still does
+  not register the Chat as the singleton (resolver design, see Chat resolver).
+- **Plan (`2e473511`).** `AddTaskOptions.auto_complete_previous: bool = True`.
+  `False` leaves existing `in_progress` tasks running.
+- **AG-UI streams (`dc2a7775`).** `from_full_stream` takes text from
+  `TEXT_MESSAGE_CONTENT` (`delta`) and arms the `"\n\n"` separator on
+  `TEXT_MESSAGE_END`. Matching is on the event type, so `TOOL_CALL_ARGS` and
+  `STATE_DELTA` deltas are skipped. Python producers (`ag-ui-protocol`,
+  pydantic-ai) type events with a `str` Enum, so the type is read through
+  `.value`, and a non-string type is skipped. `THINKING_*` / `REASONING_*`
+  events are not mapped to `ThinkingChunk`, even with `emit_thinking=True`.
+  The duplicate normalizer in `thread.py` is now an alias of
+  `from_full_stream`, so `thread.post` and `channel.post` share it. That also
+  brings `thread.post` to upstream for an empty-string text delta: it now counts
+  as emitted text, so a later step is preceded by `"\n\n"`, as upstream.
+- **Fidelity.** `chat.test.ts` 6 → 1, `thread.test.ts` 17 → 15,
+  `serialization.test.ts` 17 → 0 and `from-full-stream.test.ts` 9 → 0 missing
+  at `chat@4.41.1`. The `it.each` / `describe.each` rows are parametrized
+  tests. Python has no `WORKFLOW_DESERIALIZE` (upstream's is
+  `fromJSON(data)`), so the `workflow` restore method would duplicate the
+  `json` case and is not parametrized. A fake-timer interval check records the
+  edit loop's `wait_for` timeout instead.
 
 ### AI messages without text and tool names (chat@4.35–4.41, #198)
 
@@ -2097,6 +2363,7 @@ stay explicit instead of being rediscovered in code review.
 | Teams dialog-open action options (4.41 wave, #191) | N/A: dialog-open inbound is not ported (see the row above), so there is no `process_action` call with `on_open_modal` to spread `WebhookOptions` into or to guard against a rejected action task | `c21ccbc0` spreads `...webhookOptions` into `handleDialogOpen`'s `processAction` call; `91683e52` resolves the empty dialog response when that action rejects | Lands with the dialog inbound wave of the #93 migration. The DM message path does spread the caller's options (see the native streaming row). |
 | Fallback streaming with whitespace-only streams (non-Teams adapters) | Placeholder cleared to `" "` on final edit | Placeholder left visible (`"..."` stuck) | Upstream 4.26 guards against empty edits but leaves the placeholder stranded on the message. We issue one final `edit_message(" ")` so the placeholder disappears when no real content was produced. Teams does not route through `_fallback_stream` (DMs stream natively through the SDK `IStreamer`; group chats accumulate-and-post), so this divergence applies only to Slack / Discord / GitHub / Telegram / Google Chat / Linear / WhatsApp. |
 | Google Chat `<url\|text>` round-trip | `to_ast()` / `extract_plain_text()` parse the custom-label syntax back to a link node / bare label | `toAst()` / `extractPlainText()` leave `<url\|text>` as raw text (or parse the whole string as an autolink with a malformed URL) | Upstream 4.26 emits `<url\|text>` in `from_ast` but never taught the reverse direction to parse it. A message posted with `[label](url)` then read back through `fetch_messages` comes back as unstructured text (or worse, a link node with the full `url\|text` as its URL) in upstream. We close the round-trip via an AST placeholder substitution: each `<url\|text>` is extracted to a private-use sentinel, Markdown is parsed on the rest, and link nodes are injected where the sentinels landed. This avoids the Markdown parser's incomplete handling of balanced-parens link destinations, so URLs like `https://en.wikipedia.org/wiki/Foo_(bar)` round-trip intact. |
+| Restored thread/channel ownership (4.41 wave, #199) | `ThreadImpl.from_json` / `ChannelImpl.from_json` resolve ownership when called: an explicit `chat` with an explicit `adapter` it did not register raises `RuntimeError` ("does not belong to this Chat instance") before anything is built; an explicit `adapter` alone is matched against the active Chat at once (and again on access); modal-context restore binds the event's adapter with `chat=self` when this Chat registered it under any key, never the active singleton | `ChatBinding` resolves ownership on first access: the same error is thrown by the first state read or write, and the singleton is consulted only then | `chat.activate()` is scoped to a `contextvars.Context`, so a thread restored inside the block and used after it would find no Chat, or a different one, if ownership were resolved lazily. Raising in `from_json` also leaves an existing instance untouched on an idempotent rebind. Regression tests: `tests/test_chat_resolver.py::TestContextVarActivation::test_explicit_adapter_restored_inside_activate_keeps_its_owner`, `tests/test_serialization.py::TestThreadFromJsonFaithful::test_should_raise_before_rebinding_when_chat_does_not_own_the_adapter`, `::TestRestoredRuntimeOwnershipFixes::test_throws_for_an_explicit_chat_that_does_not_own_the_explicit_adapter` and `::TestRevivedStreamingConfiguration::test_modal_context_for_an_adapter_under_a_custom_key_stays_with_its_chat`. |
 | `from_json(data, adapter=X)` → `_adapter_name` | Updated to `X.name` so `to_json()` reflects the bound adapter | Kept at `json.adapterName`, so re-serialization can emit a name that no longer matches the actual adapter | Upstream TS has the same gap but only exposes it via the `fromJSON(json, adapter?)` overload. In Python we lean on this API more (explicit `chat=` / explicit `adapter=` is preferred over the singleton). We sync the name on rebind so runtime and serialize agree. |
 | Google Chat link labels with `\|` / `>` / `]` / newline, empty labels, URLs without a scheme, or URLs containing `\|` / `>` | Fall back to `text (url)` (or bare URL for empty labels) when the `<url\|text>` form can't round-trip safely | Always `<url\|text>`, producing malformed or un-parseable output | Google Chat's `<url\|text>` has no escape for `\|` or `>`; `]` breaks our own `to_ast()` regex (which converts `<url\|text>` to Markdown `[text](url)`, and Markdown closes the label at the first `]`); newline breaks the single-line form; schemeless URLs and URLs containing `\|`/`>` don't match our reverse parser. Upstream emits the malformed form regardless; we fall back to the pre-4.26 `text (url)` form (or the bare URL for empty labels) so the label/URL stays intact and Google Chat's auto-link detection still fires for http(s). |
 | Google Chat heading rendering | `#`-headings emit as `*text*` (bold) so they're visually distinct | Falls through to default node-to-text (plain concatenation) | Google Chat has no heading syntax; emitting plain text loses the visual hierarchy. Bold is the closest approximation the platform supports. |
@@ -2152,6 +2419,8 @@ stay explicit instead of being rediscovered in code review.
 | Slack `api` primitives `fetch_slack_file` host allowlist (vercel/chat#548; token scoping vercel/chat `7c269653` #859, #213) | `fetch_slack_file(*, url, token, api_url=None, fetch=None)` (`slack/api/__init__.py`) first gates `url` through `is_trusted_slack_file_url(url, api_url=...)`, raising `ValueError` for untrusted hosts before the token is resolved. It then matches upstream: the token is resolved and sent only when `is_slack_auth_url(url, api_url)` (exact origin in `{https://files.slack.com, https://files.slack-gov.com, https://slack-files.com, https://slack-files-gov.com, https://slack.com, https://slack-gov.com}` or the `api_url` origin), and the raw response of the injected `fetch` is returned | Upstream `api/client.ts` `fetchSlackFile` (chat@4.39.0+) sends `Authorization` only for `isSlackAuthUrl` URLs and fetches every other URL without credentials; it does not use the guarded downloader either | Token-leak / SSRF guard: a crafted `url_private` is refused instead of fetched. Same allowlist as the adapter's `rehydrate_attachment` row. The primitive keeps upstream's contract (plain `fetch`, response returned) rather than moving onto `download_attachment`, which would change its return type and bypass the injectable `fetch`; the default `fetch` (httpx) does not follow redirects. Regression coverage: `tests/test_slack_api_primitives.py::TestSlackApiPrimitives::test_refuses_external_url_without_resolving_the_token` (upstream's "fetches external URL %s without bearer auth" cases), `::test_authenticates_file_urls_on_the_configured_api_origin`, `::test_fetches_allowlisted_non_auth_origin_without_resolving_the_token`. |
 | Slack `web_client_options` → slack_sdk `WebClient` kwargs (vercel/chat#8336a3e, chat@4.31) | `SlackAdapterConfig.web_client_options: dict[str, Any] \| None` is spread (gated on `is not None`, so an explicit `{}` still spreads as a no-op) into **both** WebClient construction sites — the default `AsyncWebClient` (`_get_client`) and the per-token sync `WebClient` (`_get_web_client_for_token`). The keys are **slack_sdk** `WebClient` constructor kwargs: `timeout` (int seconds), `retry_handlers` (a list of `slack_sdk.http_retry.RetryHandler`), `headers`, etc. Any nested `headers` dict is **deep-copied per client** (`_web_client_kwargs`) so cached per-token clients never share a mutable dict and the caller's input is never mutated. | Upstream `webClientOptions?: Omit<WebClientOptions, "slackApiUrl">` forwards to `@slack/web-api`'s axios-backed `WebClient`; its headline keys are `retryConfig` (a `retryPolicies.*` policy), `rejectRateLimitedCalls`, and `timeout` (ms). | No 1:1 mapping: `slack_sdk` has no `retryConfig`/`rejectRateLimitedCalls` (retry behavior is configured via `retry_handlers`) and its `timeout` is seconds, not ms. So the option bag maps to slack_sdk `WebClient` kwargs rather than axios options. Same intent (tune the underlying HTTP client the adapter doesn't otherwise expose) and same per-client header isolation. Documented inline in `slack/types.py` (`web_client_options` docstring) and `slack/adapter.py` (`_web_client_kwargs`). **Socket Mode (vercel/chat `6adca361` #916, #213):** upstream's `socketTransportOptions` forwards only `agent`, `tls` and `slackApiUrl` to `SocketModeClient`; Python's counterpart `_socket_client_kwargs` passes `web_client_options["proxy"]` as `SocketModeClient(proxy=...)` (the WebSocket) and a fresh `AsyncWebClient` built from the `proxy`/`ssl` subset plus `api_url` as `base_url` as `web_client=` (`apps.connections.open`). Headers, timeouts and retry handlers are not forwarded, as upstream. With none of them set the client gets only `app_token`, so slack_sdk still falls back to its `HTTPS_PROXY` env handling. Regression coverage: `tests/test_adapter_api_url_config.py::TestSlackWebClientOptions`, `tests/test_slack_socket_mode.py::TestSocketModeTransport`. |
 | Slack card/modal length limits and date check (#212; upstream `4717a384`, `0153a39f`) | The `data_table` 10,000-character cell budget, the 3,000-character ASCII fallback cut, and the chart title/label/axis-label limits count Python code points (`len`, slicing). A `DateInput` `initial_value` of `0000-MM-DD` is dropped with a warning (`datetime.date` has no year 0). | Counts UTF-16 code units (`.length`, `.slice`), so a character outside the BMP (most emoji) counts as 2; `new Date("0000-01-01T00:00:00Z")` round-trips, so year 0 is kept. | Near a limit, a table or chart with astral characters can render natively in Python where upstream falls back, or be cut a few characters later; Python's cut never splits a surrogate pair (upstream's can). Counting UTF-16 units would need a Python-only helper on every limit check. Slack's own datepicker cannot pick year 0. Breadcrumbs in `slack/cards.py` (`_convert_table_to_blocks`), `slack/blocks/__init__.py` (`_table_to_blocks`) and `slack/modals.py` (`_to_initial_date`). Regression tests: `tests/test_slack_cards.py::TestCardToBlockKitWithDataTables::test_counts_table_characters_in_code_points` and `tests/test_slack_modals.py::TestDateAndNumberInputs::test_drops_a_year_zero_initial_date`. |
+| Slack env auth fallback set (#214; upstream `1721fa01`) | `SlackAdapter(...)` and `create_slack_adapter(...)` both read `SLACK_BOT_TOKEN` / `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` only when `signing_secret`, `bot_token`, `client_id`, `client_secret`, `installation_provider` and `webhook_verifier` are all `None` (`is not None`, so an explicit `""` counts as configured). | `createSlackAdapter` uses that set with truthiness (`noAuthConfig`). The `SlackAdapter` constructor's `zeroConfig` checks only `signingSecret`, `botToken`, `clientId` and `clientSecret`, so `new SlackAdapter({installationProvider})` still picks up `SLACK_BOT_TOKEN` and runs single-workspace. | Python has one env-fallback site, so it takes the factory rule, which is the documented entry point and keeps an explicit installation provider or verifier from being mixed with ambient env auth. `is not None` is hazard #1. Breadcrumb in `slack/adapter.py` (`zero_config`). Regression test: `tests/test_slack_agent_view.py::TestEnvAuthFallback::test_installation_provider_or_webhook_verifier_disables_env_fallback`. |
+| Slack malformed active-view context (#214; upstream `1721fa01`) | `normalize_app_context_entities` never raises: non-list `entities` gives `[]`, and a non-object entity becomes `AppContextUnknownEntity(type="", value=<entity>)`. | `normalizeAppContextEntities` throws a `TypeError` (a webhook 500 and a Slack retry loop) when `entities` is not an array or an entity is `null`. A primitive entity becomes `{kind: "unknown", type: undefined, value: undefined}`. | Upstream's own comment says one odd entity must not turn into a 500 and a retry loop. Well-formed input normalizes the same way. Breadcrumb in `slack/agent_context.py`. Regression test: `tests/test_slack_agent_context.py::TestNormalizeAppContextEntities::test_malformed_context_shapes_never_raise`. |
 | Teams service-URL allowlist host list (`call_teams_connector_api` + adapter `_validate_service_url`; vercel/chat#876 / `7609d8f6`, chat@4.40.0) | Both lists accept `https` on `smba.trafficmanager.net`, `msteams.botframework.azure.cn`, `smba.infra.(gcc\|gov\|dod).teams.microsoft.(com\|us)` **and the wildcards `*.botframework.com`, `*.botframework.us`, `*.teams.microsoft.com`, `*.teams.microsoft.us`**, matched case-insensitively on scheme and host (`re.IGNORECASE | re.ASCII`, like upstream's `url.hostname.toLowerCase()`; `re.ASCII` stops non-ASCII case folds such as the Kelvin sign), plus plain-`http` loopback for the local Emulator (`localhost` / `127.x.x.x` / `::1`, matched with `fullmatch` on the *parsed* hostname; userinfo, an invalid port, whitespace, control characters and `\` are refused). `call_teams_connector_api` also refuses a resolved URL whose origin differs from `service_url` (upstream parity). Both checks run before any token request. A refusal raises `ValueError` with upstream's message text (`Refusing to send a Teams bot token to an untrusted Connector serviceUrl` / `... outside the Connector serviceUrl origin`). | Upstream `getTrustedConnectorUrl` (`api/client.ts`) accepts only the exact hosts `msteams.botframework.azure.cn`, `smba.infra.{dod,gov}.teams.microsoft.us`, `smba.infra.gcc.teams.microsoft.com`, `smba.trafficmanager.net` over `https`, plus `http` loopback (`/^(?:localhost\|127(?:\.\d{1,3}){3}\|\[::1\])$/i`), and throws `TeamsApiError`. The high-level adapter delegates outbound calls to the Teams SDK with no host check of its own | **Remaining delta = the four wildcards + the exception type.** The wildcards pre-date upstream's list (Python-first hardening from the 4.31 port, when upstream validated nothing) and cover regional Bot Framework hosts such as `smba.uk.botframework.com`; dropping them could break a deployment that receives such a `serviceUrl`, so they stay (4.41 wave, #221). `ValueError` is kept so existing `except ValueError` callers do not change. Regression coverage: `tests/test_teams_api_primitive.py::TestTeamsApiSsrfDivergence` (incl. the upstream `it.each` `test_rejects_untrusted_service_url_before_acquiring_a_token`, origin and loopback cases) and `tests/test_teams_coverage.py::TestValidateServiceUrl`. |
 | Teams `graph` primitives `call_teams_graph_api` host gate (vercel/chat#876 / `7609d8f6`, chat@4.40.0) | `call_teams_graph_api` (`teams/graph/__init__.py`) validates the **final** request URL (an absolute `path_or_url`, an `@odata.nextLink` followed by `paginate_teams_graph`, or a relative path joined onto a caller-supplied `graph_url`) through `is_trusted_graph_url` **before** resolving/attaching the `Bearer` token: `https` and a host exactly in `{graph.microsoft.com, graph.microsoft.us, dod-graph.microsoft.us, graph.microsoft.de, microsoftgraph.chinacloudapi.cn}` (the same set as upstream). Absolute-vs-relative routing uses `urlparse` (scheme or netloc ⇒ absolute), so `HTTPS://evil` and `//evil` are gated too. A refusal raises `ValueError("Refusing to send a Microsoft Graph token to an untrusted URL: ...")` | Upstream `getTrustedGraphUrl` (`graph/client.ts`) resolves `pathOrUrl` (absolute when it `startsWith("http")`, else joined onto `graphUrl`) and requires `https` plus a host in `TRUSTED_GRAPH_HOSTS` (same five hosts), throwing `TeamsApiError("Refusing to send a Microsoft Graph token to an untrusted URL")` | **Host list is parity** (4.41 wave, #221; previously Python pinned to `graph.microsoft.com` only and did not check a relative path joined onto `graph_url`). Remaining delta: `ValueError` instead of `TeamsApiError` (kept for existing callers) and the parse-based absolute/relative routing (both end in the same host check on the resolved URL). Regression coverage: `tests/test_teams_graph_primitive.py::TestTeamsGraphSsrfDivergence`. |
 | Teams custom `token` factory vs `CLIENT_SECRET` (vercel/chat#732 / `e06b4b60`, chat@4.35.0) | `TeamsAdapterConfig.token` is forwarded to the SDK `AppOptions.token` and no `client_secret` is emitted (neither `app_password` nor `TEAMS_APP_PASSWORD`). The adapter builds the SDK `App` from a thin subclass whose `_init_credentials` returns `TokenCredentials` whenever a `token` factory and a client id are present, so a stray `CLIENT_SECRET` env var cannot win. The hand-rolled Bot Framework / Graph token paths (`open_dm`, `get_user`, `fetch_channel_info`, Graph reads) call `token(scope, tenant_id)` directly, uncached, and never read `app_password`; `tenant_id` follows the SDK's own rule (`TokenManager._resolve_tenant_id`): the tenant the SDK `App` was given (`credentials.tenant_id`, unset for `app_type="MultiTenant"`), else the cloud login tenant (`botframework.com`) for the Bot Framework scope and `common` for the Graph scope, so a tenant-routing factory sees the same tenant whether the SDK or a hand-rolled path asks. The Bot Framework scope is the SDK `App`'s `cloud.bot_scope` (e.g. `https://api.botframework.us/.default` under `CLOUD=USGov`); the Graph scope stays `https://graph.microsoft.com/.default` because the hand-rolled Graph reads always target `graph.microsoft.com` | `toAppOptions` passes `clientSecret: ""` next to `token` to suppress the SDK's generic `CLIENT_SECRET` env fallback (the JS SDK treats `""` as set), and every outbound call goes through the SDK App | The Python SDK (`microsoft-teams-apps` 2.0.13 – 2.0.16, `App._init_credentials`) reads `options.client_secret or os.getenv("CLIENT_SECRET")` and checks `client_id and client_secret` **before** `client_id and token`, so upstream's empty-string trick does not carry over. The subclass restores upstream's documented precedence ("takes precedence over appPassword, federated credentials, and client-secret environment variables, including CLIENT_SECRET"); without a factory it defers to the SDK unchanged. Regression coverage: `tests/test_teams_connect.py::TestCustomTokenPrecedence` (fails if the subclass is dropped: `test_token_factory_beats_client_secret_env_alone`; tenant rule: `test_hand_rolled_factory_tenant_matches_the_sdk`). |
@@ -2181,6 +2450,8 @@ stay explicit instead of being rediscovered in code review.
 | Google Chat outbound file delivery | Inbound attachment parsing implemented — `_create_attachment` builds a full `Attachment` (type detection, `fetch_data` download closure, `fetch_metadata`) for every `message.attachment` entry. Outbound file delivery logs "File uploads are not yet supported for Google Chat" and ignores files (posts text/cards only, no media upload). | **Same** — logs "File uploads are not yet supported for Google Chat" and leaves a `media.upload` TODO (`adapter-gchat/src/index.ts:1282-1289`). | **Parity — neither SDK implements Google Chat outbound file delivery.** A Python-only enhancement attempt (PR #112) exists but is unmerged; landing it would be a divergence (upstream lacks it), gated on real need. |
 | Discord Gateway WebSocket | HTTP interactions only | Both HTTP and Gateway | Gateway requires persistent connection |
 | Discord preview-suppressed links (4.41 wave, #229) | `DiscordFormatConverter` recognizes `[text](<https://…>)` from the parsed destination: `<…>` delimiters are stripped from `url` and `data["discordLinkStyle"] = "suppressed-masked-link"` is set when the bracketed URL is http(s) and the link has no title. `<https://…>` stays a text node (the Python parser has no autolinks), so its brackets render verbatim and `Message.text` keeps them | `markDiscordLinkStyles` reads each link node's source span (mdast `position`) and marks both `<https://…>` (an autolink node, plain text `https://…`) and `[text](<https://…>)` | Rendered output is identical for both forms (`tests/test_discord_format.py::TestFromAst::test_should_preserve_angle_brackets_on_an_autolink_to_suppress_its_embed`, `::test_should_preserve_angle_brackets_in_a_masked_link_destination`). The Python parser keeps no source positions; autolink parsing is a core-parser limitation (CLAUDE.md Known Limitations), not a Discord change. `from_ast` still honors `suppressed-autolink` on an AST that carries it. Regression test: `::test_suppressed_masked_link_url_has_no_angle_brackets_in_the_ast`. |
+| Discord `interaction_flags` callback errors (4.41 wave, #230) | A callback that raises, or returns something other than an `int` or `None` (an `async def` callback's coroutine, which is closed rather than left un-awaited, or a `bool`), is logged (`"Discord interaction_flags callback failed; deferring without flags"`, `{error, command}`) and the command is deferred and dispatched without flags | `getInteractionFlags` lets the exception propagate, so the HTTP interaction gets no ACK (Discord shows "The application did not respond") and the gateway path skips `deferReply` | A config callback bug should not make every slash command fail. Breadcrumb at `DiscordAdapter._get_interaction_flags`; regression tests `tests/test_discord_extended.py::TestInteractionFlags::test_raising_flags_callback_still_acks_without_flags` and `::test_async_or_non_int_flags_callback_still_acks_without_flags`. |
+| Discord Components V2 (`contentFormat`, upstream `0fdb9029`, chat@4.34; #230) | Not ported; cards render as embeds + action rows only, and no 40-component / 4000-character V2 validation runs | `DiscordContentFormat.ComponentsV2` renders cards as V2 components, including string selects | Deferred to #189. Select-menu **inbound** values (`data.values[0]`) are ported, so V2 selects sent by other code still report their choice. |
 | Discord gateway-only interactions (vercel/chat#490) | Handled on the forwarded-event surface: a `GATEWAY_INTERACTION_CREATE` envelope (raw INTERACTION_CREATE dispatch payload in `data`) is deferred via `POST /interactions/{id}/{token}/callback` (type 5 slash / type 6 component) and routed through the existing HTTP interaction handlers; a malformed forward missing `id`/`token` is logged and skipped | Upstream handles `Events.InteractionCreate` directly on the resident discord.js client via `deferReply()`/`deferUpdate()`; the upstream forwarder never forwards interactions | Python has no resident Gateway client (row above), so gateway-only deployments run an external listener shim that forwards raw dispatch payloads (`x-discord-gateway-token`). Observable wire behavior is identical — same callback REST calls, same handler routing, same `@original` deferred-response resolution. |
 | Teams `User-Agent: Vercel.ChatSDK` outbound header | Not set on `aiohttp` calls | Propagated by `botbuilder` 2.0.8 | Python Teams adapter doesn't use `botbuilder` (raw `aiohttp`). Upstream's vercel/chat#415 was a JS-only `botbuilder` SDK bump that flipped `X-User-Agent` → `User-Agent`. No equivalent dependency to bump on the Python side. Setting a `User-Agent` on the ~9 outbound `aiohttp` call sites would be a defense-in-depth nice-to-have; deferred to a follow-up. |
 | Teams adapter on `microsoft-teams-apps` (official MS Python SDK) | Inbound webhook + JWT auth, outbound send/edit/delete/typing, and native DM streaming all delegate to the official `microsoft-teams-apps` SDK `App`; Graph reads stay hand-rolled over `aiohttp` | `@microsoft/teams.apps` owns the wire format, throttling, and activity routing | **Delivered in 0.4.30** (issue #93, PRs 1–4). The migration shipped as four PRs: inbound + auth (#143), outbound (#144), native streaming via the SDK `IStreamer` (#145), and this release cut. The 3.12 floor bump (#111) — the migration's prerequisite — landed in 0.4.29. The residual adapter-level divergences (we keep the SDK as auth + transport but route the authenticated activity ourselves; close the streamer in our own `finally` because our bridge owns dispatch) are documented in the Teams divergence rows above. Graph stays hand-rolled (no `msgraph-sdk` / `[graph]` extra). |

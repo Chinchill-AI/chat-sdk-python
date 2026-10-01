@@ -6,25 +6,38 @@ non-serializable fields), is_mention, links, and round-trip integrity.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from chat_sdk import reviver
 from chat_sdk.channel import ChannelImpl
 from chat_sdk.chat import Chat
+from chat_sdk.plan import StreamingPlan, StreamingPlanOptions
 from chat_sdk.testing import (
     create_mock_adapter,
+    create_mock_state,
     create_test_message,
 )
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig, clear_chat_singleton
 from chat_sdk.types import (
+    UNSET,
     Attachment,
     Author,
+    ChatConfig,
     LinkPreview,
     Message,
     MessageMetadata,
+    MessageSubject,
+    ModalCloseEvent,
+    ModalSubmitEvent,
+    PostableMarkdown,
+    RawMessage,
+    WebhookOptions,
 )
 
 # ============================================================================
@@ -866,11 +879,12 @@ class TestThreadFromJsonFaithful:
         assert rebound._thread_history is None, "thread_history should drop on rebind"
 
     def test_should_set_state_from_chat_when_both_adapter_and_chat_passed(self, mock_state):
-        """adapter= and chat= are orthogonal. Passing both must apply both:
-        the explicit adapter is bound AND state comes from the explicit
-        chat. The previous `elif chat` branch silently ignored chat when
-        adapter was also passed, leading to split routing. Regression for
-        a self-review-subagent finding."""
+        """adapter= and chat= are applied together. Passing both binds the
+        explicit adapter AND takes state from the explicit chat. The previous
+        `elif chat` branch silently ignored chat when adapter was also
+        passed, leading to split routing. The adapter must be one the chat
+        registered (vercel/chat#967); here it is registered under a key that
+        differs from its name."""
         from chat_sdk.chat import Chat, ChatConfig
         from chat_sdk.testing import create_mock_adapter, create_mock_state
 
@@ -879,7 +893,7 @@ class TestThreadFromJsonFaithful:
         chat_instance = Chat(
             ChatConfig(
                 user_name="bot",
-                adapters={"slack": create_mock_adapter("slack")},
+                adapters={"slack": create_mock_adapter("slack"), "msteams": teams_adapter},
                 state=chat_state,
             )
         )
@@ -899,6 +913,61 @@ class TestThreadFromJsonFaithful:
         # skipped this, leaving state as None and silently routing to the
         # singleton on next access).
         assert thread._state_adapter_instance is chat_state
+
+    async def test_should_take_streaming_settings_from_the_new_chat_on_idempotent_rebind(self):
+        """A Chat-created thread carries that Chat's streaming values; after
+        `from_json(thread, chat=other)` the new owner's settings apply."""
+        first = Chat(
+            ChatConfig(
+                user_name="first",
+                adapters={"slack": create_mock_adapter("slack")},
+                state=create_mock_state(),
+                streaming_update_interval_ms=1000,
+                fallback_streaming_placeholder_text=None,
+            )
+        )
+        second_adapter = create_mock_adapter("slack")
+        stream = AsyncMock(return_value=RawMessage(id="m", thread_id="slack:C123:1234.5678", raw={}))
+        second_adapter.stream = stream  # type: ignore[attr-defined]
+        second = Chat(
+            ChatConfig(
+                user_name="second",
+                adapters={"slack": second_adapter},
+                state=create_mock_state(),
+                streaming_update_interval_ms=250,
+                fallback_streaming_placeholder_text="Second",
+            )
+        )
+
+        thread = ThreadImpl.from_json(first.thread("slack:C123:1234.5678"), chat=second)
+
+        async def _chunks():
+            yield "Hi"
+
+        await thread.post(_chunks())
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (250, "Second")
+
+    def test_should_raise_before_rebinding_when_chat_does_not_own_the_adapter(self, mock_state):
+        """Python raises in from_json itself (upstream raises on first state
+        use), so an existing instance is left untouched."""
+        from chat_sdk.chat import Chat, ChatConfig
+        from chat_sdk.testing import create_mock_adapter, create_mock_state
+
+        stray = create_mock_adapter("slack")
+        chat_instance = Chat(
+            ChatConfig(user_name="bot", adapters={"slack": create_mock_adapter("slack")}, state=create_mock_state())
+        )
+        existing = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678", adapter=stray, state_adapter=mock_state, channel_id="slack:C123"
+            )
+        )
+
+        with pytest.raises(RuntimeError, match='Adapter "slack" does not belong to this Chat instance'):
+            ThreadImpl.from_json(existing, adapter=create_mock_adapter("slack"), chat=chat_instance)
+        assert existing.adapter is stray
+        assert existing._state_adapter_instance is mock_state
 
     def test_should_rebind_adapter_on_idempotent_chat_rebind_for_direct_constructed_thread(self, mock_state):
         """When `from_json(existing_instance, chat=Y)` rebinds a thread that
@@ -1629,3 +1698,720 @@ class TestMessageWorkflowSerde:
         assert restored.text == original.text
         assert restored.is_mention == original.is_mention
         assert restored.metadata.date_sent == original.metadata.date_sent
+
+
+# ============================================================================
+# Restored runtime ownership and streaming settings (vercel/chat#967)
+# ============================================================================
+#
+# Python has no ``WORKFLOW_DESERIALIZE``. Upstream's is literally
+# ``fromJSON(data)`` (thread.ts / channel.ts at chat@4.41.1), so its
+# ``workflow`` restore method would run exactly the ``json`` case here and
+# is omitted rather than duplicated (CLAUDE.md principle 3). ``chat.reviver()`` does not register the Chat
+# as the singleton in Python, so tests that relied on that side effect
+# register it explicitly.
+
+_THREAD_ID = "slack:C123:1234.5678"
+_RESTORE_METHODS = ["json", "reviver", "standalone", "adapter"]
+
+
+@pytest.fixture
+def _no_singleton():
+    clear_chat_singleton()
+    yield
+    clear_chat_singleton()
+
+
+def _bot(adapters: dict[str, Any], state: Any = None, **config: Any) -> Chat:
+    return Chat(
+        ChatConfig(
+            user_name=config.pop("user_name", "bot"),
+            adapters=adapters,
+            state=state if state is not None else create_mock_state(),
+            logger="silent",
+            **config,
+        )
+    )
+
+
+def _decode(payload: str, chat: Chat) -> Any:
+    hook = chat.reviver()
+    return json.loads(payload, object_hook=lambda value: hook("", value))
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, default=lambda obj: obj.to_json())
+
+
+def _restore(chat: Chat, method: str, adapter: Any) -> ThreadImpl:
+    data = chat.thread(_THREAD_ID).to_json()
+    if method == "json":
+        return ThreadImpl.from_json(json.loads(json.dumps(data)))
+    if method == "reviver":
+        return _decode(json.dumps(data), chat)
+    if method == "standalone":
+        return json.loads(json.dumps(data), object_hook=reviver)
+    return ThreadImpl.from_json(data, adapter)
+
+
+def _native_stream(adapter: Any, result: Any = "sent") -> AsyncMock:
+    stream = AsyncMock(
+        return_value=None if result is None else RawMessage(id="msg-1", thread_id=_THREAD_ID, raw={}),
+    )
+    adapter.stream = stream
+    return stream
+
+
+async def _hello():
+    yield "Hello"
+
+
+async def _reply():
+    yield "Reply"
+
+
+@pytest.mark.usefixtures("_no_singleton")
+class TestRevivedStreamingConfiguration:
+    """describe("revived streaming configuration")"""
+
+    @pytest.mark.parametrize("placeholder", [None, "Loading...", "", UNSET])
+    @pytest.mark.parametrize("method", _RESTORE_METHODS)
+    async def test_uses_the_current_chat_placeholder_after_lazy_restoration(self, method, placeholder):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        original = _bot(
+            {"slack": adapter},
+            state,
+            fallback_streaming_placeholder_text=placeholder if method == "reviver" else "Old configuration",
+        )
+        thread = _restore(original, method, adapter)
+        clear_chat_singleton()
+        assert "fallbackStreamingPlaceholderText" not in thread.to_json()
+        _bot({"slack": adapter}, state, fallback_streaming_placeholder_text=placeholder).register_singleton()
+
+        await thread.post(_hello())
+
+        expected = (
+            PostableMarkdown(markdown="Hello")
+            if placeholder is None
+            else ("..." if placeholder is UNSET else placeholder)
+        )
+        assert adapter._post_calls[0] == (_THREAD_ID, expected)
+
+    @pytest.mark.parametrize("interval", [None, 250])
+    @pytest.mark.parametrize("method", _RESTORE_METHODS)
+    async def test_restores_the_fallback_edit_interval_with_override(self, method, interval, monkeypatch):
+        adapter = create_mock_adapter("slack")
+        chat = _bot({"slack": adapter}, streaming_update_interval_ms=1000)
+        thread = _restore(chat, method, adapter)
+        chat.register_singleton()
+        timeouts: list[float] = []
+
+        class _RecordingAsyncio:
+            """``chat_sdk.thread``'s view of asyncio, recording edit-loop waits."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(asyncio, name)
+
+            @staticmethod
+            async def wait_for(awaitable: Any, timeout: float | None = None) -> Any:
+                if timeout is not None:
+                    timeouts.append(timeout)
+                return await asyncio.wait_for(awaitable, timeout=timeout)
+
+        # The fallback edit loop waits ``interval / 1000`` seconds between
+        # edits; record that wait instead of advancing a fake clock.
+        monkeypatch.setattr("chat_sdk.thread.asyncio", _RecordingAsyncio())
+        finish = asyncio.Event()
+
+        async def _delayed():
+            yield "Hello"
+            await finish.wait()
+
+        posting = asyncio.ensure_future(
+            thread.post(StreamingPlan(_delayed(), StreamingPlanOptions(update_interval_ms=interval)))
+        )
+        try:
+            for _ in range(100):
+                if timeouts:
+                    break
+                await asyncio.sleep(0)
+            assert adapter._edit_calls == []
+        finally:
+            finish.set()
+            await posting
+
+        assert timeouts
+        assert set(timeouts) == {(interval if interval is not None else 1000) / 1000}
+        assert adapter._edit_calls[-1] == (_THREAD_ID, "msg-1", PostableMarkdown(markdown="Hello"))
+
+    @pytest.mark.parametrize("interval", [None, 250])
+    @pytest.mark.parametrize("method", _RESTORE_METHODS)
+    async def test_passes_restored_defaults_and_the_interval_override_to_native_streaming(self, method, interval):
+        adapter = create_mock_adapter("slack")
+        chat = _bot(
+            {"slack": adapter},
+            streaming_update_interval_ms=1000,
+            fallback_streaming_placeholder_text=None,
+        )
+        stream = _native_stream(adapter)
+        thread = _restore(chat, method, adapter)
+        chat.register_singleton()
+
+        await thread.post(
+            _hello() if interval is None else StreamingPlan(_hello(), StreamingPlanOptions(update_interval_ms=interval))
+        )
+
+        options = stream.await_args.args[2]
+        assert options.update_interval_ms == (interval if interval is not None else 1000)
+        assert options.fallback_streaming_placeholder_text is None
+
+    @pytest.mark.parametrize("placeholder", [None, "Thread placeholder", ""])
+    async def test_preserves_explicit_lazy_thread_overrides_with_placeholder(self, placeholder):
+        adapter = create_mock_adapter("slack")
+        _bot(
+            {"slack": adapter},
+            streaming_update_interval_ms=1000,
+            fallback_streaming_placeholder_text="Bot placeholder",
+        ).register_singleton()
+        stream = _native_stream(adapter)
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id=_THREAD_ID,
+                channel_id="slack:C123",
+                adapter_name="slack",
+                streaming_update_interval_ms=250,
+                fallback_streaming_placeholder_text=placeholder,
+            )
+        )
+
+        await thread.post(_hello())
+
+        options = stream.await_args.args[2]
+        assert options.update_interval_ms == 250
+        assert options.fallback_streaming_placeholder_text == placeholder
+        assert options.fallback_streaming_placeholder_text is not UNSET
+
+    async def test_does_not_inherit_another_chat_configuration_for_directly_constructed_threads(self):
+        adapter = create_mock_adapter("slack")
+        _bot(
+            {"slack": create_mock_adapter("slack")},
+            user_name="other",
+            streaming_update_interval_ms=1000,
+            fallback_streaming_placeholder_text=None,
+        ).register_singleton()
+        stream = _native_stream(adapter)
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id=_THREAD_ID, channel_id="slack:C123", adapter=adapter, state_adapter=create_mock_state()
+            )
+        )
+
+        await thread.post(_hello())
+
+        options = stream.await_args.args[2]
+        assert options.update_interval_ms == 500
+        assert options.fallback_streaming_placeholder_text is UNSET
+
+    async def test_can_stream_with_an_explicit_restored_adapter_without_a_singleton(self):
+        adapter = create_mock_adapter("slack")
+        thread = ThreadImpl.from_json(
+            {
+                "_type": "chat:Thread",
+                "id": _THREAD_ID,
+                "channelId": "slack:C123",
+                "adapterName": "slack",
+                "isDM": False,
+            },
+            adapter,
+        )
+
+        await thread.post(_hello())
+
+        assert adapter._post_calls[0] == (_THREAD_ID, "...")
+
+    @pytest.mark.parametrize("method", ["submit", "close"])
+    async def test_keeps_restored_modal_context_bound_to_its_chat(self, method):
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        owner = _bot(
+            {"slack": adapter},
+            state,
+            user_name="owner",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1200,
+        )
+        other = _bot(
+            {"slack": create_mock_adapter("slack")}, user_name="other", fallback_streaming_placeholder_text="Other"
+        )
+        await state.set(
+            "modal-context:slack:context",
+            {"thread": owner.thread(_THREAD_ID).to_json(), "channel": owner.channel("slack:C123").to_json()},
+        )
+        restored: list[Any] = []
+
+        async def _handler(event: Any) -> None:
+            restored.append(event)
+
+        owner.on_modal_submit("modal", _handler)
+        owner.on_modal_close("modal", _handler)
+        other.register_singleton()
+        user = create_test_message("message", "Hello").author
+        if method == "submit":
+            await owner.process_modal_submit(
+                ModalSubmitEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", values={}, raw={}),
+                "context",
+            )
+        else:
+            tasks: list[Any] = []
+            owner.process_modal_close(
+                ModalCloseEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", raw={}),
+                "context",
+                WebhookOptions(wait_until=tasks.append),
+            )
+            await asyncio.gather(*tasks)
+
+        assert len(restored) == 1
+        thread = restored[0].related_thread
+        channel = restored[0].related_channel
+        assert thread is not None
+        assert channel is not None
+        await thread.post(_hello())
+        assert adapter._post_calls[0] == (_THREAD_ID, PostableMarkdown(markdown="Hello"))
+        await thread.set_state({"owner": "owner"})
+        await channel.set_state({"owner": "owner"})
+        assert await owner.thread(_THREAD_ID).get_state() == {"owner": "owner"}
+        assert await owner.channel("slack:C123").get_state() == {"owner": "owner"}
+        assert await other.thread(_THREAD_ID).get_state() is None
+        assert await other.channel("slack:C123").get_state() is None
+        stream = _native_stream(adapter, None)
+        await thread.post(_hello())
+        options = stream.await_args.args[2]
+        assert options.update_interval_ms == 1200
+        assert options.fallback_streaming_placeholder_text is None
+
+    @pytest.mark.parametrize("method", ["submit", "close"])
+    async def test_modal_context_for_an_adapter_under_a_custom_key_stays_with_its_chat(self, method):
+        # Python-specific: the event's adapter is registered under a key
+        # other than `adapter.name`. The restore must still bind to this
+        # Chat, never to the active singleton that registered another
+        # adapter under the plain name (cross-bot routing, vercel/chat#967).
+        adapter = create_mock_adapter("slack")
+        state = create_mock_state()
+        owner = _bot(
+            {"slack-main": adapter},
+            state,
+            user_name="owner",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1200,
+        )
+        other_adapter = create_mock_adapter("slack")
+        other = _bot({"slack": other_adapter}, user_name="other")
+        await state.set(
+            "modal-context:slack:context",
+            {
+                "thread": {
+                    "_type": "chat:Thread",
+                    "id": _THREAD_ID,
+                    "channelId": "slack:C123",
+                    "adapterName": "slack",
+                    "isDM": False,
+                },
+                "channel": {"_type": "chat:Channel", "id": "slack:C123", "adapterName": "slack", "isDM": False},
+            },
+        )
+        restored: list[Any] = []
+
+        async def _handler(event: Any) -> None:
+            restored.append(event)
+
+        owner.on_modal_submit("modal", _handler)
+        owner.on_modal_close("modal", _handler)
+        other.register_singleton()
+        user = create_test_message("message", "Hello").author
+        if method == "submit":
+            await owner.process_modal_submit(
+                ModalSubmitEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", values={}, raw={}),
+                "context",
+            )
+        else:
+            tasks: list[Any] = []
+            owner.process_modal_close(
+                ModalCloseEvent(adapter=adapter, user=user, view_id="view", callback_id="modal", raw={}),
+                "context",
+                WebhookOptions(wait_until=tasks.append),
+            )
+            await asyncio.gather(*tasks)
+
+        assert len(restored) == 1
+        thread = restored[0].related_thread
+        channel = restored[0].related_channel
+        assert thread.adapter is adapter
+        assert channel.adapter is adapter
+        await thread.set_state({"owner": "owner"})
+        await channel.set_state({"owner": "owner"})
+        assert await state.get(f"thread-state:{_THREAD_ID}") == {"owner": "owner"}
+        assert await state.get("channel-state:slack:C123") == {"owner": "owner"}
+        assert await other.thread(_THREAD_ID).get_state() is None
+        assert await other.channel("slack:C123").get_state() is None
+        await thread.post(_hello())
+        assert adapter._post_calls[0] == (_THREAD_ID, PostableMarkdown(markdown="Hello"))
+        assert other_adapter._post_calls == []
+        stream = _native_stream(adapter, None)
+        await thread.post(_hello())
+        assert stream.await_args.args[2].update_interval_ms == 1200
+
+
+def _restore_pair(method: str, data: dict[str, Any], adapter: Any) -> tuple[ThreadImpl, ChannelImpl]:
+    if method == "standalone":
+        restored = json.loads(json.dumps(data), object_hook=reviver)
+        return restored["thread"], restored["channel"]
+    explicit = adapter if method == "adapter" else None
+    return (
+        ThreadImpl.from_json(json.loads(json.dumps(data["thread"])), explicit),
+        ChannelImpl.from_json(json.loads(json.dumps(data["channel"])), explicit),
+    )
+
+
+@pytest.mark.usefixtures("_no_singleton")
+class TestRestoredRuntimeOwnership:
+    """describe("restored runtime ownership")"""
+
+    @pytest.mark.parametrize("singleton", ["replaced", "cleared"])
+    @pytest.mark.parametrize("access", ["adapter", "state", "stream"])
+    @pytest.mark.parametrize("method", ["json", "standalone", "adapter"])
+    async def test_retains_the_runtime_after_resolving_first_with_the_singleton(self, method, access, singleton):
+        adapter = create_mock_adapter("slack")
+        first = _bot(
+            {"slack": adapter},
+            user_name="first",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1200,
+        )
+        other = create_mock_adapter("slack")
+        second = _bot(
+            {"slack": other},
+            user_name="second",
+            fallback_streaming_placeholder_text="Other",
+            streaming_update_interval_ms=250,
+        )
+        data = {
+            "thread": first.thread(_THREAD_ID).to_json(),
+            "channel": first.channel("slack:C123").to_json(),
+        }
+        thread, channel = _restore_pair(method, data, adapter)
+        first.register_singleton()
+        stream = _native_stream(adapter, None)
+        if access == "adapter":
+            assert thread.adapter is adapter
+            assert channel.adapter is adapter
+        elif access == "state":
+            await thread.get_state()
+            await channel.get_state()
+        else:
+            await thread.post(_reply())
+            await channel.post("Channel")
+        second.register_singleton()
+        if singleton == "cleared":
+            clear_chat_singleton()
+
+        await thread.set_state({"owner": "first"})
+        await channel.set_state({"owner": "first"})
+        await thread.subscribe()
+        assert thread.adapter is adapter
+        assert channel.adapter is adapter
+        assert await first.thread(_THREAD_ID).get_state() == {"owner": "first"}
+        assert await first.channel("slack:C123").get_state() == {"owner": "first"}
+        assert await second.thread(_THREAD_ID).get_state() is None
+        assert await second.channel("slack:C123").get_state() is None
+        assert await first.get_state().is_subscribed(_THREAD_ID) is True
+        assert await second.get_state().is_subscribed(_THREAD_ID) is False
+        await thread.post(_reply())
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (1200, None)
+        clear_chat_singleton()
+        await thread.post(_reply())
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (1200, None)
+        assert await thread.channel.get_state() == {"owner": "first"}
+        assert other._post_calls == []
+        assert {"thread": thread.to_json(), "channel": channel.to_json()} == data
+
+    async def test_does_not_borrow_an_unrelated_runtime_for_an_explicit_adapter(self):
+        adapter = create_mock_adapter("slack")
+        owner = _bot(
+            {"slack": adapter},
+            user_name="owner",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1200,
+        )
+        other = _bot(
+            {"slack": create_mock_adapter("slack")},
+            user_name="other",
+            fallback_streaming_placeholder_text="Other",
+            streaming_update_interval_ms=250,
+        )
+        thread = ThreadImpl.from_json(owner.thread(_THREAD_ID).to_json(), adapter)
+        channel = ChannelImpl.from_json(owner.channel("slack:C123").to_json(), adapter)
+        other.register_singleton()
+        stream = _native_stream(adapter, None)
+
+        await thread.post(_reply())
+
+        assert adapter._post_calls[0] == (_THREAD_ID, "...")
+        options = stream.await_args.args[2]
+        assert options.update_interval_ms == 500
+        assert options.fallback_streaming_placeholder_text is UNSET
+        # Unowned explicit adapters keep falling back to the singleton's state
+        await thread.set_state({"owner": "other"})
+        await channel.set_state({"owner": "other"})
+        assert await other.thread(_THREAD_ID).get_state() == {"owner": "other"}
+        assert await other.channel("slack:C123").get_state() == {"owner": "other"}
+        assert await thread.channel.get_state() == {"owner": "other"}
+        owner.register_singleton()
+        await thread.set_state({"owner": "owner"})
+        await channel.set_state({"owner": "owner"})
+        other.register_singleton()
+        await thread.post(_reply())
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (1200, None)
+        assert await owner.thread(_THREAD_ID).get_state() == {"owner": "owner"}
+        assert await owner.channel("slack:C123").get_state() == {"owner": "owner"}
+
+
+@pytest.mark.usefixtures("_no_singleton")
+class TestRestoredRuntimeOwnershipFixes:
+    """describe("restored runtime ownership fixes")"""
+
+    async def test_throws_for_an_explicit_chat_that_does_not_own_the_explicit_adapter(self):
+        adapter = create_mock_adapter("slack")
+        other = _bot({"slack": create_mock_adapter("slack")}, user_name="other")
+
+        # Python raises in from_json; upstream raises on first state use.
+        with pytest.raises(RuntimeError, match="does not belong to this Chat instance"):
+            ThreadImpl.from_json(other.thread(_THREAD_ID).to_json(), adapter, other)
+        with pytest.raises(RuntimeError, match="does not belong to this Chat instance"):
+            ChannelImpl.from_json(other.channel("slack:C123").to_json(), adapter, other)
+        assert await other.thread(_THREAD_ID).get_state() is None
+
+    async def test_recognizes_adapters_registered_under_a_key_that_differs_from_their_name(self):
+        adapter = create_mock_adapter("slack")
+        stream = _native_stream(adapter, None)
+        state = create_mock_state()
+        bot = _bot(
+            {"mySlack": adapter},
+            state,
+            streaming_update_interval_ms=1200,
+            fallback_streaming_placeholder_text=None,
+        ).register_singleton()
+        thread = ThreadImpl.from_json(
+            {
+                "_type": "chat:Thread",
+                "id": _THREAD_ID,
+                "channelId": "slack:C123",
+                "adapterName": "slack",
+                "isDM": False,
+            },
+            adapter,
+        )
+
+        await thread.post(_reply())
+        await thread.set_state({"owner": "bot"})
+
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (1200, None)
+        assert await bot.get_state().get(f"thread-state:{_THREAD_ID}") == {"owner": "bot"}
+
+    async def test_honors_a_streamingplan_updateintervalms_of_0(self):
+        adapter = create_mock_adapter("slack")
+        stream = _native_stream(adapter, None)
+        bot = _bot({"slack": adapter}, streaming_update_interval_ms=1200)
+        thread = _decode(json.dumps(bot.thread(_THREAD_ID).to_json()), bot)
+
+        await thread.post(StreamingPlan(_reply(), StreamingPlanOptions(update_interval_ms=0)))
+
+        assert stream.await_args.args[2].update_interval_ms == 0
+
+    async def test_binds_messages_revived_by_botreviver_to_that_bots_adapter(self):
+        adapter = create_mock_adapter("slack")
+        subject = MessageSubject(id="issue-1", type="issue", title="Bug", raw={})
+        adapter.fetch_subject = AsyncMock(return_value=subject)  # type: ignore[attr-defined]
+        bot = _bot({"slack": adapter})
+        restored = _decode(_dumps({"message": create_test_message("message", "Hello")}), bot)
+
+        assert await restored["message"].subject == subject
+        adapter.fetch_subject.assert_awaited_once()
+
+    async def test_from_json_with_chat_binds_the_restored_current_message_to_its_adapter(self):
+        # Python-specific: a plain dict (no reviver) so only
+        # `ThreadImpl.from_json(..., chat=bot)` can bind `current_message`
+        # (upstream thread.ts fromJSON: setMessageAdapter on _currentMessage).
+        adapter = create_mock_adapter("slack")
+        subject = MessageSubject(id="issue-1", type="issue", title="Bug", raw={})
+        adapter.fetch_subject = AsyncMock(return_value=subject)  # type: ignore[attr-defined]
+        bot = _bot({"slack": adapter})
+        data = {
+            "_type": "chat:Thread",
+            "id": _THREAD_ID,
+            "channelId": "slack:C123",
+            "adapterName": "slack",
+            "isDM": False,
+            "currentMessage": create_test_message("message", "Hello").to_json(),
+        }
+
+        thread = ThreadImpl.from_json(json.loads(json.dumps(data)), chat=bot)
+
+        assert thread._current_message is not None
+        assert await thread._current_message.subject == subject
+        adapter.fetch_subject.assert_awaited_once()
+
+
+@pytest.mark.usefixtures("_no_singleton")
+class TestChatReviverOwnership:
+    """describe("chat.reviver()") — ownership cases from vercel/chat#967."""
+
+    @pytest.mark.parametrize("mode", ["replaced", "cached", "cleared"])
+    async def test_keeps_threads_and_channels_bound_to_their_chat_when_the_singleton_is(self, mode):
+        first_adapter = create_mock_adapter("slack")
+        second_adapter = create_mock_adapter("slack")
+        first_adapter.post_channel_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="msg-1", thread_id="slack:C123", raw={})
+        )
+        second_adapter.post_channel_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="msg-1", thread_id="slack:C123", raw={})
+        )
+        first_state = create_mock_state()
+        second_state = create_mock_state()
+        first = _bot(
+            {"slack": first_adapter},
+            first_state,
+            user_name="first",
+            fallback_streaming_placeholder_text=None,
+            streaming_update_interval_ms=1000,
+        )
+        second = _bot(
+            {"slack": second_adapter},
+            second_state,
+            user_name="second",
+            fallback_streaming_placeholder_text="Second",
+            streaming_update_interval_ms=250,
+        )
+        payload = _dumps({"thread": first.thread(_THREAD_ID), "channel": first.channel("slack:C123")})
+        # Upstream's reviver() registers its Chat as the singleton; Python's
+        # does not, so register where upstream would have.
+        first.register_singleton()
+        restored = _decode(payload, first)
+        if mode == "cached":
+            assert restored["thread"].adapter is first_adapter
+            assert restored["channel"].adapter is first_adapter
+        second.register_singleton()
+        other = _decode(payload, second)
+        delayed = _decode(payload, first)
+        if mode == "cleared":
+            clear_chat_singleton()
+
+        await restored["thread"].set_state({"owner": "first"})
+        await restored["channel"].set_state({"owner": "first"})
+        await restored["thread"].subscribe()
+        await other["thread"].set_state({"owner": "second"})
+        await other["channel"].set_state({"owner": "second"})
+        assert await restored["thread"].get_state() == {"owner": "first"}
+        assert await delayed["thread"].get_state() == {"owner": "first"}
+        assert await restored["thread"].channel.get_state() == {"owner": "first"}
+        assert await other["thread"].get_state() == {"owner": "second"}
+        assert await other["channel"].get_state() == {"owner": "second"}
+        assert await first_state.is_subscribed(_THREAD_ID) is True
+        assert await second_state.is_subscribed(_THREAD_ID) is False
+
+        await restored["thread"].post(_reply())
+        await other["thread"].post(_reply())
+        assert first_adapter._post_calls[0] == (_THREAD_ID, PostableMarkdown(markdown="Reply"))
+        assert second_adapter._post_calls[0] == (_THREAD_ID, "Second")
+        await restored["channel"].post("First channel")
+        first_adapter.post_channel_message.assert_awaited_once_with("slack:C123", "First channel")
+        second_adapter.post_channel_message.assert_not_awaited()
+        stream = _native_stream(first_adapter)
+        await delayed["thread"].post(_reply())
+        options = stream.await_args.args[2]
+        assert (options.update_interval_ms, options.fallback_streaming_placeholder_text) == (1000, None)
+        assert _dumps(restored) == payload
+
+    async def test_does_not_fall_back_to_another_chats_adapter(self):
+        chat = _bot({"slack": create_mock_adapter("slack")})
+        owner = _bot({}, user_name="owner")
+        chat.register_singleton()
+        thread_payload = _dumps({"thread": chat.thread(_THREAD_ID)})
+        channel_payload = _dumps({"channel": chat.channel("slack:C123")})
+
+        # Python resolves an explicit Chat's adapter in from_json, so the
+        # missing adapter raises while decoding rather than on first access.
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            _decode(thread_payload, owner)
+        with pytest.raises(RuntimeError, match='Adapter "slack" not found'):
+            _decode(channel_payload, owner)
+
+    async def test_retains_ownership_while_streams_from_different_bots_interleave(self):
+        chat = _bot({"slack": create_mock_adapter("slack")})
+        adapter = create_mock_adapter("slack")
+        first = _bot({"slack": adapter}, fallback_streaming_placeholder_text=None)
+        payload = _dumps(first.thread(_THREAD_ID))
+        thread = _decode(payload, first)
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _delayed():
+            started.set()
+            await gate.wait()
+            yield "First"
+
+        pending = asyncio.ensure_future(thread.post(_delayed()))
+        try:
+            await started.wait()
+            second = _decode(payload, chat)
+
+            async def _immediate():
+                yield "Second"
+
+            await second.post(_immediate())
+            clear_chat_singleton()
+        finally:
+            gate.set()
+            sent = await pending
+
+        assert (_THREAD_ID, PostableMarkdown(markdown="First")) in adapter._post_calls
+        await sent.edit("Edited first")
+        await sent.delete()
+        assert (_THREAD_ID, sent.id, "Edited first") in adapter._edit_calls
+        assert adapter._delete_calls == [(_THREAD_ID, sent.id)]
+        assert chat.get_adapter("slack")._delete_calls == []
+
+    async def test_rebinds_serialized_objects_without_retaining_the_previous_runtime(self):
+        chat = _bot({"slack": create_mock_adapter("slack")})
+        payload = _dumps(
+            {
+                "nested": [chat.thread(_THREAD_ID), chat.channel("slack:C123")],
+                "message": create_test_message("message", "Hello"),
+                "values": [None, False, 0, "", {"_type": "unknown"}],
+            }
+        )
+        restored = _decode(payload, chat)
+        assert isinstance(restored["message"].metadata.date_sent, datetime)
+        assert restored["values"] == [None, False, 0, "", {"_type": "unknown"}]
+        adapter = create_mock_adapter("slack")
+        receiving = _bot({"slack": adapter}, user_name="receiving")
+        rebound = _decode(_dumps(restored), receiving)
+        clear_chat_singleton()
+        assert rebound["nested"][0].adapter is adapter
+        assert rebound["nested"][1].adapter is adapter
+        assert restored["nested"][0].adapter is chat.get_adapter("slack")
+        assert _dumps(rebound) == payload
+
+        thread = ThreadImpl.from_json(json.loads(_dumps(restored["nested"][0])))
+        channel = ChannelImpl.from_json(json.loads(_dumps(restored["nested"][1])))
+        with pytest.raises(RuntimeError, match="No Chat instance available"):
+            _ = thread.adapter
+        with pytest.raises(RuntimeError, match="No Chat instance available"):
+            _ = channel.adapter
+        receiving.register_singleton()
+        assert thread.adapter is adapter
+        assert channel.adapter is adapter

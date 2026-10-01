@@ -510,7 +510,7 @@ class TestDiscordLogHygiene:
             "data": {"name": "ask", "type": 1, "options": [{"name": "q", "type": 3, "value": SENTINEL_TEXT}]},
         }
 
-        adapter._handle_application_command_interaction(interaction, None)
+        adapter._handle_application_command_interaction(adapter._build_application_command_context(interaction))
 
         event = chat.process_slash_command.call_args[0][0]
         assert event.text == SENTINEL_TEXT

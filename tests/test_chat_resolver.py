@@ -16,7 +16,7 @@ import pytest
 
 from chat_sdk import Chat, MemoryStateAdapter
 from chat_sdk.channel import ChannelImpl
-from chat_sdk.testing import create_mock_adapter
+from chat_sdk.testing import create_mock_adapter, create_mock_state
 from chat_sdk.thread import (
     ThreadImpl,
     clear_chat_singleton,
@@ -192,6 +192,37 @@ class TestContextVarActivation:
         # Now activate a different chat — thread should NOT re-resolve
         with chat_b.activate():
             assert thread.adapter.name == "a_adapter"  # still bound to chat_a
+
+    async def test_explicit_adapter_restored_inside_activate_keeps_its_owner(self):
+        """Eager ownership (divergence, see docs/UPSTREAM_SYNC.md): an explicit
+        adapter is matched against the active Chat during ``from_json``, so
+        the thread keeps that Chat's state and streaming settings after the
+        ``activate()`` block exits. Upstream checks lazily, which here would
+        find no Chat at all."""
+        chat = Chat(
+            adapters={"slack": create_mock_adapter("slack")},
+            state=create_mock_state(),
+            user_name="bot",
+            fallback_streaming_placeholder_text=None,
+        )
+        adapter = chat.get_adapter("slack")
+
+        with chat.activate():
+            thread = ThreadImpl.from_json(_thread_json("slack"), adapter=adapter)
+            channel = ChannelImpl.from_json(_channel_json("slack"), adapter=adapter)
+
+        assert not has_chat_singleton()
+        await thread.set_state({"owner": "chat"})
+        await channel.set_state({"owner": "chat"})
+        assert await chat.get_state().get("thread-state:t1") == {"owner": "chat"}
+        assert await chat.get_state().get("channel-state:slack:C1") == {"owner": "chat"}
+
+        async def _stream():
+            yield "Hi"
+
+        await thread.post(_stream())
+        # The owner's ``None`` placeholder applies: no "..." is posted first.
+        assert [content for _, content in adapter._post_calls if content == "..."] == []
 
 
 class TestExplicitChatParameter:
@@ -472,12 +503,15 @@ class TestChatThreadFactory:
         thread = chat.thread(thread_id, current_message=msg)
         assert thread._current_message is msg
 
-    def test_omitting_current_message_stubs_a_placeholder(self):
-        """Workers that only post (no streaming) can omit ``current_message``."""
+    async def test_omitting_current_message_leaves_no_message_context(self):
+        """Without ``current_message`` the handle carries no stub message
+        (vercel/chat#633): no current message, nothing in
+        ``recent_messages``, and no empty-id author among the participants."""
         chat = _make_chat("slack")
         thread = chat.thread("slack:C123:1234567890.123456")
-        assert thread._current_message is not None
-        assert thread._current_message.id == ""
+        assert thread._current_message is None
+        assert thread.recent_messages == []
+        assert await thread.get_participants() == []
 
     def test_reuses_parent_chat_state_and_history(self):
         """The factory must bind the new Thread to the parent Chat's state
