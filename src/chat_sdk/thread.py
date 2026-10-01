@@ -482,6 +482,12 @@ class ThreadImpl:
         property getter return types have to match protocol return types
         exactly.
         """
+        # Upstream parity (thread.ts `get channel()`, chat@4.41.1): the channel
+        # is cached with the state resolved at first access. For an unowned
+        # explicit adapter that is the active Chat's state, and the cached
+        # channel keeps it even if the thread later finds its owner. Upstream's
+        # "does not borrow an unrelated runtime for an explicit adapter" test
+        # asserts exactly this capture.
         if self._channel_cache is None:
             from chat_sdk.channel import ChannelImpl, derive_channel_id
 
