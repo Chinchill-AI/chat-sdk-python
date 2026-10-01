@@ -335,6 +335,26 @@ class TestStreamCancellation:
         assert isinstance(result, RawMessage)
         assert result.id == "1234567890.5"
 
+    # Python-specific: closing a generator that holds a TaskGroup across
+    # ``yield`` raises ``BaseExceptionGroup([GeneratorExit()])``; the close is
+    # best-effort, so the native stream is still finalized.
+    async def test_a_failing_input_close_still_finalizes_the_stream(self):
+        adapter, client, _ = _adapter(agent_view=True)
+        streamer = _streaming(adapter, client)
+        signal = TurnSignal()
+
+        async def chunks() -> AsyncIterator[str]:
+            async with asyncio.TaskGroup():
+                yield "first\n"
+                signal._abort()
+                yield "second\n"
+
+        result = await adapter.stream("slack:D1:1.2", chunks(), StreamOptions(signal=signal))
+
+        streamer.stop.assert_awaited_once_with(token=TOKEN, session_status="active")
+        assert result is not None
+        assert result.id == "1234567890.5"
+
     async def test_requested_session_status_is_sent_on_the_final_stop(self):
         adapter, client, _ = _adapter(agent_view=True)
         streamer = _streaming(adapter, client)

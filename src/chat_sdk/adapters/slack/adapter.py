@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs
 
+from chat_sdk._compat import aclose_quietly
 from chat_sdk.adapters.slack.agent_context import (
     _js_truthy,
     get_app_context,
@@ -6470,9 +6471,8 @@ class SlackAdapter:
                 # Python-specific: JS ``for await`` closes the iterator on
                 # ``break``; Python's ``async for`` does not, which would leave
                 # a generator input (and its producer cleanup) suspended.
-                aclose = getattr(source, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+                # Best-effort, so a failing close cannot skip ``stop()``.
+                await aclose_quietly(source)
                 break
             if isinstance(chunk, str):
                 await push_text_and_flush(chunk)

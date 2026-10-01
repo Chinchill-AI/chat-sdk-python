@@ -2318,7 +2318,8 @@ the legacy `assistant_view` payloads are unchanged. No divergence-table rows.
 - **`stream()`.** Each chunk-loop iteration first checks
   `options.signal.aborted` and breaks, so the stream is still finalized
   through `stop()` (the signal is checked, the task is not cancelled).
-  Before breaking it closes the input iterator (`aclose()`): JS `for await`
+  Before breaking it closes the input iterator (best-effort `aclose()`, so a
+  failing close cannot skip `stop()`): JS `for await`
   does that on `break`, Python's `async for` does not.
   Under `agent_view` the final `stop()` carries `session_status`
   (`options.session_status`, default `"active"`), the rotation `stop()`
