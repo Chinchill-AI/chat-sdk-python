@@ -1,7 +1,7 @@
 # Claude Code Quick Reference -- chat-sdk-python
 
 ## What is this?
-Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to upstream v4.31.0). Multi-platform async chat framework.
+Python port of [Vercel Chat SDK](https://github.com/vercel/chat) (synced to upstream v4.41.1). Multi-platform async chat framework.
 
 ## Key Commands
 ```bash
@@ -32,6 +32,7 @@ Our version embeds the upstream Vercel Chat version: `0.{upstream_major}.{upstre
 - `0.4.31.1` = Python-only fixes on top of `4.31.0` (Slack #138/#95)
 - `0.4.31.2` = tagged, never published (publish action rejected Metadata-Version 2.5; tag immutable) — superseded by
 - `0.4.31.3` = Python-only fixes on top of `4.31.0` (Teams Graph SSRF-guard hardening #178, NOTICE); same content as 0.4.31.2
+- `0.4.41` = synced to upstream `4.41.1` (the 4.41 wave, #184; `UPSTREAM_PARITY = "4.41.1"`, the exact strict pin tag, not `4.41.0`)
 - `UPSTREAM_PARITY` constant in `__init__.py` = programmatic access
 
 ## Architecture
@@ -115,13 +116,15 @@ will not pass CI.
 **Fidelity check** (`scripts/verify_test_fidelity.py`) verifies every TS
 `it("...")` / `test("...")` in the mapped core files — plus one logical
 test per `it.each` template — has a matching Python `def test_*()`,
-pinned to `chat@4.31.0` (major.minor must match `UPSTREAM_PARITY`).
+pinned to `chat@4.41.1` (major.minor must match `UPSTREAM_PARITY`).
 The pin lives in **`scripts/upstream_pin.json`** (`pin` = strict CI tag +
 commit SHA, `target` = the sync wave's tag); nothing else hard-codes it.
 Scope is two-tier: `MAPPING` is the strict set; `TARGET_MAPPING` rows are
 only checked by `--report-target`; `UNMAPPED` lists deliberate skips with
 reasons. Every `packages/chat/src/**/*.test.ts(x)` must be in one of the
-three (remaining unmapped work: issue #78).
+three. At the `chat@4.41.1` pin the strict tier is 922/922; the four
+report-only `TARGET_MAPPING` rows (`cards`, `modals`, `emoji`, `message`)
+and the `#78 pending` `UNMAPPED` rows are the remaining work (issue #78).
 **CI runs `--strict`** (see `.github/workflows/lint.yml`):
 any missing translation in a mapped file fails the build, a missing
 upstream checkout fails, and a checkout whose HEAD differs from the pinned

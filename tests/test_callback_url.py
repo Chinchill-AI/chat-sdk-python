@@ -388,13 +388,12 @@ class TestResolveCallbackUrl:
         result = await resolve_callback_url("legacy-token", state, CallbackContext(action_id="approve"))
         assert result is None
 
-    # it("handles legacy string format") — chat@4.31.0 title, behavior now
-    # reversed. Kept so strict fidelity at the 4.31.0 pin stays green until
-    # the pin moves to 4.41.1 (#203), where upstream replaced it with the
-    # test above. Asserts what the rejection above does not: even a context
-    # that would match any record resolves nothing, and the legacy record is
-    # left for its TTL rather than deleted.
-    async def test_handles_legacy_string_format(self):
+    # Python-only follow-up to the rejection above (upstream's chat@4.31.0
+    # "handles legacy string format" test asserted the opposite and was
+    # replaced at chat@4.40.0). Asserts what that rejection does not: even a
+    # context that would match any record resolves nothing, and the legacy
+    # record is left for its TTL rather than deleted.
+    async def test_legacy_string_record_never_resolves_and_is_not_deleted(self):
         state = create_mock_state()
         await state.set("chat:callback:legacy-token", "https://example.com/hook")
         state.delete = AsyncMock(wraps=state.delete)  # type: ignore[method-assign]

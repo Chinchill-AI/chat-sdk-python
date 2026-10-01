@@ -248,7 +248,7 @@
     },
     "packages/chat/src/history/user.test.ts": {
       "python": "tests/test_history_user.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 26,
       "each_templates": 1,
@@ -261,7 +261,7 @@
     },
     "packages/chat/src/history/thread.test.ts": {
       "python": "tests/test_history_thread.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 15,
       "each_templates": 0,
@@ -274,7 +274,7 @@
     },
     "packages/chat/src/history/channel.test.ts": {
       "python": "tests/test_history_channel.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 8,
       "each_templates": 0,
@@ -287,7 +287,7 @@
     },
     "packages/chat/src/history/to-prompt.test.ts": {
       "python": "tests/test_history_to_prompt.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 2,
       "each_templates": 0,
@@ -300,7 +300,7 @@
     },
     "packages/chat/src/agent-session.test.ts": {
       "python": "tests/test_agent_session.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 2,
       "each_templates": 0,
@@ -313,7 +313,7 @@
     },
     "packages/chat/src/app-context.test.ts": {
       "python": "tests/test_app_context.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 1,
       "each_templates": 0,
@@ -326,7 +326,7 @@
     },
     "packages/chat/src/installation-events.test.ts": {
       "python": "tests/test_installation_events.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 4,
       "each_templates": 0,
@@ -339,7 +339,7 @@
     },
     "packages/adapter-shared/src/download.test.ts": {
       "python": "tests/test_shared_download.py",
-      "tier": "target",
+      "tier": "strict",
       "python_exists": true,
       "ts_tests": 28,
       "each_templates": 5,

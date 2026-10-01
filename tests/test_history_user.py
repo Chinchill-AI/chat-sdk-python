@@ -5,9 +5,10 @@ delete, eviction, and formatted round-trip behavior, plus the deprecated
 ``TranscriptsApiImpl`` alias.
 
 TS files: packages/chat/src/history/user.test.ts (the renamed transcripts
-suite) and packages/chat/src/transcripts.test.ts. The upstream pin
-(chat@4.31.0) still has the whole suite in transcripts.test.ts, so both TS
-files map here; see scripts/verify_test_fidelity.py.
+suite) and packages/chat/src/transcripts.test.ts. Up to chat@4.38 the
+whole suite lived in transcripts.test.ts; at the chat@4.41.1 pin that file
+keeps only the deprecated-alias test. Both TS files map here; see
+scripts/verify_test_fidelity.py.
 """
 
 from __future__ import annotations

@@ -288,8 +288,10 @@ from chat_sdk.types import (
     WellKnownEmoji,
 )
 
-# The upstream Vercel Chat version this release is synced to.
-UPSTREAM_PARITY = "4.31.0"
+# The upstream Vercel Chat version this release is synced to. It names the
+# exact strict-fidelity pin tag (scripts/upstream_pin.json); the package
+# version encodes only major.minor (0.4.41 -> chat@4.41.1).
+UPSTREAM_PARITY = "4.41.1"
 
 __all__ = [
     "UPSTREAM_PARITY",
