@@ -14,7 +14,9 @@ from __future__ import annotations
 import chat_sdk
 import chat_sdk.ai as chat_sdk_ai
 import chat_sdk.cards as chat_sdk_cards
+import chat_sdk.history as chat_sdk_history
 import chat_sdk.modals as chat_sdk_modals
+import chat_sdk.types as chat_sdk_types
 
 # The exact set of deprecated AI type aliases re-exported from the root,
 # mirroring upstream index.ts:8-27.
@@ -91,3 +93,31 @@ def test_card_and_modal_4_41_additions_are_root_exports() -> None:
     assert chat_sdk.chart is chat_sdk.Chart
     assert chat_sdk.date_input is chat_sdk.DateInput
     assert chat_sdk.number_input is chat_sdk.NumberInput
+
+
+# History API names added in the 4.41 wave (#197), mirroring upstream
+# index.ts, keyed by their canonical module.
+_HISTORY_4_41_EXPORTS = {
+    chat_sdk_history: ("HistoryApiImpl", "PromptEntry", "to_prompt_entries"),
+    chat_sdk_types: (
+        "ChannelHistoryApi",
+        "HistoryApi",
+        "HistoryConfig",
+        "HistoryEntry",
+        "ThreadHistoryApi",
+        "UserHistoryApi",
+        "UserHistoryConfig",
+        "UserHistoryEntry",
+    ),
+}
+
+
+def test_history_4_41_additions_are_root_exports() -> None:
+    for module, names in _HISTORY_4_41_EXPORTS.items():
+        for name in names:
+            assert name in chat_sdk.__all__, f"{name} missing from chat_sdk.__all__"
+            assert getattr(chat_sdk, name) is getattr(module, name)
+    # The canonical entry names are the deprecated ones, not new classes.
+    assert chat_sdk.HistoryEntry is chat_sdk.TranscriptEntry
+    assert chat_sdk.UserHistoryEntry is chat_sdk.TranscriptEntry
+    assert chat_sdk.UserHistoryApi is chat_sdk.TranscriptsApi

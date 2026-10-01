@@ -1,15 +1,18 @@
 """Faithful translation of transcripts-wiring.test.ts.
 
-Tests for the Chat-level Transcripts API wiring: the constructor guard
-(``transcripts`` requires ``identity``), the ``chat.transcripts`` accessor,
-and the identity-resolution dispatch hook that populates
-``message.user_key`` before handlers run.
+Tests for the Chat-level History API wiring: the constructor guard (user
+history requires an identity resolver), the ``chat.history.user`` /
+deprecated ``chat.transcripts`` accessors, the field-by-field merge of
+``history.user`` over the legacy ``transcripts`` block, and the
+identity-resolution dispatch hook that populates ``message.user_key``
+before handlers run.
 
 TS file: packages/chat/src/transcripts-wiring.test.ts
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,10 +27,15 @@ from chat_sdk.testing import (
     create_mock_state,
     create_test_message,
 )
-from chat_sdk.types import ChatConfig, TranscriptsConfig
+from chat_sdk.types import (
+    ChatConfig,
+    HistoryConfig,
+    TranscriptsConfig,
+    UserHistoryConfig,
+)
 
-TRANSCRIPTS_NOT_CONFIGURED_RE = r"chat\.transcripts is not configured"
-IDENTITY_REQUIRED_RE = r"requires ChatConfig\.identity"
+USER_HISTORY_NOT_CONFIGURED_RE = r"chat\.history\.user is not configured|chat\.transcripts is not configured"
+IDENTITY_REQUIRED_RE = r"identity resolver|requires ChatConfig\.identity"
 
 THREAD_ID = "slack:C123:1234.5678"
 
@@ -85,6 +93,15 @@ def mock_state() -> MockStateAdapter:
 
 
 class TestTranscriptsApiWiring:
+    # TS: "throws at construction when history.user is set without identity"
+    def test_throws_at_construction_when_historyuser_is_set_without_identity(self, mock_adapter, mock_state):
+        with pytest.raises(ValueError, match=IDENTITY_REQUIRED_RE):
+            _make_chat(
+                mock_adapter,
+                mock_state,
+                history=HistoryConfig(user=UserHistoryConfig(max_per_user=200)),
+            )
+
     # TS: "throws at construction when transcripts is set without identity"
     def test_throws_at_construction_when_transcripts_is_set_without_identity(self, mock_adapter, mock_state):
         with pytest.raises(ValueError, match=IDENTITY_REQUIRED_RE):
@@ -100,12 +117,64 @@ class TestTranscriptsApiWiring:
         chat = _make_chat(mock_adapter, mock_state, identity=lambda ctx: "u1")
         assert isinstance(chat, Chat)
 
-    # TS: "chat.transcripts getter throws when transcripts was not configured"
-    def test_chattranscripts_getter_throws_when_transcripts_was_not_configured(self, mock_adapter, mock_state):
+    # TS: "chat.history.user getter throws when user history was not configured"
+    def test_chathistoryuser_getter_throws_when_user_history_was_not_configured(self, mock_adapter, mock_state):
         chat = _make_chat(mock_adapter, mock_state)
 
-        with pytest.raises(ChatError, match=TRANSCRIPTS_NOT_CONFIGURED_RE):
+        with pytest.raises(ChatError, match=USER_HISTORY_NOT_CONFIGURED_RE):
+            _ = chat.history.user
+
+    # TS: "chat.transcripts getter throws when user history was not configured"
+    def test_chattranscripts_getter_throws_when_user_history_was_not_configured(self, mock_adapter, mock_state):
+        chat = _make_chat(mock_adapter, mock_state)
+
+        with pytest.raises(ChatError, match=USER_HISTORY_NOT_CONFIGURED_RE):
             _ = chat.transcripts
+
+    # TS: "chat.history.user returns the API instance when configured via history.user"
+    def test_chathistoryuser_returns_the_api_instance_when_configured_via_historyuser(self, mock_adapter, mock_state):
+        chat = _make_chat(
+            mock_adapter,
+            mock_state,
+            history=HistoryConfig(user=UserHistoryConfig(identity=lambda ctx: "u1")),
+        )
+
+        api = chat.history.user
+        assert callable(api.append)
+        assert chat.transcripts is api
+
+    # TS: "merges legacy maxPerUser=%s under history.user"
+    @pytest.mark.parametrize("max_per_user", [50, False])
+    async def test_merges_legacy_maxperuser_under_historyuser(self, mock_adapter, mock_state, max_per_user):
+        # A config migrating one field at a time: identity moved to
+        # history.user, retention/max_per_user still on the legacy
+        # transcripts block. Both must apply.
+        chat = _make_chat(
+            mock_adapter,
+            mock_state,
+            history=HistoryConfig(user=UserHistoryConfig(identity=lambda ctx: "u1")),
+            transcripts=TranscriptsConfig(max_per_user=max_per_user, retention="30d"),
+        )
+        calls: list[tuple[str, dict, int | None, int | None]] = []
+
+        async def _record(key, value, *, max_length=None, ttl_ms=None):
+            calls.append((key, value, max_length, ttl_ms))
+
+        mock_state.append_to_list = _record  # type: ignore[method-assign]
+
+        msg = create_test_message("m1", "hello")
+        msg.user_key = "u1"
+        await chat.history.user.append(SimpleNamespace(adapter=mock_adapter, id="slack:C123:1.2"), msg)
+
+        thirty_days_ms = 30 * 24 * 60 * 60 * 1000
+        assert len(calls) == 1
+        key, value, max_length, ttl_ms = calls[0]
+        assert "u1" in key
+        assert value["userKey"] == "u1"
+        # ``False`` must reach the backend as "no cap" (None), never as the
+        # bool itself.
+        assert max_length == (None if max_per_user is False else max_per_user)
+        assert ttl_ms == thirty_days_ms
 
     # TS: "chat.transcripts returns the API instance when configured"
     def test_chattranscripts_returns_the_api_instance_when_configured(self, mock_adapter, mock_state):
@@ -238,3 +307,41 @@ class TestDispatchHook:
 
         handler.assert_called()
         assert message.user_key is None
+
+
+# ---------------------------------------------------------------------------
+# Python-specific: config precedence (upstream chat.ts constructor)
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryConfigPrecedence:
+    async def test_history_user_identity_wins_over_top_level_identity(self, mock_adapter, mock_state):
+        # Upstream: `config.history?.user?.identity ?? config.identity`.
+        legacy = AsyncMock(return_value="legacy@example.com")
+        preferred = AsyncMock(return_value="preferred@example.com")
+        handler = AsyncMock(return_value=None)
+        chat = _make_chat(
+            mock_adapter,
+            mock_state,
+            identity=legacy,
+            history=HistoryConfig(user=UserHistoryConfig(identity=preferred)),
+        )
+
+        message = await _dispatch_subscribed_message(chat, mock_adapter, mock_state, handler)
+
+        assert message.user_key == "preferred@example.com"
+        legacy.assert_not_called()
+
+    async def test_history_thread_wins_over_thread_history(self, mock_adapter, mock_state):
+        # Upstream: `history?.thread ?? threadHistory ?? messageHistory`.
+        chat = _make_chat(
+            mock_adapter,
+            mock_state,
+            history=HistoryConfig(thread={"max_messages": 2}),
+            thread_history={"max_messages": 5},
+        )
+        for i in range(3):
+            await chat.history.thread.append(THREAD_ID, create_test_message(f"m{i}", f"msg {i}"))
+
+        stored = await mock_state.get_list(f"msg-history:{THREAD_ID}")
+        assert [entry["text"] for entry in stored] == ["msg 1", "msg 2"]

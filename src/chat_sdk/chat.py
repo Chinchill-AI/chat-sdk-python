@@ -28,6 +28,7 @@ from chat_sdk.callback_url import (
 from chat_sdk.channel import ChannelImpl, _ChannelImplConfigWithAdapter
 from chat_sdk.context import conversation
 from chat_sdk.errors import ChatError, ChatNotImplementedError, LockError
+from chat_sdk.history import HistoryApiImpl, UserHistoryApiImpl
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.thread import (
     ThreadImpl,
@@ -37,7 +38,6 @@ from chat_sdk.thread import (
     has_chat_singleton,
     set_chat_singleton,
 )
-from chat_sdk.transcripts import TranscriptsApiImpl
 from chat_sdk.types import (
     ActionEvent,
     Adapter,
@@ -72,6 +72,8 @@ from chat_sdk.types import (
     SlashCommandEvent,
     StateAdapter,
     TranscriptsApi,
+    TranscriptsConfig,
+    UserHistoryConfig,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -546,25 +548,48 @@ class Chat:
             else None
         )
 
-        # -- Thread history (placeholder -- real impl would use ThreadHistoryCache)
-        # `config.message_history` is the deprecated alias; `thread_history`
-        # takes precedence when both are set (mirrors upstream
-        # `config.threadHistory ?? config.messageHistory`).
-        self._thread_history = _ThreadHistoryCache(
-            self._state_adapter,
-            config.thread_history if config.thread_history is not None else config.message_history,
-        )
+        # -- Thread history ----------------------------------------------------
+        # Precedence mirrors upstream
+        # `config.history?.thread ?? config.threadHistory ?? config.messageHistory`
+        # (`message_history` is the deprecated alias of `thread_history`).
+        history_config = config.history
+        thread_history_config = history_config.thread if history_config is not None else None
+        if thread_history_config is None:
+            thread_history_config = (
+                config.thread_history if config.thread_history is not None else config.message_history
+            )
+        self._thread_history = _ThreadHistoryCache(self._state_adapter, thread_history_config)
 
-        # -- Transcripts API (cross-platform per-user persistence) -------------
-        self._identity: IdentityResolver | None = config.identity
-        self._transcripts: TranscriptsApiImpl | None = None
-        if config.transcripts is not None:
-            if config.identity is None:
-                raise ValueError(
-                    "ChatConfig.transcripts requires ChatConfig.identity to be set "
-                    "— the cross-platform user key must be resolvable"
-                )
-            self._transcripts = TranscriptsApiImpl(self._state_adapter, config.transcripts)
+        # -- User history (cross-platform per-user persistence) ----------------
+        # `history.user` is merged over the legacy `transcripts` block field by
+        # field, so a migration that only moves the identity resolver keeps
+        # the retention / max_per_user settings still on the legacy block.
+        user_history_config = _merge_user_history_config(
+            config.transcripts, history_config.user if history_config is not None else None
+        )
+        history_user_identity = (
+            history_config.user.identity if history_config is not None and history_config.user is not None else None
+        )
+        resolved_identity = history_user_identity if history_user_identity is not None else config.identity
+        if user_history_config is not None and resolved_identity is None:
+            raise ValueError(
+                "ChatConfig requires an identity resolver when user history (or legacy `transcripts`) is "
+                "configured — set `history.user.identity` or the deprecated top-level `identity` field"
+            )
+        self._identity: IdentityResolver | None = resolved_identity
+
+        # -- Unified History API -----------------------------------------------
+        # The resolver closes over `self._adapters` so adapters registered
+        # after construction are seen at call time.
+        self._history = HistoryApiImpl(
+            lambda name: self._adapters.get(name),
+            cache=self._thread_history,
+            user=(
+                UserHistoryApiImpl(self._state_adapter, user_history_config)
+                if user_history_config is not None
+                else None
+            ),
+        )
 
         # -- Logger -----------------------------------------------------------
         if isinstance(config.logger, str):
@@ -610,22 +635,30 @@ class Chat:
         self._logger.debug("Chat instance created", {"adapters": list(config.adapters.keys())})
 
     # ========================================================================
-    # Transcripts API
+    # History API
     # ========================================================================
 
     @property
-    def transcripts(self) -> TranscriptsApi:
-        """Cross-platform per-user transcript store.
+    def history(self) -> HistoryApiImpl:
+        """Unified History API.
 
-        Available only when ``transcripts`` is configured on the Chat
-        instance (and an ``identity`` resolver is set).  Raises on access
-        otherwise so callers fail loudly rather than silently no-op'ing.
+        - ``history.user``: cross-platform per-user transcript store (raises
+          on access if not configured)
+        - ``history.thread``: per-thread message listing
+        - ``history.channel``: channel-level messages and thread listings
         """
-        if self._transcripts is None:
-            raise ChatError(
-                "chat.transcripts is not configured — pass `transcripts` and `identity` to ChatConfig to enable it"
-            )
-        return self._transcripts
+        return self._history
+
+    @property
+    def transcripts(self) -> TranscriptsApi:
+        """Deprecated: use ``chat.history.user`` instead.
+
+        Available only when user history (``history.user`` or the legacy
+        ``transcripts``) is configured with an identity resolver.  Raises on
+        access otherwise so callers fail loudly rather than silently
+        no-op'ing.
+        """
+        return self.history.user
 
     # ========================================================================
     # Singleton management
@@ -3114,6 +3147,34 @@ def _message_from_json(data: dict[str, Any]) -> Message:
         attachments=_coerce_attachments(data.get("attachments", [])),
         is_mention=data.get("isMention") if "isMention" in data else data.get("is_mention"),
         links=data.get("links", []),
+    )
+
+
+def _merge_user_history_config(
+    transcripts: TranscriptsConfig | None,
+    user: UserHistoryConfig | None,
+) -> TranscriptsConfig | None:
+    """Merge ``history.user`` over the legacy ``transcripts`` block.
+
+    Upstream spreads ``{...transcripts, ...history.user}``. Dataclass fields
+    always exist, so the merge is field by field: a ``history.user`` field
+    wins unless it is ``None`` (unset). Returns ``None`` when neither block
+    is configured.
+    """
+    if transcripts is None and user is None:
+        return None
+
+    def pick(name: str) -> Any:
+        value = getattr(user, name) if user is not None else None
+        if value is not None:
+            return value
+        return getattr(transcripts, name) if transcripts is not None else None
+
+    store_formatted = pick("store_formatted")
+    return TranscriptsConfig(
+        max_per_user=pick("max_per_user"),
+        retention=pick("retention"),
+        store_formatted=store_formatted if store_formatted is not None else False,
     )
 
 

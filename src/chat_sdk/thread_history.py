@@ -6,8 +6,8 @@ Used by adapters that lack server-side message history APIs
 (e.g. WhatsApp, Telegram).  Messages are atomically appended via
 ``state.append_to_list()``, which is safe without holding a thread lock.
 
-Distinct from the cross-platform per-user Transcripts API (see
-``transcripts.py``) — this cache is keyed by thread, not user.
+Distinct from the cross-platform per-user history API (``chat.history.user``,
+see ``history/user.py``) — this cache is keyed by thread, not user.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class ThreadHistoryCache:
     ``state.append_to_list()``, which is safe without holding a thread lock.
 
     Distinct from the cross-platform per-user
-    :class:`~chat_sdk.transcripts.TranscriptsApiImpl` (see ``transcripts.py``)
+    :class:`~chat_sdk.history.UserHistoryApiImpl` (``chat.history.user``)
     — this cache is keyed by thread, not user.
     """
 
