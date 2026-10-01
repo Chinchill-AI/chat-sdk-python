@@ -18,6 +18,7 @@ from chat_sdk.adapters.discord.adapter import (
     CHANNEL_TYPE_GROUP_DM,
     CHANNEL_TYPE_PUBLIC_THREAD,
     DiscordAdapter,
+    DiscordApiError,
 )
 from chat_sdk.adapters.discord.types import DiscordAdapterConfig, DiscordThreadId
 from chat_sdk.shared.errors import NetworkError, ValidationError
@@ -70,6 +71,10 @@ def _gateway_request(body: str, token: str = "test-token") -> _FakeRequest:
             "content-type": "application/json",
         },
     )
+
+
+# ``GET /channels/thread789`` response: thread789's parent is channel456.
+THREAD_789_CHANNEL = {"id": "thread789", "parent_id": "channel456"}
 
 
 def _msg_response(msg_id="msg001", channel_id="channel456", content="Hello"):
@@ -303,12 +308,15 @@ class TestPostMessage:
     @pytest.mark.asyncio
     async def test_posts_to_thread_channel(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=_msg_response(msg_id="msg002", channel_id="thread789"))
+        adapter._discord_fetch = AsyncMock(
+            side_effect=[THREAD_789_CHANNEL, _msg_response(msg_id="msg002", channel_id="thread789")]
+        )
 
         result = await adapter.post_message("discord:guild1:channel456:thread789", "Thread reply")
 
         assert result.id == "msg002"
         assert result.thread_id == "discord:guild1:channel456:thread789"
+        assert adapter._discord_fetch.call_args_list[0].args == ("/channels/thread789", "GET")
         call_args = adapter._discord_fetch.call_args
         assert call_args[0][0] == "/channels/thread789/messages"
 
@@ -359,7 +367,9 @@ class TestEditMessage:
     @pytest.mark.asyncio
     async def test_edits_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=_msg_response(msg_id="msg002", channel_id="thread789"))
+        adapter._discord_fetch = AsyncMock(
+            side_effect=[THREAD_789_CHANNEL, _msg_response(msg_id="msg002", channel_id="thread789")]
+        )
 
         result = await adapter.edit_message("discord:guild1:channel456:thread789", "msg002", "Edited thread reply")
 
@@ -400,12 +410,14 @@ class TestDeleteMessage:
     @pytest.mark.asyncio
     async def test_deletes_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.delete_message("discord:guild1:channel456:thread789", "msg002")
 
-        assert adapter._discord_fetch.call_count == 1
-        adapter._discord_fetch.assert_called_once_with("/channels/thread789/messages/msg002", "DELETE")
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/messages/msg002", "DELETE"),
+        ]
 
 
 # ============================================================================
@@ -430,7 +442,7 @@ class TestAddReaction:
     @pytest.mark.asyncio
     async def test_adds_reaction_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.add_reaction("discord:guild1:channel456:thread789", "msg001", "heart")
 
@@ -461,7 +473,7 @@ class TestRemoveReaction:
     @pytest.mark.asyncio
     async def test_removes_reaction_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.remove_reaction("discord:guild1:channel456:thread789", "msg001", "fire")
 
@@ -578,12 +590,14 @@ class TestStartTyping:
     @pytest.mark.asyncio
     async def test_sends_typing_to_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.start_typing("discord:guild1:channel456:thread789")
 
-        assert adapter._discord_fetch.call_count == 1
-        adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+        ]
 
 
 # ============================================================================
@@ -654,7 +668,7 @@ class TestFetchMessages:
                 "attachments": [],
             },
         ]
-        adapter._discord_fetch = AsyncMock(return_value=raw_messages)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, raw_messages])
 
         result = await adapter.fetch_messages("discord:guild1:channel456:thread789")
 
@@ -1557,11 +1571,12 @@ class TestCreateDiscordThread160004Recovery:
     @pytest.mark.asyncio
     async def test_recovers_when_thread_already_exists(self):
         adapter = _make_adapter(logger=_make_logger())
+        body = '{"code": 160004, "message": "A thread has already been created for this message"}'
         adapter._discord_fetch = AsyncMock(
             side_effect=NetworkError(
                 "discord",
-                "Discord API error: 400"
-                ' {"code": 160004, "message": "A thread has already been created for this message"}',
+                f"Discord API error: 400 {body}",
+                DiscordApiError(400, body),
             )
         )
 
@@ -1573,11 +1588,9 @@ class TestCreateDiscordThread160004Recovery:
     @pytest.mark.asyncio
     async def test_propagates_non_160004_network_errors(self):
         adapter = _make_adapter(logger=_make_logger())
+        body = '{"code": 50001, "message": "Missing Access"}'
         adapter._discord_fetch = AsyncMock(
-            side_effect=NetworkError(
-                "discord",
-                'Discord API error: 403 {"code": 50001, "message": "Missing Access"}',
-            )
+            side_effect=NetworkError("discord", f"Discord API error: 403 {body}", DiscordApiError(403, body))
         )
 
         with pytest.raises(NetworkError):
