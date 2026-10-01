@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -41,6 +42,7 @@ from chat_sdk.types import (
     EmojiValue,
     Message,
     MessageContext,
+    MessageDeletedEvent,
     MessageSubject,
     ModalResponse,
     ModalSubmitEvent,
@@ -527,6 +529,64 @@ class TestSkipSelf:
         )
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
         assert len(calls) == 0
+
+
+class TestMessageLifecycleEvents:
+    # TS: "should dispatch message updates without normal message routing"
+    async def test_should_dispatch_message_updates_without_normal_message_routing(self):
+        chat, adapter, _ = await _init_chat()
+        update_handler = AsyncMock()
+        mention_handler = AsyncMock()
+        chat.on_message_updated(update_handler)
+        chat.on_mention(mention_handler)
+
+        message = create_test_message("msg-update-1", "Edited @testbot")
+        message.metadata.edited = True
+        message.metadata.edited_at = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+        previous_message = create_test_message("msg-update-1", "Original @testbot")
+
+        await chat.process_message_updated(
+            adapter=adapter,
+            message=message,
+            previous_message=previous_message,
+            thread_id="slack:C123:update.1",
+        )
+
+        assert update_handler.await_count == 1
+        thread, received, previous = update_handler.await_args.args
+        assert thread.id == "slack:C123:update.1"
+        assert received is message
+        assert previous is previous_message
+        mention_handler.assert_not_awaited()
+
+    # TS: "should dispatch message deletes with normalized event data"
+    async def test_should_dispatch_message_deletes_with_normalized_event_data(self):
+        chat, adapter, _ = await _init_chat()
+        delete_handler = AsyncMock()
+        chat.on_message_deleted(delete_handler)
+
+        await chat.process_message_deleted(
+            MessageDeletedEvent(
+                adapter=adapter,
+                channel_id="C123",
+                deleted_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc),
+                message_id="1234.5678",
+                raw={"subtype": "message_deleted"},
+                thread_id="slack:C123:1234.5678",
+            )
+        )
+
+        delete_handler.assert_awaited_once_with(
+            MessageDeletedEvent(
+                adapter=adapter,
+                channel_id="C123",
+                deleted_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc),
+                message_id="1234.5678",
+                platform="slack",
+                raw={"subtype": "message_deleted"},
+                thread_id="slack:C123:1234.5678",
+            )
+        )
 
 
 # ============================================================================

@@ -305,14 +305,17 @@ class TestFetchMessagesCursors:
         assert result.next_cursor is None
 
     @pytest.mark.asyncio
-    async def test_fetches_from_thread_channel(self):
+    async def test_cached_thread_parent_skips_channel_lookup(self):
+        # A fresh parent learned from an inbound event (here: seeded) lets the
+        # outbound call go straight to the thread without ``GET /channels``.
         adapter = _make_adapter(logger=_make_logger())
+        adapter._remember_thread_parent("thread789", "channel456")
         adapter._discord_fetch = AsyncMock(return_value=[])
 
         await adapter.fetch_messages("discord:guild1:channel456:thread789")
 
-        call_args = adapter._discord_fetch.call_args
-        assert "/channels/thread789/messages?" in call_args[0][0]
+        adapter._discord_fetch.assert_called_once()
+        assert adapter._discord_fetch.call_args[0][0].startswith("/channels/thread789/messages?")
 
 
 # ============================================================================
