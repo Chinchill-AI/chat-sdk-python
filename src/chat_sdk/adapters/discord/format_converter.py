@@ -147,7 +147,10 @@ class DiscordFormatConverter(BaseFormatConverter):
             return "".join(self._node_to_discord_markdown(child) for child in get_node_children(node))
 
         if node_type == "text":
-            # Convert bare @mentions to Discord format <@mention>
+            # Convert bare @mentions to Discord format <@mention>. Upstream
+            # parity (markdown.ts:106 + :164, verified under Node at
+            # chat@4.41.1): a native mention glued to a word character, e.g.
+            # ``<@1><@2>`` -> to_ast ``@1@2``, round-trips as ``<@1>@2``.
             return self._convert_mentions_to_discord(get_node_value(node))
 
         if node_type == "strong":
