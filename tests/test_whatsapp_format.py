@@ -49,6 +49,28 @@ class TestWhatsAppToAst:
         ast = converter.to_ast("```\ncode\n```")
         assert ast["type"] == "root"
 
+    def test_preserves_code_starting_immediately_after_the_opening_fence(self):
+        # WhatsApp puts the first code line right after the ```, which
+        # CommonMark would read as an info string.
+        ast = converter.to_ast("Here you go:\n```first line\nsecond line```")
+        assert ast["children"][0]["type"] == "paragraph"
+        code = ast["children"][1]
+        assert (code["type"], code.get("lang"), code["value"]) == ("code", None, "first line\nsecond line")
+
+    def test_does_not_rewrite_bold_or_strikethrough_inside_fenced_code(self):
+        ast = converter.to_ast("```int *a = *b; ~x~```")
+        code = ast["children"][0]
+        assert (code["type"], code["value"]) == ("code", "int *a = *b; ~x~")
+
+    def test_keeps_an_unpaired_triple_backtick_as_literal_text(self):
+        ast = converter.to_ast("use ``` to fence *code*")
+        assert len(ast["children"]) == 1
+        assert ast["children"][0]["type"] == "paragraph"
+
+    def test_separates_a_fence_from_surrounding_text_on_the_same_line(self):
+        ast = converter.to_ast("before ```code``` after")
+        assert [child["type"] for child in ast["children"]] == ["paragraph", "code", "paragraph"]
+
     def test_lists(self):
         ast = converter.to_ast("- item 1\n- item 2\n- item 3")
         assert ast["type"] == "root"

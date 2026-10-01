@@ -34,7 +34,8 @@ from chat_sdk.adapters.messenger.types import (
 )
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import NetworkError, ValidationError
-from tests.test_messenger_fetch import FakeResponse, FakeSession, make_adapter
+from tests._slack_file_transport import FakeFileResponse
+from tests.test_messenger_fetch import install_transport, make_adapter
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -952,10 +953,10 @@ class TestAttachmentParsing:
         assert callable(parsed.attachments[0].fetch_data)
 
     @pytest.mark.asyncio
-    async def test_downloads_attachment_successfully(self) -> None:
-        """``fetch_data`` downloads a Meta-CDN URL through the shared session."""
-        session = FakeSession(FakeResponse(b"fake-image-data"))
-        adapter = make_adapter(session)
+    async def test_downloads_attachment_successfully(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``fetch_data`` downloads a Meta-CDN URL through the guarded downloader."""
+        transport = install_transport(monkeypatch, FakeFileResponse(b"fake-image-data"))
+        adapter = make_adapter()
         event = _sample_event(
             message={
                 "mid": "mid.dl",
@@ -967,14 +968,16 @@ class TestAttachmentParsing:
 
         result = await parsed.attachments[0].fetch_data()
         assert result == b"fake-image-data"
-        assert session.urls == ["https://cdn.fbsbx.com/img.jpg"]
+        assert [url for url, _ in transport.calls] == ["https://cdn.fbsbx.com/img.jpg"]
 
     @pytest.mark.asyncio
-    async def test_rejects_external_fallback_downloads_before_the_network(self) -> None:
+    async def test_rejects_external_fallback_downloads_before_the_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A user-controlled ``fallback`` URL is kept for display but never fetched."""
-        session = FakeSession(FakeResponse(b"secret"))
-        adapter = make_adapter(session)
-        url = "https://169.254.169.254/latest/meta-data"
+        transport = install_transport(monkeypatch, FakeFileResponse(b"secret"))
+        adapter = make_adapter()
+        url = "https://example.com/latest/meta-data"
         event = _sample_event(
             message={
                 "mid": "mid.fallback",
@@ -987,7 +990,7 @@ class TestAttachmentParsing:
         assert attachment.url == url
         with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
             await attachment.fetch_data()
-        assert session.calls == []
+        assert transport.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1023,7 @@ class TestRehydrateAttachment:
         assert parsed.attachments[0].fetch_metadata == {"url": "https://scontent.xx.fbcdn.net/img.jpg"}
 
     @pytest.mark.asyncio
-    async def test_rehydrate_rebuilds_fetch_data_after_queue_roundtrip(self) -> None:
+    async def test_rehydrate_rebuilds_fetch_data_after_queue_roundtrip(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Simulate the queue/serialize cycle and confirm rehydration restores downloads.
 
         This is the load-bearing test: it would FAIL if ``rehydrate_attachment``
@@ -1050,16 +1053,15 @@ class TestRehydrateAttachment:
         # Preserves the metadata so a second roundtrip would still work.
         assert rehydrated.fetch_metadata == {"url": "https://scontent.xx.fbcdn.net/img.jpg"}
 
-        # Wire a fake session to capture the URL the rebuilt closure hits.
-        session = FakeSession(FakeResponse(b"rehydrated-bytes"))
-        adapter._http_session = session
+        # Wire a fake transport to capture the URL the rebuilt closure hits.
+        transport = install_transport(monkeypatch, FakeFileResponse(b"rehydrated-bytes"))
 
         data = await rehydrated.fetch_data()
         assert data == b"rehydrated-bytes"
-        assert session.urls == ["https://scontent.xx.fbcdn.net/img.jpg"]
+        assert [url for url, _ in transport.calls] == ["https://scontent.xx.fbcdn.net/img.jpg"]
 
     @pytest.mark.asyncio
-    async def test_rehydrated_closure_refuses_untrusted_url_without_io(self) -> None:
+    async def test_rehydrated_closure_refuses_untrusted_url_without_io(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A tampered ``fetch_metadata["url"]`` in persisted state is not fetched.
 
         The allowlist runs inside the download closure, so the rehydrate path
@@ -1067,23 +1069,25 @@ class TestRehydrateAttachment:
         """
         from chat_sdk.types import Attachment
 
-        session = FakeSession(FakeResponse(b"internal"))
-        adapter = make_adapter(session)
+        transport = install_transport(monkeypatch, FakeFileResponse(b"internal"))
+        adapter = make_adapter()
         tampered = Attachment(
             type="image",
             url="https://scontent.xx.fbcdn.net/img.jpg",
-            fetch_metadata={"url": "http://10.0.0.5/admin"},
+            fetch_metadata={"url": "https://attacker.example/admin"},
         )
 
         rehydrated = adapter.rehydrate_attachment(tampered)
         assert rehydrated.fetch_data is not None
         with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
             await rehydrated.fetch_data()
-        assert session.calls == []
+        assert transport.calls == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tampered_url", [123, ["https://cdn.fbsbx.com/x"], {"href": "https://cdn.fbsbx.com/x"}])
-    async def test_rehydrated_closure_refuses_non_string_url_without_io(self, tampered_url: object) -> None:
+    async def test_rehydrated_closure_refuses_non_string_url_without_io(
+        self, tampered_url: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A truthy non-string ``fetch_metadata["url"]`` fails as ``NetworkError``.
 
         Without the ``isinstance(url, str)`` guard the URL check would raise a
@@ -1091,8 +1095,8 @@ class TestRehydrateAttachment:
         """
         from chat_sdk.types import Attachment
 
-        session = FakeSession(FakeResponse(b"internal"))
-        adapter = make_adapter(session)
+        transport = install_transport(monkeypatch, FakeFileResponse(b"internal"))
+        adapter = make_adapter()
         tampered = Attachment(
             type="image",
             url="https://scontent.xx.fbcdn.net/img.jpg",
@@ -1103,7 +1107,7 @@ class TestRehydrateAttachment:
         assert rehydrated.fetch_data is not None
         with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
             await rehydrated.fetch_data()
-        assert session.calls == []
+        assert transport.calls == []
 
     def test_rehydrate_no_metadata_returns_unchanged(self) -> None:
         """Degraded mode: attachment without ``fetch_metadata`` is returned as-is."""
