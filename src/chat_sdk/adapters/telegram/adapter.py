@@ -2753,6 +2753,9 @@ class TelegramAdapter:
                 raise rate_limit_error
             await self._sleep(max(blocked_ms, pacing_ms))
 
+            # Upstream parity (chat@4.41.1 index.ts:2069-2102): only a 429 is
+            # retried; any other error, including Telegram's "message is not
+            # modified" 400 for a payload it considers unchanged, propagates.
             try:
                 await apply_edit(content)
                 return
@@ -2765,6 +2768,9 @@ class TelegramAdapter:
 
             await apply_edit(content)
 
+        # Upstream parity (chat@4.41.1 index.ts:2104-2138): an error raised
+        # by ``text_stream`` propagates without a final edit, as upstream's
+        # ``for await`` does; the core fallback's partial flush is not used.
         async for chunk in text_stream:
             text = self._stream_chunk_text(chunk)
             if text is None:

@@ -1295,7 +1295,10 @@ ported; #915 replaced its helpers, and its cases are now covered by the
   `max(blocked, pacing)`, retries once after a 429, and raises when the wait
   or the 429's `retry_after` exceeds 5 s, or the retry fails. Every wait is
   an inline `await self._sleep(ms)`, so cancelling the caller cancels the
-  stream.
+  stream. Also as upstream: a non-429 failure of the final edit (including
+  Telegram's `message is not modified` 400) propagates, and an exception
+  raised by the text stream propagates without a final edit. Unlike the core
+  fallback, the loop does not flush partial text first.
 - **Python-surface adaptations (no behavior change).** Pacing reads
   `_monotonic_ms()` (`time.monotonic()`), not the epoch `_now_ms()` the
   polling checkpoint persists; both it and `_sleep` are overridable for
