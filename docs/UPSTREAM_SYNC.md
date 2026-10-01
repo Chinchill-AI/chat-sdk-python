@@ -1030,7 +1030,8 @@ split out to #278.
   metadata of the newest part (highest `message_id`), text and AST of the
   first part with text, every attachment in `message_id` order, links
   concatenated (`None` when no part has any), `is_mention` if any part
-  mentions the bot. `reply_to` is not carried (#228). Typing starts once, for
+  mentions the bot. `reply_to` is the first part's non-`None` `reply_to`, as
+  upstream; Telegram parsing does not populate it until #228. Typing starts once, for
   the first part, after the album settles. On the webhook path the album task
   is held in `_media_group_tasks` (no GC mid-settle); `wait_until` gets a
   wrapper that never raises, a failure is logged as "Failed to process
@@ -1064,7 +1065,12 @@ split out to #278.
   checkpoint is written it waits for that step, and the loop then exits,
   as upstream's `stopPolling` does. `stop_polling` waits with
   `asyncio.wait` instead of `suppress(CancelledError)`, so cancelling the
-  caller still propagates.
+  caller still propagates. One divergence: a stop that lands while the loop
+  awaits `_ensure_bot_identity()` or the checkpoint `state.get` makes the
+  loop return before dispatching the ready retry batch. Upstream has no
+  `pollingActive` check there and still dispatches it; in Python that batch
+  could start handlers after `Chat.shutdown`'s cancellation sweep. The batch
+  stays in the checkpoint and is retried on the next start.
 - **Python-specific: cancelled handlers.** `Chat.shutdown` cancels in-flight
   handler tasks before disconnecting adapters (upstream waits for them). A
   cancelled handler task is counted as a failure, so the update stays in the

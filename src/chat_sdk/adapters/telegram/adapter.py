@@ -1535,8 +1535,12 @@ class TelegramAdapter:
                 ]
                 ready = [entries for entries in eligible if deadline(entries) <= self._now_ms()]
                 if not self._polling_active:
-                    # Stopped during the checkpoint read: dispatch nothing new
-                    # (``disconnect`` has already cancelled settling albums).
+                    # Python-specific divergence: stopped during the identity
+                    # or checkpoint await, so dispatch nothing new. Upstream
+                    # has no check here and still runs the ready retry batch;
+                    # here it could start handlers after ``Chat.shutdown``'s
+                    # cancellation sweep (``disconnect`` has already cancelled
+                    # settling albums). The batch stays in the checkpoint.
                     return
                 if ready and not drained:
                     results = await self._process_polling_updates(
@@ -1869,9 +1873,17 @@ class TelegramAdapter:
 
             async def _settled() -> None:
                 # Errors are logged by ``_done``; cancelling this wrapper does
-                # not cancel the album task.
-                with contextlib.suppress(Exception):
+                # not cancel the album task. Like ``Chat._tracked``, an album
+                # cancelled by ``disconnect()`` counts as settled; only a
+                # cancellation of this wrapper itself propagates.
+                try:
                     await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:  # noqa: S110 — logged by ``_done``
+                    pass
 
             options.wait_until(loop.create_task(_settled()))
         return task
@@ -1966,6 +1978,8 @@ class TelegramAdapter:
                 author=latest_message.author,
                 metadata=latest_message.metadata,
                 attachments=[attachment for message in parsed_messages for attachment in message.attachments],
+                # Telegram parsing populates ``reply_to`` from #228.
+                reply_to=next((message.reply_to for message in parsed_messages if message.reply_to is not None), None),
                 is_mention=any(message.is_mention for message in parsed_messages),
                 links=links or None,
             )

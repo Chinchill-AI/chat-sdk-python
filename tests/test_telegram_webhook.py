@@ -32,7 +32,7 @@ from chat_sdk.chat import Chat
 from chat_sdk.shared.errors import AdapterRateLimitError, NetworkError, ValidationError
 from chat_sdk.shared.mock_adapter import MockLogger, MockStateAdapter, create_mock_state
 from chat_sdk.state.memory import MemoryStateAdapter
-from chat_sdk.types import ChatConfig, Message, WebhookOptions
+from chat_sdk.types import ChatConfig, LinkPreview, Message, WebhookOptions
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2491,6 +2491,37 @@ def _polled_album(*, chat_id: int = 1, first_id: int = 1) -> list[dict[str, Any]
     return parts
 
 
+def _polled_kind(kind: str) -> dict[str, Any]:
+    """Update ``1`` as an ordinary message, slash command, button action or reaction."""
+    ordinary = _polled_message(1)
+    if kind == "message":
+        return ordinary
+    if kind == "command":
+        return _polled_message(1, text="/help", entities=[{"type": "bot_command", "offset": 0, "length": 5}])
+    if kind == "action":
+        return {
+            "update_id": 1,
+            "callback_query": {
+                "id": "callback",
+                "chat_instance": "instance",
+                "from": ordinary["message"]["from"],
+                "message": ordinary["message"],
+                "data": "approve",
+            },
+        }
+    return {
+        "update_id": 1,
+        "message_reaction": {
+            "chat": ordinary["message"]["chat"],
+            "message_id": 1,
+            "date": 1,
+            "user": ordinary["message"]["from"],
+            "old_reaction": [],
+            "new_reaction": [{"type": "custom_emoji", "custom_emoji_id": "reaction"}],
+        },
+    }
+
+
 class _PollingFixture:
     """Real ``Chat`` + in-memory state + a Telegram adapter on a fake Bot API."""
 
@@ -2647,6 +2678,88 @@ class TestTelegramIncomingMediaGroup:
             {"error": "handler failed", "mediaGroupId": "g", "threadId": "telegram:-100"},
         ) in adapter._logger.warn.calls  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_combined_album_keeps_the_newest_ten_parts_once_each_and_merges_their_fields(self):
+        """Newest-10 cap, redelivery dedupe, ``is_mention`` from any part, links and ``reply_to``."""
+        clock = _FakeClock()
+        adapter = _make_adapter(mode="webhook", secret_token="secret", user_name="mybot")
+        clock.install(adapter)
+        chat = MagicMock()
+        chat.get_state.return_value = create_mock_state()
+        chat.process_message = MagicMock(
+            side_effect=lambda *_args, **_kwargs: asyncio.get_running_loop().create_task(asyncio.sleep(0))
+        )
+        adapter._chat = chat
+
+        def part(message_id: int, **overrides: Any) -> dict[str, Any]:
+            message = _sample_message(
+                message_id=message_id,
+                chat={"id": -100, "type": "group"},
+                media_group_id="g",
+                photo=[{"file_id": f"p{message_id}", "file_unique_id": f"u{message_id}", "width": 1, "height": 1}],
+                **overrides,
+            )
+            message.pop("text")
+            return message
+
+        # Telegram parsing fills neither ``links`` nor ``reply_to`` yet
+        # (#228), so the per-part values are injected after parsing.
+        quoted = [adapter.parse_telegram_message(_sample_message(message_id=n), "telegram:-100") for n in (90, 91)]
+        parse = adapter.parse_telegram_message
+        extras = {3: (quoted[0], "https://a.example"), 6: (quoted[1], "https://b.example")}
+
+        def parse_with_extras(message: Any, thread_id: str) -> Message:
+            parsed = parse(message, thread_id)
+            if message["message_id"] in extras:
+                parsed.reply_to, url = extras[message["message_id"]]
+                parsed.links = [LinkPreview(url=url)]
+            return parsed
+
+        adapter.parse_telegram_message = parse_with_extras  # type: ignore[method-assign]
+
+        # Eleven parts (the oldest falls out of the 10-part buffer), only an
+        # older part mentions the bot, and part 5 is redelivered.
+        parts = [part(n, **({"caption": "@mybot look"} if n == 2 else {})) for n in range(1, 12)] + [part(5)]
+        for index, message in enumerate(parts):
+            adapter.process_update({"update_id": index + 1, "message": message})  # type: ignore[typeddict-item]
+            await _flush()
+        await clock.advance(1_000)
+
+        chat.process_message.assert_called_once()
+        parsed = chat.process_message.call_args.args[2]
+        assert [attachment.fetch_metadata["fileId"] for attachment in parsed.attachments] == [
+            f"p{n}" for n in range(2, 12)
+        ]
+        assert parsed.id == "-100:11"
+        assert parsed.text == "@mybot look"
+        assert parsed.is_mention is True
+        assert [link.url for link in parsed.links] == ["https://a.example", "https://b.example"]
+        assert parsed.reply_to is quoted[0]
+
+    @pytest.mark.asyncio
+    async def test_waituntil_settles_when_disconnect_cancels_a_settling_album(self):
+        """Python-specific: ``disconnect()`` cancels the album; the ``wait_until`` task still settles."""
+        clock = _FakeClock()
+        adapter = _make_adapter(mode="webhook", secret_token="secret", user_name="mybot")
+        clock.install(adapter)
+        chat = MagicMock()
+        chat.get_state.return_value = create_mock_state()
+        adapter._chat = chat
+        waited: list[Any] = []
+        message = _sample_message(chat={"id": -100, "type": "group"}, media_group_id="g", caption="c")
+        message.pop("text")
+
+        [task] = adapter.process_update(
+            {"update_id": 1, "message": message},  # type: ignore[typeddict-item]
+            WebhookOptions(wait_until=waited.append),
+        )
+        await _flush()
+        await adapter.disconnect()
+
+        assert task.cancelled()
+        assert await waited[0] is None
+        chat.process_message.assert_not_called()
+
 
 class TestTelegramPollingAcknowledgement:
     """Polling waits for handlers before advancing ``offset`` (#942)."""
@@ -2732,32 +2845,7 @@ class TestTelegramPollingAcknowledgement:
     @pytest.mark.parametrize("kind", ["message", "command", "action", "reaction"])
     @pytest.mark.asyncio
     async def test_saves_a_failed_update_before_acknowledgement_and_retains_it_until_retry_succeeds(self, kind: str):
-        ordinary = _polled_message(1)
-        update: dict[str, Any] = {
-            "message": ordinary,
-            "command": _polled_message(1, text="/help", entities=[{"type": "bot_command", "offset": 0, "length": 5}]),
-            "action": {
-                "update_id": 1,
-                "callback_query": {
-                    "id": "callback",
-                    "chat_instance": "instance",
-                    "from": ordinary["message"]["from"],
-                    "message": ordinary["message"],
-                    "data": "approve",
-                },
-            },
-            "reaction": {
-                "update_id": 1,
-                "message_reaction": {
-                    "chat": ordinary["message"]["chat"],
-                    "message_id": 1,
-                    "date": 1,
-                    "user": ordinary["message"]["from"],
-                    "old_reaction": [],
-                    "new_reaction": [{"type": "custom_emoji", "custom_emoji_id": "reaction"}],
-                },
-            },
-        }[kind]
+        update = _polled_kind(kind)
         fixture = _PollingFixture([update])
         calls: list[Any] = []
         gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -2972,6 +3060,8 @@ class TestTelegramPollingAcknowledgement:
             fixture.api.deliver(_polled_message(5, chat_id=3))
             gate.set_result(None)
             await _wait_until(lambda: "telegram:3" in order)
+            # The other album is already due, so the poll does not wait.
+            assert fixture.api.polls[0]["timeout"] == 0
             await clock.advance(1_000)
             await _wait_until(lambda: "telegram:2" in order)
             assert order[:3] == ["telegram:1", "telegram:3", "telegram:2"]
@@ -3036,6 +3126,105 @@ class TestTelegramPollingAcknowledgement:
             handler.assert_not_awaited()
             assert await fixture.checkpoint() == saved
             assert "offset" not in fixture.api.polls[0]
+        finally:
+            await fixture.stop()
+
+    @pytest.mark.parametrize("kind", ["message", "command", "action", "reaction"])
+    @pytest.mark.asyncio
+    async def test_processes_beyond_a_full_page_despite_a_permanently_failing_update(self, kind: str):
+        update = _polled_kind(kind)
+        others = [_polled_message(update_id, chat_id=2) for update_id in range(2, 102)]
+        album = [
+            {
+                **part,
+                "update_id": part["update_id"] + 101,
+                "message": {**part["message"], "chat": {"id": 3, "type": "private"}},
+            }
+            for part in _polled_album()
+        ]
+        fixture = _PollingFixture([update, *others, *album])
+        received: list[str] = []
+
+        async def fail(*_args: Any) -> None:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+
+        async def on_mention(thread: Any, *_args: Any) -> None:
+            if thread.id == "telegram:1":
+                await fail()
+            received.append(thread.id)
+
+        fixture.chat.on_mention(on_mention)
+        fixture.chat.on_slash_command(fail)
+        fixture.chat.on_action(fail)
+        fixture.chat.on_reaction(fail)
+        try:
+            await fixture.start(limit=100, retry_delay_ms=0)
+            await _wait_until(lambda: fixture.api.polls and fixture.api.polls[-1].get("offset") == 104, rounds=20_000)
+            assert all(poll["limit"] == 100 for poll in fixture.api.polls)
+            await fixture.clock.advance(2_100)
+            await _wait_until(lambda: "telegram:3" in received, rounds=20_000)
+            assert received.count("telegram:2") == 100
+            saved = await fixture.checkpoint()
+            assert saved["offset"] == 104
+            assert [entry["update"] for entry in saved["pending"]] == [update]
+        finally:
+            await fixture.stop()
+
+    @pytest.mark.asyncio
+    async def test_combines_an_album_spanning_a_full_polling_response(self):
+        parts = _polled_album()
+        updates = [
+            {
+                **parts[index % 2],
+                "update_id": index + 1,
+                "message": {**parts[index % 2]["message"], "message_id": index + 1, "media_group_id": str(index // 3)},
+            }
+            for index in range(102)
+        ]
+        fixture = _PollingFixture(updates)
+        handler = AsyncMock()
+        fixture.chat.on_mention(handler)
+        try:
+            await fixture.start(limit=100)
+            # The last album straddles the page: its first part is in the
+            # first response and the other two in the second.
+            await _wait_until(lambda: len(fixture.api.polls) >= 3, rounds=20_000)
+            assert [poll.get("offset") for poll in fixture.api.polls[:3]] == [None, 101, 103]
+            for _ in range(10):
+                if handler.await_count == 34:
+                    break
+                await fixture.clock.advance(1_000)
+            assert handler.await_count == 34
+            for call in handler.await_args_list:
+                assert len(call.args[1].attachments) == 3
+            await _wait_until(lambda: _is_none(fixture.checkpoint()))
+        finally:
+            await fixture.stop()
+
+    @pytest.mark.asyncio
+    async def test_recovers_bot_identity_while_polling_after_a_failed_startup_get_me(self):
+        fixture = _PollingFixture([_polled_message(1)])
+        api = fixture.api
+        get_me_calls = 0
+
+        async def flaky_get_me(method: str, payload: Any = None, **kwargs: Any) -> Any:
+            nonlocal get_me_calls
+            if method == "getMe":
+                get_me_calls += 1
+                if get_me_calls == 1:
+                    raise NetworkError("telegram", "getMe unavailable")
+            return await api(method, payload, **kwargs)
+
+        fixture.adapter.telegram_fetch = flaky_get_me  # type: ignore[method-assign]
+        fixture.chat.on_mention(AsyncMock(side_effect=RuntimeError("Reply failed")))
+        try:
+            await fixture.start()
+            await _wait_until(lambda: len(fixture.api.polls) >= 2)
+            assert get_me_calls == 2
+            # The failure is saved under the recovered bot's scope.
+            saved = await fixture.checkpoint()
+            assert [entry["update"]["update_id"] for entry in saved["pending"]] == [1]
+            assert await fixture.state.get("telegram:polling:None") is None
         finally:
             await fixture.stop()
 
