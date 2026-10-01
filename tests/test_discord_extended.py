@@ -1257,6 +1257,87 @@ class TestForwardedMessageThreadHandling:
 
 
 # ============================================================================
+# Forwarded message -- tri-state is_mention (upstream vercel/chat#946)
+# ============================================================================
+
+
+def _forwarded_thread_message(content: str, **extra) -> str:
+    return json.dumps(
+        {
+            "type": "GATEWAY_MESSAGE_CREATE",
+            "timestamp": 1234567890,
+            "data": {
+                "id": "msg123",
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "content": content,
+                "timestamp": "2021-01-01T00:00:00.000Z",
+                "author": {"id": "user789", "username": "testuser", "bot": False},
+                "mentions": [],
+                "attachments": [],
+                "thread": {"id": "thread789", "parent_id": "channel456"},
+                **extra,
+            },
+        }
+    )
+
+
+class TestForwardedMessageMentionFlag:
+    # Mirrors upstream "keeps allowlisted forwarded messages in their Discord
+    # thread" (``isMention: isMentioned || undefined``): an unmentioned
+    # forwarded message reports no detection (None), never a definitive False.
+    @pytest.mark.asyncio
+    async def test_unmentioned_forwarded_message_leaves_is_mention_unset(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        adapter._chat = mock_chat
+
+        await adapter.handle_webhook(_gateway_request(_forwarded_thread_message("No mention needed")))
+
+        message = mock_chat.handle_incoming_message.await_args.args[2]
+        assert message.is_mention is None
+
+    @pytest.mark.asyncio
+    async def test_mentioned_forwarded_message_reports_definitive_mention(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        adapter._chat = mock_chat
+
+        await adapter.handle_webhook(
+            _gateway_request(
+                _forwarded_thread_message("<@test-app-id> hi", mentions=[{"id": "test-app-id", "username": "bot"}])
+            )
+        )
+
+        message = mock_chat.handle_incoming_message.await_args.args[2]
+        assert message.is_mention is True
+
+    # End to end through a real Chat: a literal ``@botname`` with no Discord
+    # mention metadata still routes to ``on_mention`` via text detection.
+    @pytest.mark.asyncio
+    async def test_literal_botname_text_routes_to_on_mention(self):
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import MockLogger, create_mock_state
+        from chat_sdk.types import ChatConfig
+
+        adapter = _make_adapter(logger=_make_logger(), user_name="mybot")
+        chat = Chat(
+            ChatConfig(user_name="mybot", adapters={"discord": adapter}, state=create_mock_state(), logger=MockLogger())
+        )
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        await chat.webhooks["discord"](_gateway_request(_forwarded_thread_message("hey @mybot can you help")))
+
+        mention_handler.assert_awaited_once()
+        thread, message = mention_handler.await_args.args[:2]
+        assert thread.id == "discord:guild1:channel456:thread789"
+        assert message.is_mention is True
+
+
+# ============================================================================
 # Forwarded reaction -- thread parent caching
 # ============================================================================
 
