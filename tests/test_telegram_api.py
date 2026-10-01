@@ -21,10 +21,9 @@ from chat_sdk.adapters.telegram.adapter import (
     TelegramAdapter,
     _trim_to_markdown_v2_safe_boundary,
     ends_with_orphan_backslash,
-    find_unescaped_positions,
     truncate_for_telegram,
 )
-from chat_sdk.adapters.telegram.format_converter import escape_markdown_v2
+from chat_sdk.adapters.telegram.format_converter import TelegramFormatConverter, escape_markdown_v2
 from chat_sdk.adapters.telegram.types import (
     TelegramAdapterConfig,
 )
@@ -1265,7 +1264,7 @@ class TestTruncation:
 
 
 # =============================================================================
-# Tests -- MarkdownV2-safe truncation (port of chat@4.27.0 b9a1961 + f46a6fb)
+# Tests -- MarkdownV2-safe truncation (port of markdown.test.ts @ chat@4.41.1)
 #
 # Background: legacy ``slice + "..."`` truncation produces invalid MarkdownV2
 # because (1) ``.`` is a reserved character that must be escaped as ``\.``,
@@ -1275,9 +1274,9 @@ class TestTruncation:
 # unclosed. Telegram rejects all three with
 # ``Bad Request: can't parse entities``.
 #
-# These tests pin the exact failure modes that ``truncate_for_telegram``
-# guards against. Each docstring includes "What to fix if this fails:"
-# pointing at the helper that needs to be re-examined.
+# Since vercel/chat#915 text that fits the limit is returned unchanged (the
+# chat#446 under-limit trim is gone) and the over-limit trimmer is a single
+# ``_scan_delimiters`` pass that skips code, escapes and link URLs.
 # =============================================================================
 
 
@@ -1285,34 +1284,27 @@ _ESCAPED_ELLIPSIS_PATTERN = "\\.\\.\\."
 
 
 class TestTruncateForTelegram:
-    """Length-limit tests for the MarkdownV2-safe truncator."""
+    """describe("truncateForTelegram")."""
 
     def test_returns_text_unchanged_when_under_limit(self):
-        """Plain text under the limit is returned verbatim.
-
-        What to fix if this fails: ``truncate_for_telegram`` early-return
-        for non-MarkdownV2 inputs in
-        ``src/chat_sdk/adapters/telegram/adapter.py``.
-        """
+        """Plain text under the limit is returned verbatim."""
         assert truncate_for_telegram("hello", 100, "plain") == "hello"
 
-    def test_truncates_plain_text_with_literal_ellipsis(self):
-        """Plain text over the limit is sliced and gets ``...``.
+    # it("returns MarkdownV2 that fits the limit unchanged, even with unpaired
+    #     markers") -- replaces the chat#446 "streaming leak" test, which
+    # trimmed the unpaired ``_`` under the limit.
+    def test_returns_markdown_v2_that_fits_the_limit_unchanged_even_with_unpaired_markers(self):
+        text = "Hello *world* _italic and bold *bold*"
+        assert truncate_for_telegram(text, 4096, "MarkdownV2") == text
 
-        What to fix if this fails: ``truncate_for_telegram`` plain
-        branch should append ``"..."`` (3 chars) and respect the limit.
-        """
+    def test_truncates_plain_text_with_literal_ellipsis(self):
+        """Plain text over the limit is sliced and gets ``...``."""
         result = truncate_for_telegram("a" * 200, 100, "plain")
         assert len(result) == 100
         assert result.endswith("...")
 
     def test_truncates_markdown_v2_with_escaped_ellipsis(self):
-        """MarkdownV2 over the limit gets ``\\.\\.\\.`` (escaped).
-
-        What to fix if this fails: the MarkdownV2 ellipsis constant
-        must be ``\\.\\.\\.`` so Telegram doesn't choke on the bare
-        reserved ``.``.
-        """
+        """MarkdownV2 over the limit gets ``\\.\\.\\.`` (escaped)."""
         result = truncate_for_telegram("a" * 200, 100, "MarkdownV2")
         assert len(result) <= 100
         assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
@@ -1320,13 +1312,8 @@ class TestTruncateForTelegram:
     def test_strips_orphan_backslash_before_ellipsis(self):
         """A slice ending with a single ``\\`` gets the backslash dropped.
 
-        Without this fix, the orphan ``\\`` would escape the first ``\\``
-        of the ellipsis (``\\\\.\\.``) and Telegram would render a
-        literal backslash and reject the rest.
-
-        What to fix if this fails: ``ends_with_orphan_backslash`` /
-        ``_trim_to_markdown_v2_safe_boundary`` in
-        ``src/chat_sdk/adapters/telegram/adapter.py``.
+        Without this, the orphan ``\\`` would escape the first ``\\`` of the
+        ellipsis and Telegram would reject the message.
         """
         text = ("a" * 90) + "\\" + ("b" * 50)
         result = truncate_for_telegram(text, 100, "MarkdownV2")
@@ -1334,222 +1321,214 @@ class TestTruncateForTelegram:
         assert not ends_with_orphan_backslash(before_ellipsis)
         assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
 
-    def test_strips_unclosed_bold_when_star_crosses_4096(self):
-        """A ``*`` that opens bold but whose closer is past the cut.
-
-        Telegram rejects messages with unbalanced ``*`` markers as
-        ``can't parse entities``. The trim helper must walk back past
-        the unpaired opener.
-
-        What to fix if this fails: the ``*`` arm of
-        ``_MARKDOWN_V2_ENTITY_MARKERS`` in
-        ``_trim_to_markdown_v2_safe_boundary``.
-        """
-        text = ("a" * 80) + "*" + ("b" * 100)
-        result = truncate_for_telegram(text, 100, "MarkdownV2")
-        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
-        stars = before_ellipsis.count("*")
-        assert stars % 2 == 0
-
-    def test_strips_unclosed_code_when_backtick_crosses_4096(self):
-        """A `` ` `` that opens an inline-code span whose closer is past the cut.
-
-        Same problem as bold but for ``` `code` ```. The backtick-aware
-        scan in ``find_unescaped_positions`` must spot the unpaired
-        opener.
-
-        What to fix if this fails: the `` ` `` entry in
-        ``_MARKDOWN_V2_ENTITY_MARKERS``; note the renderer routes
-        backticks through ``find_unescaped_positions`` (which counts
-        them inside text) rather than the outside-code variant.
-        """
-        text = ("a" * 80) + "`" + ("b" * 100)
-        result = truncate_for_telegram(text, 100, "MarkdownV2")
-        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
-        backticks = before_ellipsis.count("`")
-        assert backticks % 2 == 0
-
     def test_handles_input_that_is_all_special_chars(self):
-        """``escape_markdown_v2(".".repeat(200))`` truncates without crashing.
+        """``escape_markdown_v2("." * 200)`` truncates without crashing.
 
-        Each ``.`` becomes ``\\.``; the truncator must not leave a
-        trailing orphan ``\\`` from cutting between ``\\`` and ``.``.
-
-        What to fix if this fails: combination of
-        ``ends_with_orphan_backslash`` plus the safe-boundary loop.
+        Each ``.`` becomes ``\\.``; the truncator must not leave a trailing
+        orphan ``\\`` from cutting between ``\\`` and ``.``.
         """
         rendered = escape_markdown_v2("." * 200)
         result = truncate_for_telegram(rendered, 100, "MarkdownV2")
         assert len(result) <= 100
         assert result.endswith(_ESCAPED_ELLIPSIS_PATTERN)
-        # And the result must have no orphan trailing backslash.
         before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
         assert not ends_with_orphan_backslash(before_ellipsis)
 
-    def test_strips_unmatched_open_bracket_when_link_crosses_4096(self):
-        """An unmatched ``[`` from a link whose ``]`` is past the cut.
-
-        The trim helper walks back past the unpaired ``[`` so the
-        appended ellipsis isn't confused for the link label.
-
-        What to fix if this fails: the bracket-balancing block in
-        ``_trim_to_markdown_v2_safe_boundary``.
-        """
-        text = ("a" * 80) + "[label" + ("b" * 100)
-        result = truncate_for_telegram(text, 100, "MarkdownV2")
-        before_ellipsis = result.removesuffix(_ESCAPED_ELLIPSIS_PATTERN)
-        opens = before_ellipsis.count("[")
-        closes = before_ellipsis.count("]")
-        # An unmatched `[` must be trimmed off (count drops to <= closes).
-        assert opens <= closes
-
-
-class TestTruncateForTelegramStreamingChunks:
-    """Port of chat#446 / upstream f46a6fb: under-the-limit MarkdownV2
-    inputs are also passed through the safe-boundary trim because
-    streaming chunks can arrive with a transiently unpaired opener."""
-
-    def test_strips_unpaired_marker_under_limit_streaming_leak(self):
-        """Streaming-chunk leak: ``_italic`` with no closer drops the opener.
-
-        What to fix if this fails: the under-the-limit branch of
-        ``truncate_for_telegram`` must call
-        ``_trim_to_markdown_v2_safe_boundary`` for MarkdownV2.
-        """
-        text = "Hello *world* _italic and bold *bold*"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        underscores = result.count("_")
-        assert underscores % 2 == 0
-
     def test_does_not_modify_plain_parse_mode_messages(self):
-        """``parse_mode="plain"`` returns the input verbatim.
-
-        What to fix if this fails: the ``is_markdown_v2`` branch in
-        ``truncate_for_telegram`` is leaking into the plain path.
-        """
+        """``parse_mode="plain"`` returns the input verbatim."""
         text = "Hello *world* _unclosed"
-        result = truncate_for_telegram(text, 4096, "plain")
-        assert result == text
+        assert truncate_for_telegram(text, 4096, "plain") == text
 
-    def test_preserves_balanced_markdown_v2_under_limit_no_op(self):
-        """Balanced MarkdownV2 under the limit is returned unchanged."""
-        text = "*bold* _italic_ ~strike~ `code`"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        assert result == text
+    # it("trims back to before the [ when hard-truncated inside a link URL")
+    def test_trims_back_to_before_the_bracket_when_hard_truncated_inside_a_link_url(self):
+        prefix = "a" * 80
+        text = f"{prefix}[link](https://example.com/{'x' * 100})"
+        assert truncate_for_telegram(text, 100, "MarkdownV2") == f"{prefix}{_ESCAPED_ELLIPSIS_PATTERN}"
+
+    # it("trims at the orphan * when hard-truncated inside bold")
+    def test_trims_at_the_orphan_star_when_hard_truncated_inside_bold(self):
+        text = ("a" * 80) + "*" + ("b" * 100)
+        assert truncate_for_telegram(text, 100, "MarkdownV2") == ("a" * 80) + _ESCAPED_ELLIPSIS_PATTERN
+
+    # it("trims at the __ opener when hard-truncated inside underline")
+    def test_trims_at_the_double_underscore_opener_when_hard_truncated_inside_underline(self):
+        text = f"__b__ rest {'z' * 100}"
+        assert truncate_for_telegram(text, 9, "MarkdownV2") == _ESCAPED_ELLIPSIS_PATTERN
+        assert truncate_for_telegram(text, 11, "MarkdownV2") == f"__b__{_ESCAPED_ELLIPSIS_PATTERN}"
+
+    def test_strips_unclosed_code_when_backtick_crosses_limit(self):
+        """A `` ` `` that opens an inline-code span whose closer is past the cut."""
+        text = ("a" * 80) + "`" + ("b" * 100)
+        assert truncate_for_telegram(text, 100, "MarkdownV2") == ("a" * 80) + _ESCAPED_ELLIPSIS_PATTERN
+
+    def test_strips_unmatched_open_bracket_when_link_label_crosses_limit(self):
+        """An unmatched ``[`` from a link whose ``]`` is past the cut."""
+        text = ("a" * 80) + "[label" + ("b" * 100)
+        assert truncate_for_telegram(text, 100, "MarkdownV2") == ("a" * 80) + _ESCAPED_ELLIPSIS_PATTERN
+
+    # it("keeps a rendered link whose URL has odd underscores when the cut
+    #     lands after it")
+    def test_keeps_a_rendered_link_whose_url_has_odd_underscores_when_the_cut_lands_after_it(self):
+        rendered = TelegramFormatConverter().render_postable(
+            {
+                "markdown": "body text\n\n[Read more](https://example.com/page?first_param=a&second_param=b&third_param=c)"
+            }
+        )
+        text = f"{rendered} {'z' * 100}"
+        result = truncate_for_telegram(text, len(rendered) + 6, "MarkdownV2")
+        assert result == f"{rendered}{_ESCAPED_ELLIPSIS_PATTERN}"
+        assert "&third_param=c)" in result
+
+    # it("retreats before a partial link at every destination cut")
+    def test_retreats_before_a_partial_link_at_every_destination_cut(self):
+        prefix = "before "
+        link = "[x\\]](https://example.com/a\\)`b\\\\)"
+        text = f"{prefix}{link} after {'z' * 100}"
+        for cut in range(len(prefix), len(prefix) + len(link) + 2):
+            expected = prefix if cut < len(prefix) + len(link) else text[:cut]
+            result = truncate_for_telegram(text, cut + 6, "MarkdownV2")
+            assert result == f"{expected}{_ESCAPED_ELLIPSIS_PATTERN}", f"cut at {cut}"
+            assert not ends_with_orphan_backslash(result)
+
+    # it.each(["`code`", "```js\ncode\n```"])("retreats before code when
+    #     cutting through its body or delimiters: %s")
+    @pytest.mark.parametrize("code", ["`code`", "```js\ncode\n```"])
+    def test_retreats_before_code_when_cutting_through_its_body_or_delimiters(self, code: str):
+        prefix = "[x](https://example.com/a`b) "
+        text = f"{prefix}{code} {'z' * 100}"
+        for cut in range(1, len(code)):
+            result = truncate_for_telegram(text, len(prefix) + cut + 6, "MarkdownV2")
+            assert result == f"{prefix}{_ESCAPED_ELLIPSIS_PATTERN}", f"cut at {cut}"
 
 
-class TestTruncateForTelegramLinkDestination:
-    """Underscores (and other delimiter markers) that live inside a
-    MarkdownV2 link destination ``[label](url)`` are literal text per
-    Telegram's MarkdownV2 spec and must not be counted as unbalanced
-    italic/bold/strike openers by the safe-boundary trimmer.
+class TestTrimToMarkdownV2SafeBoundary:
+    """describe("trimToMarkdownV2SafeBoundary")."""
 
-    Without the link-destination skip, an under-limit message like
-    ``[x](https://example.com/foo_bar)`` is truncated to
-    ``[x](https://example.com/foo`` and Telegram receives a broken link.
-    """
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "*bold* _italic_ ~strike~ `code`",
+            "__underline__ and _italic_",
+            "```python\nprint(*args, **kwargs)\n```",
+            "Result: `` done",
+            "``x`` done",
+            "`` x\n\n```\ncode\n```",
+            "[a] b",
+            "see [ref] and *bold*",
+            "*b* [x](u) [y] z",
+        ],
+    )
+    def test_leaves_balanced_markdown_v2_unchanged(self, text: str):
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
 
-    def test_preserves_url_with_single_underscore(self):
-        """A balanced under-limit link with one ``_`` in the URL round-trips."""
-        text = "[x](https://example.com/foo_bar)"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        assert result == text
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Hello *world* _italic and bold *bold*", "Hello *world* "),
+            ("_oops [x](https://e.co/?a_b=1)", ""),
+            ("__b", ""),
+            ("_a_ __b__ _c", "_a_ __b__ "),
+            ("before [x]", "before "),
+            ("before [x](https://e", "before "),
+            ("a `", "a "),
+            ("a ``", "a "),
+            ("a ```js\ncode", "a "),
+        ],
+    )
+    def test_drops_the_unpaired_tail_of(self, text: str, expected: str):
+        assert _trim_to_markdown_v2_safe_boundary(text) == expected
 
-    def test_preserves_url_with_multiple_underscores(self):
-        """Three underscores inside a URL must not be flagged as unpaired."""
-        text = "[link](https://example.com/a_b_c_d)"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        assert result == text
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("before \\`literal", "before \\`literal"),
+            ("before \\\\`unfinished", "before \\\\"),
+            ("`a\\`b`", "`a\\`b`"),
+            ("```\na\\`b\n```", "```\na\\`b\n```"),
+            ("`a``b`", "`a``b`"),
+            ("\\*a*", "\\*a"),
+            ("\\\\*a", "\\\\"),
+            ("\\_a_", "\\_a"),
+            ("\\\\_a", "\\\\"),
+            ("\\~a~", "\\~a"),
+            ("\\\\~a", "\\\\"),
+        ],
+    )
+    def test_respects_escape_parity_around_delimiters(self, text: str, expected: str):
+        assert _trim_to_markdown_v2_safe_boundary(text) == expected
 
-    def test_preserves_url_with_asterisk_and_tilde(self):
-        """``*`` and ``~`` inside a link destination are also literal."""
-        text = "[q](https://example.com/path?a=*&b=~foo)"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        assert result == text
-
-    def test_unpaired_underscore_after_link_is_still_trimmed(self):
-        """A real unpaired ``_`` *after* the link is still trimmed off
-        even with the link-destination skip -- the skip must only mask
-        delimiters that fall inside ``(url)``, not legitimate openers
-        elsewhere in the message."""
-        # The URL has 1 ``_`` (skipped); after ``)`` there is 1 trailing
-        # ``_unclosed`` opener with no closer -> trimmer must remove the
-        # tail starting at that ``_``.
+    # Python-only: an unpaired ``_`` after a link whose URL holds ``_`` is
+    # still trimmed; the URL skip masks only the ``(...)`` part.
+    def test_trims_an_unpaired_underscore_after_a_link_with_an_underscore_url(self):
         text = "[x](https://example.com/foo_bar) _unclosed"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        # The link survives intact (underscores in the URL not flagged).
-        assert "[x](https://example.com/foo_bar)" in result
-        # The trailing unpaired opener and everything after is gone.
-        assert "_unclosed" not in result
+        assert _trim_to_markdown_v2_safe_boundary(text) == "[x](https://example.com/foo_bar) "
 
-    def test_preserves_url_with_underscore_followed_by_balanced_italic(self):
-        """A link with ``_`` in the URL followed by a balanced ``_x_``
-        renders without losing the link or the italic."""
+    # Python-only: a link with ``_`` in its URL followed by a balanced
+    # ``_italic_`` keeps both.
+    def test_keeps_a_link_with_an_underscore_url_followed_by_balanced_italic(self):
         text = "[x](https://example.com/foo_bar) _italic_"
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        assert result == text
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
 
-
-class TestTrimUnclosedLinkDestination:
-    """A truncated chunk can leave an inline link with balanced ``[]`` but
-    a dangling ``(`` (e.g. ``[label](https://example.com/very-long``).
-    Telegram rejects this as invalid MarkdownV2. The safe-boundary
-    trimmer must detect this and roll the chunk back to the opening
-    ``[``."""
-
-    def test_unclosed_link_destination_trimmed_to_opening_bracket(self):
-        """Bare unclosed destination is trimmed back to the ``[``."""
-        text = "[label](https://example.com/very-long-path"
-        result = _trim_to_markdown_v2_safe_boundary(text)
-        # The unsafe range starts at the opening ``[`` (position 0), so
-        # the entire chunk is trimmed.
-        assert result == ""
-
-    def test_unclosed_link_after_safe_prefix_keeps_prefix(self):
-        """Prefix before the dangling ``[`` is preserved."""
-        text = "hello world [label](https://example.com/very-long-path"
-        result = _trim_to_markdown_v2_safe_boundary(text)
-        # The prefix up to (but not including) the unclosed ``[`` survives.
-        assert result == "hello world "
-        # And it must not contain any ``[``.
-        assert "[" not in result
-
-    def test_closed_link_passes_through_unchanged(self):
-        """Sanity: a properly closed link must not be touched."""
-        text = "[ok](https://example.com/foo)"
-        result = _trim_to_markdown_v2_safe_boundary(text)
-        assert result == text
-
-    def test_unclosed_link_inside_inline_code_is_ignored(self):
-        """``[`` inside an inline code span is literal text per
-        MarkdownV2 -- the trimmer must not treat it as a link opener."""
+    def test_ignores_link_syntax_inside_inline_code(self):
+        """``[`` inside an inline code span is literal text."""
         text = "`[label](https://nope`"
-        result = _trim_to_markdown_v2_safe_boundary(text)
-        assert result == text
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
 
-    def test_truncated_over_limit_unclosed_link_is_handled(self):
-        """End-to-end via :func:`truncate_for_telegram`: an over-limit
-        message that slices into the middle of a link destination is
-        rolled back before the ``[``, preventing Telegram's
-        ``can't parse entities`` 400."""
-        prefix = "safe text "
-        text = prefix + "[label](" + "https://example.com/" + "x" * 5000
-        result = truncate_for_telegram(text, 4096, "MarkdownV2")
-        # Result must not contain an unclosed link.
-        assert result.count("[") == result.count("]")
-        # Every ``[``...``]`` pair followed by ``(`` must have a
-        # matching ``)`` before EOS.
-        assert "[label](" not in result or ")" in result.split("[label](", 1)[1]
 
-    def test_escaped_closing_paren_does_not_count_as_closer(self):
-        """``\\)`` inside a link destination is escaped per spec, so the
-        destination is still considered unclosed if no unescaped ``)``
-        follows."""
-        text = "[a](https://example.com/\\)abc"
-        result = _trim_to_markdown_v2_safe_boundary(text)
-        # The ``\)`` is escaped, so the destination has no real closer
-        # -> trim back to ``[``.
-        assert result == ""
+class TestTrimLinkUrlsWithRawEntityMarkers:
+    """describe("link URLs with raw entity-marker characters")."""
+
+    # it.each(["`", "```"])("preserves %s inside a link destination")
+    @pytest.mark.parametrize("ticks", ["`", "```"])
+    def test_preserves_ticks_inside_a_link_destination(self, ticks: str):
+        text = f"before [x](https://example.com/a{ticks}b_*~) after"
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
+
+    # it("preserves an explicit Markdown link with a backtick destination")
+    def test_preserves_an_explicit_markdown_link_with_a_backtick_destination(self):
+        rendered = TelegramFormatConverter().render_postable({"markdown": "[x](https://example.com/a`b)"})
+        assert rendered == "[x](https://example.com/a`b)"
+        assert _trim_to_markdown_v2_safe_boundary(rendered) == rendered
+
+    # it("preserves an autolinked bare URL containing a backtick"). The Python
+    # Markdown parser has no GFM autolink literals (CLAUDE.md Known
+    # Limitations), so the bare URL is not rendered as a link here; the
+    # trimmer is checked against the string upstream's renderer produces.
+    def test_preserves_an_autolinked_bare_url_containing_a_backtick(self):
+        rendered = "before [https://example\\.com/a\\`b](https://example.com/a`b) after"
+        assert _trim_to_markdown_v2_safe_boundary(rendered) == rendered
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "`before` [x](https://example.com/a`b) `after`",
+            "```js\nbefore\n```\n[x](https://example.com/a`b)\n```js\nafter\n```",
+            "before [x\\]](https://example.com/a\\)`b\\\\) after",
+            "before [x](https://example.com/a\\`b) after",
+            "before [x](https://example.com/a\\\\`b) after",
+            "`[x](https://example.com/a\\`b)`",
+            "```\n[x](https://example.com/a\\`b)\n```",
+        ],
+    )
+    def test_preserves_links_alongside_code_and_escaped_delimiters(self, text: str):
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
+
+    @pytest.mark.parametrize("code", ["`unfinished", "```js\nunfinished"])
+    def test_does_not_let_url_backticks_balance_unfinished_code(self, code: str):
+        prefix = "before [x](https://example.com/a`b) "
+        assert _trim_to_markdown_v2_safe_boundary(prefix + code) == prefix
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[x](https://e.co/?a_b=1)",
+            "[x](https://e.co/?a_b=1&c_d=2&e_f=3)",
+            "text *bold* [x](https://e.co/?a_b=1)",
+            "[x](https://e.co/?glob=*.ts&home=~user)",
+        ],
+    )
+    def test_preserves_a_link_whose_url_contains_entity_markers(self, text: str):
+        assert _trim_to_markdown_v2_safe_boundary(text) == text
 
 
 class TestTruncateForTelegramUtf16:
@@ -1600,21 +1579,6 @@ class TestTruncateForTelegramUtf16:
         # Every character of the body should be the full emoji code point.
         for ch in body:
             assert ord(ch) == 0x1F600
-
-
-class TestFindUnescapedPositions:
-    def test_finds_unescaped_markers(self):
-        assert find_unescaped_positions("*a*", "*") == [0, 2]
-
-    def test_ignores_escaped_markers(self):
-        assert find_unescaped_positions("\\*a*", "*") == [3]
-
-    def test_handles_double_backslash_before_marker(self):
-        # ``\\\\*`` → ``\\`` (escaped backslash) then unescaped ``*``.
-        assert find_unescaped_positions("\\\\*", "*") == [2]
-
-    def test_returns_empty_for_no_markers(self):
-        assert find_unescaped_positions("hello", "*") == []
 
 
 class TestEndsWithOrphanBackslash:
@@ -1675,6 +1639,75 @@ class TestAdapterTruncateMessageMarkdownV2:
         assert result.endswith("...")
         # Length is measured in UTF-16 code units for plain mode (legacy).
         assert len(result) <= 4096
+
+
+class TestMarkdownV2LinkUrlBackticksSurviveSends:
+    """index.test.ts (vercel/chat#915): a link URL holding a backtick ships
+    intact through the MarkdownV2 send, edit and caption paths. The chat#446
+    under-limit trim used to cut the message at the URL's backtick."""
+
+    MARKDOWN = "before [x](https://example.com/a`b) after"
+
+    # it("preserves URL backticks and trailing text in a legacy MarkdownV2 post")
+    @pytest.mark.asyncio
+    async def test_preserves_url_backticks_and_trailing_text_in_a_legacy_markdown_v2_post(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(
+            side_effect=[
+                ValidationError("telegram", "Not Found: method not found"),
+                _make_telegram_message(),
+            ]
+        )
+
+        await adapter.post_message(THREAD_ID, {"markdown": self.MARKDOWN})
+
+        method, payload = adapter.telegram_fetch.call_args_list[1][0][:2]
+        assert method == "sendMessage"
+        assert payload["parse_mode"] == "MarkdownV2"
+        assert payload["text"] == self.MARKDOWN
+        assert "rich_message" not in payload
+
+    # it("preserves URL backticks and trailing text in a legacy MarkdownV2 edit")
+    @pytest.mark.asyncio
+    async def test_preserves_url_backticks_and_trailing_text_in_a_legacy_markdown_v2_edit(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(
+            side_effect=[
+                ValidationError("telegram", "Bad Request: rich message is unsupported"),
+                _make_telegram_message(),
+            ]
+        )
+
+        await adapter.edit_message(THREAD_ID, COMPOSITE_MESSAGE_ID, {"markdown": self.MARKDOWN})
+
+        method, payload = adapter.telegram_fetch.call_args_list[1][0][:2]
+        assert method == "editMessageText"
+        assert payload["parse_mode"] == "MarkdownV2"
+        assert payload["text"] == self.MARKDOWN
+        assert "rich_message" not in payload
+
+    # it("preserves URL backticks and trailing text in a MarkdownV2 file caption")
+    @pytest.mark.asyncio
+    async def test_preserves_url_backticks_and_trailing_text_in_a_markdown_v2_file_caption(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableMarkdown(
+                markdown=self.MARKDOWN,
+                files=[FileUpload(data=b"payload", filename="report.txt", mime_type="text/plain")],
+            ),
+        )
+
+        method, form_data = adapter.telegram_fetch.call_args[0][:2]
+        assert method == "sendDocument"
+        fields = _form_fields(form_data)
+        assert fields["parse_mode"] == "MarkdownV2"
+        assert fields["caption"] == self.MARKDOWN
 
 
 # =============================================================================
