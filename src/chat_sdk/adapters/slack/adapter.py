@@ -2907,6 +2907,11 @@ class SlackAdapter:
             bridge = asyncio.get_running_loop().create_task(_bridge())
         except RuntimeError:
             return  # No running event loop
+        # Upstream parity: like upstream's bridge promise (index.ts:3488-3527)
+        # and this adapter's other fire-and-forget tasks, the bridge is not
+        # tracked by ``disconnect()`` (upstream index.ts:3395-3401 only stops
+        # Socket Mode). If shutdown races it, ``process_message`` fails against
+        # the closed state and the error is logged above.
         _pin_task(bridge)
         bridge.add_done_callback(self._log_agent_view_bridge_result)
         if options is not None and options.wait_until is not None:
@@ -3285,6 +3290,7 @@ class SlackAdapter:
             task = asyncio.get_running_loop().create_task(self._apply_configured_suggested_prompts(context))
         except RuntimeError:
             return  # No running event loop
+        # Upstream parity: not tracked by ``disconnect()`` (see the bridge).
         _pin_task(task)
         if options is not None and options.wait_until is not None:
             # Shielded, as for the agent_view DM bridge: a host cancelling its
