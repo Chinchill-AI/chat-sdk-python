@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
+from chat_sdk._compat import accepts_kwarg
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.plan import is_postable_object, post_postable_object
@@ -351,9 +352,14 @@ class ChannelImpl:
 
         # Callback tokens are minted per delivery path so each is bound to
         # the conversation the card actually lands in (vercel/chat#875).
-        if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
+        native = getattr(self.adapter, "post_ephemeral", None)
+        if native:
             message = await self._process_callback_urls(message)  # type: ignore[assignment]
-            return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
+            # ``options=`` only reaches implementations that accept it
+            # (Python-only compatibility probe; see chat_sdk._compat).
+            if accepts_kwarg(native, "options"):
+                return await native(self._id, user_id, message, options=options)
+            return await native(self._id, user_id, message)
 
         if not options.fallback_to_dm:
             return None
