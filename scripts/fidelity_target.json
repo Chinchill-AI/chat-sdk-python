@@ -8,7 +8,7 @@
     "matched_exact": 813,
     "matched_fuzzy": 75,
     "missing": 176,
-    "extra": 471
+    "extra": 476
   },
   "absent_ts_files": [],
   "files": {
@@ -284,7 +284,7 @@
       "matched_exact": 15,
       "matched_fuzzy": 0,
       "missing_count": 0,
-      "extra_count": 2,
+      "extra_count": 3,
       "missing": [],
       "fuzzy_matches": []
     },
@@ -340,7 +340,7 @@
       "matched_exact": 15,
       "matched_fuzzy": 0,
       "missing_count": 0,
-      "extra_count": 2,
+      "extra_count": 5,
       "missing": [],
       "fuzzy_matches": []
     },
@@ -353,7 +353,7 @@
       "matched_exact": 8,
       "matched_fuzzy": 0,
       "missing_count": 0,
-      "extra_count": 3,
+      "extra_count": 4,
       "missing": [],
       "fuzzy_matches": []
     },
