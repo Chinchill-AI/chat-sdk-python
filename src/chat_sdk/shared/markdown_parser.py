@@ -699,7 +699,7 @@ def parse_markdown(text: str) -> Root:
 _MAX_BLOCKQUOTE_DEPTH = 768
 
 
-def _parse_blocks(text: str, depth: int) -> Root:
+def _parse_blocks(text: str, quote_depth: int) -> Root:
     children: list[Content] = []
     lines = text.split("\n")
     i = 0
@@ -777,10 +777,10 @@ def _parse_blocks(text: str, depth: int) -> Root:
                     break
             # Recursively parse blockquote content
             bq_text = "\n".join(bq_lines)
-            if depth >= _MAX_BLOCKQUOTE_DEPTH:
+            if quote_depth >= _MAX_BLOCKQUOTE_DEPTH:
                 children.append(make_blockquote([make_paragraph([make_text(bq_text)])]))
                 continue
-            bq_ast = _parse_blocks(bq_text, depth + 1)
+            bq_ast = _parse_blocks(bq_text, quote_depth + 1)
             children.append(make_blockquote(bq_ast.get("children", [])))
             continue
 

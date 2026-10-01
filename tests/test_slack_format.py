@@ -74,6 +74,9 @@ class TestToMarkdown:
         rest stays literal text instead of raising ``RecursionError``."""
         ast = self.converter.to_ast("&gt;" * 1_100 + " hi")
         assert ast_to_plain_text(ast) == ">" * (1_100 - 769) + " hi"
+        # A heading inside the quotes must not reset the nesting budget.
+        ast = self.converter.to_ast("&gt;" * 500 + " # h\n" + "&gt;" * 1_100 + " hi")
+        assert ast_to_plain_text(ast) == "h\n" + ">" * (1_100 - 769) + " hi"
 
     def test_keeps_trailing_text_after_a_code_block_as_a_paragraph(self):
         ast = self.converter.to_ast("```x``` &gt; note")
