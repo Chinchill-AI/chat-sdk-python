@@ -1261,12 +1261,17 @@ class TeamsAdapter:
         if not (isinstance(service_url, str) and service_url):
             service_url = token_service_url or None
             if service_url:
+                # The SDK token strips one trailing slash, which turns a
+                # root-path endpoint into a bare ``https://host``; the
+                # allow-list (and the inbound wire form) want ``host/``.
+                if not urlparse(service_url).path:
+                    service_url += "/"
                 # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the
                 # token fallback is SSRF-checked before it is persisted.
                 try:
                     _validate_service_url(service_url)
                 except ValidationError:
-                    self._logger.warn("Ignoring disallowed token serviceUrl", {"serviceUrl": service_url})
+                    self._logger.warn("Ignoring disallowed token serviceUrl", {"serviceUrl": token_service_url})
                     service_url = None
         channel_id = (
             self.encode_thread_id(

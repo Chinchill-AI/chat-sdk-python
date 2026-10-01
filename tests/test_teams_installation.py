@@ -326,6 +326,18 @@ class TestTeamsInstallationTokenServiceUrl:
         )
         assert options is s.options
 
+    async def test_restores_the_root_slash_the_token_strips_from_a_root_path_endpoint(self) -> None:
+        # Python-specific: the SDK token turns ``https://host/`` into
+        # ``https://host``, which the SSRF allow-list would otherwise reject.
+        s = await _Setup().init()
+        root_url = "https://smba.infra.gcc.teams.microsoft.com/"
+        token = bot_framework_token(self.key, service_url=root_url)
+        await receive(s.adapter, {**activity(), "serviceUrl": None}, s.options, token=token)
+        s.chat.process_installed.assert_called_once()
+        assert s.chat.process_installed.call_args.args[0].channel_id == s.adapter.encode_thread_id(
+            thread("personal-installation", root_url, "personal")
+        )
+
     async def test_ignores_a_disallowed_token_service_url(self) -> None:
         # Python-specific: the token fallback is checked against the SSRF
         # allow-list; a disallowed one leaves channel_id None, never persisted.
