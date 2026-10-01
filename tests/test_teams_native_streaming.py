@@ -803,7 +803,8 @@ class TestFirstChunkIdWait:
         async def gen():
             yield "hello"
 
-        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), streamer), 2)  # type: ignore[arg-type]
+        await _register_streamer(adapter, tid, streamer)
+        result = await asyncio.wait_for(adapter.stream(tid, gen()), 2)
 
         # close() reported nothing delivered, so the accumulated text is
         # delivered with one buffered post instead of being dropped.
@@ -813,8 +814,18 @@ class TestFirstChunkIdWait:
         activity, ref = send.call_args.args
         assert activity.text == "hello"
         assert ref.conversation.id == "a:1Abc-DM-conversation-id"
-        assert result.id == "fallback-1"
+        assert result is not None and result.id == "fallback-1"
         adapter._logger.warn.assert_called_once()
+        # The failed streamer is retired (the SDK keeps the posted text in its
+        # buffer), so a second post in the same handler does not reuse it.
+        assert tid not in adapter._active_streams
+
+        async def gen2():
+            yield "again"
+
+        await adapter.stream(tid, gen2())
+        assert streamer.emitted == ["hello"]
+        assert [c.args[0].text for c in send.await_args_list] == ["hello", "again"]
 
     @pytest.mark.asyncio
     async def test_uses_the_settled_stream_when_the_first_chunk_arrives_late(self, monkeypatch: pytest.MonkeyPatch):

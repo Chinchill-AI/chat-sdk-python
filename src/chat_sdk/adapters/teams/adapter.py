@@ -3022,7 +3022,11 @@ class TeamsAdapter:
                     elif not stream.canceled:
                         # Nothing reached the user and nothing is in flight:
                         # deliver the text with one buffered post instead of
-                        # dropping the reply.
+                        # dropping the reply. The failed streamer is retired
+                        # first: the SDK keeps this text buffered, so reusing
+                        # it would resend it ahead of a later reply.
+                        if self._active_streams.get(thread_id) is stream:
+                            self._active_streams.pop(thread_id, None)
                         self._logger.warn(
                             "Teams stream delivered no chunk; posting the reply as one message",
                             {"threadId": thread_id},
