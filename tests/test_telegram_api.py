@@ -31,11 +31,12 @@ from chat_sdk.shared.errors import (
     AdapterPermissionError,
     AdapterRateLimitError,
     AuthenticationError,
+    NetworkError,
     ValidationError,
 )
 from chat_sdk.shared.mock_adapter import create_mock_state
 from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
-from chat_sdk.types import Attachment, FileUpload, PostableMarkdown, PostableRaw
+from chat_sdk.types import Attachment, FetchOptions, FileUpload, Message, PostableMarkdown, PostableRaw
 
 # =============================================================================
 # Helpers
@@ -375,26 +376,6 @@ class TestPostMessageTypedAttachmentUploads:
         assert payload["height"] == 720
 
     @pytest.mark.asyncio
-    async def test_rejects_multiple_attachments(self):
-        adapter = _make_adapter()
-        _init_adapter(adapter)
-        adapter.telegram_fetch = AsyncMock(return_value=_make_telegram_message())
-
-        with pytest.raises(ValidationError, match="single attachment upload"):
-            await adapter.post_message(
-                THREAD_ID,
-                PostableRaw(
-                    raw="attachments",
-                    attachments=[
-                        Attachment(type="image", data=b"one"),
-                        Attachment(type="image", data=b"two"),
-                    ],
-                ),
-            )
-
-        adapter.telegram_fetch.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_rejects_mixed_files_and_attachments(self):
         adapter = _make_adapter()
         _init_adapter(adapter)
@@ -451,6 +432,377 @@ class TestPostMessageTypedAttachmentUploads:
             )
 
         adapter.telegram_fetch.assert_not_called()
+
+
+# =============================================================================
+# Tests -- outbound media groups (vercel/chat#605, #278)
+# =============================================================================
+
+
+def _album_part(message_id: int, chat_id: str = "123", **media: Any) -> dict[str, Any]:
+    """A message Telegram returns from ``sendMediaGroup`` (``sampleMessage`` + media)."""
+    return {
+        "message_id": message_id,
+        "chat": {"id": int(chat_id), "type": "private"},
+        "from": {"id": 999, "is_bot": True, "first_name": "Bot", "username": "mybot"},
+        "date": 1700000000,
+        **media,
+    }
+
+
+def _media_group(form_data: Any) -> list[dict[str, Any]]:
+    """``readMediaGroup``: the ``media`` field must be a JSON string."""
+    media = _form_fields(form_data)["media"]
+    assert isinstance(media, str)
+    return json.loads(media)
+
+
+def _form_field_names(form_data: Any) -> list[str]:
+    return [type_options["name"] for type_options, _headers, _value in form_data._fields]
+
+
+_TWO_FILES = [
+    FileUpload(data=b"one", filename="one.txt", mime_type="text/plain"),
+    FileUpload(data=b"two", filename="two.txt", mime_type="text/plain"),
+]
+
+
+class TestPostMessageMediaGroups:
+    """2-10 files or attachments go out as one ``sendMediaGroup``."""
+
+    @pytest.mark.asyncio
+    async def test_posts_multiple_files_as_a_telegram_media_group(self):
+        adapter = _make_adapter(user_name="mybot")
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(
+            return_value=[
+                _album_part(
+                    21,
+                    media_group_id="group-1",
+                    document={"file_id": "doc-1", "file_unique_id": "doc-unique-1", "file_name": "one.txt"},
+                ),
+                _album_part(
+                    22,
+                    media_group_id="group-1",
+                    document={"file_id": "doc-2", "file_unique_id": "doc-unique-2", "file_name": "two.txt"},
+                ),
+            ]
+        )
+
+        posted = await adapter.post_message(
+            "telegram:-100123:42",
+            PostableMarkdown(markdown="attached **files**", files=list(_TWO_FILES)),
+        )
+
+        assert posted.id == "123:22"
+        adapter.telegram_fetch.assert_awaited_once()
+        method, form_data = adapter.telegram_fetch.await_args.args
+        assert method == "sendMediaGroup"
+
+        fields = _form_fields(form_data)
+        assert fields["chat_id"] == "-100123"
+        assert fields["message_thread_id"] == "42"
+        assert _media_group(form_data) == [
+            {
+                "caption": "attached *files*",
+                "media": "attach://media0",
+                "parse_mode": "MarkdownV2",
+                "type": "document",
+            },
+            {"media": "attach://media1", "type": "document"},
+        ]
+        assert _form_binary_field(form_data, "media0") == (b"one", "one.txt", "text/plain")
+        assert _form_binary_field(form_data, "media1") == (b"two", "two.txt", "text/plain")
+        # Every returned message is cached, not only the one returned.
+        cached = await adapter.fetch_messages("telegram:123:42")
+        assert [message.id for message in cached.messages] == ["123:21", "123:22"]
+
+    @pytest.mark.asyncio
+    async def test_posts_and_normalizes_mixed_image_and_video_attachments_as_a_telegram_media_group(self):
+        adapter = _make_adapter(user_name="mybot")
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(
+            return_value=[
+                _album_part(
+                    31,
+                    media_group_id="group-2",
+                    photo=[{"file_id": "photo-1", "file_unique_id": "p1", "width": 100, "height": 100}],
+                ),
+                _album_part(
+                    32,
+                    media_group_id="group-2",
+                    video={"file_id": "video-1", "file_unique_id": "v1", "width": 1280, "height": 720},
+                ),
+            ]
+        )
+
+        posted = await adapter.post_message(
+            "telegram:123",
+            PostableMarkdown(
+                markdown="visual **album**",
+                attachments=[
+                    Attachment(
+                        type="image",
+                        mime_type="image/png",
+                        name="image.png",
+                        url="https://cdn.example.com/image.png",
+                    ),
+                    Attachment(
+                        type="video",
+                        data=b"video",
+                        height=720,
+                        mime_type="video/mp4",
+                        name="video.mp4",
+                        width=1280,
+                    ),
+                ],
+            ),
+        )
+
+        assert posted.id == "123:32"
+        method, form_data = adapter.telegram_fetch.await_args.args
+        assert method == "sendMediaGroup"
+        assert _media_group(form_data) == [
+            {
+                "caption": "visual *album*",
+                "media": "https://cdn.example.com/image.png",
+                "parse_mode": "MarkdownV2",
+                "type": "photo",
+            },
+            {"height": 720, "media": "attach://media1", "type": "video", "width": 1280},
+        ]
+        assert "media0" not in _form_field_names(form_data)
+        assert _form_binary_field(form_data, "media1") == (b"video", "video.mp4", "video/mp4")
+
+        cached = await adapter.fetch_messages("telegram:123", FetchOptions(limit=10))
+        round_tripped = [
+            [
+                adapter.rehydrate_attachment(attachment)
+                for attachment in Message.from_json(json.loads(json.dumps(message.to_json()))).attachments
+            ]
+            for message in cached.messages
+        ]
+        assert [[(a.type, a.mime_type, a.fetch_metadata) for a in group] for group in round_tripped] == [
+            [("image", "image/jpeg", {"fileId": "photo-1", "fileUniqueId": "p1"})],
+            [("video", None, {"fileId": "video-1", "fileUniqueId": "v1"})],
+        ]
+        assert all(callable(a.fetch_data) for group in round_tripped for a in group)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "types",
+        [
+            pytest.param(("image", "file"), id="image-and-document"),
+            # Audio is its own category: it may not join a photo/video album.
+            pytest.param(("audio", "image"), id="audio-and-image"),
+        ],
+    )
+    async def test_rejects_incompatible_telegram_media_group_attachment_types(self, types: tuple[str, str]):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+
+        with pytest.raises(ValidationError, match="documents and audio files must be grouped only"):
+            await adapter.post_message(
+                "telegram:123",
+                PostableRaw(
+                    raw="attachments",
+                    attachments=[Attachment(type=t, data=b"x") for t in types],  # type: ignore[arg-type]
+                ),
+            )
+
+        adapter.telegram_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_telegram_media_groups_with_more_than_10_files(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+
+        with pytest.raises(ValidationError, match="Telegram media groups support 2-10 files"):
+            await adapter.post_message(
+                "telegram:123",
+                PostableRaw(
+                    raw="files",
+                    files=[FileUpload(data=str(index).encode(), filename=f"{index}.txt") for index in range(11)],
+                ),
+            )
+
+        adapter.telegram_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sends_ten_audio_attachments_as_one_media_group(self):
+        # Edge case beyond upstream: the 10-item upper bound is inclusive and
+        # a same-category (audio) album passes the type check.
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[_album_part(index) for index in range(1, 11)])
+
+        posted = await adapter.post_message(
+            "telegram:123",
+            PostableRaw(raw="", attachments=[Attachment(type="audio", data=b"a") for _ in range(10)]),
+        )
+
+        assert posted.id == "123:10"
+        method, form_data = adapter.telegram_fetch.await_args.args
+        assert method == "sendMediaGroup"
+        media = _media_group(form_data)
+        assert [item["type"] for item in media] == ["audio"] * 10
+        # ``raw=""`` carries no caption.
+        assert "caption" not in media[0]
+        assert _form_binary_field(form_data, "media9")[1] == "attachment-9"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["files", "attachments"])
+    async def test_rejects_an_inline_keyboard_on_a_media_group(self, kind: str):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+        fetch_data = AsyncMock(return_value=b"payload")
+        uploads: dict[str, Any] = (
+            {"files": list(_TWO_FILES)}
+            if kind == "files"
+            else {"attachments": [Attachment(type="image", fetch_data=fetch_data), Attachment(type="image", data=b"2")]}
+        )
+        card = {
+            "type": "card",
+            "title": "Pick",
+            "children": [{"type": "actions", "children": [{"type": "button", "id": "yes", "label": "Yes"}]}],
+        }
+
+        with pytest.raises(ValidationError, match="Telegram media groups do not support inline keyboards"):
+            await adapter.post_message("telegram:123", {"card": card, **uploads})
+
+        # The keyboard is rejected before any attachment is downloaded.
+        fetch_data.assert_not_awaited()
+        adapter.telegram_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retries_a_media_group_caption_as_plain_text_when_markdown_v2_is_rejected(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(
+            side_effect=[
+                ValidationError("telegram", "Bad Request: can't parse caption entities: Can't find end of the entity"),
+                [_album_part(41), _album_part(42)],
+            ]
+        )
+
+        posted = await adapter.post_message(
+            "telegram:123",
+            PostableMarkdown(markdown="attached **files**", files=list(_TWO_FILES)),
+        )
+
+        assert posted.id == "123:42"
+        assert adapter.telegram_fetch.await_count == 2
+        (first_method, first_form), (retry_method, retry_form) = [
+            call.args for call in adapter.telegram_fetch.await_args_list
+        ]
+        assert first_method == retry_method == "sendMediaGroup"
+        assert _media_group(first_form)[0]["parse_mode"] == "MarkdownV2"
+        # A fresh multipart body (aiohttp FormData is single-use) with the
+        # plain caption and no parse_mode.
+        assert retry_form is not first_form
+        assert _media_group(retry_form) == [
+            {"caption": "attached files", "media": "attach://media0", "type": "document"},
+            {"media": "attach://media1", "type": "document"},
+        ]
+        assert _form_binary_field(retry_form, "media1")[0] == b"two"
+
+    @pytest.mark.asyncio
+    async def test_uploads_fetch_data_bytes_in_a_media_group_instead_of_the_url(self):
+        # Re-posting received attachments: they carry ``fetch_data`` (and maybe
+        # a URL); the downloaded bytes win, as upstream ``data ? attach:// : url``.
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[_album_part(51), _album_part(52)])
+        fetch_data = AsyncMock(return_value=b"fetched")
+
+        await adapter.post_message(
+            "telegram:123",
+            PostableRaw(
+                raw="",
+                attachments=[
+                    Attachment(
+                        type="image",
+                        url="https://cdn.example.com/image.png",
+                        fetch_data=fetch_data,
+                        mime_type="image/png",
+                        name="image.png",
+                    ),
+                    Attachment(type="image", data=b"second"),
+                ],
+            ),
+        )
+
+        fetch_data.assert_awaited_once()
+        _method, form_data = adapter.telegram_fetch.await_args.args
+        assert [item["media"] for item in _media_group(form_data)] == ["attach://media0", "attach://media1"]
+        assert _form_binary_field(form_data, "media0") == (b"fetched", "image.png", "image/png")
+
+    @pytest.mark.asyncio
+    async def test_media_group_sends_integral_dimensions_only_for_videos(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[_album_part(61), _album_part(62)])
+
+        await adapter.post_message(
+            "telegram:123",
+            PostableRaw(
+                raw="",
+                attachments=[
+                    Attachment(type="image", data=b"photo", width=640, height=480),
+                    # ``Number.isInteger``: 1280.0 is the integer 1280, ``True`` is not a number.
+                    Attachment(type="video", data=b"video", width=1280.0, height=True),  # type: ignore[arg-type]
+                ],
+            ),
+        )
+
+        _method, form_data = adapter.telegram_fetch.await_args.args
+        photo, video = _media_group(form_data)
+        assert photo == {"media": "attach://media0", "type": "photo"}
+        assert video == {"media": "attach://media1", "type": "video", "width": 1280}
+        # JSON ``1280`` (int), not ``1280.0``.
+        assert type(video["width"]) is int
+
+    @pytest.mark.asyncio
+    async def test_raises_network_error_when_send_media_group_returns_no_messages(self):
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+
+        with pytest.raises(NetworkError, match="Telegram postMessage did not return any sent messages"):
+            await adapter.post_message("telegram:123", PostableRaw(raw="", files=list(_TWO_FILES)))
+
+        adapter.telegram_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejects_an_unsupported_attachment_type_in_a_media_group_before_downloading(self):
+        """Divergence from upstream: an out-of-set ``type`` raises ValidationError
+        (not ``KeyError``) before any ``fetch_data`` download.
+
+        ``Attachment.type`` is a ``Literal`` Python does not enforce; upstream's
+        TS union rules the value out at compile time (docs/UPSTREAM_SYNC.md).
+        """
+        adapter = _make_adapter()
+        _init_adapter(adapter)
+        adapter.telegram_fetch = AsyncMock(return_value=[])
+        fetch_data = AsyncMock(return_value=b"payload")
+
+        with pytest.raises(ValidationError, match="Unsupported attachment type: sticker"):
+            await adapter.post_message(
+                "telegram:123",
+                PostableRaw(
+                    raw="",
+                    attachments=[
+                        Attachment(type="image", fetch_data=fetch_data),
+                        Attachment(type="sticker", data=b"x"),  # type: ignore[arg-type]
+                    ],
+                ),
+            )
+
+        fetch_data.assert_not_awaited()
+        adapter.telegram_fetch.assert_not_awaited()
 
 
 # =============================================================================
@@ -2300,6 +2652,31 @@ class TestReply:
 
         method, form_data = _only_call(adapter)
         assert method == "sendPhoto"
+        assert json.loads(_form_fields(form_data)["reply_parameters"]) == EXPECTED_REPLY_PARAMETERS
+
+    @pytest.mark.asyncio
+    async def test_threads_a_media_group_to_its_target(self):
+        adapter = _reply_adapter(
+            [
+                _make_telegram_message(chat_id="123", message_id=11),
+                _make_telegram_message(chat_id="123", message_id=12),
+            ]
+        )
+
+        await adapter.reply(
+            REPLY_THREAD_ID,
+            "123:7",
+            PostableMarkdown(
+                markdown="album",
+                attachments=[
+                    Attachment(type="image", data=b"one", name="one.png"),
+                    Attachment(type="image", data=b"two", name="two.png"),
+                ],
+            ),
+        )
+
+        method, form_data = _only_call(adapter)
+        assert method == "sendMediaGroup"
         assert json.loads(_form_fields(form_data)["reply_parameters"]) == EXPECTED_REPLY_PARAMETERS
 
     @pytest.mark.asyncio

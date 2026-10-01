@@ -1575,8 +1575,8 @@ Ports `aaeede70` (vercel/chat#899, chat@4.40.0) and the Teams handler half of
 Ports `629e6555` (vercel/chat#760, chat@4.37.0) and `91683e52`
 (vercel/chat#942, chat@4.41.0) in `adapters/telegram/adapter.py`. The core
 half of #942 (`WebhookOptions.deduplicate`, task-returning `process_*`)
-landed in #191. Outbound multi-file `sendMediaGroup` (`8d7ccdb1`, #605) is
-split out to #278.
+landed in #191. Outbound multi-file `sendMediaGroup` (`8d7ccdb1`, #605) was
+split out to #278 (see "Telegram outbound media groups" below).
 
 - `process_update` returns the list of dispatched handler tasks (message,
   album, slash command, action, reactions). The webhook path ignores it.
@@ -1643,6 +1643,39 @@ split out to #278.
   acknowledgement never reached Telegram (a crash before the next
   `getUpdates`) is delivered again, as upstream.
 
+### Telegram outbound media groups (chat@4.34, #278)
+
+Parity with `8d7ccdb1` (vercel/chat#605, chat@4.34.0) in
+`adapters/telegram/adapter.py`, plus the media-group half of `d5ebec12`
+(#833, `reply_parameters`).
+
+- `post_message` sends one file / attachment with `send_document` /
+  `send_attachment` as before, and 2+ with `_send_document_media_group` /
+  `_send_attachment_media_group` (one `sendMediaGroup`). Every returned
+  message is parsed and cached; the last one is returned.
+- Checks, in upstream order and before any `fetch_data` download: 2–10 items
+  (`TELEGRAM_MEDIA_GROUP_MIN` / `_MAX`), attachment categories (`file` →
+  document, `audio` → audio, `image`/`video` → visual; more than one
+  category raises), then no `reply_markup`.
+- Multipart body (`aiohttp.FormData`, rebuilt per attempt for the
+  MarkdownV2 → plain retry): `chat_id`, `message_thread_id`,
+  `reply_parameters` (JSON string), `media` (a JSON string of `InputMedia`
+  items, types from `ATTACHMENT_MEDIA_GROUP_TYPES`) and a `media{i}` file
+  part per binary payload, referenced as `attach://media{i}`. A URL-only
+  attachment puts its URL in `media` and has no part. Caption and
+  `parse_mode` go on item 0 only. Video `width` / `height` are included when
+  JS `Number.isInteger` would accept them (`_integral_update_id`: an
+  integral float counts, `bool` does not).
+- **Python-specific (divergence, one row in the non-parity table):** an
+  `Attachment.type` outside `ATTACHMENT_MEDIA_GROUP_TYPES` raises
+  `send_attachment`'s `ValidationError("Unsupported attachment type: ...")`
+  before any download (upstream's TS union rules it out; the dict lookup
+  would raise `KeyError`).
+- Tests: the four upstream media-group tests and "threads a media group to
+  its target" in `tests/test_telegram_api.py` (the adapter test file is not
+  fidelity-mapped, #78), plus Python-only tests for the inline-keyboard
+  rejection, the caption retry, the 10-item audio album and the unknown type.
+
 ### Telegram replies (chat@4.38–4.39, #228)
 
 Parity with the Telegram halves of `0f24cc30` (vercel/chat#802, chat@4.38.0),
@@ -1671,8 +1704,7 @@ Parity with the Telegram halves of `0f24cc30` (vercel/chat#802, chat@4.38.0),
   `send_attachment` URL/upload paths: a dict in JSON bodies (omitted when
   there is no target), a JSON string in multipart bodies. A rich-endpoint
   `ValidationError` mentioning `reply_parameters` falls back to a regular
-  send. Outbound media groups (#278) are not ported yet, so they get
-  `reply_parameters` when #278 lands.
+  send. Outbound media groups (#278) carry it in their multipart body too.
 - **Message-id parsing.** Bare ids must fully match `[0-9]+` and composite ids
   `([^:]+):([0-9]+)` (`re.fullmatch`), the ASCII-digit, end-anchored meaning of
   upstream's `/^\d+$/` and `/^([^:]+):(\d+)$/`. Python's `\d` and `$` would
@@ -3274,6 +3306,7 @@ stay explicit instead of being rediscovered in code review.
 | Telegram `get_user().is_bot` | Always `False` (matches upstream — `getChat` does not expose `is_bot`) | Always `false` (same caveat documented in upstream code comment) | The Telegram Bot API's `getChat` endpoint does not surface the `is_bot` field that's available on the `User` object inside incoming `Message` updates. Callers needing bot detection must use `message.author.is_bot` from webhooks instead of `chat.get_user(...).is_bot`. |
 | Telegram webhook verification + `update_id` dedupe (4.41 wave, #224) | **Parity** with upstream `c4a359e7` (vercel/chat#858, chat@4.39), `1d2b78d9` (#799, chat@4.38) and the bot-identity scope helper from `7a1150ce` (#813): webhook mode requires `secret_token` unless `allow_unverified_webhooks` / `TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS=true`; each integer `update_id` is claimed as `telegram:webhook-update:{sha256(bot_user_id)}:{update_id}` (24h) before dispatch; state/identity failure → 503. Python-surface adaptations only: the `ValidationError` text names options in snake_case (`secret_token`, `allow_unverified_webhooks=True`); the shared `getMe` is an `asyncio.Task` awaited through `asyncio.shield` so a cancelled webhook does not cancel it for other waiters; `update_id` claiming mirrors `Number.isInteger`: an integral JSON float (`7.0`, `7e0` — floats under `json.loads`, the number 7 in JS) is normalised to `int` and shares the `...:7` key, while `bool` (an `int` subclass) and fractional floats are not claimed. **Deliberate Python divergence:** a non-`bool` `allow_unverified_webhooks` (e.g. the string `"false"`) raises `ValidationError` instead of being coerced truthy — upstream's TS `boolean` type rules this out at compile time, Python has no such guard and `bool("false")` would silently fail open. `secret_token` now resolves with `??` semantics (`is not None`), replacing the earlier `or` fallback, so an explicit `""` no longer silently picks up the env secret. **Deliberate Python divergence (fixes an upstream bug):** the `getMe` username is cached and reapplied on a repeat `initialize()` — upstream's `ensureBotIdentity` returns early once `webhookScope` is set, so after `initialize` re-applies `chat.getUserName()` the Telegram username is never restored and `@real_bot` / `/cmd@real_bot` stop routing after a shutdown + re-initialize. `allow_unverified_webhooks` is the *last* `TelegramAdapterConfig` field (not alphabetical) so positional callers are not shifted. | Same | Not ported here: the Vercel Connect async `bot_token` resolver (#189) and the polling checkpoint keyed on the same scope (#227, now ported: see the Telegram polling section above). Cross-instance dedupe on Postgres relies on #240, which makes `set_if_not_exists` reclaim expired rows. |
 | Telegram inbound parsing, allowlist and typing (4.41 wave, #225) | **Parity** with upstream `4ee187ac` (#612), `2531a422` (#621, Telegram half), `0701679e` (#706, regex cache only), `54eea715` (#742), `53bf73db` (#752), `a0ba9868` (#835), `a18e7922` (#836) and the Telegram half of `b6fa24c6` (#865). Python-surface adaptations only, no behavior divergence beyond the mention-regex fold and the `allowed_user_ids` type check noted here: location coordinates and dice values go through `_js_number_str`, which renders a JSON number as JS `String()` does (`51.0` -> `"51"`, `1e-05` -> `"0.00001"`, `1.5e-07` -> `"1.5e-7"`), since `json.loads` keeps floats that JS prints differently; invoice amounts use `f"{amount / 10**e:.{e}f}"` for `toFixed(e)`; the mention pattern is `@{re.escape(name)}(?![A-Za-z0-9_-])` with `re.IGNORECASE`, because JS `\w` without the `u` flag is ASCII-only while Python's is Unicode (JS `/i` still folds non-ASCII letters, so `re.ASCII` is not used: `@ботик` matches `@БОТИК` on both sides; one residual difference is that Python's Unicode folding also equates the Kelvin sign with `k` and long s `ſ` with `s`, which JS's non-`u` canonicalization never maps onto ASCII, so `@` + U+212A + `bot` mentions a `kbot` in Python only); allowlist ids are stringified with the same `_js_number_str` (`456.0` -> `"456"`); a non-list `allowed_user_ids` (e.g. a bare `"123,456"` string, which Python would iterate per character, where upstream's `.map` throws) raises `ValidationError`; and the acting-user chain (`callback_query.from` -> `message_reaction.user` -> first non-`None` of `message`/`edited_message`/`channel_post`/`edited_channel_post` `.from`) uses `is not None` at every step; the typing action runs as an `asyncio` task created before `Chat.process_message`/`process_slash_command` schedules the handler task (JS fires the request synchronously; in Python both are tasks and run FIFO, so typing still goes first), is passed to `wait_until` when given and otherwise held in `_typing_tasks` so it is not garbage-collected (`disconnect()` cancels and awaits any still pending before closing the aiohttp session, so none reopens it); the download uses the shared aiohttp session with `ClientTimeout(total=30)` (covers the body read) and a running byte count over `response.content.iter_chunked`, raising `NetworkError`. It deliberately does **not** use `chat_sdk.shared.download` (#204): its HTTPS/public-address checks would break self-hosted Bot API servers, which upstream also exempts, and `read_attachment_body` decodes `Content-Encoding` itself while the shared aiohttp session already auto-decompresses. | Same | The media-group (album) path, its typing and the `pollingGroup` allowlist check landed in #227 (see the Telegram polling section above). `reply_to_message` parsing and `mentionOnReply` landed in #228 (see the Telegram replies section). Not ported here: `business_message.from` in the allowlist chain (#189). |
+| Telegram unknown `Attachment.type` in an outbound media group (#278) | `_validate_attachment_media_group_types` raises `ValidationError("Unsupported attachment type: ...")` before any `fetch_data` download, as `send_attachment` already does for one attachment | No check: `ATTACHMENT_MEDIA_GROUP_TYPES[type]` gives `undefined` and Telegram rejects the request | The TS `Attachment["type"]` union rules the value out at compile time; Python `Literal` does not, and the dict lookup would raise a bare `KeyError` after earlier attachments were already downloaded. Test: `test_rejects_an_unsupported_attachment_type_in_a_media_group_before_downloading`. |
 | WhatsApp `get_user` | Raises `ChatNotImplementedError` (`Chat.get_user` translates to "does not support get_user") | Not implemented upstream either (no `getUser` on the WhatsApp adapter) | WhatsApp Cloud API has no user lookup endpoint — phone numbers are the only stable identifier and there's no equivalent of `users.info` exposed to business apps. Documented explicitly so callers don't expect parity with Slack/Teams/Discord. |
 | Messenger `get_user` | Raising stub (`ChatNotImplementedError`); a Graph-API-backed impl is tracked as issue #132 | No `getUser` method on the Messenger adapter | **Parity — upstream Messenger has no user-lookup method**; the Python raising stub matches. (Meta's Graph API *could* back a real implementation, unlike WhatsApp — hence #132 stays open as an enhancement.) |
 | Linear agent sessions | **Complete** (5-PR wave, **#151** — Wave D done). All five landed on `main`: L1 agent-session types (`LinearAgentSessionThreadId`, `LinearAgentSessionCommentRawMessage`, `mode`/`kind`), L2 the `:s:{session}` thread-id encode/decode, L3 the webhook PARSE + routing (`_parse_message_from_agent_session_event`, `_handle_agent_session_event`), L4 the agent-activity EMIT path (`post_message`/`start_typing`/`stream` session branches as raw GraphQL — see the "Linear agent-activity emit" divergence row above), and **L5 (this change)**: the agent-session FETCH path (`fetch_messages` → `_fetch_agent_session_messages`, the `edit_message`/`delete_message` append-only guards, and `fetch_thread` `agentSessionId` metadata as raw GraphQL — see the "Linear agent-session fetch" divergence row above). | Full agent-sessions support (`adapter-linear` 4.27.0, `bc94f0a`): parses agent-session webhook events into messages, emits agent activity, fetches the session thread, and routes the agent-session thread id | Largest single gap from the 0.4.30 audit; pre-existing (present since 0.4.29). Closed across the 4.31 wave — tracked in **#151**. |
