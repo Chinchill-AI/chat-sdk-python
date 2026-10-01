@@ -184,6 +184,13 @@ def strip_html_tags(text: str) -> str:
     (``<<b>b>`` becomes ``<b>``), so this loops until stable. Each pass bounds
     the tag body to 2048 characters, so a long run of unclosed ``<`` cannot
     make a scan quadratic; a longer "tag" stays as text.
+
+    Upstream parity (``format/index.ts`` ``stripHtmlTags``, chat@4.41.1): the
+    same pattern and loop. A run of ``<`` followed by ``>`` still needs about
+    ``len / 2049`` passes (``"<" * n + ">" * n`` is ~0.08 s at 28 KB, roughly
+    the Teams message cap, and ~2 s at 160 KB); upstream has the same cost.
+    The unbounded ``<[^>]+>`` loop this replaces in ``TeamsFormatConverter``
+    was slower on its own worst case (``"<" * 160_000``: ~9 s).
     """
     current = text
     while True:

@@ -82,6 +82,13 @@ class TestStripHtmlTagsBounds:
         text = "<a" * 20_000  # 40k chars, no ``>``: nothing is a tag
         assert strip_html_tags(text) == text
 
+    def test_bracket_runs_strip_one_bounded_tag_per_pass(self):
+        # Each pass removes the first ``<`` within 2049 characters of a ``>``
+        # plus that ``>``: 10 000 ``<`` take five passes (4 x 2049 + 1804).
+        assert strip_html_tags("<" * 10_000 + ">" * 10_000) == ">" * 9_995
+        # A lone ``<`` left next to ``>`` has an empty body and stays.
+        assert strip_html_tags("<" * 2050 + ">") == "<"
+
     def test_tag_longer_than_the_bound_stays_as_text(self):
         assert strip_html_tags("<" + "x" * 2048 + ">") == ""
         too_long = "<" + "x" * 2049 + ">"

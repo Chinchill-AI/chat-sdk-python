@@ -1068,7 +1068,11 @@ and the Teams part of `4cc3445c` (#779, chat@4.37.0). `d4c52cad` (#652) is
   `<[^>]{1,2048}>` applied until the text stops changing. It backs
   `teams_mention_to_plain_text`, `teams_html_to_markdown` and the `teams.graph`
   `extract_text_from_graph_message`, as upstream. A 40k-character run of
-  unclosed `<a` returns unchanged in milliseconds.
+  unclosed `<a` returns unchanged in milliseconds. Like upstream, a run of `<`
+  followed by `>` still takes about `len / 2049` passes (`"<" * n + ">" * n`:
+  ~0.08 s at 28 KB, ~2 s at 160 KB); kept for parity rather than replaced by
+  a Python-only linear stripper. The unbounded loop it replaces in `to_ast`
+  was slower on its own worst case (`"<" * 160_000`: ~9 s).
 - **Divergences** (rows in the non-parity table): the per-URL client cache
   and `TeamsFormatConverter.to_ast` using the bounded stripper.
 
