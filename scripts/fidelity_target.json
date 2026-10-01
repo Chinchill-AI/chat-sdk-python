@@ -5,10 +5,10 @@
   "totals": {
     "ts_tests": 1064,
     "each_templates": 21,
-    "matched_exact": 825,
+    "matched_exact": 832,
     "matched_fuzzy": 72,
-    "missing": 167,
-    "extra": 487
+    "missing": 160,
+    "extra": 493
   },
   "absent_ts_files": [],
   "files": {
@@ -18,14 +18,12 @@
       "python_exists": true,
       "ts_tests": 177,
       "each_templates": 4,
-      "matched_exact": 158,
+      "matched_exact": 160,
       "matched_fuzzy": 11,
-      "missing_count": 8,
+      "missing_count": 6,
       "extra_count": 25,
       "missing": [
         ["Chat", "aborts an active thread signal from another Chat instance"],
-        ["Chat", "should dispatch message updates without normal message routing"],
-        ["Chat", "should dispatch message deletes with normalized event data"],
         ["Reactions", "should allow streaming from a reaction without message context"],
         ["Actions", "should allow streaming from an action without message context"],
         ["openDM", "should allow streaming to a DM thread"],
@@ -379,34 +377,27 @@
     "packages/chat/src/app-context.test.ts": {
       "python": "tests/test_app_context.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 1,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 1,
       "matched_fuzzy": 0,
-      "missing_count": 1,
-      "extra_count": 0,
-      "missing": [
-        ["onAppContextChanged", "dispatches app_context_changed events to registered handlers"]
-      ],
+      "missing_count": 0,
+      "extra_count": 2,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/chat/src/installation-events.test.ts": {
       "python": "tests/test_installation_events.py",
       "tier": "target",
-      "python_exists": false,
+      "python_exists": true,
       "ts_tests": 4,
       "each_templates": 0,
-      "matched_exact": 0,
+      "matched_exact": 4,
       "matched_fuzzy": 0,
-      "missing_count": 4,
-      "extra_count": 0,
-      "missing": [
-        ["on%s", "runs registered handlers in order with the destination context"],
-        ["on%s", "waits for asynchronous handlers, including events without a destination"],
-        ["on%s", "logs handler errors and resolves the background task"],
-        ["on%s", "does nothing without handlers and runs without waitUntil"]
-      ],
+      "missing_count": 0,
+      "extra_count": 4,
+      "missing": [],
       "fuzzy_matches": []
     },
     "packages/adapter-shared/src/download.test.ts": {
