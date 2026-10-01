@@ -218,7 +218,8 @@ _MAX_SUGGESTED_PROMPTS = 4
 # ---------------------------------------------------------------------------
 
 SLACK_USER_ID_PATTERN = re.compile(r"^[A-Z0-9_]+$")
-SLACK_USER_ID_EXACT_PATTERN = re.compile(r"^U[A-Z0-9]+$")
+# Enterprise Grid users can have W-prefixed IDs anywhere a U-prefixed ID appears
+SLACK_USER_ID_EXACT_PATTERN = re.compile(r"^[UW][A-Z0-9]+$")
 
 SLACK_MESSAGE_URL_PATTERN = re.compile(r"^https?://[^/]+\.slack\.com/archives/([A-Z0-9]+)/p(\d+)(?:\?.*)?$")
 # Bracketed URL in message text; length-bounded to keep the scan linear on
@@ -325,6 +326,10 @@ _TRAILING_SLASH_PATTERN = re.compile(r"/$")
 _UNFURL_WAIT_MS = 2000
 _UNFURL_POLL_MS = 150
 _UNFURL_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
+# How long delivered event IDs are remembered for retry deduplication. Slack
+# retries at ~1 min and ~5 min, and the opt-in Delayed Events feature
+# redelivers hourly for up to 24 hours (upstream ``EVENT_DEDUPE_TTL_MS``).
+_EVENT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +348,35 @@ class _InstallationInfo:
     installation_id: str
     is_enterprise_install: bool
     enterprise_id: str | None = None
+    team_id: str | None = None
+
+
+def _is_true_flag(value: Any) -> bool:
+    """Normalize a Slack ``is_enterprise_install`` flag.
+
+    Form-encoded webhooks deliver ``"true"``, JSON and Socket Mode deliver
+    ``True``, and the field may be absent (upstream
+    ``v === true || v === "true"``).
+    """
+    return value is True or value == "true"
+
+
+def _parse_retry_num(value: Any) -> int:
+    """Parse a Slack redelivery count (``x-slack-retry-num`` / ``retryNum``).
+
+    Missing or malformed values count as a first delivery (``0``), as
+    upstream's ``Number(...)`` yields ``NaN`` and ``NaN > 0`` is false.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+    return 0
 
 
 def _json_stringify(value: Any) -> str:
@@ -1848,6 +1882,39 @@ class SlackAdapter:
             self._client_cache.popitem(last=False)
         return client
 
+    def _with_token_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Add Enterprise Grid context to a Web API call's kwargs.
+
+        Port of upstream ``withToken`` (vercel/chat#724); the token itself is
+        already bound to the client from :meth:`_get_client`. Org-wide tokens
+        span every workspace in the org, so workspace-scoped methods need an
+        explicit ``team_id``: it is added from the event's workspace when the
+        request runs under an org-wide install. When the incoming event
+        carried a ``context_team_id`` (a shared channel hosted on an "away"
+        workspace), it is echoed as ``client_context_team_id`` on calls to the
+        originating channel. Keys the caller set (not ``None``) are never
+        overridden.
+
+        Applied at the call sites where upstream uses ``withToken``. As
+        upstream, ``chat_stream`` (which already sends the #95 ``team_id``),
+        ``chat_scheduleMessage``/``chat_deleteScheduledMessage``,
+        ``files_upload_v2`` and ``oauth_v2_access`` are not routed through it.
+        """
+        ctx = self._request_context.get()
+        if ctx is None:
+            return kwargs
+        if ctx.is_enterprise_install and ctx.team_id and kwargs.get("team_id") is None:
+            kwargs["team_id"] = ctx.team_id
+        channel = kwargs.get("channel")
+        if (
+            ctx.context_team_id
+            and channel is not None
+            and channel == ctx.context_channel
+            and kwargs.get("client_context_team_id") is None
+        ):
+            kwargs["client_context_team_id"] = ctx.context_team_id
+        return kwargs
+
     def _invalidate_client(self, token: str) -> None:
         """Remove a cached client (e.g., on token revocation).
 
@@ -1904,7 +1971,7 @@ class SlackAdapter:
             try:
                 token = await self._resolve_default_token()
                 client = self._get_client(token)
-                auth_result = await client.auth_test()
+                auth_result = await client.auth_test(**self._with_token_kwargs())
                 self._bot_user_id = auth_result.get("user_id")
                 self._bot_id = auth_result.get("bot_id") or None
                 user = auth_result.get("user")
@@ -1968,6 +2035,12 @@ class SlackAdapter:
                 "botUserId": installation.bot_user_id,
                 "teamName": installation.team_name,
             }
+        # Enterprise Grid fields are stored only when set, as upstream's
+        # ``{...installation}`` spread drops undefined keys (vercel/chat#724).
+        if installation.enterprise_id is not None:
+            data_to_store["enterpriseId"] = installation.enterprise_id
+        if installation.is_enterprise_install is not None:
+            data_to_store["isEnterpriseInstall"] = installation.is_enterprise_install
 
         await state.set(key, data_to_store)
         self._logger.info(
@@ -1993,6 +2066,10 @@ class SlackAdapter:
         bot_token_raw = (stored.get("botToken") or stored.get("bot_token")) if isinstance(stored, dict) else None
         bot_user_id = (stored.get("botUserId") or stored.get("bot_user_id") or "") if isinstance(stored, dict) else ""
         team_name = (stored.get("teamName") or stored.get("team_name") or "") if isinstance(stored, dict) else ""
+        enterprise_id_raw = stored.get("enterpriseId") if isinstance(stored, dict) else None
+        enterprise_id = enterprise_id_raw if isinstance(enterprise_id_raw, str) else None
+        is_enterprise_raw = stored.get("isEnterpriseInstall") if isinstance(stored, dict) else None
+        is_enterprise_install = is_enterprise_raw if isinstance(is_enterprise_raw, bool) else None
         if self._encryption_key and is_encrypted_token_data(bot_token_raw):
             # `is_encrypted_token_data` is a runtime type guard but doesn't
             # carry TypeGuard narrowing, so pyrefly still sees `None`. Assert
@@ -2010,12 +2087,16 @@ class SlackAdapter:
                 bot_token=decrypted,
                 bot_user_id=bot_user_id,
                 team_name=team_name,
+                enterprise_id=enterprise_id,
+                is_enterprise_install=is_enterprise_install,
             )
 
         return SlackInstallation(
             bot_token=bot_token_raw if isinstance(bot_token_raw, str) else "",
             bot_user_id=bot_user_id,
             team_name=team_name,
+            enterprise_id=enterprise_id,
+            is_enterprise_install=is_enterprise_install,
         )
 
     async def handle_oauth_callback(
@@ -2031,7 +2112,14 @@ class SlackAdapter:
                 during the code exchange. When provided it takes priority over
                 any ``redirect_uri`` query parameter in the callback URL.
 
-        Returns ``{"team_id": ..., "installation": SlackInstallation}``.
+        For Enterprise Grid org-wide installs (``is_enterprise_install``),
+        Slack returns ``team: null`` and the installation is keyed by the
+        enterprise ID instead (vercel/chat#724).
+
+        Returns ``{"team_id": ..., "enterprise_id": ..., "is_enterprise_install":
+        ..., "installation": SlackInstallation}``. ``team_id`` is always the
+        storage key (the enterprise ID for org-wide installs), so it can be
+        passed back to :meth:`get_installation` / :meth:`delete_installation`.
         """
         if not (self._client_id and self._client_secret):
             raise ValidationError(
@@ -2072,21 +2160,44 @@ class SlackAdapter:
             kwargs["redirect_uri"] = redirect_uri
         result = await client.oauth_v2_access(**kwargs)
 
-        if not (result.get("ok") and result.get("access_token") and result.get("team", {}).get("id")):
+        # Org-wide installs return ``team: null`` and identify the org via
+        # ``enterprise.id``: key the installation by whichever ID webhook token
+        # resolution will later look up (see ``_resolve_event_request_context``).
+        team_raw = result.get("team")
+        team: dict[str, Any] = team_raw if isinstance(team_raw, dict) else {}
+        enterprise_raw = result.get("enterprise")
+        enterprise: dict[str, Any] = enterprise_raw if isinstance(enterprise_raw, dict) else {}
+        is_enterprise_install = bool(result.get("is_enterprise_install"))
+        enterprise_id: str | None = enterprise.get("id") or None
+        installation_id: str | None = enterprise_id if is_enterprise_install else (team.get("id") or None)
+
+        if not (result.get("ok") and result.get("access_token") and installation_id):
+            missing = (
+                "missing access_token or enterprise.id" if is_enterprise_install else "missing access_token or team.id"
+            )
             raise AuthenticationError(
                 "slack",
-                f"Slack OAuth failed: {result.get('error') or 'missing access_token or team.id'}",
+                f"Slack OAuth failed: {result.get('error') or missing}",
             )
 
-        team_id = result["team"]["id"]
+        team_name = team.get("name")
         installation = SlackInstallation(
             bot_token=result["access_token"],
             bot_user_id=result.get("bot_user_id"),
-            team_name=result.get("team", {}).get("name"),
+            team_name=team_name if team_name is not None else enterprise.get("name"),
+            enterprise_id=enterprise_id,
+            # Recorded only for org-wide installs (upstream spreads the flag
+            # only when true), so workspace installs keep ``None``.
+            is_enterprise_install=True if is_enterprise_install else None,
         )
 
-        await self.set_installation(team_id, installation)
-        return {"team_id": team_id, "installation": installation}
+        await self.set_installation(installation_id, installation)
+        return {
+            "team_id": installation_id,
+            "enterprise_id": enterprise_id,
+            "is_enterprise_install": is_enterprise_install,
+            "installation": installation,
+        }
 
     async def delete_installation(self, team_id: str) -> None:
         """Remove a workspace installation."""
@@ -2099,17 +2210,30 @@ class SlackAdapter:
         await state.delete(self._installation_key(team_id))
         self._logger.info("Slack installation deleted", {"teamId": team_id})
 
-    def with_bot_token(self, token: str, fn: Callable[[], Any]) -> Any:
-        """Run *fn* with a specific bot token in context (for cron jobs, etc.)."""
-        tok = self._request_context.set(RequestContext(token=token))
+    def with_bot_token(self, token: str, fn: Callable[[], Any], *, installation_id: str | None = None) -> Any:
+        """Run *fn* with a specific bot token in context (for cron jobs, etc.).
+
+        In multi-workspace deployments pass ``installation_id`` (the
+        ``team_id``, or the ``enterprise_id`` for org-wide installs: the key
+        the installation was stored under) so installation-owned caches (user
+        profiles, display-name index, channel names) are scoped to it.
+        Without it they use the unscoped global keys (vercel/chat#724).
+        """
+        tok = self._request_context.set(RequestContext(token=token, installation_id=installation_id))
         try:
             return fn()
         finally:
             self._request_context.reset(tok)
 
-    async def with_bot_token_async(self, token: str, fn: Callable[[], Awaitable[Any]]) -> Any:
-        """Run an async function with a specific bot token in context."""
-        tok = self._request_context.set(RequestContext(token=token))
+    async def with_bot_token_async(
+        self, token: str, fn: Callable[[], Awaitable[Any]], *, installation_id: str | None = None
+    ) -> Any:
+        """Run an async function with a specific bot token in context.
+
+        ``installation_id`` scopes installation-owned caches, as in
+        :meth:`with_bot_token`.
+        """
+        tok = self._request_context.set(RequestContext(token=token, installation_id=installation_id))
         try:
             return await fn()
         finally:
@@ -2178,22 +2302,162 @@ class SlackAdapter:
             if not payload_str:
                 return None
             payload = json.loads(payload_str)
-            is_enterprise_install = bool(payload.get("is_enterprise_install"))
-            enterprise = payload.get("enterprise") or {}
-            enterprise_id = enterprise.get("id") or payload.get("enterprise_id") or None
-            team = payload.get("team") or {}
-            team_id = team.get("id") or payload.get("team_id") or None
-            installation_id = enterprise_id if is_enterprise_install else team_id
-
-            if not installation_id:
+            if not isinstance(payload, dict):
                 return None
-            return _InstallationInfo(
-                installation_id=installation_id,
-                is_enterprise_install=is_enterprise_install,
-                enterprise_id=enterprise_id,
-            )
+            return self._extract_installation_from_interactive_payload(payload)
         except Exception:
             return None
+
+    def _extract_installation_from_interactive_payload(self, payload: dict[str, Any]) -> _InstallationInfo | None:
+        """Extract installation info from an already-parsed interactive payload.
+
+        Socket Mode delivers these as objects rather than form-urlencoded, and
+        ``is_enterprise_install`` may arrive as ``True`` or ``"true"``
+        (upstream ``extractInstallationFromInteractivePayload``).
+        """
+        is_enterprise_install = _is_true_flag(payload.get("is_enterprise_install"))
+        enterprise = payload.get("enterprise")
+        team = payload.get("team")
+        enterprise_id = (enterprise.get("id") if isinstance(enterprise, dict) else None) or payload.get("enterprise_id")
+        team_id = (team.get("id") if isinstance(team, dict) else None) or payload.get("team_id")
+        enterprise_id = enterprise_id if isinstance(enterprise_id, str) and enterprise_id else None
+        team_id = team_id if isinstance(team_id, str) and team_id else None
+        installation_id = enterprise_id if is_enterprise_install else team_id
+
+        if not installation_id:
+            return None
+        return _InstallationInfo(
+            installation_id=installation_id,
+            is_enterprise_install=is_enterprise_install,
+            enterprise_id=enterprise_id,
+            team_id=team_id,
+        )
+
+    async def _resolve_interactive_request_context(self, info: _InstallationInfo) -> RequestContext | None:
+        """Resolve the token for an interactive payload's installation.
+
+        Returns the request context to dispatch under, or ``None`` when no
+        installation was found. Shared by the HTTP and Socket Mode paths.
+        """
+        ctx = await self._resolve_token_for_team(info.installation_id, info.is_enterprise_install)
+        if ctx is None:
+            return None
+        return replace(
+            ctx,
+            enterprise_id=info.enterprise_id,
+            is_enterprise_install=info.is_enterprise_install,
+            installation_id=info.installation_id,
+            team_id=info.team_id,
+        )
+
+    async def _resolve_event_request_context(
+        self, payload: dict[str, Any]
+    ) -> RequestContext | Literal["not-applicable", "unresolved"]:
+        """Resolve the multi-workspace request context for an event payload.
+
+        Port of upstream ``resolveEventRequestContext`` (vercel/chat#724),
+        shared by the HTTP webhook and Socket Mode paths. Returns:
+
+        - the resolved context to run the event under,
+        - ``"not-applicable"`` when no resolution is needed (single-workspace
+          mode, a non-``event_callback`` payload, or no installation ID):
+          process without a request context,
+        - ``"unresolved"`` when an installation ID was present but no
+          installation was found: drop the event.
+
+        ``authorizations[0]`` is preferred: Slack documents it as the
+        authoritative installation identity, while the top-level fields can
+        name a different (Slack Connect) workspace. Top-level fields are the
+        fallback for payloads that omit it.
+        """
+        if self._is_single_workspace or payload.get("type") != "event_callback":
+            return "not-applicable"
+
+        authorizations = payload.get("authorizations")
+        auth: dict[str, Any] = {}
+        if isinstance(authorizations, list) and authorizations and isinstance(authorizations[0], dict):
+            auth = authorizations[0]
+        # ``auth?.is_enterprise_install ?? payload.is_enterprise_install``
+        raw_flag = auth.get("is_enterprise_install")
+        is_enterprise_install = _is_true_flag(
+            raw_flag if raw_flag is not None else payload.get("is_enterprise_install")
+        )
+        # ``auth?.x || payload.x``: an empty or null authorization field falls
+        # back to the top-level one.
+        enterprise_id = auth.get("enterprise_id") or payload.get("enterprise_id") or None
+        team_id = auth.get("team_id") or payload.get("team_id") or None
+        installation_id = enterprise_id if is_enterprise_install else team_id
+        if not installation_id:
+            return "not-applicable"
+
+        ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
+        if ctx is None:
+            self._logger.warn(
+                "Could not resolve token for installation",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+            )
+            return "unresolved"
+
+        event = payload.get("event")
+        return replace(
+            ctx,
+            enterprise_id=enterprise_id,
+            is_enterprise_install=is_enterprise_install,
+            installation_id=installation_id,
+            team_id=team_id,
+            # context_team_id is an envelope top-level field, not inside `event`.
+            context_team_id=payload.get("context_team_id") or None,
+            context_channel=(event.get("channel") or None) if isinstance(event, dict) else None,
+        )
+
+    def _mark_event_delivered(self, payload: dict[str, Any]) -> None:
+        """Record that an event delivery was dispatched (fire-and-forget).
+
+        Port of upstream ``markEventDelivered``: lets a redelivery
+        (``x-slack-retry-num`` / socket ``retry_attempt``) be dropped. A failed
+        write only means a retry gets reprocessed, which message dedupe
+        already tolerates, so errors are logged and never fail the webhook.
+        """
+        event_id = payload.get("event_id")
+        if not (event_id and self._chat):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                self._chat.get_state().set(f"slack:event-delivered:{event_id}", True, _EVENT_DEDUPE_TTL_MS)
+            )
+        except Exception as exc:
+            self._logger.debug("Failed to record event delivery", {"eventId": event_id, "error": exc})
+            return
+
+        def _log_failure(t: asyncio.Task[Any]) -> None:
+            exc = None if t.cancelled() else t.exception()
+            if exc is not None:
+                self._logger.debug("Failed to record event delivery", {"eventId": event_id, "error": exc})
+
+        task.add_done_callback(_log_failure)
+        _pin_task(task)
+
+    async def _is_duplicate_event_delivery(self, payload: dict[str, Any], retry_num: int | None = None) -> bool:
+        """Return ``True`` when a retried delivery was already dispatched.
+
+        Port of upstream ``isDuplicateEventDelivery``. Only consulted on
+        retries (``retry_num > 0``), so first deliveries pay no state read.
+        Events whose first delivery never arrived have no marker and are
+        still recovered via the retry. A state error means "process".
+        """
+        event_id = payload.get("event_id")
+        if not (event_id and self._chat and retry_num and retry_num > 0):
+            return False
+        try:
+            seen = await self._chat.get_state().get(f"slack:event-delivered:{event_id}")
+        except Exception:
+            # State unavailable: process rather than drop.
+            return False
+        if seen:
+            self._logger.info("Skipping duplicate event delivery", {"eventId": event_id, "retryNum": retry_num})
+            return True
+        return False
 
     # ==================================================================
     # User / Channel lookup with caching
@@ -2253,7 +2517,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.users_info(user=user_id)
+            result = await client.users_info(**self._with_token_kwargs(user=user_id))
             user = result.get("user") or {}
             # Slack can return `{"ok": True, "user": {}}` in some edge cases
             # (rare, but observed when scopes are partial or the workspace
@@ -2336,7 +2600,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.conversations_info(channel=channel_id)
+            result = await client.conversations_info(**self._with_token_kwargs(channel=channel_id))
             channel = result.get("channel", {})
             name = channel.get("name", channel_id)
 
@@ -2547,53 +2811,14 @@ class SlackAdapter:
 
             # Slash command
             if "command" in params and "payload" not in params:
-                if not self._is_single_workspace:
-                    # For Enterprise Grid org-wide installs, use enterprise_id;
-                    # otherwise use team_id.
-                    is_enterprise_install = (params.get("is_enterprise_install") or [None])[0] == "true"
-                    enterprise_id = (params.get("enterprise_id") or [None])[0]
-                    team_id = (params.get("team_id") or [None])[0]
-                    installation_id = enterprise_id if is_enterprise_install else team_id
-
-                    if installation_id:
-                        ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
-                        if ctx:
-                            ctx = replace(
-                                ctx,
-                                enterprise_id=enterprise_id,
-                                is_enterprise_install=is_enterprise_install,
-                                installation_id=installation_id,
-                            )
-                            tok = self._request_context.set(ctx)
-                            try:
-                                return await self._handle_slash_command(params, options)
-                            finally:
-                                self._request_context.reset(tok)
-                        self._logger.warn(
-                            "Could not resolve token for slash command",
-                            {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
-                        )
-                    # Missing or unresolved installation: acknowledge without
-                    # dispatching, so handlers never run with no token context
-                    # (vercel/chat#877).
-                    return {"body": "", "status": 200}
-                return await self._handle_slash_command(params, options)
+                return await self._run_slash_command(params, options)
 
             # Interactive payload
             if not self._is_single_workspace:
                 installation_info = self._extract_installation_from_interactive(body)
                 if installation_info:
-                    ctx = await self._resolve_token_for_team(
-                        installation_info.installation_id,
-                        installation_info.is_enterprise_install,
-                    )
+                    ctx = await self._resolve_interactive_request_context(installation_info)
                     if ctx:
-                        ctx = replace(
-                            ctx,
-                            enterprise_id=installation_info.enterprise_id,
-                            is_enterprise_install=installation_info.is_enterprise_install,
-                            installation_id=installation_info.installation_id,
-                        )
                         tok = self._request_context.set(ctx)
                         try:
                             return await self._handle_interactive_payload(body, options)
@@ -2619,40 +2844,72 @@ class SlackAdapter:
                 "headers": {"Content-Type": "application/json"},
             }
 
+        # Drop redeliveries of events that were already dispatched
+        retry_header = headers.get("x-slack-retry-num") or headers.get("X-Slack-Retry-Num")
+        if await self._is_duplicate_event_delivery(payload, _parse_retry_num(retry_header)):
+            return {"body": "ok", "status": 200}
+
         # Multi-workspace: resolve token before processing events.
         # Use contextvars.copy_context() so the ContextVar value persists into
         # any async tasks spawned by _process_event_payload (e.g. process_message
         # creates a task via asyncio.create_task).  The copied context is
         # isolated -- the ContextVar change does not leak back to the caller
         # and does not need an explicit reset.
-        if not self._is_single_workspace and payload.get("type") == "event_callback":
-            # For Enterprise Grid org-wide installs, use enterprise_id;
-            # otherwise use team_id.
-            is_enterprise_install = bool(payload.get("is_enterprise_install"))
-            installation_id = payload.get("enterprise_id") if is_enterprise_install else payload.get("team_id")
-
-            if installation_id:
-                ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
-                if ctx:
-                    ctx = replace(
-                        ctx,
-                        enterprise_id=payload.get("enterprise_id"),
-                        is_enterprise_install=is_enterprise_install,
-                        installation_id=installation_id,
-                    )
-                    isolated = contextvars.copy_context()
-                    isolated.run(self._request_context.set, ctx)
-                    isolated.run(self._process_event_payload, payload, options)
-                    return {"body": "ok", "status": 200}
-                self._logger.warn(
-                    "Could not resolve token for installation",
-                    {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
-                )
-                return {"body": "ok", "status": 200}
+        resolved = await self._resolve_event_request_context(payload)
+        if resolved == "unresolved":
+            # Installation ID present but no installation found: drop the event
+            return {"body": "ok", "status": 200}
+        if isinstance(resolved, RequestContext):
+            isolated = contextvars.copy_context()
+            isolated.run(self._request_context.set, resolved)
+            isolated.run(self._process_event_payload, payload, options)
+            return {"body": "ok", "status": 200}
 
         # Single-workspace mode or fallback
         self._process_event_payload(payload, options)
         return {"body": "ok", "status": 200}
+
+    async def _run_slash_command(
+        self,
+        params: dict[str, list[str]],
+        options: WebhookOptions | None = None,
+    ) -> dict[str, Any]:
+        """Handle a slash command, resolving the installation token first.
+
+        Port of upstream ``runSlashCommand`` (vercel/chat#724), shared by the
+        HTTP webhook and Socket Mode paths. A missing or unresolved
+        installation is acknowledged without dispatching, so handlers never
+        run with no token context (vercel/chat#877).
+        """
+        if self._is_single_workspace:
+            return await self._handle_slash_command(params, options)
+        # For Enterprise Grid org-wide installs, use enterprise_id; otherwise
+        # use team_id.
+        is_enterprise_install = (params.get("is_enterprise_install") or [None])[0] == "true"
+        enterprise_id = (params.get("enterprise_id") or [None])[0]
+        team_id = (params.get("team_id") or [None])[0]
+        installation_id = enterprise_id if is_enterprise_install else team_id
+
+        if installation_id:
+            ctx = await self._resolve_token_for_team(installation_id, is_enterprise_install)
+            if ctx:
+                ctx = replace(
+                    ctx,
+                    enterprise_id=enterprise_id,
+                    is_enterprise_install=is_enterprise_install,
+                    installation_id=installation_id,
+                    team_id=team_id,
+                )
+                tok = self._request_context.set(ctx)
+                try:
+                    return await self._handle_slash_command(params, options)
+                finally:
+                    self._request_context.reset(tok)
+            self._logger.warn(
+                "Could not resolve token for slash command",
+                {"installationId": installation_id, "isEnterpriseInstall": is_enterprise_install},
+            )
+        return {"body": "", "status": 200}
 
     # ==================================================================
     # Event dispatch
@@ -2663,13 +2920,12 @@ class SlackAdapter:
         if payload.get("type") != "event_callback" or not payload.get("event"):
             return
 
+        self._mark_event_delivered(payload)
         event: dict[str, Any] = payload["event"]
 
-        # Track external/shared channel status. Note: socket-mode payloads
-        # synthesized in ``_route_socket_event`` never carry this field, which
-        # mirrors upstream's ``routeSocketEvent`` shape. Socket-mode adapters
-        # therefore won't populate ``_external_channels`` from this path —
-        # documented as a known divergence in ``docs/UPSTREAM_SYNC.md``.
+        # Track external/shared channel status from the payload-level flag.
+        # The socket-mode payload synthesized in ``_route_socket_event``
+        # carries it too (upstream ``routeSocketEvent``, vercel/chat#724).
         if payload.get("is_ext_shared_channel"):
             channel_id = event.get("channel") or (event.get("item", {}).get("channel") if "item" in event else None)
             if channel_id:
@@ -3427,7 +3683,10 @@ class SlackAdapter:
             self._logger.debug("Skipping socket mode retry", {"retry_attempt": retry_attempt})
             return
 
-        await self._route_socket_event(payload, event_type, ack)
+        # ``retry_attempt`` feeds the event_id retry marker. While the skip
+        # above stays (#283 replaces it with upstream's "process retries"),
+        # only forwarded socket events reach the marker with a retry count.
+        await self._route_socket_event(payload, event_type, ack, retry_num=_parse_retry_num(retry_attempt))
 
     async def _route_socket_event(
         self,
@@ -3435,6 +3694,7 @@ class SlackAdapter:
         event_type: str,
         ack: Callable[..., Awaitable[None]],
         options: WebhookOptions | None = None,
+        retry_num: int | None = None,
     ) -> None:
         """Route a socket-mode event to the same handler the webhook path uses.
 
@@ -3442,7 +3702,9 @@ class SlackAdapter:
         the SocketModeResponse back to Slack — for events_api and
         slash_commands we ack immediately and let processing run in the
         background; for interactive payloads we may attach a response body
-        (e.g. modal ``view_submission`` errors) onto the ack.
+        (e.g. modal ``view_submission`` errors) onto the ack. ``retry_num`` is
+        Slack's redelivery count for the envelope, used to drop retries of
+        events that were already dispatched.
         """
 
         def wrap_async(coro: Awaitable[Any]) -> None:
@@ -3475,35 +3737,35 @@ class SlackAdapter:
                     {"body_type": type(body).__name__},
                 )
                 return
-            # Match the webhook path's synthesized payload exactly. Upstream
-            # doesn't include ``is_ext_shared_channel`` here, and the webhook
-            # JSON we pass into ``_process_event_payload`` doesn't either —
-            # adding it on the socket path is a quiet socket-vs-webhook
-            # divergence (hazard #7). Keep the keys that flow into
-            # downstream handlers, drop the rest.
+            # Rebuild the envelope with the fields upstream's
+            # ``routeSocketEvent`` keeps (vercel/chat#724): the installation
+            # identity (``authorizations``, enterprise fields), the Slack
+            # Connect context and the shared-channel flag.
             payload: dict[str, Any] = {
                 "type": "event_callback",
                 "event": event,
+                "authorizations": body.get("authorizations"),
                 "team_id": body.get("team_id"),
+                "context_team_id": body.get("context_team_id"),
+                "enterprise_id": body.get("enterprise_id"),
+                "is_enterprise_install": _is_true_flag(body.get("is_enterprise_install")),
+                "is_ext_shared_channel": body.get("is_ext_shared_channel"),
                 "event_id": body.get("event_id"),
                 "event_time": body.get("event_time"),
             }
-            # Multi-workspace: resolve token before dispatch (mirrors webhook
-            # path). copy_context() keeps the ContextVar set on tasks spawned
-            # by handlers (hazard #6).
-            team_id_event = payload.get("team_id")
             try:
-                if not self._is_single_workspace and team_id_event:
-                    ctx = await self._resolve_token_for_team(team_id_event)
-                    if ctx is None:
-                        self._logger.warn(
-                            "Could not resolve token for team",
-                            {"teamId": team_id_event},
-                        )
-                        return
-                    ctx = replace(ctx, installation_id=team_id_event)
+                # Drop redeliveries of events that were already dispatched
+                if await self._is_duplicate_event_delivery(payload, retry_num):
+                    return
+                # Resolve the per-installation token exactly like the HTTP
+                # path. copy_context() keeps the ContextVar set on tasks
+                # spawned by handlers (hazard #6).
+                resolved = await self._resolve_event_request_context(payload)
+                if resolved == "unresolved":
+                    return
+                if isinstance(resolved, RequestContext):
                     isolated = contextvars.copy_context()
-                    isolated.run(self._request_context.set, ctx)
+                    isolated.run(self._request_context.set, resolved)
                     isolated.run(self._process_event_payload, payload, options)
                 else:
                     self._process_event_payload(payload, options)
@@ -3524,47 +3786,31 @@ class SlackAdapter:
             # slash_commands payload is a flat dict mirroring the
             # form-urlencoded fields; convert to the parse_qs shape that
             # _handle_slash_command expects (each value wrapped in a list).
-            params: dict[str, list[str]] = {k: [v] for k, v in body.items() if isinstance(v, str)}
+            # Socket Mode delivers the fields as JSON, so flags such as
+            # ``is_enterprise_install`` arrive as booleans: render them as the
+            # form strings (JS ``String(true)``).
+            params: dict[str, list[str]] = {}
+            for key, value in body.items():
+                if isinstance(value, bool):
+                    params[key] = ["true" if value else "false"]
+                elif isinstance(value, str):
+                    params[key] = [value]
 
-            async def run_slash() -> None:
-                if self._is_single_workspace:
-                    await self._handle_slash_command(params, options)
-                    return
-                team_id_slash = (params.get("team_id") or [None])[0]
-                ctx = await self._resolve_token_for_team(team_id_slash) if team_id_slash else None
-                if ctx is None:
-                    # Missing or unresolved installation: already acked, do
-                    # not dispatch without a token context (vercel/chat#877).
-                    self._logger.warn("Could not resolve token for slash command")
-                    return
-                ctx = replace(ctx, installation_id=team_id_slash)
-                tok = self._request_context.set(ctx)
-                try:
-                    await self._handle_slash_command(params, options)
-                finally:
-                    self._request_context.reset(tok)
-
-            wrap_async(run_slash())
+            wrap_async(self._run_slash_command(params, options))
             return
 
         if event_type == "interactive":
             try:
                 # Multi-workspace: scope token resolution to the dispatch.
-                team_ref = body.get("team")
-                # Upstream ``team?.id || payload.team_id``: a ``team`` object
-                # without an id still falls back to the top-level field.
-                team_id_interactive = (team_ref.get("id") if isinstance(team_ref, dict) else None) or body.get(
-                    "team_id"
-                )
                 if not self._is_single_workspace:
-                    ctx = await self._resolve_token_for_team(team_id_interactive) if team_id_interactive else None
+                    info = self._extract_installation_from_interactive_payload(body)
+                    ctx = await self._resolve_interactive_request_context(info) if info else None
                     if ctx is None:
                         # Missing or unresolved installation: ack without
                         # dispatching (vercel/chat#877).
                         self._logger.warn("Could not resolve token for socket interactive payload")
                         await ack()
                         return
-                    ctx = replace(ctx, installation_id=team_id_interactive)
                     tok = self._request_context.set(ctx)
                     try:
                         result = await self._dispatch_interactive_payload(body, options)
@@ -3628,7 +3874,11 @@ class SlackAdapter:
                 {"event_type": type(event_type).__name__},
             )
             return
-        await self._route_socket_event(body, event_type, noop_ack, options)
+        # ``retryNum`` is the listener's redelivery count for the original
+        # socket envelope (upstream ``SlackForwardedSocketEvent.retryNum``).
+        await self._route_socket_event(
+            body, event_type, noop_ack, options, retry_num=_parse_retry_num(event.get("retryNum"))
+        )
 
     # ==================================================================
     # Message events
@@ -3823,10 +4073,7 @@ class SlackAdapter:
             try:
                 client = self._get_client()
                 result = await client.conversations_replies(
-                    channel=channel,
-                    ts=message_id,
-                    limit=1,
-                    inclusive=True,
+                    **self._with_token_kwargs(channel=channel, ts=message_id, limit=1, inclusive=True),
                 )
                 msgs = result.get("messages", [])
                 if msgs:
@@ -4081,7 +4328,7 @@ class SlackAdapter:
     async def publish_home_view(self, user_id: str, view: dict[str, Any]) -> None:
         """Publish a Home tab view for a user."""
         client = self._get_client()
-        await client.views_publish(user_id=user_id, view=view)
+        await client.views_publish(**self._with_token_kwargs(user_id=user_id, view=view))
 
     async def set_suggested_prompts(
         self,
@@ -4109,7 +4356,9 @@ class SlackAdapter:
         # ``assistant_threads_setSuggestedPrompts`` sends) because that helper
         # requires ``thread_ts`` before slack-sdk 3.43.0, which is newer than
         # the ``slack-sdk>=3.40.0`` floor.
-        await client.api_call(api_method="assistant.threads.setSuggestedPrompts", json=payload)
+        await client.api_call(
+            api_method="assistant.threads.setSuggestedPrompts", json=self._with_token_kwargs(**payload)
+        )
 
     def _schedule_configured_suggested_prompts(
         self, context: SlackSuggestedPromptsContext, options: WebhookOptions | None
@@ -4192,12 +4441,14 @@ class SlackAdapter:
         effective_loading_messages = loading_messages if loading_messages is not None else self._loading_messages
         if effective_loading_messages:
             kwargs["loading_messages"] = effective_loading_messages
-        await client.assistant_threads_setStatus(**kwargs)
+        await client.assistant_threads_setStatus(**self._with_token_kwargs(**kwargs))
 
     async def set_assistant_title(self, channel_id: str, thread_ts: str, title: str) -> None:
         """Set title for an assistant thread (shown in History tab)."""
         client = self._get_client()
-        await client.assistant_threads_setTitle(channel_id=channel_id, thread_ts=thread_ts, title=title)
+        await client.assistant_threads_setTitle(
+            **self._with_token_kwargs(channel_id=channel_id, thread_ts=thread_ts, title=title)
+        )
 
     # ==================================================================
     # Mention resolution
@@ -4713,7 +4964,9 @@ class SlackAdapter:
 
         async def fetch_message() -> Message:
             client = self._get_client()
-            result = await client.conversations_history(channel=channel, latest=ts, inclusive=True, limit=1)
+            result = await client.conversations_history(
+                **self._with_token_kwargs(channel=channel, latest=ts, inclusive=True, limit=1)
+            )
             messages = result.get("messages", [])
             target = next((m for m in messages if m.get("ts") == ts), None)
             if not target:
@@ -5454,12 +5707,14 @@ class SlackAdapter:
                 )
                 try:
                     result = await client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts or None,
-                        text=fallback_text,
-                        blocks=blocks,
-                        unfurl_links=False,
-                        unfurl_media=False,
+                        **self._with_token_kwargs(
+                            channel=channel,
+                            thread_ts=thread_ts or None,
+                            text=fallback_text,
+                            blocks=blocks,
+                            unfurl_links=False,
+                            unfurl_media=False,
+                        ),
                     )
                 except Exception as error:
                     enriched = self._enrich_invalid_blocks_error(error, blocks)
@@ -5485,11 +5740,9 @@ class SlackAdapter:
                 },
             )
             result = await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts or None,
-                unfurl_links=False,
-                unfurl_media=False,
-                **payload,
+                **self._with_token_kwargs(
+                    channel=channel, thread_ts=thread_ts or None, unfurl_links=False, unfurl_media=False, **payload
+                ),
             )
             return RawMessage(
                 id=result.get("ts", ""),
@@ -5561,7 +5814,9 @@ class SlackAdapter:
             if card:
                 blocks = card_to_block_kit(card)
                 fallback_text = card_to_fallback_text(card)
-                result = await client.chat_update(channel=channel, ts=message_id, text=fallback_text, blocks=blocks)
+                result = await client.chat_update(
+                    **self._with_token_kwargs(channel=channel, ts=message_id, text=fallback_text, blocks=blocks)
+                )
                 return RawMessage(
                     id=result.get("ts", ""),
                     thread_id=thread_id,
@@ -5577,7 +5832,7 @@ class SlackAdapter:
                     "payloadKey": "markdown_text" if "markdown_text" in payload else "text",
                 },
             )
-            result = await client.chat_update(channel=channel, ts=message_id, **payload)
+            result = await client.chat_update(**self._with_token_kwargs(channel=channel, ts=message_id, **payload))
             return RawMessage(
                 id=result.get("ts", ""),
                 thread_id=thread_id,
@@ -5601,7 +5856,7 @@ class SlackAdapter:
         try:
             client = self._get_client()
             self._logger.debug("Slack API: chat.delete", {"channel": channel, "messageId": message_id})
-            await client.chat_delete(channel=channel, ts=message_id)
+            await client.chat_delete(**self._with_token_kwargs(channel=channel, ts=message_id))
         except Exception as error:
             self._handle_slack_error(error)
 
@@ -5622,7 +5877,7 @@ class SlackAdapter:
                 "Slack API: reactions.add",
                 {"channel": channel, "messageId": message_id, "emoji": name},
             )
-            await client.reactions_add(channel=channel, timestamp=message_id, name=name)
+            await client.reactions_add(**self._with_token_kwargs(channel=channel, timestamp=message_id, name=name))
         except Exception as error:
             self._handle_slack_error(error)
 
@@ -5639,7 +5894,7 @@ class SlackAdapter:
                 "Slack API: reactions.remove",
                 {"channel": channel, "messageId": message_id, "emoji": name},
             )
-            await client.reactions_remove(channel=channel, timestamp=message_id, name=name)
+            await client.reactions_remove(**self._with_token_kwargs(channel=channel, timestamp=message_id, name=name))
         except Exception as error:
             self._handle_slack_error(error)
 
@@ -5677,10 +5932,9 @@ class SlackAdapter:
         try:
             client = self._get_client()
             await client.assistant_threads_setStatus(
-                channel_id=channel,
-                thread_ts=thread_ts,
-                status=status_text,
-                loading_messages=loading_messages,
+                **self._with_token_kwargs(
+                    channel_id=channel, thread_ts=thread_ts, status=status_text, loading_messages=loading_messages
+                ),
             )
         except Exception as exc:
             self._logger.warn(
@@ -6326,11 +6580,9 @@ class SlackAdapter:
                 blocks = card_to_block_kit(card)
                 fallback_text = card_to_fallback_text(card)
                 result = await client.chat_postEphemeral(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    user=user_id,
-                    text=fallback_text,
-                    blocks=blocks,
+                    **self._with_token_kwargs(
+                        channel=channel, thread_ts=thread_ts or None, user=user_id, text=fallback_text, blocks=blocks
+                    ),
                 )
                 return EphemeralMessage(
                     id=result.get("message_ts", ""),
@@ -6350,10 +6602,7 @@ class SlackAdapter:
                 },
             )
             result = await client.chat_postEphemeral(
-                channel=channel,
-                thread_ts=thread_ts or None,
-                user=user_id,
-                **payload,
+                **self._with_token_kwargs(channel=channel, thread_ts=thread_ts or None, user=user_id, **payload),
             )
             return EphemeralMessage(
                 id=result.get("message_ts", ""),
@@ -6465,7 +6714,7 @@ class SlackAdapter:
         try:
             client = self._get_client()
             self._logger.debug("Slack API: conversations.open", {"userId": user_id})
-            result = await client.conversations_open(users=user_id)
+            result = await client.conversations_open(**self._with_token_kwargs(users=user_id))
             channel_info = result.get("channel", {})
             channel_id = channel_info.get("id")
             if not channel_id:
@@ -6496,7 +6745,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.views_open(trigger_id=trigger_id, view=view)
+            result = await client.views_open(**self._with_token_kwargs(trigger_id=trigger_id, view=view))
             view_id = (result.get("view") or {}).get("id", "")
             return {"viewId": view_id}
         except Exception as error:
@@ -6508,7 +6757,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.views_update(view_id=view_id, view=view)
+            result = await client.views_update(**self._with_token_kwargs(view_id=view_id, view=view))
             new_view_id = (result.get("view") or {}).get("id", "")
             return {"viewId": new_view_id}
         except Exception as error:
@@ -6597,7 +6846,9 @@ class SlackAdapter:
         cursor: str | None = None,
     ) -> FetchResult:
         client = self._get_client()
-        result = await client.conversations_replies(channel=channel, ts=thread_ts, limit=limit, cursor=cursor)
+        result = await client.conversations_replies(
+            **self._with_token_kwargs(channel=channel, ts=thread_ts, limit=limit, cursor=cursor)
+        )
         slack_messages = result.get("messages", [])
         next_cursor = (result.get("response_metadata") or {}).get("next_cursor")
 
@@ -6617,7 +6868,7 @@ class SlackAdapter:
 
         client = self._get_client()
         result = await client.conversations_replies(
-            channel=channel, ts=thread_ts, limit=fetch_limit, latest=latest, inclusive=False
+            **self._with_token_kwargs(channel=channel, ts=thread_ts, limit=fetch_limit, latest=latest, inclusive=False),
         )
         slack_messages = result.get("messages", [])
 
@@ -6647,10 +6898,14 @@ class SlackAdapter:
             # message. Fetch the single message from conversations.history
             # instead (mirrors the link-preview fetch_message at ~3293).
             if not thread_ts:
-                result = await client.conversations_history(channel=channel, latest=message_id, inclusive=True, limit=1)
+                result = await client.conversations_history(
+                    **self._with_token_kwargs(channel=channel, latest=message_id, inclusive=True, limit=1)
+                )
             else:
                 result = await client.conversations_replies(
-                    channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1
+                    **self._with_token_kwargs(
+                        channel=channel, ts=thread_ts, oldest=message_id, inclusive=True, limit=1
+                    ),
                 )
             messages = result.get("messages", [])
             target = next((m for m in messages if m.get("ts") == message_id), None)
@@ -6668,7 +6923,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.conversations_info(channel=channel)
+            result = await client.conversations_info(**self._with_token_kwargs(channel=channel))
             channel_info = result.get("channel", {})
 
             if channel_info.get("is_ext_shared"):
@@ -6724,7 +6979,7 @@ class SlackAdapter:
         if cursor:
             kwargs["oldest"] = cursor
             kwargs["inclusive"] = False
-        result = await client.conversations_history(**kwargs)
+        result = await client.conversations_history(**self._with_token_kwargs(**kwargs))
 
         slack_messages = list(reversed(result.get("messages", [])))
         messages = await asyncio.gather(
@@ -6753,7 +7008,7 @@ class SlackAdapter:
         if cursor:
             kwargs["latest"] = cursor
             kwargs["inclusive"] = False
-        result = await client.conversations_history(**kwargs)
+        result = await client.conversations_history(**self._with_token_kwargs(**kwargs))
 
         slack_messages = result.get("messages", [])
         chronological = list(reversed(slack_messages))
@@ -6788,9 +7043,9 @@ class SlackAdapter:
         try:
             client = self._get_client()
             result = await client.conversations_history(
-                channel=channel,
-                limit=min(limit * 3, 200),
-                cursor=getattr(opts, "cursor", None),
+                **self._with_token_kwargs(
+                    channel=channel, limit=min(limit * 3, 200), cursor=getattr(opts, "cursor", None)
+                ),
             )
 
             slack_messages = result.get("messages", [])
@@ -6832,7 +7087,7 @@ class SlackAdapter:
 
         try:
             client = self._get_client()
-            result = await client.conversations_info(channel=channel)
+            result = await client.conversations_info(**self._with_token_kwargs(channel=channel))
             info = result.get("channel", {})
 
             if info.get("is_ext_shared"):
