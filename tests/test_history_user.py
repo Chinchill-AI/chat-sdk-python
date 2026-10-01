@@ -1,9 +1,13 @@
-"""Faithful translation of transcripts.test.ts.
+"""Faithful translation of history/user.test.ts and transcripts.test.ts.
 
-Tests for TranscriptsApiImpl: append, list, count, delete, eviction, and
-formatted round-trip behavior.
+Tests for UserHistoryApiImpl (``chat.history.user``): append, list, count,
+delete, eviction, and formatted round-trip behavior, plus the deprecated
+``TranscriptsApiImpl`` alias.
 
-TS file: packages/chat/src/transcripts.test.ts
+TS files: packages/chat/src/history/user.test.ts (the renamed transcripts
+suite) and packages/chat/src/transcripts.test.ts. The upstream pin
+(chat@4.31.0) still has the whole suite in transcripts.test.ts, so both TS
+files map here; see scripts/verify_test_fidelity.py.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from chat_sdk.history import UserHistoryApiImpl
 from chat_sdk.shared.markdown_parser import parse_markdown
 from chat_sdk.testing import MockStateAdapter, create_mock_state, create_test_message
 from chat_sdk.transcripts import TranscriptsApiImpl
@@ -25,11 +30,11 @@ from chat_sdk.types import (
     CountQuery,
     DeleteTarget,
     ListQuery,
-    TranscriptsConfig,
+    UserHistoryConfig,
 )
 
 UUID_RE = re.compile(r"^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$")
-USER_KEY_REQUIRED_RE = r"options\.user_key is required"
+USER_KEY_REQUIRED_RE = r"history\.user\.append.*userKey is required"
 INVALID_DURATION_RE = r"Invalid duration"
 
 
@@ -74,11 +79,11 @@ def state() -> MockStateAdapter:
 
 
 @pytest.fixture
-def api(state: MockStateAdapter) -> TranscriptsApiImpl:
-    return TranscriptsApiImpl(state, TranscriptsConfig())
+def api(state: MockStateAdapter) -> UserHistoryApiImpl:
+    return UserHistoryApiImpl(state, UserHistoryConfig())
 
 
-async def _seed(api: TranscriptsApiImpl, user_key: str, count: int = 5) -> None:
+async def _seed(api: UserHistoryApiImpl, user_key: str, count: int = 5) -> None:
     thread = create_test_thread()
     for i in range(count):
         msg = create_test_message(f"m{i}", f"msg {i}")
@@ -166,7 +171,7 @@ class TestAppend:
 
     # TS: "includes formatted when storeFormatted is true"
     async def test_includes_formatted_when_storeformatted_is_true(self, state):
-        api = TranscriptsApiImpl(state, TranscriptsConfig(store_formatted=True))
+        api = UserHistoryApiImpl(state, UserHistoryConfig(store_formatted=True))
         thread = create_test_thread()
         msg = create_test_message("m1", "**bold**")
         msg.user_key = "u1"
@@ -182,7 +187,7 @@ class TestAppend:
 
     # TS: "passes retention duration string through as ttlMs"
     async def test_passes_retention_duration_string_through_as_ttlms(self, state):
-        api = TranscriptsApiImpl(state, TranscriptsConfig(retention="7d"))
+        api = UserHistoryApiImpl(state, UserHistoryConfig(retention="7d"))
         append_calls = _record_append_to_list_calls(state)
         thread = create_test_thread()
         msg = create_test_message("m1", "Hello")
@@ -198,7 +203,7 @@ class TestAppend:
 
     # TS: "passes numeric retention through unchanged"
     async def test_passes_numeric_retention_through_unchanged(self, state):
-        api = TranscriptsApiImpl(state, TranscriptsConfig(retention=60_000, max_per_user=50))
+        api = UserHistoryApiImpl(state, UserHistoryConfig(retention=60_000, max_per_user=50))
         append_calls = _record_append_to_list_calls(state)
         thread = create_test_thread()
         msg = create_test_message("m1", "Hello")
@@ -215,7 +220,7 @@ class TestAppend:
     # TS: "rejects malformed duration strings"
     def test_rejects_malformed_duration_strings(self, state):
         with pytest.raises(ValueError, match=INVALID_DURATION_RE):
-            TranscriptsApiImpl(state, TranscriptsConfig(retention="7days"))
+            UserHistoryApiImpl(state, UserHistoryConfig(retention="7days"))
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +424,25 @@ class TestDelete:
 
 
 class TestMaxPerUserEviction:
+    # TS: "retains $expected entries with maxPerUser=$maxPerUser"
+    @pytest.mark.parametrize(
+        ("max_per_user", "expected", "first"),
+        [(False, 205, "msg 0"), (None, 200, "msg 5")],
+    )
+    async def test_retains_entries_with_maxperuser(self, state, max_per_user, expected, first):
+        api = UserHistoryApiImpl(state, UserHistoryConfig(max_per_user=max_per_user))
+        thread = create_test_thread()
+        for i in range(205):
+            await api.append(thread, AppendInput(role="assistant", text=f"msg {i}"), AppendOptions(user_key="u1"))
+
+        listed = await api.list(ListQuery(user_key="u1", limit=300))
+        assert len(listed) == expected
+        assert listed[0].text == first
+        assert listed[-1].text == "msg 204"
+
     # TS: "trims to maxPerUser via appendToList semantics"
     async def test_trims_to_maxperuser_via_appendtolist_semantics(self, state):
-        api = TranscriptsApiImpl(state, TranscriptsConfig(max_per_user=3))
+        api = UserHistoryApiImpl(state, UserHistoryConfig(max_per_user=3))
         await _seed(api, "u1")
 
         listed = await api.list(ListQuery(user_key="u1"))
@@ -437,7 +458,7 @@ class TestMaxPerUserEviction:
 class TestFormattedRoundTrip:
     # TS: "preserves mdast Root through state serialization"
     async def test_preserves_mdast_root_through_state_serialization(self, state):
-        api = TranscriptsApiImpl(state, TranscriptsConfig(store_formatted=True))
+        api = UserHistoryApiImpl(state, UserHistoryConfig(store_formatted=True))
         thread = create_test_thread()
         original = parse_markdown("# Hello\n\n*world*")
         msg = create_test_message("m1", "Hello world")
@@ -448,3 +469,14 @@ class TestFormattedRoundTrip:
         listed = await api.list(ListQuery(user_key="u1"))
 
         assert listed[0].formatted == original
+
+
+# ---------------------------------------------------------------------------
+# Deprecated alias (transcripts.test.ts)
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptsApiImplDeprecatedAlias:
+    # TS: "re-exports UserHistoryApiImpl under the legacy name"
+    def test_reexports_userhistoryapiimpl_under_the_legacy_name(self):
+        assert TranscriptsApiImpl is UserHistoryApiImpl
