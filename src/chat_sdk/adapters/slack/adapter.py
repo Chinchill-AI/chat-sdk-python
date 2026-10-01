@@ -3701,16 +3701,24 @@ class SlackAdapter:
                     {"envelope_id": envelope_id, "error": str(exc)},
                 )
 
-        # Slack re-delivers events that weren't acked in time. Skip retries
-        # so we don't double-process — but still ack so Slack stops resending.
         if retry_attempt and retry_attempt > 0:
-            await ack()
-            self._logger.debug("Skipping socket mode retry", {"retry_attempt": retry_attempt})
-            return
+            # Slack redelivers an event when a prior delivery wasn't acked --
+            # including events sent while the app had no open socket (restart,
+            # deploy, connection refresh). Route it like a first delivery:
+            # the event_id marker and ``Chat.process_message``'s message-id
+            # dedupe drop an already-handled duplicate, while a genuinely
+            # missed event is recovered instead of being lost (upstream
+            # vercel/chat#667). slack_sdk names upstream's ``retry_num``
+            # ``retry_attempt``.
+            self._logger.info(
+                "Processing socket mode retry",
+                {
+                    "retry_attempt": retry_attempt,
+                    "retry_reason": getattr(request, "retry_reason", None),
+                    "type": event_type,
+                },
+            )
 
-        # ``retry_attempt`` feeds the event_id retry marker. While the skip
-        # above stays (#283 replaces it with upstream's "process retries"),
-        # only forwarded socket events reach the marker with a retry count.
         await self._route_socket_event(payload, event_type, ack, retry_num=_parse_retry_num(retry_attempt))
 
     async def _route_socket_event(
@@ -5516,32 +5524,19 @@ class SlackAdapter:
     ) -> tuple[FormattedContent, str]:
         """Body AST with leading tables above it, then trailing tables and attachments.
 
-        Returns ``(formatted, plain_text)``. Upstream derives ``message.text``
-        as ``toPlainText(formatted)``. Until #283 ports upstream's inbound
-        mrkdwn normalization (``slackMrkdwnToMarkdown``), our ``to_ast`` drops
-        code on a fence's opening line (the body ``"```npm test```"`` parses to
-        nothing), so the body's share of the plain text keeps the regex
-        ``extract_plain_text`` used before #210, and only the table and
-        attachment nodes go through ``ast_to_plain_text``. A message without
-        tables or attachments gets exactly the pre-#210 text. Otherwise the
-        pieces are joined with a blank line, skipping empty ones, as
-        ``toPlainText`` joins root children (the body loses trailing
-        whitespace there, as a parsed paragraph would). Temporary divergence:
-        #283 replaces this with ``ast_to_plain_text(formatted)``.
+        Returns ``(formatted, plain_text)``; the plain text is upstream's
+        ``text: toPlainText(formatted)`` at each ``assembleContent`` call
+        site, so ``message.text`` is the plain text of everything
+        ``message.formatted`` holds.
         """
-        before = [self._table_node(data) for data in tables.leading]
-        after = [*(self._table_node(data) for data in tables.trailing), *attachment_nodes]
         formatted = self._format_converter.to_ast(text)
-        formatted["children"] = [*before, *formatted.get("children", []), *after]
-        body = self._format_converter.extract_plain_text(text)
-        if not (before or after):
-            return formatted, body
-        pieces = [
-            *(ast_to_plain_text(node) for node in before),
-            body.rstrip(JS_WHITESPACE),
-            *(ast_to_plain_text(node) for node in after),
+        formatted["children"] = [
+            *(self._table_node(data) for data in tables.leading),
+            *formatted.get("children", []),
+            *(self._table_node(data) for data in tables.trailing),
+            *attachment_nodes,
         ]
-        return formatted, "\n\n".join(piece for piece in pieces if piece)
+        return formatted, ast_to_plain_text(formatted)
 
     def _attachment_nodes(self, content: _AttachmentContent) -> list[Content]:
         """Render one attachment's content to block nodes (upstream ``attachmentNodes``).
@@ -7402,7 +7397,17 @@ class SlackAdapter:
             raise ValidationError("slack", f"Invalid Slack channel ID: {channel_id}")
 
         synthetic_thread_id = f"slack:{channel}:"
-        return await self.post_message(synthetic_thread_id, message)
+        result = await self.post_message(synthetic_thread_id, message)
+
+        # The new message roots its own thread: return a replyable thread id
+        # (upstream vercel/chat#720). Without a string ``ts`` (e.g. a
+        # file-only upload) there is nothing to address, so keep the
+        # channel-scoped id.
+        raw = result.raw
+        ts = raw.get("ts") if isinstance(raw, dict) else None
+        if not isinstance(ts, str):
+            return result
+        return replace(result, thread_id=self.encode_thread_id(SlackThreadId(channel=channel, thread_ts=ts)))
 
     # ==================================================================
     # Thread ID encoding / decoding

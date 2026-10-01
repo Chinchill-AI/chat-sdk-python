@@ -445,17 +445,17 @@ The channel-edit divergence exists because the thread id reported for a
 channel post often never equals a click's thread id:
 - Teams and Google Chat `post_channel_message` return the channel id as the
   thread id (upstream too);
-- Slack `post_channel_message` returns the synthetic `slack:C…:` until #283
-  ports upstream `92530dd3` (vercel/chat#720), while a click reports
-  `slack:C…:<message_ts>`. After #283 a Slack *DM* post reports
+- Slack `post_channel_message` returned the synthetic `slack:C…:` until #283
+  ported upstream `92530dd3` (vercel/chat#720), while a click reports
+  `slack:C…:<message_ts>`. Since #283 a Slack *DM* post reports
   `slack:D…:<ts>`, but a DM click reports `slack:D…:` (Python's DM
   `_handle_block_actions` divergence), so a thread scope would still miss;
 - chained edits (`sent = await sent.edit(...)` twice), whose returned
   `SentMessage` dropped the thread-id override before #195 ported `16ea171e`
   (it now keeps it, so this reason no longer applies on its own).
 
-Binding to the channel resolves all of these, independent of #283's merge
-order, because every click on the message derives the same channel id.
+Binding to the channel resolves all of these, because every click on the
+message derives the same channel id.
 
 **Breaking for `callback_url` users:** tokens minted before the upgrade stop
 resolving, a repeat click no longer POSTs, tokens expire after 7 days, and the
@@ -1000,7 +1000,7 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   `None` and resolves with `is not None` (upstream `??`). Before this change the
   dataclass default `300000` always won and `0` fell through `or` to the
   constant. `0` now reaches the state adapter, and the bundled backends treat a
-  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` is #283 (split from #209).
+  `0` TTL as no expiry (upstream `state-redis` does the same). The Slack Socket Mode retry-envelope half of `0b63791b` landed in #283 (split from #209).
 - **`wait_until` and handler errors (`c21ccbc0`, `91683e52`).** Upstream hands
   `waitUntil` a `task.catch(log)` promise that fulfils when the handler fails.
   Python passed the raw task, so a host that awaited it saw handler errors
@@ -1150,7 +1150,8 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
 `bb7cd124` (#716) and `80def3ab` (#707, chat@4.35.0), `51322dde` (#891) and
 `c2b6bff0` (#883, chat@4.40.0), and `683eadc1` (#947, chat@4.41.0). Part (b)
 (the mrkdwn normalization from `e71bfead` / `44423bdc` / `c3118279`, the
-`92530dd3` channel-post id and the `0b63791b` Socket Mode retries) is #283.
+`92530dd3` channel-post id and the `0b63791b` Socket Mode retries) landed in
+#283; see "Slack inbound mrkdwn, channel-post ids, Socket Mode retries".
 
 - **Self mention (`51322dde`).** `_resolve_inline_mentions` no longer skips
   the bot's id. `<@U_BOT>` resolves through `_lookup_user_name` like any other
@@ -1191,17 +1192,16 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
 
 ### Slack inbound content: pasted tables and alert attachments (chat@4.38–4.39, #210)
 
-Parity apart from one temporary divergence (the body's plain text, below,
-until #283). Ports the Slack halves of `764e4759` (#817,
+Parity. Ports the Slack halves of `764e4759` (#817,
 chat@4.38.1) and `864d9222` (#846, chat@4.39.0); the core `toPlainText` table
 rules were #193 and the `previous_message` hunk of #846 is #211.
 
 - **Content assembly.** Both parse paths build `formatted` from the body text
   plus `table` / `data_table` blocks (tables before the first non-table block
   above the text, the rest below) plus each non-unfurl attachment's content.
-  `text` appends the tables' and attachments' `ast_to_plain_text` to the
-  body's plain text (see the #283 bullet for how the body's share is
-  derived). The helpers are module-level in
+  `text` is `ast_to_plain_text(formatted)` (upstream `toPlainText(formatted)`;
+  until #283 the body's share kept the pre-#210 regex rendering). The
+  helpers are module-level in
   `adapters/slack/adapter.py` (no separate module): `_block_text`,
   `_has_bold_text`, `_table_data`, `_event_tables`, `_attachment_content`,
   `_literal_phrasing`, `_collect_mention_ids`, `_apply_mention_names`, and the
@@ -1234,42 +1234,61 @@ rules were #193 and the `previous_message` hunk of #846 is #211.
   Python slices copy, so the upstream shape is quadratic (about 4 s on 200k
   characters of `<@U1>` tokens) now that it also runs over attachment text.
   Output is identical (fuzzed against the upstream-shaped versions).
-- **Temporary divergence until #283: the body's plain text.** Upstream
-  derives `text = toPlainText(formatted)`, and its `toAst` runs
-  `slackMrkdwnToMarkdown`, which moves code after an opening fence onto its
-  own line, unescapes `&amp;` / `&lt;` / `&gt;`, renders `<!subteam^…>` as
-  `@…` and `<#C…|name>` as `#name (C…)`. The Python
-  `SlackFormatConverter.to_ast` does none of this yet (#283 ports it), so
-  deriving all of `text` from `formatted` would drop code from ordinary
-  messages (`` ```npm test``` `` would give `text == ""`). Until #283,
-  `_assemble_content` builds `text` as the blank-line join of the non-empty
-  plain texts of the leading tables, `extract_plain_text(body)` (the pre-#210
-  rendering, so a message without tables or attachments gets the same `text`
-  as before) and the trailing tables and attachment nodes. That is what
-  `toPlainText` does with root children, so only the body's share differs
-  from upstream. #283 replaces it with `ast_to_plain_text(formatted)` and
-  updates these assertions in `tests/test_slack_inbound_content.py`:
-  `test_body_text_keeps_its_pre_283_rendering` (to upstream's fence output),
-  `test_keeps_attachment_content_out_of_an_unclosed_code_fence_in_the_body`
-  (upstream's `"Deploy failed:\n\nTypeError: boom\n\n…"`),
-  `test_preserves_rich_text_metadata_within_table_cells` (upstream's
-  `"#C789 @S789 July 11 #ff0000"`) and
-  `test_resolves_user_and_channel_mentions_in_table_cells`
-  (`"@Test Bot\t#general (C789)"`).
-  Table cells and mrkdwn attachment parts go through `to_ast` already, so
-  until #283 they show the same gaps body `formatted` shows today: a cell
-  fence loses its opening line, a `raw_text` cell holding `R&D` or `<@U…>`
-  (escaped by `_block_text`, as upstream does) shows `R&amp;D` /
-  `&lt;@U…&gt;`, a usergroup cell shows `<!subteam^S…>` and a labelled
-  channel shows `#name`. That content was absent before #210. Literal
-  attachment parts unescape on their own (`_literal_phrasing`) and already
-  match upstream.
 - **`title_link` and the unfurl wait.** On a webhook, an untitled
   `title_link` preview makes `_enrich_links` poll the unfurl cache (up to
   2 s) exactly as upstream does. Fetched (history) messages poll too, only
   because of the `_unfurl_channel_for` fallback in the divergence table; that
   already applied to every untitled link in fetched messages and is tracked
   there and in #292.
+
+### Slack inbound mrkdwn, channel-post ids, Socket Mode retries (chat@4.33–4.41, #283)
+
+Part (b) of #209. Parity, with no new divergence. Ports the Slack halves of
+`0b63791b` (#667, chat@4.33.0), `92530dd3` (#720, chat@4.35.0), `c3118279`
+(#756, chat@4.37.0), `e71bfead` (#843, chat@4.39.0) and `44423bdc` (#960,
+chat@4.41.1).
+
+- **mrkdwn (`e71bfead`, `44423bdc`, `c3118279`).** `slack/format.py` ports
+  `convertSpecialMentions` and `convertMrkdwnWithCodeFences` with their
+  helpers (`findAngleTokenEnd`, `findInlineCodeEnd`, `isOnBlockquoteLine`,
+  `escapeLeadingBlockMarker`), the `#name (C…)` channel rewrite and the
+  inverted-link swap. As upstream, the fence normalizer is a separate copy of
+  `shared.code_fences` with mrkdwn's entity escaping (`&gt;` quote lines,
+  `<…>` tokens). JS `^`/`$` without `m` are `re.match`/`\Z`, and JS `\d` is
+  `[0-9]`.
+- **`to_ast` and `message.text`.** `SlackFormatConverter.to_ast` is
+  `parse_markdown(slack_mrkdwn_to_markdown(text))`, as upstream `toAst`. The
+  old inline regex copy skipped `unescape_slack_text`, so `&lt;` / `&gt;` /
+  `&amp;` reached `formatted` and `text` verbatim. The Python-only regex
+  `extract_plain_text` override is removed (upstream `markdown.ts` has none;
+  the base is `to_ast` + `ast_to_plain_text`). Both parse paths set
+  `text = ast_to_plain_text(formatted)` over the assembled content (upstream
+  `toPlainText(formatted)`), replacing the #210 interim that kept the regex
+  rendering for the body's share. Consequences: list markers, `#`, `>` and
+  backticks no longer appear in `message.text`, and blocks join with a blank
+  line.
+- **`post_channel_message` (`92530dd3`)** returns `slack:{channel}:{ts}` when
+  the response's `raw["ts"]` is a `str`, else the synthetic `slack:{channel}:`
+  (file-only uploads), as upstream's `typeof result.raw.ts !== "string"` check.
+- **Socket Mode retries (`0b63791b`).** Retry envelopes are routed like first
+  deliveries. The event-id marker (#268) drops a retry whose first delivery
+  was dispatched, and core message-id dedupe (10 min TTL, #191) drops true
+  duplicates. slack_sdk's `SocketModeRequest.retry_attempt` / `retry_reason`
+  are upstream's `retry_num` / `retry_reason`; the info log
+  `"Processing socket mode retry"` uses the key `retry_attempt`.
+- **Linear-time scanning (implementation, not divergence).** Results equal
+  upstream's. A failed `<…>` scan is remembered so a run of unclosed `<` stays
+  linear, the inline-code newline check is bounded by the closing backtick,
+  and the blockquote-line check matches in place instead of slicing.
+  `tests/test_slack_format_primitives.py` covers 50k-character inputs.
+- **Known gaps (shared parser, not Slack-specific).** Two `markdown.test.ts`
+  cases are adapted: `parse_markdown` has no multi-backtick code spans
+  (```` ```c``` ```` inside a quote stays backticked text, where remark reads a
+  code span) and keeps a paragraph's leading space (`"```x``` &gt; note"`
+  gives `"x\n\n > note"`, upstream `"x\n\n> note"`). `parse_markdown` is
+  also quadratic on some inputs (about 2.4 s for 20k characters of `` `x ``);
+  this predates the port, since `to_ast` always ran it on every inbound
+  message, and is tracked separately.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
@@ -1365,11 +1384,9 @@ chat@4.35.0); the installation-scoped caches landed in #205. Code is in
 
 Python-specific notes:
 
-- **Socket retries before #283.** `_on_socket_request` still acks and skips
-  envelopes with `retry_attempt > 0`, so on a live socket the marker only
-  sees first deliveries; it already covers HTTP retries and forwarded socket
-  events. #283 (split from #209) removes the skip, after which `retry_attempt` reaches the
-  marker unchanged.
+- **Socket retries.** Since #283, `_on_socket_request` routes envelopes with
+  `retry_attempt > 0` like first deliveries, so `retry_attempt` reaches the
+  marker on a live socket too (before, retries were acked and dropped).
 - **Flag normalization.** `is_enterprise_install` counts only as `True` or
   `"true"` everywhere (upstream's event path uses `Boolean(...)`, so a
   `"false"` string would count there). Slack sends booleans in event JSON, so
@@ -3160,7 +3177,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
-| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reports the synthetic `slack:C…:` until #283 while clicks carry the message ts, a Slack DM click carries no ts even after #283 makes the post report one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
+| Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reported the synthetic `slack:C…:` until #283 (it still does when the response has no string ts) while clicks carry the message ts, a Slack DM click carries no ts even though the post now reports one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |
 | Adapter hook signature probe (4.41 wave, #200, #201) | `Thread.start_typing` passes `options=TypingOptions(...)` to `adapter.start_typing` under the same rule (a two-argument `start_typing(thread_id, status)` is called with two arguments). `Thread`/`Channel.post_ephemeral` pass `options=` to `adapter.post_ephemeral` only when `chat_sdk._compat.accepts_kwarg` finds an `options` parameter (positional-or-keyword or keyword-only) or `**kwargs`; an implementation with the older `(thread_id, user_id, message)` signature is called with three arguments | `adapter.postEphemeral(threadId, userId, postable, options)` and `adapter.startTyping(threadId, status, { initiatorUserId })` always | JavaScript drops extra arguments, while Python raises `TypeError`, so passing `options=` unconditionally would break third-party adapters written against the pre-4.41 signature. In-repo adapters all accept it. Regression tests: `tests/test_thread_faithful.py::TestPostEphemeral::test_three_argument_custom_post_ephemeral_still_works`, `tests/test_channel_faithful.py::TestChannelPostEphemeral::test_three_argument_custom_post_ephemeral_still_works_from_a_channel` and `tests/test_compat.py::test_accepts_kwarg`; for `start_typing`, `tests/test_turn_cancellation.py::TestThreadAbortAndTyping::test_two_argument_custom_start_typing_still_works`. |

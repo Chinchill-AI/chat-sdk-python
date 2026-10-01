@@ -185,6 +185,72 @@ class TestParseMessage:
         )
         assert message.is_mention is True
 
+    def test_converts_special_mentions_to_readable_text(self):
+        message = self._adapter().parse_message(
+            {
+                "type": "message",
+                "user": "U123",
+                "channel": "C456",
+                "text": "<!here> and <!subteam^S0123456789|@devs>",
+                "ts": "1234567890.123456",
+            }
+        )
+        assert message.text == "@here and @devs"
+        assert [node["type"] for node in message.formatted["children"]] == ["paragraph"]
+
+    def test_preserves_special_mention_tokens_in_an_inbound_inline_code_span(self):
+        text = "<!here> <!channel> <!everyone> <!subteam^S123>"
+        message = self._adapter().parse_message(
+            {
+                "type": "message",
+                "user": "U123",
+                "channel": "D456",
+                "channel_type": "im",
+                "text": f"review code `{text}`",
+                "ts": "1234567890.123456",
+                "blocks": _rich_text(
+                    {"type": "text", "text": "review code "},
+                    {"type": "text", "text": text, "style": {"code": True}},
+                ),
+            }
+        )
+        assert message.text == f"review code {text}"
+        paragraph = message.formatted["children"]
+        assert [node["type"] for node in paragraph] == ["paragraph"]
+        assert [(c["type"], c["value"]) for c in paragraph[0]["children"]] == [
+            ("text", "review code "),
+            ("inlineCode", text),
+        ]
+        assert message.is_mention is False
+
+    def test_preserves_special_mention_tokens_in_an_inbound_code_block(self):
+        text = "review fence <!here> <!channel> <!everyone>"
+        message = self._adapter().parse_message(
+            {
+                "type": "message",
+                "user": "U123",
+                "channel": "D456",
+                "channel_type": "im",
+                "text": f"```{text}```",
+                "ts": "1234567890.123456",
+                "blocks": [
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_preformatted",
+                                "elements": [{"type": "text", "text": text}],
+                                "border": 0,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        assert message.text == text
+        assert [(n["type"], n["value"]) for n in message.formatted["children"]] == [("code", text)]
+        assert message.is_mention is False
+
     def test_uses_the_bot_user_id_instead_of_the_app_bot_id(self):
         message = self._adapter().parse_message(
             {
@@ -1077,3 +1143,29 @@ class TestIncomingAuthorEmail:
         second = await adapter._parse_slack_message(dict(self.HUMAN_EVENT), "slack:C123:1234567890.123456")
         assert client.users_info.await_count == 1
         assert second.author.email == "alice@example.com"
+
+
+# ---------------------------------------------------------------------------
+# post_channel_message
+# ---------------------------------------------------------------------------
+
+
+class TestPostChannelMessage:
+    async def test_posts_to_channel_without_thread_context(self):
+        client = _Client()
+        adapter = _make_adapter(client)
+        result = await adapter.post_channel_message("slack:C123", "Top-level message")
+        assert result.id == "2222222222.000000"
+        assert result.thread_id == "slack:C123:2222222222.000000"
+        kwargs = client.chat_postMessage.call_args.kwargs
+        assert kwargs["channel"] == "C123"
+        assert kwargs.get("thread_ts") is None
+
+    async def test_keeps_the_synthetic_thread_id_when_the_response_has_no_string_ts(self):
+        """Python addition: without a string ``ts`` there is no thread to
+        address, so the synthetic ``slack:C123:`` id is kept."""
+        client = _Client()
+        client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": 2222222222})
+        adapter = _make_adapter(client)
+        result = await adapter.post_channel_message("slack:C123", "Top-level message")
+        assert result.thread_id == "slack:C123:"

@@ -13,9 +13,9 @@ Incoming: Slack ``message`` events still deliver text as mrkdwn
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
+from chat_sdk.adapters.slack.format import slack_mrkdwn_to_markdown
 from chat_sdk.emoji import convert_emoji_placeholders
 from chat_sdk.shared.base_format_converter import (
     BaseFormatConverter,
@@ -55,30 +55,14 @@ class SlackFormatConverter(BaseFormatConverter):
         return stringify_markdown(ast)
 
     def to_ast(self, platform_text: str) -> Root:
-        """Parse Slack mrkdwn into an AST. Used for incoming ``message`` events."""
-        markdown = platform_text
+        """Parse Slack mrkdwn into an AST. Used for incoming ``message`` events.
 
-        # User mentions: <@U123|name> -> @name or <@U123> -> @U123
-        markdown = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", markdown)
-        markdown = re.sub(r"<@([A-Z0-9_]+)>", r"@\1", markdown)
-
-        # Channel mentions: <#C123|name> -> #name
-        markdown = re.sub(r"<#[A-Z0-9_]+\|([^<>]+)>", r"#\1", markdown)
-        markdown = re.sub(r"<#([A-Z0-9_]+)>", r"#\1", markdown)
-
-        # Links: <url|text> -> [text](url)
-        markdown = re.sub(r"<(https?://[^|<>]+)\|([^<>]+)>", r"[\2](\1)", markdown)
-
-        # Bare links: <url> -> url
-        markdown = re.sub(r"<(https?://[^<>]+)>", r"\1", markdown)
-
-        # Bold: *text* -> **text** (Slack uses single * for bold)
-        markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
-
-        # Strikethrough: ~text~ -> ~~text~~
-        markdown = re.sub(r"(?<!~)~([^~\n]+)~(?!~)", r"~~\1~~", markdown)
-
-        return parse_markdown(markdown)
+        Upstream ``toAst``: ``parseMarkdown(slackMrkdwnToMarkdown(mrkdwn))``.
+        The shared normalizer also unescapes ``&amp;``/``&lt;``/``&gt;`` and
+        handles code fences and special mentions, which the former inline
+        regex copy here did not.
+        """
+        return parse_markdown(slack_mrkdwn_to_markdown(platform_text))
 
     # -------------------------------------------------------------------------
     # Outgoing payload builders
@@ -144,33 +128,6 @@ class SlackFormatConverter(BaseFormatConverter):
         if getattr(message, "ast", None) is not None:
             return convert_emoji_placeholders(self._ast_to_mrkdwn(message.ast), "slack")
         return ""
-
-    # -------------------------------------------------------------------------
-    # Overrides
-    # -------------------------------------------------------------------------
-
-    def extract_plain_text(self, platform_text: str) -> str:
-        """Extract plain text from Slack mrkdwn by stripping formatting."""
-        text = platform_text
-
-        # Remove user mentions formatting: <@U123|name> -> @name, <@U123> -> @U123
-        text = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", text)
-        text = re.sub(r"<@([A-Z0-9_]+)>", r"@\1", text)
-
-        # Remove channel mentions: <#C123|name> -> #name
-        text = re.sub(r"<#[A-Z0-9_]+\|([^<>]+)>", r"#\1", text)
-        text = re.sub(r"<#([A-Z0-9_]+)>", r"#\1", text)
-
-        # Remove links formatting: <url|text> -> text, <url> -> url
-        text = re.sub(r"<(https?://[^|<>]+)\|([^<>]+)>", r"\2", text)
-        text = re.sub(r"<(https?://[^<>]+)>", r"\1", text)
-
-        # Remove bold/italic/strikethrough markers
-        text = re.sub(r"\*([^*]+)\*", r"\1", text)
-        text = re.sub(r"_([^_]+)_", r"\1", text)
-        text = re.sub(r"~([^~]+)~", r"\1", text)
-
-        return text
 
     # -------------------------------------------------------------------------
     # Private helpers
