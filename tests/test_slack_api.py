@@ -94,6 +94,13 @@ class _DictResponse(dict):
         self.data = data
 
 
+class _FakeSlackResponse:
+    """Non-dict stand-in for ``slack_sdk``'s ``(Async)SlackResponse``: body on ``.data``."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data = data
+
+
 class _FakeSlackApiError(Exception):
     """Mirror of ``slack_sdk.errors.SlackApiError`` for offline tests.
 
@@ -105,11 +112,14 @@ class _FakeSlackApiError(Exception):
     stand-in reproduces the attributes the adapter inspects: ``str(error)``
     contains the Slack error code and ``error.response`` is a dict carrying
     ``{"ok": False, "error": <code>}`` (matching ``SlackApiError``'s shape).
+    Pass a ``_FakeSlackResponse`` instead to mirror the real error, whose
+    ``response`` is a (non-dict) ``SlackResponse`` with the body on ``.data``.
     """
 
-    def __init__(self, message: str, response: dict[str, Any]) -> None:
+    def __init__(self, message: str, response: dict[str, Any] | _FakeSlackResponse) -> None:
         self.response = response
-        server_error = response.get("error")
+        body = response.data if isinstance(response, _FakeSlackResponse) else response
+        server_error = body.get("error")
         super().__init__(f"{message}\nThe server responded with: {{'ok': False, 'error': '{server_error}'}}")
 
 
@@ -1460,6 +1470,46 @@ class TestRemoveReaction:
 # =============================================================================
 
 
+class TestSetSuggestedPrompts:
+    # TS: "omits thread_ts when not provided" (falsy covers None and "")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_ts", [None, ""])
+    async def test_omits_thread_ts_when_not_provided(self, thread_ts):
+        adapter, client, _ = await _init_adapter()
+
+        await adapter.set_suggested_prompts("C1", thread_ts, [{"title": "t", "message": "m"}])
+
+        # Sent through ``api_call``, never the generated helper, which
+        # requires ``thread_ts`` before slack-sdk 3.43.0.
+        assert client.get_calls("assistant_threads_setSuggestedPrompts") == []
+        assert client.get_calls("api_call") == [
+            {
+                "method": "api_call",
+                "kwargs": {
+                    "api_method": "assistant.threads.setSuggestedPrompts",
+                    "json": {"channel_id": "C1", "prompts": [{"title": "t", "message": "m"}]},
+                },
+            }
+        ]
+
+    # TS: "includes thread_ts when provided"
+    @pytest.mark.asyncio
+    async def test_includes_thread_ts_when_provided(self):
+        adapter, client, _ = await _init_adapter()
+
+        await adapter.set_suggested_prompts("C1", "111.222", [{"title": "t", "message": "m"}], title="Try")
+
+        calls = client.get_calls("api_call")
+        assert len(calls) == 1
+        assert calls[0]["kwargs"]["api_method"] == "assistant.threads.setSuggestedPrompts"
+        assert calls[0]["kwargs"]["json"] == {
+            "channel_id": "C1",
+            "prompts": [{"title": "t", "message": "m"}],
+            "thread_ts": "111.222",
+            "title": "Try",
+        }
+
+
 class TestStartTyping:
     @pytest.mark.asyncio
     async def test_sets_typing_status(self):
@@ -1513,28 +1563,184 @@ class TestStartTyping:
 
 class TestStream:
     @pytest.mark.asyncio
-    async def test_stream_requires_recipient_info(self):
+    @pytest.mark.parametrize(
+        "options",
+        [None, StreamOptions(), StreamOptions(recipient_user_id="U1"), StreamOptions(recipient_team_id="T1")],
+        ids=["no-options", "empty", "missing-team", "missing-user"],
+    )
+    async def test_delegates_channel_streams_without_recipient_context_to_fallback(self, options):
+        # Upstream 438f5513 (Slack half): a non-DM channel without both
+        # recipient ids returns None before consuming the stream so core
+        # runs post+edit.
         adapter, client, _ = await _init_adapter()
+        client.chat_stream = AsyncMock()
+        consumed: list[str] = []
 
         async def text_gen() -> AsyncIterator[str]:
+            consumed.append("Hello")
             yield "Hello"
 
-        with pytest.raises(ValidationError, match="recipient"):
-            await adapter.stream("slack:C123:1234567890.000000", text_gen())
+        result = await adapter.stream("slack:C123:1234567890.000000", text_gen(), options)
+
+        assert result is None
+        assert consumed == []
+        client.chat_stream.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stream_requires_recipient_user_and_team(self):
+    async def test_delegates_to_fallback_before_consuming_the_stream(self):
+        # Upstream "delegates to fallback before consuming the stream"
+        # (438f5513): an empty thread_ts (top-level DM) returns None even
+        # with recipient context, and the stream is never iterated. This
+        # retires the Python-only single-post degrade (chat-sdk-python#94).
         adapter, client, _ = await _init_adapter()
+        client.chat_stream = AsyncMock()
+        consumed: list[str] = []
+
+        async def text_gen() -> AsyncIterator[str]:
+            consumed.append("Hello")
+            yield "Hello"
+
+        result = await adapter.stream(
+            "slack:C123:", text_gen(), StreamOptions(recipient_user_id="U123", recipient_team_id="T123")
+        )
+
+        assert result is None
+        assert consumed == []
+        client.chat_stream.assert_not_awaited()
+        assert client.get_calls("chat_postMessage") == []
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_fallback_when_slack_sdk_has_no_chat_stream(self):
+        # Python-specific: slack_sdk releases before the streaming helper
+        # (3.37.0; the extras' floor is 3.40.0) have no ``chat_stream``. A DM, which
+        # now streams natively without recipient ids, must still defer to
+        # core's post+edit before the stream is read instead of raising.
+        adapter = _make_adapter()
+
+        class _OldClient:
+            pass
+
+        adapter._get_client = lambda token=None: _OldClient()  # type: ignore[assignment]
+        consumed: list[str] = []
+
+        async def text_gen() -> AsyncIterator[str]:
+            consumed.append("Hello")
+            yield "Hello"
+
+        result = await adapter.stream("slack:D123:1234567890.000000", text_gen())
+
+        assert result is None
+        assert consumed == []
+
+    @pytest.mark.asyncio
+    async def test_allows_dm_streams_without_recipient_context(self):
+        # Upstream "allows DM streams without recipient context" (438f5513):
+        # a D… channel streams natively with no recipient ids, and neither
+        # recipient key nor the #95 ``team_id`` is sent.
+        adapter, client, _ = await _init_adapter()
+        streamer = MagicMock()
+        streamer.append = AsyncMock(return_value=None)
+        streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1234567890.111111"})
+        client.chat_stream = AsyncMock(return_value=streamer)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "hello"
+
+        result = await adapter.stream("slack:D123:1234567890.000000", text_gen())
+
+        client.chat_stream.assert_awaited_once_with(channel="D123", thread_ts="1234567890.000000")
+        assert result is not None
+        assert result.id == "1234567890.111111"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [
+            (StreamOptions(recipient_user_id="U1"), {"recipient_user_id": "U1"}),
+            (StreamOptions(recipient_team_id="T1"), {"recipient_team_id": "T1", "team_id": "T1"}),
+            (
+                StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
+                {"recipient_user_id": "U1", "recipient_team_id": "T1", "team_id": "T1"},
+            ),
+            (StreamOptions(recipient_user_id="", recipient_team_id=""), {}),
+        ],
+        ids=["user-only", "team-only", "both", "empty-strings"],
+    )
+    async def test_sends_recipient_ids_and_team_id_only_when_known(self, options, expected):
+        # Python-specific: recipient ids are spread into chat_stream only
+        # when truthy (upstream 438f5513), and the #95 ``team_id`` follows
+        # ``recipient_team_id``. Keeps the Grid mutation guard meaningful.
+        adapter, client, _ = await _init_adapter()
+        streamer = MagicMock()
+        streamer.append = AsyncMock(return_value=None)
+        streamer.stop = AsyncMock(return_value={"ok": True, "ts": "1.2"})
+        client.chat_stream = AsyncMock(return_value=streamer)
+
+        async def text_gen() -> AsyncIterator[str]:
+            yield "hello"
+
+        await adapter.stream("slack:D123:1234567890.000000", text_gen(), options)
+
+        client.chat_stream.assert_awaited_once_with(channel="D123", thread_ts="1234567890.000000", **expected)
+
+    @pytest.mark.asyncio
+    async def test_action_without_message_ts_streams_through_post_and_edit(self):
+        # Python-specific end-to-end (#199): a block action with
+        # container.thread_ts but no message ts builds a thread with no
+        # current_message, so there is no recipient context. The reply
+        # must still go out through core's post+edit fallback.
+        import asyncio
+
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import create_mock_state
+        from chat_sdk.types import ActionEvent, Author, ChatConfig, WebhookOptions
+
+        adapter = _make_adapter()
+        client = MockSlackClient()
+        client.set_response("auth_test", {"user_id": "U_BOT", "bot_id": "B_BOT", "user": "testbot"})
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234.9"})
+        client.chat_stream = AsyncMock()
+        _patch_client(adapter, client)
+        chat = Chat(
+            ChatConfig(user_name="testbot", adapters={"slack": adapter}, state=create_mock_state(), logger="silent")
+        )
+        errors: list[BaseException] = []
 
         async def text_gen() -> AsyncIterator[str]:
             yield "Hello"
 
-        with pytest.raises(ValidationError):
-            await adapter.stream(
-                "slack:C123:1234567890.000000",
-                text_gen(),
-                StreamOptions(recipient_user_id="U1"),  # missing team
-            )
+        async def handler(event: Any) -> None:
+            try:
+                await event.thread.post(text_gen())
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+                errors.append(exc)
+
+        chat.on_action(handler)
+        tasks: list[Any] = []
+        chat.process_action(
+            ActionEvent(
+                adapter=adapter,
+                thread=None,
+                thread_id="slack:C1:1234.5",
+                message_id="",
+                action_id="a",
+                user=Author(user_id="U1", user_name="u", full_name="u", is_bot=False, is_me=False),
+                raw={"team": {"id": "T1"}, "container": {"type": "message", "thread_ts": "1234.5", "channel_id": "C1"}},
+            ),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        await asyncio.gather(*tasks)
+
+        assert errors == []
+        client.chat_stream.assert_not_awaited()
+        posts = client.get_calls("chat_postMessage")
+        assert len(posts) == 1
+        assert posts[0]["kwargs"]["channel"] == "C1"
+        assert posts[0]["kwargs"]["thread_ts"] == "1234.5"
+        assert posts[0]["kwargs"]["text"] == "..."
+        edits = client.get_calls("chat_update")
+        assert len(edits) == 1
+        assert edits[0]["kwargs"] == {"channel": "C1", "ts": "1234.9", "markdown_text": "Hello"}
 
     @pytest.mark.asyncio
     async def test_stream_with_markdown_text_chunks(self):
@@ -1955,6 +2161,9 @@ class TestStream:
         # The stream completed (chat.startStream did NOT raise team_not_found)
         # because the workspace team_id was threaded through.
         assert result.id == "1234567890.951951"
+        # Delivered natively: only the sanity post above hit chat.postMessage
+        # (a team_not_found would have engaged the post+edit fallback).
+        assert len(client.get_calls("chat_postMessage")) == 1
         # The fix passes team_id = recipient_team_id to chat_stream.
         client.chat_stream.assert_awaited_once()
         assert captured["team_id"] == "T_GRID_WS"
@@ -2010,17 +2219,20 @@ class TestStream:
         assert "client_context_team_id" not in captured
 
     @pytest.mark.asyncio
-    async def test_stream_raises_team_not_found_without_team_id_on_grid(self):
+    async def test_stream_without_team_id_on_grid_falls_back_to_post_and_edit(self):
         """Mutation guard for issue #95: prove the Grid simulation actually
         fails when ``team_id`` is missing.
 
-        This drives the same Grid-aware streamer but with ``chat_stream``
-        stripped of any ``team_id`` (mimicking the pre-fix code path), and
-        asserts the stream start raises ``team_not_found``. This anchors the
-        positive test above: if the fix were reverted, the streamer would
-        raise here, so the positive test cannot pass vacuously.
+        This drives a Grid-aware streamer with ``chat_stream`` stripped of
+        any ``team_id`` (mimicking the pre-fix code path, or a Grid DM with
+        no recipient team). ``chat.startStream`` fails with
+        ``team_not_found`` on the first native call, so the reply is
+        delivered by the post+edit fallback instead, and the transient error
+        does not latch native streaming off. This anchors the positive test
+        above: without ``team_id`` its result id would be the fallback post.
         """
         adapter, client, _ = await _init_adapter()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234567890.000222"})
 
         class _GridStreamer:
             async def append(self, **kwargs: Any) -> dict[str, Any]:
@@ -2046,12 +2258,354 @@ class TestStream:
         async def text_gen() -> AsyncIterator[str]:
             yield "streamed hello on grid"
 
-        with pytest.raises(_FakeSlackApiError, match="team_not_found"):
-            await adapter.stream(
-                "slack:C_GRID:1234567890.000000",
-                text_gen(),
-                StreamOptions(recipient_user_id="U_GRID", recipient_team_id="T_GRID_WS"),
+        result = await adapter.stream(
+            "slack:C_GRID:1234567890.000000",
+            text_gen(),
+            StreamOptions(recipient_user_id="U_GRID", recipient_team_id="T_GRID_WS"),
+        )
+
+        assert result is not None
+        assert result.id == "1234567890.000222"
+        posts = client.get_calls("chat_postMessage")
+        assert len(posts) == 1
+        assert posts[0]["kwargs"]["markdown_text"] == "streamed hello on grid"
+        assert adapter._native_streaming_broken is False
+
+
+# =============================================================================
+# Native streaming fallback (upstream index.test.ts "native streaming fallback")
+# =============================================================================
+
+_DM_STREAM_THREAD = "slack:D123:1234567890.000000"
+
+
+def _fallback_adapter(**overrides: Any) -> tuple[SlackAdapter, MockSlackClient, AsyncMock, AsyncMock]:
+    """Upstream ``createAdapter``: post_message / edit_message spied with a fixed result."""
+    from chat_sdk.types import RawMessage
+
+    adapter = _make_adapter(**overrides)
+    client = MockSlackClient()
+    _patch_client(adapter, client)
+    post_spy = AsyncMock(return_value=RawMessage(id="fallback-ts", thread_id="t", raw={}))
+    edit_spy = AsyncMock(return_value=RawMessage(id="fallback-ts", thread_id="t", raw={}))
+    adapter.post_message = post_spy  # type: ignore[method-assign]
+    adapter.edit_message = edit_spy  # type: ignore[method-assign]
+    return adapter, client, post_spy, edit_spy
+
+
+def _streamer(append: AsyncMock, stop: AsyncMock | None = None) -> MagicMock:
+    streamer = MagicMock()
+    streamer.append = append
+    streamer.stop = stop if stop is not None else AsyncMock(return_value={"ok": True, "ts": "stream-ts"})
+    return streamer
+
+
+async def _text_stream(*parts: Any) -> AsyncIterator[Any]:
+    for part in parts:
+        yield part
+
+
+def _untouched_stream() -> tuple[Any, list[str]]:
+    """An async iterable that records whether iteration ever started."""
+    consumed: list[str] = []
+
+    async def gen() -> AsyncIterator[str]:
+        consumed.append("next")
+        yield "never"
+
+    return gen(), consumed
+
+
+def _last_fallback_markdown(post_spy: AsyncMock, edit_spy: AsyncMock) -> str:
+    """Markdown of the final fallback frame: the closing edit, else the post."""
+    message = edit_spy.call_args.args[2] if edit_spy.await_count else post_spy.call_args.args[1]
+    return message.markdown
+
+
+def _task_update() -> Any:
+    from chat_sdk.types import TaskUpdateChunk
+
+    return TaskUpdateChunk(id="task-1", title="Task", status="in_progress", output="step")
+
+
+class TestNativeStreamingFallback:
+    @pytest.mark.asyncio
+    async def test_returns_none_before_consuming_the_stream_when_native_streaming_is_false(self):
+        adapter, client, _, _ = _fallback_adapter(native_streaming=False)
+        client.chat_stream = AsyncMock()
+        stream, consumed = _untouched_stream()
+
+        assert await adapter.stream(_DM_STREAM_THREAD, stream) is None
+        assert consumed == []
+        client.chat_stream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_post_and_edit_when_the_first_native_call_fails(self):
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        stop = AsyncMock()
+        client.chat_stream = AsyncMock(
+            return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming here")), stop)
+        )
+
+        result = await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello ", "world"))
+
+        assert post_spy.await_count == 1
+        stop.assert_not_awaited()
+        assert result is not None
+        assert result.id == "fallback-ts"
+        # Whatever the throttle did mid-stream, the final forced flush must
+        # have delivered the full text, via the initial post or a closing edit.
+        assert _last_fallback_markdown(post_spy, edit_spy) == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_streams_fallback_updates_through_markdown_not_plain_text(self):
+        from chat_sdk.types import PostableMarkdown
+
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming here"))))
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("**bold** ", "and `code`"))
+
+        # A bare string resolves to Slack's ``text`` field, which renders
+        # legacy mrkdwn only: every live edit would show the raw syntax.
+        assert post_spy.await_count == 1
+        for call in post_spy.call_args_list:
+            assert isinstance(call.args[1], PostableMarkdown)
+        for call in edit_spy.call_args_list:
+            assert isinstance(call.args[2], PostableMarkdown)
+        assert _last_fallback_markdown(post_spy, edit_spy) == "**bold** and `code`"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failing_call", ["append", "stop"])
+    @pytest.mark.parametrize("response_shape", ["slack-response", "dict"])
+    async def test_latches_native_streaming_off_after_an_unsupported_method_platform_error(
+        self, failing_call: str, response_shape: str
+    ):
+        # Also the Python shape of the platform error: a ``SlackApiError``-like
+        # exception whose response body has ``error: "unknown_method"``. A real
+        # ``SlackApiError`` carries a ``SlackResponse`` (body on ``.data``);
+        # the dict shape is what ``_handle_slack_error`` also accepts.
+        # ``stop`` covers the common production path: a short reply stays
+        # buffered (append returns None), so ``stop()`` makes the first call.
+        adapter, client, post_spy, _ = _fallback_adapter()
+        body = {"ok": False, "error": "unknown_method"}
+        platform_error = _FakeSlackApiError(
+            "unknown_method", _FakeSlackResponse(body) if response_shape == "slack-response" else body
+        )
+        if failing_call == "append":
+            streamer = _streamer(AsyncMock(side_effect=platform_error))
+        else:
+            streamer = _streamer(AsyncMock(return_value=None), AsyncMock(side_effect=platform_error))
+        client.chat_stream = AsyncMock(return_value=streamer)
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello"))
+        client.chat_stream.assert_awaited_once()
+        assert post_spy.call_args.args[1].markdown == "hello"
+        assert adapter._native_streaming_broken is True
+
+        # The second stream skips the doomed native attempt entirely.
+        stream, consumed = _untouched_stream()
+        assert await adapter.stream("slack:D123:1234567890.111111", stream) is None
+        client.chat_stream.assert_awaited_once()
+        assert consumed == []
+
+    @pytest.mark.asyncio
+    async def test_does_not_latch_native_streaming_off_after_a_transient_error(self):
+        adapter, client, _, _ = _fallback_adapter()
+        client.chat_stream = AsyncMock(
+            side_effect=lambda **_: _streamer(AsyncMock(side_effect=ConnectionResetError("socket hang up")))
+        )
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello"))
+        await adapter.stream("slack:D123:1234567890.111111", _text_stream("hello again"))
+
+        # Native streaming is re-attempted on the next stream.
+        assert client.chat_stream.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_propagates_mid_stream_failures_once_native_content_has_rendered(self):
+        adapter, client, post_spy, _ = _fallback_adapter()
+        # The first native call succeeds (content is rendering), the next fails.
+        append = AsyncMock(side_effect=[{"ok": True}, RuntimeError("mid-stream boom")])
+        client.chat_stream = AsyncMock(return_value=_streamer(append))
+
+        # A structured chunk flushes to the native stream immediately,
+        # marking native content as rendered before the text append fails.
+        with pytest.raises(RuntimeError, match="mid-stream boom"):
+            await adapter.stream(_DM_STREAM_THREAD, _text_stream(_task_update(), "hello"))
+        post_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_buffered_appends_never_hit_the_api_and_stop_fails(self):
+        adapter, client, post_spy, _ = _fallback_adapter()
+        # append() returning None means the delta was only buffered in
+        # memory: no API call happened, so stop() carries the first failure.
+        append = AsyncMock(return_value=None)
+        stop = AsyncMock(side_effect=RuntimeError("no streaming here"))
+        client.chat_stream = AsyncMock(return_value=_streamer(append, stop))
+
+        result = await adapter.stream(_DM_STREAM_THREAD, _text_stream("short reply"))
+
+        assert append.await_count == 1
+        assert result is not None
+        assert result.id == "fallback-ts"
+        assert post_spy.await_count == 1
+        assert post_spy.call_args.args[1].markdown == "short reply"
+
+    @pytest.mark.asyncio
+    async def test_propagates_stop_failures_once_native_content_has_rendered(self):
+        adapter, client, post_spy, _ = _fallback_adapter()
+        # A non-None append response means content rendered natively.
+        append = AsyncMock(return_value={"ok": True})
+        stop = AsyncMock(side_effect=RuntimeError("stop boom"))
+        client.chat_stream = AsyncMock(return_value=_streamer(append, stop))
+
+        with pytest.raises(RuntimeError, match="stop boom"):
+            await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello"))
+        post_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_structured_chunks_in_fallback_mode_without_failing_the_stream(self):
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        append = AsyncMock(side_effect=RuntimeError("no streaming here"))
+        client.chat_stream = AsyncMock(return_value=_streamer(append))
+
+        # "hello\n" is a complete line, so it is committed and the failed
+        # append switches to fallback before the structured chunk arrives.
+        result = await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello\n", _task_update(), "world"))
+
+        assert result is not None
+        assert result.id == "fallback-ts"
+        # Only the first text append reached the streamer; the structured
+        # chunk was skipped rather than sent or failing the stream.
+        assert append.await_count == 1
+        assert "chunks" not in append.call_args.kwargs
+        assert post_spy.await_count == 1
+        assert post_spy.call_args.args[1].markdown == "hello\n"
+        assert _last_fallback_markdown(post_spy, edit_spy) == "hello\nworld"
+
+    @pytest.mark.asyncio
+    async def test_throttles_fallback_edits_by_update_interval_ms(self, monkeypatch: pytest.MonkeyPatch):
+        # Python-specific: the fallback throttles on a monotonic clock. Edits
+        # inside ``update_interval_ms`` are skipped; the final flush is forced.
+        import itertools
+
+        import chat_sdk.adapters.slack.adapter as slack_adapter_module
+
+        clock = itertools.chain([0.0, 500.0, 600.0, 999.0], itertools.repeat(1100.0))
+        monkeypatch.setattr(slack_adapter_module, "_monotonic_ms", lambda: next(clock))
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming"))))
+
+        await adapter.stream(
+            _DM_STREAM_THREAD,
+            _text_stream("a\n", "b\n", "c\n", "d"),
+            StreamOptions(update_interval_ms=500),
+        )
+
+        assert [call.args[1].markdown for call in post_spy.call_args_list] == ["a\n"]
+        # "b" at exactly 500 ms edits (upstream ``now - lastFallbackEditAt >=
+        # updateIntervalMs``) and restarts the window, so "c" at 600 ms and
+        # the "d" step at 999 ms are throttled; the end forces "d". With ``>``
+        # instead of ``>=``, "b" would be skipped and "c" would edit instead.
+        assert [call.args[2].markdown for call in edit_spy.call_args_list] == ["a\nb\n", "a\nb\nc\nd"]
+        assert all(call.args[1] == "fallback-ts" for call in edit_spy.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_fallback_throttle_defaults_to_1000_ms_without_options(self, monkeypatch: pytest.MonkeyPatch):
+        # Upstream ``options?.updateIntervalMs ?? 1000`` for direct calls.
+        import itertools
+
+        import chat_sdk.adapters.slack.adapter as slack_adapter_module
+
+        clock = itertools.chain([0.0, 999.0, 1000.0], itertools.repeat(1001.0))
+        monkeypatch.setattr(slack_adapter_module, "_monotonic_ms", lambda: next(clock))
+        adapter, client, post_spy, edit_spy = _fallback_adapter()
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(side_effect=RuntimeError("no streaming"))))
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("a\n", "b\n", "c\n", "d"))
+
+        assert [call.args[1].markdown for call in post_spy.call_args_list] == ["a\n"]
+        # "b" at 999 ms is throttled; "c" at 1000 ms edits; the end forces "d".
+        assert [call.args[2].markdown for call in edit_spy.call_args_list] == ["a\nb\nc\n", "a\nb\nc\nd"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("config", "options", "warned"),
+        [
+            ({}, StreamOptions(stop_blocks=[{"type": "divider"}]), True),
+            ({"feedback_buttons": True}, None, True),
+            ({}, None, False),
+        ],
+        ids=["stop-blocks", "feedback-buttons", "no-blocks"],
+    )
+    async def test_warns_about_skipped_stream_blocks_and_returns_an_empty_reply_marker(self, config, options, warned):
+        # A fallback stream cannot attach stream-end blocks (``stop_blocks``
+        # or the #214 feedback buttons), so it warns, as upstream.
+        # Python-specific: an empty fallback reply returns a RawMessage with
+        # an empty id instead of upstream's null: the stream is already
+        # consumed, so None would make core post its placeholder for nothing.
+        adapter, client, post_spy, edit_spy = _fallback_adapter(**config)
+        adapter._logger = MagicMock()
+        stop = AsyncMock(side_effect=RuntimeError("no streaming here"))
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(return_value=None), stop))
+
+        result = await adapter.stream(_DM_STREAM_THREAD, _text_stream(), options)
+
+        assert result is not None
+        assert result.id == ""
+        assert result.thread_id == _DM_STREAM_THREAD
+        post_spy.assert_not_awaited()
+        edit_spy.assert_not_awaited()
+        warnings = [call.args[0] for call in adapter._logger.warn.call_args_list]
+        assert any("stream-end blocks" in message for message in warnings) is warned
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_thread_post_uses_placeholder_then_edits(self):
+        # Python-specific end-to-end: a top-level DM (empty thread_ts) with
+        # full recipient context now replies through core's post+edit (the
+        # placeholder, then an edit with the markdown), not one accumulated
+        # post (retired #94 branch) and not native streaming.
+        from chat_sdk.testing import create_mock_state
+        from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
+        from chat_sdk.types import Author, Message, MessageMetadata
+
+        adapter = _make_adapter()
+        client = MockSlackClient()
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234.9"})
+        client.chat_stream = AsyncMock()
+        _patch_client(adapter, client)
+        current = Message(
+            id="1234.5",
+            thread_id="slack:D123:",
+            text="hi",
+            formatted={"type": "root", "children": []},
+            raw={"team": "T1", "user": "U1"},
+            author=Author(user_id="U1", user_name="u", full_name="u", is_bot=False, is_me=False),
+            metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+        )
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:D123:",
+                adapter=adapter,
+                state_adapter=create_mock_state(),
+                channel_id="slack:D123",
+                is_dm=True,
+                current_message=current,
             )
+        )
+
+        sent = await thread.post(_text_stream("**Hello** ", "from DM"))
+
+        client.chat_stream.assert_not_awaited()
+        posts = client.get_calls("chat_postMessage")
+        assert len(posts) == 1
+        assert posts[0]["kwargs"]["channel"] == "D123"
+        assert posts[0]["kwargs"]["thread_ts"] is None
+        assert posts[0]["kwargs"]["text"] == "..."
+        edits = client.get_calls("chat_update")
+        assert edits[-1]["kwargs"] == {"channel": "D123", "ts": "1234.9", "markdown_text": "**Hello** from DM"}
+        assert sent.id == "1234.9"
 
 
 # =============================================================================
@@ -2915,11 +3469,9 @@ class TestEmptyThreadTsGuards:
 
     What to fix if this fails: each Slack API call (``chat_postMessage``,
     ``chat_postEphemeral``, ``chat_scheduleMessage``) must pass ``None``
-    instead of the empty string for ``thread_ts``. ``stream`` must degrade
-    to a single accumulated ``post_message`` call when ``thread_ts`` is
-    empty — ``chat.startStream`` rejects empty thread_ts but
-    ``chat.postMessage`` accepts it, and raising would silently drop
-    top-level DM streaming replies (chat-sdk-python#94).
+    instead of the empty string for ``thread_ts``. ``stream`` returns
+    ``None`` for an empty ``thread_ts`` so core's post+edit delivers the
+    reply (``TestStream::test_delegates_to_fallback_before_consuming_the_stream``).
     """
 
     @pytest.mark.asyncio
@@ -2936,53 +3488,6 @@ class TestEmptyThreadTsGuards:
         calls = client.get_calls("chat_scheduleMessage")
         assert len(calls) == 1
         assert calls[0]["kwargs"]["thread_ts"] is None
-
-    @pytest.mark.asyncio
-    async def test_stream_with_empty_thread_ts_degrades_to_post_message(self):
-        """Top-level DMs (empty ``thread_ts``) must accumulate the stream and
-        post a single non-streamed message instead of raising.
-
-        What to fix if this fails: ``SlackAdapter.stream`` must, when
-        ``thread_ts`` is empty, drain ``text_stream`` (concatenating
-        ``str`` chunks and ``markdown_text`` chunk text), call
-        ``post_message`` exactly once with a ``PostableMarkdown``
-        wrapping the accumulated text, and never invoke
-        ``chat_stream``. Raising here silently drops top-level DM
-        replies because ``Thread._handle_stream`` does not catch
-        adapter exceptions (chat-sdk-python#94).
-        """
-        adapter, client, _ = await _init_adapter()
-        # Streaming API mock that must NOT be touched on the empty-thread path.
-        mock_streamer = MagicMock()
-        mock_streamer.append = AsyncMock()
-        mock_streamer.stop = AsyncMock(return_value={"message": {"ts": "0"}})
-        client.chat_stream = AsyncMock(return_value=mock_streamer)
-        client.set_response("chat_postMessage", {"ok": True, "ts": "5555.5555"})
-
-        from chat_sdk.types import MarkdownTextChunk
-
-        async def text_gen() -> AsyncIterator[str | StreamChunk]:
-            yield "Hello "
-            yield MarkdownTextChunk(text="from ")
-            yield "DM"
-
-        result = await adapter.stream(
-            "slack:C123:",
-            text_gen(),
-            StreamOptions(recipient_user_id="U1", recipient_team_id="T1"),
-        )
-
-        # Native streaming API must not have been used.
-        assert not client.chat_stream.called
-        # post_message was invoked exactly once with the accumulated text.
-        post_calls = client.get_calls("chat_postMessage")
-        assert len(post_calls) == 1
-        assert post_calls[0]["kwargs"]["channel"] == "C123"
-        assert post_calls[0]["kwargs"]["thread_ts"] is None
-        # Accumulated markdown goes out via Slack's native markdown_text field.
-        assert post_calls[0]["kwargs"]["markdown_text"] == "Hello from DM"
-        assert "text" not in post_calls[0]["kwargs"]
-        assert result.id == "5555.5555"
 
     @pytest.mark.asyncio
     async def test_stream_with_thread_ts_uses_native_streaming(self):

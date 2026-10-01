@@ -35,7 +35,6 @@ try:
     from chat_sdk.adapters.slack.adapter import (
         SLACK_MESSAGE_URL_PATTERN,
         SlackAdapter,
-        _find_next_mention,
     )
     from chat_sdk.adapters.slack.types import (
         SlackAdapterConfig,
@@ -404,30 +403,6 @@ class TestChannelVisibility:
 
 
 # ---------------------------------------------------------------------------
-# _find_next_mention helper
-# ---------------------------------------------------------------------------
-
-
-class TestFindNextMention:
-    def test_at_mention(self):
-        assert _find_next_mention("Hello <@U123>") == 6
-
-    def test_channel_mention(self):
-        assert _find_next_mention("See <#C123>") == 4
-
-    def test_no_mention(self):
-        assert _find_next_mention("No mentions here") == -1
-
-    def test_at_before_hash(self):
-        result = _find_next_mention("<@U1> and <#C2>")
-        assert result == 0
-
-    def test_hash_before_at(self):
-        result = _find_next_mention("<#C2> and <@U1>")
-        assert result == 0
-
-
-# ---------------------------------------------------------------------------
 # User change cache invalidation
 # ---------------------------------------------------------------------------
 
@@ -733,8 +708,9 @@ class TestIgnoredSubtypes:
     @pytest.mark.parametrize(
         "subtype",
         [
-            "message_changed",
-            "message_deleted",
+            # message_changed / message_deleted are not ignored: they dispatch
+            # to the lifecycle handlers (see TestMessageSubtypes in
+            # test_slack_webhook.py).
             "message_replied",
             "channel_join",
             "channel_leave",
@@ -764,6 +740,8 @@ class TestIgnoredSubtypes:
         req = _make_signed_request(body)
         await adapter.handle_webhook(req)
         assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+        assert not chat.process_message_deleted.called
 
 
 # ---------------------------------------------------------------------------

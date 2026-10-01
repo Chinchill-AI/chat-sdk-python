@@ -541,6 +541,47 @@ class TestParseMessage:
         assert msg.author.is_bot is False
         assert msg.author.is_me is False
 
+    def test_should_mark_an_agent_session_comment_as_a_mention(self):
+        # Ported (vercel/chat#946 / #885): ``parse_message`` delegates the
+        # agent-session kind, which is a mention on the stable session thread.
+        adapter = _make_adapter()
+        raw = {
+            "kind": "agent_session_comment",
+            "organizationId": "org-123",
+            "agentSessionId": "session-123",
+            "comment": {
+                "id": "comment-1",
+                "body": "Hello",
+                "issueId": "issue-1",
+                "user": {"type": "user", "id": "user-1", "displayName": "user", "fullName": "User One"},
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
+            },
+        }
+        msg = adapter.parse_message(raw)
+        assert msg.is_mention is True
+        assert msg.thread_id == "linear:issue-1:s:session-123"
+        assert msg.author.user_id == "user-1"
+        assert msg.author.user_name == "user"
+
+    def test_should_leave_is_mention_undetermined_for_an_ordinary_comment(self):
+        # Ported (vercel/chat#946): undetermined (``None``), not ``False``, so
+        # core text detection still finds the @mention in the comment body.
+        adapter = _make_adapter()
+        raw = {
+            "kind": "comment",
+            "comment": {
+                "id": "comment-mention",
+                "body": "Hey @testbot could you take a look?",
+                "issueId": "issue-1",
+                "userId": "user-1",
+                "createdAt": "2025-01-29T12:00:00.000Z",
+                "updatedAt": "2025-01-29T12:00:00.000Z",
+            },
+        }
+        msg = adapter.parse_message(raw)
+        assert msg.is_mention is None
+
 
 # ---------------------------------------------------------------------------
 # Constructor / auth modes

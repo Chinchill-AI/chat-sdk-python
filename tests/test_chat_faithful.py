@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -31,6 +32,7 @@ from chat_sdk.testing import (
     create_test_message,
 )
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     AppHomeOpenedEvent,
     Attachment,
@@ -38,24 +40,33 @@ from chat_sdk.types import (
     ChatConfig,
     ConcurrencyConfig,
     EmojiValue,
+    Message,
     MessageContext,
+    MessageDeletedEvent,
     MessageSubject,
     ModalResponse,
     ModalSubmitEvent,
     QueueEntry,
+    RawMessage,
     ReactionEvent,
     SlashCommandEvent,
+    StreamOptions,
     WebhookOptions,
 )
 from tests._fake_clock import FakeClock, install_token_lock_mock
 
 HELP_REGEX = re.compile(r"help", re.IGNORECASE)
 HELLO_REGEX = re.compile(r"hello", re.IGNORECASE)
+ANY_REGEX = re.compile(r".*")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _chunks():
+    yield "Hello"
 
 
 def _make_chat(
@@ -324,6 +335,41 @@ class TestChatInit:
 
 
 class TestFallbackStreamingPlaceholder:
+    def test_unset_placeholder_sentinel_keeps_its_identity(self):
+        """Adapters compare the placeholder with ``is UNSET``; the sentinel
+        must survive the copies a config or options object goes through."""
+        import copy
+        import dataclasses
+        import pickle
+
+        options = StreamOptions(update_interval_ms=0)
+        assert options.fallback_streaming_placeholder_text is UNSET
+        assert copy.deepcopy(options).fallback_streaming_placeholder_text is UNSET
+        assert pickle.loads(pickle.dumps(options)).fallback_streaming_placeholder_text is UNSET
+        assert dataclasses.replace(options).fallback_streaming_placeholder_text is UNSET
+        assert (
+            ChatConfig(adapters={}, state=create_mock_state(), user_name="b").fallback_streaming_placeholder_text
+            is UNSET
+        )
+        # Falsy, so a truthiness check never treats it as placeholder text.
+        assert not UNSET
+        # Appended last: positional construction binds the same fields.
+        positional = StreamOptions("T123", "U123")
+        assert (positional.recipient_team_id, positional.recipient_user_id) == ("T123", "U123")
+        assert positional.fallback_streaming_placeholder_text is UNSET
+
+    async def test_explicit_empty_placeholder_is_posted_and_forwarded(self):
+        """``""`` is an explicit placeholder, distinct from ``None`` (none)
+        and ``UNSET`` (default ``"..."``)."""
+        chat, adapter, state = _make_chat(fallback_streaming_placeholder_text="")
+        await chat.thread("slack:C123:1234.5678").post(_chunks())
+        assert adapter._post_calls[0] == ("slack:C123:1234.5678", "")
+
+        stream = AsyncMock(return_value=RawMessage(id="m", thread_id="slack:C123:1234.5678", raw={}))
+        adapter.stream = stream  # type: ignore[attr-defined]
+        await chat.thread("slack:C123:1234.5678").post(_chunks())
+        assert stream.await_args.args[2].fallback_streaming_placeholder_text == ""
+
     # TS: "should preserve null fallback streaming placeholder config"
     async def test_should_preserve_null_fallback_streaming_placeholder_config(self):
         adapter = create_mock_adapter("slack")
@@ -483,6 +529,64 @@ class TestSkipSelf:
         )
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
         assert len(calls) == 0
+
+
+class TestMessageLifecycleEvents:
+    # TS: "should dispatch message updates without normal message routing"
+    async def test_should_dispatch_message_updates_without_normal_message_routing(self):
+        chat, adapter, _ = await _init_chat()
+        update_handler = AsyncMock()
+        mention_handler = AsyncMock()
+        chat.on_message_updated(update_handler)
+        chat.on_mention(mention_handler)
+
+        message = create_test_message("msg-update-1", "Edited @testbot")
+        message.metadata.edited = True
+        message.metadata.edited_at = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+        previous_message = create_test_message("msg-update-1", "Original @testbot")
+
+        await chat.process_message_updated(
+            adapter=adapter,
+            message=message,
+            previous_message=previous_message,
+            thread_id="slack:C123:update.1",
+        )
+
+        assert update_handler.await_count == 1
+        thread, received, previous = update_handler.await_args.args
+        assert thread.id == "slack:C123:update.1"
+        assert received is message
+        assert previous is previous_message
+        mention_handler.assert_not_awaited()
+
+    # TS: "should dispatch message deletes with normalized event data"
+    async def test_should_dispatch_message_deletes_with_normalized_event_data(self):
+        chat, adapter, _ = await _init_chat()
+        delete_handler = AsyncMock()
+        chat.on_message_deleted(delete_handler)
+
+        await chat.process_message_deleted(
+            MessageDeletedEvent(
+                adapter=adapter,
+                channel_id="C123",
+                deleted_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc),
+                message_id="1234.5678",
+                raw={"subtype": "message_deleted"},
+                thread_id="slack:C123:1234.5678",
+            )
+        )
+
+        delete_handler.assert_awaited_once_with(
+            MessageDeletedEvent(
+                adapter=adapter,
+                channel_id="C123",
+                deleted_at=datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc),
+                message_id="1234.5678",
+                platform="slack",
+                raw={"subtype": "message_deleted"},
+                thread_id="slack:C123:1234.5678",
+            )
+        )
 
 
 # ============================================================================
@@ -673,6 +777,32 @@ class TestMessageDeduplication:
         assert len(pattern_calls) == 1
         assert pattern_calls[0] == "msg-1"
 
+    # TS: "should not trigger onNewMention when a bot with a hyphen-suffixed name is mentioned"
+    async def test_should_not_trigger_onnewmention_when_a_bot_with_a_hyphensuffixed_name_is_mentioned(self):
+        # @slack-bot should not react when @slack-bot-dev is mentioned
+        chat, adapter, state = await _init_chat()
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        msg = create_test_message("msg-1", "Hey @slack-bot-dev help me")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        mention_handler.assert_not_awaited()
+
+    # TS: "should not trigger onNewMention when a hyphen-suffixed user ID is mentioned"
+    async def test_should_not_trigger_onnewmention_when_a_hyphensuffixed_user_id_is_mentioned(self):
+        # Bot with ID UBOT123 should not react when @UBOT123-canary is mentioned
+        adapter = create_mock_adapter("slack")
+        adapter.bot_user_id = "UBOT123"
+        chat, adapter, state = await _init_chat(adapter=adapter)
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        msg = create_test_message("msg-1", "deploy @UBOT123-canary now")
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
+
+        mention_handler.assert_not_awaited()
+
 
 # ============================================================================
 # 6. Pattern matching (test 19)
@@ -747,6 +877,115 @@ class TestIsMention:
 
         assert len(received_messages) == 1
         assert received_messages[0].is_mention is True
+
+    # TS: it.each(...)("should not treat %s as a mention (%s)") — one @pytest.mark.parametrize test
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("jane@slack-bot.com", id="an email whose domain starts with the bot name"),
+            pytest.param("foo.bar@slack-bot.com", id="a dotted email local part"),
+            pytest.param("foo-bar@slack-bot.com", id="a hyphenated email local part"),
+            pytest.param("https://user@slack-bot.com", id="url userinfo"),
+        ],
+    )
+    async def test_should_not_treat_as_a_mention(self, text: str):
+        chat, adapter, state = await _init_chat()
+        handler = AsyncMock(return_value=None)
+        chat.on_message(ANY_REGEX)(handler)
+
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", create_test_message("msg-1", text))
+
+        handler.assert_awaited_once()
+        assert handler.await_args.args[1].is_mention is False
+
+    # TS: it.each(...)("should still detect %s as a mention (%s)") — one @pytest.mark.parametrize test
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("@slack-bot help", id="at the start"),
+            pytest.param("hey @slack-bot", id="after a space"),
+            pytest.param("(@slack-bot)", id="wrapped in parentheses"),
+            pytest.param("cc:@slack-bot", id="after a colon"),
+            pytest.param("wait...@slack-bot", id="after an ellipsis"),
+        ],
+    )
+    async def test_should_still_detect_as_a_mention(self, text: str):
+        chat, adapter, state = await _init_chat()
+        handler = AsyncMock(return_value=None)
+        chat.on_mention(handler)
+
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", create_test_message("msg-1", text))
+
+        handler.assert_awaited_once()
+        assert handler.await_args.args[1].is_mention is True
+
+    # Python-specific: JS ``\w`` (no ``u`` flag) is ASCII-only, Python's is
+    # Unicode. The guards spell the ASCII class out, so a non-ASCII letter
+    # before ``@`` does not suppress the mention -- as upstream, where
+    # ``é@slack-bot`` is a mention. Characters that only Python's Unicode
+    # case folding maps into ``[A-Za-z]`` (Kelvin sign, long s) are not word
+    # characters either; ASCII letters/digits/``_`` still are.
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param("é@slack-bot", True, id="non-ASCII letter before @"),
+            pytest.param("K@slack-bot", True, id="Kelvin sign before @"),
+            pytest.param("ſ@slack-bot", True, id="long s before @"),
+            pytest.param("@slack-botä hi", True, id="non-ASCII letter after the name"),
+            pytest.param("x@slack-bot", False, id="ASCII letter before @"),
+            pytest.param("_@slack-bot", False, id="underscore before @"),
+            pytest.param("@slack-bot_x", False, id="underscore after the name"),
+            pytest.param("@SLACK-BOT hi", True, id="case-insensitive name"),
+        ],
+    )
+    async def test_mention_guards_use_ascii_word_characters(self, text: str, expected: bool):
+        chat, adapter, state = await _init_chat()
+        handler = AsyncMock(return_value=None)
+        chat.on_message(ANY_REGEX)(handler)
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", create_test_message("msg-1", text))
+
+        called, skipped = (mention_handler, handler) if expected else (handler, mention_handler)
+        called.assert_awaited_once()
+        skipped.assert_not_awaited()
+        assert called.await_args.args[1].is_mention is expected
+
+    # TS: "should keep a definitive non-mention reported by the adapter"
+    async def test_should_keep_a_definitive_nonmention_reported_by_the_adapter(self):
+        chat, adapter, state = await _init_chat()
+        mention_handler = AsyncMock(return_value=None)
+        message_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+        chat.on_message(ANY_REGEX)(message_handler)
+
+        # The adapter inspected structured content and found no mention, even
+        # though the flattened text contains @username (e.g. a code sample).
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-1", "docs mention `@slack-bot` in a snippet", is_mention=False),
+        )
+
+        mention_handler.assert_not_awaited()
+        message_handler.assert_awaited_once()
+        assert message_handler.await_args.args[1].is_mention is False
+
+    # TS: "should keep a definitive mention reported by the adapter"
+    async def test_should_keep_a_definitive_mention_reported_by_the_adapter(self):
+        chat, adapter, state = await _init_chat()
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-1", "no resolvable mention text here", is_mention=True),
+        )
+
+        mention_handler.assert_awaited_once()
+        assert mention_handler.await_args.args[1].is_mention is True
 
 
 # ============================================================================
@@ -1090,6 +1329,25 @@ class TestReactions:
             for tid, content in adapter._post_calls
         )
 
+    # TS: "should allow streaming from a reaction without message context"
+    async def test_should_allow_streaming_from_a_reaction_without_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+            await event.thread.post(_chunks())
+
+        chat.on_reaction(_handler)
+
+        chat.process_reaction(_make_reaction_event(adapter))
+        await asyncio.sleep(0.02)
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        # No stub message built from the reaction (vercel/chat#633).
+        assert threads[0]._current_message is None
+        assert threads[0].recent_messages == []
+
 
 # ============================================================================
 # 12. Actions (tests 40-50)
@@ -1097,6 +1355,41 @@ class TestReactions:
 
 
 class TestActions:
+    # TS: "should allow streaming from an action without message context"
+    async def test_should_allow_streaming_from_an_action_without_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+            await event.thread.post(_chunks())
+
+        chat.on_action(_handler)
+
+        chat.process_action(_make_action_event(adapter, message_id=""))
+        await asyncio.sleep(0.02)
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        assert threads[0]._current_message is None
+        assert threads[0].recent_messages == []
+
+    async def test_action_with_message_id_keeps_message_context(self):
+        chat, adapter, state = await _init_chat()
+        threads: list[Any] = []
+
+        async def _handler(event):
+            threads.append(event.thread)
+
+        chat.on_action(_handler)
+
+        chat.process_action(_make_action_event(adapter, message_id="msg-9"))
+        await asyncio.sleep(0.02)
+
+        current = threads[0]._current_message
+        assert current is not None
+        assert current.id == "msg-9"
+        assert current.author.user_id == "U123"
+
     # TS: "should call onAction handler for all actions"
     async def test_should_call_onaction_handler_for_all_actions(self):
         chat, adapter, state = await _init_chat()
@@ -1575,6 +1868,18 @@ class TestOpenDM:
 
         assert any(tid == "slack:DU123456:" and content == "Hello via DM!" for tid, content in adapter._post_calls)
 
+    # TS: "should allow streaming to a DM thread"
+    async def test_should_allow_streaming_to_a_dm_thread(self):
+        chat, adapter, state = await _init_chat()
+        thread = await chat.open_dm("U123456")
+
+        await thread.post(_chunks())
+
+        assert adapter._edit_calls[-1][:2] == ("slack:DU123456:", "msg-1")
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+        assert thread._current_message is None
+        assert thread.recent_messages == []
+
 
 # ============================================================================
 # 13b. getUser (vercel/chat#391)
@@ -1926,6 +2231,43 @@ class TestThreadFactory:
             tid == "slack:C123:1234.5678" and content == "Hello from outside a webhook!"
             for tid, content in adapter._post_calls
         )
+
+    # TS: "should allow streaming to a thread handle"
+    async def test_should_allow_streaming_to_a_thread_handle(self):
+        chat, adapter, state = await _init_chat()
+        thread = chat.thread("slack:C123:1234.5678")
+
+        await thread.post(_chunks())
+
+        assert adapter._edit_calls[-1][2].markdown == "Hello"
+
+    # TS: it.each "passes only explicit placeholder config to adapter streaming"
+    @pytest.mark.parametrize(
+        ("placeholder_config", "expected"),
+        [
+            ({}, UNSET),
+            ({"fallback_streaming_placeholder_text": "Working..."}, "Working..."),
+            ({"fallback_streaming_placeholder_text": None}, None),
+        ],
+    )
+    async def test_passes_only_explicit_placeholder_config_to_adapter_streaming(self, placeholder_config, expected):
+        adapter = create_mock_adapter("teams")
+        stream = AsyncMock(return_value=RawMessage(id="answer-id", thread_id="teams:C123:1234.5678", raw={}))
+        adapter.stream = stream  # type: ignore[attr-defined]
+        custom_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"teams": adapter},
+                state=create_mock_state(),
+                logger=MockLogger(),
+                **placeholder_config,
+            )
+        )
+
+        await custom_chat.thread("teams:C123:1234.5678").post(_chunks())
+
+        options = stream.await_args.args[2]
+        assert options.fallback_streaming_placeholder_text is expected
 
     # TS: "should throw for an invalid thread ID"
     async def test_should_throw_for_an_invalid_thread_id(self):
@@ -2734,8 +3076,49 @@ class TestConcurrencyQueue:
             {"text": "Hey @slack-bot", "is_mention": True}
         ]
 
-    # TS: "should keep a definitive non-mention on skipped queued messages" -- not
-    # ported here: it needs tri-state ``is_mention`` (``??`` semantics), tracked in #192.
+    # TS: "should keep a definitive non-mention on skipped queued messages"
+    async def test_should_keep_a_definitive_nonmention_on_skipped_queued_messages(self):
+        state = create_mock_state()
+        adapter = create_mock_adapter("slack")
+
+        chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
+
+        mention_handler = AsyncMock(return_value=None)
+        message_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+        chat.on_message(ANY_REGEX)(message_handler)
+
+        await state.acquire_lock("slack:C123:1234.5678", 30000)
+
+        # The adapter inspected structured content and reported no mention, so
+        # the text-looking mention must not be promoted while draining the queue.
+        await chat.handle_incoming_message(
+            adapter,
+            "slack:C123:1234.5678",
+            create_test_message("msg-q-skip-coded-1", "docs mention `@slack-bot`", is_mention=False),
+        )
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-skip-coded-2", "please review this")
+        )
+
+        await state.force_release_lock("slack:C123:1234.5678")
+        await chat.handle_incoming_message(
+            adapter, "slack:C123:1234.5678", create_test_message("msg-q-skip-coded-3", "trigger")
+        )
+
+        mention_handler.assert_not_awaited()
+
+        # The earlier queued message must reach the batch as a skipped message
+        # and stay a non-mention there.
+        batched = next(
+            (c for c in message_handler.await_args_list if c.args[2] is not None and c.args[2].skipped),
+            None,
+        )
+        assert batched is not None
+        assert batched.args[1].is_mention is False
+        assert [{"text": m.text, "is_mention": m.is_mention} for m in batched.args[2].skipped] == [
+            {"text": "docs mention `@slack-bot`", "is_mention": False}
+        ]
 
     # TS: "should continue to message patterns when skipped queued mention has no handler"
     async def test_should_continue_to_message_patterns_when_skipped_queued_mention_has_no_handler(self):
@@ -3125,14 +3508,21 @@ class TestConcurrencyQueueAttachmentRehydration:
             )
 
         adapter.rehydrate_attachment = rehydrate  # type: ignore[attr-defined]
+        mock_subject = MessageSubject(type="issue", id="ENG-1", title="Original message subject", raw={})
+        adapter.fetch_subject = AsyncMock(return_value=mock_subject)  # type: ignore[attr-defined]
 
         chat, _, _ = await _init_chat(adapter=adapter, state=state, concurrency="queue")
 
         received_attachments: list[list[Attachment]] = []
+        received_reply_to: list[Message] = []
+        received_reply_to_subject: list[MessageSubject | None] = []
 
         @chat.on_mention
         async def handler(thread, message, context=None):
             received_attachments.append(message.attachments)
+            if message.reply_to is not None:
+                received_reply_to.append(message.reply_to)
+                received_reply_to_subject.append(await message.reply_to.subject)
 
         # Pre-acquire the lock so the first message is enqueued (and JSON-serialized)
         await state.acquire_lock("slack:C123:1234.5678", 30000)
@@ -3152,6 +3542,19 @@ class TestConcurrencyQueueAttachmentRehydration:
                     fetch_data=original_fetch,
                 ),
             ],
+            reply_to=create_test_message(
+                "msg-original",
+                "Original",
+                raw={"reply": True},
+                attachments=[
+                    Attachment(
+                        type="file",
+                        name="reply.pdf",
+                        fetch_metadata={"url": "https://example.com/reply.pdf"},
+                        fetch_data=original_fetch,
+                    ),
+                ],
+            ),
         )
 
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
@@ -3162,8 +3565,11 @@ class TestConcurrencyQueueAttachmentRehydration:
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", trigger)
 
         # rehydrate_attachment should have been called for the queued message
-        assert len(rehydrate_calls) == 1
-        assert rehydrate_calls[0].fetch_metadata == {"url": "https://example.com/f.pdf"}
+        # and (upstream vercel/chat#802) for its replied-to message.
+        assert [att.fetch_metadata for att in rehydrate_calls] == [
+            {"url": "https://example.com/f.pdf"},
+            {"url": "https://example.com/reply.pdf"},
+        ]
         assert rehydrate_calls[0].type == "file"
 
         # Find the handler call that received the originally-queued attachment.
@@ -3173,6 +3579,11 @@ class TestConcurrencyQueueAttachmentRehydration:
         )
         assert queued_attachments is not None
         assert queued_attachments[0].fetch_data is mock_fetch_data
+        assert len(received_reply_to) == 1
+        assert isinstance(received_reply_to[0], Message)
+        assert received_reply_to[0].attachments[0].fetch_data is mock_fetch_data
+        assert received_reply_to_subject == [mock_subject]
+        adapter.fetch_subject.assert_awaited_once_with({"reply": True})  # type: ignore[attr-defined]
 
     # TS: "should skip rehydration for attachments that already have fetchData"
     async def test_should_skip_rehydration_for_attachments_that_already_have_fetchdata(self):
@@ -3346,6 +3757,58 @@ class TestConcurrencyQueueAttachmentRehydration:
         )
         assert queued_attachments is not None
         assert queued_attachments[0].fetch_data is mock_fetch_data
+
+    # Python-specific: the plain-dict fallback (no ``_type`` envelope) reads
+    # ``replyTo`` then ``reply_to``, recurses into it with the same
+    # ``rehydrate_attachment`` pass, and reads ``email`` plus ``isSystem``
+    # then ``is_system`` on the author, keeping ``False`` as ``False``.
+    @pytest.mark.parametrize(
+        ("reply_key", "system_key", "system_value"),
+        [("replyTo", "isSystem", True), ("reply_to", "is_system", False)],
+    )
+    async def test_plain_dict_fallback_reads_reply_to_and_author_fields(self, reply_key, system_key, system_value):
+        adapter = create_mock_adapter("slack")
+        rehydrated: list[str | None] = []
+
+        async def fetched() -> bytes:
+            return b"data"
+
+        def rehydrate(att: Attachment) -> Attachment:
+            rehydrated.append(att.name)
+            return Attachment(type=att.type, name=att.name, fetch_data=fetched)
+
+        adapter.rehydrate_attachment = rehydrate  # type: ignore[attr-defined]
+        chat, _, _ = await _init_chat(adapter=adapter)
+
+        def author(**extra: Any) -> dict[str, Any]:
+            return {"user_id": "U1", "user_name": "u", "full_name": "U", "is_bot": False, "is_me": False, **extra}
+
+        raw = {
+            "id": "msg-1",
+            "thread_id": "slack:C123:1234.5678",
+            "text": "Reply",
+            "author": author(email="a@b.c", **{system_key: system_value}),
+            "metadata": {"date_sent": "2024-01-15T10:30:00+00:00", "edited": False},
+            reply_key: {
+                "id": "msg-0",
+                "thread_id": "slack:C123:1234.5678",
+                "text": "Original",
+                "author": author(),
+                "metadata": {"date_sent": "2024-01-14T10:30:00+00:00", "edited": False},
+                "attachments": [{"type": "file", "name": "reply.pdf"}],
+            },
+        }
+
+        msg = chat._rehydrate_message(raw, adapter)
+
+        assert msg.author.email == "a@b.c"
+        assert msg.author.is_system is system_value
+        assert isinstance(msg.reply_to, Message)
+        assert msg.reply_to.id == "msg-0"
+        assert msg.reply_to.author.email is None
+        assert msg.reply_to.author.is_system is None
+        assert rehydrated == ["reply.pdf"]
+        assert msg.reply_to.attachments[0].fetch_data is fetched
 
 
 # ============================================================================

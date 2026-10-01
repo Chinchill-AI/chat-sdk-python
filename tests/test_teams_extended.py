@@ -18,6 +18,7 @@ from __future__ import annotations
 import inspect
 import json
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -108,12 +109,16 @@ class _SentActivity:
 
 
 def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
-    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+    """Replace the SDK activity sender with an AsyncMock returning a SentActivity.
 
-    The migrated outbound send/typing paths delegate to the SDK ``App.send``.
+    Outbound send/typing paths go through ``TeamsAdapter._send_to``, which hands
+    ``(activity, ConversationReference)`` to ``App.activity_sender.send`` when the
+    App has one (the 2.0.x shape, set here on every SDK line). Mirrors upstream's
+    ``vi.spyOn(app.activitySender, "send")``. Returns the mock so tests can
+    assert call count / arguments.
     """
     send = AsyncMock(return_value=_SentActivity(sent_id))
-    adapter._app.send = send  # type: ignore[method-assign]
+    adapter._app.activity_sender = SimpleNamespace(send=send)
     return send
 
 
@@ -333,7 +338,7 @@ class TestPostMessageAdaptiveCard:
             },
         )
         assert result.id == "card-msg-1"
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         assert dumped["type"] == "message"
         assert len(dumped["attachments"]) == 1
@@ -745,6 +750,50 @@ class TestParseMessageExtended:
 
 
 # ---------------------------------------------------------------------------
+# Mention fallback (tri-state is_mention, upstream vercel/chat#946)
+# ---------------------------------------------------------------------------
+
+
+class TestMentionTextFallback:
+    # The Teams adapter only ever reports ``True`` (from a mention entity), as
+    # upstream; without one it leaves ``is_mention`` unset, so Chat still
+    # routes a literal ``@<bot user_name>`` in a channel to ``on_mention``.
+    @pytest.mark.asyncio
+    async def test_channel_message_without_mention_entity_routes_by_text(self):
+        import asyncio
+
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import MockLogger, create_mock_state
+        from chat_sdk.types import ChatConfig, WebhookOptions
+
+        adapter = _make_adapter(app_id="bot-app-id", user_name="mybot")
+        chat = Chat(
+            ChatConfig(user_name="mybot", adapters={"teams": adapter}, state=create_mock_state(), logger=MockLogger())
+        )
+        adapter._chat = chat
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        tasks: list[Any] = []
+        activity = {
+            "type": "message",
+            "id": "msg-text-mention",
+            "text": "hey @mybot can you help",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "19:abc@thread.tacv2"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "entities": [],
+        }
+        await adapter._handle_message_activity(activity, WebhookOptions(wait_until=tasks.append))
+        await asyncio.gather(*tasks)
+
+        mention_handler.assert_awaited_once()
+        message = mention_handler.await_args.args[1]
+        assert message.id == "msg-text-mention"
+        assert message.is_mention is True
+
+
+# ---------------------------------------------------------------------------
 # Message action (Action.Submit in message activity)
 # ---------------------------------------------------------------------------
 
@@ -990,8 +1039,8 @@ class TestStream:
         assert result.id == "stream-msg-1"
         # Single SDK send carrying the full accumulated text — no edits.
         send.assert_called_once()
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
         assert activity.text == "Hello world"
         assert activity.text_format == "markdown"
 

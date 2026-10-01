@@ -21,7 +21,7 @@ import pytest
 from chat_sdk.callback_url import decode_callback_value
 from chat_sdk.cards import Actions, Button, Card
 from chat_sdk.channel import derive_channel_id
-from chat_sdk.errors import ChatNotImplementedError
+from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.plan import StreamingPlan, StreamingPlanOptions
 from chat_sdk.shared.mock_adapter import MockLogger
 from chat_sdk.testing import (
@@ -86,6 +86,20 @@ def _make_thread(
             logger=logger,
         )
     )
+
+
+def _plan_thread() -> ThreadImpl:
+    """Thread whose adapter supports native plan objects (postObject/editObject)."""
+    adapter = create_mock_adapter()
+    adapter.post_object = AsyncMock(  # type: ignore[attr-defined]
+        return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={})
+    )
+    adapter.edit_object = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    return _make_thread(adapter)
+
+
+def _task_status(plan: Any, task_id: str) -> str | None:
+    return next((t.status for t in plan.tasks if t.id == task_id), None)
 
 
 async def _create_text_stream(chunks: list[str]) -> AsyncIterator[str]:
@@ -1917,7 +1931,9 @@ class TestPostEphemeral:
         thread = _make_thread(adapter, state)
         result = await thread.post_ephemeral("U456", "Secret message", PostEphemeralOptions(fallback_to_dm=True))
 
-        mock_post_ephemeral.assert_called_once_with("slack:C123:1234.5678", "U456", "Secret message")
+        mock_post_ephemeral.assert_called_once_with(
+            "slack:C123:1234.5678", "U456", "Secret message", options=PostEphemeralOptions(fallback_to_dm=True)
+        )
         assert result is not None
         assert result.id == "ephemeral-1"
         assert result.thread_id == "slack:C123:1234.5678"
@@ -1954,7 +1970,9 @@ class TestPostEphemeral:
         await thread.post_ephemeral(author, "Secret message", PostEphemeralOptions(fallback_to_dm=True))
 
         assert mock_post_ephemeral.call_count == 1
-        mock_post_ephemeral.assert_called_once_with("slack:C123:1234.5678", "U789", "Secret message")
+        mock_post_ephemeral.assert_called_once_with(
+            "slack:C123:1234.5678", "U789", "Secret message", options=PostEphemeralOptions(fallback_to_dm=True)
+        )
 
     # it("should fallback to DM when adapter has no postEphemeral and fallbackToDM is true")
     @pytest.mark.asyncio
@@ -2024,6 +2042,43 @@ class TestPostEphemeral:
 
         # Should return None since no fallback is possible
         assert result is None
+
+    # Python-specific: a custom adapter written against the older
+    # 3-argument ``post_ephemeral`` still works (``options=`` is only passed
+    # to implementations that accept it).
+    @pytest.mark.asyncio
+    async def test_three_argument_custom_post_ephemeral_still_works(self):
+        adapter = create_mock_adapter()
+        calls: list[tuple[str, str, Any]] = []
+
+        async def legacy_post_ephemeral(thread_id: str, user_id: str, message: Any) -> EphemeralMessage:
+            calls.append((thread_id, user_id, message))
+            return EphemeralMessage(id="eph-legacy", thread_id=thread_id, used_fallback=False, raw={})
+
+        adapter.post_ephemeral = legacy_post_ephemeral  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        result = await thread.post_ephemeral("U456", "Secret message", PostEphemeralOptions(fallback_to_dm=True))
+
+        assert calls == [("slack:C123:1234.5678", "U456", "Secret message")]
+        assert result is not None
+        assert result.id == "eph-legacy"
+
+    # Python-specific: an adapter that returns ``None`` (no private delivery
+    # path) yields ``None`` with no DM fallback, as upstream does.
+    @pytest.mark.asyncio
+    async def test_adapter_returning_none_yields_none_without_dm_fallback(self):
+        adapter = create_mock_adapter()
+        adapter.post_ephemeral = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        result = await thread.post_ephemeral("U456", "Secret message", PostEphemeralOptions(fallback_to_dm=True))
+
+        assert result is None
+        adapter.post_ephemeral.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "U456", "Secret message", options=PostEphemeralOptions(fallback_to_dm=True)
+        )
+        assert adapter._post_calls == []
 
 
 # ===========================================================================
@@ -2208,11 +2263,14 @@ class TestPostWithPlan:
         thread = _make_thread(adapter, state)
         plan = Plan(StartPlanOptions(initial_message="Start"))
         await thread.post(plan)
+        initial_task = plan.current_task
+        assert initial_task is not None
         task1 = await plan.add_task(AddTaskOptions(title="Step 1"))
-        task2 = await plan.add_task(AddTaskOptions(title="Step 2"))
-
         assert task1 is not None
+        assert _task_status(plan, initial_task.id) == "complete"
+        task2 = await plan.add_task(AddTaskOptions(title="Step 2"))
         assert task2 is not None
+        assert _task_status(plan, task1.id) == "complete"
 
         updated = await plan.update_task(UpdateTaskInput(id=task1.id, output="Step 1 result", status="complete"))
 
@@ -2223,6 +2281,65 @@ class TestPostWithPlan:
         step2 = next((t for t in plan.tasks if t.id == task2.id), None)
         assert step2 is not None
         assert step2.status == "in_progress"
+
+    # it("should not auto-complete in_progress tasks when autoCompletePrevious is false")
+    async def test_should_not_autocomplete_inprogress_tasks_when_autocompleteprevious_is_false(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        plan = Plan(StartPlanOptions(initial_message="Step 1"))
+        await _plan_thread().post(plan)
+
+        step1 = plan.current_task
+        step2 = await plan.add_task(AddTaskOptions(title="Step 2", auto_complete_previous=False))
+        step3 = await plan.add_task(AddTaskOptions(title="Step 3", auto_complete_previous=False))
+
+        assert step1 is not None and step2 is not None and step3 is not None
+        assert [_task_status(plan, t.id) for t in (step1, step2, step3)] == ["in_progress"] * 3
+
+    # it("should auto-complete all in_progress tasks when switching back to default addTask")
+    async def test_should_autocomplete_all_inprogress_tasks_when_switching_back_to_default_addtask(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        plan = Plan(StartPlanOptions(initial_message="Step 1"))
+        await _plan_thread().post(plan)
+
+        step1 = plan.current_task
+        step2 = await plan.add_task(AddTaskOptions(title="Step 2", auto_complete_previous=False))
+        step3 = await plan.add_task(AddTaskOptions(title="Step 3", auto_complete_previous=False))
+
+        sequential_task = await plan.add_task(AddTaskOptions(title="Sequential step"))
+
+        assert step1 is not None and step2 is not None and step3 is not None
+        assert [_task_status(plan, t.id) for t in (step1, step2, step3)] == ["complete"] * 3
+        assert sequential_task is not None
+        assert sequential_task.status == "in_progress"
+        assert plan.current_task is not None
+        assert plan.current_task.id == sequential_task.id
+        assert len(plan.tasks) == 4
+
+    # it("should target the most recent in_progress task when updating without id")
+    async def test_should_target_the_most_recent_inprogress_task_when_updating_without_id(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions, UpdateTaskInput
+
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await _plan_thread().post(plan)
+
+        fetch_task = await plan.add_task(AddTaskOptions(title="Fetch data"))
+        transform_task = await plan.add_task(AddTaskOptions(title="Transform", auto_complete_previous=False))
+        assert fetch_task is not None and transform_task is not None
+
+        assert plan.current_task is not None
+        assert plan.current_task.id == transform_task.id
+        assert _task_status(plan, fetch_task.id) == "in_progress"
+
+        updated = await plan.update_task("parallel output")
+        assert updated is not None
+        assert updated.id == transform_task.id
+
+        fetch_updated = await plan.update_task(UpdateTaskInput(id=fetch_task.id, output="fetch output"))
+        assert fetch_updated is not None
+        assert fetch_updated.id == fetch_task.id
+        assert _task_status(plan, transform_task.id) == "in_progress"
 
     # it("should return null when updating by non-existent ID")
     @pytest.mark.asyncio
@@ -2740,6 +2857,112 @@ class TestStartTyping:
 
 
 # ===========================================================================
+# markAsRead
+# ===========================================================================
+
+
+class TestMarkAsRead:
+    """describe("markAsRead")"""
+
+    # it("marks the current message when no target is provided")
+    @pytest.mark.asyncio
+    async def test_marks_the_current_message_when_no_target_is_provided(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        message = create_test_message("msg-1", "Hello")
+        thread = _make_thread(adapter, current_message=message)
+
+        await thread.mark_as_read()
+
+        adapter.mark_as_read.assert_awaited_once_with("slack:C123:1234.5678", "msg-1", message)
+
+    # it("marks an explicit message id")
+    @pytest.mark.asyncio
+    async def test_marks_an_explicit_message_id(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        thread = _make_thread(adapter)
+
+        await thread.mark_as_read("msg-2")
+
+        adapter.mark_as_read.assert_awaited_once_with("slack:C123:1234.5678", "msg-2", None)
+
+    # it("marks an explicit message")
+    @pytest.mark.asyncio
+    async def test_marks_an_explicit_message(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        message = create_test_message("msg-3", "Hello")
+        thread = _make_thread(adapter)
+
+        await thread.mark_as_read(message)
+
+        adapter.mark_as_read.assert_awaited_once_with("slack:C123:1234.5678", "msg-3", message)
+
+    # it("rejects a message from another thread")
+    @pytest.mark.asyncio
+    async def test_rejects_a_message_from_another_thread(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        message = create_test_message("msg-4", "Hello", thread_id="slack:C999:9999.0000")
+        thread = _make_thread(adapter)
+
+        with pytest.raises(ChatError, match="Cannot mark a message from another thread as read"):
+            await thread.mark_as_read(message)
+        adapter.mark_as_read.assert_not_awaited()
+
+    # it("requires a target outside a message handler")
+    @pytest.mark.asyncio
+    async def test_requires_a_target_outside_a_message_handler(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        thread = _make_thread(adapter)
+
+        with pytest.raises(ChatError, match="A message is required outside a message handler"):
+            await thread.mark_as_read()
+        adapter.mark_as_read.assert_not_awaited()
+
+    # it("throws when the adapter does not support read receipts")
+    @pytest.mark.asyncio
+    async def test_throws_when_the_adapter_does_not_support_read_receipts(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = None
+        thread = _make_thread(adapter, current_message=create_test_message("msg-5", "Hello"))
+
+        with pytest.raises(ChatNotImplementedError) as exc_info:
+            await thread.mark_as_read()
+        assert exc_info.value.method == "read-receipts"
+
+    # it("preserves the current message through serialization")
+    @pytest.mark.asyncio
+    async def test_preserves_the_current_message_through_serialization(self):
+        adapter = create_mock_adapter()
+        adapter.mark_as_read = AsyncMock(return_value=None)
+        original = _make_thread(adapter, current_message=create_test_message("msg-6", "Hello"))
+        restored = ThreadImpl.from_json(original.to_json(), adapter=adapter)
+
+        await restored.mark_as_read()
+
+        adapter.mark_as_read.assert_awaited_once()
+        thread_id, message_id, message = adapter.mark_as_read.await_args.args
+        assert (thread_id, message_id) == ("slack:C123:1234.5678", "msg-6")
+        assert isinstance(message, Message)
+        assert message.id == "msg-6"
+
+    # Python-specific: ``None`` means "current message", but an explicit
+    # empty ID is not replaced by it (upstream ``message ?? current`` keeps
+    # ``""``, then ``!target`` rejects it).
+    @pytest.mark.asyncio
+    async def test_empty_message_id_is_rejected_even_with_a_current_message(self):
+        adapter = create_mock_adapter()
+        thread = _make_thread(adapter, current_message=create_test_message("msg-7", "Hello"))
+
+        with pytest.raises(ChatError, match="A message is required outside a message handler"):
+            await thread.mark_as_read("")
+        adapter.mark_as_read.assert_not_awaited()
+
+
+# ===========================================================================
 # mentionUser
 # ===========================================================================
 
@@ -2776,7 +2999,8 @@ class TestCreateSentMessageFromMessage:
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
-        msg = create_test_message("msg-1", "Hello world")
+        reply_to = create_test_message("msg-0", "Original message")
+        msg = create_test_message("msg-1", "Hello world", reply_to=reply_to)
 
         sent = thread.create_sent_message_from_message(msg)
 
@@ -2786,6 +3010,7 @@ class TestCreateSentMessageFromMessage:
         assert sent.author == msg.author
         assert sent.metadata == msg.metadata
         assert sent.attachments == msg.attachments
+        assert sent.reply_to is reply_to
 
     # it("should provide edit capability")
     @pytest.mark.asyncio
@@ -2864,6 +3089,21 @@ class TestCreateSentMessageFromMessage:
 
         sent = thread.create_sent_message_from_message(msg)
         assert sent.is_mention is True
+
+    # Python-specific: ``edit()`` on the wrapped message keeps its
+    # ``reply_to`` (upstream ``createSentMessage(..., threadId, replyTo)``).
+    @pytest.mark.asyncio
+    async def test_edit_of_a_wrapped_message_keeps_reply_to(self):
+        adapter = create_mock_adapter()
+        thread = _make_thread(adapter)
+        original = create_test_message("msg-0", "Question")
+        msg = create_test_message("msg-1", "Answer", reply_to=original)
+
+        edited = await thread.create_sent_message_from_message(msg).edit("Better answer")
+
+        assert edited.reply_to is original
+        assert edited.text == "Better answer"
+        assert adapter._edit_calls == [("slack:C123:1234.5678", "msg-1", "Better answer")]
 
     # it("should provide toJSON that delegates to the original message")
     # Note: Python SentMessage doesn't have to_json; skipping or adapting
@@ -3036,6 +3276,272 @@ class TestSentMessageToJson:
         assert result.text == "Hello world"
         assert result.author.is_bot is True
         assert result.author.is_me is True
+
+
+# ===========================================================================
+# reply()
+# ===========================================================================
+
+
+def _reply_raw() -> RawMessage:
+    return RawMessage(id="reply-1", thread_id="slack:C123:1234.5678", raw={})
+
+
+class TestReply:
+    """describe("reply()")"""
+
+    # it("throws when the adapter does not support replies")
+    @pytest.mark.asyncio
+    async def test_throws_when_the_adapter_does_not_support_replies(self):
+        thread = _make_thread()
+
+        with pytest.raises(ChatNotImplementedError) as exc_info:
+            await thread.reply("original", "Hello")
+        assert exc_info.value.method == "replies"
+
+    # it("delegates a message id and content to the adapter")
+    @pytest.mark.asyncio
+    async def test_delegates_a_message_id_and_content_to_the_adapter(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        result = await thread.reply("original", PostableMarkdown(markdown="Hello"))
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown="Hello")
+        )
+        assert result.id == "reply-1"
+
+    # it("accepts a Message and preserves it on the result")
+    @pytest.mark.asyncio
+    async def test_accepts_a_message_and_preserves_it_on_the_result(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+        original = create_test_message("original", "Question")
+
+        result = await thread.reply(original, "Answer")
+
+        adapter.reply.assert_awaited_once_with("slack:C123:1234.5678", "original", "Answer")  # type: ignore[attr-defined]
+        assert result.reply_to is original
+
+    # it("rejects a Message from another thread")
+    @pytest.mark.asyncio
+    async def test_rejects_a_message_from_another_thread(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+        original = create_test_message("original", "Question", thread_id="slack:C999:9999.0000")
+
+        with pytest.raises(ChatError, match="Cannot reply to a message from another thread"):
+            await thread.reply(original, "Answer")
+        adapter.reply.assert_not_awaited()  # type: ignore[attr-defined]
+
+    # it("converts JSX cards before delegating")
+    # Python has no JSX; a CardElement dict is passed through to the adapter.
+    @pytest.mark.asyncio
+    async def test_converts_jsx_cards_before_delegating(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        await thread.reply("original", Card(title="Answer"))
+
+        thread_id, target_id, postable = adapter.reply.await_args.args  # type: ignore[attr-defined]
+        assert (thread_id, target_id) == ("slack:C123:1234.5678", "original")
+        assert postable["type"] == "card"
+        assert postable["title"] == "Answer"
+
+    # it("buffers streams into one markdown reply")
+    @pytest.mark.asyncio
+    async def test_buffers_streams_into_one_markdown_reply(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        await thread.reply("original", _create_text_stream(["Hello ", "world"]))
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown="Hello world")
+        )
+
+    # it("falls back to a space when a stream produces no text")
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_space_when_a_stream_produces_no_text(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        async def stream() -> AsyncIterator[Any]:
+            yield {"type": "tool-call", "toolName": "search"}
+            yield {"type": "finish-step"}
+
+        await thread.reply("original", stream())
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown=" ")
+        )
+
+    # Python-specific: the empty-stream check uses JS ``trim()``'s whitespace
+    # set. Whitespace-only text (and U+FEFF, which JS trims) posts " ";
+    # U+001C, which ``str.strip()`` would drop but JS keeps, is sent as is.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("chunks", "expected"),
+        [(["  ", "\n"], " "), (["\ufeff"], " "), (["\x1c"], "\x1c")],
+        ids=["spaces-and-newline", "bom", "file-separator"],
+    )
+    async def test_whitespace_only_stream_uses_js_trim(self, chunks: list[str], expected: str):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        await thread.reply("original", _create_text_stream(chunks))
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown=expected)
+        )
+
+    # it("resolves a message id against messages the thread knows")
+    @pytest.mark.asyncio
+    async def test_resolves_a_message_id_against_messages_the_thread_knows(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+        original = create_test_message("original", "Question")
+        thread.recent_messages = [original]
+
+        result = await thread.reply("original", "Answer")
+
+        assert result.reply_to is original
+
+    # it("leaves replyTo undefined for an unknown message id")
+    @pytest.mark.asyncio
+    async def test_leaves_replyto_undefined_for_an_unknown_message_id(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        adapter.fetch_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        thread = _make_thread(adapter)
+
+        result = await thread.reply("not-in-memory", "Answer")
+
+        adapter.reply.assert_awaited_once_with("slack:C123:1234.5678", "not-in-memory", "Answer")  # type: ignore[attr-defined]
+        assert result.reply_to is None
+        # The ID is never resolved by fetching.
+        adapter.fetch_message.assert_not_awaited()
+
+    # Python-specific: an ID matching the message being handled resolves to
+    # it (``_find_known_message`` checks the current message first).
+    @pytest.mark.asyncio
+    async def test_resolves_the_current_message_id_to_the_current_message(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        current = create_test_message("current", "Question")
+        thread = _make_thread(adapter, current_message=current)
+
+        result = await thread.reply("current", "Answer")
+
+        assert result.reply_to is current
+
+    # Python-specific: streams keep text and ``markdown_text`` chunks and drop
+    # structured ``task_update`` chunks.
+    @pytest.mark.asyncio
+    async def test_buffers_markdown_text_chunks_and_drops_task_updates(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+
+        async def stream() -> AsyncIterator[Any]:
+            yield "Hi "
+            yield TaskUpdateChunk(id="t1", title="Searching", status="in_progress")
+            yield MarkdownTextChunk(text="**there**")
+            yield {"type": "markdown_text", "text": "!"}
+
+        await thread.reply("original", stream())
+
+        adapter.reply.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "slack:C123:1234.5678", "original", PostableMarkdown(markdown="Hi **there**!")
+        )
+
+    # Python-specific: the reply is cached in thread history with its target.
+    @pytest.mark.asyncio
+    async def test_appends_the_reply_to_thread_history(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        history = AsyncMock()
+        thread = ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1234.5678",
+                adapter=adapter,
+                state_adapter=create_mock_state(),
+                channel_id="C123",
+                thread_history=history,
+            )
+        )
+        original = create_test_message("original", "Question")
+
+        await thread.reply(original, "Answer")
+
+        history.append.assert_awaited_once()
+        thread_id, cached = history.append.await_args.args
+        assert thread_id == "slack:C123:1234.5678"
+        assert cached.id == "reply-1"
+        assert cached.text == "Answer"
+        assert cached.reply_to is original
+
+    # Python-specific: ``SentMessage.edit()`` keeps the reply target.
+    @pytest.mark.asyncio
+    async def test_edit_after_reply_keeps_reply_to(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        thread = _make_thread(adapter)
+        original = create_test_message("original", "Question")
+
+        sent = await thread.reply(original, "Answer")
+        edited = await sent.edit("Better answer")
+
+        assert edited.reply_to is original
+        assert edited.text == "Better answer"
+
+    # Python-specific: callback URLs in a reply card are minted with this
+    # thread's scope, as for ``post()``.
+    @pytest.mark.asyncio
+    async def test_reply_encodes_callback_urls_with_thread_scope(self):
+        adapter = create_mock_adapter()
+        adapter.reply = AsyncMock(return_value=_reply_raw())  # type: ignore[attr-defined]
+        state = create_mock_state()
+        thread = _make_thread(adapter, state)
+
+        await thread.reply("original", _make_card_with_callback("https://example.com/cb"))
+
+        sent_card = adapter.reply.await_args.args[2]  # type: ignore[attr-defined]
+        button = sent_card["children"][0]["children"][0]
+        token = decode_callback_value(button["value"]).callback_token
+        assert token is not None
+        stored = await state.get(f"chat:callback:{token}")
+        assert stored is not None
+        assert stored["url"] == "https://example.com/cb"
+        assert stored["scope"] == {"id": "slack:C123:1234.5678", "type": "thread"}
+
+
+class TestSentMessageEditThreadId:
+    """Python-specific: edits keep the thread ID the adapter returned."""
+
+    @pytest.mark.asyncio
+    async def test_edit_keeps_thread_id_override(self):
+        adapter = create_mock_adapter()
+        adapter.post_message = AsyncMock(  # type: ignore[method-assign]
+            return_value=RawMessage(id="msg-9", thread_id="slack:C123:9999.0000", raw={})
+        )
+        thread = _make_thread(adapter)
+
+        sent = await thread.post("Hello")
+        edited = await sent.edit("Updated")
+
+        assert sent.thread_id == "slack:C123:9999.0000"
+        assert edited.thread_id == "slack:C123:9999.0000"
+        assert adapter._edit_calls == [("slack:C123:9999.0000", "msg-9", "Updated")]
 
 
 # ===========================================================================

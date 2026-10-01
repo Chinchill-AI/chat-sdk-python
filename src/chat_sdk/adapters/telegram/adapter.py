@@ -78,6 +78,7 @@ from chat_sdk.shared.errors import (
 from chat_sdk.shared.markdown_parser import ast_to_plain_text, parse_markdown, stringify_markdown
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     AdapterPostableMessage,
     Attachment,
@@ -91,6 +92,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     MessageMetadata,
+    PostableMarkdown,
     RawMessage,
     ReactionEvent,
     SlashCommandEvent,
@@ -140,6 +142,26 @@ TELEGRAM_DEFAULT_POLLING_TIMEOUT_SECONDS = 30
 TELEGRAM_DEFAULT_POLLING_LIMIT = 100
 TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS = 1000
 TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS = 250
+# Post-and-edit streaming (vercel/chat#822, #826): minimum gap between edits
+# of the streamed message. Telegram allows roughly one edit per second in a
+# private chat and fewer in groups, so the floors sit just above that.
+TELEGRAM_DEFAULT_PRIVATE_STREAMING_EDIT_INTERVAL_MS = 1100
+TELEGRAM_DEFAULT_NON_PRIVATE_STREAMING_EDIT_INTERVAL_MS = 3100
+# The final edit of a stream waits out at most this long for a rate limit
+# before raising instead.
+TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS = 5000
+TELEGRAM_STREAM_PLACEHOLDER_TEXT = "..."
+# Incoming albums (vercel/chat#760): parts are buffered in state until no new
+# part has arrived for the settle window, then emitted as one message.
+TELEGRAM_INCOMING_MEDIA_GROUP_BUFFER_TTL_MS = 30_000
+TELEGRAM_INCOMING_MEDIA_GROUP_LOCK_TTL_MS = 5_000
+TELEGRAM_INCOMING_MEDIA_GROUP_RETRY_MS = 50
+TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS = 1_000
+# Albums hold at most 10 items; the incoming buffer keeps the newest 10.
+TELEGRAM_MEDIA_GROUP_MAX = 10
+# Upper bound for both the request-failure backoff and the per-update retry
+# backoff of the polling loop (vercel/chat#942).
+TELEGRAM_POLLING_MAX_BACKOFF_MS = 30_000
 # Telegram rejects unparseable MarkdownV2 with a 400 whose description reads
 # "Bad Request: can't parse entities: ..." ("caption entities" for media
 # captions). Matched case-insensitively as a substring, like upstream's
@@ -281,7 +303,8 @@ def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
 # MarkdownV2-safe truncation
 # ---------------------------------------------------------------------------
 #
-# Port of packages/adapter-telegram/src/markdown.ts (chat@4.27.0).
+# Port of packages/adapter-telegram/src/markdown.ts (chat@4.41.1,
+# vercel/chat#915).
 #
 # Naive ``slice + "..."`` produces invalid MarkdownV2: ``.`` is a reserved
 # character (must be escaped as ``\.``); a slice can leave an orphan
@@ -290,67 +313,57 @@ def _truncate_to_utf16(text: str, limit: int, ellipsis: str = "...") -> str:
 # leaving it unclosed. Telegram rejects all three with
 # ``Bad Request: can't parse entities``.
 #
-# These helpers walk back past unbalanced delimiters and orphan backslashes
-# before appending an escaped ellipsis. They also run on
-# under-the-limit MarkdownV2 inputs (per upstream f46a6fb / chat#446) so
-# streamed chunks that arrive with a transiently unpaired opener are
-# trimmed back to a parseable boundary.
+# Text that fits the limit is returned unchanged: the MarkdownV2 renderer
+# emits balanced entities, so there is nothing to repair, and a trim there
+# could only delete valid content (such as a link URL holding a backtick).
+# Over the limit, the slice is walked back past unbalanced delimiters and
+# orphan backslashes before an escaped ellipsis is appended.
 
 # Entity delimiters whose opener/closer pairing must be preserved when
-# truncating a rendered MarkdownV2 string.
-_MARKDOWN_V2_ENTITY_MARKERS: tuple[str, ...] = ("*", "_", "~", "`")
+# truncating a rendered MarkdownV2 string. Telegram reads ``__`` as
+# underline, which pairs separately from single ``_`` italics.
+_MARKDOWN_V2_ENTITY_MARKERS: tuple[str, ...] = ("*", "_", "__", "~", "`")
 
 _MARKDOWN_V2_ELLIPSIS = "\\.\\.\\."
 _PLAIN_ELLIPSIS = "..."
 
 
-def find_unescaped_positions(text: str, marker: str) -> list[int]:
-    """Return indices of every occurrence of *marker* in *text* not preceded
-    by an odd number of backslashes (i.e. not escaped)."""
-    positions: list[int] = []
-    for i, ch in enumerate(text):
-        if ch != marker:
-            continue
-        backslashes = 0
-        j = i - 1
-        while j >= 0 and text[j] == "\\":
-            backslashes += 1
-            j -= 1
-        if backslashes % 2 == 0:
-            positions.append(i)
-    return positions
+@dataclass
+class _DelimiterScan:
+    """Result of :func:`_scan_delimiters` (upstream ``DelimiterScan``)."""
 
+    close_brackets: int
+    """Number of ``]`` that close a link label."""
 
-def _find_unescaped_positions_outside_code(
-    text: str,
-    marker: str,
-    *,
-    skip_link_dest: bool = False,
-) -> list[int]:
-    """Like :func:`find_unescaped_positions` but skips occurrences inside
-    fenced code blocks (```````) or inline code spans
-    (`````). Inside those regions Telegram treats ``*``, ``_``, ``~``,
-    ``[``, ``]`` as literal text.
+    markers: dict[str, list[int]]
+    """Unescaped entity delimiter positions outside code and link URLs.
 
-    When ``skip_link_dest`` is True, also skips occurrences inside a
-    MarkdownV2 link destination region (the ``(...)`` immediately
-    following ``]``). Per Telegram's MarkdownV2 spec, only ``)`` and
-    ``\\`` need escaping inside the destination -- ``_``, ``*``, ``~``
-    are literal text and must not be counted as unbalanced entity
-    delimiters by the safe-boundary trimmer. Without this, an under-limit
-    link like ``[x](https://example.com/foo_bar)`` would be truncated to
-    ``[x](https://example.com/foo`` because the trimmer saw the ``_`` as
-    an unpaired italic opener.
-
-    Port of upstream ``findUnescapedPositionsOutsideCode`` (chat#446).
+    Fences and ``__`` record one position per delimiter so a cut through an
+    opener retreats to its first character.
     """
-    positions: list[int] = []
+
+    open_brackets: list[int]
+    """Unescaped ``[`` positions outside code and link URLs."""
+
+
+def _scan_delimiters(text: str) -> _DelimiterScan:
+    """Collect every delimiter the trimmer pairs up, in one pass.
+
+    Port of upstream ``scanDelimiters``. Markers inside fenced code, inline
+    code, or the ``(...)`` part of a link are literal text and are skipped.
+    Positions index *text* (code points), which is what the caller slices.
+    """
+    markers: dict[str, list[int]] = {marker: [] for marker in _MARKDOWN_V2_ENTITY_MARKERS}
+    open_brackets: list[int] = []
+    close_brackets = 0
     in_fence = False
     in_inline = False
-    in_link_dest = False
+    in_link_url = False
     backslashes = 0
-    i = 0
     n = len(text)
+    last_index = n - 1
+
+    i = 0
     while i < n:
         ch = text[i]
 
@@ -361,47 +374,72 @@ def _find_unescaped_positions_outside_code(
 
         escaped = backslashes % 2 == 1
         backslashes = 0
+        if escaped:
+            i += 1
+            continue
 
-        if ch == "`" and not escaped and not in_link_dest:
-            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
-            if is_triple and not in_inline:
+        if in_link_url:
+            # A link's ``]`` only counts toward bracket pairing once its URL
+            # closes, so a slice mid-URL leaves the ``[`` unmatched.
+            if ch == ")":
+                in_link_url = False
+                close_brackets += 1
+            i += 1
+            continue
+
+        if ch == "`":
+            if not in_inline and text.startswith("```", i):
+                markers["`"].append(i)
                 in_fence = not in_fence
                 i += 3
                 continue
-            if not in_fence:
-                in_inline = not in_inline
+            if in_fence:
+                i += 1
+                continue
+            markers["`"].append(i)
+            # A slice that ends in two opening backticks is a cut fence, not
+            # a balanced empty inline-code span.
+            if not in_inline and i + 2 == n and text[i + 1] == "`":
+                i += 1
+            in_inline = not in_inline
             i += 1
             continue
 
-        # Enter a link destination when we see ``](`` outside code -- the
-        # ``]`` itself is still counted (the caller scans brackets in a
-        # separate pass), but the URL inside ``(...)`` is treated as
-        # literal text for delimiter-balance purposes.
-        if (
-            skip_link_dest
-            and not in_link_dest
-            and not in_fence
-            and not in_inline
-            and not escaped
-            and ch == "]"
-            and text[i + 1 : i + 2] == "("
-        ):
-            if ch == marker:
-                positions.append(i)
-            in_link_dest = True
-            i += 2  # consume ``](``
-            continue
-
-        if in_link_dest and not escaped and ch == ")":
-            in_link_dest = False
+        if in_fence or in_inline:
             i += 1
             continue
 
-        if ch == marker and not escaped and not in_fence and not in_inline and not in_link_dest:
-            positions.append(i)
+        if ch == "[":
+            open_brackets.append(i)
+            i += 1
+            continue
+
+        if ch == "]":
+            if text[i + 1 : i + 2] == "(":
+                in_link_url = True
+                i += 2
+                continue
+            if i < last_index:
+                # Telegram accepts a bare ``[label]``; only a ``]`` that ends
+                # the slice may have lost its ``(url)`` to the cut.
+                close_brackets += 1
+            i += 1
+            continue
+
+        if ch == "_":
+            if text[i + 1 : i + 2] == "_":
+                markers["__"].append(i)
+                i += 2
+            else:
+                markers["_"].append(i)
+                i += 1
+            continue
+
+        if ch in ("*", "~"):
+            markers[ch].append(i)
         i += 1
 
-    return positions
+    return _DelimiterScan(close_brackets=close_brackets, markers=markers, open_brackets=open_brackets)
 
 
 def ends_with_orphan_backslash(text: str) -> bool:
@@ -414,99 +452,21 @@ def ends_with_orphan_backslash(text: str) -> bool:
     return trailing % 2 == 1
 
 
-def _find_unclosed_link_dest_open_bracket(text: str) -> int | None:
-    """Return the position of the ``[`` that opens an inline link whose
-    destination ``(`` is never closed by ``)``.
-
-    A truncated chunk like ``[label](https://example.com/very-long`` has
-    balanced ``[]`` brackets but a dangling ``(`` -- Telegram rejects this
-    as invalid MarkdownV2. The detector walks the text honouring fenced/
-    inline code regions and escape backslashes, finds each ``](`` pair,
-    and reports the corresponding ``[`` position if no unescaped ``)``
-    closes the destination before end-of-string.
-    """
-    n = len(text)
-    in_fence = False
-    in_inline = False
-    backslashes = 0
-    bracket_stack: list[int] = []  # positions of unmatched ``[`` outside code
-    i = 0
-    while i < n:
-        ch = text[i]
-
-        if ch == "\\":
-            backslashes += 1
-            i += 1
-            continue
-
-        escaped = backslashes % 2 == 1
-        backslashes = 0
-
-        if ch == "`" and not escaped:
-            is_triple = text[i + 1 : i + 2] == "`" and text[i + 2 : i + 3] == "`"
-            if is_triple and not in_inline:
-                in_fence = not in_fence
-                i += 3
-                continue
-            if not in_fence:
-                in_inline = not in_inline
-            i += 1
-            continue
-
-        if escaped or in_fence or in_inline:
-            i += 1
-            continue
-
-        if ch == "[":
-            bracket_stack.append(i)
-            i += 1
-            continue
-
-        if ch == "]" and bracket_stack:
-            open_pos = bracket_stack.pop()
-            # If immediately followed by ``(``, this is an inline link
-            # destination. Scan forward to verify there's an unescaped
-            # closing ``)`` before EOS.
-            if text[i + 1 : i + 2] == "(":
-                j = i + 2
-                inner_backslashes = 0
-                closed = False
-                while j < n:
-                    cj = text[j]
-                    if cj == "\\":
-                        inner_backslashes += 1
-                        j += 1
-                        continue
-                    inner_escaped = inner_backslashes % 2 == 1
-                    inner_backslashes = 0
-                    if cj == ")" and not inner_escaped:
-                        closed = True
-                        break
-                    j += 1
-                if not closed:
-                    return open_pos
-            i += 1
-            continue
-
-        i += 1
-
-    return None
-
-
 def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
     """Drop trailing characters that would produce invalid MarkdownV2.
 
-    Drops:
-      - orphan trailing ``\\`` (would escape the appended ellipsis or nothing)
-      - unclosed entity delimiter (``*``, ``_``, ``~``, `` ` ``) whose closer
-        was cut off
-      - unmatched ``[`` from a link whose closer was cut off
-      - inline link with balanced ``[]`` but unclosed ``(`` destination
-        (e.g. ``[label](https://example.com/very-long``) -- chunk is
-        trimmed back to the opening ``[``
+    Port of upstream ``trimToMarkdownV2SafeBoundary`` (chat@4.41.1). Drops:
+
+      - an orphan trailing ``\\`` (would escape the appended ellipsis or
+        nothing)
+      - an unclosed entity delimiter (``*``, ``_``, ``__``, ``~``,
+        `` ` ``) whose closer was cut off
+      - an unmatched ``[`` from a link whose closer was cut off, or whose
+        ``(...)`` URL part was left unterminated by the slice
 
     Best-effort: may drop more than strictly necessary in edge cases, but
     guarantees the output is parseable MarkdownV2 (when the input was).
+    Production callers go through :func:`truncate_for_telegram`.
     """
     current = text
     max_iterations = len(current) + 1
@@ -516,33 +476,21 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
             current = current[:-1]
             continue
 
-        min_unsafe_position = len(current)
+        scan = _scan_delimiters(current)
+        cut = len(current)
 
         for marker in _MARKDOWN_V2_ENTITY_MARKERS:
-            if marker == "`":
-                positions = find_unescaped_positions(current, marker)
-            else:
-                positions = _find_unescaped_positions_outside_code(current, marker, skip_link_dest=True)
+            positions = scan.markers[marker]
             if len(positions) % 2 == 1:
-                last_unpaired = positions[-1] if positions else len(current)
-                if last_unpaired < min_unsafe_position:
-                    min_unsafe_position = last_unpaired
+                cut = min(cut, positions[-1])
 
-        open_brackets = _find_unescaped_positions_outside_code(current, "[")
-        close_brackets = _find_unescaped_positions_outside_code(current, "]")
-        if len(open_brackets) > len(close_brackets):
-            last_open = open_brackets[-1] if open_brackets else len(current)
-            if last_open < min_unsafe_position:
-                min_unsafe_position = last_open
+        if len(scan.open_brackets) > scan.close_brackets:
+            cut = min(cut, scan.open_brackets[-1])
 
-        unclosed_link_open = _find_unclosed_link_dest_open_bracket(current)
-        if unclosed_link_open is not None and unclosed_link_open < min_unsafe_position:
-            min_unsafe_position = unclosed_link_open
-
-        if min_unsafe_position >= len(current):
+        if cut >= len(current):
             return current
 
-        current = current[:min_unsafe_position]
+        current = current[:cut]
 
     return current
 
@@ -550,15 +498,14 @@ def _trim_to_markdown_v2_safe_boundary(text: str) -> str:
 def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
     """Truncate *text* to *limit* UTF-16 code units, appending an ellipsis.
 
-    For MarkdownV2 (``parse_mode == "MarkdownV2"``), uses an escaped
-    ellipsis (``\\.\\.\\.``) and trims back past any unbalanced entity
-    delimiter or orphan backslash before appending. Plain text gets a
-    literal ``...``.
+    Text that fits the limit is returned unchanged for every parse mode
+    (vercel/chat#915): the MarkdownV2 renderer emits balanced entities, so a
+    trim there could only delete valid content.
 
-    Even when *text* is under the limit, MarkdownV2 inputs go through
-    :func:`_trim_to_markdown_v2_safe_boundary` so that streamed chunks
-    with transiently unpaired entity markers don't trigger Telegram's
-    ``can't parse entities`` 400 (port of chat#446 / upstream f46a6fb).
+    Over the limit, MarkdownV2 (``parse_mode == "MarkdownV2"``) gets an
+    escaped ellipsis (``\\.\\.\\.``) and the slice is trimmed back past any
+    unbalanced entity delimiter or orphan backslash first; plain text gets a
+    literal ``...``.
 
     ``limit`` is interpreted in UTF-16 code units to match Telegram's
     documented 4096 / 1024 caps and upstream JavaScript's ``string.length``
@@ -566,11 +513,10 @@ def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
     units each, so a 4096-emoji MarkdownV2 message would otherwise sail
     past this check and be rejected by Telegram as too long.
     """
-    is_markdown_v2 = parse_mode == "MarkdownV2"
-
     if _utf16_len(text) <= limit:
-        return _trim_to_markdown_v2_safe_boundary(text) if is_markdown_v2 else text
+        return text
 
+    is_markdown_v2 = parse_mode == "MarkdownV2"
     ellipsis = _MARKDOWN_V2_ELLIPSIS if is_markdown_v2 else _PLAIN_ELLIPSIS
     sliced = _slice_to_utf16_units(text, limit - _utf16_len(ellipsis))
 
@@ -578,6 +524,19 @@ def truncate_for_telegram(text: str, limit: int, parse_mode: str | None) -> str:
         sliced = _trim_to_markdown_v2_safe_boundary(sliced)
 
     return f"{sliced}{ellipsis}"
+
+
+def _retry_after_seconds(error: AdapterRateLimitError) -> float:
+    """``error.retryAfter ?? 1`` for the streaming rate-limit waits.
+
+    ``retry_after`` comes straight from Telegram's JSON ``parameters``. A
+    value that is not a finite number is treated as absent (1 s): in Python
+    ``"5" * 1000`` would build a string instead of a delay.
+    """
+    retry_after = error.retry_after
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and math.isfinite(retry_after):
+        return float(retry_after)
+    return 1.0
 
 
 def _trim_trailing_slashes(url: str) -> str:
@@ -880,11 +839,33 @@ class TelegramAdapter:
         self._has_explicit_user_name: bool = bool(explicit_user_name)
 
         self._mode: str = config.mode or "auto"
+        # Streaming (vercel/chat#822): drafts are opt-in; every other stream
+        # posts and edits. ``nativeStreaming ?? false`` then a truthiness test.
+        self._native_streaming: bool = bool(config.native_streaming)
+        # ``typeof !== "number" || !Number.isFinite`` -> unset; else clamped to
+        # an integer >= 0. ``bool`` is an ``int`` subclass, but upstream's
+        # ``typeof true`` is ``"boolean"``, so it is ignored too.
+        raw_edit_interval = config.streaming_edit_interval_ms
+        self._streaming_edit_interval_ms: int | None = (
+            self.clamp_integer(raw_edit_interval, 0, 0, 2**53 - 1)
+            if isinstance(raw_edit_interval, (int, float))
+            and not isinstance(raw_edit_interval, bool)
+            and math.isfinite(raw_edit_interval)
+            else None
+        )
         self._long_polling: TelegramLongPollingConfig | None = config.long_polling
 
         self._runtime_mode: TelegramRuntimeMode = "webhook"
         self._polling_task: asyncio.Task[None] | None = None
         self._polling_active: bool = False
+        # True only while the polling loop is parked in ``getUpdates`` or one
+        # of its sleeps: the awaits upstream's per-iteration AbortController
+        # reaches. ``stop_polling`` cancels the loop only then, so in-flight
+        # handlers and checkpoint writes finish first, as upstream.
+        self._polling_interruptible: bool = False
+        # Strong references to webhook album tasks (vercel/chat#760) so they
+        # are not garbage-collected mid-settle when no ``wait_until`` is given.
+        self._media_group_tasks: set[asyncio.Task[None]] = set()
 
         # Draft-id counter for native DM draft streaming (vercel/chat#340).
         # Seeded from wall-clock millis (mod int32 max) so concurrent bot
@@ -1191,6 +1172,15 @@ class TelegramAdapter:
 
     async def disconnect(self) -> None:
         """Disconnect the adapter, stop polling, and close the shared HTTP session."""
+        # Python-only: ``Chat.shutdown`` cancels in-flight handler tasks before
+        # disconnecting adapters, but an album still settling would dispatch
+        # a new handler afterwards (and keep ``stop_polling`` waiting on it).
+        # Cancel albums first; a polled album then stays in the checkpoint.
+        media_group_tasks = [task for task in self._media_group_tasks if not task.done()]
+        for task in media_group_tasks:
+            task.cancel()
+        if media_group_tasks:
+            await asyncio.wait(media_group_tasks)
         await self.stop_polling()
         # Python-only: a pending receipt-typing task would otherwise reopen the
         # shared aiohttp session via ``_get_http_session`` after it is closed.
@@ -1256,16 +1246,27 @@ class TelegramAdapter:
     async def stop_polling(self) -> None:
         """Stop long-polling.
 
-        Cancels the polling task so that a blocked long-poll HTTP request
-        does not cause a ~30 s hang on shutdown.
+        Like upstream's ``AbortController``, this interrupts only a pending
+        ``getUpdates`` request or a polling sleep, so a blocked long poll does
+        not hang shutdown for ~30 s. When the loop is waiting for update
+        handlers or writing its checkpoint, that step finishes first and the
+        loop then exits, so the checkpoint stays consistent.
         """
         if not self._polling_active:
             return
         self._polling_active = False
-        if self._polling_task and not self._polling_task.done():
-            self._polling_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._polling_task
+        task = self._polling_task
+        if task is not None and not task.done():
+            if self._polling_interruptible:
+                task.cancel()
+            # ``asyncio.wait`` rather than ``await task``: the loop's own
+            # cancellation is expected, but cancelling *this* caller must
+            # still propagate (``suppress(CancelledError)`` would swallow it).
+            # Upstream parity: like ``stopPolling``, this waits for in-flight
+            # handlers, so a polled handler must not await it (deadlock).
+            await asyncio.wait({task})
+            if not task.cancelled():
+                task.result()
         self._polling_task = None
         self._logger.info("Telegram polling stopped")
 
@@ -1280,45 +1281,323 @@ class TelegramAdapter:
             {"dropPendingUpdates": drop_pending_updates},
         )
 
+    def _now_ms(self) -> int:
+        """Epoch milliseconds for album settle windows and polling retries.
+
+        Epoch time (upstream ``Date.now()``), not monotonic, because
+        ``receivedAt`` / ``retryAt`` are persisted in state and compared after
+        a restart or on another instance. Overridable so tests can inject a
+        fake clock (together with :meth:`_sleep`).
+        """
+        return int(time.time() * 1000)
+
+    async def _sleep(self, delay_ms: float) -> None:
+        """Port of upstream ``sleep``; overridable so tests can fake time."""
+        if delay_ms <= 0:
+            return
+        await asyncio.sleep(delay_ms / 1000)
+
+    async def _polling_abortable(self, awaitable: Awaitable[_T]) -> _T:
+        """Await *awaitable* as a point where ``stop_polling`` may cancel the loop.
+
+        The Python stand-in for upstream's per-iteration ``AbortController``,
+        whose signal reaches only ``getUpdates`` and the loop's sleeps.
+        """
+        self._polling_interruptible = True
+        try:
+            return await awaitable
+        finally:
+            self._polling_interruptible = False
+
+    def _polling_group(self, update: TelegramUpdate) -> str | None:
+        """Key shared by the polled parts of one album, or ``None``.
+
+        Port of upstream ``pollingGroup``: parts are grouped by chat, forum
+        topic and ``media_group_id``. With an allowlist, a part from a user
+        outside it is not grouped (it is then dropped by :meth:`process_update`
+        without ever being buffered in the checkpoint).
+        """
+        message = self._message_update(update)
+        if self._allowed_user_ids is not None:
+            sender = cast(
+                "TelegramUser | None",
+                None if message is None else (message.get("from_user") or message.get("from")),  # type: ignore[call-overload]
+            )
+            if sender is None or _js_number_str(sender.get("id")) not in self._allowed_user_ids:
+                return None
+        if message is None or not message.get("media_group_id"):
+            return None
+        return json.dumps([message["chat"]["id"], message.get("message_thread_id"), message.get("media_group_id")])
+
+    def _polling_group_key(self, update: TelegramUpdate) -> str:
+        group = self._polling_group(update)
+        return group if group is not None else str(update.get("update_id"))
+
+    @staticmethod
+    async def _await_update_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+        """Wait for every handler task of one update, then raise the first failure.
+
+        ``Promise.allSettled`` + rethrow. ``asyncio.wait`` never cancels the
+        handler tasks, even if the polling loop itself is cancelled.
+        """
+        if not tasks:
+            return
+        await asyncio.wait(tasks)
+        for task in tasks:
+            if task.cancelled():
+                # Python-only: ``Chat.shutdown`` cancels in-flight handler
+                # tasks. Count that as a failure so the update stays in the
+                # checkpoint instead of being acknowledged unhandled.
+                raise RuntimeError("Telegram update handler was cancelled")
+            error = task.exception()
+            if error is not None:
+                raise error
+
+    async def _process_polling_updates(
+        self,
+        updates: list[TelegramUpdate],
+        completed: set[int],
+    ) -> list[tuple[TelegramUpdate, Exception | None]]:
+        """Dispatch polled updates and wait for their handlers.
+
+        Port of upstream ``processPollingUpdates``. The parts of one album
+        succeed or fail together; updates already in *completed* are not
+        dispatched again. Returns ``(update, error)`` pairs in ``update_id``
+        order, where ``error`` is ``None`` for a handled update.
+        """
+        groups: dict[str, list[TelegramUpdate]] = {}
+        for update in updates:
+            groups.setdefault(self._polling_group_key(update), []).append(update)
+
+        async def run_update(update: TelegramUpdate) -> None:
+            if update["update_id"] in completed:
+                return
+            # The checkpoint, not core dedupe, deduplicates polled updates: a
+            # retried update must not be dropped as a duplicate (#942).
+            # Upstream parity: with the "queue" / "debounce" strategies a
+            # message's task settles once it is enqueued, and a queued
+            # handler's failure surfaces on the task that drains the queue, so
+            # the retry is attributed to that update (same in ``chat.ts``).
+            # Also upstream parity: a handler dispatched here is admitted work
+            # that ``stop_polling`` waits for, even when it starts after
+            # ``Chat.shutdown``'s (Python-only) cancellation sweep.
+            await self._await_update_tasks(self.process_update(update, WebhookOptions(deduplicate=False)))
+
+        async def run_group(group: list[TelegramUpdate]) -> list[tuple[TelegramUpdate, Exception | None]]:
+            try:
+                results = await asyncio.gather(*(run_update(update) for update in group), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                for update in group:
+                    completed.add(update["update_id"])
+                return [(update, None) for update in group]
+            except Exception as error:
+                return [(update, error) for update in group]
+
+        grouped = await asyncio.gather(*(run_group(group) for group in groups.values()))
+        return sorted(
+            (result for results in grouped for result in results),
+            key=lambda result: result[0]["update_id"],
+        )
+
+    async def _fetch_polling_updates(self, params: dict[str, Any], collect_ms: int | None) -> list[TelegramUpdate]:
+        """Call ``getUpdates``, giving up with no updates after *collect_ms*.
+
+        Upstream aborts the long poll with a timer (``collecting``) once a
+        pending album has settled or a retry falls due. Abandoned updates are
+        not acknowledged, so Telegram returns them again on the next poll.
+        """
+        if collect_ms is None or collect_ms <= 0:
+            return await self.telegram_fetch("getUpdates", params)
+        fetch = asyncio.ensure_future(self.telegram_fetch("getUpdates", params))
+        timer = asyncio.ensure_future(self._sleep(collect_ms))
+        try:
+            await asyncio.wait({fetch, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            timer.cancel()
+            if not fetch.done():
+                fetch.cancel()
+        # A cancelled fetch only finishes cancelling once it runs again.
+        await asyncio.wait({fetch})
+        if fetch.cancelled():
+            return []
+        return fetch.result()
+
     async def polling_loop(self, config: ResolvedTelegramLongPollingConfig) -> None:
-        """Core polling loop that calls ``getUpdates`` in a loop."""
-        offset: int | None = None
+        """Long-poll ``getUpdates``, acknowledging only settled updates.
+
+        Port of upstream ``pollingLoop`` (vercel/chat#942). Each batch's
+        handler tasks are awaited before ``offset`` moves past it. A failed
+        update (or every part of a failed album) is saved in the
+        ``telegram:polling:{scope}`` checkpoint with exponential backoff and
+        retried; album parts wait there for the settle window and are then
+        dispatched together. ``stop_polling`` cancels the loop only while it
+        waits in ``getUpdates`` or a sleep (see :meth:`_polling_abortable`).
+        """
+        if not self._chat:
+            return
+        state = self._chat.get_state()
+        checkpoint: dict[str, Any] | None = None
         consecutive_failures = 0
-        max_backoff_ms = 30_000
+        drained = False
+        completed: set[int] = set()
+
+        def retry(entries: list[dict[str, Any]], error: Exception) -> dict[str, Any]:
+            attempts = max((entry.get("attempts") if entry.get("attempts") is not None else 0) for entry in entries) + 1
+            retry_after = error.retry_after if isinstance(error, AdapterRateLimitError) else None
+            delay = max(
+                min(
+                    max(config.retry_delay_ms, TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS) * 2 ** min(attempts - 1, 30),
+                    TELEGRAM_POLLING_MAX_BACKOFF_MS,
+                ),
+                retry_after * 1000 if retry_after is not None else 0,
+            )
+            retry_at = self._now_ms() + int(delay)
+            self._logger.warn(
+                "Telegram polling update processing failed",
+                {
+                    "error": str(error),
+                    "updateId": entries[0]["update"].get("update_id"),
+                    "attempts": attempts,
+                    "retryAt": retry_at,
+                },
+            )
+            return {"attempts": attempts, "retryAt": retry_at}
+
+        def deadline(entries: list[dict[str, Any]]) -> int:
+            return max(
+                max(
+                    entry["receivedAt"]
+                    + (TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS if self._polling_group(entry["update"]) else 0),
+                    entry["retryAt"] if entry.get("retryAt") is not None else 0,
+                )
+                for entry in entries
+            )
 
         while self._polling_active:
             try:
-                params: dict[str, Any] = {"limit": config.limit, "timeout": config.timeout}
+                # Retried every iteration, so a failed startup ``getMe``
+                # recovers once Telegram is reachable.
+                await self._ensure_bot_identity()
+                key = f"{self._name}:polling:{self._webhook_scope}"
+                if checkpoint is None:
+                    stored: dict[str, Any] | None = await state.get(key)
+                    checkpoint = stored if stored is not None else {"pending": []}
+                offset: int | None = checkpoint.get("offset")
+                acknowledged = offset if offset is not None else 0
+
+                groups: dict[str, list[dict[str, Any]]] = {}
+                for entry in checkpoint["pending"]:
+                    groups.setdefault(self._polling_group_key(entry["update"]), []).append(entry)
+                eligible = [
+                    entries
+                    for entries in groups.values()
+                    if all(entry["update"]["update_id"] < acknowledged for entry in entries)
+                ]
+                ready = [entries for entries in eligible if deadline(entries) <= self._now_ms()]
+                if not self._polling_active:
+                    # Python-specific divergence: stopped during the identity
+                    # or checkpoint await, so dispatch nothing new. Upstream
+                    # has no check here and still runs the ready retry batch;
+                    # here it could start handlers after ``Chat.shutdown``'s
+                    # cancellation sweep (``disconnect`` has already cancelled
+                    # settling albums). The batch stays in the checkpoint.
+                    return
+                if ready and not drained:
+                    results = await self._process_polling_updates(
+                        [entry["update"] for entries in ready for entry in entries],
+                        completed,
+                    )
+                    failures = {update["update_id"]: error for update, error in results if error is not None}
+                    retries: dict[int, dict[str, Any]] = {}
+                    for entries in ready:
+                        failed = next((entry for entry in entries if entry["update"]["update_id"] in failures), None)
+                        if failed is None:
+                            continue
+                        scheduled = retry(entries, failures[failed["update"]["update_id"]])
+                        for entry in entries:
+                            retries[entry["update"]["update_id"]] = scheduled
+                    pending = [
+                        {**entry, **retries.get(entry["update"]["update_id"], {})}
+                        for entry in checkpoint["pending"]
+                        if entry["update"]["update_id"] not in completed
+                    ]
+                    next_checkpoint: dict[str, Any] = {**checkpoint, "pending": pending}
+                    if pending:
+                        await state.set(key, next_checkpoint)
+                    else:
+                        await state.delete(key)
+                    checkpoint = next_checkpoint
+                    for update, _error in results:
+                        completed.discard(update["update_id"])
+                    consecutive_failures = 0
+                    # Poll once before the next ready batch, so new updates
+                    # are not starved by a run of retries.
+                    drained = True
+                    continue
+
+                remaining = (
+                    max(0, min(deadline(entries) for entries in eligible) - self._now_ms()) if eligible else None
+                )
+                if not self._polling_active:
+                    # Stopped while the loop could not be cancelled; upstream's
+                    # already-aborted signal fails this fetch at once.
+                    return
+                params: dict[str, Any] = {
+                    "limit": config.limit,
+                    # Ask for an immediate answer when a batch is already due.
+                    "timeout": 0 if remaining == 0 else config.timeout,
+                }
                 if offset is not None:
                     params["offset"] = offset
                 if config.allowed_updates is not None:
                     params["allowed_updates"] = config.allowed_updates
-                updates: list[TelegramUpdate] = await self.telegram_fetch(
-                    "getUpdates",
-                    params,
+                updates: list[TelegramUpdate] = await self._polling_abortable(
+                    self._fetch_polling_updates(params, remaining)
                 )
+                drained = False
+                if not self._polling_active:
+                    return
 
-                consecutive_failures = 0
-
+                results = await self._process_polling_updates(
+                    [update for update in updates if self._polling_group(update) is None],
+                    completed,
+                )
+                pending_by_id: dict[int, dict[str, Any]] = {
+                    entry["update"]["update_id"]: entry for entry in checkpoint["pending"]
+                }
+                for update, error in results:
+                    if error is not None:
+                        failed_entry: dict[str, Any] = {"update": update, "receivedAt": self._now_ms()}
+                        pending_by_id[update["update_id"]] = {**failed_entry, **retry([failed_entry], error)}
                 for update in updates:
-                    offset = update.get("update_id", 0) + 1
-                    try:
-                        self.process_update(update)
-                    except Exception as error:
-                        self._logger.warn(
-                            "Failed to process Telegram polled update",
-                            {
-                                "error": str(error),
-                                "updateId": update.get("update_id"),
-                            },
-                        )
-            except asyncio.CancelledError:
-                return
+                    update_id = update["update_id"]
+                    if (
+                        self._polling_group(update) is not None
+                        and update_id not in completed
+                        and update_id not in pending_by_id
+                    ):
+                        pending_by_id[update_id] = {"update": update, "receivedAt": self._now_ms()}
+                next_offset = offset
+                for update in updates:
+                    next_offset = update["update_id"] + 1
+                next_checkpoint: dict[str, Any] = {"offset": next_offset, "pending": list(pending_by_id.values())}
+                # Saved before the next ``getUpdates`` acknowledges these
+                # updates; a failed write keeps the old offset in memory too.
+                if next_checkpoint["pending"] or checkpoint["pending"]:
+                    await state.set(key, next_checkpoint)
+                checkpoint = next_checkpoint
+                acknowledged = next_offset if next_offset is not None else 0
+                completed.difference_update([update_id for update_id in completed if update_id < acknowledged])
+                if not updates and remaining is not None and self._polling_active:
+                    await self._polling_abortable(self._sleep(min(remaining, TELEGRAM_INCOMING_MEDIA_GROUP_RETRY_MS)))
+                consecutive_failures = 0
             except Exception as error:
                 consecutive_failures += 1
                 backoff_ms = min(
                     config.retry_delay_ms * 2 ** (consecutive_failures - 1),
-                    max_backoff_ms,
+                    TELEGRAM_POLLING_MAX_BACKOFF_MS,
                 )
 
                 self._logger.warn(
@@ -1333,7 +1612,7 @@ class TelegramAdapter:
                 if not self._polling_active:
                     return
 
-                await asyncio.sleep(backoff_ms / 1000.0)
+                await self._polling_abortable(self._sleep(backoff_ms))
 
     # -- Runtime mode resolution ---------------------------------------------
 
@@ -1393,15 +1672,13 @@ class TelegramAdapter:
 
     # -- Update dispatching --------------------------------------------------
 
-    def process_update(
-        self,
-        update: TelegramUpdate,
-        options: WebhookOptions | None = None,
-    ) -> None:
-        """Dispatch a Telegram update to the appropriate handler."""
-        # ``message ?? edited_message ?? channel_post ?? edited_channel_post``:
-        # the first present (non-None) payload, as upstream's nullish chain.
-        message_update: TelegramMessage | None = next(
+    @staticmethod
+    def _message_update(update: TelegramUpdate) -> TelegramMessage | None:
+        """``message ?? edited_message ?? channel_post ?? edited_channel_post``.
+
+        The first present (non-None) payload, as upstream's nullish chain.
+        """
+        return next(
             (
                 candidate
                 for candidate in (
@@ -1415,30 +1692,59 @@ class TelegramAdapter:
             None,
         )
 
+    def process_update(
+        self,
+        update: TelegramUpdate,
+        options: WebhookOptions | None = None,
+    ) -> list[asyncio.Task[Any]]:
+        """Dispatch a Telegram update to the appropriate handler.
+
+        Returns every dispatched handler task (message, album, slash command,
+        action, reactions) so the polling loop can wait for them before
+        acknowledging the update (vercel/chat#942). The webhook path ignores
+        the list.
+        """
+        tasks: list[asyncio.Task[Any]] = []
+        message_update = self._message_update(update)
+
         # User allowlist (vercel/chat#742), checked before any routing. With an
         # allowlist set, an update with no acting user (e.g. an anonymous
         # channel post) is dropped too.
         if self._allowed_user_ids is not None:
             user_id = self._update_user_id(update, message_update)
             if user_id is None or _js_number_str(user_id) not in self._allowed_user_ids:
-                return
+                return tasks
 
         # Slash commands are gated to fresh ``message`` updates only — edited
         # messages and channel posts never route to the slash-command
-        # handlers. ``handle_slash_command_update`` returns ``True`` when it
-        # consumed the update, in which case the regular message path is
-        # skipped (mirrors upstream ``messageUpdate && !handledSlashCommand``).
+        # handlers, and neither do album parts (vercel/chat#760), whose
+        # caption is the album's text. ``handle_slash_command_update`` returns
+        # a truthy value when it consumed the update, in which case the
+        # regular message path is skipped (upstream
+        # ``messageUpdate && !handledSlashCommand``).
         message = update.get("message")
-        handled_slash_command = message is not None and self.handle_slash_command_update(message, options)
+        handled_slash_command: asyncio.Task[Any] | bool = (
+            message is not None
+            and not message.get("media_group_id")
+            and self.handle_slash_command_update(message, options)
+        )
+        if not isinstance(handled_slash_command, bool):
+            tasks.append(handled_slash_command)
 
         if message_update is not None and not handled_slash_command:
-            self.handle_incoming_message_update(message_update, options)
+            message_task = self.handle_incoming_message_update(message_update, options)
+            if message_task is not None:
+                tasks.append(message_task)
 
         if update.get("callback_query"):
-            self.handle_callback_query(update["callback_query"], options)
+            action_task = self.handle_callback_query(update["callback_query"], options)
+            if action_task is not None:
+                tasks.append(action_task)
 
         if update.get("message_reaction"):
-            self.handle_message_reaction_update(update["message_reaction"], options)
+            tasks.extend(self.handle_message_reaction_update(update["message_reaction"], options))
+
+        return tasks
 
     @staticmethod
     def _update_user_id(update: TelegramUpdate, message_update: TelegramMessage | None) -> Any:
@@ -1466,10 +1772,14 @@ class TelegramAdapter:
         self,
         telegram_message: TelegramMessage,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Handle a new or edited message update."""
+    ) -> asyncio.Task[Any] | None:
+        """Handle a new or edited message update.
+
+        Returns the handler task, or for an album part the task that buffers
+        it and, once the album has settled, dispatches the combined message.
+        """
         if not self._chat:
-            return
+            return None
 
         thread_id = self.encode_thread_id(
             TelegramThreadId(
@@ -1478,23 +1788,181 @@ class TelegramAdapter:
             )
         )
 
+        if telegram_message.get("media_group_id"):
+            return self._start_incoming_media_group(telegram_message, thread_id, options)
+
         self._start_typing_for_private_message(telegram_message, thread_id, options)
 
         parsed_message = self.parse_telegram_message(telegram_message, thread_id)
         self.cache_message(parsed_message)
 
-        self._chat.process_message(self, thread_id, parsed_message, options)
+        return self._chat.process_message(self, thread_id, parsed_message, options)
+
+    def _start_incoming_media_group(
+        self,
+        telegram_message: TelegramMessage,
+        thread_id: str,
+        options: WebhookOptions | None,
+    ) -> asyncio.Task[None] | None:
+        """Run :meth:`_process_incoming_media_group` as a task.
+
+        A failure is logged; ``wait_until`` gets a wrapper that settles
+        without raising (upstream's ``task.catch(log)``), while the returned
+        task still raises so the polling loop can retry the album.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        media_group_id = telegram_message.get("media_group_id")
+        task = loop.create_task(self._process_incoming_media_group(telegram_message, thread_id, options))
+        self._media_group_tasks.add(task)
+
+        def _done(done: asyncio.Task[None]) -> None:
+            self._media_group_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                self._logger.warn(
+                    "Failed to process incoming Telegram media group",
+                    {"error": str(error), "mediaGroupId": media_group_id, "threadId": thread_id},
+                )
+
+        task.add_done_callback(_done)
+
+        if options is not None and options.wait_until is not None:
+
+            async def _settled() -> None:
+                # Errors are logged by ``_done``; cancelling this wrapper does
+                # not cancel the album task. Like ``Chat._tracked``, an album
+                # cancelled by ``disconnect()`` counts as settled; only a
+                # cancellation of this wrapper itself propagates.
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:  # noqa: S110 — logged by ``_done``
+                    pass
+
+            options.wait_until(loop.create_task(_settled()))
+        return task
+
+    async def _process_incoming_media_group(
+        self,
+        telegram_message: TelegramMessage,
+        thread_id: str,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Buffer one album part and dispatch the album once it has settled.
+
+        Port of upstream ``processIncomingMediaGroup`` (vercel/chat#760).
+        Parts are appended under a state lock to
+        ``telegram:incoming-media-group:{thread}:{media_group_id}`` (shared
+        across instances). Each part's task waits until no part has arrived
+        for the settle window; the first to see it settled removes the buffer
+        and dispatches one message carrying the newest part's id and raw, the
+        first non-empty text, every attachment in ``message_id`` order and
+        ``is_mention`` if any part mentions the bot. The others return.
+        """
+        media_group_id = telegram_message.get("media_group_id")
+        if not (self._chat and media_group_id):
+            return
+
+        state = self._chat.get_state()
+        # Upstream parity: the buffer key is not scoped to the bot identity
+        # (upstream ``processIncomingMediaGroup`` uses the same key), so bots
+        # sharing one state namespace must not share a group chat.
+        media_group_key = f"{self._name}:incoming-media-group:{thread_id}:{media_group_id}"
+        lock_key = f"{media_group_key}:lock"
+        appended = False
+
+        while True:
+            lock = await state.acquire_lock(lock_key, TELEGRAM_INCOMING_MEDIA_GROUP_LOCK_TTL_MS)
+            if not lock:
+                await self._sleep(TELEGRAM_INCOMING_MEDIA_GROUP_RETRY_MS)
+                continue
+
+            entries: list[dict[str, Any]] = []
+            remaining_settle_ms = 0
+            try:
+                stored = await state.get(media_group_key)
+                entries = list(stored) if stored is not None else []
+                if not appended:
+                    entries = [
+                        entry for entry in entries if entry["message"]["message_id"] != telegram_message["message_id"]
+                    ]
+                    entries.append({"message": telegram_message, "receivedAt": self._now_ms()})
+                    await state.set(
+                        media_group_key,
+                        entries[-TELEGRAM_MEDIA_GROUP_MAX:],
+                        TELEGRAM_INCOMING_MEDIA_GROUP_BUFFER_TTL_MS,
+                    )
+                    appended = True
+                    remaining_settle_ms = TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS
+                elif not entries:
+                    # Already dispatched by another part, or (upstream parity)
+                    # the buffer expired after a stall longer than its TTL.
+                    return
+                else:
+                    newest_received_at = max(entry["receivedAt"] for entry in entries)
+                    remaining_settle_ms = max(
+                        0,
+                        TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS - (self._now_ms() - newest_received_at),
+                    )
+                    if remaining_settle_ms == 0:
+                        await state.delete(media_group_key)
+            finally:
+                await state.release_lock(lock)
+
+            if remaining_settle_ms > 0:
+                await self._sleep(remaining_settle_ms)
+                continue
+
+            ordered_messages = sorted(
+                (cast("TelegramMessage", entry["message"]) for entry in entries),
+                key=lambda message: message["message_id"],
+            )
+            parsed_messages = [self.parse_telegram_message(message, thread_id) for message in ordered_messages]
+            if not parsed_messages:
+                return
+            latest_message = parsed_messages[-1]
+            content_message = next((message for message in parsed_messages if message.text), latest_message)
+            links = [link for message in parsed_messages for link in (message.links or [])]
+            combined_message = Message(
+                id=latest_message.id,
+                thread_id=thread_id,
+                text=content_message.text,
+                formatted=content_message.formatted,
+                raw=latest_message.raw,
+                author=latest_message.author,
+                metadata=latest_message.metadata,
+                attachments=[attachment for message in parsed_messages for attachment in message.attachments],
+                # Telegram parsing populates ``reply_to`` from #228.
+                reply_to=next((message.reply_to for message in parsed_messages if message.reply_to is not None), None),
+                is_mention=any(message.is_mention for message in parsed_messages),
+                links=links or None,
+            )
+
+            self._start_typing_for_private_message(ordered_messages[0], thread_id)
+            self.cache_message(combined_message)
+            task = self._chat.process_message(self, thread_id, combined_message, options)
+            if task is not None:
+                await task
+            return
 
     def handle_slash_command_update(
         self,
         telegram_message: TelegramMessage,
         options: WebhookOptions | None = None,
-    ) -> bool:
+    ) -> asyncio.Task[Any] | bool:
         """Route a leading ``/command`` message to the slash-command handlers.
 
-        Returns ``True`` when the update was consumed as a slash command (so
-        :meth:`process_update` skips the regular message path), and ``False``
-        otherwise. Like the Discord adapter, the event is built with
+        Returns the handler task (``True`` without a running loop) when the
+        update was consumed as a slash command, so :meth:`process_update`
+        skips the regular message path, and ``False`` otherwise. Like the Discord adapter, the event is built with
         ``channel=None`` and the resolved thread ID is attached as
         ``channel_id`` — ``Chat`` re-wraps it into a real ``Channel`` before
         invoking handlers.
@@ -1527,9 +1995,9 @@ class TelegramAdapter:
             raw=telegram_message,
         )
         event.channel_id = thread_id  # type: ignore[attr-defined]
-        self._chat.process_slash_command(event, options)
+        task = self._chat.process_slash_command(event, options)
 
-        return True
+        return task if task is not None else True
 
     def _start_typing_for_private_message(
         self,
@@ -1629,10 +2097,13 @@ class TelegramAdapter:
         self,
         callback_query: TelegramCallbackQuery,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Handle a callback query (inline keyboard button press)."""
+    ) -> asyncio.Task[Any] | None:
+        """Handle a callback query (inline keyboard button press).
+
+        Returns the action handler task; the acknowledgement is not part of it.
+        """
         if not (self._chat and callback_query.get("message")):
-            return
+            return None
 
         message = callback_query["message"]
         thread_id = self.encode_thread_id(
@@ -1668,7 +2139,7 @@ class TelegramAdapter:
             )
         )
 
-        self._chat.process_action(
+        action_task = self._chat.process_action(
             ActionEvent(
                 adapter=self,
                 thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
@@ -1702,15 +2173,17 @@ class TelegramAdapter:
             task = None
         if task and callable(wait_until):
             wait_until(task)
+        return action_task
 
     def handle_message_reaction_update(
         self,
         reaction_update: TelegramMessageReactionUpdated,
         options: WebhookOptions | None = None,
-    ) -> None:
-        """Handle a message reaction update."""
+    ) -> list[asyncio.Task[Any]]:
+        """Handle a message reaction update; returns the reaction handler tasks."""
+        tasks: list[asyncio.Task[Any]] = []
         if not self._chat:
-            return
+            return tasks
 
         thread_id = self.encode_thread_id(
             TelegramThreadId(
@@ -1733,7 +2206,7 @@ class TelegramAdapter:
         for reaction in reaction_update.get("new_reaction", []):
             key = self.reaction_key(reaction)
             if key not in old_reactions:
-                self._chat.process_reaction(
+                added_task = self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
                         thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
@@ -1747,11 +2220,13 @@ class TelegramAdapter:
                     ),
                     options,
                 )
+                if added_task is not None:
+                    tasks.append(added_task)
 
         for reaction in reaction_update.get("old_reaction", []):
             key = self.reaction_key(reaction)
             if key not in new_reactions:
-                self._chat.process_reaction(
+                removed_task = self._chat.process_reaction(
                     ReactionEvent(
                         adapter=self,
                         thread=None,  # pyrefly: ignore[bad-argument-type]  # filled in by Chat
@@ -1765,6 +2240,9 @@ class TelegramAdapter:
                     ),
                     options,
                 )
+                if removed_task is not None:
+                    tasks.append(removed_task)
+        return tasks
 
     # -- Posting / editing / deleting ----------------------------------------
 
@@ -2126,16 +2604,225 @@ class TelegramAdapter:
         text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
     ) -> RawMessage | None:
-        """Stream a message to a Telegram private chat via draft updates.
+        """Stream a message to a Telegram chat.
 
-        Port of upstream ``TelegramAdapter.stream`` (vercel/chat#479, on top
-        of the #340 draft-streaming foundation). Private chats (DMs) get
-        native draft streaming: the draft bubble updates in place as chunks
-        arrive, throttled to ``options.update_interval_ms`` (default
+        Port of upstream ``TelegramAdapter.stream`` (chat@4.41.1). Every chat
+        streams through :meth:`_post_and_edit_stream` (a posted message
+        edited as chunks arrive, paced to Telegram's edit limits) unless
+        ``native_streaming`` is on and the thread is a private chat, which
+        uses :meth:`_native_draft_stream` (vercel/chat#822). Always returns a
+        message; it never hands the stream back to the core fallback.
+        """
+        if self._native_streaming and self.is_dm(thread_id):
+            return await self._native_draft_stream(thread_id, text_stream, options)
+
+        return await self._post_and_edit_stream(thread_id, text_stream, options)
+
+    def _monotonic_ms(self) -> float:
+        """Monotonic milliseconds for streaming pacing.
+
+        Separate from :meth:`_now_ms` (epoch time, persisted in state) because
+        edit pacing is only compared within one stream. Overridable so tests
+        can inject a fake clock (together with :meth:`_sleep`).
+        """
+        return time.monotonic() * 1000.0
+
+    @staticmethod
+    def _stream_chunk_text(chunk: StreamInput) -> str | None:
+        """Text of a streamed chunk, or ``None`` for chunks without any.
+
+        Plain strings and ``markdown_text`` chunks carry text; task / plan
+        progress chunks have no Telegram representation.
+        """
+        if isinstance(chunk, str):
+            return chunk
+        if isinstance(chunk, dict):
+            return chunk.get("text", "") if chunk.get("type") == "markdown_text" else None
+        if getattr(chunk, "type", None) == "markdown_text":
+            # Runtime-narrowed to a MarkdownTextChunk via the `type` tag; only
+            # that variant has `.text`. Pyrefly doesn't do tag-based union
+            # narrowing, so read via `getattr`.
+            return getattr(chunk, "text", "")
+        return None
+
+    async def _post_and_edit_stream(
+        self,
+        thread_id: str,
+        text_stream: AsyncIterable[StreamInput],
+        options: StreamOptions | None,
+    ) -> RawMessage:
+        """Post a placeholder message and edit it as chunks arrive.
+
+        Port of upstream ``postAndEditStream`` (vercel/chat#822, #826). The
+        adapter owns this loop rather than deferring to the core fallback so
+        edits can be throttled to Telegram's per-chat rate limit, which the
+        core interval (500 ms by default) sits under.
+
+        * Edits are at least ``max(options.update_interval_ms,
+          streaming_edit_interval_ms or the chat-type floor)`` apart: 1100 ms
+          for private chats, 3100 ms otherwise.
+        * The placeholder is ``options.fallback_streaming_placeholder_text``
+          when the bot or thread set one (``None`` posts nothing until the
+          first text arrives) and ``"..."`` when it is ``UNSET``.
+        * An intermediate edit failure is logged and skipped; a 429 also
+          holds further edits until its ``retry_after`` has passed.
+        * The final edit waits for both the pacing interval and any rate
+          limit, retries once after a 429, and raises when the wait would
+          exceed :data:`TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS` or the retry
+          fails, so a caller never mistakes a truncated message for the
+          complete one.
+
+        Every wait is awaited inline (no background task), so cancelling the
+        caller cancels the stream.
+        """
+        default_interval_ms = (
+            TELEGRAM_DEFAULT_PRIVATE_STREAMING_EDIT_INTERVAL_MS
+            if self.is_dm(thread_id)
+            else TELEGRAM_DEFAULT_NON_PRIVATE_STREAMING_EDIT_INTERVAL_MS
+        )
+        interval_ms = max(
+            self.clamp_integer(
+                options.update_interval_ms if options is not None else None,
+                0,
+                0,
+                2**53 - 1,
+            ),
+            self._streaming_edit_interval_ms if self._streaming_edit_interval_ms is not None else default_interval_ms,
+        )
+        configured_placeholder = options.fallback_streaming_placeholder_text if options is not None else UNSET
+        placeholder_text: str | None = (
+            TELEGRAM_STREAM_PLACEHOLDER_TEXT if configured_placeholder is UNSET else configured_placeholder
+        )
+
+        renderer = StreamingMarkdownRenderer()
+        accumulated = ""
+        posted: RawMessage | None = None
+        edit_thread_id = thread_id
+        last_edit_content = ""
+        last_edit_at = 0.0
+        blocked_until = 0.0
+        rate_limit_error: AdapterRateLimitError | None = None
+
+        if placeholder_text is not None:
+            posted = await self.post_message(thread_id, placeholder_text)
+            edit_thread_id = posted.thread_id or thread_id
+            last_edit_content = placeholder_text
+            last_edit_at = self._monotonic_ms()
+
+        # Upstream parity (chat@4.41.1 index.ts:2019-2049): the placeholder
+        # is a plain post and edits go through ``edit_message`` with its own
+        # rich -> MarkdownV2 fallback (no separate rich-support probe), and
+        # the pacing timestamp advances only on a successful edit.
+        async def apply_edit(content: str) -> None:
+            nonlocal posted, edit_thread_id, last_edit_content, last_edit_at, blocked_until, rate_limit_error
+            if posted is None:
+                return
+            posted = await self.edit_message(edit_thread_id, posted.id, PostableMarkdown(markdown=content))
+            edit_thread_id = posted.thread_id or edit_thread_id
+            last_edit_content = content
+            last_edit_at = self._monotonic_ms()
+            blocked_until = 0.0
+            rate_limit_error = None
+
+        def remember_rate_limit(error: AdapterRateLimitError) -> None:
+            nonlocal blocked_until, rate_limit_error
+            retry_after_ms = max(0.0, _retry_after_seconds(error)) * 1000
+            blocked_until = max(blocked_until, self._monotonic_ms() + retry_after_ms)
+            rate_limit_error = error
+
+        def should_edit(content: str) -> bool:
+            return posted is not None and bool(content.strip(JS_WHITESPACE)) and content != last_edit_content
+
+        async def flush_edit(content: str) -> None:
+            if not should_edit(content):
+                return
+            try:
+                await apply_edit(content)
+            except Exception as error:
+                if isinstance(error, AdapterRateLimitError):
+                    remember_rate_limit(error)
+                self._logger.warn(
+                    "Telegram stream edit failed",
+                    {"error": str(error), "thread_id": thread_id},
+                )
+
+        async def flush_final_edit(content: str) -> None:
+            if not should_edit(content):
+                return
+
+            now = self._monotonic_ms()
+            blocked_ms = max(0.0, blocked_until - now)
+            pacing_ms = max(0.0, interval_ms - (now - last_edit_at))
+            if blocked_ms > TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS and rate_limit_error is not None:
+                raise rate_limit_error
+            await self._sleep(max(blocked_ms, pacing_ms))
+
+            # Upstream parity (chat@4.41.1 index.ts:2069-2102): only a 429 is
+            # retried; any other error, including Telegram's "message is not
+            # modified" 400 for a payload it considers unchanged, propagates.
+            try:
+                await apply_edit(content)
+                return
+            except AdapterRateLimitError as error:
+                remember_rate_limit(error)
+                retry_after_ms = _retry_after_seconds(error) * 1000
+                if retry_after_ms > TELEGRAM_STREAM_FINAL_EDIT_RETRY_CAP_MS:
+                    raise
+                await self._sleep(retry_after_ms)
+
+            await apply_edit(content)
+
+        # Upstream parity (chat@4.41.1 index.ts:2104-2138): an error raised
+        # by ``text_stream`` propagates without a final edit, as upstream's
+        # ``for await`` does; the core fallback's partial flush is not used.
+        async for chunk in text_stream:
+            text = self._stream_chunk_text(chunk)
+            if text is None:
+                continue
+
+            accumulated += text
+            renderer.push(text)
+
+            if posted is not None:
+                now = self._monotonic_ms()
+                if now >= blocked_until and now - last_edit_at >= interval_ms:
+                    await flush_edit(renderer.render())
+                continue
+
+            initial = renderer.render()
+            if initial.strip(JS_WHITESPACE):
+                posted = await self.post_message(thread_id, PostableMarkdown(markdown=initial))
+                edit_thread_id = posted.thread_id or thread_id
+                last_edit_content = initial
+                last_edit_at = self._monotonic_ms()
+
+        final_content = renderer.finish()
+
+        if posted is not None:
+            await flush_final_edit(final_content)
+            return posted
+
+        # Nothing was posted: the caller suppressed the placeholder and the
+        # stream produced no renderable text.
+        if not accumulated.strip(JS_WHITESPACE):
+            raise ValidationError("telegram", "Telegram streaming requires text content")
+
+        return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
+
+    async def _native_draft_stream(
+        self,
+        thread_id: str,
+        text_stream: AsyncIterable[StreamInput],
+        options: StreamOptions | None,
+    ) -> RawMessage:
+        """Stream to a private chat via native draft updates.
+
+        Port of upstream ``nativeDraftStream`` (vercel/chat#479 on top of the
+        #340 draft-streaming foundation; opt-in since #822). The draft bubble
+        updates in place as chunks arrive, throttled to
+        ``options.update_interval_ms`` (default
         :data:`TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS`), and a final send
-        persists the message when the stream ends. Returns ``None`` for
-        non-DM threads — before consuming any chunks — so the SDK's built-in
-        post+edit fallback handles groups, supergroups, and channels.
+        persists the message when the stream ends.
 
         The outbound ladder is **rich → MarkdownV2 → plain**:
 
@@ -2153,9 +2840,6 @@ class TelegramAdapter:
         attempted. There is no longer an empty opening draft; the first
         bubble update carries real content.
         """
-        if not self.is_dm(thread_id):
-            return None
-
         parsed_thread = self._resolve_thread_id(thread_id)
         update_interval_ms = self.clamp_integer(
             options.update_interval_ms if options is not None else None,
@@ -2172,9 +2856,6 @@ class TelegramAdapter:
         draft_streaming_enabled = True
         stream_uses_markdown = True
         stream_uses_rich = self._rich_messages_available
-
-        def _now_ms() -> float:
-            return time.monotonic() * 1000.0
 
         def render_markdown_text(text: str) -> str:
             return self.truncate_message(
@@ -2222,7 +2903,7 @@ class TelegramAdapter:
                         },
                     )
                     last_draft_text = text
-                    last_flush_at = _now_ms()
+                    last_flush_at = self._monotonic_ms()
                     return
                 except Exception as error:
                     if not self.can_fallback_from_rich_message(error, "sendRichMessageDraft"):
@@ -2252,7 +2933,7 @@ class TelegramAdapter:
             try:
                 await self.telegram_fetch("sendMessageDraft", _draft_payload(draft_text, markdown=use_markdown))
                 last_draft_text = draft_text
-                last_flush_at = _now_ms()
+                last_flush_at = self._monotonic_ms()
             except Exception as error:
                 if use_markdown and self.is_telegram_markdown_parse_error(error):
                     # Telegram rejected the MarkdownV2 entities: downgrade
@@ -2263,7 +2944,7 @@ class TelegramAdapter:
                     try:
                         await self.telegram_fetch("sendMessageDraft", _draft_payload(plain_draft_text, markdown=False))
                         last_draft_text = plain_draft_text
-                        last_flush_at = _now_ms()
+                        last_flush_at = self._monotonic_ms()
                     except Exception as retry_error:
                         draft_streaming_enabled = False
                         self._logger.warn(
@@ -2290,17 +2971,7 @@ class TelegramAdapter:
             await send_draft(draft_text, stream_uses_markdown)
 
         async for chunk in text_stream:
-            text: str | None = None
-            if isinstance(chunk, str):
-                text = chunk
-            elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
-                text = chunk.get("text", "")
-            elif hasattr(chunk, "type") and getattr(chunk, "type", None) == "markdown_text":
-                # Runtime-narrowed to a MarkdownTextChunk via the `type`
-                # tag; only that variant has `.text`. Pyrefly doesn't do
-                # tag-based union narrowing, so read via `getattr`.
-                text = getattr(chunk, "text", "")
-
+            text = self._stream_chunk_text(chunk)
             if text is None:
                 # Task/plan progress chunks have no draft representation.
                 continue
@@ -2308,7 +2979,7 @@ class TelegramAdapter:
             accumulated += text
             renderer.push(text)
 
-            if _now_ms() - last_flush_at >= update_interval_ms:
+            if self._monotonic_ms() - last_flush_at >= update_interval_ms:
                 await flush_draft()
 
         if not accumulated.strip():

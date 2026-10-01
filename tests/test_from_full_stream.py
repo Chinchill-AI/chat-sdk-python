@@ -5,13 +5,19 @@ Port of from-full-stream.ts tests.
 
 from __future__ import annotations
 
+import enum
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from chat_sdk.from_full_stream import from_full_stream
-from chat_sdk.types import StreamChunk, ThinkingChunk
+from chat_sdk.testing import create_mock_adapter, create_mock_state
+from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
+from chat_sdk.types import PostableMarkdown, RawMessage, StreamChunk, ThinkingChunk
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -473,3 +479,184 @@ class TestThinkingOptIn:
         off = await _collect(from_full_stream(_async_iter(events)))
         on = await _collect(from_full_stream(_async_iter(events), emit_thinking=True))
         assert off == on == ["A", "\n\n", "B"]
+
+
+# ---------------------------------------------------------------------------
+# AG-UI streams (TanStack AI chat()) — vercel/chat#934
+# ---------------------------------------------------------------------------
+
+
+async def _text(events: list[Any]) -> str:
+    return "".join(str(item) for item in await _collect(from_full_stream(_async_iter(events))))
+
+
+class TestAGUIStreamsTanStackAIChat:
+    async def test_extracts_text_message_content_deltas(self):
+        events = [
+            {"type": "RUN_STARTED", "threadId": "t1", "runId": "r1"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "hello"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": " world"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "RUN_FINISHED", "threadId": "t1", "runId": "r1"},
+        ]
+        assert await _text(events) == "hello world"
+
+    async def test_injects_separator_between_text_messages_in_a_tool_loop(self):
+        events = [
+            {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Looking."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "search"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": '{"q":"x"}'},
+            {"type": "TOOL_CALL_END", "toolCallId": "c1"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "c1", "content": "data"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m2", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "Found it."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m2"},
+        ]
+        assert await _text(events) == "Looking.\n\nFound it."
+
+    async def test_does_not_add_trailing_separator_after_final_text_message_end(self):
+        events = [
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "done"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "RUN_FINISHED", "threadId": "t1", "runId": "r1"},
+        ]
+        assert await _text(events) == "done"
+
+    async def test_does_not_inject_separator_when_text_message_end_comes_before_any_text(self):
+        events = [
+            {"type": "TEXT_MESSAGE_START", "messageId": "m0", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m0"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "first"},
+        ]
+        assert await _text(events) == "first"
+
+    async def test_skips_tool_call_args_deltas_even_though_they_carry_a_delta_field(self):
+        events = [
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": '{"secret":1}'},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "visible"},
+        ]
+        assert await _text(events) == "visible"
+
+    async def test_skips_reasoning_and_run_lifecycle_events(self):
+        events = [
+            {"type": "REASONING_START", "messageId": "r1"},
+            {"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "hmm"},
+            {"type": "REASONING_END", "messageId": "r1"},
+            {"type": "STEP_STARTED", "stepName": "think"},
+            {"type": "STEP_FINISHED", "stepName": "think"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "answer"},
+            {"type": "RUN_ERROR", "message": "boom"},
+        ]
+        assert await _text(events) == "answer"
+
+    async def test_skips_state_delta_even_though_its_delta_is_an_array(self):
+        events = [
+            {"type": "STATE_DELTA", "delta": [{"op": "add", "path": "/x", "value": 1}]},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "text"},
+        ]
+        assert await _text(events) == "text"
+
+    async def test_ignores_text_message_content_with_nonstring_delta(self):
+        events = [
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": 42},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "ok"},
+        ]
+        assert await _text(events) == "ok"
+
+    async def test_handles_ai_sdk_and_agui_events_in_the_same_stream(self):
+        events = [
+            {"type": "text-delta", "textDelta": "a"},
+            {"type": "finish-step"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "b"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "text-delta", "text": "c"},
+        ]
+        assert await _text(events) == "a\n\nb\n\nc"
+
+
+class TestAGUIPythonEventModels:
+    """Python AG-UI producers (``ag-ui-protocol``, pydantic-ai) emit model
+    objects whose ``type`` is a ``str`` Enum and whose fields are snake_case."""
+
+    async def test_str_enum_typed_attribute_events(self):
+        class EventType(str, enum.Enum):  # noqa: UP042 — the ag-ui-protocol shape; StrEnum is 3.11+
+            TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
+            TEXT_MESSAGE_END = "TEXT_MESSAGE_END"
+            TOOL_CALL_ARGS = "TOOL_CALL_ARGS"
+
+        @dataclass
+        class Event:
+            type: EventType
+            message_id: str = ""
+            delta: Any = None
+
+        events = [
+            Event(EventType.TEXT_MESSAGE_CONTENT, "m1", "Looking."),
+            Event(EventType.TEXT_MESSAGE_END, "m1"),
+            Event(EventType.TOOL_CALL_ARGS, "c1", '{"q":"x"}'),
+            Event(EventType.TEXT_MESSAGE_CONTENT, "m2", "Found it."),
+        ]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["Looking.", "\n\n", "Found it."]
+
+    async def test_plain_enum_type_is_compared_by_value(self):
+        class EventType(enum.Enum):
+            TEXT_MESSAGE_CONTENT = "TEXT_MESSAGE_CONTENT"
+
+        events = [SimpleNamespace(type=EventType.TEXT_MESSAGE_CONTENT, delta="hi")]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["hi"]
+
+    async def test_unhashable_type_value_is_skipped(self):
+        events = [{"type": ["TEXT_MESSAGE_CONTENT"], "delta": "x"}, {"type": "TEXT_MESSAGE_CONTENT", "delta": "y"}]
+        assert await _collect(from_full_stream(_async_iter(events))) == ["y"]
+
+
+class TestAGUIThroughThreadPost:
+    """``thread.post()`` normalises through the same implementation."""
+
+    @staticmethod
+    def _thread(adapter: Any) -> ThreadImpl:
+        return ThreadImpl(
+            _ThreadImplConfig(
+                id="slack:C123:1.2", adapter=adapter, state_adapter=create_mock_state(), channel_id="slack:C123"
+            )
+        )
+
+    async def test_native_stream_receives_agui_text_with_separators(self):
+        adapter = create_mock_adapter("slack")
+        received: list[Any] = []
+
+        async def _stream(thread_id: str, stream: Any, options: Any) -> RawMessage:
+            async for chunk in stream:
+                received.append(chunk)
+            return RawMessage(id="sent", thread_id=thread_id, raw={})
+
+        adapter.stream = AsyncMock(side_effect=_stream)  # type: ignore[attr-defined]
+        events = [
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Looking."},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": '{"secret":1}'},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "Found it."},
+        ]
+
+        sent = await self._thread(adapter).post(_async_iter(events))
+
+        assert received == ["Looking.", "\n\n", "Found it."]
+        assert sent.text == "Looking.\n\nFound it."
+
+    async def test_fallback_stream_posts_agui_text(self):
+        adapter = create_mock_adapter("slack")
+        events = [
+            {"type": "STATE_DELTA", "delta": [{"op": "add", "path": "/x", "value": 1}]},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "a"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "text-delta", "text": "b"},
+        ]
+
+        await self._thread(adapter).post(_async_iter(events))
+
+        assert adapter._post_calls == [("slack:C123:1.2", "...")]
+        assert adapter._edit_calls[-1] == ("slack:C123:1.2", "msg-1", PostableMarkdown(markdown="a\n\nb"))

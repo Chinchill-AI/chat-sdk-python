@@ -928,7 +928,9 @@ class TestChannelPostEphemeral:
         channel = _make_channel(adapter, state)
         result = await channel.post_ephemeral("U456", "Secret!", PostEphemeralOptions(fallback_to_dm=True))
 
-        mock_post_ephemeral.assert_called_once_with("slack:C123", "U456", "Secret!")
+        mock_post_ephemeral.assert_called_once_with(
+            "slack:C123", "U456", "Secret!", options=PostEphemeralOptions(fallback_to_dm=True)
+        )
         assert result is not None
         assert result.id == "eph-1"
         assert result.thread_id == "slack:C123"
@@ -965,7 +967,9 @@ class TestChannelPostEphemeral:
         await channel.post_ephemeral(author, "Hello!", PostEphemeralOptions(fallback_to_dm=False))
 
         assert mock_post_ephemeral.call_count == 1
-        mock_post_ephemeral.assert_called_once_with("slack:C123", "U789", "Hello!")
+        mock_post_ephemeral.assert_called_once_with(
+            "slack:C123", "U789", "Hello!", options=PostEphemeralOptions(fallback_to_dm=False)
+        )
 
     # it("should return null when adapter has no postEphemeral and fallbackToDM is false")
     @pytest.mark.asyncio
@@ -1014,6 +1018,26 @@ class TestChannelPostEphemeral:
         result = await channel.post_ephemeral("U456", "Secret!", PostEphemeralOptions(fallback_to_dm=True))
 
         assert result is None
+
+    # Python-specific: a custom adapter written against the older
+    # 3-argument ``post_ephemeral`` still works from a channel.
+    @pytest.mark.asyncio
+    async def test_three_argument_custom_post_ephemeral_still_works_from_a_channel(self):
+        adapter = create_mock_adapter()
+        calls: list[tuple[str, str, Any]] = []
+
+        async def legacy_post_ephemeral(thread_id: str, user_id: str, message: Any) -> EphemeralMessage:
+            calls.append((thread_id, user_id, message))
+            return EphemeralMessage(id="eph-legacy", thread_id=thread_id, used_fallback=False, raw={})
+
+        adapter.post_ephemeral = legacy_post_ephemeral  # type: ignore[attr-defined]
+        channel = _make_channel(adapter, create_mock_state())
+
+        result = await channel.post_ephemeral("U456", "Secret!", PostEphemeralOptions(fallback_to_dm=False))
+
+        assert calls == [("slack:C123", "U456", "Secret!")]
+        assert result is not None
+        assert result.id == "eph-legacy"
 
 
 # ===========================================================================
@@ -1615,7 +1639,7 @@ class TestCallbackUrlProcessing:
     # card binds its tokens to the channel, not to the reported thread id.
     # Round trip with the real Slack id functions and the real block_actions
     # click, both for the synthetic `slack:C…:` post id Python reports today
-    # and for the `slack:C…:<ts>` id upstream 92530dd3 reports (#209). A DM
+    # and for the `slack:C…:<ts>` id upstream 92530dd3 reports (#283). A DM
     # click reports no ts, so a thread scope would miss it either way.
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

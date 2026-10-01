@@ -10,8 +10,10 @@ agent runtime in the standard library, and adding ``pydantic`` (or any other
 runtime) would couple ``chat_sdk`` to a third-party schema validator. To
 keep the surface framework-agnostic — and faithful to the upstream contract
 that a tool is "a description + an input schema + an ``execute`` callable" —
-each factory returns a plain :class:`ChatTool` dataclass holding:
+each factory returns a plain :class:`ChatTool` dataclass holding (upstream's
+``ChatToolSpec`` shape, chat@4.41.0):
 
+* ``name`` — the camelCase tool id (``"fetchMessages"``, …).
 * ``description`` — the natural-language description shown to the model.
 * ``input_schema`` — a JSON-Schema-shaped :class:`dict` describing the tool
   inputs. Consumers that bind these tools into the Vercel AI SDK (via the
@@ -26,7 +28,8 @@ each factory returns a plain :class:`ChatTool` dataclass holding:
 The factory entry point :func:`create_chat_tools` mirrors upstream's
 ``createChatTools`` exactly: presets, ``require_approval`` config (bool or
 per-tool mapping), per-tool ``overrides``, and the same set of protected
-core fields that overrides cannot replace.
+core fields that overrides cannot replace (plus ``name``, which stays equal
+to the tool's key).
 
 .. _vercel/chat#492: https://github.com/vercel/chat/pull/492
 """
@@ -40,7 +43,7 @@ from typing import Any, Literal
 
 from chat_sdk.ai.scope import ReadScope, ScopeGuard, create_scope_guard
 from chat_sdk.chat import Chat
-from chat_sdk.errors import ChatError, ChatNotImplementedError
+from chat_sdk.errors import ChatError
 from chat_sdk.types import (
     Author,
     FetchOptions,
@@ -71,6 +74,16 @@ class ChatTool:
     ``on_input_delta``, ``on_input_start`` — are stored in :attr:`extras`
     as a free-form dict so callers can forward them to whatever agent
     runtime they bind these tools into.
+
+    ``name`` is the camelCase tool id (``"fetchMessages"``, ``"postMessage"``,
+    …), mirroring upstream's framework-agnostic ``ChatToolSpec.name``
+    (chat@4.41.0). Every factory sets it, and :func:`create_chat_tools` keys
+    its result by the same id, so ``list(create_chat_tools(chat).values())``
+    can be handed to a runtime that needs a tool name (OpenAI
+    ``function.name``, Anthropic ``tools[].name``, pydantic-ai
+    ``Tool(name=...)``). It is the last field and defaults to ``""`` so
+    existing positional and keyword construction keeps working; it is always
+    a ``str``, never ``None``.
     """
 
     description: str
@@ -78,6 +91,7 @@ class ChatTool:
     execute: Callable[[dict[str, Any]], Awaitable[Any]]
     needs_approval: bool | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +249,9 @@ _PRESET_TOOLS: dict[str, list[str]] = {
 # ``PROTECTED_TOOL_FIELDS``. ``args``/``id``/``output_schema``/``type``/
 # ``supports_deferred_results`` come from upstream's AI SDK shape; they're
 # included verbatim so consumers porting upstream ``overrides`` dicts get
-# the same protection.
+# the same protection. ``name`` is Python-only: upstream's AI SDK tools carry
+# no name (the record key is the id), but ``ChatTool.name`` must stay equal to
+# its ``create_chat_tools`` key, so an override cannot change it.
 _PROTECTED_TOOL_FIELDS: frozenset[str] = frozenset(
     {
         "args",
@@ -243,6 +259,7 @@ _PROTECTED_TOOL_FIELDS: frozenset[str] = frozenset(
         "id",
         "input_schema",
         "inputSchema",
+        "name",
         "output_schema",
         "outputSchema",
         "supports_deferred_results",
@@ -366,6 +383,7 @@ def get_channel_info(chat: ChatBinding, guard: ScopeGuard | None = None) -> Chat
         }
 
     return ChatTool(
+        name="getChannelInfo",
         description=(
             "Fetch metadata for a channel: name, member count, DM status, "
             "visibility, etc. Use to identify a channel before posting."
@@ -403,6 +421,7 @@ def post_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
         return {"messageId": sent.id, "threadId": sent.thread_id}
 
     return ChatTool(
+        name="postMessage",
         description=(
             "Post a message inside an existing thread. Use this to reply within a "
             "conversation the bot already has context for. The threadId is the "
@@ -438,6 +457,7 @@ def post_channel_message(chat: ChatBinding, options: ToolOptions | None = None) 
         return {"messageId": sent.id, "threadId": sent.thread_id}
 
     return ChatTool(
+        name="postChannelMessage",
         description=(
             "Post a top-level message to a channel (not threaded under an existing "
             "message). The channelId is the full id (e.g. 'slack:C123ABC')."
@@ -469,6 +489,7 @@ def send_direct_message(chat: ChatBinding, options: ToolOptions | None = None) -
         return {"messageId": sent.id, "threadId": sent.thread_id}
 
     return ChatTool(
+        name="sendDirectMessage",
         description=(
             "Open (or reuse) a 1:1 direct-message conversation with a user and post "
             "a message in it. The userId format is platform-specific (e.g. 'U123456' "
@@ -508,6 +529,7 @@ def edit_message(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
         return {"messageId": result.id, "threadId": result.thread_id}
 
     return ChatTool(
+        name="editMessage",
         description=(
             "Edit a previously posted message in a thread. Replaces the existing "
             "message body. Only messages the bot itself authored can be edited on "
@@ -548,6 +570,7 @@ def delete_message(chat: ChatBinding, options: ToolOptions | None = None) -> Cha
         }
 
     return ChatTool(
+        name="deleteMessage",
         description=(
             "Delete a message from a thread. Only messages the bot itself authored can be deleted on most platforms."
         ),
@@ -591,6 +614,7 @@ def add_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> ChatT
         }
 
     return ChatTool(
+        name="addReaction",
         description=(
             "Add an emoji reaction to a specific message. Use a well-known emoji "
             "name (e.g. 'thumbs_up', 'heart', 'check') or a platform-native shorthand."
@@ -634,6 +658,7 @@ def remove_reaction(chat: ChatBinding, options: ToolOptions | None = None) -> Ch
         }
 
     return ChatTool(
+        name="removeReaction",
         description="Remove an emoji reaction the bot previously added to a message.",
         input_schema={
             "type": "object",
@@ -674,11 +699,10 @@ def fetch_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTo
     async def _execute(args: dict[str, Any]) -> dict[str, Any]:
         if guard is not None:
             guard(args["threadId"])
-        thread = chat.thread(args["threadId"])
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         direction = args.get("direction", "backward")
-        result = await thread.adapter.fetch_messages(
+        result = await chat.history.thread.list(
             args["threadId"],
             FetchOptions(limit=limit, cursor=cursor, direction=direction),
         )
@@ -688,6 +712,7 @@ def fetch_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTo
         }
 
     return ChatTool(
+        name="fetchMessages",
         description=(
             "Fetch recent messages from a thread, ordered chronologically (oldest "
             "first within the page). Use to read the conversation before responding."
@@ -728,28 +753,22 @@ def fetch_channel_messages(chat: ChatBinding, guard: ScopeGuard | None = None) -
         channel_id: str = args["channelId"]
         if guard is not None:
             guard(channel_id)
-        adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
-        adapter = chat.get_adapter(adapter_name) if adapter_name else None
-        fetch_method = getattr(adapter, "fetch_channel_messages", None) if adapter is not None else None
-        if fetch_method is None:
-            raise ChatError(f'Adapter "{adapter_name}" does not support fetching channel messages')
-
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
         direction = args.get("direction", "backward")
-        try:
-            result = await fetch_method(
-                channel_id,
-                FetchOptions(limit=limit, cursor=cursor, direction=direction),
-            )
-        except ChatNotImplementedError as exc:
-            raise ChatError(f'Adapter "{adapter_name}" does not support fetching channel messages') from exc
+        # history.channel raises ChatError for an unregistered adapter and for
+        # a missing capability (including a ChatNotImplementedError stub).
+        result = await chat.history.channel.list_messages(
+            channel_id,
+            FetchOptions(limit=limit, cursor=cursor, direction=direction),
+        )
         return {
             "messages": [_project_message(m) for m in result.messages],
             "nextCursor": result.next_cursor,
         }
 
     return ChatTool(
+        name="fetchChannelMessages",
         description=(
             "Fetch top-level messages in a channel (not thread replies). Returns "
             "messages in chronological order within the page."
@@ -791,6 +810,7 @@ def fetch_thread(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool
         }
 
     return ChatTool(
+        name="fetchThread",
         description=("Fetch metadata about a thread (channel id, channel name, visibility, DM status, etc)."),
         input_schema={
             "type": "object",
@@ -811,18 +831,9 @@ def list_threads(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool
         channel_id: str = args["channelId"]
         if guard is not None:
             guard(channel_id)
-        adapter_name = channel_id.split(":")[0] if ":" in channel_id else ""
-        adapter = chat.get_adapter(adapter_name) if adapter_name else None
-        list_method = getattr(adapter, "list_threads", None) if adapter is not None else None
-        if list_method is None:
-            raise ChatError(f'Adapter "{adapter_name}" does not support listing threads')
-
         limit = args.get("limit", 20)
         cursor = args.get("cursor")
-        try:
-            result = await list_method(channel_id, options=ListThreadsOptions(limit=limit, cursor=cursor))
-        except ChatNotImplementedError as exc:
-            raise ChatError(f'Adapter "{adapter_name}" does not support listing threads') from exc
+        result = await chat.history.channel.list_threads(channel_id, ListThreadsOptions(limit=limit, cursor=cursor))
         return {
             "threads": [
                 {
@@ -837,6 +848,7 @@ def list_threads(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool
         }
 
     return ChatTool(
+        name="listThreads",
         description=(
             "List recent threads in a channel. Returns lightweight summaries with the root message of each thread."
         ),
@@ -870,6 +882,7 @@ def get_thread_participants(chat: ChatBinding, guard: ScopeGuard | None = None) 
         return {"participants": [_project_author(p) for p in participants]}
 
     return ChatTool(
+        name="getThreadParticipants",
         description=(
             "Return the unique non-bot participants in a thread. Useful for "
             "deciding whether to subscribe (1:1) or stay quiet (group)."
@@ -899,6 +912,7 @@ def subscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) -> C
         return {"subscribed": True, "threadId": args["threadId"]}
 
     return ChatTool(
+        name="subscribeThread",
         description=(
             "Subscribe to all future messages in a thread. After subscribing, the "
             "bot will receive every message in this thread (not just @mentions)."
@@ -932,6 +946,7 @@ def unsubscribe_thread(chat: ChatBinding, options: ToolOptions | None = None) ->
         return {"subscribed": False, "threadId": args["threadId"]}
 
     return ChatTool(
+        name="unsubscribeThread",
         description=("Unsubscribe from a thread. The bot will stop receiving non-mention messages in this thread."),
         input_schema={
             "type": "object",
@@ -960,6 +975,7 @@ def start_typing(chat: ChatBinding, guard: ScopeGuard | None = None) -> ChatTool
         return {"typing": True, "threadId": args["threadId"]}
 
     return ChatTool(
+        name="startTyping",
         description=(
             "Show a typing indicator in a thread. Use this when starting a "
             "long-running operation so users know the bot is working."
@@ -1008,6 +1024,7 @@ def get_user(chat: ChatBinding, needs_approval: bool = True) -> ChatTool:
         }
 
     return ChatTool(
+        name="getUser",
         description=(
             "Look up profile information about a user by their platform-specific id "
             "(e.g. 'U123456' for Slack, '29:...' for Teams, 'users/123' for Google "

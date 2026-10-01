@@ -12,15 +12,18 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
+from chat_sdk._compat import accepts_kwarg
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.plan import is_postable_object, post_postable_object
 from chat_sdk.thread import (
     _ChannelImplConfigForThread,
+    _ChatBinding,
     _ChatSingleton,
     _extract_message_content,
     _from_full_stream,
     _is_async_iterable,
+    _not_owned_message,
     _to_message,
     get_chat_singleton,
     has_chat_singleton,
@@ -96,6 +99,8 @@ class _ChannelImplConfigLazy:
     adapter_name: str
     channel_visibility: ChannelVisibility = "unknown"
     is_dm: bool = False
+    # Owning Chat for lazy resolution (upstream ``ChannelImplConfigLazy.chat``)
+    chat: _ChatSingleton | None = None
 
 
 # Union of accepted config types
@@ -125,6 +130,7 @@ class ChannelImpl:
             self._adapter_name: str | None = config.adapter_name
             self._state_adapter_instance: StateAdapter | None = None
             self._thread_history: Any = None
+            self._binding: _ChatBinding | None = _ChatBinding(config.chat)
         else:
             # _ChannelImplConfigWithAdapter, _ChannelImplConfigForThread,
             # or _ChannelImplConfigForChat (from chat.py) -- all have
@@ -133,6 +139,7 @@ class ChannelImpl:
             self._adapter_name = None
             self._state_adapter_instance = config.state_adapter  # type: ignore[union-attr]
             self._thread_history = getattr(config, "thread_history", None)
+            self._binding = None
 
     # -- Properties ----------------------------------------------------------
 
@@ -151,27 +158,30 @@ class ChannelImpl:
     @property
     def adapter(self) -> Adapter:
         if self._adapter is not None:
+            if self._binding is not None:
+                self._binding.resolve_owner(self._adapter)
             return self._adapter
 
-        if not self._adapter_name:
+        if not self._adapter_name or self._binding is None:
             raise RuntimeError("Channel has no adapter configured")
 
-        chat = get_chat_singleton()
-        adapter = chat.get_adapter(self._adapter_name)
-        if adapter is None:
-            raise RuntimeError(f'Adapter "{self._adapter_name}" not found in Chat singleton')
-
-        self._adapter = adapter
-        return adapter
+        self._adapter = self._binding.resolve_adapter(self._adapter_name)
+        return self._adapter
 
     @property
     def _state_adapter(self) -> StateAdapter:
         if self._state_adapter_instance is not None:
             return self._state_adapter_instance
 
-        chat = get_chat_singleton()
-        self._state_adapter_instance = chat.get_state()
-        return self._state_adapter_instance
+        if self._binding is None:
+            self._state_adapter_instance = get_chat_singleton().get_state()
+            return self._state_adapter_instance
+
+        # Only cache state from the Chat that owns the adapter (vercel/chat#967).
+        owned, state = self._binding.resolve_state(self.adapter)
+        if owned:
+            self._state_adapter_instance = state
+        return state
 
     @property
     def name(self) -> str | None:
@@ -295,7 +305,7 @@ class ChannelImpl:
 
         if _is_async_iterable(message):
             accumulated = ""
-            async for chunk in _from_full_stream(message):
+            async for chunk in _from_full_stream(message):  # type: ignore[arg-type]
                 if isinstance(chunk, str):
                     accumulated += chunk
             return await self._post_single_message(PostableMarkdown(markdown=accumulated))
@@ -342,9 +352,14 @@ class ChannelImpl:
 
         # Callback tokens are minted per delivery path so each is bound to
         # the conversation the card actually lands in (vercel/chat#875).
-        if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
+        native = getattr(self.adapter, "post_ephemeral", None)
+        if native:
             message = await self._process_callback_urls(message)  # type: ignore[assignment]
-            return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
+            # ``options=`` only reaches implementations that accept it
+            # (Python-only compatibility probe; see chat_sdk._compat).
+            if accepts_kwarg(native, "options"):
+                return await native(self._id, user_id, message, options=options)
+            return await native(self._id, user_id, message)
 
         if not options.fallback_to_dm:
             return None
@@ -461,7 +476,15 @@ class ChannelImpl:
         are still applied. This makes it safe to call via
         ``json.loads(..., object_hook=reviver)`` while still respecting
         explicit rebinding.
+
+        Ownership follows :meth:`ThreadImpl.from_json`: raises
+        ``RuntimeError`` when ``chat`` did not register ``adapter``.
         """
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md (eager
+        # ownership): raised here rather than on first state use.
+        if chat is not None and adapter is not None and not chat.owns_adapter(adapter):
+            raise RuntimeError(_not_owned_message(adapter))
+
         if isinstance(data, ChannelImpl):
             channel = data
             # Transactional rebind: if chat= is passed without adapter=,
@@ -485,6 +508,7 @@ class ChannelImpl:
             if adapter is not None or chat is not None:
                 channel._state_adapter_instance = None
                 channel._thread_history = None
+                channel._binding = _ChatBinding(chat)
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
@@ -499,13 +523,12 @@ class ChannelImpl:
                     adapter_name=raw_adapter_name if raw_adapter_name is not None else "",
                     channel_visibility=raw_channel_visibility if raw_channel_visibility is not None else "unknown",
                     is_dm=data.get("isDM") if "isDM" in data else data.get("is_dm", False),
+                    chat=chat,
                 )
             )
-        # `adapter` and `chat` are orthogonal: if both are passed we apply
-        # both (explicit adapter + chat's state). If only one is passed,
-        # the other's effects are left lazy. An earlier `elif chat` branch
-        # silently dropped chat's state when adapter was also passed,
-        # creating a split-routing bug.
+        binding = channel._binding
+        # With both `adapter` and `chat`, the explicit adapter is bound and
+        # state comes from `chat` (which was checked above to own it).
         if adapter is not None:
             channel._adapter = adapter
             # Divergence from upstream — see docs/UPSTREAM_SYNC.md.
@@ -523,13 +546,21 @@ class ChannelImpl:
                         raise RuntimeError(f'Adapter "{lookup_name}" not found in the provided Chat instance')
                     channel._adapter = resolved
                     channel._adapter_name = lookup_name
+            if binding is not None:
+                binding.bind(chat)
             channel._state_adapter_instance = chat.get_state()
-        elif adapter is None and has_chat_singleton() and channel._adapter_name:
+        elif adapter is not None:
+            # Eager ownership check, as in ThreadImpl.from_json. Divergence
+            # from upstream — see docs/UPSTREAM_SYNC.md.
+            if binding is not None:
+                binding.resolve_owner(adapter)
+        elif binding is not None and channel._adapter is None and channel._adapter_name and has_chat_singleton():
             active = get_chat_singleton()
             resolved = active.get_adapter(channel._adapter_name)
             if resolved is not None:
                 channel._adapter = resolved
-            channel._state_adapter_instance = active.get_state()
+                binding.bind(active)
+                channel._state_adapter_instance = active.get_state()
         return channel
 
     @classmethod

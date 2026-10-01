@@ -21,6 +21,11 @@ A 404 ``method not found`` / ``ResourceNotFound`` on a rich call latches
 rich). A transient ``can't parse`` / validation failure falls back for the
 current message only and leaves the flag set.
 
+Since vercel/chat#822 (chat@4.38) draft streaming is opt-in
+(``native_streaming=True``); the draft tests below set it. By default every
+chat streams through the adapter's post-and-edit loop (#822 / #826), covered
+by ``TestTelegramPostAndEditStreaming`` with a fake clock and sleep.
+
 Upstream mocks ``fetch`` at the HTTP layer; these tests follow the
 established Python convention of mocking ``telegram_fetch`` with an ordered
 script — each entry is either a value to return or an exception to raise.
@@ -28,6 +33,7 @@ script — each entry is either a value to return or an exception to raise.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -38,6 +44,7 @@ from chat_sdk.adapters.telegram.adapter import (
 from chat_sdk.adapters.telegram.types import TelegramAdapterConfig
 from chat_sdk.shared.errors import (
     AdapterRateLimitError,
+    NetworkError,
     ResourceNotFoundError,
     ValidationError,
 )
@@ -49,6 +56,7 @@ from chat_sdk.shared.mock_adapter import MockLogger
 
 DM_THREAD_ID = "telegram:123"
 DM_CHAT_ID = "123"
+GROUP_THREAD_ID = "telegram:-100123"
 
 
 def _make_adapter(**overrides: Any) -> TelegramAdapter:
@@ -81,6 +89,34 @@ def _sample_message(
     if rich_message is not None:
         msg["rich_message"] = rich_message
     return msg
+
+
+def _group_stream_message(text: str) -> dict[str, Any]:
+    """A supergroup message (mirrors upstream ``groupStreamMessage``)."""
+    return _sample_message(text=text, message_id=21, chat_id=-100123, chat_type="supergroup")
+
+
+class _FakeClock:
+    """Fake monotonic clock + sleep for the post-and-edit pacing tests.
+
+    Installs itself as the adapter's ``_monotonic_ms`` / ``_sleep``; each
+    ``_sleep(ms)`` is recorded and advances the clock instead of waiting.
+
+    The clock starts well past zero so a stream that forgets to stamp its
+    placeholder (leaving the initial ``last_edit_at = 0``) edits on the first
+    chunk instead of passing by coincidence, as it would with a real
+    ``time.monotonic()``.
+    """
+
+    def __init__(self, adapter: TelegramAdapter, now: float = 10_000.0) -> None:
+        self.now = now
+        self.sleeps: list[float] = []
+        adapter._monotonic_ms = lambda: self.now  # type: ignore[method-assign]
+        adapter._sleep = self._sleep  # type: ignore[method-assign]
+
+    async def _sleep(self, delay_ms: float) -> None:
+        self.sleeps.append(delay_ms)
+        self.now += max(0.0, delay_ms)
 
 
 def _rich_message(text: str) -> dict[str, Any]:
@@ -246,15 +282,15 @@ class TestTelegramRichSend:
 class TestTelegramRichDraftStreaming:
     """it() blocks for TelegramAdapter.stream rich draft updates."""
 
-    # it("streams draft updates for private chats and sends a final message")
+    # it("streams draft updates when native streaming is enabled")
     #
     # HAZARD 1 (dropped opening draft): the rewrite removed the empty
     # ``send_draft("", False)`` that opened the bubble in #340. With two
     # chunks at interval 0 the call sequence is now [draft, draft, final] =
     # THREE calls (was four). This test pins the NEW count.
     @pytest.mark.asyncio
-    async def test_streams_rich_draft_updates_and_sends_final_rich_message(self):
-        adapter = _make_adapter()
+    async def test_streams_draft_updates_when_native_streaming_is_enabled(self):
+        adapter = _make_adapter(native_streaming=True)
         calls = _script_fetch(
             adapter,
             [
@@ -301,7 +337,7 @@ class TestTelegramRichDraftStreaming:
     @pytest.mark.asyncio
     async def test_flushes_trailing_table_like_block_after_renderer_finish(self):
         table = "| a | b |\n| - | - |\n| 1 | 2 |"
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         calls = _script_fetch(
             adapter,
             [
@@ -328,7 +364,7 @@ class TestTelegramRichDraftStreaming:
     async def test_keeps_rich_markdown_for_draft_and_final_without_markdownv2_rerender(self):
         long_markdown = "a" * 3494 + "**ok**"
 
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         calls = _method_fetch(
             adapter,
             {
@@ -355,21 +391,20 @@ class TestTelegramRichDraftStreaming:
         assert calls[0][1]["rich_message"]["markdown"] == long_markdown
         assert calls[1][1]["rich_message"]["markdown"] == long_markdown
 
-    # it("returns null for non-DM streaming so Chat SDK can use fallback streaming")
+    # it("streams non-DM chats with post-and-edit even when nativeStreaming is on")
     @pytest.mark.asyncio
-    async def test_returns_null_for_nondm_streaming_so_chat_sdk_can_use_fallback_streaming(self):
-        adapter = _make_adapter()
-        calls = _script_fetch(adapter, [])
-
-        result = await adapter.stream(
-            "telegram:-100123",
-            _text_stream(["hello"]),
-            _stream_options(0),
+    async def test_streams_nondm_chats_with_post_and_edit_even_when_native_streaming_is_on(self):
+        adapter = _make_adapter(native_streaming=True, streaming_edit_interval_ms=0)
+        calls = _script_fetch(
+            adapter,
+            [_group_stream_message("..."), _group_stream_message("hello world")],
         )
 
-        assert result is None
-        # Delegation happens before any chunk is consumed or API call made.
-        assert calls == []
+        result = await adapter.stream(GROUP_THREAD_ID, _text_stream(["hello world"]), _stream_options(0))
+
+        assert result is not None
+        assert result.id == "-100123:21"
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText"]
 
     # it("renders MarkdownV2 when rich draft streaming is unavailable")
     #
@@ -381,7 +416,7 @@ class TestTelegramRichDraftStreaming:
     @pytest.mark.asyncio
     async def test_renders_markdownv2_when_rich_draft_streaming_is_unavailable(self):
         logger = MockLogger()
-        adapter = _make_adapter(logger=logger)
+        adapter = _make_adapter(logger=logger, native_streaming=True)
         calls = _script_fetch(
             adapter,
             [
@@ -420,7 +455,7 @@ class TestTelegramRichDraftStreaming:
     @pytest.mark.asyncio
     async def test_continues_to_the_final_message_when_markdown_draft_retry_also_fails(self):
         logger = MockLogger()
-        adapter = _make_adapter(logger=logger)
+        adapter = _make_adapter(logger=logger, native_streaming=True)
         calls = _script_fetch(
             adapter,
             [
@@ -450,7 +485,7 @@ class TestTelegramRichDraftStreaming:
     # side (can_fallback allows fallback; remember_failure does not flip).
     @pytest.mark.asyncio
     async def test_transient_rich_draft_failure_does_not_latch_rich_off(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         calls = _script_fetch(
             adapter,
             [
@@ -473,7 +508,7 @@ class TestTelegramRichDraftStreaming:
     #     False), MarkdownV2 draft rejected, plain retry accepted, plain final.
     @pytest.mark.asyncio
     async def test_falls_back_to_plaintext_draft_and_final_send_when_telegram_cant_parse_streamed_markdown(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         adapter._rich_messages_available = False  # rich endpoint known-missing
         calls = _script_fetch(
             adapter,
@@ -505,7 +540,7 @@ class TestTelegramRichDraftStreaming:
     # sendRichMessage.
     @pytest.mark.asyncio
     async def test_stream_defaults_update_interval_when_options_omitted(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         calls = _script_fetch(
             adapter,
             [True, True, _sample_message(text=None, rich_message=_rich_message("hello world"))],
@@ -527,7 +562,7 @@ class TestTelegramRichDraftStreaming:
     # the stream raises rather than persisting a blank message.
     @pytest.mark.asyncio
     async def test_stream_rejects_whitespace_only_streams(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(native_streaming=True)
         calls = _script_fetch(adapter, [True])
 
         with pytest.raises(ValidationError, match="requires text content"):
@@ -535,6 +570,547 @@ class TestTelegramRichDraftStreaming:
 
         # Only the mid-stream rich draft went out; no final send was attempted.
         assert [method for method, _payload in calls] == ["sendRichMessageDraft"]
+
+
+class TestTelegramNativeDraftPlainRendering:
+    """it.each("renders plain text only when selected for %s native drafts")
+    (vercel/chat#900): the plain rendering of the stream is computed only
+    once a draft actually ships as plain text."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("draft_format", ["rich", "markdown", "plain"])
+    async def test_renders_plain_text_only_when_selected_for_native_drafts(
+        self, draft_format: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        import chat_sdk.adapters.telegram.adapter as telegram_adapter_module
+
+        plain_text_calls: list[str] = []
+        real_markdown_to_plain_text = telegram_adapter_module._markdown_to_plain_text
+
+        def spy(markdown: str) -> str:
+            plain_text_calls.append(markdown)
+            return real_markdown_to_plain_text(markdown)
+
+        monkeypatch.setattr(telegram_adapter_module, "_markdown_to_plain_text", spy)
+
+        adapter = _make_adapter(native_streaming=True)
+        calls: list[tuple[str, Any]] = []
+
+        async def fetch(method: str, payload: Any = None, **_kwargs: Any) -> Any:
+            calls.append((method, payload))
+            if method == "sendRichMessageDraft" and draft_format != "rich":
+                raise ResourceNotFoundError("telegram", method)
+            if method == "sendMessageDraft" and payload.get("parse_mode") and draft_format == "plain":
+                raise _parse_entities_error()
+            if method.endswith("Draft"):
+                return True
+            return _sample_message(text="hello world")
+
+        adapter.telegram_fetch = fetch  # type: ignore[method-assign]
+        expected_calls = 1 if draft_format == "plain" else 0
+
+        async def text_stream():
+            yield "**hello**"
+            assert len(plain_text_calls) == expected_calls
+            yield " world"
+            assert len(plain_text_calls) == 2 * expected_calls
+
+        result = await adapter.stream(DM_THREAD_ID, text_stream(), _stream_options(0))
+
+        assert result is not None
+        assert result.id == "123:11"
+        final_method, final_body = calls[-1]
+        if draft_format == "rich":
+            assert final_method == "sendRichMessage"
+            assert final_body["rich_message"]["markdown"] == "**hello** world"
+            assert plain_text_calls == []
+        else:
+            assert final_method == "sendMessage"
+            assert final_body["text"] == ("*hello* world" if draft_format == "markdown" else "hello world")
+            assert final_body.get("parse_mode") == ("MarkdownV2" if draft_format == "markdown" else None)
+
+
+# =============================================================================
+# Tests -- post-and-edit streaming (vercel/chat#822, #826)
+# =============================================================================
+
+
+class TestTelegramPostAndEditStreaming:
+    """it() blocks for the adapter-owned post-and-edit stream."""
+
+    # it("streams private chats with post-and-edit by default")
+    @pytest.mark.asyncio
+    async def test_streams_private_chats_with_post_and_edit_by_default(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        calls = _script_fetch(adapter, [_sample_message(text="..."), _sample_message(text="hello world")])
+
+        result = await adapter.stream(DM_THREAD_ID, _text_stream(["hello world"]), _stream_options(0))
+
+        assert result is not None
+        methods = [method for method, _payload in calls]
+        assert methods == ["sendMessage", "editMessageText"]
+        assert not any("Draft" in method for method in methods)
+        # The placeholder is a plain-text post; the edit carries the markdown.
+        assert calls[0][1]["text"] == "..."
+        assert calls[1][1]["rich_message"]["markdown"] == "hello world"
+
+    # it("uses the private chat streaming edit floor")
+    @pytest.mark.asyncio
+    async def test_uses_the_private_chat_streaming_edit_floor(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        edit_times: list[float] = []
+
+        def edit() -> dict[str, Any]:
+            edit_times.append(clock.now)
+            return _sample_message(text="chunk")
+
+        _method_fetch(adapter, {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": edit})
+
+        start = clock.now
+
+        async def text_stream():
+            yield "one "
+            clock.now = start + 1200
+            yield "two "
+            clock.now = start + 1300
+            yield "three"
+
+        await adapter.stream(DM_THREAD_ID, text_stream(), _stream_options(0))
+
+        # 1200 ms after the placeholder clears the 1100 ms floor; 1300 does
+        # not, so the final edit waits the remaining 1000 ms.
+        assert [t - start for t in edit_times] == [1200, 2300]
+        assert clock.sleeps == [1000]
+
+    # it("uses the group streaming edit floor")
+    @pytest.mark.asyncio
+    async def test_uses_the_group_streaming_edit_floor(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        edit_times: list[float] = []
+
+        def edit() -> dict[str, Any]:
+            edit_times.append(clock.now)
+            return _group_stream_message("chunk")
+
+        _method_fetch(adapter, {"sendMessage": lambda: _group_stream_message("..."), "editMessageText": edit})
+
+        start = clock.now
+
+        async def text_stream():
+            yield "one "
+            clock.now = start + 1200
+            yield "two "
+            clock.now = start + 1300
+            yield "three"
+
+        await adapter.stream(GROUP_THREAD_ID, text_stream(), _stream_options(0))
+
+        # No chunk clears the 3100 ms group floor; the final edit waits 1800 ms.
+        assert [t - start for t in edit_times] == [3100]
+        assert clock.sleeps == [1800]
+
+    # Python-only: a Chat-level interval above the floor wins
+    # (``max(options.update_interval_ms, floor)``).
+    @pytest.mark.asyncio
+    async def test_a_larger_update_interval_raises_the_edit_interval_above_the_floor(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        edit_times: list[float] = []
+
+        def edit() -> dict[str, Any]:
+            edit_times.append(clock.now)
+            return _sample_message(text="chunk")
+
+        _method_fetch(adapter, {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": edit})
+
+        start = clock.now
+
+        async def text_stream():
+            yield "one "
+            clock.now = start + 1500
+            yield "two "
+            clock.now = start + 2100
+            yield "three"
+            clock.now = start + 2200
+            yield " four"
+
+        await adapter.stream(DM_THREAD_ID, text_stream(), _stream_options(2000))
+
+        assert [t - start for t in edit_times] == [2100, 4100]
+        assert clock.sleeps == [1900]
+
+    # it("edits per chunk when streamingEditIntervalMs opts out of throttling")
+    @pytest.mark.asyncio
+    async def test_edits_per_chunk_when_streaming_edit_interval_ms_opts_out_of_throttling(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        calls = _method_fetch(
+            adapter,
+            {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": lambda: _sample_message("chunk")},
+        )
+
+        await adapter.stream(DM_THREAD_ID, _text_stream(["one ", "two ", "three"]), _stream_options(0))
+
+        edits = [payload["rich_message"]["markdown"] for method, payload in calls if method == "editMessageText"]
+        assert edits == ["one ", "one two ", "one two three"]
+
+    # it("retries the final streamed edit once when Telegram rate limits it").
+    # With no throttling the chunk's own edit is the one rate limited (0 s);
+    # the closing edit then delivers the text.
+    @pytest.mark.asyncio
+    async def test_retries_the_final_streamed_edit_once_when_telegram_rate_limits_it(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                AdapterRateLimitError("telegram", 0),
+                _sample_message(text="hello"),
+            ],
+        )
+
+        result = await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+        assert result is not None
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
+        assert clock.sleeps == [0]
+
+    # Python-only: a 429 on the closing edit itself is retried once after
+    # ``retry_after ?? 1`` seconds. A missing (or non-numeric) value waits 1 s.
+    # The 1100 ms DM floor keeps the chunk from being edited mid-stream, so
+    # the closing edit is the first one.
+    @pytest.mark.asyncio
+    # A ``retry_after`` of exactly 5 s is still retried (the cap is a strict
+    # ``>``, as upstream index.ts:2094).
+    @pytest.mark.parametrize(("retry_after", "expected_wait_ms"), [(None, 1000), ("5", 1000), (2, 2000), (5, 5000)])
+    async def test_a_rate_limited_closing_edit_is_retried_after_retry_after(
+        self, retry_after: Any, expected_wait_ms: float
+    ):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                AdapterRateLimitError("telegram", retry_after),
+                _sample_message(text="hello"),
+            ],
+        )
+
+        await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
+        assert calls[2][1]["rich_message"]["markdown"] == "hello"
+        assert clock.sleeps == [1100, expected_wait_ms]
+
+    # it("rejects when the final streamed edit retry fails")
+    @pytest.mark.asyncio
+    async def test_rejects_when_the_final_streamed_edit_retry_fails(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        _FakeClock(adapter)
+        _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                AdapterRateLimitError("telegram", 0),
+                NetworkError("telegram", "Internal Server Error"),
+            ],
+        )
+
+        with pytest.raises(NetworkError):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+    # Python-only: when the single retry of a rate-limited closing edit fails,
+    # the stream raises instead of returning the stale message.
+    @pytest.mark.asyncio
+    async def test_a_failed_retry_of_the_closing_edit_raises(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                AdapterRateLimitError("telegram", 1),
+                AdapterRateLimitError("telegram", 1),
+            ],
+        )
+
+        with pytest.raises(AdapterRateLimitError):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
+        assert clock.sleeps == [1100, 1000]
+
+    # it("rejects when the final retry_after exceeds the cap"). The chunk's
+    # edit is rate limited for 30 s, so the closing edit raises up front.
+    @pytest.mark.asyncio
+    async def test_rejects_when_the_final_retry_after_exceeds_the_cap(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [_sample_message(text="..."), AdapterRateLimitError("telegram", 30)],
+        )
+
+        with pytest.raises(AdapterRateLimitError):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+        assert [method for method, _payload in calls].count("editMessageText") == 1
+        # Raised without waiting out the 30 s.
+        assert clock.sleeps == []
+
+    # Python-only: a 429 on the closing edit itself whose retry_after exceeds
+    # the 5 s cap raises without a retry.
+    @pytest.mark.asyncio
+    async def test_a_closing_edit_rate_limit_over_the_cap_raises_without_retry(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [_sample_message(text="..."), AdapterRateLimitError("telegram", 6)],
+        )
+
+        with pytest.raises(AdapterRateLimitError):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0))
+
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText"]
+        assert clock.sleeps == [1100]
+
+    # it("respects retry_after after an intermediate streamed edit")
+    @pytest.mark.asyncio
+    async def test_respects_retry_after_after_an_intermediate_streamed_edit(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        clock = _FakeClock(adapter)
+        calls = _method_fetch(
+            adapter,
+            {
+                "sendMessage": lambda: _sample_message(text="..."),
+                "editMessageText": iter(
+                    [AdapterRateLimitError("telegram", 30)] + [_sample_message("chunk")] * 5
+                ).__next__,
+            },
+        )
+
+        with pytest.raises(AdapterRateLimitError):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["one ", "two ", "three"]), _stream_options(0))
+
+        assert [method for method, _payload in calls].count("editMessageText") == 1
+        assert clock.sleeps == []
+
+    # Python-only: an intermediate 429 within the cap delays the final edit
+    # until ``retry_after`` has passed, and is logged rather than raised. A
+    # wait of exactly 5 s is within the cap (strict ``>``, as upstream
+    # index.ts:2077).
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("retry_after", "expected_wait_ms"), [(2, 2000), (5, 5000)])
+    async def test_final_edit_waits_out_an_intermediate_rate_limit_within_the_cap(
+        self, retry_after: int, expected_wait_ms: float
+    ):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger, streaming_edit_interval_ms=0)
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                AdapterRateLimitError("telegram", retry_after),
+                _sample_message(text="one two"),
+            ],
+        )
+
+        await adapter.stream(DM_THREAD_ID, _text_stream(["one ", "two"]), _stream_options(0))
+
+        assert clock.sleeps == [expected_wait_ms]
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
+        assert calls[2][1]["rich_message"]["markdown"] == "one two"
+        assert any(call[0] == "Telegram stream edit failed" for call in logger.warn.calls)
+
+    # Python-only: an intermediate failure that is not a rate limit is logged
+    # and does not hold back the next edit.
+    @pytest.mark.asyncio
+    async def test_intermediate_non_rate_limit_failure_is_logged_and_skipped(self):
+        logger = MockLogger()
+        adapter = _make_adapter(logger=logger, streaming_edit_interval_ms=0)
+        clock = _FakeClock(adapter)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text="..."),
+                NetworkError("telegram", "Bad Gateway"),
+                _sample_message(text="one two"),
+            ],
+        )
+
+        await adapter.stream(DM_THREAD_ID, _text_stream(["one ", "two"]), _stream_options(0))
+
+        assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
+        assert calls[2][1]["rich_message"]["markdown"] == "one two"
+        assert clock.sleeps == []
+        assert any(
+            call[0] == "Telegram stream edit failed" and call[1]["thread_id"] == DM_THREAD_ID
+            for call in logger.warn.calls
+        )
+
+    # Python-only: cancellation during a pacing wait propagates (every wait is
+    # awaited inline) and no later edit is sent.
+    @pytest.mark.asyncio
+    async def test_cancelling_during_the_final_pacing_wait_propagates(self):
+        adapter = _make_adapter()
+        calls = _method_fetch(
+            adapter,
+            {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": lambda: _sample_message("x")},
+        )
+        adapter._monotonic_ms = lambda: 0.0  # type: ignore[method-assign]
+        waiting = asyncio.Event()
+
+        async def blocking_sleep(_delay_ms: float) -> None:
+            waiting.set()
+            await asyncio.Event().wait()
+
+        adapter._sleep = blocking_sleep  # type: ignore[method-assign]
+
+        task = asyncio.create_task(adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), _stream_options(0)))
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [method for method, _payload in calls] == ["sendMessage"]
+
+
+class TestTelegramPostAndEditPlaceholder:
+    """Python-only: ``StreamOptions.fallback_streaming_placeholder_text`` is
+    tri-state (#199). ``UNSET`` posts ``"..."``, ``None`` posts nothing until
+    text arrives, and a string is posted as given."""
+
+    @staticmethod
+    def _options(placeholder: Any) -> Any:
+        options = _stream_options(0)
+        options.fallback_streaming_placeholder_text = placeholder
+        return options
+
+    @pytest.mark.asyncio
+    async def test_a_configured_placeholder_is_posted_as_plain_text(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        calls = _script_fetch(adapter, [_sample_message(text="Thinking"), _sample_message(text="hello")])
+
+        await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), self._options("Thinking"))
+
+        assert calls[0][0] == "sendMessage"
+        assert calls[0][1]["text"] == "Thinking"
+        assert calls[0][1].get("parse_mode") is None
+
+    @pytest.mark.asyncio
+    async def test_no_placeholder_posts_the_first_text_then_edits(self):
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        calls = _script_fetch(
+            adapter,
+            [
+                _sample_message(text=None, rich_message=_rich_message("hello")),
+                _sample_message(text=None, rich_message=_rich_message("hello world")),
+            ],
+        )
+
+        result = await adapter.stream(DM_THREAD_ID, _text_stream(["hello", " world"]), self._options(None))
+
+        assert result is not None
+        assert [method for method, _payload in calls] == ["sendRichMessage", "editMessageText"]
+        assert calls[0][1]["rich_message"]["markdown"] == "hello"
+        assert calls[1][1]["rich_message"]["markdown"] == "hello world"
+
+    # The first post stamps the pacing clock, so the 1100 ms DM floor runs
+    # from it rather than from the start of the stream.
+    @pytest.mark.asyncio
+    async def test_no_placeholder_paces_edits_from_the_first_post(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        start = clock.now
+        edit_times: list[float] = []
+
+        def edit() -> dict[str, Any]:
+            edit_times.append(clock.now)
+            return _sample_message(text=None, rich_message=_rich_message("one two"))
+
+        calls = _method_fetch(
+            adapter,
+            {
+                "sendRichMessage": lambda: _sample_message(text=None, rich_message=_rich_message("one")),
+                "editMessageText": edit,
+            },
+        )
+
+        async def text_stream():
+            yield "one "
+            clock.now = start + 500
+            yield "two"
+
+        await adapter.stream(DM_THREAD_ID, text_stream(), self._options(None))
+
+        assert [method for method, _payload in calls] == ["sendRichMessage", "editMessageText"]
+        assert [t - start for t in edit_times] == [1100]
+        assert clock.sleeps == [600]
+
+    @pytest.mark.asyncio
+    async def test_no_placeholder_posts_held_back_text_once_the_stream_ends(self):
+        table = "| a | b |\n| - | - |\n| 1 | 2 |"
+        adapter = _make_adapter(streaming_edit_interval_ms=0)
+        calls = _script_fetch(adapter, [_sample_message(text=None, rich_message=_rich_message("table"))])
+
+        await adapter.stream(DM_THREAD_ID, _text_stream([table]), self._options(None))
+
+        assert [method for method, _payload in calls] == ["sendRichMessage"]
+        assert calls[0][1]["rich_message"]["markdown"] == table
+
+    @pytest.mark.asyncio
+    async def test_no_placeholder_and_no_text_raises(self):
+        adapter = _make_adapter()
+        calls = _script_fetch(adapter, [])
+
+        with pytest.raises(ValidationError, match="requires text content"):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["  "]), self._options(None))
+
+        assert calls == []
+
+    # An empty-string placeholder is passed to ``post_message`` as upstream
+    # does, which rejects empty text before calling Telegram.
+    @pytest.mark.asyncio
+    async def test_an_empty_placeholder_is_rejected_by_post_message(self):
+        adapter = _make_adapter()
+        calls = _script_fetch(adapter, [])
+
+        with pytest.raises(ValidationError, match="Message text cannot be empty"):
+            await adapter.stream(DM_THREAD_ID, _text_stream(["hello"]), self._options(""))
+
+        assert calls == []
+
+
+class TestTelegramStreamingConfig:
+    """Python-only: ``native_streaming`` / ``streaming_edit_interval_ms``
+    resolution (upstream constructor, vercel/chat#822)."""
+
+    def test_defaults(self):
+        adapter = _make_adapter()
+        assert adapter._native_streaming is False
+        assert adapter._streaming_edit_interval_ms is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (250, 250),
+            (0, 0),
+            (-5, 0),
+            (1500.7, 1500),
+            (True, None),
+            ("100", None),
+            (float("nan"), None),
+            (float("inf"), None),
+        ],
+    )
+    def test_streaming_edit_interval_is_clamped_or_ignored(self, value: Any, expected: int | None):
+        adapter = _make_adapter(streaming_edit_interval_ms=value)
+        assert adapter._streaming_edit_interval_ms == expected
 
 
 # =============================================================================

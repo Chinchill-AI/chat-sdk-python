@@ -15,6 +15,7 @@ import contextvars
 import hmac
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -22,11 +23,16 @@ import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs
 
+from chat_sdk.adapters.slack.agent_context import (
+    _js_truthy,
+    get_app_context,
+    normalize_app_context_entities,
+)
 from chat_sdk.adapters.slack.api import (
     _is_trusted_slack_response_url,
     is_slack_auth_url,
@@ -44,6 +50,7 @@ from chat_sdk.adapters.slack.crypto import (
     encrypt_token,
     is_encrypted_token_data,
 )
+from chat_sdk.adapters.slack.format import escape_slack_text, unescape_slack_text
 from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
 from chat_sdk.adapters.slack.modals import (
     ModalMetadata,
@@ -58,8 +65,11 @@ from chat_sdk.adapters.slack.types import (
     SlackAdapterMode,
     SlackBotToken,
     SlackBotTokenResolver,
+    SlackFeedbackButtonsOptions,
     SlackInstallation,
     SlackInstallationProvider,
+    SlackSuggestedPrompts,
+    SlackSuggestedPromptsContext,
     SlackThreadId,
     SlackWebhookVerifier,
 )
@@ -67,9 +77,11 @@ from chat_sdk.adapters.slack.webhook import (
     read_slack_request_body,
     verify_slack_request,
 )
+from chat_sdk.cards import _js_number_to_string
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.adapter_utils import (
     extract_card,
     extract_files,
@@ -90,10 +102,12 @@ from chat_sdk.shared.errors import (
     ValidationError,
 )
 from chat_sdk.shared.log_utils import utf8_byte_length
-from chat_sdk.shared.mentions import replace_bare_mentions
+from chat_sdk.shared.markdown_parser import Content, ast_to_plain_text
+from chat_sdk.shared.mentions import mask_code_spans, replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
+    AppContextChangedEvent,
     AppHomeOpenedEvent,
     AssistantContextChangedEvent,
     AssistantThreadStartedEvent,
@@ -114,12 +128,14 @@ from chat_sdk.types import (
     LockScope,
     MemberJoinedChannelEvent,
     Message,
+    MessageDeletedEvent,
     MessageMetadata,
     ModalCloseEvent,
     ModalResponse,
     ModalSubmitEvent,
     OptionsLoadEvent,
     PostableMarkdown,
+    PostEphemeralOptions,
     RawMessage,
     ReactionEvent,
     ScheduledMessage,
@@ -146,6 +162,54 @@ def _pin_task(task: asyncio.Task[Any]) -> None:
     """Pin a fire-and-forget task so the GC doesn't collect it."""
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+__all__ = [
+    "SlackAdapter",
+    "build_feedback_buttons_block",
+    "create_slack_adapter",
+    "get_app_context",
+    "normalize_app_context_entities",
+]
+
+
+def build_feedback_buttons_block(options: SlackFeedbackButtonsOptions | None = None) -> dict[str, Any]:
+    """Build a ``context_actions`` block with Slack's native feedback buttons.
+
+    Thumbs up/down on agent replies (vercel/chat ``0f743c9b`` #698). The
+    adapter appends this block to natively streamed replies when the
+    ``feedback_buttons`` config is set; use this helper to attach the same
+    block to non-streamed messages via raw blocks. Clicks dispatch to
+    ``chat.on_action`` with the configured ``action_id`` and value.
+    """
+    opts = options if options is not None else SlackFeedbackButtonsOptions()
+    return {
+        "type": "context_actions",
+        "elements": [
+            {
+                "type": "feedback_buttons",
+                "action_id": opts.action_id if opts.action_id is not None else "message_feedback",
+                "positive_button": {
+                    "text": {
+                        "type": "plain_text",
+                        "text": opts.positive_label if opts.positive_label is not None else "Good response",
+                    },
+                    "value": opts.positive_value if opts.positive_value is not None else "positive",
+                },
+                "negative_button": {
+                    "text": {
+                        "type": "plain_text",
+                        "text": opts.negative_label if opts.negative_label is not None else "Bad response",
+                    },
+                    "value": opts.negative_value if opts.negative_value is not None else "negative",
+                },
+            }
+        ],
+    }
+
+
+# Slack displays at most this many suggested prompts per thread.
+_MAX_SUGGESTED_PROMPTS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +268,11 @@ def _make_slack_lookup_failed(user_id: str) -> SlackUserCacheEntry:
 
 
 # Ignored message subtypes (system/meta events).
-# `message_changed` is NOT in this set — it is routed to
-# `_handle_message_changed` so we can capture link unfurl metadata.
+# `message_changed` / `message_deleted` are NOT in this set — they are routed
+# to `_handle_message_changed` / `_handle_message_deleted` (unfurl caching and
+# the `on_message_updated` / `on_message_deleted` lifecycle handlers).
 _IGNORED_SUBTYPES = frozenset(
     {
-        "message_deleted",
         "message_replied",
         "channel_join",
         "channel_leave",
@@ -228,6 +292,30 @@ _IGNORED_SUBTYPES = frozenset(
         "tombstone",
     }
 )
+
+
+def _edited_ts(message: dict[str, Any]) -> Any:
+    """``message.edited?.ts`` (``None`` when ``edited`` is missing or not an object)."""
+    edited = message.get("edited")
+    return edited.get("ts") if isinstance(edited, dict) else None
+
+
+def _with_inherited(message: dict[str, Any], **fallbacks: Any) -> dict[str, Any]:
+    """Upstream ``{...message, key: message.key ?? fallback}`` for each fallback.
+
+    A key whose resolved value is ``None`` is not added: upstream's ``??``
+    yields ``undefined`` there, which never reaches the serialized payload, so
+    ``Message.raw`` must not gain ``None`` keys Slack never sent.
+    """
+    out = dict(message)
+    for key, fallback in fallbacks.items():
+        value = message.get(key)
+        if value is None:
+            value = fallback
+        if value is not None:
+            out[key] = value
+    return out
+
 
 # Link-unfurl wait window: Slack delivers unfurled attachments via a
 # separate `message_changed` event ~100-2000ms after the original. We
@@ -295,15 +383,793 @@ def _json_stringify(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-def _find_next_mention(text: str) -> int:
-    """Find the next ``<@`` or ``<#`` mention in *text*."""
-    at_idx = text.find("<@")
-    hash_idx = text.find("<#")
-    if at_idx == -1:
-        return hash_idx
-    if hash_idx == -1:
-        return at_idx
-    return min(at_idx, hash_idx)
+def _bot_profile_user_id(event: dict[str, Any]) -> str | None:
+    """``event.bot_profile?.user_id`` -- the bot's user (``U…``) id, if any."""
+    profile = event.get("bot_profile")
+    if not isinstance(profile, dict):
+        return None
+    user_id = profile.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+# Slack's reserved user for platform-generated messages (channel archived,
+# reminders, ...). Upstream ``SLACK_SYSTEM_USER_ID``.
+_SLACK_SYSTEM_USER_ID = "USLACK"
+
+# How content refers to the bot: as a mention Slack renders, as a literal
+# token (inside code or display text), or not at all. ``literal`` explains an
+# ``app_mention`` event without making it an invocation; ``none`` leaves the
+# event unexplained. Upstream ``SlackMentionEvidence``.
+_MentionEvidence = Literal["literal", "mention", "none"]
+
+
+def _mention_token_pattern(user_id: str) -> re.Pattern[str]:
+    """The opening ``<@U…`` / ``<@!U…`` of Slack's mention syntax for *user_id*.
+
+    Upstream matches ``/<@!?{id}(?:\\|[^>]*)?>/i`` in one regex. That regex
+    backtracks quadratically on a run of unclosed ``<@id|`` tokens, so
+    :meth:`_MentionMatcher.search` matches this prefix and checks the tail
+    separately; the two accept exactly the same strings. ``re.ASCII`` keeps
+    ``IGNORECASE`` to ASCII case folding, like JS's ``i`` flag without ``u``.
+    """
+    return re.compile(rf"<@!?{re.escape(user_id)}", re.IGNORECASE | re.ASCII)
+
+
+@dataclass(frozen=True)
+class _MentionMatcher:
+    """The bot to look for, compiled once per message (upstream ``mentionMatcher``).
+
+    ``user_id`` is uppercased so a structured ``user`` element compares the
+    way the case-insensitive token pattern matches.
+    """
+
+    prefix: re.Pattern[str]
+    user_id: str
+
+    def search(self, text: str) -> bool:
+        """Whether *text* holds ``<@id>`` or ``<@id|…>`` (upstream ``token.test``).
+
+        ``(?:\\|[^>]*)?>`` after the prefix means: a ``>`` right away, or a
+        ``|`` with any ``>`` later in the text (``[^>]*`` stops at the first).
+        """
+        last_close = text.rfind(">")
+        for match in self.prefix.finditer(text):
+            end = match.end()
+            if end <= last_close and (text[end] == ">" or text[end] == "|"):
+                return True
+        return False
+
+
+def _mention_matcher(user_id: str) -> _MentionMatcher:
+    return _MentionMatcher(prefix=_mention_token_pattern(user_id), user_id=user_id.upper())
+
+
+def _classify_mrkdwn_mention(text: str, matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify a mrkdwn string, where code is carried as backticks."""
+    if not matcher.search(text):
+        return "none"
+    return "mention" if matcher.search(mask_code_spans(text)) else "literal"
+
+
+def _classify_attachment_part(part: _AttachmentPart, matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify one legacy attachment part.
+
+    Literal parts render only Slack control sequences, so a ``<@U…>`` token
+    there is a mention; mrkdwn parts carry code as backticks.
+    """
+    if part.mrkdwn:
+        return _classify_mrkdwn_mention(part.text, matcher)
+    return "mention" if matcher.search(part.text) else "none"
+
+
+def _classify_blocks_mention(blocks: list[Any], matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify how *blocks* refer to the matched user (upstream ``classifyBlocksMention``).
+
+    Slack renders a mention from a ``user`` element, and from a ``<@U…>``
+    token in a text object explicitly typed ``mrkdwn``. A rich-text ``text``
+    element, a link label, and a ``raw_text`` table cell are display text: a
+    token there stays literal. Inline code (``style.code``) and preformatted
+    elements render literally too, whatever they hold.
+
+    Walks with an explicit stack rather than recursion so a deeply nested
+    payload cannot raise ``RecursionError``; the result does not depend on
+    visit order (any mention wins, otherwise any literal).
+    """
+    literal = False
+    stack: list[tuple[Any, bool]] = [(block, False) for block in blocks]
+    while stack:
+        value, in_code = stack.pop()
+        if isinstance(value, list):
+            stack.extend((item, in_code) for item in value)
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        style = value.get("style")
+        is_code = (
+            in_code
+            or value.get("type") == "rich_text_preformatted"
+            or (isinstance(style, dict) and style.get("code") is True)
+        )
+
+        user_id = value.get("user_id")
+        text = value.get("text")
+        if value.get("type") == "user" and isinstance(user_id, str) and user_id.upper() == matcher.user_id:
+            if not is_code:
+                return "mention"
+            literal = True
+        elif isinstance(text, str) and matcher.search(text):
+            if not is_code and value.get("type") == "mrkdwn" and matcher.search(mask_code_spans(text)):
+                return "mention"
+            literal = True
+
+        for key in ("elements", "rows", "fields", "text"):
+            child = value.get(key)
+            if isinstance(child, (list, dict)):
+                stack.append((child, is_code))
+
+    return "literal" if literal else "none"
+
+
+@dataclass(frozen=True)
+class _AttachmentPart:
+    """One piece of legacy attachment text (upstream ``SlackAttachmentPart``).
+
+    ``mrkdwn`` parts go through the format converter (formatting characters
+    are markup); literal parts render as plain text where only Slack control
+    sequences (``<@U…>``, ``<url|label>``, entity escapes) are honored, so
+    literal ``*``/``_``/backticks survive.
+    """
+
+    text: str
+    mrkdwn: bool
+
+
+@dataclass(frozen=True)
+class _TableData:
+    """A table extracted from a Slack table block, one mrkdwn string per cell.
+
+    ``headerless`` is true when the source rows carry no header styling. GFM
+    tables always render their first row as a header, so headerless tables
+    get an empty header row prepended instead of promoting the first data
+    row. Upstream ``SlackTableData``.
+    """
+
+    headerless: bool
+    rows: list[list[str]]
+
+
+@dataclass(frozen=True)
+class _EventTables:
+    """The message's own tables, split by position (upstream ``SlackEventTables``).
+
+    ``leading`` tables appear before any other block and render above the
+    text; ``trailing`` holds all the rest and renders below it.
+    """
+
+    leading: list[_TableData]
+    trailing: list[_TableData]
+
+
+@dataclass(frozen=True)
+class _AttachmentContent:
+    """Renderable content of one attachment (upstream ``SlackAttachmentContent``).
+
+    ``blocks`` is the structured content (when present, Slack renders only
+    the blocks), ``parts`` the legacy text parts and ``tables`` the tables
+    extracted from the blocks.
+    """
+
+    blocks: list[Any]
+    parts: list[_AttachmentPart]
+    tables: list[_TableData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _MentionNames:
+    """Resolved display names for mention tokens (upstream ``SlackMentionNames``)."""
+
+    users: dict[str, str] = field(default_factory=dict)
+    channels: dict[str, str] = field(default_factory=dict)
+
+
+_TABLE_BLOCK_TYPES = frozenset({"table", "data_table"})
+_HTTP_URL_PREFIX_PATTERN = re.compile(r"^https?://")
+
+
+def _str(value: Any) -> str | None:
+    """``value`` when it is a string (upstream ``str``)."""
+    return value if isinstance(value, str) else None
+
+
+def _block_text_leaf(value: Any) -> str | list[Any]:
+    """Render one table-cell element, or return the child list to flatten.
+
+    Returns the element's mrkdwn string, or its ``elements`` list when the
+    element is a container whose text is the join of its children (see
+    :func:`_block_text`). Mirrors upstream ``blocktext`` case by case.
+    """
+    if not (isinstance(value, dict) and isinstance(value.get("type"), str)):
+        return ""
+
+    value_type = value["type"]
+    text = _str(value.get("text"))
+    if value_type == "raw_text":
+        # A raw_text cell is plain text: Slack reserves mentions and links for
+        # rich_text cells, so its control characters render literally. Kept
+        # aligned with ``_classify_blocks_mention``, which does not scan it.
+        # Upstream parity (adapter-slack/src/index.ts:722-726, 7106-7124): only
+        # ``&``/``<``/``>`` are escaped and the cell then goes through the
+        # mrkdwn converter, so ``*``/``_``/``---`` in a raw cell still read as
+        # formatting there too.
+        return escape_slack_text(text or "")
+    if value_type == "link":
+        url = _str(value.get("url"))
+        if not url:
+            return text or ""
+        return f"<{url}|{text}>" if text else f"<{url}>"
+    if value_type == "emoji":
+        name = _str(value.get("name"))
+        return f":{name}:" if name else ""
+    if value_type == "user":
+        user_id = _str(value.get("user_id"))
+        return f"<@{user_id}>" if user_id else ""
+    if value_type == "broadcast":
+        broadcast_range = _str(value.get("range"))
+        return f"@{broadcast_range}" if broadcast_range else ""
+    if value_type == "channel":
+        channel_id = _str(value.get("channel_id"))
+        return f"<#{channel_id}>" if channel_id else ""
+    if value_type == "usergroup":
+        usergroup_id = _str(value.get("usergroup_id"))
+        return f"<!subteam^{usergroup_id}>" if usergroup_id else ""
+    if value_type == "date":
+        fallback = _str(value.get("fallback"))
+        if fallback:
+            return fallback
+        # Format the timestamp rather than leaking the raw format template
+        # (e.g. "{date_num}") when Slack omits the fallback. UTC, like JS
+        # ``toISOString()``; never a naive local date.
+        timestamp = value.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            try:
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                # Outside ``datetime``'s range (upstream ``toISOString`` throws).
+                return ""
+        return ""
+    if value_type == "color":
+        return _str(value.get("value")) or ""
+    if value_type == "team":
+        return _str(value.get("team_id")) or ""
+
+    if text is not None:
+        return text
+    for key in ("label", "url", "file_id"):
+        fallback = _str(value.get(key))
+        if fallback is not None:
+            return fallback
+    # Raw value cells (raw_number, raw_date, raw_currency, raw_percent,
+    # raw_boolean, …) carry a primitive value when text is absent. ``0``,
+    # ``False`` and ``""`` are values, so test the type, never truthiness;
+    # numbers and booleans format like JS ``String()``.
+    raw_value = value.get("value")
+    if isinstance(raw_value, str):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return _js_number_to_string(raw_value)
+    elements = value.get("elements")
+    return elements if isinstance(elements, list) else ""
+
+
+def _block_text(value: Any) -> str:
+    """Flatten a table cell (or any rich text element in one) to mrkdwn.
+
+    Port of upstream ``blocktext``. Mentions, channels and links are emitted
+    as mrkdwn tokens so the format converter renders them the same way it
+    renders body text. Children of ``rich_text`` / ``rich_text_list`` join
+    with ``\\n``; every other container's children join directly.
+
+    Walks with an explicit stack instead of recursing, so a deeply nested
+    cell cannot raise ``RecursionError`` and drop the whole message (the
+    same choice ``_classify_blocks_mention`` makes).
+    """
+    # One frame per open container: its separator and rendered children.
+    frames: list[tuple[str, list[str]]] = [("", [])]
+    work: list[tuple[bool, Any]] = [(False, value)]
+    while work:
+        closing, item = work.pop()
+        if closing:
+            separator, parts = frames.pop()
+            frames[-1][1].append(separator.join(parts))
+            continue
+        rendered = _block_text_leaf(item)
+        if isinstance(rendered, str):
+            frames[-1][1].append(rendered)
+            continue
+        frames.append(("\n" if item["type"] in ("rich_text", "rich_text_list") else "", []))
+        work.append((True, None))
+        work.extend((False, child) for child in reversed(rendered))
+    return "".join(frames[0][1])
+
+
+def _has_bold_text(value: Any) -> bool:
+    """Whether any element in *value* is styled bold (upstream ``hasBoldText``)."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, dict):
+            continue
+        style = item.get("style")
+        if isinstance(style, dict) and style.get("bold") is True:
+            return True
+        elements = item.get("elements")
+        if isinstance(elements, list):
+            stack.extend(elements)
+    return False
+
+
+def _table_data(block: Any) -> _TableData | None:
+    """Parse a ``table`` / ``data_table`` block (upstream ``tableData``)."""
+    if not (isinstance(block, dict) and block.get("type") in _TABLE_BLOCK_TYPES):
+        return None
+    rows = block.get("rows")
+    if not isinstance(rows, list):
+        return None
+
+    source_rows = [row for row in rows if isinstance(row, list) and row]
+    if not source_rows:
+        return None
+
+    # data_table rows always start with a header row (the outbound renderer
+    # relies on this); pasted ``table`` blocks mark headers only via bold
+    # cell styling.
+    headerless = block["type"] == "table" and not any(_has_bold_text(cell) for cell in source_rows[0])
+    return _TableData(headerless=headerless, rows=[[_block_text(cell) for cell in row] for row in source_rows])
+
+
+def _tables_in(blocks: list[Any]) -> list[_TableData]:
+    """The tables parsed from *blocks*, in order, skipping malformed ones."""
+    return [data for data in (_table_data(block) for block in blocks) if data is not None]
+
+
+def _event_tables(event: dict[str, Any]) -> _EventTables:
+    """Collect table blocks from the message's own blocks, split by position.
+
+    Slack flattens all rich text into ``event["text"]``, so exact
+    interleaving can't be reconstructed; tables pasted above the text at
+    least stay above it. Attachment tables are handled per attachment (see
+    :func:`_attachment_content`) so they stay next to their text.
+    """
+    raw_blocks = event.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    split_idx = next(
+        (
+            idx
+            for idx, block in enumerate(blocks)
+            if not (isinstance(block, dict) and block.get("type") in _TABLE_BLOCK_TYPES)
+        ),
+        len(blocks),
+    )
+    return _EventTables(leading=_tables_in(blocks[:split_idx]), trailing=_tables_in(blocks[split_idx:]))
+
+
+def _is_foreign_attachment(attachment: dict[str, Any]) -> bool:
+    """Unfurls carry content that is not the message author's."""
+    return bool(
+        attachment.get("is_msg_unfurl")
+        or attachment.get("is_app_unfurl")
+        or attachment.get("from_url")
+        or attachment.get("original_url")
+    )
+
+
+def _author_attachments(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attachments authored by the message sender, in order.
+
+    Unfurls are excluded everywhere author attachments are read -- content,
+    tables, mention classification and links alike -- because their content
+    is not the author's.
+    """
+    attachments = event.get("attachments")
+    if not isinstance(attachments, list):
+        return []
+    return [a for a in attachments if isinstance(a, dict) and not _is_foreign_attachment(a)]
+
+
+def _attachment_content(attachment: dict[str, Any]) -> _AttachmentContent:
+    """Content of a legacy attachment (upstream ``attachmentContent``).
+
+    Alerting integrations (Sentry, PagerDuty, GitHub) put the real payload in
+    ``pretext``/``title``/``text``/``fields``. Slack renders those as plain
+    text unless they are named in ``mrkdwn_in``; ``title`` is always plain
+    text and links to ``title_link``.
+
+    When the attachment carries table blocks, Slack renders only the blocks
+    and ignores the legacy fields, so no parts are built. Block types that
+    can't be rendered fall back to the legacy fields, and ``fallback`` fills
+    in last, only when nothing else renders.
+    """
+    raw_blocks = attachment.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    tables = _tables_in(blocks)
+    parts: list[_AttachmentPart] = []
+    if tables:
+        return _AttachmentContent(blocks=blocks, parts=parts, tables=tables)
+
+    raw_mrkdwn_in = attachment.get("mrkdwn_in")
+    # Only string entries name fields (``set()`` of a dict entry would raise).
+    mrkdwn_in = {name for name in raw_mrkdwn_in if isinstance(name, str)} if isinstance(raw_mrkdwn_in, list) else set()
+
+    def push(value: Any, mrkdwn: bool) -> None:
+        trimmed = value.strip(JS_WHITESPACE) if isinstance(value, str) else ""
+        if trimmed:
+            parts.append(_AttachmentPart(text=trimmed, mrkdwn=mrkdwn))
+
+    push(attachment.get("pretext"), "pretext" in mrkdwn_in)
+    raw_title = attachment.get("title")
+    title = raw_title.strip(JS_WHITESPACE) if isinstance(raw_title, str) else ""
+    title_link = attachment.get("title_link")
+    if isinstance(title_link, str) and title_link:
+        # Fold the link in as a control sequence so the title renders as a
+        # link node and the URL survives into the normalized message.
+        push(f"<{title_link}|{escape_slack_text(title)}>" if title else f"<{title_link}>", False)
+    else:
+        push(title, False)
+    push(attachment.get("text"), "text" in mrkdwn_in)
+    fields = attachment.get("fields")
+    for entry in fields if isinstance(fields, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        raw_field_title = entry.get("title")
+        raw_value = entry.get("value")
+        field_title = raw_field_title.strip(JS_WHITESPACE) if isinstance(raw_field_title, str) else ""
+        value = raw_value.strip(JS_WHITESPACE) if isinstance(raw_value, str) else ""
+        push(f"{field_title}: {value}" if field_title and value else field_title or value, "fields" in mrkdwn_in)
+
+    if not parts:
+        push(attachment.get("fallback"), False)
+    return _AttachmentContent(blocks=blocks, parts=parts, tables=tables)
+
+
+def _collect_mention_ids(text: str, user_ids: set[str], channel_ids: set[str]) -> None:
+    """Collect the user and channel ids referenced by ``<@U…>`` / ``<#C…>`` tokens.
+
+    Upstream ``collectMentionIds``. Parses by splitting on ``<`` (no regex
+    over user text, so no ReDoS).
+    """
+    for segment in text.split("<"):
+        end = segment.find(">")
+        if end == -1:
+            continue
+        inner = segment[:end]
+        if inner.startswith("@"):
+            rest = inner[1:]
+            pipe_idx = rest.find("|")
+            uid = rest[:pipe_idx] if pipe_idx >= 0 else rest
+            if SLACK_USER_ID_PATTERN.fullmatch(uid):
+                user_ids.add(uid)
+        elif inner.startswith("#"):
+            rest = inner[1:]
+            # Only collect bare channel ids (no label already present)
+            if "|" not in rest and SLACK_USER_ID_PATTERN.fullmatch(rest):
+                channel_ids.add(rest)
+
+
+def _apply_mention_names(text: str, names: _MentionNames) -> str:
+    """Replace ``<@U123>``, ``<@U123|old>`` and ``<#C123>`` with resolved names.
+
+    Upstream ``applyMentionNames``. Tokens without a resolved name are left
+    untouched. Scans with ``str.find`` (no regex over user text, so no ReDoS).
+    Upstream re-slices the remaining text per token, which is quadratic with
+    Python's copying slices; this walks indices instead, with the same output.
+    """
+    if not names.users and not names.channels:
+        return text
+
+    out: list[str] = []
+    pos = 0
+    next_at = text.find("<@")
+    next_hash = text.find("<#")
+    while True:
+        if next_at != -1 and next_at < pos:
+            next_at = text.find("<@", pos)
+        if next_hash != -1 and next_hash < pos:
+            next_hash = text.find("<#", pos)
+        start = max(next_at, next_hash) if next_at == -1 or next_hash == -1 else min(next_at, next_hash)
+        if start == -1:
+            break
+        end = text.find(">", start)
+        if end == -1:
+            break
+        out.append(text[pos:start])
+        prefix = text[start + 1]  # '@' or '#'
+        inner = text[start + 2 : end]
+        pipe_idx = inner.find("|")
+        id_str = inner[:pipe_idx] if pipe_idx >= 0 else inner
+        token = text[start : end + 1]
+        if prefix == "@" and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            name = names.users.get(id_str)
+            out.append(f"<@{id_str}|{name}>" if name else token)
+        elif prefix == "#" and pipe_idx == -1 and id_str in names.channels:
+            out.append(f"<#{id_str}|{names.channels[id_str]}>")
+        else:
+            out.append(token)
+        pos = end + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _content_mention_ids(
+    tables: _EventTables,
+    attachments: list[_AttachmentContent],
+) -> tuple[set[str], set[str]]:
+    """``(user_ids, channel_ids)`` across table cells and attachment parts.
+
+    Upstream ``mentionIds``.
+    """
+    user_ids: set[str] = set()
+    channel_ids: set[str] = set()
+    all_tables = [*tables.leading, *tables.trailing]
+    for attachment in attachments:
+        all_tables.extend(attachment.tables)
+        for part in attachment.parts:
+            _collect_mention_ids(part.text, user_ids, channel_ids)
+    for data in all_tables:
+        for row in data.rows:
+            for cell in row:
+                _collect_mention_ids(cell, user_ids, channel_ids)
+    return user_ids, channel_ids
+
+
+def _literal_phrasing(line: str) -> list[Content]:
+    """Render one line of plain-text Slack content to phrasing nodes.
+
+    Upstream ``literalPhrasing``. Control sequences are honored the way the
+    mrkdwn converter renders them (``<@U…|name>`` -> ``@name``,
+    ``<url|label>`` -> link), but nothing is parsed as markdown, so
+    formatting characters stay literal.
+    """
+    children: list[Content] = []
+    plain: list[str] = []
+
+    def flush_plain() -> None:
+        value = "".join(plain)
+        if value:
+            children.append({"type": "text", "value": unescape_slack_text(value)})
+        plain.clear()
+
+    # Index walk rather than upstream's per-token re-slicing (quadratic with
+    # Python's copying slices); same output.
+    pos = 0
+    while pos < len(line):
+        start = line.find("<", pos)
+        end = -1 if start == -1 else line.find(">", start + 1)
+        if end == -1:
+            plain.append(line[pos:])
+            break
+        plain.append(line[pos:start])
+        token = line[start : end + 1]
+        inner = line[start + 1 : end]
+        pos = end + 1
+
+        pipe_idx = inner.find("|")
+        target = inner if pipe_idx == -1 else inner[:pipe_idx]
+        label = None if pipe_idx == -1 else inner[pipe_idx + 1 :]
+        id_str = target[1:]
+        if target.startswith("@") and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            plain.append(f"@{label if label is not None else id_str}")
+        elif target.startswith("#") and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            plain.append(f"#{label} ({id_str})" if label else f"#{id_str}")
+        elif _HTTP_URL_PREFIX_PATTERN.match(target):
+            flush_plain()
+            link_text = unescape_slack_text(label) if label else target
+            children.append({"type": "link", "url": target, "children": [{"type": "text", "value": link_text}]})
+        else:
+            plain.append(token)
+    flush_plain()
+    return children
+
+
+# Slack platform errors meaning the workspace will never accept the native
+# streaming methods (as opposed to transient or request-specific failures).
+# Upstream ``NATIVE_STREAMING_UNSUPPORTED_ERRORS`` (vercel/chat 0f743c9b).
+_NATIVE_STREAMING_UNSUPPORTED_ERRORS = frozenset({"feature_not_enabled", "method_deprecated", "unknown_method"})
+
+
+def _slack_platform_error_code(error: BaseException) -> str | None:
+    """Return the Slack platform error code (``response["error"]``) or ``None``.
+
+    Upstream ``slackPlatformErrorCode``. slack_sdk raises ``SlackApiError``
+    with a ``response`` (a ``SlackResponse`` whose ``data`` dict holds
+    ``error``). Read by shape, as ``_handle_slack_error`` does, because
+    slack_sdk is an optional dependency. Network errors, timeouts and
+    ``SlackRequestError`` carry no response, so they return ``None``.
+    """
+    resp = getattr(error, "response", None)
+    data = getattr(resp, "data", None)
+    body = data if isinstance(data, dict) else resp
+    if isinstance(body, dict):
+        code = body.get("error")
+        if isinstance(code, str) and code:
+            return code
+    return None
+
+
+def _monotonic_ms() -> float:
+    """Monotonic clock in ms for stream timing (patched in tests).
+
+    Drives the post+edit fallback throttle and the native stream segment age.
+    Monotonic rather than wall-clock (upstream ``Date.now()``) so a system
+    clock change can't trigger or suppress a segment rotation.
+    """
+    return time.monotonic() * 1000
+
+
+# Native stream rotation (vercel/chat d4a1f03a, #884). Slack expires a native
+# stream about five minutes after it starts, so a long reply is finalized and
+# continued in a new message once its segment reaches the max age.
+# Default lifetime of one native stream segment before it is rotated.
+_DEFAULT_STREAM_SEGMENT_MAX_AGE_MS = 240_000
+# Once a segment is past its max age, rotation waits up to this long for a
+# paragraph break so a paragraph, list, or table is not split across two
+# messages. The default max age plus this grace stays below Slack's roughly
+# five-minute stream expiry.
+_STREAM_SEGMENT_ROTATION_GRACE_MS = 30_000
+# Slack's error for appending to or stopping a stream it already expired.
+_STREAM_EXPIRED_ERROR = "message_not_in_streaming_state"
+# The patterns below are upstream's, with JS semantics kept: ``.`` excludes
+# every JS line terminator (Python's would match ``\r``, U+2028, U+2029) and
+# ``\Z`` is JS ``$`` without the ``m`` flag (Python's ``$`` also matches before
+# a trailing ``\n``), and ``_JS_SPACE`` is JS ``\s`` (Python's ``\s`` also
+# matches U+001C..U+001F and U+0085 but not U+FEFF).
+_JS_SPACE = re.escape(JS_WHITESPACE)
+_JS_DOT = "[^\n\r  ]"
+# Fenced code block delimiter: up to three spaces, then 3+ backticks or tildes.
+_FENCE_LINE_PATTERN = re.compile(rf"^ {{0,3}}(`{{3,}}|~{{3,}})({_JS_DOT}*)\Z")
+_TABLE_ROW_PATTERN = re.compile(rf"^\|{_JS_DOT}*\|\Z")
+_TABLE_SEPARATOR_PATTERN = re.compile(
+    rf"^\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*(?:\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*)*\|\Z"
+)
+
+
+@dataclass(frozen=True)
+class _OpenFence:
+    """An open fenced code block (upstream ``OpenFence``)."""
+
+    # The fence run that opened the block, e.g. "```" or "~~~~".
+    marker: str
+    # The full opening line (marker plus info string), used to reopen it.
+    opening: str
+
+
+class _FenceTracker:
+    """Track fenced code block state line by line, CommonMark style.
+
+    A fence closes only on a run of the same character at least as long as
+    its opener with nothing but whitespace after it; other fence-looking
+    lines inside the block are literal content. Upstream ``FenceTracker``.
+    """
+
+    def __init__(self, open_fence: _OpenFence | None = None) -> None:
+        self.open: _OpenFence | None = open_fence
+
+    def feed(self, line: str) -> bool:
+        """Feed one complete line (without its newline).
+
+        Returns ``True`` when the line opened or closed a fence.
+        """
+        match = _FENCE_LINE_PATTERN.match(line)
+        if match is None:
+            return False
+        marker, info = match.group(1), match.group(2)
+        if self.open is not None:
+            if (
+                marker[0] == self.open.marker[0]
+                and len(marker) >= len(self.open.marker)
+                and info.strip(JS_WHITESPACE) == ""
+            ):
+                self.open = None
+                return True
+            return False
+        # A backtick fence's info string cannot contain backticks.
+        if marker[0] == "`" and "`" in info:
+            return False
+        self.open = _OpenFence(marker=marker, opening=line.rstrip(JS_WHITESPACE))
+        return True
+
+
+def _open_fence_in(text: str) -> _OpenFence | None:
+    """The code fence left open at the end of *text*, if any.
+
+    A trailing partial line is fed too: the streaming renderer only commits
+    partial lines inside a fence, so it is either literal content or a
+    closing delimiter. Upstream ``openFenceIn``.
+    """
+    tracker = _FenceTracker()
+    for line in text.split("\n"):
+        tracker.feed(line)
+    return tracker.open
+
+
+def _closes_fence(fence: _OpenFence, line: str) -> bool:
+    """Whether *line*, appended after a line break, would close *fence*."""
+    return _FenceTracker(fence).feed(line)
+
+
+def _segment_cut_index(text: str) -> int:
+    """Index in *text* to cut a stream segment at.
+
+    After the last paragraph break when there is one, otherwise after the
+    last line break (0 when none). Upstream ``segmentCutIndex``.
+    """
+    paragraph_break = text.rfind("\n\n")
+    if paragraph_break != -1:
+        return paragraph_break + 2
+    return text.rfind("\n") + 1
+
+
+def _table_continuation(text: str) -> str:
+    """The header and separator rows of a GFM table *text* ends inside.
+
+    Each row is newline-terminated, so the rows that follow in a new segment
+    still render as a table. Empty when *text* does not end inside a
+    confirmed table. Upstream ``tableContinuation``.
+    """
+    if not text.endswith("\n"):
+        return ""
+    lines = text.split("\n")
+    lines.pop()
+    rows: list[str] = []
+    for line in reversed(lines):
+        if not _TABLE_ROW_PATTERN.match(line.strip(JS_WHITESPACE)):
+            break
+        rows.insert(0, line)
+    separator_at = next(
+        (index for index, row in enumerate(rows) if _TABLE_SEPARATOR_PATTERN.match(row.strip(JS_WHITESPACE))),
+        -1,
+    )
+    if separator_at < 1:
+        return ""
+    return f"{rows[separator_at - 1]}\n{rows[separator_at]}\n"
+
+
+def _response_ts(response: Any) -> str | None:
+    """The ``ts`` of a Slack Web API response (dict or ``SlackResponse``).
+
+    Read by shape, as ``_slack_platform_error_code`` does: a ``SlackResponse``
+    keeps the parsed body in its ``data`` dict.
+    """
+    body = response if isinstance(response, dict) else getattr(response, "data", None)
+    if not isinstance(body, dict):
+        return None
+    ts = body.get("ts")
+    return ts if isinstance(ts, str) and ts else None
+
+
+@dataclass
+class _StreamSegment:
+    """One native Slack stream (a "segment") of a reply (upstream ``segment``)."""
+
+    streamer: Any
+    # Stamped by the first call Slack accepts on the segment, which is when
+    # Slack's expiry clock starts; until then the streamer only buffers text.
+    started_at: float | None = None
+    # Flush the next text append immediately instead of buffering it, so a
+    # segment opened by rotation becomes visible with its first text.
+    flush_next_append: bool = False
+    # Code fence opening line to send before the segment's first text, when
+    # the previous segment was cut inside a fenced block.
+    reopen_fence: str = ""
+    # Table header and separator rows to send before the segment's first
+    # text if that text continues the table cut by the previous segment.
+    table_header: str = ""
+    # The message ts from the first response Slack returned. Python-specific:
+    # upstream reads the public ``streamer.ts``, which slack_sdk only exposes
+    # from 3.43.0 (earlier releases keep it in the private ``_stream_ts``)
+    # while the floor is 3.40.0. ``streamer.ts`` can replace this once the
+    # floor reaches 3.43.0.
+    ts: str | None = None
 
 
 def _normalize_bot_token_provider(
@@ -425,18 +1291,26 @@ class SlackAdapter:
                 "or provide a webhook_verifier.",
             )
 
-        # Auth fields: botToken presence selects single-workspace mode.
-        # Explicit ``is not None`` to mirror the truthiness-trap rule above:
-        # an explicit empty string for any of these should still count as
-        # "config provided" and disable the env-fallback path. ``app_token``
-        # also participates (so socket-mode-only configs disable env fallbacks
-        # for the other secrets the same way bot-token-only configs do).
+        # Auth fields: botToken presence selects single-workspace mode. Fall
+        # back to SLACK_BOT_TOKEN / SLACK_CLIENT_ID / SLACK_CLIENT_SECRET only
+        # when the caller passed no auth or verification field — upstream
+        # ``createSlackAdapter``'s ``noAuthConfig`` set (vercel/chat 1721fa01),
+        # so non-auth options (``agent_view``, ``mode``, ``app_token``,
+        # ``logger``, ...) keep env auth detection, while an explicit auth
+        # setup (including a signing_secret-only multi-workspace config) is
+        # never mixed with ambient env auth. Python has one env-fallback site
+        # (``create_slack_adapter`` is a thin wrapper), so this is also the
+        # constructor rule. Explicit ``is not None`` (not upstream's
+        # truthiness): an explicit empty string still counts as "config
+        # provided" (hazard #1).
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md
         zero_config = (
             config.signing_secret is None
             and config.bot_token is None
             and config.client_id is None
             and config.client_secret is None
-            and config.app_token is None
+            and config.installation_provider is None
+            and config.webhook_verifier is None
         )
 
         bot_token_config: SlackBotToken | None = config.bot_token
@@ -468,6 +1342,21 @@ class SlackAdapter:
         bot_token_provider = _normalize_bot_token_provider(bot_token_config)
 
         self._name = "slack"
+        # Native streaming switch (upstream ``nativeStreaming``, vercel/chat
+        # 0f743c9b). ``_native_streaming_broken`` latches when the workspace
+        # rejects the native methods with an error that won't heal, so later
+        # streams go straight to post+edit. It is per adapter instance, which
+        # multi-workspace mode shares across workspaces (as upstream).
+        self._native_streaming: bool = config.native_streaming
+        self._native_streaming_broken: bool = False
+        # Zero, negative and NaN would make every flush rotate; ``math.inf``
+        # means never rotate (upstream ``streamSegmentMaxAgeMs``).
+        segment_max_age = config.stream_segment_max_age_ms
+        self._stream_segment_max_age_ms: float = (
+            segment_max_age
+            if segment_max_age is not None and not math.isnan(segment_max_age) and segment_max_age > 0
+            else _DEFAULT_STREAM_SEGMENT_MAX_AGE_MS
+        )
         self._signing_secret: str | None = signing_secret
         # ``webhook_verifier`` takes precedence; ``signing_secret`` is only used
         # when no verifier is configured (matches upstream vercel/chat#468).
@@ -545,6 +1434,17 @@ class SlackAdapter:
         # a read.
         self._socket_connect_timeout_s: float = config.connect_timeout_s
         self._logger: Logger = config.logger or ConsoleLogger("info")
+        # Agent messaging experience + declarative agent config (vercel/chat
+        # 1721fa01 #684, 0f743c9b #698). All default off.
+        self._agent_view: bool = config.agent_view
+        self._suggested_prompts: SlackSuggestedPrompts | None = config.suggested_prompts
+        self._loading_messages: list[str] | None = config.loading_messages
+        # Normalized feedback_buttons config (``True`` becomes the defaults).
+        self._feedback_buttons: SlackFeedbackButtonsOptions | None = None
+        if config.feedback_buttons:
+            self._feedback_buttons = (
+                SlackFeedbackButtonsOptions() if config.feedback_buttons is True else config.feedback_buttons
+            )
         self._user_name: str = config.user_name or "bot"
         self._bot_user_id: str | None = config.bot_user_id or None
         self._bot_id: str | None = None  # Bot app ID (B_xxx)
@@ -2042,8 +2942,19 @@ class SlackAdapter:
             self._handle_assistant_thread_started(event, options)
         elif event_type == "assistant_thread_context_changed":
             self._handle_assistant_context_changed(event, options)
-        elif event_type == "app_home_opened" and event.get("tab") == "home":
-            self._handle_app_home_opened(event, options)
+        elif event_type == "app_context_changed":
+            self._handle_app_context_changed(event, options)
+        elif event_type == "app_home_opened":
+            # Under agent_view, app_home_opened is the DM-open signal and fires
+            # for every tab; otherwise only the Home tab is dispatched.
+            if self._agent_view or event.get("tab") == "home":
+                # ``authorizations[0].team_id || team_id`` (vercel/chat#889).
+                authorizations = payload.get("authorizations")
+                first_auth = authorizations[0] if isinstance(authorizations, list) and authorizations else None
+                team_id = (first_auth.get("team_id") if isinstance(first_auth, dict) else None) or payload.get(
+                    "team_id"
+                )
+                self._handle_app_home_opened(event, options, team_id or None)
         elif event_type == "member_joined_channel":
             self._handle_member_joined_channel(event, options)
         elif event_type == "user_change":
@@ -2772,7 +3683,7 @@ class SlackAdapter:
             return
 
         # ``retry_attempt`` feeds the event_id retry marker. While the skip
-        # above stays (#209 replaces it with upstream's "process retries"),
+        # above stays (#283 replaces it with upstream's "process retries"),
         # only forwarded socket events reach the marker with a retry count.
         await self._route_socket_event(payload, event_type, ack, retry_num=_parse_retry_num(retry_attempt))
 
@@ -2981,6 +3892,9 @@ class SlackAdapter:
         if subtype == "message_changed":
             self._handle_message_changed(event, options)
             return
+        if subtype == "message_deleted":
+            self._handle_message_deleted(event, options)
+            return
         if subtype and subtype in _IGNORED_SUBTYPES:
             self._logger.debug("Ignoring message subtype", {"subtype": subtype})
             return
@@ -2992,20 +3906,132 @@ class SlackAdapter:
             )
             return
 
-        # DMs: top-level messages use empty threadTs
+        # See _thread_id_for_message_event for the DM/channel rule. Under
+        # agent_view a subscribed conversation-scoped open_dm ID takes over;
+        # see the bridge below.
         is_dm = event.get("channel_type") == "im"
-        thread_ts = (event.get("thread_ts") or "") if is_dm else (event.get("thread_ts") or event.get("ts", ""))
-        thread_id = self.encode_thread_id(SlackThreadId(channel=event["channel"], thread_ts=thread_ts))
+        thread_id = self._thread_id_for_message_event(event)
 
-        is_mention = event.get("type") == "app_mention"
+        # ``is_mention`` comes from the message content (``_detect_self_mention``):
+        # Slack fires ``app_mention`` even for a bot id inside code, so the
+        # event type alone is not trusted (upstream vercel/chat#947).
+        def make_factory(target_thread_id: str) -> Callable[[], Awaitable[Message]]:
+            async def factory() -> Message:
+                return await self._parse_slack_message(event, target_thread_id)
 
-        async def factory() -> Message:
-            msg = await self._parse_slack_message(event, thread_id)
-            if is_mention:
-                msg.is_mention = True
-            return msg
+            return factory
 
-        self._chat.process_message(self, thread_id, factory, options)
+        # Under agent_view each top-level DM message is its own thread root,
+        # which would silently bypass subscriptions created on the
+        # conversation-scoped thread ID that open_dm() returns (slack:{D}:).
+        # Bridge: when that ID is subscribed, route the message to it so
+        # on_subscribed_message and per-thread state keep working.
+        if self._agent_view and is_dm and not event.get("thread_ts"):
+            self._bridge_agent_view_dm(event, thread_id, make_factory, options)
+            return
+
+        self._chat.process_message(self, thread_id, make_factory(thread_id), options)
+
+    def _bridge_agent_view_dm(
+        self,
+        event: dict[str, Any],
+        thread_id: str,
+        make_factory: Callable[[str], Callable[[], Awaitable[Message]]],
+        options: WebhookOptions | None,
+    ) -> None:
+        """Route a top-level agent_view DM to a subscribed ``slack:{D}:`` thread.
+
+        Port of upstream's bridge task in ``handleMessageEvent``
+        (vercel/chat 1721fa01, c21ccbc0). The task is created here,
+        synchronously, so it copies the current context (the multi-workspace
+        token ContextVar set by ``handle_webhook``); a shielded view of it is
+        handed to ``wait_until``.
+        """
+        chat = self._chat
+        if chat is None:
+            return
+        conversation_thread_id = self.encode_thread_id(SlackThreadId(channel=event["channel"], thread_ts=""))
+
+        async def _bridge() -> None:
+            routed_thread_id = thread_id
+            try:
+                if await chat.get_state().is_subscribed(conversation_thread_id):
+                    routed_thread_id = conversation_thread_id
+            except Exception as error:
+                self._logger.warn(
+                    "agent_view DM subscription check failed; using per-message thread",
+                    {"error": str(error), "threadId": thread_id},
+                )
+            try:
+                task = chat.process_message(self, routed_thread_id, make_factory(routed_thread_id), options)
+                if task is not None:
+                    await task
+            except Exception as error:
+                self._logger.warn(
+                    "Agent view DM processing failed",
+                    {"error": error, "threadId": routed_thread_id},
+                )
+                # vercel/chat c21ccbc0: re-raise only when the host opted in
+                # and has a wait_until to observe the failure.
+                if options is not None and options.propagate_handler_errors and options.wait_until is not None:
+                    raise
+            # Hook for #215 (Agent Sessions): upstream applies the configured
+            # session title here (``applyConfiguredSessionTitle``).
+
+        try:
+            bridge = asyncio.get_running_loop().create_task(_bridge())
+        except RuntimeError:
+            return  # No running event loop
+        # Upstream parity: like upstream's bridge promise (index.ts:3488-3527)
+        # and this adapter's other fire-and-forget tasks, the bridge is not
+        # tracked by ``disconnect()`` (upstream index.ts:3395-3401 only stops
+        # Socket Mode). If shutdown races it, ``process_message`` fails against
+        # the closed state and the error is logged above.
+        _pin_task(bridge)
+        bridge.add_done_callback(self._log_agent_view_bridge_result)
+        if options is not None and options.wait_until is not None:
+            # Python-specific: upstream's promise cannot be cancelled, an
+            # asyncio task can. wait_until gets a shielded view, so a host
+            # cancelling it (after the webhook already returned 200) cannot
+            # drop the DM before process_message runs. A handler error the
+            # bridge re-raises still reaches the host through it.
+            options.wait_until(asyncio.shield(bridge))
+
+    def _log_agent_view_bridge_result(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback for the agent_view DM bridge: retrieve and log its outcome.
+
+        The bridge only fails when it re-raises a handler error for a host
+        that set ``propagate_handler_errors`` (that host awaits it via
+        ``wait_until``); retrieving the exception here keeps asyncio from
+        reporting it as never retrieved.
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._logger.debug("Agent view DM bridge re-raised a handler error", {"error": str(error)})
+
+    def _thread_id_for_message_event(self, event: dict[str, Any]) -> str:
+        """Thread ID for a message-shaped event (upstream ``threadIdForMessageEvent``).
+
+        Single source of truth for how message, edit and delete events map
+        onto a thread: they must agree, or an edit dispatches to a different
+        thread than the message it edits.
+
+        Channels: ``thread_ts`` or ``ts`` (per-thread IDs). DMs without
+        agent_view: ``thread_ts`` or ``""`` (top-level DMs share the
+        conversation-scoped ``slack:{D}:`` thread, matching openDM
+        subscriptions). DMs under agent_view follow Slack's new model, where
+        each user message is a thread root: ``thread_ts`` or ``ts``. Upstream
+        uses ``||`` here, so an empty ``thread_ts`` falls through to ``ts``
+        (hence ``or``, not ``is not None``).
+        """
+        is_dm = event.get("channel_type") == "im"
+        if is_dm and not self._agent_view:
+            thread_ts = event.get("thread_ts") or ""
+        else:
+            thread_ts = event.get("thread_ts") or event.get("ts") or ""
+        return self.encode_thread_id(SlackThreadId(channel=event.get("channel") or "", thread_ts=thread_ts))
 
     # ==================================================================
     # Reaction events
@@ -3122,6 +4148,21 @@ class SlackAdapter:
 
         thread_id = self.encode_thread_id(SlackThreadId(channel=channel_id, thread_ts=thread_ts))
 
+        # Apply configured suggested prompts for the new assistant thread
+        # (vercel/chat 0f743c9b). The task is created inside the request scope
+        # so the multi-workspace token context propagates; it catches
+        # internally, so it is safe without a wait_until.
+        self._schedule_configured_suggested_prompts(
+            SlackSuggestedPromptsContext(
+                channel_id=channel_id,
+                user_id=user_id,
+                enterprise_id=context.get("enterprise_id"),
+                team_id=context.get("team_id"),
+                thread_ts=thread_ts,
+            ),
+            options,
+        )
+
         self._chat.process_assistant_thread_started(
             AssistantThreadStartedEvent(
                 adapter=self,
@@ -3179,16 +4220,67 @@ class SlackAdapter:
     # App home / member joined
     # ==================================================================
 
-    def _handle_app_home_opened(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+    def _handle_app_home_opened(
+        self,
+        event: dict[str, Any],
+        options: WebhookOptions | None = None,
+        team_id: str | None = None,
+    ) -> None:
         if not self._chat:
             self._logger.warn("Chat instance not initialized, ignoring app_home_opened")
             return
+
+        # Upstream ``event.context ? {entities} : {}``: entities only when the
+        # event folds in a context (JS truthiness, so ``{}`` counts).
+        context = event.get("context")
+        entities = normalize_app_context_entities(context) if _js_truthy(context) else None
+
+        # Under agent_view, a Messages-tab open is the thread-open signal:
+        # apply configured suggested prompts without thread_ts (they pin at
+        # the top of the agent conversation). Legacy assistant_view prompts
+        # flow through assistant_thread_started instead.
+        if self._agent_view and event.get("tab") == "messages":
+            self._schedule_configured_suggested_prompts(
+                SlackSuggestedPromptsContext(
+                    channel_id=event.get("channel", ""),
+                    user_id=event.get("user", ""),
+                    team_id=team_id,
+                    # Normalized again, as upstream does (index.ts:4049-4062):
+                    # the resolver and the app_home_opened handlers must not
+                    # share (and so mutate) one entities list.
+                    entities=normalize_app_context_entities(context) if _js_truthy(context) else None,
+                ),
+                options,
+            )
 
         self._chat.process_app_home_opened(
             AppHomeOpenedEvent(
                 adapter=self,
                 user_id=event.get("user", ""),
                 channel_id=event.get("channel", ""),
+                tab=event.get("tab"),
+                entities=entities,
+            ),
+            options,
+        )
+
+    def _handle_app_context_changed(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Handle ``app_context_changed`` (Slack Agent messaging experience).
+
+        Reports the user's current active view via normalized entities; a
+        missing ``context`` yields ``[]``.
+        """
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring app_context_changed")
+            return
+
+        self._chat.process_app_context_changed(
+            AppContextChangedEvent(
+                adapter=self,
+                channel_id=event.get("channel", ""),
+                user_id=event.get("user", ""),
+                entities=normalize_app_context_entities(event.get("context")),
+                raw=event,
             ),
             options,
         )
@@ -3240,20 +4332,92 @@ class SlackAdapter:
     async def set_suggested_prompts(
         self,
         channel_id: str,
-        thread_ts: str,
+        thread_ts: str | None,
         prompts: list[dict[str, str]],
         title: str | None = None,
     ) -> None:
-        """Set suggested prompts for an assistant thread."""
+        """Set suggested prompts for an assistant thread.
+
+        ``thread_ts`` is optional under the Agent messaging experience
+        (agent_view), where prompts sit at the top of the agent conversation
+        without a thread; it is omitted from the request when falsy.
+        """
         client = self._get_client()
-        kwargs: dict[str, Any] = {
+        payload: dict[str, Any] = {
             "channel_id": channel_id,
-            "thread_ts": thread_ts,
             "prompts": prompts,
         }
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
         if title:
-            kwargs["title"] = title
-        await client.assistant_threads_setSuggestedPrompts(**self._with_token_kwargs(**kwargs))
+            payload["title"] = title
+        # Python-specific: go through ``api_call`` (what the generated
+        # ``assistant_threads_setSuggestedPrompts`` sends) because that helper
+        # requires ``thread_ts`` before slack-sdk 3.43.0, which is newer than
+        # the ``slack-sdk>=3.40.0`` floor.
+        await client.api_call(
+            api_method="assistant.threads.setSuggestedPrompts", json=self._with_token_kwargs(**payload)
+        )
+
+    def _schedule_configured_suggested_prompts(
+        self, context: SlackSuggestedPromptsContext, options: WebhookOptions | None
+    ) -> None:
+        """Start ``_apply_configured_suggested_prompts`` and hand it to ``wait_until``.
+
+        Called synchronously from the event handlers, so the task copies the
+        request context (multi-workspace token). As upstream, the task is
+        created (and handed to ``wait_until``) even when ``suggested_prompts``
+        is unset; it then returns immediately.
+        """
+        try:
+            task = asyncio.get_running_loop().create_task(self._apply_configured_suggested_prompts(context))
+        except RuntimeError:
+            return  # No running event loop
+        # Upstream parity: not tracked by ``disconnect()`` (see the bridge).
+        _pin_task(task)
+        if options is not None and options.wait_until is not None:
+            # Shielded, as for the agent_view DM bridge: a host cancelling its
+            # wait_until task must not cancel the (uncancellable upstream) work.
+            options.wait_until(asyncio.shield(task))
+
+    async def _apply_configured_suggested_prompts(self, context: SlackSuggestedPromptsContext) -> None:
+        """Resolve and apply the configured ``suggested_prompts`` for a newly opened thread.
+
+        Errors are logged, never raised: this runs on the webhook path,
+        where a failure must not turn into a 500.
+        """
+        configured = self._suggested_prompts
+        if configured is None:
+            return
+        try:
+            if callable(configured):
+                resolved = configured(context)
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+            else:
+                resolved = configured
+            # As upstream (``!resolved || resolved.prompts.length === 0``):
+            # ``None`` or an empty prompt list skips the thread.
+            if resolved is None or not resolved.prompts:
+                return
+            prompts = list(resolved.prompts)
+            if len(prompts) > _MAX_SUGGESTED_PROMPTS:
+                self._logger.warn(
+                    f"Slack shows at most {_MAX_SUGGESTED_PROMPTS} suggested prompts; dropping the rest",
+                    {"configured": len(prompts)},
+                )
+                prompts = prompts[:_MAX_SUGGESTED_PROMPTS]
+            await self.set_suggested_prompts(
+                context.channel_id,
+                context.thread_ts,
+                cast("list[dict[str, str]]", prompts),
+                resolved.title,
+            )
+        except Exception as error:
+            self._logger.warn(
+                "Failed to apply configured suggested prompts",
+                {"channelId": context.channel_id, "error": error},
+            )
 
     async def set_assistant_status(
         self,
@@ -3262,15 +4426,20 @@ class SlackAdapter:
         status: str,
         loading_messages: list[str] | None = None,
     ) -> None:
-        """Set status/thinking indicator for an assistant thread."""
+        """Set status/thinking indicator for an assistant thread.
+
+        When ``loading_messages`` is omitted (``None``), falls back to the
+        adapter-level ``loading_messages`` config (vercel/chat 0f743c9b).
+        """
         client = self._get_client()
         kwargs: dict[str, Any] = {
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "status": status,
         }
-        if loading_messages:
-            kwargs["loading_messages"] = loading_messages
+        effective_loading_messages = loading_messages if loading_messages is not None else self._loading_messages
+        if effective_loading_messages:
+            kwargs["loading_messages"] = effective_loading_messages
         await client.assistant_threads_setStatus(**self._with_token_kwargs(**kwargs))
 
     async def set_assistant_title(self, channel_id: str, thread_ts: str, title: str) -> None:
@@ -3284,75 +4453,36 @@ class SlackAdapter:
     # Mention resolution
     # ==================================================================
 
-    async def _resolve_inline_mentions(self, text: str, skip_self_mention: bool) -> str:
+    async def _resolve_inline_mentions(self, text: str) -> str:
         """Resolve inline user/channel mentions to display names.
 
         Converts ``<@U123>`` to ``<@U123|displayName>`` so downstream parsers
-        render them as ``@displayName`` instead of ``@U123``.
+        render them as ``@displayName`` instead of ``@U123``. The bot's own
+        mention is decoded too (upstream vercel/chat#891):
+        :meth:`_detect_self_mention` classifies it from the raw event before
+        the id markup is replaced.
         """
         user_ids: set[str] = set()
         channel_ids: set[str] = set()
+        _collect_mention_ids(text, user_ids, channel_ids)
+        names = await self._lookup_mention_names(user_ids, channel_ids)
+        return _apply_mention_names(text, names)
 
-        for segment in text.split("<"):
-            end = segment.find(">")
-            if end == -1:
-                continue
-            inner = segment[:end]
-            if inner.startswith("@"):
-                rest = inner[1:]
-                pipe_idx = rest.find("|")
-                uid = rest[:pipe_idx] if pipe_idx >= 0 else rest
-                if SLACK_USER_ID_PATTERN.match(uid):
-                    user_ids.add(uid)
-            elif inner.startswith("#"):
-                rest = inner[1:]
-                pipe_idx = rest.find("|")
-                if pipe_idx == -1 and SLACK_USER_ID_PATTERN.match(rest):
-                    channel_ids.add(rest)
-
+    async def _lookup_mention_names(self, user_ids: set[str], channel_ids: set[str]) -> _MentionNames:
+        """Look up display names for collected mention ids in one parallel wave."""
         if not user_ids and not channel_ids:
-            return text
+            return _MentionNames()
 
-        if skip_self_mention and self._bot_user_id:
-            user_ids.discard(self._bot_user_id)
-
-        if not user_ids and not channel_ids:
-            return text
-
-        # Look up all mentioned users and channels in parallel
+        users = list(user_ids)
+        channels = list(channel_ids)
         user_lookups, channel_lookups = await asyncio.gather(
-            asyncio.gather(*(self._lookup_user_name(uid) for uid in user_ids)),
-            asyncio.gather(*(self._lookup_channel_name(cid) for cid in channel_ids)),
+            asyncio.gather(*(self._lookup_user_name(uid) for uid in users)),
+            asyncio.gather(*(self._lookup_channel_name(cid) for cid in channels)),
         )
-
-        user_name_map = dict(zip(user_ids, user_lookups, strict=False))
-        channel_name_map = dict(zip(channel_ids, channel_lookups, strict=False))
-
-        # Replace mentions using split-based approach (no ReDoS)
-        result = ""
-        remaining = text
-        start_idx = _find_next_mention(remaining)
-        while start_idx != -1:
-            result += remaining[:start_idx]
-            remaining = remaining[start_idx:]
-            end_idx = remaining.find(">")
-            if end_idx == -1:
-                break
-            prefix = remaining[1]  # '@' or '#'
-            inner = remaining[2:end_idx]
-            pipe_idx = inner.find("|")
-            id_str = inner[:pipe_idx] if pipe_idx >= 0 else inner
-            if prefix == "@" and SLACK_USER_ID_PATTERN.match(id_str):
-                name = user_name_map.get(id_str)
-                result += f"<@{id_str}|{name}>" if name else f"<@{id_str}>"
-            elif prefix == "#" and pipe_idx == -1 and id_str in channel_name_map:
-                name = channel_name_map[id_str]
-                result += f"<#{id_str}|{name}>"
-            else:
-                result += remaining[: end_idx + 1]
-            remaining = remaining[end_idx + 1 :]
-            start_idx = _find_next_mention(remaining)
-        return result + remaining
+        return _MentionNames(
+            users=dict(zip(users, user_lookups, strict=True)),
+            channels=dict(zip(channels, channel_lookups, strict=True)),
+        )
 
     async def _lookup_user_name(self, user_id: str) -> str:
         """Look up a user's display name (helper for parallel resolution)."""
@@ -3480,6 +4610,18 @@ class SlackAdapter:
                     "site_name": att.get("service_name"),
                 }
                 urls.add(att_url)
+            # Alert attachments link their title (e.g. the Sentry issue URL);
+            # surface it so handlers can reach what the Slack UI links to.
+            # Upstream parity (adapter-slack/src/index.ts:4466-4470): the
+            # preview carries no title, so on a webhook ``_enrich_links`` may
+            # wait for an unfurl like it does for any untitled link. Fetched
+            # (history) messages wait too, but only because of the Python
+            # ``_unfurl_channel_for`` fallback (upstream returns at once there,
+            # index.ts:4704); that applies to every untitled link and is
+            # tracked with that divergence in docs/UPSTREAM_SYNC.md (#292).
+            title_link = att.get("title_link")
+            if isinstance(title_link, str) and title_link and not _is_foreign_attachment(att):
+                urls.add(title_link)
 
         previews: list[LinkPreview] = []
         for url in urls:
@@ -3520,29 +4662,128 @@ class SlackAdapter:
             fetch_message=preview.fetch_message,
         )
 
-    def _handle_message_changed(self, event: dict[str, Any], _options: WebhookOptions | None = None) -> None:
-        """Cache unfurl metadata from ``message_changed`` events.
+    def _handle_message_changed(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Handle a ``message_changed`` event (upstream ``handleMessageChanged``).
 
-        Slack delivers link unfurls asynchronously by editing the original
-        message and dispatching ``message_changed``. We extract any unfurl
-        attachments and store them keyed by the inner message ``ts`` so
-        :meth:`_enrich_links` can pick them up for the original event.
+        Caches link-unfurl metadata as a side step (Slack delivers unfurls by
+        editing the original message), then dispatches real edits to
+        ``process_message_updated``. Unfurl-only updates, hidden thread
+        metadata updates, language-detection updates with no content change
+        and ``tombstone`` replacements are not reported as edits.
         """
         inner = event.get("message")
         channel = event.get("channel")
-        if not (inner and channel and isinstance(inner, dict)):
+        if not (isinstance(inner, dict) and channel):
             return
 
-        attachments = inner.get("attachments") or []
+        normalized = _with_inherited(
+            inner,
+            channel=channel,
+            channel_type=event.get("channel_type"),
+            team=event.get("team"),
+            team_id=event.get("team_id"),
+            type="message",
+        )
+
+        # Slack does not document ``tombstone`` and upstream has no captured
+        # payload for it, so it is not claimed to mean "deleted". It arrives
+        # with a ``previous_message`` and changed text, so it would otherwise
+        # pass the hidden-edit check below.
+        if inner.get("subtype") == "tombstone":
+            self._logger.debug("Ignoring tombstone message_changed")
+            return
+
+        self._cache_unfurls_from_message_changed(channel, inner)
+
+        previous = event.get("previous_message")
+        has_previous = isinstance(previous, dict)
+        is_hidden_message_edit = isinstance(previous, dict) and (
+            _edited_ts(inner) != _edited_ts(previous) or inner.get("text") != previous.get("text")
+        )
+
+        # Slack link unfurls arrive as hidden message_changed events. Some
+        # real edits are hidden too, but they carry a previous snapshot and
+        # changed content/edit metadata. Hidden thread metadata updates after
+        # deletes carry neither change, so they are ignored here.
+        if event.get("hidden") is True and not is_hidden_message_edit:
+            return
+
+        # Slack's automatic language detection updates locale metadata and
+        # dispatches message_changed without touching the message.
+        if has_previous and not is_hidden_message_edit:
+            self._logger.debug("Ignoring message_changed with no content change")
+            return
+
+        if not (self._chat and normalized.get("channel") and normalized.get("ts")):
+            return
+
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Core skips the
+        # bot's own edits only after resolving the message factory (user
+        # lookup, participant write, up to _UNFURL_WAIT_MS of unfurl polling),
+        # and post+edit / native streaming emit one message_changed per
+        # update. The same check core applies (``author.is_me`` comes from
+        # ``_is_message_from_self``) is made here first; handlers see the same.
+        if self._is_message_from_self(normalized):
+            self._logger.debug("Skipping message_changed from self")
+            return
+
+        thread_id = self._thread_id_for_message_event(normalized)
+
+        async def parse_message() -> Message:
+            return await self._parse_slack_message(normalized, thread_id)
+
+        parse_previous: Callable[[], Awaitable[Message]] | None = None
+        if isinstance(previous, dict):
+            before = previous
+
+            # Parse the pre-edit snapshot through the same async path as the
+            # new message so mentions render identically on both sides.
+            # Upstream parity (chat@4.41.1 adapter-slack index.ts:3670-3675):
+            # the snapshot inherits only channel / channel_type / type, not
+            # team / team_id (unlike ``normalized`` and the delete path).
+            async def _parse_previous() -> Message:
+                snapshot = _with_inherited(
+                    before,
+                    channel=normalized.get("channel"),
+                    channel_type=normalized.get("channel_type"),
+                    type="message",
+                )
+                try:
+                    return await self._parse_slack_message(snapshot, thread_id)
+                except Exception as exc:
+                    # Never let a lookup failure on the old snapshot drop the
+                    # edit. ``Exception`` lets ``CancelledError`` propagate.
+                    self._logger.warn(
+                        "Falling back to sync parse for pre-edit message",
+                        {"error": exc, "threadId": thread_id},
+                    )
+                    return self._parse_slack_message_sync(snapshot, thread_id)
+
+            parse_previous = _parse_previous
+
+        self._chat.process_message_updated(
+            self,
+            thread_id,
+            parse_message,
+            previous_message=parse_previous,
+            options=options,
+        )
+
+    def _cache_unfurls_from_message_changed(self, channel: str, inner: dict[str, Any]) -> None:
+        """Cache link-unfurl metadata carried by a ``message_changed`` inner message.
+
+        Stored keyed by installation, channel and inner ``ts`` so
+        :meth:`_enrich_links` can pick it up for the original message. A side
+        step only: ``_handle_message_changed`` continues either way.
+        """
+        attachments = inner.get("attachments")
+        if not isinstance(attachments, list):
+            return
         has_unfurls = any(
             isinstance(att, dict) and (att.get("from_url") or att.get("original_url")) for att in attachments
         )
-        if not has_unfurls:
-            self._logger.debug("Ignoring message_changed without unfurl data")
-            return
-
         ts = inner.get("ts")
-        if not (self._chat and ts):
+        if not (has_unfurls and self._chat and ts):
             return
 
         self._logger.debug(
@@ -3591,6 +4832,62 @@ class SlackAdapter:
         except RuntimeError:
             # No running loop (sync test context) — skip silently.
             self._logger.debug("No running loop; skipping unfurl cache write")
+
+    def _handle_message_deleted(self, event: dict[str, Any], options: WebhookOptions | None = None) -> None:
+        """Dispatch a ``message_deleted`` event to ``process_message_deleted``.
+
+        Upstream ``handleMessageDeleted``. The deleted ts is the first
+        non-``None`` of ``deleted_ts``, ``message.ts`` and
+        ``previous_message.ts`` (upstream ``??``).
+        """
+        inner = event.get("message")
+        previous_raw = event.get("previous_message")
+        deleted_ts = event.get("deleted_ts")
+        if deleted_ts is None and isinstance(inner, dict):
+            deleted_ts = inner.get("ts")
+        if deleted_ts is None and isinstance(previous_raw, dict):
+            deleted_ts = previous_raw.get("ts")
+        channel = event.get("channel")
+        if not (self._chat and channel and deleted_ts):
+            return
+
+        previous: dict[str, Any] | None = None
+        if isinstance(previous_raw, dict):
+            previous = _with_inherited(
+                previous_raw,
+                channel=channel,
+                channel_type=event.get("channel_type"),
+                team=event.get("team"),
+                team_id=event.get("team_id"),
+                type="message",
+            )
+
+        previous_ts = previous.get("ts") if previous is not None else None
+        thread_id = self._thread_id_for_message_event(
+            {
+                "channel": channel,
+                "channel_type": previous.get("channel_type") if previous is not None else event.get("channel_type"),
+                "thread_ts": previous.get("thread_ts") if previous is not None else None,
+                "ts": previous_ts if previous_ts is not None else deleted_ts,
+            }
+        )
+        event_ts = event.get("event_ts")
+        deleted_at = self._parse_slack_timestamp(event_ts if event_ts is not None else event.get("ts"))
+
+        self._chat.process_message_deleted(
+            MessageDeletedEvent(
+                adapter=self,
+                channel_id=channel,
+                deleted_at=deleted_at,
+                message_id=deleted_ts,
+                previous_message=(
+                    self._parse_slack_message_sync(previous, thread_id) if previous is not None else None
+                ),
+                raw=event,
+                thread_id=thread_id,
+            ),
+            options,
+        )
 
     async def _enrich_links(
         self,
@@ -3681,24 +4978,96 @@ class SlackAdapter:
     # Message parsing
     # ==================================================================
 
+    def _detect_self_mention(
+        self,
+        event: dict[str, Any],
+        raw_text: str,
+        attachments: list[_AttachmentContent],
+    ) -> bool | None:
+        """Whether the message invokes the bot (upstream ``detectSelfMention``).
+
+        Slack fires ``app_mention`` for a bot id that only appears inside
+        code, so the invocation is classified from the message content: a
+        ``user`` element for the bot outside code, or a ``<@U…>`` token
+        outside code in mrkdwn content, is a mention. Inline (``style.code``)
+        and preformatted content renders literally, so a bot id there is not.
+
+        Returns ``True`` for an invocation and ``False`` when the content
+        refers to the bot only literally, or not at all. An ``app_mention``
+        whose content never shows the known bot id is still trusted (Slack
+        saw a mention under an id the adapter does not know, such as an
+        Enterprise Grid ``W…`` id). Without any bot id, ``app_mention`` is
+        trusted the same way and other messages return ``None`` so the core
+        text-based fallback decides. Never collapse the tri-state with ``or``.
+        """
+        # Request-scoped id first (multi-workspace), then the configured one.
+        bot_user_id = self.bot_user_id
+        if not bot_user_id:
+            return True if event.get("type") == "app_mention" else None
+
+        matcher = _mention_matcher(bot_user_id)
+        literal = False
+
+        def found(evidence: _MentionEvidence) -> bool:
+            nonlocal literal
+            if evidence == "literal":
+                literal = True
+            return evidence == "mention"
+
+        raw_blocks = event.get("blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        # Blocks model the message body. The flattened ``text`` field loses
+        # the code/literal distinction, so it is only consulted without them.
+        body = _classify_blocks_mention(blocks, matcher) if blocks else _classify_mrkdwn_mention(raw_text, matcher)
+        if found(body):
+            return True
+
+        for attachment in attachments:
+            if attachment.blocks:
+                # Structured attachment content is authoritative for that
+                # attachment, so its legacy fallback cannot add evidence.
+                if found(_classify_blocks_mention(attachment.blocks, matcher)):
+                    return True
+                continue
+            for part in attachment.parts:
+                if found(_classify_attachment_part(part, matcher)):
+                    return True
+
+        # An ``app_mention`` no literal token explains still stands. Otherwise
+        # Slack mentions are user-id tokens: with the content inspected, the
+        # absence of one is a definitive non-mention, so a display name in
+        # plain or code-styled text cannot fall through to name matching.
+        return event.get("type") == "app_mention" and not literal
+
+    def _author_fields(self, event: dict[str, Any]) -> tuple[str, bool]:
+        """``(user_id, is_system)`` for a message author (both parse paths).
+
+        Bot messages carry the bot *user* id in ``bot_profile.user_id``;
+        prefer it to the app-level ``bot_id`` (upstream vercel/chat#883).
+        ``USLACK`` is Slack's own system user (upstream vercel/chat#707).
+        """
+        user = event.get("user")
+        user_id = user or _bot_profile_user_id(event) or event.get("bot_id") or "unknown"
+        return user_id, user == _SLACK_SYSTEM_USER_ID
+
     async def _parse_slack_message(
         self,
         event: dict[str, Any],
         thread_id: str,
-        *,
-        skip_self_mention: bool = True,
     ) -> Message:
         """Parse a Slack event into a normalized Message (async with user lookup)."""
         is_me = self._is_message_from_self(event)
-        raw_text = event.get("text", "")
+        raw_text = event.get("text") or ""
 
         user_name = event.get("username", "unknown")
         full_name = event.get("username", "unknown")
+        email: str | None = None
 
         if event.get("user") and not event.get("username"):
             user_info = await self._lookup_user(event["user"])
             user_name = user_info["display_name"]
             full_name = user_info["real_name"]
+            email = user_info.get("email")
 
         # Track thread participants
         if event.get("user") and self._chat:
@@ -3718,7 +5087,17 @@ class SlackAdapter:
                     {"threadId": thread_id, "userId": event.get("user"), "error": exc},
                 )
 
-        text = await self._resolve_inline_mentions(raw_text, skip_self_mention)
+        # Classify the bot's own mention from the raw event before resolution
+        # replaces the id markup with display names.
+        attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        is_mention = self._detect_self_mention(event, raw_text, attachments)
+
+        # Resolve inline @mentions (the bot's own included) to display names,
+        # then fold in tables and attachment content (their mentions resolve
+        # in one more lookup wave).
+        text = await self._resolve_inline_mentions(raw_text)
+        formatted, plain_text = await self._resolved_content(event, text, attachments)
+        author_id, is_system = self._author_fields(event)
 
         ts_str = event.get("ts", "0")
         try:
@@ -3736,15 +5115,18 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=self._format_converter.extract_plain_text(text),
-            formatted=self._format_converter.to_ast(text),
+            text=plain_text,
+            formatted=formatted,
             raw=event,
+            is_mention=is_mention,
             author=Author(
-                user_id=event.get("user") or event.get("bot_id") or "unknown",
+                user_id=author_id,
                 user_name=user_name,
                 full_name=full_name,
                 is_bot=bool(event.get("bot_id")),
                 is_me=is_me,
+                email=email,
+                is_system=is_system,
             ),
             metadata=MessageMetadata(
                 date_sent=date_sent,
@@ -3794,7 +5176,13 @@ class SlackAdapter:
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
         """Synchronous message parsing (no user lookup, falls back to user ID)."""
         is_me = self._is_message_from_self(event)
-        text = event.get("text", "")
+        text = event.get("text") or ""
+        attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        # Classified the same way as the async path, so an edit's pre-edit
+        # snapshot cannot disagree with the edited message about it.
+        is_mention = self._detect_self_mention(event, text, attachments)
+        formatted, plain_text = self._content(event, text, attachments)
+        author_id, is_system = self._author_fields(event)
         user_name = event.get("username") or event.get("user") or "unknown"
         full_name = event.get("username") or event.get("user") or "unknown"
 
@@ -3814,15 +5202,17 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=self._format_converter.extract_plain_text(text),
-            formatted=self._format_converter.to_ast(text),
+            text=plain_text,
+            formatted=formatted,
             raw=event,
+            is_mention=is_mention,
             author=Author(
-                user_id=event.get("user") or event.get("bot_id") or "unknown",
+                user_id=author_id,
                 user_name=user_name,
                 full_name=full_name,
                 is_bot=bool(event.get("bot_id")),
                 is_me=is_me,
+                is_system=is_system,
             ),
             metadata=MessageMetadata(
                 date_sent=date_sent,
@@ -3835,6 +5225,193 @@ class SlackAdapter:
             ],
             links=self._extract_links(event),
         )
+
+    # ==================================================================
+    # Message content (body, tables, attachments)
+    # ==================================================================
+
+    def _content(
+        self,
+        event: dict[str, Any],
+        text: str,
+        attachments: list[_AttachmentContent] | None = None,
+    ) -> tuple[FormattedContent, str]:
+        """The message's AST (body text, its tables and attachment content) and plain text.
+
+        Upstream ``content`` (sync, no mention lookups). See
+        :meth:`_assemble_content` for how the plain text is derived.
+        """
+        if attachments is None:
+            attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        return self._assemble_content(
+            text,
+            _event_tables(event),
+            [node for attachment in attachments for node in self._attachment_nodes(attachment)],
+        )
+
+    async def _resolved_content(
+        self,
+        event: dict[str, Any],
+        text: str,
+        attachments: list[_AttachmentContent] | None = None,
+    ) -> tuple[FormattedContent, str]:
+        """Like :meth:`_content`, resolving mentions in cells and attachments.
+
+        Upstream ``resolvedContent``. User and channel mentions inside table
+        cells and attachment parts resolve the way
+        :meth:`_resolve_inline_mentions` resolves body text. All ids are
+        collected up front and looked up in a single parallel wave, so no id
+        is fetched twice.
+        """
+        if attachments is None:
+            attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        tables = _event_tables(event)
+        user_ids, channel_ids = _content_mention_ids(tables, attachments)
+        names = await self._lookup_mention_names(user_ids, channel_ids)
+
+        def resolve_table(data: _TableData) -> _TableData:
+            rows = [[_apply_mention_names(cell, names) if cell else cell for cell in row] for row in data.rows]
+            return replace(data, rows=rows)
+
+        def resolve_part(part: _AttachmentPart) -> _AttachmentPart:
+            return replace(part, text=_apply_mention_names(part.text, names))
+
+        nodes: list[Content] = []
+        for attachment in attachments:
+            resolved = replace(
+                attachment,
+                parts=[resolve_part(part) for part in attachment.parts],
+                tables=[resolve_table(data) for data in attachment.tables],
+            )
+            nodes.extend(self._attachment_nodes(resolved))
+        return self._assemble_content(
+            text,
+            _EventTables(
+                leading=[resolve_table(data) for data in tables.leading],
+                trailing=[resolve_table(data) for data in tables.trailing],
+            ),
+            nodes,
+        )
+
+    def _assemble_content(
+        self,
+        text: str,
+        tables: _EventTables,
+        attachment_nodes: list[Content],
+    ) -> tuple[FormattedContent, str]:
+        """Body AST with leading tables above it, then trailing tables and attachments.
+
+        Returns ``(formatted, plain_text)``. Upstream derives ``message.text``
+        as ``toPlainText(formatted)``. Until #283 ports upstream's inbound
+        mrkdwn normalization (``slackMrkdwnToMarkdown``), our ``to_ast`` drops
+        code on a fence's opening line (the body ``"```npm test```"`` parses to
+        nothing), so the body's share of the plain text keeps the regex
+        ``extract_plain_text`` used before #210, and only the table and
+        attachment nodes go through ``ast_to_plain_text``. A message without
+        tables or attachments gets exactly the pre-#210 text. Otherwise the
+        pieces are joined with a blank line, skipping empty ones, as
+        ``toPlainText`` joins root children (the body loses trailing
+        whitespace there, as a parsed paragraph would). Temporary divergence:
+        #283 replaces this with ``ast_to_plain_text(formatted)``.
+        """
+        before = [self._table_node(data) for data in tables.leading]
+        after = [*(self._table_node(data) for data in tables.trailing), *attachment_nodes]
+        formatted = self._format_converter.to_ast(text)
+        formatted["children"] = [*before, *formatted.get("children", []), *after]
+        body = self._format_converter.extract_plain_text(text)
+        if not (before or after):
+            return formatted, body
+        pieces = [
+            *(ast_to_plain_text(node) for node in before),
+            body.rstrip(JS_WHITESPACE),
+            *(ast_to_plain_text(node) for node in after),
+        ]
+        return formatted, "\n\n".join(piece for piece in pieces if piece)
+
+    def _attachment_nodes(self, content: _AttachmentContent) -> list[Content]:
+        """Render one attachment's content to block nodes (upstream ``attachmentNodes``).
+
+        Literal lines share a paragraph (separated by hard breaks) so an
+        attachment reads as one block; mrkdwn parts are parsed in isolation so
+        an unclosed code fence in the body or another attachment can't swallow
+        this one's content. Tables from the attachment's blocks follow its
+        text, keeping each attachment's content together.
+        """
+        nodes: list[Content] = []
+        lines: list[list[Content]] = []
+
+        def flush() -> None:
+            if not lines:
+                return
+            children: list[Content] = []
+            for line in lines:
+                if children:
+                    children.append({"type": "break"})
+                children.extend(line)
+            nodes.append({"type": "paragraph", "children": children})
+            lines.clear()
+
+        for part in content.parts:
+            if part.mrkdwn:
+                flush()
+                nodes.extend(self._format_converter.to_ast(part.text).get("children", []))
+                continue
+            for line in part.text.split("\n"):
+                if line.strip(JS_WHITESPACE):
+                    lines.append(_literal_phrasing(line))
+                else:
+                    # A blank line inside a literal part starts a new paragraph
+                    flush()
+        flush()
+        nodes.extend(self._table_node(data) for data in content.tables)
+        return nodes
+
+    def _table_node(self, data: _TableData) -> Content:
+        """An mdast ``table`` for *data* (upstream ``tableNode``)."""
+        rows: list[Content] = [
+            {
+                "type": "tableRow",
+                "children": [{"type": "tableCell", "children": self._cell_children(cell)} for cell in row],
+            }
+            for row in data.rows
+        ]
+        if data.headerless:
+            width = max(len(row) for row in data.rows)
+            header = {"type": "tableRow", "children": [{"type": "tableCell", "children": []} for _ in range(width)]}
+            rows.insert(0, header)
+        return {"type": "table", "children": rows}
+
+    def _cell_children(self, cell: str) -> list[Content]:
+        """Phrasing content for a cell's mrkdwn (upstream ``cellChildren``).
+
+        Uses the same format converter as body text, so mentions, links and
+        emoji render consistently. Non-paragraph blocks flatten to plain text.
+        """
+        if not cell:
+            return []
+        children: list[Content] = []
+        for node in self._format_converter.to_ast(cell).get("children", []):
+            if children:
+                children.append({"type": "text", "value": "\n"})
+            if node.get("type") == "paragraph":
+                children.extend(node.get("children", []))
+            else:
+                children.append({"type": "text", "value": ast_to_plain_text({"type": "root", "children": [node]})})
+        return children
+
+    @staticmethod
+    def _parse_slack_timestamp(ts: str | None) -> datetime | None:
+        """Parse a Slack ``ts`` (``"1700000000.123456"``) into an aware UTC datetime.
+
+        Upstream ``parseSlackTimestamp``: ``None`` for a missing, empty or
+        non-numeric value (JS ``NaN`` -> ``undefined``).
+        """
+        if not ts:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
 
     def _create_attachment(self, file: dict[str, Any], team_id: str | None = None) -> Attachment:
         """Create an Attachment from a Slack file object.
@@ -4065,11 +5642,17 @@ class SlackAdapter:
         )
 
     def _is_message_from_self(self, event: dict[str, Any]) -> bool:
-        """Check if a Slack event is from this bot."""
+        """Check if a Slack event is from this bot.
+
+        The bot user id (``U…``) matches ``event.user`` or, on bot messages,
+        ``event.bot_profile.user_id`` (upstream vercel/chat#883); the app bot
+        id (``B…``) matches ``event.bot_id``.
+        """
+        user_id = event.get("user") or _bot_profile_user_id(event)
         ctx = self._request_context.get()
-        if ctx and ctx.bot_user_id and event.get("user") == ctx.bot_user_id:
+        if ctx and ctx.bot_user_id and user_id == ctx.bot_user_id:
             return True
-        if self._bot_user_id and event.get("user") == self._bot_user_id:
+        if self._bot_user_id and user_id == self._bot_user_id:
             return True
         return bool(self._bot_id and event.get("bot_id") == self._bot_id)
 
@@ -4330,16 +5913,24 @@ class SlackAdapter:
             self._logger.debug("Slack: startTyping skipped - no thread context")
             return
 
-        status_text = status or "Typing..."
+        # Upstream (vercel/chat 0f743c9b): ``status ?? loadingMessages?.[0] ??
+        # "Typing..."`` and ``status ? [status] : (loadingMessages ??
+        # ["Typing..."])``. An explicit ``""`` is sent as-is (it clears the
+        # status) while the loading messages fall back to the defaults.
+        configured = self._loading_messages
+        default_status = configured[0] if configured else "Typing..."
+        status_text = status if status is not None else default_status
+        default_messages = configured if configured is not None else ["Typing..."]
+        loading_messages = [status] if status else default_messages
         self._logger.debug(
             "Slack API: assistant.threads.setStatus",
-            {"channel": channel, "threadTs": thread_ts, "status": status_text},
+            {"channel": channel, "threadTs": thread_ts, "status": status},
         )
         try:
             client = self._get_client()
             await client.assistant_threads_setStatus(
                 **self._with_token_kwargs(
-                    channel_id=channel, thread_ts=thread_ts, status=status_text, loading_messages=[status_text]
+                    channel_id=channel, thread_ts=thread_ts, status=status_text, loading_messages=loading_messages
                 ),
             )
         except Exception as exc:
@@ -4357,50 +5948,65 @@ class SlackAdapter:
         thread_id: str,
         text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
-    ) -> RawMessage:
+    ) -> RawMessage | None:
         """Stream a message using Slack's native streaming API.
 
         Consumes an async iterable of text chunks and/or structured
         ``StreamChunk`` objects and streams them to Slack.
 
-        Requires ``recipient_user_id`` and ``recipient_team_id`` in *options*.
-        """
-        if not options or not (options.recipient_user_id and options.recipient_team_id):
-            raise ValidationError(
-                "slack",
-                "Slack streaming requires recipient_user_id and recipient_team_id in options",
-            )
+        Slack expires a native stream after roughly five minutes, so a reply
+        that streams longer than ``stream_segment_max_age_ms`` is finalized
+        and continued in a new message. The returned ``id`` is the last
+        message of the reply; earlier segments are already final and are not
+        tracked.
 
+        Returns ``None`` before consuming *text_stream*, so core's post+edit
+        fallback delivers the reply, when the thread has no ``thread_ts``
+        (top-level DMs), when a non-DM channel lacks ``recipient_user_id`` /
+        ``recipient_team_id``, or when native streaming is off
+        (``native_streaming=False`` or latched off by an unsupported-method
+        error). If the first native call fails, the rest of the reply is
+        delivered here with throttled post+edit.
+        """
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
-        # Normalize empty thread_ts to None to avoid Slack API "invalid_thread_ts" errors.
-        # ``chat.startStream`` rejects an empty thread_ts (top-level DMs have no
-        # parent thread to attach to), but ``chat.postMessage`` accepts it.
-        # Degrade DMs to a single accumulated post_message call so streaming
-        # replies aren't silently dropped (chat-sdk-python#94).
+        # chat.startStream rejects an empty thread_ts (top-level DMs have no
+        # parent to attach to), so those replies go through core's post+edit.
         thread_ts = decoded.thread_ts or None
         if not thread_ts:
+            self._logger.debug("Slack: using fallback stream - no thread context")
+            return None
+        recipient_user_id = options.recipient_user_id if options else None
+        recipient_team_id = options.recipient_team_id if options else None
+        # DMs stream natively without recipient ids; channels need both
+        # (upstream 438f5513, vercel/chat#633). Message-less threads
+        # (``chat.thread(id)``, open_dm, action/reaction threads) have none.
+        if not (channel.startswith("D") or (recipient_user_id and recipient_team_id)):
+            self._logger.debug("Slack: using fallback stream - no recipient context")
+            return None
+        if not self._native_streaming or self._native_streaming_broken:
             self._logger.debug(
-                "Slack: stream degraded to post_message - no thread context",
-                {"channel": channel},
+                "Slack: using fallback stream - native streaming disabled",
+                {"configured": self._native_streaming, "broken": self._native_streaming_broken},
             )
-            accumulated = ""
-            async for chunk in text_stream:
-                if isinstance(chunk, str):
-                    accumulated += chunk
-                elif hasattr(chunk, "type") and chunk.type == "markdown_text":  # type: ignore[union-attr]
-                    accumulated += chunk.text  # type: ignore[union-attr]
-            return await self.post_message(thread_id, PostableMarkdown(markdown=accumulated))
-        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
-
+            return None
         token = self._get_token()
         client = self._get_client(token)
+        if not callable(getattr(client, "chat_stream", None)):
+            # Python-specific: slack_sdk releases older than the streaming
+            # helper (3.37.0) have no ``chat_stream``. The extras' floor is
+            # 3.40.0 (``append(chunks=...)``), but a slack_sdk installed
+            # outside them may be older. Defer to core's post+edit before
+            # the stream is read.
+            self._logger.debug("Slack: using fallback stream - slack_sdk has no chat_stream")
+            return None
+        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
-        stream_kwargs: dict[str, Any] = {
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "recipient_user_id": options.recipient_user_id,
-            "recipient_team_id": options.recipient_team_id,
+        stream_kwargs: dict[str, Any] = {"channel": channel, "thread_ts": thread_ts}
+        if recipient_user_id:
+            stream_kwargs["recipient_user_id"] = recipient_user_id
+        if recipient_team_id:
+            stream_kwargs["recipient_team_id"] = recipient_team_id
             # Enterprise Grid disambiguation (chat-sdk-python#95). On Grid
             # orgs ``chat.startStream`` fails with ``team_not_found`` unless
             # the workspace ``team_id`` is supplied explicitly — the
@@ -4416,40 +6022,51 @@ class SlackAdapter:
             # inbound path (the workspace where the interaction happened =
             # the streaming target workspace). Harmless on non-Grid
             # workspaces: passing the correct ``team_id`` is always valid.
-            "team_id": options.recipient_team_id,
-        }
-        if options.task_display_mode:
+            # Sent only when a recipient team is known (a DM without
+            # recipient context has none); if a Grid ``chat.startStream``
+            # then fails, the first-call fallback below delivers the reply.
+            stream_kwargs["team_id"] = recipient_team_id
+        if options and options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
 
-        streamer = await client.chat_stream(**stream_kwargs)
+        async def create_streamer() -> Any:
+            # Every segment gets the same kwargs, including the Grid
+            # ``team_id`` (#95): each segment opens with its own
+            # ``chat.startStream``.
+            return await client.chat_stream(**stream_kwargs)
 
+        # One native Slack stream (a "segment") is open at a time. Slack
+        # expires streams after roughly five minutes, so a long reply is
+        # finalized and continued in a fresh segment (see rotate_segment).
+        segment = _StreamSegment(streamer=await create_streamer())
+        rotations = 0
+        max_age_ms = self._stream_segment_max_age_ms
+
+        # Prefix of ``resolved_committed`` handed to the current segment's
+        # streamer.
         last_appended = ""
+        # Prefix of ``resolved_committed`` Slack has confirmed. Text between
+        # here and ``last_appended`` sits in the streamer's local buffer and
+        # has to be resent if the segment turns out to have expired.
+        last_flushed = ""
 
         # Use StreamingMarkdownRenderer for safe incremental rendering
         from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 
         renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
-        structured_chunks_supported = True
 
         # Outgoing @name mention resolution for the native streaming path
         # (vercel/chat 6f0d2f02). post_message/edit_message resolve mentions
         # themselves, so the committed renderer text is resolved here before
         # deltas are calculated. ``resolved_source_done`` indexes into the
         # renderer's committable text; ``resolved_committed`` is its resolved
-        # counterpart and the coordinate space ``last_appended`` tracks.
-        # Mixing the two spaces would duplicate or drop text as soon as a
-        # replacement changes length (``@alice`` -> ``<@U123>``).
+        # counterpart and the coordinate space ``last_appended`` and
+        # ``last_flushed`` track. Mixing the two spaces would duplicate or
+        # drop text as soon as a replacement changes length
+        # (``@alice`` -> ``<@U123>``).
         resolved_committed = ""
         resolved_source_done = 0
-        inside_resolved_fence = False
-
-        def is_fence_line(line: str) -> bool:
-            # Python ``lstrip()`` rather than JS ``trimStart()`` (different
-            # whitespace sets, e.g. U+FEFF / U+001C-U+001F) on purpose: it
-            # matches the Python StreamingMarkdownRenderer's own fence
-            # tracking, which decides what gets committed mid-fence.
-            trimmed = line.lstrip()
-            return trimmed.startswith("```") or trimmed.startswith("~~~")
+        fences = _FenceTracker()
 
         async def resolve_committed(committable: str) -> None:
             """Extend ``resolved_committed`` with newly committed renderer text.
@@ -4467,7 +6084,7 @@ class SlackAdapter:
             unclosed marker (``https://x.io/*@alice``) can resolve the
             handle after it. Upstream ``resolveCommitted`` behaves the same.
             """
-            nonlocal resolved_committed, resolved_source_done, inside_resolved_fence
+            nonlocal resolved_committed, resolved_source_done
             while resolved_source_done < len(committable):
                 # JS ``lastIndexOf("\n", done - 1)``: last newline before
                 # ``done``. (At ``done == 0`` JS clamps to index 0; the only
@@ -4475,42 +6092,321 @@ class SlackAdapter:
                 line_start = committable.rfind("\n", 0, resolved_source_done) + 1
                 newline_at = committable.find("\n", resolved_source_done)
                 line_end = len(committable) if newline_at == -1 else newline_at + 1
-                segment = committable[resolved_source_done:line_end]
-                fence_line = is_fence_line(committable[line_start:line_end])
-                if inside_resolved_fence or fence_line:
+                piece = committable[resolved_source_done:line_end]
+                line = committable[line_start : line_end if newline_at == -1 else newline_at]
+                if fences.open is not None or _FENCE_LINE_PATTERN.match(line):
                     # Fence delimiters and fenced content are literal.
-                    resolved_committed += segment
+                    resolved_committed += piece
                 else:
-                    resolved_committed += await self._resolve_outgoing_mentions(segment, thread_id)
-                # Toggle only once the fence line's newline is committed.
-                if newline_at != -1 and fence_line:
-                    inside_resolved_fence = not inside_resolved_fence
+                    resolved_committed += await self._resolve_outgoing_mentions(piece, thread_id)
+                # Fence state changes only once the line's newline is committed.
+                if newline_at != -1:
+                    fences.feed(line)
                 resolved_source_done = line_end
 
-        # The resolved bot token is passed on EVERY append and on stop
-        # (vercel/chat#573). Passing it only on the first append left
-        # chat.startStream/chat.stopStream unauthenticated ("not_authed")
+        # In-stream fallback (vercel/chat 0f743c9b). If the very first native
+        # call is rejected (streaming methods unavailable, e.g. GovSlack, or
+        # the feature is off for the workspace), nothing has rendered yet, so
+        # the rest of the reply goes out as throttled post+edit instead. The
+        # consumed text lives in the renderer, so nothing is lost. Failures
+        # after content has rendered natively still propagate: mixing the two
+        # modes would duplicate output.
+        mode: Literal["native", "fallback"] = "native"
+        # True once Slack accepted a native call: a non-None ``append``
+        # response (slack_sdk's ``AsyncChatStream.append`` buffers and returns
+        # None until it flushes) or a successful structured-chunk append.
+        native_rendered = False
+        fallback_message: RawMessage | None = None
+        fallback_sent = ""
+        last_fallback_edit_at: float | None = None
+        # Core seeds ``update_interval_ms`` from ``streaming_update_interval_ms``
+        # (default 500), so this 1000 ms default applies only to direct calls.
+        update_interval_ms = (
+            options.update_interval_ms if options is not None and options.update_interval_ms is not None else 1000
+        )
+
+        async def flush_fallback(force: bool) -> None:
+            nonlocal fallback_message, fallback_sent, last_fallback_edit_at
+            committable = renderer.get_committable_text()
+            if not committable or committable == fallback_sent:
+                return
+            now = _monotonic_ms()
+            if not (force or last_fallback_edit_at is None or now - last_fallback_edit_at >= update_interval_ms):
+                return
+            # Through the markdown field (Slack ``markdown_text``, 12k chars),
+            # not a bare string, which resolves to ``text``: legacy mrkdwn
+            # that shows raw ``**``/``#`` and caps at 4k (vercel/chat 8fdaf4a9).
+            # post_message/edit_message resolve outgoing mentions themselves.
+            if fallback_message is not None:
+                await self.edit_message(thread_id, fallback_message.id, PostableMarkdown(markdown=committable))
+            else:
+                fallback_message = await self.post_message(thread_id, PostableMarkdown(markdown=committable))
+            fallback_sent = committable
+            last_fallback_edit_at = now
+
+        def switch_to_fallback(error: Exception) -> None:
+            nonlocal mode
+            mode = "fallback"
+            if _slack_platform_error_code(error) in _NATIVE_STREAMING_UNSUPPORTED_ERRORS:
+                # The workspace will reject every future attempt too: latch so
+                # later streams skip straight to post+edit.
+                self._native_streaming_broken = True
+            self._logger.warn(
+                "Slack native streaming unavailable, falling back to post-and-edit",
+                {"channel": channel, "error": error},
+            )
+
+        def finish_fallback() -> RawMessage:
+            if (options is not None and options.stop_blocks) or self._feedback_buttons is not None:
+                self._logger.warn(
+                    "Slack: stream-end blocks (stop_blocks/feedback_buttons) skipped - "
+                    "post-and-edit fallback cannot attach stream blocks",
+                    {"channel": channel},
+                )
+            self._logger.debug(
+                "Slack: fallback stream complete",
+                {"messageId": fallback_message.id if fallback_message is not None else None},
+            )
+            if fallback_message is not None:
+                return fallback_message
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md. Upstream
+            # returns ``fallback.message`` (null for an empty reply), and core
+            # then re-runs its fallback. Here the stream is already consumed,
+            # so ``None`` would make core post its placeholder for nothing.
+            return RawMessage(id="", thread_id=thread_id, raw=None)
+
+        # The resolved bot token is passed on EVERY append and on stop, on
+        # every segment (vercel/chat#573). Passing it only on the first append
+        # left chat.startStream/chat.stopStream unauthenticated ("not_authed")
         # whenever the stream reached stop() before a token-bearing append
         # had flushed (e.g. fully buffered markdown). In multi-workspace
         # mode `token` is the per-request installation token resolved by
         # _get_token() at stream entry.
-        async def flush_markdown_delta(delta: str) -> None:
+        def is_stream_expired(error: Exception) -> bool:
+            return _slack_platform_error_code(error) == _STREAM_EXPIRED_ERROR
+
+        def mark_segment_started(response: Any) -> None:
+            """Record that Slack accepted a call on the current segment."""
+            nonlocal native_rendered
+            if segment.started_at is None:
+                segment.started_at = _monotonic_ms()
+            if segment.ts is None:
+                segment.ts = _response_ts(response)
+            segment.flush_next_append = False
+            native_rendered = True
+
+        def segment_age_ms() -> float:
+            return 0 if segment.started_at is None else _monotonic_ms() - segment.started_at
+
+        def rotation_due(at_block_boundary: bool) -> bool:
+            """Whether the current segment must be rotated before more content is sent.
+
+            Past the max age, rotation waits for a block boundary (a
+            paragraph break in the pending text, or a structured chunk) for
+            up to the grace window, then happens regardless. A segment Slack
+            has not started yet has no expiry clock and is never rotated.
+            """
+            if segment.started_at is None:
+                return False
+            age = segment_age_ms()
+            if age < max_age_ms:
+                return False
+            return at_block_boundary or age >= max_age_ms + _STREAM_SEGMENT_ROTATION_GRACE_MS
+
+        # Structured chunk state, replayed into every new segment. Task cards
+        # and the plan title belong to one Slack message, so without the
+        # replay an update for a task first shown in an earlier segment would
+        # render as a brand-new card. Structured chunks may fail if the app
+        # lacks the Assistant scopes/features; they are then disabled for the
+        # rest of the stream to avoid repeated failures, and logged once.
+        structured_chunks_supported = True
+        # Keyed by task id; values are the serialized ``chunk_data`` dicts.
+        open_tasks: dict[Any, dict[str, Any]] = {}
+        current_plan: dict[str, Any] | None = None
+
+        def remember_structured_chunk(chunk_data: dict[str, Any]) -> None:
+            nonlocal current_plan
+            if chunk_data["type"] == "plan_update":
+                current_plan = chunk_data
+            elif chunk_data["type"] == "task_update":
+                if chunk_data.get("status") in ("complete", "error"):
+                    open_tasks.pop(chunk_data.get("id"), None)
+                else:
+                    open_tasks[chunk_data.get("id")] = chunk_data
+
+        def disable_structured_chunks(chunk_type: Any, error: Exception) -> None:
+            nonlocal structured_chunks_supported
+            structured_chunks_supported = False
+            self._logger.warn(
+                "Slack stream: structured-chunk append failed, falling back to "
+                "text-only for the rest of this stream. Likely causes: missing "
+                "`assistant_view` / `assistant:write` scope on the app manifest, "
+                "malformed chunk payload, or a transient Slack API error.",
+                {"chunkType": chunk_type, "error": error},
+            )
+
+        async def start_next_segment(sent: str) -> None:
+            """Open a new segment that continues from *sent*.
+
+            *sent* is the resolved text Slack holds so far. Open task cards
+            and the plan title are replayed right away; when *sent* ends
+            inside a code fence or a table, the fence opening or the table
+            header is queued to precede the segment's first text (see
+            ``with_segment_prefix``) rather than sent on its own.
+            """
+            nonlocal segment, rotations
+            segment = _StreamSegment(streamer=await create_streamer(), flush_next_append=True)
+            fence = _open_fence_in(sent)
+            segment.reopen_fence = f"{fence.opening}\n" if fence is not None else ""
+            segment.table_header = "" if fence is not None else _table_continuation(sent)
+            rotations += 1
+            replay = ([current_plan] if current_plan is not None else []) + list(open_tasks.values())
+            if replay and structured_chunks_supported:
+                try:
+                    response = await segment.streamer.append(chunks=replay, token=token)
+                    mark_segment_started(response)
+                except Exception as exc:
+                    disable_structured_chunks("replay", exc)
+
+        def with_segment_prefix(text: str) -> str:
+            """Prepend whatever a rotation queued for the segment's first text.
+
+            The reopened code fence always (fenced content is literal), the
+            repeated table header only when *text* starts with a table row.
+            """
+            first_line = text.split("\n", 1)[0]
+            header = segment.table_header if _TABLE_ROW_PATTERN.match(first_line.strip(JS_WHITESPACE)) else ""
+            prefixed = segment.reopen_fence + header + text
+            segment.reopen_fence = ""
+            segment.table_header = ""
+            return prefixed
+
+        async def rotate_segment(delta: str) -> str:
+            """Finalize the current segment and continue in a new one.
+
+            *delta* is the resolved text about to be sent: the part up to its
+            last paragraph break (or last line break) travels with the old
+            segment's stop call so the cut lands on a block boundary, and a
+            code fence still open there is closed. Returns the text to send
+            on the new segment.
+            """
+            nonlocal last_flushed
+            cut_at = _segment_cut_index(delta)
+            head = delta[:cut_at]
+            tail = delta[cut_at:]
+            sent = last_appended + head
+            fence = _open_fence_in(sent)
+            if fence is not None and sent.endswith("\n") and _closes_fence(fence, tail):
+                # The pending partial line is the closing delimiter: finish
+                # the block in the old segment instead of reopening it in the
+                # new one. Upstream parity (chat@4.41.1 index.ts:6270-6277,
+                # pinned by the ported "treats a pending partial closing fence
+                # as the block's end" test): the partial line is not held for
+                # its newline, so a literal ```js line split right after its
+                # backticks at a forced cut is taken as the closer, as upstream.
+                head += tail
+                sent += tail
+                tail = ""
+                fence = None
+            closer = ("" if sent.endswith("\n") else "\n") + fence.marker if fence is not None else ""
+            # ``head`` may be this segment's first text, so it takes any
+            # prefix a previous rotation queued for it. Upstream parity
+            # (chat@4.41.1 index.ts:6281-6282): an empty ``head`` skips the
+            # queued prefix even when a closer is sent, so a segment that got
+            # only a structured-chunk replay before rotating again ends with
+            # a bare fence marker. Kept as upstream: no Python-specific hazard.
+            final_text = (with_segment_prefix(head) if head else "") + closer
+            age_ms = segment_age_ms()
+            stop_kwargs: dict[str, Any] = {"token": token}
+            if final_text:
+                stop_kwargs["markdown_text"] = final_text
+            # SL10: agent_view keeps the session busy here with
+            # ``session_status="processing"`` (upstream d4a1f03a), since the
+            # reply continues in the next segment. Wired with #215.
+            try:
+                result = await segment.streamer.stop(**stop_kwargs)
+                last_flushed = sent
+                self._logger.debug(
+                    "Slack: rotated stream segment",
+                    {"channel": channel, "messageId": _response_ts(result), "ageMs": age_ms},
+                )
+            except Exception as exc:
+                if not is_stream_expired(exc):
+                    raise
+                # Slack expired the segment during an idle gap. Nothing after
+                # the last confirmed flush reached it, so that text moves to
+                # the new segment instead of failing the reply.
+                self._logger.warn(
+                    "Slack: stream segment expired before rotation, continuing in a new message",
+                    {"channel": channel, "ageMs": age_ms},
+                )
+                tail = last_appended[len(last_flushed) :] + delta
+                sent = last_flushed
+            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6316):
+            # the successor opens even when ``tail`` is empty. If the reply
+            # then ends with nothing more, the final ``stop()`` starts and
+            # stops it (both SDKs' streamer ``stop()`` calls chat.startStream
+            # first), leaving a message holding only the stream-end blocks,
+            # and its ts is returned. Kept as upstream: no Python-specific
+            # hazard, and skipping it would also drop the stop blocks.
+            await start_next_segment(sent)
+            return tail
+
+        async def send_delta(delta: str, at_block_boundary: bool) -> None:
+            """Send a resolved-text delta, rotating the segment first when due.
+
+            Rotation carries the leading part of the delta out with the old
+            segment, so only what it returns goes to the new one.
+            """
+            nonlocal last_appended, last_flushed
+            text = await rotate_segment(delta) if rotation_due(at_block_boundary or "\n\n" in delta) else delta
+            if text:
+                # slack_sdk's ``append`` buffers small deltas and returns
+                # None until it calls the API, so only a non-None response
+                # proves Slack accepted the stream. ``chunks=[]`` (not None)
+                # makes it flush right away, so a segment opened by rotation
+                # is visible immediately.
+                append_kwargs: dict[str, Any] = {"markdown_text": with_segment_prefix(text), "token": token}
+                if segment.flush_next_append:
+                    append_kwargs["chunks"] = []
+                response = await segment.streamer.append(**append_kwargs)
+                if response is not None:
+                    mark_segment_started(response)
+                    last_flushed = resolved_committed
+            last_appended = resolved_committed
+
+        async def flush_committed(force: bool = False) -> None:
+            """Flush committed renderer text.
+
+            As a mention-resolved ``markdown_text`` delta on the native
+            stream, or as a throttled post/edit in fallback mode. A failure
+            before any native call succeeded switches to fallback mode.
+            """
+            if mode == "fallback":
+                await flush_fallback(force)
+                return
+            await resolve_committed(renderer.get_committable_text())
+            delta = resolved_committed[len(last_appended) :]
             if not delta:
                 return
-            await streamer.append(markdown_text=delta, token=token)
+            try:
+                await send_delta(delta, False)
+            except Exception as exc:
+                if native_rendered:
+                    # Content is already rendering natively; a mid-stream
+                    # failure can't be recovered here.
+                    raise
+                switch_to_fallback(exc)
+                await flush_fallback(force)
 
         # Accepts the residual stream-input union: ``is_thinking_chunk`` filters
         # ``ThinkingChunk`` out before this runs (it is never reached with one),
         # but it stays in the static type since that runtime guard does not
         # narrow it. The generic ``_read``-based body handles any chunk shape.
         async def send_structured_chunk(chunk: StreamChunk | ThinkingChunk | dict[str, Any]) -> None:
-            nonlocal last_appended, structured_chunks_supported
-            if not structured_chunks_supported:
-                return
-            await resolve_committed(renderer.get_committable_text())
-            delta = resolved_committed[len(last_appended) :]
-            await flush_markdown_delta(delta)
-            last_appended = resolved_committed
+            nonlocal last_flushed
+            # Flush buffered markdown first to keep ordering.
+            await flush_committed()
 
             def _read(name: str) -> Any:
                 if isinstance(chunk, dict):
@@ -4518,6 +6414,10 @@ class SlackAdapter:
                 return getattr(chunk, name, None)
 
             chunk_type = _read("type")
+            if mode == "fallback" or not structured_chunks_supported:
+                # Task cards only exist on the native streaming surface.
+                self._logger.debug("Slack: structured chunk skipped", {"chunkType": chunk_type, "mode": mode})
+                return
             if not chunk_type:
                 self._logger.warn(
                     "Slack stream: ignoring chunk with no `type` field",
@@ -4525,31 +6425,30 @@ class SlackAdapter:
                 )
                 return
 
-            try:
-                chunk_data: dict[str, Any] = {"type": chunk_type}
-                for field_name in ("id", "title", "status", "output", "text"):
-                    value = _read(field_name)
-                    if value is not None:
-                        chunk_data[field_name] = value
+            chunk_data: dict[str, Any] = {"type": chunk_type}
+            for field_name in ("id", "title", "status", "output", "text"):
+                value = _read(field_name)
+                if value is not None:
+                    chunk_data[field_name] = value
 
-                await streamer.append(chunks=[chunk_data], token=token)
+            # A structured chunk is a block boundary, so a segment past its
+            # max age rotates here instead of waiting for a paragraph break.
+            await send_delta("", True)
+
+            try:
+                response = await segment.streamer.append(chunks=[chunk_data], token=token)
             except Exception as exc:
-                structured_chunks_supported = False
-                self._logger.warn(
-                    "Slack stream: structured-chunk append failed, falling back to "
-                    "text-only for the rest of this stream. Likely causes: missing "
-                    "`assistant_view` / `assistant:write` scope on the app manifest, "
-                    "malformed chunk payload, or a transient Slack API error.",
-                    {"chunkType": chunk_type, "error": exc},
-                )
+                disable_structured_chunks(chunk_type, exc)
+                return
+            # A chunks append always calls the API, so success means Slack
+            # accepted the stream; it flushes the streamer's text buffer too.
+            mark_segment_started(response)
+            last_flushed = last_appended
+            remember_structured_chunk(chunk_data)
 
         async def push_text_and_flush(text: str) -> None:
-            nonlocal last_appended
             renderer.push(text)
-            await resolve_committed(renderer.get_committable_text())
-            delta = resolved_committed[len(last_appended) :]
-            await flush_markdown_delta(delta)
-            last_appended = resolved_committed
+            await flush_committed()
 
         async for chunk in text_stream:
             if isinstance(chunk, str):
@@ -4582,14 +6481,61 @@ class SlackAdapter:
         # the resolved buffer is built incrementally from committable text,
         # so the final source must extend the same prefix.
         renderer.finish()
-        await resolve_committed(renderer.get_committable_text())
-        final_delta = resolved_committed[len(last_appended) :]
-        await flush_markdown_delta(final_delta)
+        await flush_committed(force=True)
 
+        if mode == "fallback":
+            return finish_fallback()
+
+        # Caller blocks (StreamingPlan end_with) first, then the configured
+        # feedback buttons so they render at the very end of the reply
+        # (vercel/chat 0f743c9b).
+        stop_blocks: list[Any] = list(options.stop_blocks or []) if options is not None else []
+        if self._feedback_buttons is not None:
+            stop_blocks.append(build_feedback_buttons_block(self._feedback_buttons))
         stop_kwargs: dict[str, Any] = {"token": token}
-        if options.stop_blocks:
-            stop_kwargs["blocks"] = options.stop_blocks
-        result = await streamer.stop(**stop_kwargs)
+        if stop_blocks:
+            stop_kwargs["blocks"] = stop_blocks
+        try:
+            result = await segment.streamer.stop(**stop_kwargs)
+        except Exception as exc:
+            if not native_rendered:
+                # Short replies can buffer every delta in the streamer, making
+                # stop() the FIRST real API call; on an unsupported workspace
+                # the failure lands here, so the fallback must engage here too.
+                # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6471-6484):
+                # stop() makes chat.startStream then chat.stopStream in both
+                # SDKs, and upstream also falls back on ``!nativeRendered``
+                # without checking whether startStream succeeded before
+                # stopStream failed (it deliberately avoids the streamer's
+                # ``ts`` accessor).
+                switch_to_fallback(exc)
+                await flush_fallback(True)
+                return finish_fallback()
+            if not is_stream_expired(exc):
+                raise
+            # Slack expired the last segment during a trailing idle gap and
+            # has already finalized that message.
+            unconfirmed = last_appended[len(last_flushed) :]
+            if not unconfirmed:
+                # Every delta was delivered, so the reply is complete; only
+                # the stream-end blocks are lost. Report the finalized message
+                # rather than posting an empty one just to carry the blocks.
+                expired_ts = segment.ts
+                if not expired_ts:
+                    raise
+                self._logger.warn(
+                    "Slack: stream expired before stop, stream-end blocks skipped",
+                    {"channel": channel, "messageId": expired_ts, "skippedBlocks": len(stop_blocks)},
+                )
+                # SL10: end_typing(thread_id, session_status) before this
+                # return (upstream index.ts:6508). Wired with #215.
+                return RawMessage(id=expired_ts, thread_id=thread_id, raw={"ts": expired_ts})
+            self._logger.warn(
+                "Slack: stream expired before stop, delivering the rest in a new message",
+                {"channel": channel},
+            )
+            await start_next_segment(last_flushed)
+            result = await segment.streamer.stop(**stop_kwargs, markdown_text=with_segment_prefix(unconfirmed))
 
         message_ts = ""
         if isinstance(result, dict):
@@ -4598,7 +6544,7 @@ class SlackAdapter:
             data = result.data
             message_ts = (data.get("message") or {}).get("ts") or data.get("ts", "")
 
-        self._logger.debug("Slack: stream complete", {"messageId": message_ts})
+        self._logger.debug("Slack: stream complete", {"messageId": message_ts, "segments": rotations + 1})
         return RawMessage(id=message_ts, thread_id=thread_id, raw=result)
 
     # ==================================================================
@@ -4610,8 +6556,14 @@ class SlackAdapter:
         thread_id: str,
         user_id: str,
         message: AdapterPostableMessage,
+        *,
+        options: PostEphemeralOptions | None = None,
     ) -> EphemeralMessage:
-        """Post an ephemeral (user-only visible) message."""
+        """Post an ephemeral (user-only visible) message.
+
+        ``options`` is accepted for the adapter contract and unused: delivery
+        is always native.
+        """
         message = await self._resolve_message_mentions(message, thread_id)
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
@@ -5032,7 +6984,6 @@ class SlackAdapter:
                 self._parse_slack_message(
                     msg,
                     f"slack:{channel}:{msg.get('thread_ts') or msg.get('ts', '')}",
-                    skip_self_mention=False,
                 )
                 for msg in slack_messages
             )
@@ -5064,7 +7015,6 @@ class SlackAdapter:
                 self._parse_slack_message(
                     msg,
                     f"slack:{channel}:{msg.get('thread_ts') or msg.get('ts', '')}",
-                    skip_self_mention=False,
                 )
                 for msg in chronological
             )
@@ -5103,7 +7053,7 @@ class SlackAdapter:
             for msg in selected:
                 thread_ts = msg.get("ts", "")
                 tid = f"slack:{channel}:{thread_ts}"
-                root_message = await self._parse_slack_message(msg, tid, skip_self_mention=False)
+                root_message = await self._parse_slack_message(msg, tid)
 
                 last_reply_at: datetime | None = None
                 if msg.get("latest_reply"):

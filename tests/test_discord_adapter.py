@@ -6,16 +6,25 @@ Ported from packages/adapter-discord/src/index.test.ts.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chat_sdk.adapters.discord.adapter import (
     DiscordAdapter,
+    DiscordApiError,
     create_discord_adapter,
 )
-from chat_sdk.adapters.discord.types import DiscordAdapterConfig, DiscordThreadId
-from chat_sdk.shared.errors import ValidationError
+from chat_sdk.adapters.discord.types import (
+    DiscordAdapterConfig,
+    DiscordRequestContext,
+    DiscordSlashCommandContext,
+    DiscordThreadId,
+)
+from chat_sdk.shared.errors import NetworkError, ValidationError
+from chat_sdk.types import Attachment, Message, PostableMarkdown
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -690,3 +699,787 @@ class TestInitialize:
         mock_chat = MagicMock()
         await adapter.initialize(mock_chat)
         assert adapter._chat is mock_chat
+
+
+# ===========================================================================
+# 4.41 sync (#229): thread-parent validation, starter-message routing,
+# DiscordApiError codes, forwarded snapshots, attachment downloads.
+# ===========================================================================
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: Any):
+        self.status = status
+        self.ok = 200 <= status < 300
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body if isinstance(self._body, str) else json.dumps(self._body)
+
+    async def json(self) -> Any:
+        return self._body
+
+
+class _FakeResponseContext:
+    def __init__(self, response: _FakeResponse):
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeSession:
+    """aiohttp-session stand-in so ``_discord_fetch`` builds real errors.
+
+    ``route(method, url)`` returns ``(status, body)``; every call is recorded
+    as ``(url, method)``.
+    """
+
+    closed = False
+
+    def __init__(self, route: Callable[[str, str], tuple[int, Any]]):
+        self._route = route
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method: str, url: str, **_kwargs: Any) -> _FakeResponseContext:
+        self.calls.append((url, method))
+        status, body = self._route(method, url)
+        return _FakeResponseContext(_FakeResponse(status, body))
+
+
+API = "https://discord.com/api/v10"
+# Upstream passes "heart" through its emoji resolver; this port's
+# ``_encode_emoji`` URL-quotes the given string as-is, so pass the glyph.
+HEART_GLYPH = "\u2764\ufe0f"
+HEART = "%E2%9D%A4%EF%B8%8F"
+
+
+def _with_session(adapter: DiscordAdapter, route: Callable[[str, str], tuple[int, Any]]) -> _FakeSession:
+    session = _FakeSession(route)
+    adapter._http_session = session
+    return session
+
+
+def _mismatched(adapter: DiscordAdapter) -> AsyncMock:
+    """Seed thread789 as a child of otherChannel; any fetch is a failure."""
+    adapter._remember_thread_parent("thread789", "otherChannel")
+    fetch = AsyncMock(return_value={"id": "should-not-happen"})
+    adapter._discord_fetch = fetch
+    return fetch
+
+
+class TestThreadParentValidation:
+    @pytest.mark.asyncio
+    async def test_rejects_a_thread_id_whose_target_belongs_to_another_channel(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "victimChannel", "parent_id": "otherChannel"})
+
+        with pytest.raises(ValidationError, match="does not belong to channel channel456"):
+            await adapter.fetch_messages("discord:guild1:channel456:victimChannel")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/victimChannel", "GET")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda a, t: a.post_message(t, "hi"),
+            lambda a, t: a.edit_message(t, "msg1", "hi"),
+            lambda a, t: a.delete_message(t, "msg1"),
+            lambda a, t: a.add_reaction(t, "msg1", "heart"),
+            lambda a, t: a.remove_reaction(t, "msg1", "heart"),
+            lambda a, t: a.start_typing(t),
+            lambda a, t: a.fetch_messages(t),
+            # A starter-message id must not bypass the check either.
+            lambda a, t: a.edit_message(t, "thread789", "hi"),
+            lambda a, t: a.set_thread_title(t, "renamed"),
+        ],
+        ids=[
+            "post",
+            "edit",
+            "delete",
+            "add_reaction",
+            "remove_reaction",
+            "typing",
+            "fetch",
+            "edit_starter",
+            "rename",
+        ],
+    )
+    async def test_every_outbound_thread_operation_rejects_a_mismatched_parent(self, call):
+        adapter = _make_adapter(logger=_make_logger())
+        fetch = _mismatched(adapter)
+
+        with pytest.raises(ValidationError, match="Discord thread thread789 does not belong to channel channel456"):
+            await call(adapter, "discord:guild1:channel456:thread789")
+
+        fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_slash_command_response_is_validated_before_patching(self):
+        adapter = _make_adapter(logger=_make_logger())
+        fetch = _mismatched(adapter)
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild1:channel456:thread789",
+            initial_response_sent=False,
+            interaction_token="tok",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        with pytest.raises(ValidationError):
+            await adapter.post_message("discord:guild1:channel456:thread789", "hi")
+
+        fetch.assert_not_called()
+        assert slash.initial_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_slash_context_for_another_conversation_does_not_capture_the_post(self):
+        # Upstream ``tryPostSlashResponse``: only a post to the interaction's
+        # own conversation answers it; a post elsewhere goes to its channel.
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "m1"})
+        slash = DiscordSlashCommandContext(
+            channel_id="discord:guild1:channelA",
+            initial_response_sent=False,
+            interaction_token="tok",
+        )
+        adapter._request_context.set(DiscordRequestContext(slash_command=slash))
+
+        await adapter.post_message("discord:guild1:channelB", "for B")
+
+        adapter._discord_fetch.assert_called_once_with(
+            "/channels/channelB/messages", "POST", {"content": "for B"}, files=None
+        )
+        assert slash.initial_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_thread_segment_is_url_quoted_in_the_parent_lookup(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "a/b", "parent_id": "other"})
+
+        with pytest.raises(ValidationError):
+            await adapter.start_typing("discord:guild1:channel456:a/b")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/a%2Fb", "GET")
+
+    @pytest.mark.asyncio
+    async def test_parentless_channel_lookup_is_rejected(self):
+        # A non-thread channel (no parent_id) can never be a thread segment.
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value={"id": "channel999", "type": 0})
+
+        with pytest.raises(ValidationError):
+            await adapter.start_typing("discord:guild1:channel456:channel999")
+        adapter._discord_fetch.assert_called_once_with("/channels/channel999", "GET")
+
+    @pytest.mark.asyncio
+    async def test_channel_only_thread_id_needs_no_lookup(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        await adapter.start_typing("discord:guild1:channel456")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/channel456/typing", "POST")
+
+    @pytest.mark.asyncio
+    async def test_verified_parent_is_cached_until_the_ttl_expires(self, monkeypatch):
+        import chat_sdk.adapters.discord.adapter as discord_module
+
+        now = [1_000.0]
+        monkeypatch.setattr(discord_module.time, "time", lambda: now[0])
+        adapter = _make_adapter(logger=_make_logger())
+        thread_channel = {"id": "thread789", "parent_id": "channel456"}
+        adapter._discord_fetch = AsyncMock(side_effect=[thread_channel, None, None, thread_channel, None])
+        thread_id = "discord:guild1:channel456:thread789"
+
+        await adapter.start_typing(thread_id)  # GET + POST
+        now[0] += discord_module.THREAD_PARENT_CACHE_TTL - 1
+        await adapter.start_typing(thread_id)  # cached: POST only
+        now[0] += 2
+        await adapter.start_typing(thread_id)  # expired: GET + POST
+
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+            ("/channels/thread789/typing", "POST"),
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+        ]
+
+    def test_cache_stays_bounded(self, monkeypatch):
+        import chat_sdk.adapters.discord.adapter as discord_module
+
+        monkeypatch.setattr(discord_module, "THREAD_PARENT_CACHE_MAX", 3)
+        adapter = _make_adapter()
+        for index in range(5):
+            adapter._remember_thread_parent(f"t{index}", "p")
+        # Re-remembering refreshes recency, so t2 survives the next eviction.
+        adapter._remember_thread_parent("t2", "p")
+        adapter._remember_thread_parent("t5", "p")
+
+        assert list(adapter._thread_parent_cache) == ["t4", "t2", "t5"]
+
+    @pytest.mark.asyncio
+    async def test_component_interaction_in_a_thread_remembers_its_parent(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        await adapter.initialize(mock_chat)
+        adapter._handle_component_interaction(
+            {
+                "type": 3,
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "channel": {"id": "thread789", "type": 11, "parent_id": "channel456"},
+                "message": {"id": "msg1"},
+                "member": {"user": {"id": "u1", "username": "user"}},
+                "data": {"custom_id": "approve"},
+            }
+        )
+        assert mock_chat.process_action.call_args[0][0].thread_id == "discord:guild1:channel456:thread789"
+
+        adapter._discord_fetch = AsyncMock(return_value=None)
+        await adapter.start_typing("discord:guild1:channel456:thread789")
+        adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
+
+    @pytest.mark.asyncio
+    async def test_parentless_thread_interaction_encodes_the_channel_only(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        await adapter.initialize(mock_chat)
+        adapter._handle_application_command_interaction(
+            adapter._build_application_command_context(
+                {
+                    "type": 2,
+                    "channel_id": "thread789",
+                    "guild_id": "guild1",
+                    "channel": {"id": "thread789", "type": 11},
+                    "member": {"user": {"id": "u1", "username": "user"}},
+                    "data": {"name": "help"},
+                    "token": "tok",
+                }
+            )
+        )
+        event = mock_chat.process_slash_command.call_args[0][0]
+        assert event.channel_id == "discord:guild1:thread789"
+        assert adapter._thread_parent_cache == {}
+
+    @pytest.mark.asyncio
+    async def test_forwarded_message_thread_info_is_remembered(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock(return_value=None)
+
+        await adapter._handle_forwarded_message(
+            {
+                "id": "m1",
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "content": "hi",
+                "author": {"id": "u1", "username": "user"},
+                "mentions": [],
+                "thread": {"id": "thread789", "parent_id": "channel456"},
+                "timestamp": "2021-01-01T00:00:00.000Z",
+            }
+        )
+        await adapter.start_typing("discord:guild1:channel456:thread789")
+
+        adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra", "lookups", "expected_thread_id"),
+        [
+            # Thread channel type: the parent is looked up, not guessed.
+            (
+                {"channel_type": 11},
+                [{"id": "thread789", "parent_id": "channel456"}],
+                "discord:guild1:channel456:thread789",
+            ),
+            # No channel type either: the channel itself is the conversation.
+            ({}, [], "discord:guild1:thread789"),
+        ],
+        ids=["thread-channel-type", "no-channel-type"],
+    )
+    async def test_forwarded_thread_without_parent_id_still_gets_replies(self, extra, lookups, expected_thread_id):
+        # A ``thread`` without ``parent_id`` used to encode as
+        # ``discord:g:T:T``, a parent the outbound validation then rejects.
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock(side_effect=[*lookups, None])
+
+        await adapter._handle_forwarded_message(
+            {
+                "id": "m1",
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "content": "hi",
+                "author": {"id": "u1", "username": "user"},
+                "mentions": [],
+                "thread": {"id": "thread789"},
+                "timestamp": "2021-01-01T00:00:00.000Z",
+                **extra,
+            }
+        )
+        thread_id = mock_chat.handle_incoming_message.call_args[0][1]
+        await adapter.start_typing(thread_id)
+
+        assert thread_id == expected_thread_id
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            *(("/channels/thread789", "GET") for _ in lookups),
+            ("/channels/thread789/typing", "POST"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_forwarded_thread_parent_looked_up_from_discord_is_remembered(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock(side_effect=[{"id": "thread789", "parent_id": "channel456"}, None])
+
+        await adapter._handle_forwarded_message(
+            {
+                "id": "m1",
+                "channel_id": "thread789",
+                "channel_type": 11,
+                "guild_id": "guild1",
+                "content": "hi",
+                "author": {"id": "u1", "username": "user"},
+                "mentions": [],
+                "timestamp": "2021-01-01T00:00:00.000Z",
+            }
+        )
+        await adapter.start_typing("discord:guild1:channel456:thread789")
+
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_uses_forwarded_thread_info_without_fetching_the_channel(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        await adapter.initialize(mock_chat)
+        adapter._discord_fetch = AsyncMock()
+        body = json.dumps(
+            {
+                "type": "GATEWAY_MESSAGE_REACTION_ADD",
+                "timestamp": 1,
+                "data": {
+                    "user_id": "user789",
+                    "channel_id": "thread789",
+                    "message_id": "msg123",
+                    "guild_id": "guild1",
+                    "channel_type": 11,
+                    "thread": {"id": "thread789", "parent_id": "channel456"},
+                    "emoji": {"name": "\U0001f44d", "id": None},
+                    "member": {"user": {"id": "user789", "username": "testuser"}},
+                },
+            }
+        )
+        request = _FakeRequest(body, {"x-discord-gateway-token": "test-token"})
+
+        response = await adapter.handle_webhook(request)
+
+        assert response["status"] == 200
+        adapter._discord_fetch.assert_not_called()
+        assert mock_chat.process_reaction.call_args[0][0].thread_id == "discord:guild1:channel456:thread789"
+        assert adapter._cached_thread_parent("thread789") == "channel456"
+
+
+class TestThreadStarterMessageRouting:
+    @pytest.mark.asyncio
+    async def test_routes_forum_starter_operations_to_the_thread(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        def route(method: str, url: str) -> tuple[int, Any]:
+            if url.endswith("/channels/starter123") and method == "GET":
+                return 200, {"id": "starter123", "parent_id": "forum456"}
+            # Forum channels hold no messages: a channel-type error, not 10008.
+            if "/channels/forum456/" in url:
+                return 400, {"code": 50024, "message": "Cannot execute action on this channel type"}
+            if method in ("DELETE", "PUT"):
+                return 204, None
+            return 200, {"id": "starter123", "channel_id": "starter123", "content": "updated"}
+
+        session = _with_session(adapter, route)
+        thread_id = "discord:guild1:forum456:starter123"
+        await adapter.edit_message(thread_id, "starter123", "updated")
+        await adapter.delete_message(thread_id, "starter123")
+        await adapter.add_reaction(thread_id, "starter123", HEART_GLYPH)
+        await adapter.remove_reaction(thread_id, "starter123", HEART_GLYPH)
+
+        assert session.calls == [
+            (f"{API}/channels/starter123", "GET"),
+            (f"{API}/channels/starter123/messages/starter123", "PATCH"),
+            (f"{API}/channels/starter123/messages/starter123", "DELETE"),
+            (f"{API}/channels/starter123/messages/starter123/reactions/{HEART}/@me", "PUT"),
+            (f"{API}/channels/starter123/messages/starter123/reactions/{HEART}/@me", "DELETE"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_parent_channel_for_a_text_channel_starter(self):
+        adapter = _make_adapter(logger=_make_logger())
+
+        def route(method: str, url: str) -> tuple[int, Any]:
+            if url.endswith("/channels/starter123") and method == "GET":
+                return 200, {"id": "starter123", "parent_id": "channel456"}
+            # A text-channel thread's starter lives in the parent channel.
+            if "/channels/starter123/" in url:
+                return 404, {"code": 10008, "message": "Unknown Message"}
+            if method == "PUT":
+                return 204, None
+            return 200, {"id": "starter123", "channel_id": "channel456", "content": "updated"}
+
+        session = _with_session(adapter, route)
+        thread_id = "discord:guild1:channel456:starter123"
+        result = await adapter.edit_message(thread_id, "starter123", "updated")
+        await adapter.add_reaction(thread_id, "starter123", HEART_GLYPH)
+
+        assert result.id == "starter123"
+        assert session.calls == [
+            (f"{API}/channels/starter123", "GET"),
+            (f"{API}/channels/starter123/messages/starter123", "PATCH"),
+            (f"{API}/channels/channel456/messages/starter123", "PATCH"),
+            (f"{API}/channels/starter123/messages/starter123/reactions/{HEART}/@me", "PUT"),
+            (f"{API}/channels/channel456/messages/starter123/reactions/{HEART}/@me", "PUT"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_other_discord_errors(self):
+        adapter = _make_adapter(logger=_make_logger())
+        responses = iter(
+            [
+                (200, {"id": "starter123", "parent_id": "channel456"}),
+                (403, {"code": 50013, "message": "Missing Permissions"}),
+            ]
+        )
+        session = _with_session(adapter, lambda _m, _u: next(responses))
+
+        with pytest.raises(NetworkError, match="50013") as exc_info:
+            await adapter.add_reaction("discord:guild1:channel456:starter123", "starter123", HEART_GLYPH)
+
+        assert len(session.calls) == 2
+        original = exc_info.value.original_error
+        assert isinstance(original, DiscordApiError)
+        assert (original.status, original.code) == (403, 50013)
+
+    @pytest.mark.asyncio
+    async def test_non_starter_message_in_a_thread_is_not_probed_twice(self):
+        adapter = _make_adapter(logger=_make_logger())
+        adapter._remember_thread_parent("thread789", "channel456")
+        session = _with_session(adapter, lambda _m, _u: (404, {"code": 10008, "message": "Unknown Message"}))
+
+        with pytest.raises(NetworkError):
+            await adapter.delete_message("discord:guild1:channel456:thread789", "msg999")
+
+        assert session.calls == [(f"{API}/channels/thread789/messages/msg999", "DELETE")]
+
+
+class TestDiscordApiError:
+    @pytest.mark.parametrize(
+        ("body", "code"),
+        [
+            ('{"code": 10008, "message": "Unknown Message"}', 10008),
+            ("<html>502 Bad Gateway</html>", None),
+            ("", None),
+            ('{"code": "10008"}', None),
+            ('{"code": true}', None),
+            ("[10008]", None),
+            ("[" * 200_000, None),
+        ],
+        ids=["json", "html", "empty", "string-code", "bool-code", "non-object", "deeply-nested"],
+    )
+    def test_parses_only_a_numeric_json_code(self, body, code):
+        error = DiscordApiError(500, body)
+        assert error.code == code
+        assert error.status == 500
+
+    @pytest.mark.asyncio
+    async def test_should_not_recover_when_160004_only_appears_elsewhere_in_the_body(self):
+        adapter = _make_adapter(logger=_make_logger())
+        _with_session(
+            adapter,
+            lambda _m, _u: (429, {"code": 429, "message": "You are being rate limited.", "retry_after": 160004}),
+        )
+
+        with pytest.raises(NetworkError) as exc_info:
+            await adapter._create_discord_thread("channel123", "msg456")
+        assert exc_info.value.original_error.code == 429
+
+    @pytest.mark.asyncio
+    async def test_recovers_from_160004_raised_by_the_real_fetch(self):
+        adapter = _make_adapter(logger=_make_logger())
+        _with_session(
+            adapter,
+            lambda _m, _u: (400, {"code": 160004, "message": "A thread has already been created for this message"}),
+        )
+
+        result = await adapter._create_discord_thread("channel123", "msg456")
+
+        assert result["id"] == "msg456"
+
+
+# ---------------------------------------------------------------------------
+# Forwarded message snapshots (vercel/chat #825)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_message(**overrides: Any) -> dict[str, Any]:
+    raw = {
+        "id": "message123",
+        "channel_id": "channel456",
+        "guild_id": "guild789",
+        "author": {"id": "user123", "username": "testuser"},
+        "content": "Outer context",
+        "timestamp": "2021-01-01T00:00:00.000Z",
+        "edited_timestamp": None,
+        "attachments": [
+            {
+                "id": "outer123",
+                "filename": "outer.txt",
+                "size": 100,
+                "url": "https://cdn.discord.com/outer.txt",
+                "content_type": "text/plain",
+            }
+        ],
+        "type": 0,
+        "message_reference": {"type": 1, "message_id": "source123", "channel_id": "source456"},
+        "message_snapshots": [
+            {
+                "message": {
+                    "type": 0,
+                    "content": "Forwarded voice note",
+                    "attachments": [
+                        {
+                            "id": "snapshot123",
+                            "filename": "voice.ogg",
+                            "size": 1234,
+                            "url": "https://cdn.discord.com/voice.ogg",
+                            "content_type": "audio/ogg",
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+    raw.update(overrides)
+    return raw
+
+
+class TestForwardedSnapshots:
+    def test_parses_outer_and_snapshot_content_and_attachments(self):
+        adapter = _make_adapter()
+
+        message = adapter.parse_message(_snapshot_message())
+
+        assert message.text == "Outer context\n\nForwarded voice note"
+        assert [(a.name, a.type, a.url) for a in message.attachments] == [
+            ("outer.txt", "file", "https://cdn.discord.com/outer.txt"),
+            ("voice.ogg", "audio", "https://cdn.discord.com/voice.ogg"),
+        ]
+        assert all(a.fetch_data is not None for a in message.attachments)
+
+    def test_handles_a_message_without_attachments(self):
+        adapter = _make_adapter()
+        raw = _snapshot_message(content="Message without attachments", message_snapshots=None)
+        del raw["attachments"]
+
+        message = adapter.parse_message(raw)
+
+        assert message.text == "Message without attachments"
+        assert message.attachments == []
+
+    def test_empty_outer_content_is_dropped_from_the_joined_text(self):
+        adapter = _make_adapter()
+        message = adapter.parse_message(_snapshot_message(content="", attachments=[]))
+        assert message.text == "Forwarded voice note"
+
+    def test_thread_starter_referenced_message_snapshots_are_read(self):
+        adapter = _make_adapter()
+        referenced = _snapshot_message(content="", attachments=[])
+        raw = {"id": "starter", "type": 21, "content": "", "referenced_message": referenced}
+
+        message = adapter._parse_discord_message(raw, "discord:guild789:channel456:starter")
+
+        assert message.text == "Forwarded voice note"
+        assert [a.name for a in message.attachments] == ["voice.ogg"]
+
+    @pytest.mark.asyncio
+    async def test_reads_content_and_attachments_from_forwarded_message_snapshots(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        await adapter.initialize(mock_chat)
+        body = json.dumps(
+            {
+                "type": "GATEWAY_MESSAGE_CREATE",
+                "timestamp": 1,
+                "data": {
+                    "id": "forwarded-message",
+                    "channel_id": "thread789",
+                    "guild_id": "guild1",
+                    "content": "",
+                    "author": {"id": "user789", "username": "testuser", "bot": False},
+                    "mentions": [],
+                    "attachments": [],
+                    "thread": {"id": "thread789", "parent_id": "channel456"},
+                    "timestamp": "2026-08-14T15:39:39.136Z",
+                    "message_snapshots": [
+                        {
+                            "message": {
+                                "content": "Forwarded voice note",
+                                "attachments": [
+                                    {
+                                        "content_type": "audio/ogg",
+                                        "url": "https://cdn.discordapp.com/attachments/1/2/voice.ogg",
+                                        "filename": "voice.ogg",
+                                        "size": 1234,
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                },
+            }
+        )
+
+        await adapter.handle_webhook(_FakeRequest(body, {"x-discord-gateway-token": "test-token"}))
+
+        _adapter, thread_id, message = mock_chat.handle_incoming_message.call_args[0]
+        assert thread_id == "discord:guild1:channel456:thread789"
+        assert message.text == "Forwarded voice note"
+        assert [(a.mime_type, a.name, a.url) for a in message.attachments] == [
+            ("audio/ogg", "voice.ogg", "https://cdn.discordapp.com/attachments/1/2/voice.ogg")
+        ]
+        assert message.attachments[0].fetch_data is not None
+
+
+# ---------------------------------------------------------------------------
+# rehydrate_attachment / guarded downloads (vercel/chat #679, #800, #865)
+# ---------------------------------------------------------------------------
+
+SIGNED_URL = "https://cdn.discordapp.com/attachments/1/2/photo.png?ex=abc&is=def&hm=123"
+
+
+class TestRehydrateAttachment:
+    @pytest.mark.asyncio
+    async def test_rebuilds_fetch_data_to_download_the_attachment_from_its_cdn_url(self):
+        transfer = AsyncMock(return_value=b"photo")
+
+        class _Adapter(DiscordAdapter):
+            async def _download_attachment(self, url: str) -> bytes:
+                return await transfer(url)
+
+        adapter = _Adapter(
+            DiscordAdapterConfig(bot_token="test-token", public_key=TEST_PUBLIC_KEY, application_id="test-app-id")
+        )
+
+        attachment = adapter.rehydrate_attachment(Attachment(type="image", url=SIGNED_URL))
+
+        assert await attachment.fetch_data() == b"photo"
+        transfer.assert_awaited_once_with(SIGNED_URL)
+
+    @pytest.mark.asyncio
+    async def test_rejects_internal_attachment_urls_before_the_network(self, monkeypatch):
+        import chat_sdk.shared.download as download_module
+
+        transport = AsyncMock()
+        monkeypatch.setattr(download_module, "create_transport", lambda _adapter: transport)
+        adapter = _make_adapter()
+
+        attachment = adapter.rehydrate_attachment(
+            Attachment(type="image", url="https://169.254.169.254/latest/meta-data")
+        )
+
+        with pytest.raises(NetworkError, match="Refusing to fetch an internal attachment URL"):
+            await attachment.fetch_data()
+        transport.assert_not_called()
+
+    def test_returns_the_attachment_unchanged_when_it_has_no_url(self):
+        adapter = _make_adapter()
+        attachment = Attachment(type="image")
+
+        rehydrated = adapter.rehydrate_attachment(attachment)
+
+        assert rehydrated is attachment
+        assert rehydrated.fetch_data is None
+
+    @pytest.mark.asyncio
+    async def test_prefers_fetch_metadata_url_over_the_attachment_url(self):
+        adapter = _make_adapter()
+        adapter._download_attachment = AsyncMock(return_value=b"x")
+        attachment = Attachment(type="file", url="https://cdn.discordapp.com/stale", fetch_metadata={"url": SIGNED_URL})
+
+        rehydrated = adapter.rehydrate_attachment(attachment)
+        await rehydrated.fetch_data()
+
+        adapter._download_attachment.assert_awaited_once_with(SIGNED_URL)
+        assert attachment.fetch_data is None  # the input is not mutated
+
+    @pytest.mark.asyncio
+    async def test_inbound_attachment_survives_serialization(self):
+        adapter = _make_adapter()
+        adapter._download_attachment = AsyncMock(return_value=b"bytes")
+        raw = _snapshot_message(
+            attachments=[
+                {"filename": "photo.png", "url": SIGNED_URL, "content_type": "image/png", "width": 800, "height": 600}
+            ],
+            message_snapshots=None,
+        )
+        parsed = adapter.parse_message(raw)
+        assert parsed.attachments[0].fetch_metadata == {"url": SIGNED_URL}
+        assert (parsed.attachments[0].width, parsed.attachments[0].height) == (800, 600)
+
+        restored = Message.from_json(parsed.to_json())
+        assert restored.attachments[0].fetch_data is None
+        rehydrated = adapter.rehydrate_attachment(restored.attachments[0])
+
+        assert await rehydrated.fetch_data() == b"bytes"
+        adapter._download_attachment.assert_awaited_once_with(SIGNED_URL)
+
+    @pytest.mark.asyncio
+    async def test_download_goes_through_the_guarded_downloader(self, monkeypatch):
+        import chat_sdk.shared.download as download_module
+
+        guarded = AsyncMock(return_value=b"ok")
+        monkeypatch.setattr(download_module, "download_attachment", guarded)
+        adapter = _make_adapter()
+
+        assert await adapter._download_attachment(SIGNED_URL) == b"ok"
+        # Defaults (25 MB, 30 s) and no Discord credentials.
+        guarded.assert_awaited_once_with(SIGNED_URL, adapter="discord")
+
+    @pytest.mark.asyncio
+    async def test_download_wraps_unknown_errors_in_network_error(self, monkeypatch):
+        import chat_sdk.shared.download as download_module
+
+        cause = OSError("connection reset")
+        monkeypatch.setattr(download_module, "download_attachment", AsyncMock(side_effect=cause))
+        adapter = _make_adapter()
+
+        with pytest.raises(NetworkError, match="Failed to download Discord attachment") as exc_info:
+            await adapter._download_attachment(SIGNED_URL)
+        assert exc_info.value.original_error is cause
+
+
+class TestSuppressedLinksPayload:
+    @pytest.mark.asyncio
+    async def test_preserves_suppressed_links_in_the_discord_api_payload(self):
+        adapter = _make_adapter(logger=_make_logger())
+        markdown = "<https://google.com> [Google](<https://google.com>)"
+        adapter._discord_fetch = AsyncMock(return_value={"id": "msg-suppressed-links"})
+
+        await adapter.post_message("discord:guild1:channel456", PostableMarkdown(markdown=markdown))
+
+        adapter._discord_fetch.assert_called_once()
+        path, method, payload = adapter._discord_fetch.call_args[0][:3]
+        assert (path, method, payload["content"]) == ("/channels/channel456/messages", "POST", markdown)
