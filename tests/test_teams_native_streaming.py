@@ -928,6 +928,41 @@ class TestFirstChunkIdWait:
         assert result.id == ""
 
     @pytest.mark.asyncio
+    async def test_real_sdk_cancel_while_settling_returns_normally(self, monkeypatch: pytest.MonkeyPatch):
+        """The slow first flush succeeds, then the user cancels while the
+        stream is being finalized: the cancel is swallowed like every other
+        native-stream cancel, and nothing is posted."""
+        import httpx
+
+        from chat_sdk.adapters.teams import adapter as adapter_module
+
+        requests: list[dict[str, Any]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content or b"{}")
+            requests.append(body)
+            if len(requests) == 1:
+                await asyncio.sleep(0.3)
+                return httpx.Response(200, json={"id": "stream-msg-1"})
+            return httpx.Response(403, json={"error": {"message": "Content stream was cancelled by user"}})
+
+        adapter = _real_sdk_adapter(handler)
+        tid = _dm_thread_id(adapter)
+        stream = adapter._create_streamer(_dm_activity(), tid)
+        assert stream is not None
+        monkeypatch.setattr(adapter_module, "STREAM_FIRST_CHUNK_ID_TIMEOUT_S", 0.05)
+
+        async def gen():
+            yield "hello"
+
+        result = await asyncio.wait_for(adapter._stream_via_emit(tid, gen(), stream), 10)
+
+        assert stream.canceled is True
+        assert [_is_stream_activity(r) for r in requests] == [True, True]
+        assert result.id == ""
+        assert result.raw == {"text": "hello"}
+
+    @pytest.mark.asyncio
     async def test_real_sdk_slow_first_flush_is_not_duplicated(self, monkeypatch: pytest.MonkeyPatch):
         """The first flush is still in flight when the bound expires: the
         reply is finalized as a stream, never also posted."""

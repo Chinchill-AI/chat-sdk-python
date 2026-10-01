@@ -2951,7 +2951,17 @@ class TeamsAdapter:
                 # stream that did get through, and returns ``None`` when nothing
                 # was delivered. The handler's own ``close()`` is then a no-op.
                 if not stream.canceled:
-                    settled = await stream.close()
+                    try:
+                        settled = await stream.close()
+                    except StreamCancelledError:
+                        # The user canceled while the stream was being
+                        # finalized. Only the SDK subclass is caught; a plain
+                        # task cancel still propagates.
+                        self._logger.debug(
+                            "Teams stream canceled while settling",
+                            {"threadId": thread_id},
+                        )
+                        return RawMessage(id="", thread_id=thread_id, raw={"text": accumulated})
                     if settled is not None:
                         message_id = getattr(settled, "id", "") or ""
                     elif not stream.canceled:
