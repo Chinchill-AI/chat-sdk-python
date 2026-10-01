@@ -696,7 +696,10 @@ and #204 (`download_attachment`). One divergence-table row (the
   message=None)`.** Sends `message_id if message_id is not None else
   thread_id_or_message_id` (upstream `messageId ?? threadIdOrMessageId`), so
   the old one-argument call `mark_as_read("wamid.X")` still works and an
-  explicit `""` is kept. Raises `AdapterError("WhatsApp mark as read failed",
+  explicit `""` is kept. The first parameter defaults to `None` so the old
+  keyword call `mark_as_read(message_id="wamid.X")` works too (JavaScript
+  has no keyword arguments); with neither set it raises `TypeError` before
+  any request. Raises `AdapterError("WhatsApp mark as read failed",
   "whatsapp")` unless the response is a dict with `success` exactly `True`
   (divergence row: upstream's `!response.success` is truthiness).
 - **Messenger `mark_as_read(thread_id, message_id=None, message=None)`.**

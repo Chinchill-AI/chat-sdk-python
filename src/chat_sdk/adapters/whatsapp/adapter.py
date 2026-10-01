@@ -2090,7 +2090,7 @@ class WhatsAppAdapter:
 
     async def mark_as_read(
         self,
-        thread_id_or_message_id: str,
+        thread_id_or_message_id: str | None = None,
         message_id: str | None = None,
         message: Message | None = None,
     ) -> None:
@@ -2098,19 +2098,25 @@ class WhatsAppAdapter:
 
         Called by ``Thread.mark_as_read()`` as ``(thread_id, message_id,
         message)``; the one-argument form ``mark_as_read(message_id)`` still
-        works, as upstream's ``messageId ?? threadIdOrMessageId``.
+        works, as upstream's ``messageId ?? threadIdOrMessageId``. The first
+        parameter is optional so the pre-#239 keyword call
+        ``mark_as_read(message_id=...)`` keeps working too (Python-only:
+        upstream has no keyword arguments).
 
         Raises :class:`AdapterError` unless the Graph API answers
         ``success: true``.
 
         See: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/mark-messages-as-read
         """
+        target = message_id if message_id is not None else thread_id_or_message_id
+        if target is None:
+            raise TypeError("mark_as_read() requires a message id")
         response = await self._graph_api_request(
             f"/{self._phone_number_id}/messages",
             {
                 "messaging_product": "whatsapp",
                 "status": "read",
-                "message_id": message_id if message_id is not None else thread_id_or_message_id,
+                "message_id": target,
             },
         )
 

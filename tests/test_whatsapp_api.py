@@ -1551,6 +1551,24 @@ class TestMarkAsReadPythonSpecific:
         assert session.calls[0][2]["json"]["message_id"] == ""
 
     @pytest.mark.asyncio
+    async def test_pre_239_keyword_call_still_works(self):
+        # The old signature was ``mark_as_read(self, message_id)``, so
+        # ``mark_as_read(message_id=...)`` was a valid call.
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        await adapter.mark_as_read(message_id="wamid.inbound")
+
+        assert session.calls[0][2]["json"]["message_id"] == "wamid.inbound"
+
+    @pytest.mark.asyncio
+    async def test_no_message_id_raises_before_any_request(self):
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        with pytest.raises(TypeError, match="requires a message id"):
+            await adapter.mark_as_read()
+        assert session.calls == []
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("body", [{}, {"success": "true"}, {"success": 1}, [True]])
     async def test_only_a_json_true_success_counts(self, body: Any):
         # Divergence from upstream (truthy ``success``): see docs/UPSTREAM_SYNC.md.
