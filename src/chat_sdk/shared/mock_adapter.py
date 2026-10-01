@@ -105,6 +105,13 @@ class MockAdapter:
         self._fetch_calls: list[tuple[str, FetchOptions | None]] = []
         self._initialize_calls: list[Any] = []
 
+        # Read receipts are enabled by default, as in upstream's mock
+        # (``markAsRead: vi.fn()``); tests that need an adapter without them
+        # set ``adapter.mark_as_read = None``. ``reply`` is absent by default.
+        from unittest.mock import AsyncMock
+
+        self.mark_as_read: Any = AsyncMock(name="mark_as_read", return_value=None)
+
     async def initialize(self, chat: Any) -> None:
         self._initialize_calls.append(chat)
 

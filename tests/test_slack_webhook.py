@@ -954,10 +954,19 @@ class TestMessageSubtypes:
         return adapter, chat
 
     # TS: "routes the message, its edit, and its delete to one thread id in %s"
-    # Only the "a flat DM" case; #214 adds "a threaded agent_view DM".
     @pytest.mark.asyncio
-    async def test_routes_the_message_its_edit_and_its_delete_to_one_thread_id_in_a_flat_dm(self):
-        adapter, chat = await self._init()
+    @pytest.mark.parametrize(
+        ("agent_view", "expected"),
+        [(False, "slack:D_DM:"), (True, "slack:D_DM:1111.0001")],
+        ids=["a flat DM", "a threaded agent_view DM"],
+    )
+    async def test_routes_the_message_its_edit_and_its_delete_to_one_thread_id_in(
+        self, agent_view: bool, expected: str
+    ):
+        from chat_sdk.types import WebhookOptions
+
+        adapter, chat = await self._init(agent_view=agent_view)
+        chat.get_state.return_value.is_subscribed = AsyncMock(return_value=False)
         dm = {
             "type": "message",
             "user": "U_USER",
@@ -966,35 +975,36 @@ class TestMessageSubtypes:
             "text": "hello",
             "ts": "1111.0001",
         }
-        await adapter.handle_webhook(self._event_req(dm))
-        await adapter.handle_webhook(
-            self._event_req(
-                {
-                    "type": "message",
-                    "subtype": "message_changed",
-                    "channel": "D_DM",
-                    "channel_type": "im",
-                    "ts": "1111.0002",
-                    "message": {**dm, "text": "edited", "edited": {"ts": "1111.0002"}},
-                    "previous_message": dm,
-                }
-            )
+
+        async def send(event: dict[str, Any]) -> None:
+            tasks: list[Any] = []
+            await adapter.handle_webhook(self._event_req(event), WebhookOptions(wait_until=tasks.append))
+            await asyncio.gather(*tasks)
+
+        await send(dm)
+        await send(
+            {
+                "type": "message",
+                "subtype": "message_changed",
+                "channel": "D_DM",
+                "channel_type": "im",
+                "ts": "1111.0002",
+                "message": {**dm, "text": "edited", "edited": {"ts": "1111.0002"}},
+                "previous_message": dm,
+            }
         )
-        await adapter.handle_webhook(
-            self._event_req(
-                {
-                    "type": "message",
-                    "subtype": "message_deleted",
-                    "channel": "D_DM",
-                    "channel_type": "im",
-                    "ts": "1111.0003",
-                    "deleted_ts": "1111.0001",
-                    "previous_message": dm,
-                }
-            )
+        await send(
+            {
+                "type": "message",
+                "subtype": "message_deleted",
+                "channel": "D_DM",
+                "channel_type": "im",
+                "ts": "1111.0003",
+                "deleted_ts": "1111.0001",
+                "previous_message": dm,
+            }
         )
 
-        expected = "slack:D_DM:"
         assert chat.process_message.call_args.args[1] == expected
         assert chat.process_message_updated.call_args.args[1] == expected
         assert chat.process_message_deleted.call_args.args[0].thread_id == expected

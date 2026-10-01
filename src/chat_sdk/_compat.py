@@ -1,44 +1,57 @@
-"""Compatibility helpers for adapters written against older hook signatures.
+"""Python-only compatibility helpers for calling adapter hooks.
 
-Python-only (no upstream counterpart). Upstream adds optional trailing
-parameters to adapter hooks (e.g. ``startTyping(threadId, status, options)``);
-in JS, extra arguments are ignored, but in Python they raise ``TypeError`` on
-an adapter that predates them. Callers pass the new keyword only when
-:func:`accepts_kwarg` says the hook takes it.
+Upstream (TypeScript) can add a trailing optional parameter to an adapter
+hook and every existing implementation keeps working, because JavaScript
+silently drops extra arguments. Python raises ``TypeError`` instead, so when
+the SDK starts passing a new keyword to a hook (``post_ephemeral(options=)``)
+it first checks that the implementation accepts it. In-repo adapters always
+do; the probe keeps third-party adapters written against the older signature
+working. See docs/UPSTREAM_SYNC.md (Known Non-Parity).
 """
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import inspect
-import weakref
 from collections.abc import Callable
 from typing import Any
 
-_cache: weakref.WeakKeyDictionary[Any, dict[str, bool]] = weakref.WeakKeyDictionary()
+
+@functools.lru_cache(maxsize=512)
+def _accepts_kwarg_cached(func: Callable[..., Any], name: str) -> bool:
+    return _accepts_kwarg_uncached(func, name)
 
 
-def accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
-    """Return whether ``fn`` can be called with the keyword argument ``name``.
-
-    True when ``fn`` declares ``name`` as a keyword-capable parameter or takes
-    ``**kwargs``. False when it does not, or when its signature cannot be
-    inspected (calling without the keyword is the safe choice). Results are
-    cached per underlying function (bound methods share their function's
-    entry).
-    """
-    target = getattr(fn, "__func__", fn)
+def _accepts_kwarg_uncached(func: Callable[..., Any], name: str) -> bool:
     try:
-        per_fn = _cache.get(target)
-    except TypeError:  # not hashable / not weak-referenceable
-        per_fn = None
-    if per_fn is not None and name in per_fn:
-        return per_fn[name]
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        # Not introspectable (some builtins / C callables): pass the keyword,
+        # as upstream always does.
+        return True
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
-    result = _probe(fn, name)
-    with contextlib.suppress(TypeError):  # not hashable / not weak-referenceable
-        _cache.setdefault(target, {})[name] = result
-    return result
+
+def accepts_kwarg(func: Callable[..., Any], name: str) -> bool:
+    """Return whether ``func`` can be called with keyword argument ``name``.
+
+    ``**kwargs`` counts as accepting. Bound methods are probed through their
+    underlying function so the result is cached per class, not per instance.
+    """
+    target = getattr(func, "__func__", func)
+    try:
+        return _accepts_kwarg_cached(target, name)
+    except TypeError:
+        # Unhashable callable: probe without the cache.
+        return _accepts_kwarg_uncached(target, name)
 
 
 async def aclose_quietly(iterator: object) -> None:
@@ -60,19 +73,3 @@ async def aclose_quietly(iterator: object) -> None:
         _, rest = group.split((GeneratorExit, Exception))
         if rest is not None:
             raise
-
-
-def _probe(fn: Callable[..., Any], name: str) -> bool:
-    try:
-        params = inspect.signature(fn).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    for param in params:
-        if param.kind is inspect.Parameter.VAR_KEYWORD:
-            return True
-        if param.name == name and param.kind in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        ):
-            return True
-    return False

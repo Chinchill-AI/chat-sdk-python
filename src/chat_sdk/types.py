@@ -1900,7 +1900,9 @@ class BaseAdapter:
     Concrete adapters should inherit from this class and override methods
     they support.  Required methods (from :class:`Adapter`) must still be
     implemented by the subclass.  Optional methods raise
-    :class:`~chat_sdk.errors.ChatNotImplementedError` by default.
+    :class:`~chat_sdk.errors.ChatNotImplementedError` by default, except
+    the optional ``reply`` and ``mark_as_read`` hooks, which have no default
+    (see the comment above ``schedule_message``).
     """
 
     # -- Required properties (must be overridden) ----------------------------
@@ -1982,9 +1984,42 @@ class BaseAdapter:
         thread_id: str,
         user_id: str,
         message: AdapterPostableMessage,
-    ) -> EphemeralMessage:
-        """Post an ephemeral message visible only to a specific user."""
+        *,
+        options: PostEphemeralOptions | None = None,
+    ) -> EphemeralMessage | None:
+        """Post a message visible only to a specific user, natively or via an explicit fallback.
+
+        ``options`` is the caller's :class:`PostEphemeralOptions`. Returns an
+        :class:`EphemeralMessage` (``used_fallback`` says whether delivery was
+        private), or ``None`` when the adapter has no private delivery path;
+        ``Thread.post_ephemeral`` returns that ``None`` unchanged. Platforms
+        with targeted messages (e.g. Teams) implement this natively.
+
+        The SDK passes ``options=`` only to implementations whose signature
+        accepts it, so overrides written without the parameter keep working.
+        """
         raise ChatNotImplementedError(self.name, "postEphemeral")
+
+    # -- Optional hooks without a default -----------------------------------
+    #
+    # ``reply`` and ``mark_as_read`` are deliberately NOT defined here.
+    # ``Thread.reply()`` / ``Thread.mark_as_read()`` look them up with
+    # ``getattr(adapter, name, None)`` and raise ``ChatNotImplementedError``
+    # (``"replies"`` / ``"read-receipts"``) *before* any other work when they
+    # are absent, as upstream's ``if (!this.adapter.reply)`` does. A raising
+    # default here would make every subclass look capable, so ``reply()``
+    # would drain the caller's stream and mint callback tokens before
+    # failing. Subclasses that support them define:
+    #
+    #   async def reply(self, thread_id: str, message_id: str,
+    #                   message: AdapterPostableMessage) -> RawMessage
+    #       Post ``message`` as a native reply to ``message_id``.
+    #
+    #   async def mark_as_read(self, thread_id: str, message_id: str,
+    #                          message: Message | None = None) -> None
+    #       Send a read receipt. ``message`` is the full message when the
+    #       caller has one, so adapters can read platform data off
+    #       ``message.raw`` instead of resolving the ID themselves.
 
     async def schedule_message(
         self,
@@ -2446,6 +2481,29 @@ class Thread(Postable, Protocol):
 
     async def get_participants(self) -> list[Author]:
         """Return unique non-bot, non-self authors who've posted in the thread."""
+        ...
+
+    async def reply(
+        self,
+        target: str | Message,
+        message: AdapterPostableMessage | AsyncIterable[Any],
+    ) -> SentMessage:
+        """Reply to a specific message with the platform's native reply.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError` on adapters
+        without native reply support. A ``Message`` target is checked against
+        this thread and carried to ``SentMessage.reply_to``; a raw ID is
+        resolved only against messages the thread already holds (never
+        fetched). Streams are buffered and posted as one message.
+        """
+        ...
+
+    async def mark_as_read(self, message: str | Message | None = None) -> None:
+        """Send a read receipt; defaults to the message being handled.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError` when the
+        adapter does not support read receipts.
+        """
         ...
 
     def create_sent_message_from_message(self, message: Message) -> SentMessage:

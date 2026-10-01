@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from chat_sdk._compat import accepts_kwarg, aclose_quietly
 from chat_sdk.callback_url import CallbackScope, process_card_callback_urls
-from chat_sdk.errors import ChatNotImplementedError
+from chat_sdk.errors import ChatError, ChatNotImplementedError
 from chat_sdk.from_full_stream import from_full_stream
 from chat_sdk.logger import Logger
 from chat_sdk.plan import is_postable_object, post_postable_object
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 from chat_sdk.types import (
     THREAD_STATE_TTL_MS,
@@ -784,9 +785,17 @@ class ThreadImpl:
         # Callback tokens are minted per delivery path so each is bound to
         # the conversation the card actually lands in (vercel/chat#875).
         # Try native ephemeral
-        if hasattr(self.adapter, "post_ephemeral") and self.adapter.post_ephemeral:  # type: ignore[union-attr]
+        native = getattr(self.adapter, "post_ephemeral", None)
+        if native:
             message = await self._process_callback_urls(message)  # type: ignore[assignment]
-            return await self.adapter.post_ephemeral(self._id, user_id, message)  # type: ignore[union-attr]
+            # The adapter may return ``None`` (no private delivery path); that
+            # is returned unchanged, with no DM fallback, as upstream does.
+            # Python-only: ``options=`` is passed only to implementations that
+            # accept it, so adapters written against the older 3-argument
+            # signature keep working (see chat_sdk._compat).
+            if accepts_kwarg(native, "options"):
+                return await native(self._id, user_id, message, options=options)
+            return await native(self._id, user_id, message)
 
         if not options.fallback_to_dm:
             return None
@@ -807,6 +816,82 @@ class ThreadImpl:
             )
 
         return None
+
+    async def reply(
+        self,
+        target: str | Message,
+        message: AdapterPostableMessage | AsyncIterable[Any],
+    ) -> SentMessage:
+        """Reply to a specific message in this thread with the platform's native reply.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError` (``"replies"``)
+        on adapters without a ``reply`` hook.
+
+        ``target`` is the message to reply to, or its ID. Prefer passing the
+        :class:`Message`: it is checked against this thread and carried through
+        to ``SentMessage.reply_to`` and cached thread history. A raw ID is
+        resolved only against messages this thread already holds
+        (``recent_messages`` or the message being handled) and is never
+        fetched; an unknown ID is still sent, with ``reply_to`` left ``None``
+        and no cross-thread check. Streams are buffered and posted as one
+        markdown message rather than streamed edit-by-edit.
+        """
+        reply_hook = getattr(self.adapter, "reply", None)
+        if not reply_hook:
+            raise ChatNotImplementedError(self.adapter.name, "replies")
+
+        target_message = target if isinstance(target, Message) else self._find_known_message(target)
+
+        if target_message is not None and target_message.thread_id != self._id:
+            # Upstream throws a plain ``Error``; ``ChatError`` keeps the SDK's
+            # error hierarchy (same message). See docs/UPSTREAM_SYNC.md.
+            raise ChatError("Cannot reply to a message from another thread")
+
+        postable: AdapterPostableMessage
+        if _is_async_iterable(message):
+            markdown = ""
+            async for chunk in from_full_stream(message):  # type: ignore[arg-type]
+                if isinstance(chunk, str):
+                    markdown += chunk
+                elif getattr(chunk, "type", None) == "markdown_text":
+                    # Only MarkdownTextChunk carries ``.text`` (pyrefly does
+                    # not narrow on the ``type`` tag).
+                    markdown += getattr(chunk, "text", "")
+                elif isinstance(chunk, dict) and chunk.get("type") == "markdown_text":
+                    markdown += chunk.get("text", "")
+            # A stream can finish without producing text (tool calls only, or
+            # just task_update/plan_update chunks). Platforms reject empty
+            # bodies, so fall back to a single space as upstream does. JS
+            # ``trim()`` whitespace set, not ``str.strip()``'s.
+            postable = PostableMarkdown(markdown=markdown if markdown.strip(JS_WHITESPACE) else " ")
+        else:
+            postable = message  # type: ignore[assignment]
+
+        postable = await self._process_callback_urls(postable)
+        target_id = target if isinstance(target, str) else target.id
+        raw_msg: RawMessage = await reply_hook(self._id, target_id, postable)
+        result = self._create_sent_message(
+            raw_msg.id,
+            postable,
+            raw_msg.thread_id,
+            raw=raw_msg.raw,
+            reply_to=target_message,
+        )
+
+        if self._thread_history is not None:
+            await self._thread_history.append(self._id, _to_message(result))
+
+        return result
+
+    def _find_known_message(self, message_id: str) -> Message | None:
+        """Resolve a message ID against messages this thread already holds.
+
+        Deliberately does not fetch: callers that need ``reply_to`` populated
+        for certain should pass the :class:`Message` itself.
+        """
+        if self._current_message is not None and self._current_message.id == message_id:
+            return self._current_message
+        return next((m for m in self._recent_messages if m.id == message_id), None)
 
     async def _process_callback_urls(
         self,
@@ -1236,6 +1321,37 @@ class ThreadImpl:
         if end_typing is not None:
             await end_typing(self._id, status if status is not None else "active")
 
+    async def mark_as_read(self, message: str | Message | None = None) -> None:
+        """Send a read receipt for an inbound message.
+
+        Defaults to the message being handled, so it takes no argument inside
+        a message handler. Pass a :class:`Message` or a message ID to target
+        one explicitly; a ``Message`` must belong to this thread. Platforms
+        may treat the receipt as a watermark and mark earlier messages read
+        along with the target.
+
+        Raises :class:`~chat_sdk.errors.ChatNotImplementedError`
+        (``"read-receipts"``) on adapters without a ``mark_as_read`` hook.
+        """
+        mark_hook = getattr(self.adapter, "mark_as_read", None)
+        if not mark_hook:
+            raise ChatNotImplementedError(self.adapter.name, "read-receipts")
+
+        # ``None`` means "the current message"; upstream's ``message ??
+        # currentMessage`` followed by ``!target`` also rejects an empty ID.
+        target = message if message is not None else self._current_message
+        if target is None or target == "":
+            raise ChatError("A message is required outside a message handler")
+
+        if isinstance(target, str):
+            await mark_hook(self._id, target, None)
+            return
+
+        if target.thread_id != self._id:
+            raise ChatError("Cannot mark a message from another thread as read")
+
+        await mark_hook(self._id, target.id, target)
+
     # -- Refresh -------------------------------------------------------------
 
     async def refresh(self) -> None:
@@ -1458,6 +1574,7 @@ class ThreadImpl:
         postable: AdapterPostableMessage,
         thread_id_override: str | None = None,
         raw: Any = None,
+        reply_to: Message | None = None,
     ) -> SentMessage:
         adapter = self.adapter
         thread_id = thread_id_override or self._id
@@ -1468,7 +1585,10 @@ class ThreadImpl:
         async def _edit(new_content: Any) -> SentMessage:
             new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
-            return thread_impl._create_sent_message(message_id, new_content)
+            # Keep the resolved thread ID and reply target on the edited
+            # message (upstream ``createSentMessage(messageId, postable,
+            # threadId, replyTo)``).
+            return thread_impl._create_sent_message(message_id, new_content, thread_id, reply_to=reply_to)
 
         async def _delete() -> None:
             await adapter.delete_message(thread_id, message_id)
@@ -1498,6 +1618,7 @@ class ThreadImpl:
             attachments=attachments,
             links=[],
             raw=raw,
+            reply_to=reply_to,
             _edit=_edit,
             _delete=_delete,
             _add_reaction=_add_reaction,
@@ -1514,7 +1635,7 @@ class ThreadImpl:
         async def _edit(new_content: Any) -> SentMessage:
             new_content = await thread_impl._process_callback_urls(new_content)
             await adapter.edit_message(thread_id, message_id, new_content)
-            return thread_impl._create_sent_message(message_id, new_content, thread_id)
+            return thread_impl._create_sent_message(message_id, new_content, thread_id, reply_to=message.reply_to)
 
         async def _delete() -> None:
             await adapter.delete_message(thread_id, message_id)

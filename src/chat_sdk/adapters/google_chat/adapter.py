@@ -76,6 +76,7 @@ from chat_sdk.types import (
     LockScope,
     Message,
     PostableMarkdown,
+    PostEphemeralOptions,
     RawMessage,
     ReactionEvent,
     StateAdapter,
@@ -1862,8 +1863,14 @@ class GoogleChatAdapter:
         thread_id: str,
         user_id: str,
         message: AdapterPostableMessage,
+        *,
+        options: PostEphemeralOptions | None = None,
     ) -> EphemeralMessage:
-        """Post an ephemeral (user-only visible) message."""
+        """Post an ephemeral (user-only visible) message.
+
+        ``options`` is accepted for the adapter contract and unused: delivery
+        is always native.
+        """
         decoded = self.decode_thread_id(thread_id)
         space_name = decoded.space_name
         thread_name = decoded.thread_name
