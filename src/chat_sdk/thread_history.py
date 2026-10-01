@@ -6,8 +6,8 @@ Used by adapters that lack server-side message history APIs
 (e.g. WhatsApp, Telegram).  Messages are atomically appended via
 ``state.append_to_list()``, which is safe without holding a thread lock.
 
-Distinct from the cross-platform per-user Transcripts API (see
-``transcripts.py``) — this cache is keyed by thread, not user.
+Distinct from the cross-platform per-user history API (``chat.history.user``,
+see ``history/user.py``) — this cache is keyed by thread, not user.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class ThreadHistoryCache:
     ``state.append_to_list()``, which is safe without holding a thread lock.
 
     Distinct from the cross-platform per-user
-    :class:`~chat_sdk.transcripts.TranscriptsApiImpl` (see ``transcripts.py``)
+    :class:`~chat_sdk.history.UserHistoryApiImpl` (``chat.history.user``)
     — this cache is keyed by thread, not user.
     """
 
@@ -68,9 +68,13 @@ class ThreadHistoryCache:
         """
         key = f"{KEY_PREFIX}{thread_id}"
 
-        # Serialize with raw nulled out to save storage
+        # Omit raw payloads to keep history storage bounded -- along the whole
+        # ``replyTo`` chain (upstream vercel/chat#802).
         serialized = message.to_json()
-        serialized["raw"] = None
+        current: dict[str, Any] | None = serialized
+        while current is not None:
+            current["raw"] = None
+            current = current.get("replyTo")
 
         await self._state.append_to_list(
             key,

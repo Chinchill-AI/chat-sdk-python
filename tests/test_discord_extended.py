@@ -18,6 +18,7 @@ from chat_sdk.adapters.discord.adapter import (
     CHANNEL_TYPE_GROUP_DM,
     CHANNEL_TYPE_PUBLIC_THREAD,
     DiscordAdapter,
+    DiscordApiError,
 )
 from chat_sdk.adapters.discord.types import DiscordAdapterConfig, DiscordThreadId
 from chat_sdk.shared.errors import NetworkError, ValidationError
@@ -70,6 +71,10 @@ def _gateway_request(body: str, token: str = "test-token") -> _FakeRequest:
             "content-type": "application/json",
         },
     )
+
+
+# ``GET /channels/thread789`` response: thread789's parent is channel456.
+THREAD_789_CHANNEL = {"id": "thread789", "parent_id": "channel456"}
 
 
 def _msg_response(msg_id="msg001", channel_id="channel456", content="Hello"):
@@ -303,12 +308,15 @@ class TestPostMessage:
     @pytest.mark.asyncio
     async def test_posts_to_thread_channel(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=_msg_response(msg_id="msg002", channel_id="thread789"))
+        adapter._discord_fetch = AsyncMock(
+            side_effect=[THREAD_789_CHANNEL, _msg_response(msg_id="msg002", channel_id="thread789")]
+        )
 
         result = await adapter.post_message("discord:guild1:channel456:thread789", "Thread reply")
 
         assert result.id == "msg002"
         assert result.thread_id == "discord:guild1:channel456:thread789"
+        assert adapter._discord_fetch.call_args_list[0].args == ("/channels/thread789", "GET")
         call_args = adapter._discord_fetch.call_args
         assert call_args[0][0] == "/channels/thread789/messages"
 
@@ -359,7 +367,9 @@ class TestEditMessage:
     @pytest.mark.asyncio
     async def test_edits_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=_msg_response(msg_id="msg002", channel_id="thread789"))
+        adapter._discord_fetch = AsyncMock(
+            side_effect=[THREAD_789_CHANNEL, _msg_response(msg_id="msg002", channel_id="thread789")]
+        )
 
         result = await adapter.edit_message("discord:guild1:channel456:thread789", "msg002", "Edited thread reply")
 
@@ -400,12 +410,14 @@ class TestDeleteMessage:
     @pytest.mark.asyncio
     async def test_deletes_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.delete_message("discord:guild1:channel456:thread789", "msg002")
 
-        assert adapter._discord_fetch.call_count == 1
-        adapter._discord_fetch.assert_called_once_with("/channels/thread789/messages/msg002", "DELETE")
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/messages/msg002", "DELETE"),
+        ]
 
 
 # ============================================================================
@@ -430,7 +442,7 @@ class TestAddReaction:
     @pytest.mark.asyncio
     async def test_adds_reaction_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.add_reaction("discord:guild1:channel456:thread789", "msg001", "heart")
 
@@ -461,7 +473,7 @@ class TestRemoveReaction:
     @pytest.mark.asyncio
     async def test_removes_reaction_in_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.remove_reaction("discord:guild1:channel456:thread789", "msg001", "fire")
 
@@ -578,12 +590,14 @@ class TestStartTyping:
     @pytest.mark.asyncio
     async def test_sends_typing_to_thread(self):
         adapter = _make_adapter(logger=_make_logger())
-        adapter._discord_fetch = AsyncMock(return_value=None)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, None])
 
         await adapter.start_typing("discord:guild1:channel456:thread789")
 
-        assert adapter._discord_fetch.call_count == 1
-        adapter._discord_fetch.assert_called_once_with("/channels/thread789/typing", "POST")
+        assert [c.args for c in adapter._discord_fetch.call_args_list] == [
+            ("/channels/thread789", "GET"),
+            ("/channels/thread789/typing", "POST"),
+        ]
 
 
 # ============================================================================
@@ -654,7 +668,7 @@ class TestFetchMessages:
                 "attachments": [],
             },
         ]
-        adapter._discord_fetch = AsyncMock(return_value=raw_messages)
+        adapter._discord_fetch = AsyncMock(side_effect=[THREAD_789_CHANNEL, raw_messages])
 
         result = await adapter.fetch_messages("discord:guild1:channel456:thread789")
 
@@ -1243,6 +1257,87 @@ class TestForwardedMessageThreadHandling:
 
 
 # ============================================================================
+# Forwarded message -- tri-state is_mention (upstream vercel/chat#946)
+# ============================================================================
+
+
+def _forwarded_thread_message(content: str, **extra) -> str:
+    return json.dumps(
+        {
+            "type": "GATEWAY_MESSAGE_CREATE",
+            "timestamp": 1234567890,
+            "data": {
+                "id": "msg123",
+                "channel_id": "thread789",
+                "guild_id": "guild1",
+                "content": content,
+                "timestamp": "2021-01-01T00:00:00.000Z",
+                "author": {"id": "user789", "username": "testuser", "bot": False},
+                "mentions": [],
+                "attachments": [],
+                "thread": {"id": "thread789", "parent_id": "channel456"},
+                **extra,
+            },
+        }
+    )
+
+
+class TestForwardedMessageMentionFlag:
+    # Mirrors upstream "keeps allowlisted forwarded messages in their Discord
+    # thread" (``isMention: isMentioned || undefined``): an unmentioned
+    # forwarded message reports no detection (None), never a definitive False.
+    @pytest.mark.asyncio
+    async def test_unmentioned_forwarded_message_leaves_is_mention_unset(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        adapter._chat = mock_chat
+
+        await adapter.handle_webhook(_gateway_request(_forwarded_thread_message("No mention needed")))
+
+        message = mock_chat.handle_incoming_message.await_args.args[2]
+        assert message.is_mention is None
+
+    @pytest.mark.asyncio
+    async def test_mentioned_forwarded_message_reports_definitive_mention(self):
+        adapter = _make_adapter(logger=_make_logger())
+        mock_chat = MagicMock()
+        mock_chat.handle_incoming_message = AsyncMock()
+        adapter._chat = mock_chat
+
+        await adapter.handle_webhook(
+            _gateway_request(
+                _forwarded_thread_message("<@test-app-id> hi", mentions=[{"id": "test-app-id", "username": "bot"}])
+            )
+        )
+
+        message = mock_chat.handle_incoming_message.await_args.args[2]
+        assert message.is_mention is True
+
+    # End to end through a real Chat: a literal ``@botname`` with no Discord
+    # mention metadata still routes to ``on_mention`` via text detection.
+    @pytest.mark.asyncio
+    async def test_literal_botname_text_routes_to_on_mention(self):
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import MockLogger, create_mock_state
+        from chat_sdk.types import ChatConfig
+
+        adapter = _make_adapter(logger=_make_logger(), user_name="mybot")
+        chat = Chat(
+            ChatConfig(user_name="mybot", adapters={"discord": adapter}, state=create_mock_state(), logger=MockLogger())
+        )
+        mention_handler = AsyncMock(return_value=None)
+        chat.on_mention(mention_handler)
+
+        await chat.webhooks["discord"](_gateway_request(_forwarded_thread_message("hey @mybot can you help")))
+
+        mention_handler.assert_awaited_once()
+        thread, message = mention_handler.await_args.args[:2]
+        assert thread.id == "discord:guild1:channel456:thread789"
+        assert message.is_mention is True
+
+
+# ============================================================================
 # Forwarded reaction -- thread parent caching
 # ============================================================================
 
@@ -1557,11 +1652,12 @@ class TestCreateDiscordThread160004Recovery:
     @pytest.mark.asyncio
     async def test_recovers_when_thread_already_exists(self):
         adapter = _make_adapter(logger=_make_logger())
+        body = '{"code": 160004, "message": "A thread has already been created for this message"}'
         adapter._discord_fetch = AsyncMock(
             side_effect=NetworkError(
                 "discord",
-                "Discord API error: 400"
-                ' {"code": 160004, "message": "A thread has already been created for this message"}',
+                f"Discord API error: 400 {body}",
+                DiscordApiError(400, body),
             )
         )
 
@@ -1573,11 +1669,9 @@ class TestCreateDiscordThread160004Recovery:
     @pytest.mark.asyncio
     async def test_propagates_non_160004_network_errors(self):
         adapter = _make_adapter(logger=_make_logger())
+        body = '{"code": 50001, "message": "Missing Access"}'
         adapter._discord_fetch = AsyncMock(
-            side_effect=NetworkError(
-                "discord",
-                'Discord API error: 403 {"code": 50001, "message": "Missing Access"}',
-            )
+            side_effect=NetworkError("discord", f"Discord API error: 403 {body}", DiscordApiError(403, body))
         )
 
         with pytest.raises(NetworkError):
