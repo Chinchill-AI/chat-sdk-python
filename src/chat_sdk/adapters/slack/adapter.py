@@ -6074,6 +6074,13 @@ class SlackAdapter:
                 )
                 tail = last_appended[len(last_flushed) :] + delta
                 sent = last_flushed
+            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6316):
+            # the successor opens even when ``tail`` is empty. If the reply
+            # then ends with nothing more, the final ``stop()`` starts and
+            # stops it (both SDKs' streamer ``stop()`` calls chat.startStream
+            # first), leaving a message holding only the stream-end blocks,
+            # and its ts is returned. Kept as upstream: no Python-specific
+            # hazard, and skipping it would also drop the stop blocks.
             await start_next_segment(sent)
             return tail
 
