@@ -4643,19 +4643,25 @@ class SlackAdapter:
         thread_id: str,
         text_stream: AsyncIterable[StreamInput],
         options: StreamOptions | None = None,
-    ) -> RawMessage:
+    ) -> RawMessage | None:
         """Stream a message using Slack's native streaming API.
 
         Consumes an async iterable of text chunks and/or structured
         ``StreamChunk`` objects and streams them to Slack.
 
-        Requires ``recipient_user_id`` and ``recipient_team_id`` in *options*.
+        Native streaming needs ``recipient_user_id`` and ``recipient_team_id``
+        in *options*. Without them this returns ``None`` before consuming
+        *text_stream*, so the core post+edit fallback delivers the reply.
         """
         if not options or not (options.recipient_user_id and options.recipient_team_id):
-            raise ValidationError(
-                "slack",
-                "Slack streaming requires recipient_user_id and recipient_team_id in options",
-            )
+            # Upstream returns null here (438f5513, vercel/chat#633) for
+            # threads with no message context: `chat.thread(id)`, open_dm,
+            # and message-less action/reaction threads (#199). Minimal port
+            # of that guard; upstream's DM exemption and the rest of the
+            # Slack streaming half (native_streaming, mid-stream fallback,
+            # retiring the #94 branch below) are #207.
+            self._logger.debug("Slack: using fallback stream - no recipient context")
+            return None
 
         decoded = self.decode_thread_id(thread_id)
         channel = decoded.channel
