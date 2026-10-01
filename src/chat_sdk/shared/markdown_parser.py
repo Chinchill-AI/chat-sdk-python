@@ -687,6 +687,19 @@ def parse_markdown(text: str) -> Root:
 
     Returns a Root dict ``{"type": "root", "children": [...]}``.
     """
+    return _parse_blocks(text, 0)
+
+
+# Divergence from upstream -- see docs/UPSTREAM_SYNC.md. Blockquotes parse
+# recursively; past this depth the rest stays literal text so ``> > > ...``
+# from untrusted input cannot raise ``RecursionError`` (remark has no cap).
+# One frame per level: 768 keeps the 600-level guarantee of
+# ``test_deeply_nested_blockquote_does_not_overflow_the_stack`` with room under
+# Python's default recursion limit (1,000) for the caller's frames.
+_MAX_BLOCKQUOTE_DEPTH = 768
+
+
+def _parse_blocks(text: str, depth: int) -> Root:
     children: list[Content] = []
     lines = text.split("\n")
     i = 0
@@ -763,7 +776,11 @@ def parse_markdown(text: str) -> Root:
                 else:
                     break
             # Recursively parse blockquote content
-            bq_ast = parse_markdown("\n".join(bq_lines))
+            bq_text = "\n".join(bq_lines)
+            if depth >= _MAX_BLOCKQUOTE_DEPTH:
+                children.append(make_blockquote([make_paragraph([make_text(bq_text)])]))
+                continue
+            bq_ast = _parse_blocks(bq_text, depth + 1)
             children.append(make_blockquote(bq_ast.get("children", [])))
             continue
 

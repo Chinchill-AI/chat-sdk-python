@@ -226,6 +226,8 @@ class TestSlackFormatPrimitives:
         quoted = "&gt; " + "```" * 10_000
         assert slack_mrkdwn_to_markdown(quoted) == "> " + "```" * 10_000
         assert slack_mrkdwn_to_markdown("<!here " + "<" * n) == "<!here " + "<" * n
+        indented_quote = " " * 20_000 + "&gt;" + "```" * 6_665
+        assert slack_mrkdwn_to_markdown(indented_quote) == " " * 20_000 + ">" + "```" * 6_665
 
     def test_converts_basic_markdown_bold_to_slack_mrkdwn_bold(self):
         assert markdown_bold_to_slack_mrkdwn("The **domain** is example.com") == "The *domain* is example.com"

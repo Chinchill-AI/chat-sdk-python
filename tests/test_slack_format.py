@@ -68,6 +68,13 @@ class TestToMarkdown:
         # Upstream: "npm test" (multi-backtick code span, a shared-parser gap).
         assert ast_to_plain_text(ast).replace("`", "") == "npm test"
 
+    def test_deeply_nested_quotes_do_not_exhaust_the_stack(self):
+        """Python-specific guard: ``&gt;`` now unescapes, so 1,100 quote
+        markers reach the recursive blockquote parser. Past 768 levels the
+        rest stays literal text instead of raising ``RecursionError``."""
+        ast = self.converter.to_ast("&gt;" * 1_100 + " hi")
+        assert ast_to_plain_text(ast) == ">" * (1_100 - 769) + " hi"
+
     def test_keeps_trailing_text_after_a_code_block_as_a_paragraph(self):
         ast = self.converter.to_ast("```x``` &gt; note")
         assert ast["children"][0]["type"] == "code"

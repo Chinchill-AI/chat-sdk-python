@@ -1243,7 +1243,8 @@ rules were #193 and the `previous_message` hunk of #846 is #211.
 
 ### Slack inbound mrkdwn, channel-post ids, Socket Mode retries (chat@4.33–4.41, #283)
 
-Part (b) of #209. Parity, with no new divergence. Ports the Slack halves of
+Part (b) of #209. Parity apart from one divergence (the blockquote depth cap,
+below). Ports the Slack halves of
 `0b63791b` (#667, chat@4.33.0), `92530dd3` (#720, chat@4.35.0), `c3118279`
 (#756, chat@4.37.0), `e71bfead` (#843, chat@4.39.0) and `44423bdc` (#960,
 chat@4.41.1).
@@ -1279,8 +1280,11 @@ chat@4.41.1).
 - **Linear-time scanning (implementation, not divergence).** Results equal
   upstream's. A failed `<…>` scan is remembered so a run of unclosed `<` stays
   linear, the inline-code newline check is bounded by the closing backtick,
-  and the blockquote-line check matches in place instead of slicing.
-  `tests/test_slack_format_primitives.py` covers 50k-character inputs.
+  and the blockquote-line check (`_BlockquoteLines`) remembers the current
+  line, so many fences on one long indented quote line stay linear (upstream
+  re-slices the line per fence). `tests/test_slack_format_primitives.py`
+  covers 50k-character inputs, and a differential fuzz against upstream
+  `format/index.ts` (40k random mrkdwn inputs) found no mismatch.
 - **Known gaps (shared parser, not Slack-specific).** Two `markdown.test.ts`
   cases are adapted: `parse_markdown` has no multi-backtick code spans
   (```` ```c``` ```` inside a quote stays backticked text, where remark reads a
@@ -1297,6 +1301,12 @@ chat@4.41.1).
   from `message.text`. It now stays text in the quote (backticks kept, the
   multi-backtick gap above). A line-leading *unpaired* ```` ```npm test ````
   still opens an empty code block, as in upstream (remark does the same).
+- **Blockquote depth cap (divergence, see the non-parity table).** `&gt;` now
+  unescapes, so `"&gt;" * 1100` reaches `parse_markdown`'s recursive
+  blockquote parsing and raised `RecursionError`, failing the message (and a
+  whole `fetch_messages` page). Past 768 nested levels the rest of the quote
+  stays literal text. Nested lists recurse the same way and predate this
+  change (#308).
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
@@ -3217,6 +3227,7 @@ stay explicit instead of being rediscovered in code review.
 | Area | Python behavior | TS behavior | Rationale |
 |------|----------------|-------------|-----------|
 | JSX Card/Modal elements | Not supported; tests skipped | `Card()` returns JSX element | Python has no JSX runtime |
+| Blockquote nesting cap (4.41 wave, #283) | `parse_markdown` nests at most 768 blockquotes; deeper `>` markers stay literal text in the innermost quote | remark nests without limit (`"> " * 1100 + "x"` gives 1,100 blockquotes) | Blockquotes parse recursively and Python's recursion limit (1,000) turned untrusted input such as Slack `"&gt;" * 1100` into a `RecursionError` that dropped the message. Only absurdly deep quotes differ. Regression test: `tests/test_slack_format.py::TestToMarkdown::test_deeply_nested_quotes_do_not_exhaust_the_stack`. |
 | Channel edit callback scope (4.41 wave, #194) | A channel `SentMessage.edit` binds new callback tokens to `{channel.id, "channel"}`, the scope the original `channel.post` used | `createSentMessage(...).edit` binds to `{threadId, "thread"}`, where `threadId` is the id the adapter reported for the post (or the channel id) | The reported thread id often never equals a click's thread id: Teams and Google Chat report the channel id (upstream as well; Teams clicks carry `;messageid=`, Google Chat clicks carry the thread name), Python's Slack reported the synthetic `slack:C…:` until #283 (it still does when the response has no string ts) while clicks carry the message ts, a Slack DM click carries no ts even though the post now reports one, and a chained edit dropped the override until #195 ported `16ea171e`. Upstream's edited buttons never POST in those cases. Every click on the message derives the channel id, and the channel scope is no broader than the original post's. Regression tests: `tests/test_channel_faithful.py::TestCallbackUrlProcessing::test_edited_slack_channel_card_resolves_for_the_real_click` (real Slack id functions and `_handle_block_actions`, channel and DM, before and after #283), `::test_edited_teams_channel_card_resolves_for_a_click_in_that_channel` (real Teams id functions) and `::test_chained_edit_keeps_callback_tokens_resolvable`. To be filed as an upstream issue against vercel/chat (Teams and Google Chat edited channel cards never POST); upstream Slack is unaffected, since its `postChannelMessage` and DM clicks both carry the message ts. |
 | Callback-token lease fence (4.41 wave, #194) | After deleting a matched record, `resolve_callback_url` calls `extend_lock(lock, CALLBACK_LOCK_TTL_MS)`. If that fails, the 10 s lease lapsed mid-consume, and the call returns `None` instead of the record (fail closed: no POST, raw `__cb:` value to handlers) | `resolveCallbackUrl` returns the record after `delete` regardless of lease state, so if a `get`/`delete` stalls past the lease, a second click that takes the expired lock also resolves it and both POST | Keeps the single-use contract under state-backend stalls. `extend_lock` checks token ownership and expiry in every backend (Memory, Redis script, Postgres `WHERE token = $4 AND expires_at > now()`), and `Chat` already relies on it for lock heartbeats. The cost is one extra state call per resolved click. A stalled consume that loses its lease also burns the token without a POST. To be filed as an upstream issue against vercel/chat (a stalled `get`/`delete` past the 10 s lease lets a second click double-POST). Regression test: `tests/test_callback_url.py::TestResolveCallbackUrlLocking::test_lost_lease_fails_closed_instead_of_double_consuming`. |
 | Link-preview fence slicing (4.41 wave, #195) | `_render_link_for_prompt` bounds url/title/description/site with Python slicing, which counts code points | `renderLinkForPrompt` slices with `String.prototype.slice`, which counts UTF-16 code units | Only differs for astral characters (emoji and the like): a bounded field keeps up to the limit in code points, where JS keeps half as many astral characters and can end on a lone surrogate. Emulating UTF-16 slicing would produce lone surrogates that break UTF-8 encoding of the prompt. Whitespace handling is not a divergence: the normalizer uses JS's exact `\s`/`trim` set. Regression test: `tests/test_ai_messages.py::TestLinkPreviews::test_link_metadata_bounds_count_code_points_not_utf16_units`. |

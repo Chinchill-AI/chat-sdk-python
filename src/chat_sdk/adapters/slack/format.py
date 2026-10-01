@@ -268,6 +268,7 @@ def _convert_mrkdwn_with_code_fences(mrkdwn: str) -> str:
     cursor = 0
     length = len(mrkdwn)
     angle = _AngleTokenScanner(mrkdwn)
+    quote_lines = _BlockquoteLines(mrkdwn)
     # Set when the closing fence splits a line: the text after it lands at the
     # start of a new line, where CommonMark would promote a leading block
     # marker Slack rendered inline.
@@ -304,7 +305,7 @@ def _convert_mrkdwn_with_code_fences(mrkdwn: str) -> str:
 
         content_start = cursor + len(_CODE_FENCE)
         content_end = mrkdwn.find(_CODE_FENCE, content_start)
-        if content_end == -1 or _is_on_blockquote_line(mrkdwn, cursor):
+        if content_end == -1 or quote_lines.contains(cursor):
             # Slack renders an unpaired or quoted ``` literally. Upstream-parity
             # choice: the fence is left as is (adapter-slack format/index.ts
             # convertMrkdwnWithCodeFences), so a line-leading unpaired
@@ -351,13 +352,37 @@ def _find_inline_code_end(mrkdwn: str, index: int) -> int:
     return close + 1
 
 
-def _is_on_blockquote_line(mrkdwn: str, index: int) -> bool:
-    # Upstream ``slice(lineStart, index).trimStart().startsWith("&gt;")``,
-    # matched in place so many fences on one long line copy nothing.
-    line_start = mrkdwn.rfind("\n", 0, index) + 1
-    indent = _JS_LEADING_WHITESPACE.match(mrkdwn, line_start, index)
-    content_start = indent.end() if indent is not None else line_start
-    return mrkdwn.startswith("&gt;", content_start, index)
+class _BlockquoteLines:
+    """Upstream ``isOnBlockquoteLine``, remembering the current line.
+
+    Upstream computes ``slice(lineStart, index).trimStart().startsWith("&gt;")``
+    per fence. *index* only grows and always sits on a backtick, so the
+    leading-whitespace run (and thus the answer) is fixed per line: the line
+    start is found by scanning only the new text since the last call, and
+    the answer is computed once per line. Results are identical; many fences
+    on one long line stay linear.
+    """
+
+    __slots__ = ("_line_start", "_quoted", "_scanned", "_text")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._scanned = 0
+        self._line_start = 0
+        self._quoted: bool | None = None
+
+    def contains(self, index: int) -> bool:
+        """Whether the line holding *index* starts (after whitespace) with ``&gt;``."""
+        newline = self._text.rfind("\n", self._scanned, index)
+        self._scanned = index
+        if newline != -1:
+            self._line_start = newline + 1
+            self._quoted = None
+        if self._quoted is None:
+            indent = _JS_LEADING_WHITESPACE.match(self._text, self._line_start, index)
+            content_start = indent.end() if indent is not None else self._line_start
+            self._quoted = self._text.startswith("&gt;", content_start, index)
+        return self._quoted
 
 
 def _escape_leading_block_marker(text: str) -> str:
