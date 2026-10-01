@@ -1011,7 +1011,13 @@ split out to #278.
   handler tasks before disconnecting adapters (upstream waits for them). A
   cancelled handler task is counted as a failure, so the update stays in the
   checkpoint and is retried after a restart instead of being acknowledged
-  unhandled.
+  unhandled. For the same reason `disconnect()` cancels albums still settling
+  (`_media_group_tasks`) before stopping the poller; otherwise an album could
+  dispatch a new handler after `Chat.shutdown`'s cancellation sweep and keep
+  `stop_polling` waiting on it.
+- **Album buffer key (parity).** The buffer key is not scoped to the bot
+  identity, exactly as upstream. Bots that share one state namespace must not
+  share a group chat (core `dedupe:` keys are not bot-scoped either).
 - Delivery is now at-least-once: an update whose handler finished but whose
   acknowledgement never reached Telegram (a crash before the next
   `getUpdates`) is delivered again, as upstream.

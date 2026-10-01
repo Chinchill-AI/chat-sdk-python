@@ -2722,6 +2722,10 @@ class TestTelegramPollingAcknowledgement:
             assert len(handler.await_args.args[1].attachments) == 2
             assert fixture.api.polls[1]["offset"] == 12
             assert await fixture.checkpoint() is None
+            # Cutting the collection poll short is not a request failure.
+            assert not [
+                call for call in fixture.adapter._logger.warn.calls if call[0] == "Telegram polling request failed"
+            ]  # type: ignore[attr-defined]
         finally:
             await fixture.stop()
 
@@ -3070,6 +3074,25 @@ class TestTelegramPollingShutdownPythonEdges:
             assert all(poll["offset"] == 3 for poll in second.api.polls)
         finally:
             await second.stop()
+
+    @pytest.mark.asyncio
+    async def test_chat_shutdown_during_album_settle_does_not_wait_for_the_album(self):
+        fixture = _PollingFixture(_polled_album())
+        handler = AsyncMock()
+        fixture.chat.on_mention(handler)
+        await fixture.start()
+        await _wait_until(lambda: len(fixture.api.polls) >= 2)
+        # Due album: the loop dispatches it, and the parts park in their
+        # settle sleep (the fake clock is not advanced again).
+        await fixture.clock.advance(1_050)
+        assert fixture.adapter._media_group_tasks
+
+        await asyncio.wait_for(fixture.chat.shutdown(), timeout=5)
+
+        handler.assert_not_awaited()
+        assert fixture.adapter.is_polling is False
+        saved = await fixture.checkpoint()
+        assert [(entry["update"]["update_id"], entry["attempts"]) for entry in saved["pending"]] == [(1, 1), (2, 1)]
 
     @pytest.mark.asyncio
     async def test_stop_polling_waits_for_an_in_flight_handler(self):

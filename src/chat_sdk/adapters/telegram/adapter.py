@@ -1210,6 +1210,15 @@ class TelegramAdapter:
 
     async def disconnect(self) -> None:
         """Disconnect the adapter, stop polling, and close the shared HTTP session."""
+        # Python-only: ``Chat.shutdown`` cancels in-flight handler tasks before
+        # disconnecting adapters, but an album still settling would dispatch
+        # a new handler afterwards (and keep ``stop_polling`` waiting on it).
+        # Cancel albums first; a polled album then stays in the checkpoint.
+        media_group_tasks = [task for task in self._media_group_tasks if not task.done()]
+        for task in media_group_tasks:
+            task.cancel()
+        if media_group_tasks:
+            await asyncio.wait(media_group_tasks)
         await self.stop_polling()
         # Python-only: a pending receipt-typing task would otherwise reopen the
         # shared aiohttp session via ``_get_http_session`` after it is closed.
@@ -1438,10 +1447,11 @@ class TelegramAdapter:
             timer.cancel()
             if not fetch.done():
                 fetch.cancel()
-        if not fetch.cancelled():
-            return fetch.result()
+        # A cancelled fetch only finishes cancelling once it runs again.
         await asyncio.wait({fetch})
-        return []
+        if fetch.cancelled():
+            return []
+        return fetch.result()
 
     async def polling_loop(self, config: ResolvedTelegramLongPollingConfig) -> None:
         """Long-poll ``getUpdates``, acknowledging only settled updates.
@@ -1875,6 +1885,9 @@ class TelegramAdapter:
             return
 
         state = self._chat.get_state()
+        # Upstream parity: the buffer key is not scoped to the bot identity
+        # (upstream ``processIncomingMediaGroup`` uses the same key), so bots
+        # sharing one state namespace must not share a group chat.
         media_group_key = f"{self._name}:incoming-media-group:{thread_id}:{media_group_id}"
         lock_key = f"{media_group_key}:lock"
         appended = False
