@@ -480,6 +480,10 @@ def _block_text_leaf(value: Any) -> str | list[Any]:
         # A raw_text cell is plain text: Slack reserves mentions and links for
         # rich_text cells, so its control characters render literally. Kept
         # aligned with ``_classify_blocks_mention``, which does not scan it.
+        # Upstream parity (adapter-slack/src/index.ts:722-726, 7106-7124): only
+        # ``&``/``<``/``>`` are escaped and the cell then goes through the
+        # mrkdwn converter, so ``*``/``_``/``---`` in a raw cell still read as
+        # formatting there too.
         return escape_slack_text(text or "")
     if value_type == "link":
         url = _str(value.get("url"))
@@ -3779,6 +3783,9 @@ class SlackAdapter:
                 urls.add(att_url)
             # Alert attachments link their title (e.g. the Sentry issue URL);
             # surface it so handlers can reach what the Slack UI links to.
+            # Upstream parity (adapter-slack/src/index.ts:4466-4470): the
+            # preview carries no title, so ``_enrich_links`` may wait for an
+            # unfurl like it does for any untitled link.
             title_link = att.get("title_link")
             if isinstance(title_link, str) and title_link and not _is_foreign_attachment(att):
                 urls.add(title_link)

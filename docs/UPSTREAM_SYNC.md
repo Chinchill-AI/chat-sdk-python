@@ -1134,10 +1134,14 @@ rules were #193 and the `previous_message` hunk of #846 is #211.
   Python slices copy, so the upstream shape is quadratic (about 4 s on 200k
   characters of `<@U1>` tokens) now that it also runs over attachment text.
   Output is identical (fuzzed against the upstream-shaped versions).
-- **Interim gap until #283.** Upstream's `toAst` runs `slackMrkdwnToMarkdown`,
-  which unescapes `&amp;` / `&lt;` / `&gt;` and renders `<!subteam^…>` as
-  `@…`. The Python `SlackFormatConverter.to_ast` does neither yet (#283 ports
-  that normalization). Body text already showed these entities; table cells
+- **Depends on #283 (merge after it).** Upstream's `toAst` runs
+  `slackMrkdwnToMarkdown`, which moves code after an opening fence onto its
+  own line, unescapes `&amp;` / `&lt;` / `&gt;` and renders `<!subteam^…>` as
+  `@…`. The Python `SlackFormatConverter.to_ast` does none of this yet (#283
+  ports it). Because `text` is now derived from `formatted`, a body like
+  `` ```npm test``` `` gives `text == ""` and a fenced block loses its first
+  line until #283 lands (the old regex `extract_plain_text` kept them;
+  `formatted` already lost them). Body text already showed the entities; table cells
   and mrkdwn attachment parts now render through the same converter, so a
   `raw_text` cell holding `R&D` or `<@U…>` (escaped by `_block_text`, as
   upstream does) shows `R&amp;D` / `&lt;@U…&gt;`, and a usergroup cell shows
