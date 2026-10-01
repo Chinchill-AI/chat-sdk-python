@@ -1322,6 +1322,49 @@ Parity with upstream `169788b6` (vercel/chat#592, chat@4.39.0) and
   `tests/test_history_user.py`, so the strict pin check and the target
   report both pass without duplicate tests.
 
+### AI messages without text and tool names (chat@4.35–4.41, #198)
+
+Parity with upstream `25f30998` (vercel/chat#713, chat@4.35.0), adapted
+from `21dc60c3` (#935, chat@4.41.0), and the `messages.test.ts` case of
+`eddcd7e4` (#828, chat@4.39.0). No divergence-table rows.
+
+- **Messages without text (`25f30998`).** `to_ai_messages` no longer drops
+  messages whose text is empty or whitespace. The `[name]: ` prefix is added
+  only when there is text; a link-only message renders `Links:\n…` with no
+  leading blank line; a user message with attachment parts gets a leading
+  text part only when it has text or links. A message is skipped when its
+  content is a whitespace-only string or an empty list, checked **before**
+  `transform_message`, so the transform never sees it.
+  `on_unsupported_attachment` still fires for video/audio on a message that
+  is then skipped. "Whitespace" is JS `trim`'s set
+  (`chat_sdk.shared._js_compat.JS_WHITESPACE`), not `str.strip()`'s: a
+  BOM-only message is skipped and a NEL-only one is kept, as upstream.
+- **Module split (`21dc60c3`).** The link renderer, MIME helpers,
+  `_sort_by_date_sent`, `_build_message_text`, `_is_unsupported_attachment`
+  and `_attachment_to_part` moved to `chat_sdk.ai.message_content`
+  (upstream `ai/message-content.ts`). They stay private;
+  `TEXT_MIME_PREFIXES` is still importable from `chat_sdk.ai` and
+  `chat_sdk.ai.messages`. Upstream's `fetchAttachmentContent` /
+  `attachmentToPart` split serves its TanStack converter; Python has one
+  converter, so `_attachment_to_part` keeps fetching and encoding together.
+- **`ChatToolSpec` → `ChatTool.name` (`21dc60c3`).** `ChatTool` already had
+  the spec shape (description, input schema, `execute`, `needs_approval`);
+  the port adds only `name: str = ""` as the **last** field, so existing
+  positional and keyword construction keeps working. Every factory sets its
+  camelCase id and `create_chat_tools` keys the result by it, so
+  `list(create_chat_tools(chat).values())` can feed runtimes that need a tool
+  name. `"name"` is in `_PROTECTED_TOOL_FIELDS` (Python-only: upstream's AI
+  SDK tools carry no name), so an override cannot desynchronize it from the
+  key. The `toAiTool` wrappers and the TanStack exporter are TS-only (#203).
+- **Bytes-like attachment data (`eddcd7e4`).** Upstream passes an
+  `ArrayBuffer` from `fetchData` through as the part's `data`. Python always
+  inlines a base64 `data:` URL; `base64.b64encode` accepts `bytes`,
+  `bytearray` and `memoryview`, so no conversion is needed. The upstream
+  test "uses ArrayBuffer attachment data without Buffer conversion" is
+  ported under its own name with `bytearray` and `memoryview` data,
+  asserting the same `data:image/png;base64,AQID` part. As before, an
+  unnamed attachment gets `filename=""` (upstream leaves it `undefined`).
+
 ## What to Port vs What to Adapt
 
 ### Port 1:1
