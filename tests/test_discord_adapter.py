@@ -839,7 +839,9 @@ class TestThreadParentValidation:
 
         await adapter.post_message("discord:guild1:channelB", "for B")
 
-        adapter._discord_fetch.assert_called_once_with("/channels/channelB/messages", "POST", {"content": "for B"}, files=None)
+        adapter._discord_fetch.assert_called_once_with(
+            "/channels/channelB/messages", "POST", {"content": "for B"}, files=None
+        )
         assert slash.initial_response_sent is False
 
     @pytest.mark.asyncio
