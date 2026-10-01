@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import weakref
 from datetime import datetime, timezone
 
@@ -21,6 +22,7 @@ from chat_sdk.types import (
     MessageSubjectParty,
     PlanUpdateChunk,
     RawMessage,
+    SentMessage,
     TaskUpdateChunk,
     ThinkingChunk,
     _get_message_adapter,
@@ -404,6 +406,88 @@ def _make_message(**overrides) -> Message:
     }
     defaults.update(overrides)
     return Message(**defaults)
+
+
+class TestMessageAuthorSerialization:
+    """Port of message.test.ts ``toJSON()`` author tests (upstream #707, #711)."""
+
+    # TS: "should preserve author.isSystem through a full JSON roundtrip"
+    def test_should_preserve_authorissystem_through_a_full_json_roundtrip(self):
+        msg = _make_message(
+            author=Author(
+                user_id="USLACK",
+                user_name="Slack",
+                full_name="Slack",
+                is_bot=False,
+                is_me=False,
+                is_system=True,
+            )
+        )
+        roundtripped = json.loads(json.dumps(msg.to_json()))
+        restored = Message.from_json(roundtripped)
+        assert restored.author.is_system is True
+
+    # TS: "should leave author.isSystem absent for non-system authors"
+    def test_should_leave_authorissystem_absent_for_nonsystem_authors(self):
+        data = _make_message().to_json()
+        assert "isSystem" not in data["author"]
+        assert "email" not in data["author"]
+        assert Message.from_json(data).author.is_system is None
+
+    # TS: "should preserve author email through serialization"
+    def test_should_preserve_author_email_through_serialization(self):
+        original = _make_message(
+            author=Author(
+                user_id="U123",
+                user_name="testuser",
+                full_name="Test User",
+                is_bot=False,
+                is_me=False,
+                email="test@example.com",
+            )
+        )
+        data = original.to_json()
+        assert data["author"]["email"] == "test@example.com"
+        assert Message.from_json(data).author.email == "test@example.com"
+
+    # Python-specific (hazard #1): an explicit ``False`` is a value, not
+    # "absent" -- it is emitted and survives the roundtrip, as upstream.
+    def test_false_is_system_is_emitted_and_preserved(self):
+        msg = _make_message(
+            author=Author(user_id="U1", user_name="u", full_name="U", is_bot=False, is_me=False, is_system=False)
+        )
+        data = msg.to_json()
+        assert data["author"]["isSystem"] is False
+        assert Message.from_json(data).author.is_system is False
+
+
+class TestReplyToBinding:
+    """Python-side coverage for ``reply_to`` plumbing outside serialization."""
+
+    def test_set_message_adapter_recurses_into_reply_to(self):
+        root = _make_message(id="m-root")
+        reply_to = _make_message(id="m0", reply_to=root)
+        msg = _make_message(id="m1", reply_to=reply_to)
+        adapter = object()
+        set_message_adapter(msg, adapter)
+        assert _get_message_adapter(msg) is adapter
+        assert _get_message_adapter(reply_to) is adapter
+        assert _get_message_adapter(root) is adapter
+
+    def test_sent_message_to_history_message_keeps_reply_to(self):
+        from chat_sdk.thread import _to_message
+
+        reply_to = _make_message(id="m0")
+        sent = SentMessage(
+            id="m1",
+            thread_id="t1",
+            text="hi",
+            formatted={"type": "root", "children": []},
+            author=_make_message().author,
+            metadata=_make_message().metadata,
+            reply_to=reply_to,
+        )
+        assert _to_message(sent).reply_to is reply_to
 
 
 class _AdapterWithSubject:
