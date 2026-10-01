@@ -101,9 +101,14 @@ class _FakeClock:
 
     Installs itself as the adapter's ``_monotonic_ms`` / ``_sleep``; each
     ``_sleep(ms)`` is recorded and advances the clock instead of waiting.
+
+    The clock starts well past zero so a stream that forgets to stamp its
+    placeholder (leaving the initial ``last_edit_at = 0``) edits on the first
+    chunk instead of passing by coincidence, as it would with a real
+    ``time.monotonic()``.
     """
 
-    def __init__(self, adapter: TelegramAdapter, now: float = 0.0) -> None:
+    def __init__(self, adapter: TelegramAdapter, now: float = 10_000.0) -> None:
         self.now = now
         self.sleeps: list[float] = []
         adapter._monotonic_ms = lambda: self.now  # type: ignore[method-assign]
@@ -662,18 +667,20 @@ class TestTelegramPostAndEditStreaming:
 
         _method_fetch(adapter, {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": edit})
 
+        start = clock.now
+
         async def text_stream():
             yield "one "
-            clock.now = 1200
+            clock.now = start + 1200
             yield "two "
-            clock.now = 1300
+            clock.now = start + 1300
             yield "three"
 
         await adapter.stream(DM_THREAD_ID, text_stream(), _stream_options(0))
 
         # 1200 ms after the placeholder clears the 1100 ms floor; 1300 does
         # not, so the final edit waits the remaining 1000 ms.
-        assert edit_times == [1200, 2300]
+        assert [t - start for t in edit_times] == [1200, 2300]
         assert clock.sleeps == [1000]
 
     # it("uses the group streaming edit floor")
@@ -689,17 +696,19 @@ class TestTelegramPostAndEditStreaming:
 
         _method_fetch(adapter, {"sendMessage": lambda: _group_stream_message("..."), "editMessageText": edit})
 
+        start = clock.now
+
         async def text_stream():
             yield "one "
-            clock.now = 1200
+            clock.now = start + 1200
             yield "two "
-            clock.now = 1300
+            clock.now = start + 1300
             yield "three"
 
         await adapter.stream(GROUP_THREAD_ID, text_stream(), _stream_options(0))
 
         # No chunk clears the 3100 ms group floor; the final edit waits 1800 ms.
-        assert edit_times == [3100]
+        assert [t - start for t in edit_times] == [3100]
         assert clock.sleeps == [1800]
 
     # Python-only: a Chat-level interval above the floor wins
@@ -716,18 +725,20 @@ class TestTelegramPostAndEditStreaming:
 
         _method_fetch(adapter, {"sendMessage": lambda: _sample_message(text="..."), "editMessageText": edit})
 
+        start = clock.now
+
         async def text_stream():
             yield "one "
-            clock.now = 1500
+            clock.now = start + 1500
             yield "two "
-            clock.now = 2100
+            clock.now = start + 2100
             yield "three"
-            clock.now = 2200
+            clock.now = start + 2200
             yield " four"
 
         await adapter.stream(DM_THREAD_ID, text_stream(), _stream_options(2000))
 
-        assert edit_times == [2100, 4100]
+        assert [t - start for t in edit_times] == [2100, 4100]
         assert clock.sleeps == [1900]
 
     # it("edits per chunk when streamingEditIntervalMs opts out of throttling")
@@ -771,7 +782,9 @@ class TestTelegramPostAndEditStreaming:
     # The 1100 ms DM floor keeps the chunk from being edited mid-stream, so
     # the closing edit is the first one.
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("retry_after", "expected_wait_ms"), [(None, 1000), ("5", 1000), (2, 2000)])
+    # A ``retry_after`` of exactly 5 s is still retried (the cap is a strict
+    # ``>``, as upstream index.ts:2094).
+    @pytest.mark.parametrize(("retry_after", "expected_wait_ms"), [(None, 1000), ("5", 1000), (2, 2000), (5, 5000)])
     async def test_a_rate_limited_closing_edit_is_retried_after_retry_after(
         self, retry_after: Any, expected_wait_ms: float
     ):
@@ -887,9 +900,14 @@ class TestTelegramPostAndEditStreaming:
         assert clock.sleeps == []
 
     # Python-only: an intermediate 429 within the cap delays the final edit
-    # until ``retry_after`` has passed, and is logged rather than raised.
+    # until ``retry_after`` has passed, and is logged rather than raised. A
+    # wait of exactly 5 s is within the cap (strict ``>``, as upstream
+    # index.ts:2077).
     @pytest.mark.asyncio
-    async def test_final_edit_waits_out_an_intermediate_rate_limit_within_the_cap(self):
+    @pytest.mark.parametrize(("retry_after", "expected_wait_ms"), [(2, 2000), (5, 5000)])
+    async def test_final_edit_waits_out_an_intermediate_rate_limit_within_the_cap(
+        self, retry_after: int, expected_wait_ms: float
+    ):
         logger = MockLogger()
         adapter = _make_adapter(logger=logger, streaming_edit_interval_ms=0)
         clock = _FakeClock(adapter)
@@ -897,14 +915,14 @@ class TestTelegramPostAndEditStreaming:
             adapter,
             [
                 _sample_message(text="..."),
-                AdapterRateLimitError("telegram", 2),
+                AdapterRateLimitError("telegram", retry_after),
                 _sample_message(text="one two"),
             ],
         )
 
         await adapter.stream(DM_THREAD_ID, _text_stream(["one ", "two"]), _stream_options(0))
 
-        assert clock.sleeps == [2000]
+        assert clock.sleeps == [expected_wait_ms]
         assert [method for method, _payload in calls] == ["sendMessage", "editMessageText", "editMessageText"]
         assert calls[2][1]["rich_message"]["markdown"] == "one two"
         assert any(call[0] == "Telegram stream edit failed" for call in logger.warn.calls)
@@ -1001,6 +1019,38 @@ class TestTelegramPostAndEditPlaceholder:
         assert [method for method, _payload in calls] == ["sendRichMessage", "editMessageText"]
         assert calls[0][1]["rich_message"]["markdown"] == "hello"
         assert calls[1][1]["rich_message"]["markdown"] == "hello world"
+
+    # The first post stamps the pacing clock, so the 1100 ms DM floor runs
+    # from it rather than from the start of the stream.
+    @pytest.mark.asyncio
+    async def test_no_placeholder_paces_edits_from_the_first_post(self):
+        adapter = _make_adapter()
+        clock = _FakeClock(adapter)
+        start = clock.now
+        edit_times: list[float] = []
+
+        def edit() -> dict[str, Any]:
+            edit_times.append(clock.now)
+            return _sample_message(text=None, rich_message=_rich_message("one two"))
+
+        calls = _method_fetch(
+            adapter,
+            {
+                "sendRichMessage": lambda: _sample_message(text=None, rich_message=_rich_message("one")),
+                "editMessageText": edit,
+            },
+        )
+
+        async def text_stream():
+            yield "one "
+            clock.now = start + 500
+            yield "two"
+
+        await adapter.stream(DM_THREAD_ID, text_stream(), self._options(None))
+
+        assert [method for method, _payload in calls] == ["sendRichMessage", "editMessageText"]
+        assert [t - start for t in edit_times] == [1100]
+        assert clock.sleeps == [600]
 
     @pytest.mark.asyncio
     async def test_no_placeholder_posts_held_back_text_once_the_stream_ends(self):

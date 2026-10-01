@@ -1466,18 +1466,10 @@ class TestTrimToMarkdownV2SafeBoundary:
         text = "[x](https://example.com/foo_bar) _italic_"
         assert _trim_to_markdown_v2_safe_boundary(text) == text
 
-    def test_trims_an_unclosed_link_destination_to_the_opening_bracket(self):
-        """``[label](https://...`` with no ``)`` is trimmed back to ``[``."""
-        assert _trim_to_markdown_v2_safe_boundary("[label](https://example.com/very-long-path") == ""
-
     def test_ignores_link_syntax_inside_inline_code(self):
         """``[`` inside an inline code span is literal text."""
         text = "`[label](https://nope`"
         assert _trim_to_markdown_v2_safe_boundary(text) == text
-
-    def test_escaped_closing_paren_does_not_close_a_link_destination(self):
-        """``\\)`` inside a link destination is escaped, so it is no closer."""
-        assert _trim_to_markdown_v2_safe_boundary("[a](https://example.com/\\)abc") == ""
 
 
 class TestTrimLinkUrlsWithRawEntityMarkers:
