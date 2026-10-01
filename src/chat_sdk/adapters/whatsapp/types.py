@@ -300,6 +300,15 @@ class WhatsAppMediaResponse(TypedDict):
     url: str
 
 
+class WhatsAppMediaUploadResponse(TypedDict):
+    """Response from uploading media via the Cloud API.
+
+    See: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media#upload-media
+    """
+
+    id: str
+
+
 # =============================================================================
 # API Response Types
 # =============================================================================
@@ -349,19 +358,39 @@ class WhatsAppInteractiveSection(TypedDict):
     title: str
 
 
-class WhatsAppInteractiveMessage(TypedDict, total=False):
-    """Interactive message payload for sending buttons or lists.
+class WhatsAppCtaUrlParameters(TypedDict):
+    """Parameters of a ``cta_url`` interactive action."""
 
-    The action field can be either:
-    - buttons: list of reply buttons (max 3)
-    - sections: list of sections with rows + button label
+    display_text: str
+    url: str
+
+
+class WhatsAppCtaUrlAction(TypedDict):
+    """Action of a ``cta_url`` interactive message (a single URL button)."""
+
+    name: Literal["cta_url"]
+    parameters: WhatsAppCtaUrlParameters
+
+
+class WhatsAppInteractiveMessage(TypedDict, total=False):
+    """Interactive message payload for sending buttons, lists, or CTA URLs.
+
+    The action field depends on ``type``:
+    - ``"button"``: ``{"buttons": [...]}``, a list of reply buttons (max 3)
+    - ``"list"``: ``{"button": str, "sections": [...]}``, sections with rows
+    - ``"cta_url"``: :class:`WhatsAppCtaUrlAction`,
+      ``{"name": "cta_url", "parameters": {"display_text", "url"}}``
+
+    Upstream models this as a union discriminated on ``type``; it stays one
+    loose TypedDict here because pyrefly does not narrow TypedDict unions on
+    a tag.
     """
 
     action: dict[str, Any]
     body: dict[str, str]  # {"text": str}
     footer: dict[str, str]  # {"text": str}
     header: dict[str, str]  # {"text": str, "type": "text"}
-    type: str  # "button" | "list"
+    type: str  # "button" | "list" | "cta_url"
 
 
 class WhatsAppGraphErrorData(TypedDict, total=False):

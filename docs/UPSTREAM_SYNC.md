@@ -590,9 +590,9 @@ the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
   JSON, so it still surfaces as `WhatsAppApiError` / `NetworkError`.
 - **`_graph_fetch_json`** (upstream `graphFetchJson`) backs `_graph_api_request`
   (label `"WhatsApp API error"`) and the `download_media` metadata GET (label
-  `"Failed to get media URL"`, which used to raise `RuntimeError`). The
-  multipart upload call site lands with #238; the binary download step moves
-  to the shared downloader in #239.
+  `"Failed to get media URL"`, which used to raise `RuntimeError`), and
+  `_graph_api_upload` (label `"WhatsApp API upload error"`, #238). The
+  binary download step moves to the shared downloader in #239.
   - **Status range:** success is any 2xx, like `response.ok`. The old port
     accepted only 200, so a 201/204 used to raise.
   - The body is read as bytes, decoded like WHATWG `Response.text()` (UTF-8
@@ -608,6 +608,80 @@ the `...recipient()` spread from `3e6e866a`, chat@4.39.0) and `31bce0a7`
 Regression coverage: `tests/test_whatsapp_errors.py`,
 `tests/test_whatsapp_api.py` (`TestSendTemplate`, `TestGraphApiErrors`,
 `TestGraphFetchJsonPythonSpecific`).
+
+### WhatsApp outbound media and CTA URL link buttons (chat@4.34–4.37, #238)
+
+Ports upstream `8bd8a575` (vercel/chat#537, chat@4.34.0; outbound files and
+attachments), `09b72e9d` (vercel/chat#736, chat@4.35.0; no duplicate card
+title on Card + file posts) and `6abf4807` (vercel/chat#781, chat@4.37.0;
+`cta_url` link buttons), as they stand at chat@4.41.1 (with the
+`...recipient()` spread from `3e6e866a`). One narrow divergence, in the
+multipart filename (see **Upload**); otherwise no behavioral divergence.
+
+- **Names.** `getWhatsAppMediaType` / `validateFileSize` / `WhatsAppMediaType`
+  are `get_whatsapp_media_type` / `validate_file_size` / `WhatsAppMediaType`,
+  exported from `chat_sdk.adapters.whatsapp`. `uploadMedia`,
+  `sendMediaMessage`, `postMessageWithMedia`, `resolveMedia`,
+  `graphApiUpload`, `renderPostableText` and `inferMimeType` are the private
+  `_upload_media`, `_send_media_message`, `_post_message_with_media`,
+  `_resolve_media`, `_graph_api_upload`, `_render_postable_text` and
+  `_infer_mime_type`. `cardToWhatsApp(card, {allowCtaUrl})` is
+  `card_to_whatsapp(card, *, allow_cta_url=True)`; `cardLinkButtonLines` is
+  the public `card_link_button_lines`. The `caption` / `filename` /
+  `recipient` parameters of the new private helpers are keyword-only, so #239
+  can add `reply_id` beside them.
+- **Upload.** An `aiohttp.FormData` (`messaging_product=whatsapp`, then
+  `file` with the filename and MIME type) is posted through
+  `_graph_fetch_json`; aiohttp writes the multipart `Content-Type` and
+  boundary. Media resolve concurrently (`asyncio.gather`, like
+  `Promise.all`) and are sent one at a time, in order. The part is
+  serialized like Node's WHATWG `FormData`: `FormData(quote_fields=False)`
+  keeps spaces and non-ASCII raw (aiohttp's default would percent-encode
+  them), the filename has only LF / CR / `"` escaped as `%0A` / `%0D` /
+  `%22`, and the part `Content-Type` follows `Blob` type rules (lowercased;
+  any character outside U+0020–U+007E gives `application/octet-stream`). The
+  document message keeps the unescaped filename. **Divergence:** aiohttp
+  rejects every other C0 control and DEL in a part header with a bare
+  `ValueError`, where Node sends them raw, so those are percent-escaped too;
+  and aiohttp writes a backslash as `\\` (quoted-string form) where Node
+  writes it raw.
+- **Truthiness.** Upstream's `Buffer` is truthy even when empty, so
+  `FileUpload(data=b"")` is still uploaded, and `Attachment(data=b"")` is
+  uploaded rather than falling back to its URL (`is None` checks, not
+  truthiness). A link attachment's `size` is checked whenever it is a number,
+  including `0`. The `"File upload data is empty"` / `"Attachment data is
+  empty"` guards are unreachable here, as they are upstream (`to_buffer`
+  raises `"Unsupported file data type"` first).
+- **JS string semantics.** The 1024 caption limit compares the UTF-16 length
+  (`text.length`), so astral characters count twice. The `cta_url` blank-label
+  check strips the JS `trim` whitespace set (`JS_WHITESPACE`, which includes
+  U+FEFF), and the `http(s)` scheme test is ASCII case-insensitive
+  (`re.IGNORECASE | re.ASCII`; without `re.ASCII` Python folds U+017F to `s`,
+  which a JS regex without the `u` flag does not).
+- **Types.** `WhatsAppInteractiveMessage` stays one `total=False` TypedDict
+  (`type` is `"button" | "list" | "cta_url"`) rather than upstream's union
+  discriminated on `type`, because pyrefly does not narrow TypedDict unions on
+  a tag; the `cta_url` action is modelled by `WhatsAppCtaUrlAction` /
+  `WhatsAppCtaUrlParameters`. `WhatsAppMediaUploadResponse` is new.
+- **Kept as upstream (not divergences).** A text-fallback card posted with
+  media is captioned with the shared `card_to_fallback_text`, which omits
+  `image_url` and image children (the full `card_to_whatsapp_text` is sent
+  only when that caption is empty). `cta_url` eligibility checks element
+  types, not lengths, so a title over 60 or a body over 1024 characters is
+  truncated in the interactive envelope rather than kept as text. Both match
+  chat@4.41.1 (`index.ts` `postMessageWithMedia`, `cards.ts`
+  `findPromotableCtaLink` / `buildInteractiveEnvelope`).
+- `_extract_reply_buttons` already returned `None` (never `[]`) for an actions
+  row without reply buttons; `card_to_whatsapp` now tests `is not None`, like
+  upstream's `if (actionButtons)`.
+- `FileUpload` and `Attachment` are told apart with `isinstance(item,
+  FileUpload)` instead of upstream's `"filename" in item`; postable files and
+  attachments are dataclasses in Python, as the other adapters assume.
+
+Regression coverage: `tests/test_whatsapp_api.py` (`TestPostMessageFileUploads`,
+`TestGetWhatsAppMediaType`, `TestOutboundMediaPythonSpecific`, and the
+`media uploads` row of `TestGraphApiErrors`), `tests/test_whatsapp_cards.py`
+(`TestCardToWhatsApp` cta_url cases, `TestCtaUrlPythonSpecific`).
 
 ### Postgres state: expired claims and migration-owned schemas (chat@4.35–4.41, #240)
 
