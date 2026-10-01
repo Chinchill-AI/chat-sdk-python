@@ -2869,8 +2869,8 @@ class SlackAdapter:
         Port of upstream's bridge task in ``handleMessageEvent``
         (vercel/chat 1721fa01, c21ccbc0). The task is created here,
         synchronously, so it copies the current context (the multi-workspace
-        token ContextVar set by ``handle_webhook``) and is handed to
-        ``wait_until``.
+        token ContextVar set by ``handle_webhook``); a shielded view of it is
+        handed to ``wait_until``.
         """
         chat = self._chat
         if chat is None:
@@ -2890,10 +2890,7 @@ class SlackAdapter:
             try:
                 task = chat.process_message(self, routed_thread_id, make_factory(routed_thread_id), options)
                 if task is not None:
-                    # Shielded: cancelling the bridge (e.g. a host's wait_until
-                    # bookkeeping) must not cancel the handler, matching the
-                    # non-bridge path where wait_until gets Chat's wrapper.
-                    await asyncio.shield(task)
+                    await task
             except Exception as error:
                 self._logger.warn(
                     "Agent view DM processing failed",
@@ -2913,7 +2910,12 @@ class SlackAdapter:
         _pin_task(bridge)
         bridge.add_done_callback(self._log_agent_view_bridge_result)
         if options is not None and options.wait_until is not None:
-            options.wait_until(bridge)
+            # Python-specific: upstream's promise cannot be cancelled, an
+            # asyncio task can. wait_until gets a shielded view, so a host
+            # cancelling it (after the webhook already returned 200) cannot
+            # drop the DM before process_message runs. A handler error the
+            # bridge re-raises still reaches the host through it.
+            options.wait_until(asyncio.shield(bridge))
 
     def _log_agent_view_bridge_result(self, task: asyncio.Task[Any]) -> None:
         """Done-callback for the agent_view DM bridge: retrieve and log its outcome.
@@ -3285,7 +3287,9 @@ class SlackAdapter:
             return  # No running event loop
         _pin_task(task)
         if options is not None and options.wait_until is not None:
-            options.wait_until(task)
+            # Shielded, as for the agent_view DM bridge: a host cancelling its
+            # wait_until task must not cancel the (uncancellable upstream) work.
+            options.wait_until(asyncio.shield(task))
 
     async def _apply_configured_suggested_prompts(self, context: SlackSuggestedPromptsContext) -> None:
         """Resolve and apply the configured ``suggested_prompts`` for a newly opened thread.

@@ -361,6 +361,32 @@ class TestAgentViewDmThreading:
             "agent_view DM subscription check failed; using per-message thread"
         ]
 
+    # Python-specific: a host cancelling its wait_until awaitable (after the
+    # webhook returned 200) must not drop the DM; upstream promises cannot be
+    # cancelled.
+    async def test_cancelling_wait_until_does_not_drop_the_dm(self):
+        adapter, _ = _adapter(agent_view=True)
+        state = create_mock_state()
+        release = asyncio.Event()
+
+        async def slow_is_subscribed(thread_id: str) -> bool:
+            await release.wait()
+            return False
+
+        state.is_subscribed = slow_is_subscribed  # type: ignore[method-assign]
+        chat = await _init(adapter, state)
+        tasks: list[Any] = []
+
+        await adapter.handle_webhook(_signed(json.dumps(_dm_message())), WebhookOptions(wait_until=tasks.append))
+        await asyncio.sleep(0)
+        tasks[0].cancel()
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert tasks[0].cancelled()
+        assert chat.process_message.call_args.args[1] == "slack:D1:1771.99"
+
     # Python-specific: the bridge task is created inside the request
     # context, so the multi-workspace installation token is visible to it.
     async def test_bridge_task_sees_the_installation_token(self):

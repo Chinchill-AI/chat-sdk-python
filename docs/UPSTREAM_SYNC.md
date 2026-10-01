@@ -1194,14 +1194,18 @@ of `c21ccbc0` (#943). Everything is opt-in on `SlackAdapterConfig`.
 - **open_dm bridge.** A top-level agent_view DM (no `thread_ts`) goes through a
   task that checks `state.is_subscribed("slack:{D}:")` and routes to that ID
   when it is subscribed. If the check fails, it warns and keeps the per-message
-  ID. The task then calls `process_message` and awaits the handler task through
-  `asyncio.shield`, so cancelling the bridge does not cancel the handler. On
+  ID. The task then calls `process_message` and awaits the handler task. On
   failure it logs `"Agent view DM processing failed"` and re-raises only when
   `propagate_handler_errors` and `wait_until` are both set. The task is created
   synchronously inside the webhook's copied context, so it sees the
-  multi-workspace token. It is pinned, has a done-callback that retrieves its
-  exception, and is handed to `wait_until`. `CancelledError` propagates. The
-  Agent Sessions title hook (#215) goes at the end of the task.
+  multi-workspace token. It is pinned and has a done-callback that retrieves
+  its exception. `CancelledError` propagates. The Agent Sessions title hook
+  (#215) goes at the end of the task. Python-specific: `wait_until` gets
+  `asyncio.shield(bridge)`, not the task itself. Upstream's promise cannot be
+  cancelled, but an asyncio task can, so a host that cancels its `wait_until`
+  awaitable after the 200 would otherwise drop the DM before `process_message`
+  runs. A re-raised handler error still reaches the host through the shield.
+  The configured suggested-prompts task is handed over the same way.
 - **`suggested_prompts`.** Either a `SlackSuggestedPromptsOptions(prompts, title=None)`
   or a sync or async resolver (`inspect.isawaitable`) that takes a
   `SlackSuggestedPromptsContext`. It is applied on `assistant_thread_started`
