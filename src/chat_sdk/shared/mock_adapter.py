@@ -2,7 +2,8 @@
 
 Python port of mock-adapter.ts.
 Provides ``MockAdapter``, ``MockStateAdapter``, ``create_mock_adapter``,
-``create_mock_state``, ``create_test_message``, and ``mock_logger``.
+``create_mock_state``, ``create_test_message``, ``create_mock_chat_instance``
+and ``mock_logger``.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from chat_sdk.types import (
@@ -380,3 +382,77 @@ def create_test_message(
     }
     defaults.update(overrides)
     return Message(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Mock ChatInstance
+# ---------------------------------------------------------------------------
+
+# Fire-and-forget processors: plain ``MagicMock`` (the real ones return a task
+# or ``None``; adapters never await them).
+_MOCK_CHAT_SYNC_PROCESSORS = (
+    "process_message",
+    "process_message_updated",
+    "process_message_deleted",
+    "process_reaction",
+    "process_action",
+    "process_modal_close",
+    "process_slash_command",
+    "process_installed",
+    "process_uninstalled",
+    "process_member_joined_channel",
+    "process_app_home_opened",
+    "process_assistant_thread_started",
+    "process_assistant_context_changed",
+    "process_app_context_changed",
+)
+# Processors adapters await (they return a value to the platform).
+_MOCK_CHAT_ASYNC_PROCESSORS = (
+    "handle_incoming_message",
+    "process_options_load",
+    "process_modal_submit",
+)
+
+
+def create_mock_chat_instance(
+    *,
+    state: Any = None,
+    logger: Any = None,
+    user_name: str = "test-bot",
+    overrides: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    """Create a mock ``ChatInstance`` for adapter tests.
+
+    Port of upstream ``createMockChatInstance`` (``packages/tests``). Every
+    ``process_*`` hook is a recording mock — ``MagicMock`` for the
+    fire-and-forget ones, ``AsyncMock`` (resolving to ``None``) for
+    ``handle_incoming_message``, ``process_options_load`` and
+    ``process_modal_submit`` — so tests can assert an adapter dispatched
+    through the right hook. Includes the optional ``process_installed`` /
+    ``process_uninstalled``. ``get_state()`` / ``get_user_name()`` /
+    ``get_logger()`` return the supplied (or default) state, user name and
+    logger; ``history`` is a recording ``AsyncMock`` (``transcripts`` is
+    ``history.user``); ``overrides`` replaces attributes last. Unknown attributes raise
+    ``AttributeError`` (it is not a bare ``MagicMock``), so
+    ``getattr(chat, "process_x", None)`` probes behave as on a real ``Chat``.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    resolved_state = state if state is not None else create_mock_state()
+    resolved_logger = logger if logger is not None else mock_logger
+
+    attrs: dict[str, Any] = {name: MagicMock(name=name) for name in _MOCK_CHAT_SYNC_PROCESSORS}
+    attrs.update({name: AsyncMock(name=name, return_value=None) for name in _MOCK_CHAT_ASYNC_PROCESSORS})
+    # Upstream's factory omits ``history`` and casts ``as unknown as
+    # ChatInstance``; Python's ``ChatInstance`` is ``@runtime_checkable``, so
+    # without it ``isinstance(mock, ChatInstance)`` is False. ``transcripts``
+    # is ``history.user``, as on a real ``Chat``.
+    history = AsyncMock(name="history")
+    attrs["history"] = history
+    attrs["transcripts"] = history.user
+    attrs["get_state"] = lambda: resolved_state
+    attrs["get_user_name"] = lambda: user_name
+    attrs["get_logger"] = lambda prefix=None: resolved_logger
+    if overrides:
+        attrs.update(overrides)
+    return SimpleNamespace(**attrs)
