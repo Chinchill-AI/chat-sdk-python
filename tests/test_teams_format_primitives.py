@@ -101,7 +101,9 @@ class TestStripHtmlTagsBounds:
 
     def test_html_to_markdown_and_mentions_use_the_bounded_stripper(self):
         assert teams_html_to_markdown("<p>" + "<" + "x" * 2047 + "<b>>done</p>") == "done"
-        assert teams_mention_to_plain_text("<at><b>Ada</b></at>") == "@Ada"
+        # Needs the repeat-until-stable loop: one pass of ``<[^>]+>`` (the old
+        # mention stripper) eats ``<xxx…<b>`` and leaves ``@>Ada``.
+        assert teams_mention_to_plain_text("<at><" + "x" * 2047 + "<b>>Ada</at>") == "@Ada"
 
 
 class TestTeamsFormatAdversarial:

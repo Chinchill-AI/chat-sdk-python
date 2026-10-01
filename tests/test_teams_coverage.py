@@ -2105,6 +2105,33 @@ class TestConversationTypeGraphContext:
         assert adapter.decode_thread_id(thread_id).conversation_type == "groupChat"
         assert adapter.is_dm(thread_id) is False
 
+    async def test_fetch_channel_messages_ignores_stale_dm_context_for_an_explicit_group_chat(self):
+        adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
+        state = _make_mock_state()
+        state._cache["teams:channelContext:a:group-chat-id"] = json.dumps(
+            {"type": "dm", "graph_chat_id": "19:stale-personal-chat@unq.gbl.spaces"}
+        )
+        await adapter.initialize(_make_mock_chat(state))
+        called_with: list[str] = []
+
+        async def fake_chat_list(chat_id: str, params: Any):
+            called_with.append(chat_id)
+            return [{"id": "message-1", "body": {"contentType": "text", "content": "Hello"}}]
+
+        adapter._graph_list_chat_messages = fake_chat_list  # type: ignore[method-assign]
+        channel_id = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:group-chat-id",
+                service_url="https://smba.trafficmanager.net/teams/",
+                conversation_type="groupChat",
+            )
+        )
+
+        result = await adapter.fetch_channel_messages(channel_id)
+
+        assert called_with == ["a:group-chat-id"]
+        assert [m.text for m in result.messages] == ["Hello"]
+
     async def test_list_threads_marks_dm_context_children_personal(self):
         """A legacy (untyped) ID with a stored DM context lists personal
         children; for a ``19:`` personal chat that adds the ``:personal``
@@ -2133,10 +2160,13 @@ class TestConversationTypeGraphContext:
         assert adapter.is_dm(thread_id) is True
 
     async def test_fetch_channel_info_treats_an_explicit_group_chat_as_non_dm(self):
+        # Any context stored for the ID is skipped for an explicit group chat
+        # (upstream graph-api.ts fetchChannelInfo → getGraphContext); a stale
+        # *channel* context would otherwise trigger a Graph teams/channels GET.
         adapter = _make_adapter(logger=_make_logger(), app_id="bot-app-id")
         state = _make_mock_state()
         state._cache["teams:channelContext:a:group-chat-id"] = json.dumps(
-            {"type": "dm", "graph_chat_id": "19:stale@unq.gbl.spaces"}
+            {"team_id": "stale-team", "channel_id": "19:stale@thread.tacv2"}
         )
         await adapter.initialize(_make_mock_chat(state))
         adapter._get_graph_token = AsyncMock(return_value="t")  # type: ignore[method-assign]

@@ -1341,16 +1341,69 @@ class TestOutboundServiceUrlRouting:
         }
         assert adapter._app.api.service_url == self.DEFAULT_URL
 
+    @staticmethod
+    def _card() -> Any:
+        from chat_sdk.cards import Card
+        from chat_sdk.types import PostableCard
+
+        return PostableCard(card=Card(title="Results"))
+
     @pytest.mark.asyncio
-    async def test_post_message_rejects_a_disallowed_thread_url_before_sending(self):
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "post_message_text",
+            "post_message_card",
+            "post_channel_message_text",
+            "post_channel_message_card",
+            "edit_message",
+            "delete_message",
+            "start_typing",
+        ],
+    )
+    async def test_every_outbound_op_rejects_a_disallowed_thread_url_before_sending(
+        self, operation: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The SSRF allow-list check runs at each outbound call site (the
+        per-URL client carries the bot token), so each site is pinned here:
+        a thread ID naming an attacker host never reaches the SDK sender, the
+        HTTP client, or the per-URL client cache."""
+        from microsoft_teams.common.http.client import Client
+
         from chat_sdk.shared.errors import NetworkError
 
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
         send = _mock_app_send(adapter)
+        http_calls: list[str] = []
 
-        with pytest.raises(NetworkError, match="not an allowed Bot Framework endpoint"):
-            await adapter.post_message(self._thread(adapter, "https://evil.example.com/"), "hi")
+        async def fake_http(_self, url, **_kwargs):
+            http_calls.append(url)
+            raise AssertionError(f"unexpected HTTP call to {url}")
+
+        for verb in ("post", "put", "delete"):
+            monkeypatch.setattr(Client, verb, fake_http)
+
+        thread_id = self._thread(adapter, "https://evil.example.com/")
+        calls = {
+            "post_message_text": lambda: adapter.post_message(thread_id, "hi"),
+            "post_message_card": lambda: adapter.post_message(thread_id, self._card()),
+            "post_channel_message_text": lambda: adapter.post_channel_message(thread_id, "hi"),
+            "post_channel_message_card": lambda: adapter.post_channel_message(thread_id, self._card()),
+            "edit_message": lambda: adapter.edit_message(thread_id, "m-1", "hi"),
+            "delete_message": lambda: adapter.delete_message(thread_id, "m-1"),
+            "start_typing": lambda: adapter.start_typing(thread_id),
+        }
+
+        if operation == "start_typing":
+            # typing failures are logged, never raised (upstream parity)
+            await calls[operation]()
+            assert "not an allowed Bot Framework endpoint" in str(adapter._logger.error.call_args)
+        else:
+            with pytest.raises(NetworkError, match="not an allowed Bot Framework endpoint"):
+                await calls[operation]()
         send.assert_not_called()
+        assert http_calls == []
+        assert adapter._api_clients == {}
 
 
 class TestTeamsAppRouting:
@@ -1663,6 +1716,42 @@ class TestConversationTypeRouting:
         thread_id = chat.process_message.call_args.args[1]
         assert adapter.is_dm(thread_id) is False
         assert adapter._active_streams == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["message_action", "card_invoke", "reaction"])
+    async def test_actions_and_reactions_in_a_group_chat_get_the_typed_thread_id(self, handler: str):
+        """Button clicks and reactions in an ``a:`` group chat share the
+        message's ``:groupChat`` thread ID (and so its subscription/state
+        keys), not the untyped DM-looking three-segment form."""
+        adapter = _make_adapter()
+        chat = MagicMock()
+        adapter._chat = chat
+        activity: dict[str, Any] = {
+            "id": "m-1",
+            "replyToId": "m-0",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "a:group-chat", "conversationType": "groupChat"},
+            "serviceUrl": self.SERVICE_URL,
+        }
+        expected = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group-chat", service_url=self.SERVICE_URL, conversation_type="groupChat")
+        )
+
+        if handler == "message_action":
+            adapter._handle_message_action({**activity, "type": "message"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        elif handler == "card_invoke":
+            await adapter._handle_adaptive_card_action({**activity, "type": "invoke"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        else:
+            adapter._handle_reaction_activity(
+                {**activity, "type": "messageReaction", "reactionsAdded": [{"type": "like"}]}
+            )
+            event = chat.process_reaction.call_args.args[0]
+
+        assert event.thread_id == expected
+        assert event.thread_id.endswith(":groupChat")
+        assert adapter.is_dm(event.thread_id) is False
 
 
 class TestFileAttachments:
