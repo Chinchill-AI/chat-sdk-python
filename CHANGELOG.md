@@ -277,7 +277,7 @@ Ports upstream `32687038` (vercel/chat#830, chat@4.38.1), the Google Chat part o
     - **New author fields.** `author.email` is filled from the cached `users.info` profile (async path only). `author.is_system` is `True` for Slack's `USLACK` system user and `False` otherwise.
   - Matching on untrusted text stays linear (results identical to upstream). See `docs/UPSTREAM_SYNC.md`.
   - A live Slack-loop check is pending: `@bot` in a channel and in a DM must still trigger, and a code-only `` `<@bot>` `` must not trigger `on_mention`.
-  - Fidelity: no mapped files change (`adapter-slack/src/index.test.ts` is an adapter test). The target report stays at 198 missing (+0).
+  - Fidelity: no mapped files change (`adapter-slack/src/index.test.ts` is an adapter test). The target report is unchanged: missing 167 -> 167 (+0).
 
 ## 0.4.31.3
 
