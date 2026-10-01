@@ -1553,28 +1553,86 @@ class TestStartTyping:
 
 class TestStream:
     @pytest.mark.asyncio
-    async def test_stream_requires_recipient_info(self):
+    @pytest.mark.parametrize(
+        "options",
+        [None, StreamOptions(), StreamOptions(recipient_user_id="U1"), StreamOptions(recipient_team_id="T1")],
+        ids=["no-options", "empty", "missing-team", "missing-user"],
+    )
+    async def test_delegates_channel_streams_without_recipient_context_to_fallback(self, options):
+        # Upstream 438f5513 (Slack half): return None before consuming the
+        # stream so core runs post+edit. The DM exemption is #207.
         adapter, client, _ = await _init_adapter()
+        client.chat_stream = AsyncMock()
+        consumed: list[str] = []
 
         async def text_gen() -> AsyncIterator[str]:
+            consumed.append("Hello")
             yield "Hello"
 
-        with pytest.raises(ValidationError, match="recipient"):
-            await adapter.stream("slack:C123:1234567890.000000", text_gen())
+        result = await adapter.stream("slack:C123:1234567890.000000", text_gen(), options)
+
+        assert result is None
+        assert consumed == []
+        client.chat_stream.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stream_requires_recipient_user_and_team(self):
-        adapter, client, _ = await _init_adapter()
+    async def test_action_without_message_ts_streams_through_post_and_edit(self):
+        # Python-specific end-to-end (#199): a block action with
+        # container.thread_ts but no message ts builds a thread with no
+        # current_message, so there is no recipient context. The reply
+        # must still go out through core's post+edit fallback.
+        import asyncio
+
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import create_mock_state
+        from chat_sdk.types import ActionEvent, Author, ChatConfig, WebhookOptions
+
+        adapter = _make_adapter()
+        client = MockSlackClient()
+        client.set_response("auth_test", {"user_id": "U_BOT", "bot_id": "B_BOT", "user": "testbot"})
+        client.set_response("chat_postMessage", {"ok": True, "ts": "1234.9"})
+        client.chat_stream = AsyncMock()
+        _patch_client(adapter, client)
+        chat = Chat(
+            ChatConfig(user_name="testbot", adapters={"slack": adapter}, state=create_mock_state(), logger="silent")
+        )
+        errors: list[BaseException] = []
 
         async def text_gen() -> AsyncIterator[str]:
             yield "Hello"
 
-        with pytest.raises(ValidationError):
-            await adapter.stream(
-                "slack:C123:1234567890.000000",
-                text_gen(),
-                StreamOptions(recipient_user_id="U1"),  # missing team
-            )
+        async def handler(event: Any) -> None:
+            try:
+                await event.thread.post(text_gen())
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+                errors.append(exc)
+
+        chat.on_action(handler)
+        tasks: list[Any] = []
+        chat.process_action(
+            ActionEvent(
+                adapter=adapter,
+                thread=None,
+                thread_id="slack:C1:1234.5",
+                message_id="",
+                action_id="a",
+                user=Author(user_id="U1", user_name="u", full_name="u", is_bot=False, is_me=False),
+                raw={"team": {"id": "T1"}, "container": {"type": "message", "thread_ts": "1234.5", "channel_id": "C1"}},
+            ),
+            WebhookOptions(wait_until=tasks.append),
+        )
+        await asyncio.gather(*tasks)
+
+        assert errors == []
+        client.chat_stream.assert_not_awaited()
+        posts = client.get_calls("chat_postMessage")
+        assert len(posts) == 1
+        assert posts[0]["kwargs"]["channel"] == "C1"
+        assert posts[0]["kwargs"]["thread_ts"] == "1234.5"
+        assert posts[0]["kwargs"]["text"] == "..."
+        edits = client.get_calls("chat_update")
+        assert len(edits) == 1
+        assert edits[0]["kwargs"] == {"channel": "C1", "ts": "1234.9", "markdown_text": "Hello"}
 
     @pytest.mark.asyncio
     async def test_stream_with_markdown_text_chunks(self):

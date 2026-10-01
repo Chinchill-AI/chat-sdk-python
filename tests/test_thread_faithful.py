@@ -88,6 +88,20 @@ def _make_thread(
     )
 
 
+def _plan_thread() -> ThreadImpl:
+    """Thread whose adapter supports native plan objects (postObject/editObject)."""
+    adapter = create_mock_adapter()
+    adapter.post_object = AsyncMock(  # type: ignore[attr-defined]
+        return_value=RawMessage(id="plan-msg-1", thread_id="slack:C123:1234.5678", raw={})
+    )
+    adapter.edit_object = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+    return _make_thread(adapter)
+
+
+def _task_status(plan: Any, task_id: str) -> str | None:
+    return next((t.status for t in plan.tasks if t.id == task_id), None)
+
+
 async def _create_text_stream(chunks: list[str]) -> AsyncIterator[str]:
     """Create an async iterable from a list of string chunks."""
     for chunk in chunks:
@@ -2208,11 +2222,14 @@ class TestPostWithPlan:
         thread = _make_thread(adapter, state)
         plan = Plan(StartPlanOptions(initial_message="Start"))
         await thread.post(plan)
+        initial_task = plan.current_task
+        assert initial_task is not None
         task1 = await plan.add_task(AddTaskOptions(title="Step 1"))
-        task2 = await plan.add_task(AddTaskOptions(title="Step 2"))
-
         assert task1 is not None
+        assert _task_status(plan, initial_task.id) == "complete"
+        task2 = await plan.add_task(AddTaskOptions(title="Step 2"))
         assert task2 is not None
+        assert _task_status(plan, task1.id) == "complete"
 
         updated = await plan.update_task(UpdateTaskInput(id=task1.id, output="Step 1 result", status="complete"))
 
@@ -2223,6 +2240,65 @@ class TestPostWithPlan:
         step2 = next((t for t in plan.tasks if t.id == task2.id), None)
         assert step2 is not None
         assert step2.status == "in_progress"
+
+    # it("should not auto-complete in_progress tasks when autoCompletePrevious is false")
+    async def test_should_not_autocomplete_inprogress_tasks_when_autocompleteprevious_is_false(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        plan = Plan(StartPlanOptions(initial_message="Step 1"))
+        await _plan_thread().post(plan)
+
+        step1 = plan.current_task
+        step2 = await plan.add_task(AddTaskOptions(title="Step 2", auto_complete_previous=False))
+        step3 = await plan.add_task(AddTaskOptions(title="Step 3", auto_complete_previous=False))
+
+        assert step1 is not None and step2 is not None and step3 is not None
+        assert [_task_status(plan, t.id) for t in (step1, step2, step3)] == ["in_progress"] * 3
+
+    # it("should auto-complete all in_progress tasks when switching back to default addTask")
+    async def test_should_autocomplete_all_inprogress_tasks_when_switching_back_to_default_addtask(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions
+
+        plan = Plan(StartPlanOptions(initial_message="Step 1"))
+        await _plan_thread().post(plan)
+
+        step1 = plan.current_task
+        step2 = await plan.add_task(AddTaskOptions(title="Step 2", auto_complete_previous=False))
+        step3 = await plan.add_task(AddTaskOptions(title="Step 3", auto_complete_previous=False))
+
+        sequential_task = await plan.add_task(AddTaskOptions(title="Sequential step"))
+
+        assert step1 is not None and step2 is not None and step3 is not None
+        assert [_task_status(plan, t.id) for t in (step1, step2, step3)] == ["complete"] * 3
+        assert sequential_task is not None
+        assert sequential_task.status == "in_progress"
+        assert plan.current_task is not None
+        assert plan.current_task.id == sequential_task.id
+        assert len(plan.tasks) == 4
+
+    # it("should target the most recent in_progress task when updating without id")
+    async def test_should_target_the_most_recent_inprogress_task_when_updating_without_id(self):
+        from chat_sdk.plan import AddTaskOptions, Plan, StartPlanOptions, UpdateTaskInput
+
+        plan = Plan(StartPlanOptions(initial_message="Start"))
+        await _plan_thread().post(plan)
+
+        fetch_task = await plan.add_task(AddTaskOptions(title="Fetch data"))
+        transform_task = await plan.add_task(AddTaskOptions(title="Transform", auto_complete_previous=False))
+        assert fetch_task is not None and transform_task is not None
+
+        assert plan.current_task is not None
+        assert plan.current_task.id == transform_task.id
+        assert _task_status(plan, fetch_task.id) == "in_progress"
+
+        updated = await plan.update_task("parallel output")
+        assert updated is not None
+        assert updated.id == transform_task.id
+
+        fetch_updated = await plan.update_task(UpdateTaskInput(id=fetch_task.id, output="fetch output"))
+        assert fetch_updated is not None
+        assert fetch_updated.id == fetch_task.id
+        assert _task_status(plan, transform_task.id) == "in_progress"
 
     # it("should return null when updating by non-existent ID")
     @pytest.mark.asyncio

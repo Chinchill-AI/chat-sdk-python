@@ -6,12 +6,14 @@ Python port of Vercel Chat SDK types.ts.
 from __future__ import annotations
 
 import asyncio
+import enum
 import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import (
     Any,
+    Final,
     Literal,
     NotRequired,
     Protocol,
@@ -44,6 +46,38 @@ def _parse_iso(s: str) -> datetime:
     # Truncate any extra digits (e.g., Teams sends 7-digit nanosecond timestamps).
     s = re.sub(r"(\.\d{6})\d+", r"\1", s)
     return datetime.fromisoformat(s)
+
+
+# =============================================================================
+# Unset sentinel
+# =============================================================================
+
+
+class _Unset(enum.Enum):
+    """Marker for "not configured" where ``None`` already has a meaning.
+
+    TS distinguishes ``undefined`` (omitted) from ``null`` (disabled); Python
+    has only ``None``. ``fallback_streaming_placeholder_text`` uses ``None``
+    for "no placeholder", so "not configured" needs its own value. An enum
+    member keeps its identity through ``copy.deepcopy``, pickling and
+    ``dataclasses.replace``. Compare with ``is UNSET``. It is falsy, so a
+    truthiness check never mistakes it for placeholder text.
+    """
+
+    UNSET = "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET: Final = _Unset.UNSET
+"""The single :class:`_Unset` value. Never serialized."""
+
+Unset = Literal[_Unset.UNSET]
+"""Type of :data:`UNSET`, for annotations such as ``str | None | Unset``."""
 
 
 # =============================================================================
@@ -1117,6 +1151,12 @@ class StreamOptions:
     stop_blocks: list[Any] | None = None
     task_display_mode: Literal["timeline", "plan"] | None = None
     update_interval_ms: int | None = None
+    # Placeholder for post+edit fallback streaming, present only when the
+    # bot or thread configured one: text, ``None`` (no placeholder), or
+    # ``UNSET`` (not configured; the fallback then posts ``"..."``).
+    # vercel/chat#709. Adapters compare with ``is UNSET``. Last, so
+    # positional construction binds the same fields as before.
+    fallback_streaming_placeholder_text: str | None | Unset = UNSET
 
 
 # =============================================================================
@@ -1948,7 +1988,10 @@ class ChatConfig:
     # the bundled state backends treat it as no expiry, so message IDs are
     # then deduped permanently (matches upstream).
     dedupe_ttl_ms: int | None = None
-    fallback_streaming_placeholder_text: str | None = "..."
+    # Placeholder posted before post+edit fallback streaming. ``None``
+    # disables it; ``UNSET`` (the default) posts ``"..."`` in the fallback
+    # but is not forwarded to ``adapter.stream`` (vercel/chat#709).
+    fallback_streaming_placeholder_text: str | None | Unset = UNSET
     # Unified history configuration. Supersedes the individual
     # ``transcripts``, ``identity``, ``thread_history`` and ``message_history``
     # fields.

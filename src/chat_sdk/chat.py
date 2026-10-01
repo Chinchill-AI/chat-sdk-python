@@ -79,6 +79,7 @@ from chat_sdk.types import (
     ReactionEvent,
     SlashCommandEvent,
     StateAdapter,
+    StreamOptions,
     TranscriptsApi,
     TranscriptsConfig,
     UninstalledEvent,
@@ -722,6 +723,27 @@ class Chat:
     def get_state(self) -> StateAdapter:
         return self._state_adapter
 
+    def get_streaming_options(self) -> StreamOptions:
+        """Streaming defaults applied to threads restored into this Chat.
+
+        Only ``update_interval_ms`` and ``fallback_streaming_placeholder_text``
+        are set; the placeholder is ``UNSET`` when not configured.
+        Internal: used by restored threads (vercel/chat#967).
+        """
+        return StreamOptions(
+            update_interval_ms=self._streaming_update_interval_ms,
+            fallback_streaming_placeholder_text=self._fallback_streaming_placeholder_text,
+        )
+
+    def owns_adapter(self, adapter: Adapter) -> bool:
+        """Whether this exact adapter instance is registered with this Chat.
+
+        Compares by identity over the registered values, since the key an
+        adapter is registered under may differ from ``adapter.name``.
+        Internal: used by restored threads and channels (vercel/chat#967).
+        """
+        return any(registered is adapter for registered in self._adapters.values())
+
     def get_user_name(self) -> str:
         return self._user_name
 
@@ -1234,7 +1256,13 @@ class Chat:
                 if t == "chat:Channel":
                     return ChannelImpl.from_json(value, chat=chat)
                 if t == "chat:Message":
-                    return _message_from_json(value)
+                    message = _message_from_json(value)
+                    # Bind to this Chat's adapter so `message.subject`
+                    # resolves (vercel/chat#967).
+                    owner = chat.get_adapter(message.thread_id.split(":")[0])
+                    if owner is not None:
+                        set_message_adapter(message, owner)
+                    return message
             return value
 
         return _reviver
@@ -1501,7 +1529,7 @@ class Chat:
         options: WebhookOptions | None = None,
     ) -> ModalResponse | None:
         """Process a modal form submission. Returns optional response."""
-        related = await self._retrieve_modal_context(event.adapter.name, context_id)
+        related = await self._retrieve_modal_context(event.adapter, context_id)
         callback_url = related.get("callback_url")
 
         full_event = ModalSubmitEvent(
@@ -1572,7 +1600,7 @@ class Chat:
         """Process a modal close event."""
 
         async def _task() -> None:
-            related = await self._retrieve_modal_context(event.adapter.name, context_id)
+            related = await self._retrieve_modal_context(event.adapter, context_id)
 
             full_event = ModalCloseEvent(
                 adapter=event.adapter,
@@ -1887,9 +1915,10 @@ class Chat:
 
     async def _retrieve_modal_context(
         self,
-        adapter_name: str,
+        adapter: Adapter,
         context_id: str | None,
     ) -> dict[str, Any]:
+        adapter_name = adapter.name
         if not context_id:
             return {
                 "callback_url": None,
@@ -1909,11 +1938,20 @@ class Chat:
                 "related_channel": None,
             }
 
-        adapter = self._adapters.get(adapter_name)
+        # Bind restored objects to this Chat (vercel/chat#967). Upstream looks
+        # the adapter up by `adapter.name` and always passes `this`; we bind
+        # the event's own adapter instead, so an adapter registered under a
+        # custom key still restores into this Chat (an explicit `chat`
+        # resolves eagerly here, so a by-name miss would raise). Never fall
+        # back to the active singleton: it may be another bot's Chat. An
+        # adapter this Chat did not register is matched only against the
+        # Chat that owns that exact instance. Divergence from upstream
+        # (eager ownership) — see docs/UPSTREAM_SYNC.md.
+        owner = self if self.owns_adapter(adapter) else None
 
         related_thread = None
         if stored.get("thread"):
-            related_thread = ThreadImpl.from_json(stored["thread"], adapter)
+            related_thread = ThreadImpl.from_json(stored["thread"], adapter, chat=owner)
 
         related_message = None
         if stored.get("message") and related_thread is not None:
@@ -1922,7 +1960,7 @@ class Chat:
 
         related_channel = None
         if stored.get("channel"):
-            related_channel = ChannelImpl.from_json(stored["channel"], adapter)
+            related_channel = ChannelImpl.from_json(stored["channel"], adapter, chat=owner)
 
         # Accept both camelCase (written by this SDK and the TS SDK) and
         # snake_case (hand-written state) — same tolerance as from_json.
@@ -2010,17 +2048,27 @@ class Chat:
         thread: ThreadImpl | None = None
         if event.thread_id:
             is_subscribed = False
-            dummy_message = Message(
-                id=event.message_id or "",
-                thread_id=event.thread_id,
-                text="",
-                formatted={"type": "root", "children": []},
-                raw=event.raw,
-                author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
-                attachments=[],
+            # Without a message id there is no message context: the thread
+            # gets `current_message=None` rather than a stub (vercel/chat#633).
+            # Upstream parity (chat.ts processAction, chat@4.41.1). Such a
+            # thread has no recipient context, so Slack's `stream()` returns
+            # None and core's post+edit fallback replies (the adapter half of
+            # the same change; the rest of it is #207).
+            message_for_thread = (
+                Message(
+                    id=event.message_id,
+                    thread_id=event.thread_id,
+                    text="",
+                    formatted={"type": "root", "children": []},
+                    raw=event.raw,
+                    author=event.user,
+                    metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
+                    attachments=[],
+                )
+                if event.message_id
+                else None
             )
-            thread = self._create_thread(event.adapter, event.thread_id, dummy_message, is_subscribed)
+            thread = self._create_thread(event.adapter, event.thread_id, message_for_thread, is_subscribed)
 
         # Build openModal helper
         async def _open_modal(modal: Any) -> dict[str, str] | None:
@@ -2120,19 +2168,12 @@ class Chat:
             return
 
         is_subscribed = await self._state_adapter.is_subscribed(event.thread_id)
+        # A reaction without the reacted-to message has no message context
+        # (vercel/chat#633).
         thread = self._create_thread(
             event.adapter,
             event.thread_id,
-            event.message
-            or Message(
-                id=event.message_id,
-                thread_id=event.thread_id,
-                text="",
-                formatted={"type": "root", "children": []},
-                raw=None,
-                author=event.user,
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
-            ),
+            event.message,
             is_subscribed,
         )
 
@@ -2182,20 +2223,7 @@ class Chat:
             raise ChatError(f'Adapter "{adapter.name}" does not support open_dm')
 
         thread_id: str = await adapter.open_dm(user_id)  # type: ignore[union-attr]
-        return self._create_thread(
-            adapter,
-            thread_id,
-            Message(
-                id="",
-                thread_id=thread_id,
-                text="",
-                formatted={"type": "root", "children": []},
-                raw=None,
-                author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                metadata=MessageMetadata(date_sent=datetime.now(tz=timezone.utc), edited=False),
-            ),
-            False,
-        )
+        return self._create_thread(adapter, thread_id, None, False)
 
     async def get_user(self, user: str | Author) -> UserInfo | None:
         """Look up user information by user ID.
@@ -2340,22 +2368,10 @@ class Chat:
         if not derived_channel_id:
             raise ChatError(f"Invalid thread ID: {thread_id}")
 
-        stub_message = (
-            current_message
-            if current_message is not None
-            else Message(
-                id="",
-                thread_id=thread_id,
-                text="",
-                formatted={"type": "root", "children": []},
-                raw=None,
-                author=Author(user_id="", user_name="", full_name="", is_bot=False, is_me=False),
-                # Deterministic timestamp for the stub message — `datetime.now()`
-                # makes this method non-deterministic and harder to test.
-                metadata=MessageMetadata(date_sent=datetime.fromtimestamp(0, tz=timezone.utc), edited=False),
-            )
-        )
-        return self._create_thread(adapter, thread_id, stub_message, False)
+        # Without `current_message` the handle has no message context:
+        # `current_message` is None and `recent_messages` is empty
+        # (vercel/chat#633).
+        return self._create_thread(adapter, thread_id, current_message, False)
 
     # ========================================================================
     # Adapter inference
@@ -3113,7 +3129,7 @@ class Chat:
         self,
         adapter: Adapter,
         thread_id: str,
-        initial_message: Message,
+        initial_message: Message | None,
         is_subscribed_context: bool = False,
     ) -> ThreadImpl:
         channel_id = adapter.channel_id_from_thread_id(thread_id)

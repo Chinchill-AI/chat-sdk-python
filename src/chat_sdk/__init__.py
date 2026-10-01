@@ -168,6 +168,7 @@ from chat_sdk.state.memory import MemoryStateAdapter
 from chat_sdk.thread import ThreadImpl
 from chat_sdk.thread_history import ThreadHistoryCache, ThreadHistoryConfig
 from chat_sdk.types import (
+    UNSET,
     ActionEvent,
     Adapter,
     AdapterPostableMessage,
@@ -271,6 +272,7 @@ from chat_sdk.types import (
     TranscriptsConfig,
     UninstalledEvent,
     UninstalledHandler,
+    Unset,
     UserHistoryApi,
     UserHistoryConfig,
     UserHistoryEntry,
@@ -558,8 +560,10 @@ __all__ = [
     "TranscriptRole",
     "TranscriptsApi",
     "TranscriptsConfig",
+    "UNSET",
     "UninstalledEvent",
     "UninstalledHandler",
+    "Unset",
     "UserHistoryApi",
     "UserHistoryConfig",
     "UserHistoryEntry",
