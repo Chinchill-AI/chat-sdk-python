@@ -1795,7 +1795,11 @@ behavior differences.
   the turn's signal for dispatched messages, passed through
   `_ThreadImplConfig.signal` and `_create_thread(..., signal=None)`; a
   thread built anywhere else (`chat.thread()`, `from_json`, event threads)
-  gets a signal that is never aborted, as upstream. `StreamOptions.signal`
+  gets a signal that is never aborted, as upstream. The Python-only
+  idempotent rebind (`ThreadImpl.from_json(existing_thread, chat=...)`)
+  resets the signal and the typing flag with the other binding state. A
+  turn aborted before the first chunk is pulled closes the unstarted
+  normalizer without touching the caller's stream, as upstream. `StreamOptions.signal`
   carries it to `adapter.stream`; `StreamOptions` also gains
   `session_status` (`AgentSessionStatus`), and `StreamingPlanOptions`
   gains `session_status`, mapped like the other plan options (`is not

@@ -339,6 +339,24 @@ class TestThreadAbortAndTyping:
 
         assert adapter._start_typing_options == [None, None]
 
+    async def test_rebinding_a_thread_resets_turn_state(self):
+        old_adapter = create_mock_adapter("slack")
+        old_signal = TurnSignal()
+        thread = _thread(old_adapter, signal=old_signal)
+        await thread.start_typing()
+        old_signal._abort()
+        new_adapter = create_mock_adapter("slack")
+        new_adapter.end_typing = AsyncMock()  # type: ignore[attr-defined]
+        new_chat = _chat(new_adapter)
+
+        rebound = ThreadImpl.from_json(thread, chat=new_chat)
+
+        assert rebound is thread
+        assert rebound.signal is not old_signal
+        assert rebound.signal.aborted is False
+        await rebound.post("after rebind")  # the old turn's indicator is not ended here
+        new_adapter.end_typing.assert_not_awaited()
+
 
 class TestAcceptsKwarg:
     def test_probe_results(self):

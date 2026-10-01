@@ -878,6 +878,10 @@ class ThreadImpl:
         # Python-only, default-off divergence: when enabled, raw reasoning
         # parts become ``ThinkingChunk`` objects; when off (the default) the
         # stream is byte-for-byte upstream.
+        # Upstream parity (thread.ts ``takeUntilAborted``, chat@4.41.1): a
+        # turn aborted before the first chunk is pulled closes the unstarted
+        # normalizer without touching ``raw_stream``, as upstream's
+        # ``iterator.return()`` on an unstarted ``fromFullStream`` does.
         text_stream = _take_until_aborted(
             _from_full_stream(raw_stream, emit_thinking=self._emit_thinking),
             self._signal,
@@ -1353,6 +1357,10 @@ class ThreadImpl:
                 thread._binding = _ChatBinding(chat)
                 thread._streaming_update_interval_ms = None
                 thread._fallback_streaming_placeholder_text = UNSET
+                # Turn-local state belongs to the old binding's turn, as a
+                # fresh restore (which has neither) would show.
+                thread._signal = TurnSignal()
+                thread._typing_started = False
         else:
             # Explicit None-checks (not `or`) to avoid the truthiness trap:
             # `""` is a valid-but-falsy value that shouldn't silently fall
