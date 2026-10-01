@@ -372,3 +372,14 @@ class TestHistoryConfigPrecedence:
         assert len(stored) == 1
         assert ("formatted" in stored[0]) is expect_formatted
         assert (entry.formatted is not None) is expect_formatted
+
+    def test_history_is_keyword_only_so_positional_identity_still_binds(self, mock_adapter, mock_state):
+        # Python-specific: ChatConfig is a positional dataclass. Adding
+        # ``history`` must not shift ``identity`` (or any later field) for
+        # existing positional callers.
+        resolver = AsyncMock(return_value="u1")
+        config = ChatConfig({"slack": mock_adapter}, mock_state, "testbot", None, None, "...", resolver)
+
+        assert config.identity is resolver
+        assert config.history is None
+        Chat(config)

@@ -1793,7 +1793,11 @@ class ChatConfig:
     #   (replaces ``transcripts`` + ``identity``)
     # - ``history.thread``: per-thread message backfill (replaces
     #   ``thread_history`` / ``message_history``)
-    history: HistoryConfig | None = None
+    #
+    # Keyword-only (Python-specific): ``ChatConfig`` is a positional
+    # dataclass, so inserting ``history`` positionally would shift
+    # ``identity`` and every later field for existing positional callers.
+    history: HistoryConfig | None = field(default=None, kw_only=True)
     # Deprecated: prefer ``history.user.identity``. Still read when user
     # history is enabled; the resolver may live here or on
     # ``history.user.identity`` (preferred), and one of the two is required.
