@@ -1070,8 +1070,8 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
   extractor is a minimal private port of `attachmentContent` (blocks and
   parts, no tables). Upstream builds the parts when `tables.length === 0`;
   with no tables extracted that gate is always open, so parts are built even
-  beside blocks (detection ignores them there). #210 extends it for rendering
-  and restores the tables gate.
+  beside blocks (detection ignores them there). #210 has since extended it
+  for rendering and restored the tables gate (see the next section).
 - **Author (`c2b6bff0`, `bb7cd124`, `80def3ab`).** `user_id` is `user`, then
   `bot_profile.user_id`, then `bot_id`. `_is_message_from_self` matches the bot
   user id against `user or bot_profile.user_id`. `email` comes from the
@@ -1087,8 +1087,64 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
   50k characters). `re.ASCII` limits `IGNORECASE` to ASCII folding, as JS `i`
   does without `u`. The block walk uses an explicit stack, so deep nesting
   cannot raise `RecursionError`.
-- **Known gap.** Table blocks do not render into `text` yet (#210), so two
-  ported table tests assert only `is_mention`.
+- **Known gap (closed by #210).** Table blocks now render into `text`; the two
+  ported table tests here still assert only `is_mention`, and
+  `tests/test_slack_inbound_content.py` covers the table text.
+
+### Slack inbound content: pasted tables and alert attachments (chat@4.38–4.39, #210)
+
+Parity, with no new divergence. Ports the Slack halves of `764e4759` (#817,
+chat@4.38.1) and `864d9222` (#846, chat@4.39.0); the core `toPlainText` table
+rules were #193 and the `previous_message` hunk of #846 is #211.
+
+- **Content assembly.** Both parse paths build `formatted` from the body text
+  plus `table` / `data_table` blocks (tables before the first non-table block
+  above the text, the rest below) plus each non-unfurl attachment's content,
+  and derive `text = ast_to_plain_text(formatted)` instead of
+  `extract_plain_text(event["text"])`. The helpers are module-level in
+  `adapters/slack/adapter.py` (no separate module): `_block_text`,
+  `_has_bold_text`, `_table_data`, `_event_tables`, `_attachment_content`,
+  `_literal_phrasing`, `_collect_mention_ids`, `_apply_mention_names`, and the
+  `_content` / `_resolved_content` / `_assemble_content` / `_attachment_nodes`
+  / `_table_node` / `_cell_children` methods. `_detect_self_mention` reads the
+  same `_attachment_content` parts.
+- **Attachments.** Literal parts (`pretext` / `title` / `text` / `fields` not
+  named in `mrkdwn_in`) share a paragraph joined by `break`; mrkdwn parts are
+  parsed in isolation. `fallback` is used only when there are no parts and no
+  tables. An attachment with table blocks renders only its tables. A
+  non-foreign attachment's `title_link` is added to `message.links`.
+- **Mentions.** The async path resolves body mentions first (as before), then
+  collects every id in cells and attachment parts and looks them up in one
+  `asyncio.gather` wave. The sync path does no lookups.
+  `_resolve_inline_mentions` is now collect / lookup / apply; apply leaves a
+  token without a resolved name untouched (upstream behavior; the old inline
+  code rewrote it to `<@id>`, which never happened in practice because a
+  failed lookup resolves to the id).
+- **JS `String()` / Date parity.** Raw cell values format through
+  `chat_sdk.cards._js_number_to_string` (`True` -> `true`, `3.0` -> `3`), and
+  type checks replace truthiness so `0` / `False` / `""` render. A date cell
+  without `fallback` formats its timestamp as a UTC ISO date; a timestamp
+  outside `datetime`'s range renders empty (upstream `toISOString` throws and
+  the message fails to parse).
+- **Explicit stacks and index walks (implementation details, not
+  divergences).** `_block_text` and `_has_bold_text` walk with explicit
+  stacks, matching the #209 block walk, so a deeply nested cell cannot raise
+  `RecursionError`. `_apply_mention_names` and `_literal_phrasing` walk
+  indices instead of re-slicing the remaining text per token as upstream does:
+  Python slices copy, so the upstream shape is quadratic (about 4 s on 200k
+  characters of `<@U1>` tokens) now that it also runs over attachment text.
+  Output is identical (fuzzed against the upstream-shaped versions).
+- **Interim gap until #283.** Upstream's `toAst` runs `slackMrkdwnToMarkdown`,
+  which unescapes `&amp;` / `&lt;` / `&gt;` and renders `<!subteam^…>` as
+  `@…`. The Python `SlackFormatConverter.to_ast` does neither yet (#283 ports
+  that normalization). Body text already showed these entities; table cells
+  and mrkdwn attachment parts now render through the same converter, so a
+  `raw_text` cell holding `R&D` or `<@U…>` (escaped by `_block_text`, as
+  upstream does) shows `R&amp;D` / `&lt;@U…&gt;`, and a usergroup cell shows
+  `<!subteam^S…>`. The "preserves rich text metadata within table cells" port
+  pins the current output with a comment; #283 should update it. Literal
+  attachment parts unescape on their own (`_literal_phrasing`) and are
+  unaffected.
 
 ### Teams Adaptive Card 1.5 rendering (chat@4.36–4.41, #220)
 
