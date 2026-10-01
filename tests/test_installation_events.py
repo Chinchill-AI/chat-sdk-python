@@ -15,7 +15,7 @@ import pytest
 from chat_sdk.chat import Chat
 from chat_sdk.context import active_conversation
 from chat_sdk.testing import MockLogger, create_mock_adapter, create_mock_chat_instance, create_mock_state
-from chat_sdk.types import ChatConfig, InstalledEvent, UninstalledEvent, WebhookOptions
+from chat_sdk.types import ChatConfig, ChatInstance, InstalledEvent, UninstalledEvent, WebhookOptions
 
 KINDS = ["Installed", "Uninstalled"]
 _UNSET: Any = object()
@@ -226,3 +226,5 @@ async def test_mock_chat_instance_async_processors_overrides_and_accessors():
     assert chat.process_message is sentinel
     assert chat.get_state() is state
     assert chat.get_user_name() == "helper-bot"
+    assert isinstance(chat, ChatInstance)
+    assert chat.transcripts is chat.history.user

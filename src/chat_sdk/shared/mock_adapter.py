@@ -431,7 +431,8 @@ def create_mock_chat_instance(
     through the right hook. Includes the optional ``process_installed`` /
     ``process_uninstalled``. ``get_state()`` / ``get_user_name()`` /
     ``get_logger()`` return the supplied (or default) state, user name and
-    logger; ``overrides`` replaces attributes last. Unknown attributes raise
+    logger; ``history`` is a recording ``AsyncMock`` (``transcripts`` is
+    ``history.user``); ``overrides`` replaces attributes last. Unknown attributes raise
     ``AttributeError`` (it is not a bare ``MagicMock``), so
     ``getattr(chat, "process_x", None)`` probes behave as on a real ``Chat``.
     """
@@ -442,7 +443,13 @@ def create_mock_chat_instance(
 
     attrs: dict[str, Any] = {name: MagicMock(name=name) for name in _MOCK_CHAT_SYNC_PROCESSORS}
     attrs.update({name: AsyncMock(name=name, return_value=None) for name in _MOCK_CHAT_ASYNC_PROCESSORS})
-    attrs["transcripts"] = AsyncMock(name="transcripts")
+    # Upstream's factory omits ``history`` and casts ``as unknown as
+    # ChatInstance``; Python's ``ChatInstance`` is ``@runtime_checkable``, so
+    # without it ``isinstance(mock, ChatInstance)`` is False. ``transcripts``
+    # is ``history.user``, as on a real ``Chat``.
+    history = AsyncMock(name="history")
+    attrs["history"] = history
+    attrs["transcripts"] = history.user
     attrs["get_state"] = lambda: resolved_state
     attrs["get_user_name"] = lambda: user_name
     attrs["get_logger"] = lambda prefix=None: resolved_logger
