@@ -11,18 +11,16 @@ See: https://developers.facebook.com/docs/messenger-platform
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import inspect
 import json
 import os
-import re
 import time
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
 from typing import Any, Literal, cast
-from urllib.parse import parse_qs, urljoin, urlparse, urlsplit
+from urllib.parse import parse_qs, urlparse
 
 from chat_sdk.adapters.messenger.cards import (
     MessengerCardResultTemplate,
@@ -48,6 +46,7 @@ from chat_sdk.emoji import convert_emoji_placeholders, default_emoji_resolver
 from chat_sdk.errors import ChatNotImplementedError
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.shared.adapter_utils import extract_card
+from chat_sdk.shared.download import AttachmentTransport, download_attachment
 from chat_sdk.shared.errors import (
     AdapterRateLimitError,
     AuthenticationError,
@@ -90,52 +89,12 @@ MESSENGER_MESSAGE_LIMIT = 2000
 # Used to disambiguate identical-timestamp messages in the local cache.
 _MESSAGE_SEQUENCE_SUFFIX = ":"
 
-# Attachment download guard (port of upstream ``adapter-messenger/src/fetch.ts``,
-# vercel/chat 153bd964). Webhook ``payload.url`` values are only fetched when
-# they point at Meta's attachment CDNs; ``fallback`` / link-share attachments
+# Attachment download hosts (port of upstream ``adapter-messenger/src/fetch.ts``,
+# vercel/chat 153bd964 / b6fa24c6). Webhook ``payload.url`` values are only
+# fetched from Meta's attachment CDNs; ``fallback`` / link-share attachments
 # carry user-controlled URLs, so anything else is refused before any I/O.
 _MESSENGER_MEDIA_HOSTS = ("fbsbx.com", "fbcdn.net")
-_ATTACHMENT_LIMIT_BYTES = 25 * 1024 * 1024
-_ATTACHMENT_MAX_REDIRECTS = 5
-_ATTACHMENT_TIMEOUT_S = 30.0
-_ATTACHMENT_CHUNK_BYTES = 64 * 1024
-_ATTACHMENT_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _UNTRUSTED_ATTACHMENT_URL_MESSAGE = "Refusing to fetch an untrusted attachment URL"
-# Plain DNS labels only (matched against the lowercased ``hostname``; the raw
-# netloc is separately required to be ASCII, since ``str.lower()`` folds some
-# non-ASCII characters such as U+212A KELVIN SIGN to ASCII). Rejects IP
-# literals in brackets, percent-encoded or non-ASCII hosts, empty labels and a
-# trailing dot (``cdn.fbsbx.com.``), so the host we validate is the host
-# aiohttp/yarl connects to.
-_ATTACHMENT_HOSTNAME_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*")
-
-
-def _is_trusted_messenger_media_url(url: str) -> bool:
-    """True when ``url`` is an https URL on a Meta attachment CDN host.
-
-    The host must equal one of :data:`_MESSENGER_MEDIA_HOSTS` or be a
-    subdomain of one (case-insensitive). Userinfo, a non-443 explicit port,
-    a non-ASCII authority, whitespace/control characters and backslashes
-    are rejected outright so
-    ``urlsplit`` and aiohttp's URL parser cannot disagree about the host.
-    """
-    if not isinstance(url, str) or not url:
-        return False
-    if any(ch <= " " or ch in "\\\x7f" for ch in url):
-        return False
-    try:
-        parts = urlsplit(url)
-        port = parts.port
-    except ValueError:
-        return False
-    if parts.scheme != "https" or "@" in parts.netloc or not parts.netloc.isascii():
-        return False
-    if port is not None and port != 443:
-        return False
-    hostname = parts.hostname
-    if not hostname or not _ATTACHMENT_HOSTNAME_RE.fullmatch(hostname):
-        return False
-    return any(hostname == host or hostname.endswith(f".{host}") for host in _MESSENGER_MEDIA_HOSTS)
 
 
 class MessengerAdapter:
@@ -687,6 +646,28 @@ class MessengerAdapter:
             },
         )
 
+    async def mark_as_read(
+        self,
+        thread_id: str,
+        message_id: str | None = None,
+        message: Message | None = None,
+    ) -> None:
+        """Send a ``mark_seen`` sender_action via the Send API.
+
+        Messenger marks the whole conversation seen, so ``message_id`` and
+        ``message`` are accepted for the ``Thread.mark_as_read()`` hook
+        contract and ignored, as upstream's ``_messageId``.
+        """
+        recipient_id = self._resolve_thread_id(thread_id).recipient_id
+        await self._graph_api_fetch(
+            "me/messages",
+            method="POST",
+            body={
+                "recipient": {"id": recipient_id},
+                "sender_action": "mark_seen",
+            },
+        )
+
     # =========================================================================
     # Fetching
     # =========================================================================
@@ -892,8 +873,8 @@ class MessengerAdapter:
         the queue/debounce/burst concurrency paths, where the original
         ``fetch_data`` closure was dropped during JSON serialization.  Reads
         the download URL from ``attachment.fetch_metadata`` (populated by
-        :meth:`_extract_attachments`) and rebuilds the lazy downloader that
-        reuses the shared aiohttp session.  Returns the attachment unchanged
+        :meth:`_extract_attachments`) and rebuilds the lazy downloader (the
+        shared guarded downloader, via :meth:`_download_attachment`).  Returns the attachment unchanged
         when no URL is present — matching the upstream documented "leave
         unchanged when no hook" degraded-mode behavior.
 
@@ -944,101 +925,41 @@ class MessengerAdapter:
         """
         raise ChatNotImplementedError(self.name, "getUser")
 
-    async def _download_attachment(self, url: str) -> bytes:
-        """Download a Meta-CDN attachment URL with SSRF guards.
+    async def _download_attachment(self, url: str, transport: AttachmentTransport | None = None) -> bytes:
+        """Download a Meta-CDN attachment URL through the shared guarded downloader.
 
-        Port of upstream ``fetch.ts`` ``download()`` (vercel/chat 153bd964):
-        https + ``fbsbx.com`` / ``fbcdn.net`` hosts only (validated before any
-        network I/O and again on every redirect hop), at most 5 redirects, a
-        25 MB body cap and a 30 s deadline covering every hop and the body
-        read. Every failure surfaces as ``NetworkError("messenger", ...)``.
+        Port of upstream ``fetch.ts`` ``download()``: ``download_attachment``
+        with ``hosts=("fbsbx.com", "fbcdn.net")`` and no credentials (https
+        only, every redirect hop re-validated, internal addresses refused as
+        literals and after DNS resolution, 25 MB cap, 30 s deadline).
+        Downloader errors are ``NetworkError("messenger", ...)``; anything
+        else becomes ``NetworkError("messenger", "Failed to download
+        Messenger attachment")``.
 
         Validation lives here (not at parse time) so closures rebuilt by
         :meth:`rehydrate_attachment` from persisted ``fetch_metadata`` are
         guarded too, and ``attachment.url`` keeps the original value.
-
-        Divergence from upstream — see docs/UPSTREAM_SYNC.md: no DNS /
-        private-IP resolution check yet (the host allowlist alone rejects IP
-        literals and non-Meta names; connection-bound checks arrive with the
-        shared downloader, #204/#239), and the URL check is stricter (rejects
-        userinfo, non-443 ports, non-DNS-label hosts).
+        ``transport`` is upstream's optional transport argument.
         """
-        if not _is_trusted_messenger_media_url(url):
+        # Persisted ``fetch_metadata`` is untyped JSON: a non-string URL is
+        # refused like any other untrusted one, not surfaced as a TypeError.
+        if not isinstance(url, str):
             raise NetworkError("messenger", _UNTRUSTED_ATTACHMENT_URL_MESSAGE)
         try:
-            async with asyncio.timeout(_ATTACHMENT_TIMEOUT_S):
-                return await self._fetch_attachment_body(url)
+            return await download_attachment(
+                url,
+                adapter="messenger",
+                hosts=_MESSENGER_MEDIA_HOSTS,
+                transport=transport,
+            )
         except NetworkError:
             raise
-        except TimeoutError as error:
-            # Covers both the overall deadline and aiohttp's per-request
-            # ``ClientTimeout`` (its timeout errors subclass ``TimeoutError``).
-            raise NetworkError(
-                "messenger",
-                "Timed out fetching the attachment",
-                original_error=error,
-            ) from error
         except Exception as error:
             raise NetworkError(
                 "messenger",
                 "Failed to download Messenger attachment",
                 original_error=error,
             ) from error
-
-    async def _fetch_attachment_body(self, url: str) -> bytes:
-        """Follow redirects manually (re-validating each hop) and read the body."""
-        import aiohttp
-
-        session = await self._get_http_session()
-        timeout = aiohttp.ClientTimeout(total=_ATTACHMENT_TIMEOUT_S)
-        current = url
-        for _hop in range(_ATTACHMENT_MAX_REDIRECTS + 1):
-            async with session.get(current, allow_redirects=False, timeout=timeout) as response:
-                status = response.status
-                if status in _ATTACHMENT_REDIRECT_STATUSES:
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise NetworkError("messenger", "Attachment redirect has no location")
-                    # Upstream order: the hop limit is checked before the next
-                    # Location is validated, so a 6th redirect always reports
-                    # "Too many attachment redirects" wherever it points.
-                    if _hop == _ATTACHMENT_MAX_REDIRECTS:
-                        raise NetworkError("messenger", "Too many attachment redirects")
-                    try:
-                        next_url = urljoin(current, location)
-                    except ValueError:
-                        next_url = ""
-                    if not _is_trusted_messenger_media_url(next_url):
-                        raise NetworkError("messenger", _UNTRUSTED_ATTACHMENT_URL_MESSAGE)
-                    current = next_url
-                    continue
-                if status < 200 or status >= 300:
-                    reason = response.reason or ""
-                    raise NetworkError("messenger", f"Failed to fetch file: {status} {reason}".strip())
-                return await self._read_attachment_body(response)
-        # Unreachable: the final iteration either returns, raises on a non-2xx
-        # status, or raises "Too many attachment redirects" above.
-        raise NetworkError("messenger", "Too many attachment redirects")  # pragma: no cover
-
-    @staticmethod
-    async def _read_attachment_body(response: Any) -> bytes:
-        """Read ``response`` in chunks, refusing bodies over the 25 MB cap."""
-        declared_header = response.headers.get("Content-Length")
-        if declared_header is not None:
-            try:
-                declared = int(declared_header)
-            except ValueError:
-                declared = None
-            if declared is not None and declared > _ATTACHMENT_LIMIT_BYTES:
-                raise NetworkError("messenger", "Attachment exceeds the download limit")
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in response.content.iter_chunked(_ATTACHMENT_CHUNK_BYTES):
-            total += len(chunk)
-            if total > _ATTACHMENT_LIMIT_BYTES:
-                raise NetworkError("messenger", "Attachment exceeds the download limit")
-            chunks.append(chunk)
-        return b"".join(chunks)
 
     # =========================================================================
     # User profile (with cache)

@@ -27,8 +27,12 @@ from chat_sdk.adapters.whatsapp.adapter import (
 )
 from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig
 from chat_sdk.logger import ConsoleLogger
+from chat_sdk.shared import download as download_module
 from chat_sdk.shared.errors import AdapterError, NetworkError, ValidationError
+from chat_sdk.testing import create_mock_state
+from chat_sdk.thread import ThreadImpl, _ThreadImplConfig
 from chat_sdk.types import Attachment, FileUpload, MarkdownTextChunk, PostableCard, PostableMarkdown, StreamChunk
+from tests._slack_file_transport import FakeFileResponse, FakeFileTransport
 
 # =============================================================================
 # Helpers
@@ -612,19 +616,19 @@ class TestGraphFetchJsonPythonSpecific:
     @pytest.mark.asyncio
     async def test_media_metadata_get_then_binary_download(self):
         media_url = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1"
-        adapter, session = _adapter_with_session(
-            _json_response({"url": media_url, "id": "media123"}),
-            _FakeGraphResponse(200, b"\x89PNG"),
-        )
+        adapter, session = _adapter_with_session(_json_response({"url": media_url, "id": "media123"}))
+        transport = FakeFileTransport(FakeFileResponse(b"\x89PNG"))
 
-        data = await adapter.download_media("media123")
+        data = await adapter.download_media("media123", transport)
 
         assert data == b"\x89PNG"
-        (meta_method, meta_url, meta_kwargs), (get_method, get_url, _) = session.calls
+        # Step 1 goes through the Graph session; step 2 only through the
+        # guarded downloader's transport.
+        ((meta_method, meta_url, meta_kwargs),) = session.calls
         assert meta_method == "GET"
-        assert meta_url.endswith("/media123")
+        assert meta_url == "https://graph.facebook.com/v25.0/media123"
         assert meta_kwargs == {"headers": {"Authorization": "Bearer test-token"}}
-        assert (get_method, get_url) == ("GET", media_url)
+        assert [url for url, _ in transport.calls] == [media_url]
 
     @pytest.mark.asyncio
     async def test_media_metadata_error_message_uses_its_label(self):
@@ -1496,3 +1500,410 @@ class TestOutboundMediaPythonSpecific:
         bodies = session.message_bodies()
         assert len(bodies) == 1
         assert bodies[0]["image"]["caption"] == "Track: https://example.com/track"
+
+
+# =============================================================================
+# Tests — mark_as_read (port of describe("markAsRead"))
+# =============================================================================
+
+
+class TestMarkAsRead:
+    @pytest.mark.asyncio
+    async def test_marks_an_inbound_message_as_read(self):
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        await adapter.mark_as_read(THREAD_ID, "wamid.inbound")
+
+        ((method, url, kwargs),) = session.calls
+        assert url == f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
+        assert method == "POST"
+        assert kwargs["json"] == {"messaging_product": "whatsapp", "status": "read", "message_id": "wamid.inbound"}
+
+    @pytest.mark.asyncio
+    async def test_preserves_the_adapter_level_message_id_signature(self):
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        await adapter.mark_as_read("wamid.inbound")
+
+        assert session.calls[0][2]["json"] == {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": "wamid.inbound",
+        }
+
+    @pytest.mark.asyncio
+    async def test_rejects_an_unsuccessful_api_response(self):
+        adapter, _ = _adapter_with_session(_json_response({"success": False}))
+
+        with pytest.raises(AdapterError, match="WhatsApp mark as read failed") as excinfo:
+            await adapter.mark_as_read("wamid.inbound")
+        assert excinfo.value.adapter == "whatsapp"
+
+
+class TestMarkAsReadPythonSpecific:
+    @pytest.mark.asyncio
+    async def test_explicit_empty_message_id_is_not_replaced_by_the_thread_id(self):
+        # ``messageId ?? threadIdOrMessageId`` keeps ``""``; ``or`` would not.
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        await adapter.mark_as_read(THREAD_ID, "")
+
+        assert session.calls[0][2]["json"]["message_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_pre_239_keyword_call_still_works(self):
+        # The old signature was ``mark_as_read(self, message_id)``, so
+        # ``mark_as_read(message_id=...)`` was a valid call.
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        await adapter.mark_as_read(message_id="wamid.inbound")
+
+        assert session.calls[0][2]["json"]["message_id"] == "wamid.inbound"
+
+    @pytest.mark.asyncio
+    async def test_no_message_id_raises_before_any_request(self):
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+
+        with pytest.raises(TypeError, match="requires a message id"):
+            await adapter.mark_as_read()
+        assert session.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [{}, {"success": "true"}, {"success": 1}, [True]])
+    async def test_only_a_json_true_success_counts(self, body: Any):
+        # Divergence from upstream (truthy ``success``): see docs/UPSTREAM_SYNC.md.
+        adapter, _ = _adapter_with_session(_json_response(body))
+
+        with pytest.raises(AdapterError, match="WhatsApp mark as read failed"):
+            await adapter.mark_as_read("wamid.inbound")
+
+    @pytest.mark.asyncio
+    async def test_thread_mark_as_read_sends_the_current_message_id(self):
+        adapter, session = _adapter_with_session(_json_response({"success": True}))
+        inbound = adapter.parse_message(
+            {
+                "message": {
+                    "id": "wamid.current",
+                    "from": USER_WA_ID,
+                    "timestamp": "1700000000",
+                    "type": "text",
+                    "text": {"body": "hi"},
+                },
+                "phone_number_id": PHONE_NUMBER_ID,
+            }
+        )
+        thread = ThreadImpl(
+            _ThreadImplConfig(id=THREAD_ID, adapter=adapter, state_adapter=create_mock_state(), current_message=inbound)
+        )
+
+        await thread.mark_as_read()
+
+        assert session.calls[0][2]["json"]["message_id"] == "wamid.current"
+
+
+# =============================================================================
+# Tests — reply (port of describe("reply"))
+# =============================================================================
+
+
+def _context(body: dict[str, Any]) -> Any:
+    return body.get("context", "<absent>")
+
+
+_APPROVE_CARD: dict[str, Any] = {
+    "type": "card",
+    "title": "Approve?",
+    "children": [
+        {"type": "actions", "children": [{"type": "button", "id": "yes", "label": "Yes"}]},
+    ],
+}
+
+
+class TestReply:
+    @pytest.mark.asyncio
+    async def test_adds_contextual_reply_data_to_text_messages(self):
+        adapter, session = _media_adapter()
+
+        await adapter.reply(THREAD_ID, "wamid.original", {"markdown": "Hello there"})
+
+        assert session.message_bodies()[0]["context"] == {"message_id": "wamid.original"}
+
+    @pytest.mark.asyncio
+    async def test_adds_contextual_reply_data_only_to_the_first_split_message(self):
+        adapter, session = _media_adapter()
+
+        await adapter.reply(THREAD_ID, "wamid.original", {"markdown": "a" * 5000})
+
+        first, second = session.message_bodies()
+        assert first["context"] == {"message_id": "wamid.original"}
+        assert "context" not in second
+
+    @pytest.mark.asyncio
+    async def test_adds_contextual_reply_data_to_interactive_cards(self):
+        adapter, session = _media_adapter()
+
+        await adapter.reply(THREAD_ID, "wamid.original", {"card": copy.deepcopy(_APPROVE_CARD)})
+
+        (sent,) = session.message_bodies()
+        assert sent["type"] == "interactive"
+        assert sent["context"] == {"message_id": "wamid.original"}
+
+    @pytest.mark.asyncio
+    async def test_adds_reply_context_only_to_the_first_media_message(self):
+        adapter, session = _media_adapter()
+
+        await adapter.reply(
+            THREAD_ID,
+            "wamid.original",
+            {
+                "markdown": "Two files",
+                "files": [
+                    FileUpload(data=b"a", filename="first.pdf", mime_type="application/pdf"),
+                    FileUpload(data=b"b", filename="second.pdf", mime_type="application/pdf"),
+                ],
+            },
+        )
+
+        first, second = session.message_bodies()
+        assert first["context"] == {"message_id": "wamid.original"}
+        assert "context" not in second
+
+
+class TestReplyPythonSpecific:
+    @pytest.mark.asyncio
+    async def test_post_message_sends_no_reply_context(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(THREAD_ID, {"markdown": "Hello there"})
+
+        assert _context(session.message_bodies()[0]) == "<absent>"
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_id_sends_no_context(self):
+        # Upstream spreads ``context`` only for a truthy ``replyId``.
+        adapter, session = _media_adapter()
+
+        await adapter.reply(THREAD_ID, "", {"markdown": "Hello there"})
+
+        assert _context(session.message_bodies()[0]) == "<absent>"
+
+    @pytest.mark.asyncio
+    async def test_leading_text_before_media_takes_the_reply_context(self):
+        # Audio cannot carry a caption, so the text goes first on its own.
+        adapter, session = _media_adapter()
+
+        await adapter.reply(
+            THREAD_ID,
+            "wamid.original",
+            {
+                "markdown": "Listen",
+                "files": [FileUpload(data=b"a", filename="clip.mp3", mime_type="audio/mpeg")],
+            },
+        )
+
+        text, audio = session.message_bodies()
+        assert (text["type"], _context(text)) == ("text", {"message_id": "wamid.original"})
+        assert (audio["type"], _context(audio)) == ("audio", "<absent>")
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_after_media_has_no_reply_context(self):
+        adapter, session = _media_adapter()
+
+        await adapter.reply(
+            THREAD_ID,
+            "wamid.original",
+            {
+                "card": copy.deepcopy(_APPROVE_CARD),
+                "files": [FileUpload(data=b"j", filename="p.jpg", mime_type="image/jpeg")],
+            },
+        )
+
+        image, card = session.message_bodies()
+        assert (image["type"], _context(image)) == ("image", {"message_id": "wamid.original"})
+        assert (card["type"], _context(card)) == ("interactive", "<absent>")
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_sends_native_reply_context(self):
+        adapter, session = _media_adapter()
+        thread = ThreadImpl(_ThreadImplConfig(id=THREAD_ID, adapter=adapter, state_adapter=create_mock_state()))
+
+        sent = await thread.reply("wamid.original", "Hello there")
+
+        (body,) = session.message_bodies()
+        assert body["context"] == {"message_id": "wamid.original"}
+        assert sent.id == "wamid.msg1"
+
+
+# =============================================================================
+# Tests — download_media (port of describe("downloadMedia"))
+# =============================================================================
+
+_UNTRUSTED_MEDIA = "Refusing to send the access token to an untrusted media URL"
+
+
+def _graph_example_adapter(*responses: _FakeGraphResponse) -> tuple[WhatsAppAdapter, _FakeGraphSession]:
+    """Adapter whose Graph API origin is ``https://graph.example``.
+
+    Upstream configures this with ``apiUrl``; the Python config has no
+    ``api_url`` option, so the derived Graph URL is set directly.
+    """
+    adapter, session = _adapter_with_session(*responses)
+    adapter._graph_api_url = "https://graph.example/v25.0"
+    return adapter, session
+
+
+class TestDownloadMedia:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://attacker.example/media",
+            "http://lookaside.fbsbx.com/whatsapp/media",
+            "https://evilfbsbx.com/whatsapp/media",
+            "https://lookaside.fbsbx.com.attacker.example/whatsapp/media",
+            "https://lookaside.fbsbx.com:8443/whatsapp/media",
+        ],
+    )
+    async def test_rejects_untrusted_media_url(self, url: str):
+        adapter, session = _adapter_with_session(_json_response({"url": url}))
+        transport = FakeFileTransport(FakeFileResponse(b"leaked"))
+
+        with pytest.raises(NetworkError, match=_UNTRUSTED_MEDIA):
+            await adapter.download_media("media-123", transport)
+        assert len(session.calls) == 1
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        ["https://lookaside.fbsbx.com/whatsapp/media", "https://scontent.xx.fbcdn.net/whatsapp/media"],
+    )
+    async def test_downloads_media_from_trusted_meta_url(self, url: str):
+        adapter, session = _adapter_with_session(_json_response({"url": url}))
+        transport = FakeFileTransport(FakeFileResponse(b"media"))
+
+        data = await adapter.download_media("media-123", transport)
+
+        assert data == b"media"
+        assert len(session.calls) == 1
+        assert [hop for hop, _ in transport.calls] == [url]
+        assert transport.authorizations == ["Bearer test-token"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "location", ["https://sub.graph.example/media/file", "https://graph.example:8443/media/file"]
+    )
+    async def test_refuses_to_send_the_token_to_off_policy_redirect(self, location: str):
+        adapter, _ = _graph_example_adapter(_json_response({"url": "https://graph.example/media/file"}))
+        transport = FakeFileTransport(FakeFileResponse(b"", status=302, headers={"location": location}))
+
+        with pytest.raises(NetworkError, match=_UNTRUSTED_MEDIA):
+            await adapter.download_media("media-123", transport)
+        assert len(transport.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_downloads_media_from_the_configured_graph_origin(self):
+        adapter, _ = _graph_example_adapter(_json_response({"url": "https://graph.example/media/file"}))
+        transport = FakeFileTransport(FakeFileResponse(b"media"))
+
+        await adapter.download_media("media-123", transport)
+
+        assert [hop for hop, _ in transport.calls] == ["https://graph.example/media/file"]
+        assert transport.authorizations == ["Bearer test-token"]
+
+
+class TestDownloadMediaPythonSpecific:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://mmg.whatsapp.net/media",
+            "https://whatsapp.com/media",
+            "https://www.facebook.com/media",
+            # The Graph hostname on another port is not the Graph origin.
+            "https://graph.facebook.com:8443/media",
+        ],
+    )
+    async def test_hosts_outside_upstream_policy_are_refused(self, url: str):
+        # The pre-#239 Python allowlist also trusted facebook.com and
+        # whatsapp.{net,com}; upstream's policy is fbcdn.net / fbsbx.com plus
+        # the exact Graph origin.
+        adapter, _ = _adapter_with_session(_json_response({"url": url}))
+        transport = FakeFileTransport(FakeFileResponse(b"leaked"))
+
+        with pytest.raises(NetworkError, match=_UNTRUSTED_MEDIA):
+            await adapter.download_media("media-123", transport)
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [{}, {"url": None}, {"url": 42}, []])
+    async def test_missing_or_non_string_media_url_is_refused(self, payload: Any):
+        adapter, _ = _adapter_with_session(_json_response(payload))
+        transport = FakeFileTransport(FakeFileResponse(b"leaked"))
+
+        with pytest.raises(NetworkError, match=_UNTRUSTED_MEDIA):
+            await adapter.download_media("media-123", transport)
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    async def test_token_follows_a_redirect_between_policy_hosts(self):
+        adapter, _ = _adapter_with_session(_json_response({"url": "https://graph.facebook.com/v25.0/media/file"}))
+        transport = FakeFileTransport(
+            FakeFileResponse(b"", status=302, headers={"location": "https://lookaside.fbsbx.com/media"}),
+            FakeFileResponse(b"media"),
+        )
+
+        assert await adapter.download_media("media-123", transport) == b"media"
+        assert [hop for hop, _ in transport.calls] == [
+            "https://graph.facebook.com/v25.0/media/file",
+            "https://lookaside.fbsbx.com/media",
+        ]
+        assert transport.authorizations == ["Bearer test-token", "Bearer test-token"]
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_a_foreign_host_is_refused_by_the_host_allowlist(self):
+        # The shared downloader's ``hosts=`` allowlist refuses a foreign hop
+        # before ``headers_for`` runs, so the downloader's own message (not
+        # the media-policy one) surfaces and the token is sent only once.
+        adapter, _ = _adapter_with_session(_json_response({"url": "https://lookaside.fbsbx.com/media"}))
+        transport = FakeFileTransport(
+            FakeFileResponse(b"", status=302, headers={"location": "https://attacker.example/x"}),
+        )
+
+        with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
+            await adapter.download_media("media-123", transport)
+        assert len(transport.calls) == 1
+        assert transport.authorizations == ["Bearer test-token"]
+
+    @pytest.mark.asyncio
+    async def test_non_network_failures_are_wrapped(self):
+        cause = RuntimeError("socket closed")
+
+        async def failing(url: str, headers: dict[str, str]) -> Any:
+            raise cause
+
+        adapter, _ = _adapter_with_session(_json_response({"url": "https://lookaside.fbsbx.com/media"}))
+
+        with pytest.raises(NetworkError) as excinfo:
+            await adapter.download_media("media-123", failing)
+        assert str(excinfo.value) == "Failed to download media media-123"
+        assert excinfo.value.adapter == "whatsapp"
+        assert excinfo.value.original_error is cause
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_attachment_takes_the_guarded_path(self, monkeypatch: pytest.MonkeyPatch):
+        adapter, _ = _adapter_with_session(
+            _json_response({"url": "https://lookaside.fbsbx.com/media"}),
+            _json_response({"url": "https://attacker.example/media"}),
+        )
+        transport = FakeFileTransport(FakeFileResponse(b"rehydrated"))
+        monkeypatch.setattr(download_module, "create_transport", lambda _adapter: transport)
+        rehydrated = adapter.rehydrate_attachment(Attachment(type="image", fetch_metadata={"mediaId": "media-1"}))
+        assert rehydrated.fetch_data is not None
+
+        assert await rehydrated.fetch_data() == b"rehydrated"
+        assert transport.authorizations == ["Bearer test-token"]
+        # The same closure refuses an off-policy URL before any request.
+        with pytest.raises(NetworkError, match=_UNTRUSTED_MEDIA):
+            await rehydrated.fetch_data()
+        assert len(transport.calls) == 1

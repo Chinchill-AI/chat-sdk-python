@@ -50,6 +50,7 @@ from chat_sdk.adapters.telegram.types import (
     TelegramMessageReactionUpdated,
     TelegramRawMessage,
     TelegramReactionType,
+    TelegramReplyParameters,
     TelegramStickerFile,
     TelegramThreadId,
     TelegramUpdate,
@@ -124,7 +125,12 @@ TELEGRAM_WEBHOOK_VERIFICATION_ERROR = (
 # Claimed ``update_id`` keys live for 24h — Telegram stops redelivering a
 # failed webhook update well within that window (vercel/chat#799).
 TELEGRAM_WEBHOOK_UPDATE_TTL_MS = 24 * 60 * 60 * 1000
-MESSAGE_ID_PATTERN = re.compile(r"^([^:]+):(\d+)$")
+# Used with ``fullmatch``: upstream's ``/^([^:]+):(\d+)$/`` and
+# ``/^\d+$/`` are ASCII-digit, end-anchored patterns, whereas Python's
+# ``\d`` matches any Unicode digit and ``$`` matches before a trailing
+# newline.
+MESSAGE_ID_PATTERN = re.compile(r"([^:]+):([0-9]+)")
+BARE_MESSAGE_ID_PATTERN = re.compile(r"[0-9]+")
 TELEGRAM_MARKDOWN_PARSE_MODE = "MarkdownV2"
 MESSAGE_SEQUENCE_PATTERN = re.compile(r":(\d+)$")
 # Map a normalized Attachment.type to the Telegram Bot API media method and
@@ -786,6 +792,13 @@ class TelegramAdapter:
             else os.environ.get("TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS") == "true"
         )
         self._warned_no_verification: bool = False
+        # ``config.mentionOnReply ?? env === "true"`` (vercel/chat#834): an
+        # explicit config value (including False) wins over the env var.
+        self._mention_on_reply: bool = (
+            config.mention_on_reply
+            if config.mention_on_reply is not None
+            else os.environ.get("TELEGRAM_MENTION_ON_REPLY") == "true"
+        )
         # User allowlist (vercel/chat#742): ``allowedUserIds ??
         # TELEGRAM_ALLOWED_USER_IDS.split(",")``, each id stringified and
         # trimmed, empties dropped. An empty result allows everyone (None).
@@ -1941,7 +1954,6 @@ class TelegramAdapter:
                 author=latest_message.author,
                 metadata=latest_message.metadata,
                 attachments=[attachment for message in parsed_messages for attachment in message.attachments],
-                # Telegram parsing populates ``reply_to`` from #228.
                 reply_to=next((message.reply_to for message in parsed_messages if message.reply_to is not None), None),
                 is_mention=any(message.is_mention for message in parsed_messages),
                 links=links or None,
@@ -2251,9 +2263,18 @@ class TelegramAdapter:
         self,
         thread_id: str,
         message: AdapterPostableMessage,
+        *,
+        reply_to_message_id: str | None = None,
     ) -> RawMessage:
-        """Post a message to a Telegram thread."""
+        """Post a message to a Telegram thread.
+
+        With *reply_to_message_id* the message is sent as a native reply to
+        that message (see :meth:`reply`).
+        """
         parsed_thread = self._resolve_thread_id(thread_id)
+        # Resolve the reply target once so a malformed id fails before any
+        # rendering or attachment downloads, and every send path threads it.
+        reply_parameters = self._build_reply_parameters(reply_to_message_id, parsed_thread.chat_id)
 
         card = extract_card(message)
         reply_markup = card_to_telegram_inline_keyboard(card) if card else None
@@ -2304,7 +2325,9 @@ class TelegramAdapter:
             file = files[0]
             if not file:
                 raise ValidationError("telegram", "File upload payload is empty")
-            raw_message = await self.send_document(parsed_thread, file, text, plain_text, reply_markup, parse_mode)
+            raw_message = await self.send_document(
+                parsed_thread, file, text, plain_text, reply_markup, parse_mode, reply_parameters
+            )
         elif len(attachments) == 1:
             attachment = attachments[0]
             if not attachment:
@@ -2316,6 +2339,7 @@ class TelegramAdapter:
                 plain_text,
                 reply_markup,
                 parse_mode,
+                reply_parameters,
             )
         else:
             if not text.strip():
@@ -2329,21 +2353,22 @@ class TelegramAdapter:
                     parse_mode,
                     reply_markup,
                     thread_id,
+                    reply_parameters,
                 )
 
             if rich is not None:
                 rich_payload = rich
 
                 async def _send_rich() -> TelegramMessage:
-                    return await self.telegram_fetch(
-                        "sendRichMessage",
-                        {
-                            "chat_id": parsed_thread.chat_id,
-                            "message_thread_id": parsed_thread.message_thread_id,
-                            "rich_message": {"markdown": rich_payload.markdown},
-                            "reply_markup": reply_markup,
-                        },
-                    )
+                    rich_body: dict[str, Any] = {
+                        "chat_id": parsed_thread.chat_id,
+                        "message_thread_id": parsed_thread.message_thread_id,
+                        "rich_message": {"markdown": rich_payload.markdown},
+                        "reply_markup": reply_markup,
+                    }
+                    if reply_parameters is not None:
+                        rich_body["reply_parameters"] = reply_parameters
+                    return await self.telegram_fetch("sendRichMessage", rich_body)
 
                 raw_message = await self.with_telegram_rich_fallback(
                     _send_rich,
@@ -2385,6 +2410,21 @@ class TelegramAdapter:
     ) -> RawMessage:
         """Post a message to a Telegram channel."""
         return await self.post_message(channel_id, message)
+
+    async def reply(
+        self,
+        thread_id: str,
+        message_id: str,
+        message: AdapterPostableMessage,
+    ) -> RawMessage:
+        """Post *message* as a native Telegram reply to *message_id*.
+
+        Port of upstream ``reply`` (vercel/chat#833), the adapter hook behind
+        ``Thread.reply()``. Every Telegram send is a single API call (text is
+        truncated, not split), so ``reply_parameters`` always rides on that
+        one call.
+        """
+        return await self.post_message(thread_id, message, reply_to_message_id=message_id)
 
     async def edit_message(
         self,
@@ -3281,10 +3321,7 @@ class TelegramAdapter:
         text = content.text if content is not None and content.text else apply_telegram_entities(plain_text, entities)
 
         # Determine author -- Telegram uses 'from' key which is a reserved word
-        from_user = cast(
-            "TelegramUser | None",
-            raw.get("from_user") or raw.get("from"),  # type: ignore[call-overload]
-        )
+        from_user = self._message_sender(raw)
         sender_chat = raw.get("sender_chat")
 
         if from_user:
@@ -3302,6 +3339,10 @@ class TelegramAdapter:
             )
 
         edit_date = raw.get("edit_date")
+        # ``raw.reply_to_message ? parse(...) : undefined`` (vercel/chat#802).
+        # The Bot API never nests a further reply inside it, so this recursion
+        # is one level deep.
+        reply_to_message = raw.get("reply_to_message")
 
         # `content?.formatted ?? this.formatConverter.toAst(richMarkdown || text)`:
         # `??` (nullish) for the supplied AST, then `richMarkdown || text` is a
@@ -3324,6 +3365,9 @@ class TelegramAdapter:
                 edited_at=(datetime.fromtimestamp(edit_date, tz=timezone.utc) if edit_date is not None else None),
             ),
             attachments=self.extract_attachments(raw),
+            reply_to=(
+                self.parse_telegram_message(reply_to_message, thread_id) if reply_to_message is not None else None
+            ),
             is_mention=self.is_bot_mentioned(raw, plain_text),
         )
 
@@ -3610,6 +3654,7 @@ class TelegramAdapter:
         plain_text: str,
         reply_markup: TelegramInlineKeyboardMarkup | None = None,
         parse_mode: str | None = None,
+        reply_parameters: TelegramReplyParameters | None = None,
     ) -> TelegramMessage:
         """Send a document (file upload) to Telegram."""
         data = getattr(file, "data", b"")
@@ -3630,6 +3675,7 @@ class TelegramAdapter:
                     resolved_text,
                     reply_markup,
                     resolved_parse_mode,
+                    reply_parameters,
                 ),
             )
 
@@ -3650,12 +3696,14 @@ class TelegramAdapter:
         text: str,
         reply_markup: TelegramInlineKeyboardMarkup | None = None,
         parse_mode: str | None = None,
+        reply_parameters: TelegramReplyParameters | None = None,
     ) -> Any:
         """Build the multipart form body for a ``sendDocument`` call."""
         import aiohttp
 
         form_data = aiohttp.FormData()
         form_data.add_field("chat_id", thread.chat_id)
+        self._append_reply_parameters(form_data, reply_parameters)
 
         if isinstance(thread.message_thread_id, int):
             form_data.add_field("message_thread_id", str(thread.message_thread_id))
@@ -3687,6 +3735,7 @@ class TelegramAdapter:
         plain_text: str,
         reply_markup: TelegramInlineKeyboardMarkup | None = None,
         parse_mode: str | None = None,
+        reply_parameters: TelegramReplyParameters | None = None,
     ) -> TelegramMessage:
         """Send a typed attachment using the Telegram media method for its type.
 
@@ -3724,6 +3773,8 @@ class TelegramAdapter:
                     "chat_id": thread.chat_id,
                     upload["field"]: attachment.url,
                 }
+                if reply_parameters is not None:
+                    payload["reply_parameters"] = reply_parameters
 
                 if isinstance(thread.message_thread_id, int):
                     payload["message_thread_id"] = thread.message_thread_id
@@ -3771,6 +3822,7 @@ class TelegramAdapter:
 
             if reply_markup:
                 form_data.add_field("reply_markup", json.dumps(reply_markup))
+            self._append_reply_parameters(form_data, reply_parameters)
 
             return await self.telegram_fetch(upload["method"], form_data)
 
@@ -3886,6 +3938,33 @@ class TelegramAdapter:
         """Encode a chat ID and message ID into a composite string."""
         return f"{chat_id}:{message_id}"
 
+    def _build_reply_parameters(
+        self,
+        reply_to_message_id: str | None,
+        expected_chat_id: str,
+    ) -> TelegramReplyParameters | None:
+        """Build Bot API ``reply_parameters`` for an optional reply target.
+
+        Port of upstream ``buildReplyParameters`` (vercel/chat#833).
+        ``allow_sending_without_reply`` keeps delivery working when the target
+        was deleted in the meantime: the message arrives unthreaded instead of
+        the send failing. The same applies to a message id that never existed
+        in the chat or lives in another forum topic -- only the chat half of a
+        composite target is validated here.
+        """
+        # Truthy check, as upstream's ``if (!replyToMessageId)``: an empty id
+        # sends unthreaded.
+        if not reply_to_message_id:
+            return None
+        decoded = self.decode_composite_message_id(reply_to_message_id, expected_chat_id)
+        return {"message_id": decoded["message_id"], "allow_sending_without_reply": True}
+
+    @staticmethod
+    def _append_reply_parameters(form_data: Any, reply_parameters: TelegramReplyParameters | None) -> None:
+        """Add ``reply_parameters`` to a multipart body as a JSON string."""
+        if reply_parameters is not None:
+            form_data.add_field("reply_parameters", json.dumps(reply_parameters))
+
     def decode_composite_message_id(
         self,
         message_id: str,
@@ -3895,7 +3974,7 @@ class TelegramAdapter:
 
         Returns a dict with ``chat_id``, ``message_id`` (int), and ``composite_id``.
         """
-        composite_match = MESSAGE_ID_PATTERN.match(message_id)
+        composite_match = MESSAGE_ID_PATTERN.fullmatch(message_id)
 
         if composite_match:
             chat_id = composite_match.group(1)
@@ -3920,19 +3999,13 @@ class TelegramAdapter:
                 f"Telegram message ID must be in <chatId>:<messageId> format, got: {message_id}",
             )
 
-        try:
-            parsed_message_id = int(message_id)
-        except (ValueError, TypeError) as exc:
-            raise ValidationError(
-                "telegram",
-                f"Invalid Telegram message ID: {message_id}",
-            ) from exc
-
-        if not math.isfinite(parsed_message_id):
+        # ``int()`` alone would also accept " 7", "+7" and "1_0".
+        if not BARE_MESSAGE_ID_PATTERN.fullmatch(message_id):
             raise ValidationError(
                 "telegram",
                 f"Invalid Telegram message ID: {message_id}",
             )
+        parsed_message_id = int(message_id)
 
         return {
             "chat_id": expected_chat_id,
@@ -3979,8 +4052,38 @@ class TelegramAdapter:
 
     # -- Mention detection ---------------------------------------------------
 
+    @staticmethod
+    def _message_sender(message: TelegramMessage) -> TelegramUser | None:
+        """The message's ``from`` user (``from_user`` in the TypedDict)."""
+        return cast(
+            "TelegramUser | None",
+            message.get("from_user") or message.get("from"),  # type: ignore[call-overload]
+        )
+
     def is_bot_mentioned(self, message: TelegramMessage, text: str) -> bool:
         """Check if the bot is mentioned in a message."""
+        # Replying to one of the bot's own messages addresses it as directly
+        # as an @mention does (vercel/chat#834). Opt-in, and checked before
+        # the empty-text guard so a reply carrying only a photo or a document
+        # still counts. Two payloads look like a reply to the bot but are not:
+        # - in forum topics every message replies implicitly to the
+        #   topic-creation service message (its message_id equals
+        #   message_thread_id), authored by the bot when the bot created it;
+        # - the Bot API echoes the bot's own outbound replies back in send
+        #   responses, and the bot replying to itself is not a user
+        #   addressing it.
+        replied_to = message.get("reply_to_message")
+        if self._mention_on_reply and self._bot_user_id and replied_to is not None:
+            replied_to_sender = self._message_sender(replied_to)
+            sender = self._message_sender(message)
+            if (
+                replied_to_sender
+                and str(replied_to_sender.get("id", "")) == self._bot_user_id
+                and replied_to.get("message_id") != message.get("message_thread_id")
+                and not (sender and str(sender.get("id", "")) == self._bot_user_id)
+            ):
+                return True
+
         if not text:
             return False
 
@@ -4210,6 +4313,7 @@ class TelegramAdapter:
         parse_mode: str | None,
         reply_markup: TelegramInlineKeyboardMarkup | None,
         thread_id: str,
+        reply_parameters: TelegramReplyParameters | None = None,
     ) -> TelegramMessage:
         """Send a non-rich message via ``sendMessage`` with markdown fallback.
 
@@ -4220,16 +4324,16 @@ class TelegramAdapter:
         """
 
         async def _send_message(resolved_parse_mode: str | None, resolved_text: str) -> TelegramMessage:
-            return await self.telegram_fetch(
-                "sendMessage",
-                {
-                    "chat_id": thread.chat_id,
-                    "message_thread_id": thread.message_thread_id,
-                    "text": resolved_text,
-                    "reply_markup": reply_markup,
-                    "parse_mode": resolved_parse_mode,
-                },
-            )
+            body: dict[str, Any] = {
+                "chat_id": thread.chat_id,
+                "message_thread_id": thread.message_thread_id,
+                "text": resolved_text,
+                "reply_markup": reply_markup,
+                "parse_mode": resolved_parse_mode,
+            }
+            if reply_parameters is not None:
+                body["reply_parameters"] = reply_parameters
+            return await self.telegram_fetch("sendMessage", body)
 
         return await self.with_telegram_markdown_fallback(
             parse_mode,
@@ -4250,7 +4354,8 @@ class TelegramAdapter:
         * a ``ResourceNotFoundError`` raised by a ``sendRichMessage*`` call
           (the 404 ``method not found``); OR
         * a :class:`ValidationError` whose message contains ``can't parse``,
-          or ``method`` + ``not found``, or ``rich message`` + ``unsupported``.
+          or ``method`` + ``not found``, or ``rich message`` + ``unsupported``,
+          or ``reply_parameters`` (a gateway that rejects reply targets).
 
         Distinct from :meth:`remember_rich_message_failure`, which decides the
         *narrower* set that additionally latches rich off permanently. A
@@ -4259,10 +4364,17 @@ class TelegramAdapter:
         message = str(error).lower() if isinstance(error, ValidationError) else ""
         missing_method = "method" in message and "not found" in message
         unsupported_rich = "rich message" in message and "unsupported" in message
+        # A gateway that predates reply support may reject the extra
+        # ``reply_parameters`` field; degrade to a regular send, which threads
+        # it (vercel/chat#833).
+        rejected_reply_parameters = "reply_parameters" in message
 
         return bool(
             (method.startswith("sendRichMessage") and isinstance(error, ResourceNotFoundError))
-            or (isinstance(error, ValidationError) and ("can't parse" in message or missing_method or unsupported_rich))
+            or (
+                isinstance(error, ValidationError)
+                and ("can't parse" in message or missing_method or unsupported_rich or rejected_reply_parameters)
+            )
         )
 
     def remember_rich_message_failure(self, error: object, method: str) -> None:
