@@ -5858,6 +5858,11 @@ class SlackAdapter:
             # Short replies can buffer every delta in the streamer, making
             # stop() the FIRST real API call; on an unsupported workspace the
             # failure lands here, so the fallback must engage here too.
+            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6471-6484):
+            # stop() makes chat.startStream then chat.stopStream in both SDKs,
+            # and upstream also falls back on ``!nativeRendered`` without
+            # checking whether startStream succeeded before stopStream failed
+            # (it deliberately avoids the streamer's ``ts`` accessor).
             switch_to_fallback(exc)
             await flush_fallback(True)
             return finish_fallback()
