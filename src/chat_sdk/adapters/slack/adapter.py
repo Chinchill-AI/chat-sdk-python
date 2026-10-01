@@ -22,7 +22,7 @@ import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs
@@ -49,7 +49,7 @@ from chat_sdk.adapters.slack.crypto import (
     encrypt_token,
     is_encrypted_token_data,
 )
-from chat_sdk.adapters.slack.format import escape_slack_text
+from chat_sdk.adapters.slack.format import escape_slack_text, unescape_slack_text
 from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
 from chat_sdk.adapters.slack.modals import (
     ModalMetadata,
@@ -76,6 +76,7 @@ from chat_sdk.adapters.slack.webhook import (
     read_slack_request_body,
     verify_slack_request,
 )
+from chat_sdk.cards import _js_number_to_string
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
@@ -100,6 +101,7 @@ from chat_sdk.shared.errors import (
     ValidationError,
 )
 from chat_sdk.shared.log_utils import utf8_byte_length
+from chat_sdk.shared.markdown_parser import Content, ast_to_plain_text
 from chat_sdk.shared.mentions import mask_code_spans, replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
@@ -345,17 +347,6 @@ def _json_stringify(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-def _find_next_mention(text: str) -> int:
-    """Find the next ``<@`` or ``<#`` mention in *text*."""
-    at_idx = text.find("<@")
-    hash_idx = text.find("<#")
-    if at_idx == -1:
-        return hash_idx
-    if hash_idx == -1:
-        return at_idx
-    return min(at_idx, hash_idx)
-
-
 def _bot_profile_user_id(event: dict[str, Any]) -> str | None:
     """``event.bot_profile?.user_id`` -- the bot's user (``U…``) id, if any."""
     profile = event.get("bot_profile")
@@ -488,9 +479,10 @@ def _classify_blocks_mention(blocks: list[Any], matcher: _MentionMatcher) -> _Me
 class _AttachmentPart:
     """One piece of legacy attachment text (upstream ``SlackAttachmentPart``).
 
-    ``mrkdwn`` parts are mrkdwn (formatting characters are markup);
-    literal parts render as plain text where only Slack control sequences
-    (``<@U…>``, ``<url|label>``, entity escapes) are honored.
+    ``mrkdwn`` parts go through the format converter (formatting characters
+    are markup); literal parts render as plain text where only Slack control
+    sequences (``<@U…>``, ``<url|label>``, entity escapes) are honored, so
+    literal ``*``/``_``/backticks survive.
     """
 
     text: str
@@ -498,16 +490,232 @@ class _AttachmentPart:
 
 
 @dataclass(frozen=True)
-class _AttachmentContent:
-    """Mention-relevant content of one attachment.
+class _TableData:
+    """A table extracted from a Slack table block, one mrkdwn string per cell.
 
-    Minimal port of upstream ``attachmentContent``: ``blocks`` (when present,
-    Slack renders only the blocks) and the legacy ``parts``. Table rendering
-    (#210) extends this.
+    ``headerless`` is true when the source rows carry no header styling. GFM
+    tables always render their first row as a header, so headerless tables
+    get an empty header row prepended instead of promoting the first data
+    row. Upstream ``SlackTableData``.
+    """
+
+    headerless: bool
+    rows: list[list[str]]
+
+
+@dataclass(frozen=True)
+class _EventTables:
+    """The message's own tables, split by position (upstream ``SlackEventTables``).
+
+    ``leading`` tables appear before any other block and render above the
+    text; ``trailing`` holds all the rest and renders below it.
+    """
+
+    leading: list[_TableData]
+    trailing: list[_TableData]
+
+
+@dataclass(frozen=True)
+class _AttachmentContent:
+    """Renderable content of one attachment (upstream ``SlackAttachmentContent``).
+
+    ``blocks`` is the structured content (when present, Slack renders only
+    the blocks), ``parts`` the legacy text parts and ``tables`` the tables
+    extracted from the blocks.
     """
 
     blocks: list[Any]
     parts: list[_AttachmentPart]
+    tables: list[_TableData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _MentionNames:
+    """Resolved display names for mention tokens (upstream ``SlackMentionNames``)."""
+
+    users: dict[str, str] = field(default_factory=dict)
+    channels: dict[str, str] = field(default_factory=dict)
+
+
+_TABLE_BLOCK_TYPES = frozenset({"table", "data_table"})
+_HTTP_URL_PREFIX_PATTERN = re.compile(r"^https?://")
+
+
+def _str(value: Any) -> str | None:
+    """``value`` when it is a string (upstream ``str``)."""
+    return value if isinstance(value, str) else None
+
+
+def _block_text_leaf(value: Any) -> str | list[Any]:
+    """Render one table-cell element, or return the child list to flatten.
+
+    Returns the element's mrkdwn string, or its ``elements`` list when the
+    element is a container whose text is the join of its children (see
+    :func:`_block_text`). Mirrors upstream ``blocktext`` case by case.
+    """
+    if not (isinstance(value, dict) and isinstance(value.get("type"), str)):
+        return ""
+
+    value_type = value["type"]
+    text = _str(value.get("text"))
+    if value_type == "raw_text":
+        # A raw_text cell is plain text: Slack reserves mentions and links for
+        # rich_text cells, so its control characters render literally. Kept
+        # aligned with ``_classify_blocks_mention``, which does not scan it.
+        # Upstream parity (adapter-slack/src/index.ts:722-726, 7106-7124): only
+        # ``&``/``<``/``>`` are escaped and the cell then goes through the
+        # mrkdwn converter, so ``*``/``_``/``---`` in a raw cell still read as
+        # formatting there too.
+        return escape_slack_text(text or "")
+    if value_type == "link":
+        url = _str(value.get("url"))
+        if not url:
+            return text or ""
+        return f"<{url}|{text}>" if text else f"<{url}>"
+    if value_type == "emoji":
+        name = _str(value.get("name"))
+        return f":{name}:" if name else ""
+    if value_type == "user":
+        user_id = _str(value.get("user_id"))
+        return f"<@{user_id}>" if user_id else ""
+    if value_type == "broadcast":
+        broadcast_range = _str(value.get("range"))
+        return f"@{broadcast_range}" if broadcast_range else ""
+    if value_type == "channel":
+        channel_id = _str(value.get("channel_id"))
+        return f"<#{channel_id}>" if channel_id else ""
+    if value_type == "usergroup":
+        usergroup_id = _str(value.get("usergroup_id"))
+        return f"<!subteam^{usergroup_id}>" if usergroup_id else ""
+    if value_type == "date":
+        fallback = _str(value.get("fallback"))
+        if fallback:
+            return fallback
+        # Format the timestamp rather than leaking the raw format template
+        # (e.g. "{date_num}") when Slack omits the fallback. UTC, like JS
+        # ``toISOString()``; never a naive local date.
+        timestamp = value.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            try:
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                # Outside ``datetime``'s range (upstream ``toISOString`` throws).
+                return ""
+        return ""
+    if value_type == "color":
+        return _str(value.get("value")) or ""
+    if value_type == "team":
+        return _str(value.get("team_id")) or ""
+
+    if text is not None:
+        return text
+    for key in ("label", "url", "file_id"):
+        fallback = _str(value.get(key))
+        if fallback is not None:
+            return fallback
+    # Raw value cells (raw_number, raw_date, raw_currency, raw_percent,
+    # raw_boolean, …) carry a primitive value when text is absent. ``0``,
+    # ``False`` and ``""`` are values, so test the type, never truthiness;
+    # numbers and booleans format like JS ``String()``.
+    raw_value = value.get("value")
+    if isinstance(raw_value, str):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return _js_number_to_string(raw_value)
+    elements = value.get("elements")
+    return elements if isinstance(elements, list) else ""
+
+
+def _block_text(value: Any) -> str:
+    """Flatten a table cell (or any rich text element in one) to mrkdwn.
+
+    Port of upstream ``blocktext``. Mentions, channels and links are emitted
+    as mrkdwn tokens so the format converter renders them the same way it
+    renders body text. Children of ``rich_text`` / ``rich_text_list`` join
+    with ``\\n``; every other container's children join directly.
+
+    Walks with an explicit stack instead of recursing, so a deeply nested
+    cell cannot raise ``RecursionError`` and drop the whole message (the
+    same choice ``_classify_blocks_mention`` makes).
+    """
+    # One frame per open container: its separator and rendered children.
+    frames: list[tuple[str, list[str]]] = [("", [])]
+    work: list[tuple[bool, Any]] = [(False, value)]
+    while work:
+        closing, item = work.pop()
+        if closing:
+            separator, parts = frames.pop()
+            frames[-1][1].append(separator.join(parts))
+            continue
+        rendered = _block_text_leaf(item)
+        if isinstance(rendered, str):
+            frames[-1][1].append(rendered)
+            continue
+        frames.append(("\n" if item["type"] in ("rich_text", "rich_text_list") else "", []))
+        work.append((True, None))
+        work.extend((False, child) for child in reversed(rendered))
+    return "".join(frames[0][1])
+
+
+def _has_bold_text(value: Any) -> bool:
+    """Whether any element in *value* is styled bold (upstream ``hasBoldText``)."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, dict):
+            continue
+        style = item.get("style")
+        if isinstance(style, dict) and style.get("bold") is True:
+            return True
+        elements = item.get("elements")
+        if isinstance(elements, list):
+            stack.extend(elements)
+    return False
+
+
+def _table_data(block: Any) -> _TableData | None:
+    """Parse a ``table`` / ``data_table`` block (upstream ``tableData``)."""
+    if not (isinstance(block, dict) and block.get("type") in _TABLE_BLOCK_TYPES):
+        return None
+    rows = block.get("rows")
+    if not isinstance(rows, list):
+        return None
+
+    source_rows = [row for row in rows if isinstance(row, list) and row]
+    if not source_rows:
+        return None
+
+    # data_table rows always start with a header row (the outbound renderer
+    # relies on this); pasted ``table`` blocks mark headers only via bold
+    # cell styling.
+    headerless = block["type"] == "table" and not any(_has_bold_text(cell) for cell in source_rows[0])
+    return _TableData(headerless=headerless, rows=[[_block_text(cell) for cell in row] for row in source_rows])
+
+
+def _tables_in(blocks: list[Any]) -> list[_TableData]:
+    """The tables parsed from *blocks*, in order, skipping malformed ones."""
+    return [data for data in (_table_data(block) for block in blocks) if data is not None]
+
+
+def _event_tables(event: dict[str, Any]) -> _EventTables:
+    """Collect table blocks from the message's own blocks, split by position.
+
+    Slack flattens all rich text into ``event["text"]``, so exact
+    interleaving can't be reconstructed; tables pasted above the text at
+    least stay above it. Attachment tables are handled per attachment (see
+    :func:`_attachment_content`) so they stay next to their text.
+    """
+    raw_blocks = event.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    split_idx = next(
+        (
+            idx
+            for idx, block in enumerate(blocks)
+            if not (isinstance(block, dict) and block.get("type") in _TABLE_BLOCK_TYPES)
+        ),
+        len(blocks),
+    )
+    return _EventTables(leading=_tables_in(blocks[:split_idx]), trailing=_tables_in(blocks[split_idx:]))
 
 
 def _is_foreign_attachment(attachment: dict[str, Any]) -> bool:
@@ -521,7 +729,12 @@ def _is_foreign_attachment(attachment: dict[str, Any]) -> bool:
 
 
 def _author_attachments(event: dict[str, Any]) -> list[dict[str, Any]]:
-    """Attachments authored by the message sender, in order (unfurls excluded)."""
+    """Attachments authored by the message sender, in order.
+
+    Unfurls are excluded everywhere author attachments are read -- content,
+    tables, mention classification and links alike -- because their content
+    is not the author's.
+    """
     attachments = event.get("attachments")
     if not isinstance(attachments, list):
         return []
@@ -529,21 +742,24 @@ def _author_attachments(event: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _attachment_content(attachment: dict[str, Any]) -> _AttachmentContent:
-    """Blocks and legacy parts of an attachment (upstream ``attachmentContent``).
+    """Content of a legacy attachment (upstream ``attachmentContent``).
 
-    Slack renders ``pretext``/``text``/``fields`` as plain text unless they
-    are named in ``mrkdwn_in``; ``title`` is always plain text and links to
-    ``title_link``. ``fallback`` fills in only when nothing else renders.
+    Alerting integrations (Sentry, PagerDuty, GitHub) put the real payload in
+    ``pretext``/``title``/``text``/``fields``. Slack renders those as plain
+    text unless they are named in ``mrkdwn_in``; ``title`` is always plain
+    text and links to ``title_link``.
 
-    Upstream builds the parts whenever the attachment has no table blocks
-    (``tables.length === 0``). Tables are not extracted yet (#210), so that
-    gate is always open here and the parts are built even beside blocks;
-    ``_detect_self_mention`` ignores the parts of an attachment with blocks,
-    as upstream does.
+    When the attachment carries table blocks, Slack renders only the blocks
+    and ignores the legacy fields, so no parts are built. Block types that
+    can't be rendered fall back to the legacy fields, and ``fallback`` fills
+    in last, only when nothing else renders.
     """
     raw_blocks = attachment.get("blocks")
     blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    tables = _tables_in(blocks)
     parts: list[_AttachmentPart] = []
+    if tables:
+        return _AttachmentContent(blocks=blocks, parts=parts, tables=tables)
 
     raw_mrkdwn_in = attachment.get("mrkdwn_in")
     # Only string entries name fields (``set()`` of a dict entry would raise).
@@ -559,23 +775,164 @@ def _attachment_content(attachment: dict[str, Any]) -> _AttachmentContent:
     title = raw_title.strip(JS_WHITESPACE) if isinstance(raw_title, str) else ""
     title_link = attachment.get("title_link")
     if isinstance(title_link, str) and title_link:
+        # Fold the link in as a control sequence so the title renders as a
+        # link node and the URL survives into the normalized message.
         push(f"<{title_link}|{escape_slack_text(title)}>" if title else f"<{title_link}>", False)
     else:
         push(title, False)
     push(attachment.get("text"), "text" in mrkdwn_in)
     fields = attachment.get("fields")
-    for field in fields if isinstance(fields, list) else []:
-        if not isinstance(field, dict):
+    for entry in fields if isinstance(fields, list) else []:
+        if not isinstance(entry, dict):
             continue
-        raw_field_title = field.get("title")
-        raw_value = field.get("value")
+        raw_field_title = entry.get("title")
+        raw_value = entry.get("value")
         field_title = raw_field_title.strip(JS_WHITESPACE) if isinstance(raw_field_title, str) else ""
         value = raw_value.strip(JS_WHITESPACE) if isinstance(raw_value, str) else ""
         push(f"{field_title}: {value}" if field_title and value else field_title or value, "fields" in mrkdwn_in)
 
     if not parts:
         push(attachment.get("fallback"), False)
-    return _AttachmentContent(blocks=blocks, parts=parts)
+    return _AttachmentContent(blocks=blocks, parts=parts, tables=tables)
+
+
+def _collect_mention_ids(text: str, user_ids: set[str], channel_ids: set[str]) -> None:
+    """Collect the user and channel ids referenced by ``<@U…>`` / ``<#C…>`` tokens.
+
+    Upstream ``collectMentionIds``. Parses by splitting on ``<`` (no regex
+    over user text, so no ReDoS).
+    """
+    for segment in text.split("<"):
+        end = segment.find(">")
+        if end == -1:
+            continue
+        inner = segment[:end]
+        if inner.startswith("@"):
+            rest = inner[1:]
+            pipe_idx = rest.find("|")
+            uid = rest[:pipe_idx] if pipe_idx >= 0 else rest
+            if SLACK_USER_ID_PATTERN.fullmatch(uid):
+                user_ids.add(uid)
+        elif inner.startswith("#"):
+            rest = inner[1:]
+            # Only collect bare channel ids (no label already present)
+            if "|" not in rest and SLACK_USER_ID_PATTERN.fullmatch(rest):
+                channel_ids.add(rest)
+
+
+def _apply_mention_names(text: str, names: _MentionNames) -> str:
+    """Replace ``<@U123>``, ``<@U123|old>`` and ``<#C123>`` with resolved names.
+
+    Upstream ``applyMentionNames``. Tokens without a resolved name are left
+    untouched. Scans with ``str.find`` (no regex over user text, so no ReDoS).
+    Upstream re-slices the remaining text per token, which is quadratic with
+    Python's copying slices; this walks indices instead, with the same output.
+    """
+    if not names.users and not names.channels:
+        return text
+
+    out: list[str] = []
+    pos = 0
+    next_at = text.find("<@")
+    next_hash = text.find("<#")
+    while True:
+        if next_at != -1 and next_at < pos:
+            next_at = text.find("<@", pos)
+        if next_hash != -1 and next_hash < pos:
+            next_hash = text.find("<#", pos)
+        start = max(next_at, next_hash) if next_at == -1 or next_hash == -1 else min(next_at, next_hash)
+        if start == -1:
+            break
+        end = text.find(">", start)
+        if end == -1:
+            break
+        out.append(text[pos:start])
+        prefix = text[start + 1]  # '@' or '#'
+        inner = text[start + 2 : end]
+        pipe_idx = inner.find("|")
+        id_str = inner[:pipe_idx] if pipe_idx >= 0 else inner
+        token = text[start : end + 1]
+        if prefix == "@" and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            name = names.users.get(id_str)
+            out.append(f"<@{id_str}|{name}>" if name else token)
+        elif prefix == "#" and pipe_idx == -1 and id_str in names.channels:
+            out.append(f"<#{id_str}|{names.channels[id_str]}>")
+        else:
+            out.append(token)
+        pos = end + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _content_mention_ids(
+    tables: _EventTables,
+    attachments: list[_AttachmentContent],
+) -> tuple[set[str], set[str]]:
+    """``(user_ids, channel_ids)`` across table cells and attachment parts.
+
+    Upstream ``mentionIds``.
+    """
+    user_ids: set[str] = set()
+    channel_ids: set[str] = set()
+    all_tables = [*tables.leading, *tables.trailing]
+    for attachment in attachments:
+        all_tables.extend(attachment.tables)
+        for part in attachment.parts:
+            _collect_mention_ids(part.text, user_ids, channel_ids)
+    for data in all_tables:
+        for row in data.rows:
+            for cell in row:
+                _collect_mention_ids(cell, user_ids, channel_ids)
+    return user_ids, channel_ids
+
+
+def _literal_phrasing(line: str) -> list[Content]:
+    """Render one line of plain-text Slack content to phrasing nodes.
+
+    Upstream ``literalPhrasing``. Control sequences are honored the way the
+    mrkdwn converter renders them (``<@U…|name>`` -> ``@name``,
+    ``<url|label>`` -> link), but nothing is parsed as markdown, so
+    formatting characters stay literal.
+    """
+    children: list[Content] = []
+    plain: list[str] = []
+
+    def flush_plain() -> None:
+        value = "".join(plain)
+        if value:
+            children.append({"type": "text", "value": unescape_slack_text(value)})
+        plain.clear()
+
+    # Index walk rather than upstream's per-token re-slicing (quadratic with
+    # Python's copying slices); same output.
+    pos = 0
+    while pos < len(line):
+        start = line.find("<", pos)
+        end = -1 if start == -1 else line.find(">", start + 1)
+        if end == -1:
+            plain.append(line[pos:])
+            break
+        plain.append(line[pos:start])
+        token = line[start : end + 1]
+        inner = line[start + 1 : end]
+        pos = end + 1
+
+        pipe_idx = inner.find("|")
+        target = inner if pipe_idx == -1 else inner[:pipe_idx]
+        label = None if pipe_idx == -1 else inner[pipe_idx + 1 :]
+        id_str = target[1:]
+        if target.startswith("@") and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            plain.append(f"@{label if label is not None else id_str}")
+        elif target.startswith("#") and SLACK_USER_ID_PATTERN.fullmatch(id_str):
+            plain.append(f"#{label} ({id_str})" if label else f"#{id_str}")
+        elif _HTTP_URL_PREFIX_PATTERN.match(target):
+            flush_plain()
+            link_text = unescape_slack_text(label) if label else target
+            children.append({"type": "link", "url": target, "children": [{"type": "text", "value": link_text}]})
+        else:
+            plain.append(token)
+    flush_plain()
+    return children
 
 
 # Slack platform errors meaning the workspace will never accept the native
@@ -3675,61 +4032,25 @@ class SlackAdapter:
         """
         user_ids: set[str] = set()
         channel_ids: set[str] = set()
+        _collect_mention_ids(text, user_ids, channel_ids)
+        names = await self._lookup_mention_names(user_ids, channel_ids)
+        return _apply_mention_names(text, names)
 
-        for segment in text.split("<"):
-            end = segment.find(">")
-            if end == -1:
-                continue
-            inner = segment[:end]
-            if inner.startswith("@"):
-                rest = inner[1:]
-                pipe_idx = rest.find("|")
-                uid = rest[:pipe_idx] if pipe_idx >= 0 else rest
-                if SLACK_USER_ID_PATTERN.match(uid):
-                    user_ids.add(uid)
-            elif inner.startswith("#"):
-                rest = inner[1:]
-                pipe_idx = rest.find("|")
-                if pipe_idx == -1 and SLACK_USER_ID_PATTERN.match(rest):
-                    channel_ids.add(rest)
-
+    async def _lookup_mention_names(self, user_ids: set[str], channel_ids: set[str]) -> _MentionNames:
+        """Look up display names for collected mention ids in one parallel wave."""
         if not user_ids and not channel_ids:
-            return text
+            return _MentionNames()
 
-        # Look up all mentioned users and channels in parallel
+        users = list(user_ids)
+        channels = list(channel_ids)
         user_lookups, channel_lookups = await asyncio.gather(
-            asyncio.gather(*(self._lookup_user_name(uid) for uid in user_ids)),
-            asyncio.gather(*(self._lookup_channel_name(cid) for cid in channel_ids)),
+            asyncio.gather(*(self._lookup_user_name(uid) for uid in users)),
+            asyncio.gather(*(self._lookup_channel_name(cid) for cid in channels)),
         )
-
-        user_name_map = dict(zip(user_ids, user_lookups, strict=False))
-        channel_name_map = dict(zip(channel_ids, channel_lookups, strict=False))
-
-        # Replace mentions using split-based approach (no ReDoS)
-        result = ""
-        remaining = text
-        start_idx = _find_next_mention(remaining)
-        while start_idx != -1:
-            result += remaining[:start_idx]
-            remaining = remaining[start_idx:]
-            end_idx = remaining.find(">")
-            if end_idx == -1:
-                break
-            prefix = remaining[1]  # '@' or '#'
-            inner = remaining[2:end_idx]
-            pipe_idx = inner.find("|")
-            id_str = inner[:pipe_idx] if pipe_idx >= 0 else inner
-            if prefix == "@" and SLACK_USER_ID_PATTERN.match(id_str):
-                name = user_name_map.get(id_str)
-                result += f"<@{id_str}|{name}>" if name else f"<@{id_str}>"
-            elif prefix == "#" and pipe_idx == -1 and id_str in channel_name_map:
-                name = channel_name_map[id_str]
-                result += f"<#{id_str}|{name}>"
-            else:
-                result += remaining[: end_idx + 1]
-            remaining = remaining[end_idx + 1 :]
-            start_idx = _find_next_mention(remaining)
-        return result + remaining
+        return _MentionNames(
+            users=dict(zip(users, user_lookups, strict=True)),
+            channels=dict(zip(channels, channel_lookups, strict=True)),
+        )
 
     async def _lookup_user_name(self, user_id: str) -> str:
         """Look up a user's display name (helper for parallel resolution)."""
@@ -3857,6 +4178,18 @@ class SlackAdapter:
                     "site_name": att.get("service_name"),
                 }
                 urls.add(att_url)
+            # Alert attachments link their title (e.g. the Sentry issue URL);
+            # surface it so handlers can reach what the Slack UI links to.
+            # Upstream parity (adapter-slack/src/index.ts:4466-4470): the
+            # preview carries no title, so on a webhook ``_enrich_links`` may
+            # wait for an unfurl like it does for any untitled link. Fetched
+            # (history) messages wait too, but only because of the Python
+            # ``_unfurl_channel_for`` fallback (upstream returns at once there,
+            # index.ts:4704); that applies to every untitled link and is
+            # tracked with that divergence in docs/UPSTREAM_SYNC.md (#292).
+            title_link = att.get("title_link")
+            if isinstance(title_link, str) and title_link and not _is_foreign_attachment(att):
+                urls.add(title_link)
 
         previews: list[LinkPreview] = []
         for url in urls:
@@ -4325,8 +4658,11 @@ class SlackAdapter:
         attachments = [_attachment_content(a) for a in _author_attachments(event)]
         is_mention = self._detect_self_mention(event, raw_text, attachments)
 
-        # Resolve inline @mentions (the bot's own included) to display names.
+        # Resolve inline @mentions (the bot's own included) to display names,
+        # then fold in tables and attachment content (their mentions resolve
+        # in one more lookup wave).
         text = await self._resolve_inline_mentions(raw_text)
+        formatted, plain_text = await self._resolved_content(event, text, attachments)
         author_id, is_system = self._author_fields(event)
 
         ts_str = event.get("ts", "0")
@@ -4345,8 +4681,8 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=self._format_converter.extract_plain_text(text),
-            formatted=self._format_converter.to_ast(text),
+            text=plain_text,
+            formatted=formatted,
             raw=event,
             is_mention=is_mention,
             author=Author(
@@ -4411,6 +4747,7 @@ class SlackAdapter:
         # Classified the same way as the async path, so an edit's pre-edit
         # snapshot cannot disagree with the edited message about it.
         is_mention = self._detect_self_mention(event, text, attachments)
+        formatted, plain_text = self._content(event, text, attachments)
         author_id, is_system = self._author_fields(event)
         user_name = event.get("username") or event.get("user") or "unknown"
         full_name = event.get("username") or event.get("user") or "unknown"
@@ -4431,8 +4768,8 @@ class SlackAdapter:
         return Message(
             id=event.get("ts", ""),
             thread_id=thread_id,
-            text=self._format_converter.extract_plain_text(text),
-            formatted=self._format_converter.to_ast(text),
+            text=plain_text,
+            formatted=formatted,
             raw=event,
             is_mention=is_mention,
             author=Author(
@@ -4454,6 +4791,179 @@ class SlackAdapter:
             ],
             links=self._extract_links(event),
         )
+
+    # ==================================================================
+    # Message content (body, tables, attachments)
+    # ==================================================================
+
+    def _content(
+        self,
+        event: dict[str, Any],
+        text: str,
+        attachments: list[_AttachmentContent] | None = None,
+    ) -> tuple[FormattedContent, str]:
+        """The message's AST (body text, its tables and attachment content) and plain text.
+
+        Upstream ``content`` (sync, no mention lookups). See
+        :meth:`_assemble_content` for how the plain text is derived.
+        """
+        if attachments is None:
+            attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        return self._assemble_content(
+            text,
+            _event_tables(event),
+            [node for attachment in attachments for node in self._attachment_nodes(attachment)],
+        )
+
+    async def _resolved_content(
+        self,
+        event: dict[str, Any],
+        text: str,
+        attachments: list[_AttachmentContent] | None = None,
+    ) -> tuple[FormattedContent, str]:
+        """Like :meth:`_content`, resolving mentions in cells and attachments.
+
+        Upstream ``resolvedContent``. User and channel mentions inside table
+        cells and attachment parts resolve the way
+        :meth:`_resolve_inline_mentions` resolves body text. All ids are
+        collected up front and looked up in a single parallel wave, so no id
+        is fetched twice.
+        """
+        if attachments is None:
+            attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        tables = _event_tables(event)
+        user_ids, channel_ids = _content_mention_ids(tables, attachments)
+        names = await self._lookup_mention_names(user_ids, channel_ids)
+
+        def resolve_table(data: _TableData) -> _TableData:
+            rows = [[_apply_mention_names(cell, names) if cell else cell for cell in row] for row in data.rows]
+            return replace(data, rows=rows)
+
+        def resolve_part(part: _AttachmentPart) -> _AttachmentPart:
+            return replace(part, text=_apply_mention_names(part.text, names))
+
+        nodes: list[Content] = []
+        for attachment in attachments:
+            resolved = replace(
+                attachment,
+                parts=[resolve_part(part) for part in attachment.parts],
+                tables=[resolve_table(data) for data in attachment.tables],
+            )
+            nodes.extend(self._attachment_nodes(resolved))
+        return self._assemble_content(
+            text,
+            _EventTables(
+                leading=[resolve_table(data) for data in tables.leading],
+                trailing=[resolve_table(data) for data in tables.trailing],
+            ),
+            nodes,
+        )
+
+    def _assemble_content(
+        self,
+        text: str,
+        tables: _EventTables,
+        attachment_nodes: list[Content],
+    ) -> tuple[FormattedContent, str]:
+        """Body AST with leading tables above it, then trailing tables and attachments.
+
+        Returns ``(formatted, plain_text)``. Upstream derives ``message.text``
+        as ``toPlainText(formatted)``. Until #283 ports upstream's inbound
+        mrkdwn normalization (``slackMrkdwnToMarkdown``), our ``to_ast`` drops
+        code on a fence's opening line (the body ``"```npm test```"`` parses to
+        nothing), so the body's share of the plain text keeps the regex
+        ``extract_plain_text`` used before #210, and only the table and
+        attachment nodes go through ``ast_to_plain_text``. A message without
+        tables or attachments gets exactly the pre-#210 text. Otherwise the
+        pieces are joined with a blank line, skipping empty ones, as
+        ``toPlainText`` joins root children (the body loses trailing
+        whitespace there, as a parsed paragraph would). Temporary divergence:
+        #283 replaces this with ``ast_to_plain_text(formatted)``.
+        """
+        before = [self._table_node(data) for data in tables.leading]
+        after = [*(self._table_node(data) for data in tables.trailing), *attachment_nodes]
+        formatted = self._format_converter.to_ast(text)
+        formatted["children"] = [*before, *formatted.get("children", []), *after]
+        body = self._format_converter.extract_plain_text(text)
+        if not (before or after):
+            return formatted, body
+        pieces = [
+            *(ast_to_plain_text(node) for node in before),
+            body.rstrip(JS_WHITESPACE),
+            *(ast_to_plain_text(node) for node in after),
+        ]
+        return formatted, "\n\n".join(piece for piece in pieces if piece)
+
+    def _attachment_nodes(self, content: _AttachmentContent) -> list[Content]:
+        """Render one attachment's content to block nodes (upstream ``attachmentNodes``).
+
+        Literal lines share a paragraph (separated by hard breaks) so an
+        attachment reads as one block; mrkdwn parts are parsed in isolation so
+        an unclosed code fence in the body or another attachment can't swallow
+        this one's content. Tables from the attachment's blocks follow its
+        text, keeping each attachment's content together.
+        """
+        nodes: list[Content] = []
+        lines: list[list[Content]] = []
+
+        def flush() -> None:
+            if not lines:
+                return
+            children: list[Content] = []
+            for line in lines:
+                if children:
+                    children.append({"type": "break"})
+                children.extend(line)
+            nodes.append({"type": "paragraph", "children": children})
+            lines.clear()
+
+        for part in content.parts:
+            if part.mrkdwn:
+                flush()
+                nodes.extend(self._format_converter.to_ast(part.text).get("children", []))
+                continue
+            for line in part.text.split("\n"):
+                if line.strip(JS_WHITESPACE):
+                    lines.append(_literal_phrasing(line))
+                else:
+                    # A blank line inside a literal part starts a new paragraph
+                    flush()
+        flush()
+        nodes.extend(self._table_node(data) for data in content.tables)
+        return nodes
+
+    def _table_node(self, data: _TableData) -> Content:
+        """An mdast ``table`` for *data* (upstream ``tableNode``)."""
+        rows: list[Content] = [
+            {
+                "type": "tableRow",
+                "children": [{"type": "tableCell", "children": self._cell_children(cell)} for cell in row],
+            }
+            for row in data.rows
+        ]
+        if data.headerless:
+            width = max(len(row) for row in data.rows)
+            header = {"type": "tableRow", "children": [{"type": "tableCell", "children": []} for _ in range(width)]}
+            rows.insert(0, header)
+        return {"type": "table", "children": rows}
+
+    def _cell_children(self, cell: str) -> list[Content]:
+        """Phrasing content for a cell's mrkdwn (upstream ``cellChildren``).
+
+        Uses the same format converter as body text, so mentions, links and
+        emoji render consistently. Non-paragraph blocks flatten to plain text.
+        """
+        if not cell:
+            return []
+        children: list[Content] = []
+        for node in self._format_converter.to_ast(cell).get("children", []):
+            if children:
+                children.append({"type": "text", "value": "\n"})
+            if node.get("type") == "paragraph":
+                children.extend(node.get("children", []))
+            else:
+                children.append({"type": "text", "value": ast_to_plain_text({"type": "root", "children": [node]})})
+        return children
 
     @staticmethod
     def _parse_slack_timestamp(ts: str | None) -> datetime | None:

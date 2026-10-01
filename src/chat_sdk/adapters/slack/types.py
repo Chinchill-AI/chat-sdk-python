@@ -354,6 +354,54 @@ class SlackRichTextBlock(TypedDict, total=False):
     elements: list[SlackRichTextSection]
 
 
+class SlackMessageBlock(TypedDict, total=False):
+    """A block in a Slack message or attachment (upstream ``SlackMessageBlock``).
+
+    ``rows`` is the row list of a ``table`` / ``data_table`` block (one list
+    of cell elements per row); it is untrusted, so the adapter checks shapes.
+    """
+
+    type: str
+    block_id: str
+    elements: list[Any]
+    rows: Any
+    # ``{"code": True}`` marks an inline-code text element.
+    style: dict[str, Any]
+    text: Any
+    url: str
+    user_id: str
+
+
+class SlackAttachmentField(TypedDict, total=False):
+    """A ``fields`` entry of a legacy attachment."""
+
+    title: str
+    value: str
+    short: bool
+
+
+class SlackAttachment(TypedDict, total=False):
+    """A legacy attachment: unfurl previews, app unfurls, alert payloads."""
+
+    blocks: list[SlackMessageBlock]
+    fallback: str
+    fields: list[SlackAttachmentField]
+    from_url: str
+    image_url: str
+    is_app_unfurl: bool
+    is_msg_unfurl: bool
+    # Field names Slack renders as mrkdwn ("pretext", "text", "fields")
+    mrkdwn_in: list[str]
+    original_url: str
+    pretext: str
+    service_icon: str
+    service_name: str
+    text: str
+    thumb_url: str
+    title: str
+    title_link: str
+
+
 class SlackFileInfo(TypedDict, total=False):
     """File metadata from a Slack event."""
 
@@ -369,7 +417,10 @@ class SlackFileInfo(TypedDict, total=False):
 class SlackEvent(TypedDict, total=False):
     """Slack event payload (raw message format)."""
 
-    blocks: list[SlackRichTextBlock]
+    # Legacy attachments (unfurl previews, app unfurls, alert payloads, ...)
+    attachments: list[SlackAttachment]
+    # Rich text, table and other blocks
+    blocks: list[SlackMessageBlock | SlackRichTextBlock]
     bot_id: str
     # Bot messages: ``{"user_id": "U…"}`` -- the bot's user id (vs app ``bot_id``)
     bot_profile: dict[str, Any]
