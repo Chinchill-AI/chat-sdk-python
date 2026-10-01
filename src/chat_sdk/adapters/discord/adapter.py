@@ -34,6 +34,7 @@ from chat_sdk.adapters.discord.types import (
     DiscordGatewayMessageData,
     DiscordGatewayReactionData,
     DiscordInteraction,
+    DiscordInteractionFlagsContext,
     DiscordInteractionResponse,
     DiscordRequestContext,
     DiscordSlashCommandContext,
@@ -203,6 +204,21 @@ class DiscordAdapter:
         self._mention_role_ids: list[str] = config.mention_role_ids or (
             [rid.strip() for rid in os.environ.get("DISCORD_MENTION_ROLE_IDS", "").split(",") if rid.strip()]
         )
+        # Upstream ``config.respondToChannelIds ?? env ?? []``: an explicit
+        # ``[]`` wins over the env var (unlike the ``mention_role_ids`` parse
+        # above). Blank env entries are dropped; upstream keeps them, but a
+        # blank id never names a real channel.
+        if config.respond_to_channel_ids is not None:
+            self._respond_to_channel_ids: list[str] = list(config.respond_to_channel_ids)
+        else:
+            env_channel_ids = os.environ.get("DISCORD_RESPOND_TO_CHANNEL_IDS")
+            self._respond_to_channel_ids = (
+                [cid.strip() for cid in env_channel_ids.split(",") if cid.strip()] if env_channel_ids else []
+            )
+        self._respond_to_global_mentions: bool = (
+            config.respond_to_global_mentions if config.respond_to_global_mentions is not None else False
+        )
+        self._interaction_flags = config.interaction_flags
         self._bot_user_id: str | None = application_id  # Discord app ID is the bot's user ID
         self._logger: Logger = config.logger or ConsoleLogger("info", prefix="discord")
         self._user_name = config.user_name or "bot"
@@ -361,12 +377,16 @@ class DiscordAdapter:
 
         # Handle APPLICATION_COMMAND (slash commands)
         if interaction_type == INTERACTION_TYPE_APPLICATION_COMMAND:
-            self._handle_application_command_interaction(interaction, options)
-            return self._respond_to_interaction(
-                {
-                    "type": InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-                }
-            )
+            context = self._build_application_command_context(interaction)
+            flags = self._get_interaction_flags(context)
+            self._handle_application_command_interaction(context, flags, options)
+            deferred: DiscordInteractionResponse = {
+                "type": InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+            }
+            # ``is not None``: ``0`` is a real flag value and is still sent.
+            if flags is not None:
+                deferred["data"] = {"flags": flags}
+            return self._respond_to_interaction(deferred)
 
         return self._make_response("Unknown interaction type", 400)
 
@@ -445,10 +465,21 @@ class DiscordAdapter:
         )
 
         decoded = decode_discord_custom_id(custom_id)
+        # Select menus report their choice in ``data.values`` (upstream
+        # ``values[0] ?? decoded.value ?? actionId``). An empty-string choice
+        # is a real value, so only ``None`` falls through.
+        values = cast("dict[str, Any]", data).get("values")
+        selected = values[0] if isinstance(values, list) and values else None
+        if selected is not None:
+            value = selected
+        elif decoded.value is not None:
+            value = decoded.value
+        else:
+            value = decoded.action_id
         self._chat.process_action(
             ActionEvent(
                 action_id=decoded.action_id,
-                value=decoded.value if decoded.value is not None else decoded.action_id,
+                value=value,
                 user=Author(
                     user_id=user.get("id", ""),
                     user_name=user.get("username", ""),
@@ -465,16 +496,12 @@ class DiscordAdapter:
             options,
         )
 
-    def _handle_application_command_interaction(
+    def _build_application_command_context(
         self,
         interaction: DiscordInteraction,
-        options: WebhookOptions | None = None,
-    ) -> None:
-        """Handle APPLICATION_COMMAND interactions (slash commands)."""
-        if not self._chat:
-            self._logger.warn("Chat instance not initialized, ignoring interaction")
-            return
-
+    ) -> DiscordInteractionFlagsContext | None:
+        """Parse an APPLICATION_COMMAND interaction once (upstream
+        ``getApplicationCommandContext``); ``None`` when it is unusable."""
         # `interaction["data"]` is a union of several TypedDicts (one per
         # interaction type). Cast to a plain dict so we can access shared
         # fields like `name` and `options` without pyrefly rejecting keys
@@ -483,21 +510,66 @@ class DiscordAdapter:
         command_name = data.get("name")
         if not command_name:
             self._logger.warn("No command name in application command interaction")
-            return
+            return None
 
         user = (interaction.get("member") or {}).get("user") or interaction.get("user")
         if not user:
             self._logger.warn("No user in application command interaction")
-            return
+            return None
 
         interaction_channel_id = interaction.get("channel_id")
         if not interaction_channel_id:
             self._logger.warn("Missing channel_id in application command interaction")
-            return
+            return None
 
         channel_id = self._encode_interaction_thread_id(interaction, interaction_channel_id)
 
         command, text = self._parse_slash_command(command_name, data.get("options"))
+
+        return DiscordInteractionFlagsContext(
+            channel_id=channel_id,
+            command=command,
+            interaction=interaction,
+            text=text,
+            user=user,
+        )
+
+    def _get_interaction_flags(self, context: DiscordInteractionFlagsContext | None) -> int | None:
+        """Flags for the deferred slash-command response (upstream
+        ``getInteractionFlags``)."""
+        if not (context and self._interaction_flags):
+            return None
+        try:
+            return self._interaction_flags(context)
+        except Exception as error:
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream
+            # lets the callback throw, which fails the interaction ACK. The
+            # command is still acknowledged here, without flags.
+            self._logger.error(
+                "Discord interaction_flags callback failed; deferring without flags",
+                {"error": str(error), "command": context.command},
+            )
+            return None
+
+    def _handle_application_command_interaction(
+        self,
+        context: DiscordInteractionFlagsContext | None,
+        initial_response_flags: int | None = None,
+        options: WebhookOptions | None = None,
+    ) -> None:
+        """Handle APPLICATION_COMMAND interactions (slash commands)."""
+        if not self._chat:
+            self._logger.warn("Chat instance not initialized, ignoring interaction")
+            return
+
+        if context is None:
+            return
+
+        channel_id = context.channel_id
+        command = context.command
+        interaction = context.interaction
+        text = context.text
+        user = context.user
 
         self._logger.debug(
             "Processing Discord slash command",
@@ -511,11 +583,17 @@ class DiscordAdapter:
             },
         )
 
-        # Store interaction context for deferred response
-        self._request_context.set(
+        # Keep interaction metadata in the request context so a handler's
+        # ``post`` resolves the deferred response. Scoped like upstream's
+        # ``requestContext.run``: the handler task copies the context when
+        # ``process_slash_command`` creates it, and the reset below keeps the
+        # slash context from leaking into later events on the caller's task
+        # (which would turn their posts into interaction follow-ups).
+        context_token = self._request_context.set(
             DiscordRequestContext(
                 slash_command=DiscordSlashCommandContext(
                     channel_id=channel_id,
+                    initial_response_flags=initial_response_flags,
                     interaction_token=interaction.get("token", ""),
                     initial_response_sent=False,
                 ),
@@ -537,7 +615,10 @@ class DiscordAdapter:
             raw=interaction,
         )
         event.channel_id = channel_id  # type: ignore[attr-defined]
-        self._chat.process_slash_command(event, options)
+        try:
+            self._chat.process_slash_command(event, options)
+        finally:
+            self._request_context.reset(context_token)
 
     def _encode_interaction_thread_id(
         self,
@@ -689,12 +770,15 @@ class DiscordAdapter:
         try:
             if interaction_type == INTERACTION_TYPE_APPLICATION_COMMAND:
                 # deferReply: ACK now, respond via the interaction webhook later.
+                context = self._build_application_command_context(interaction)
+                flags = self._get_interaction_flags(context)
                 await self._defer_gateway_interaction(
                     interaction_id,
                     interaction_token,
                     InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                    flags,
                 )
-                self._handle_application_command_interaction(interaction, options)
+                self._handle_application_command_interaction(context, flags, options)
                 return
 
             # deferUpdate: ACK the component, update the message later.
@@ -715,19 +799,24 @@ class DiscordAdapter:
         interaction_id: str,
         interaction_token: str,
         response_type: int,
+        flags: int | None = None,
     ) -> None:
         """ACK a gateway-received interaction via the callback endpoint.
 
         ``POST /interactions/{id}/{token}/callback`` is the REST equivalent
         of returning the deferral as the HTTP response body on the
-        Interactions Endpoint path. Path segments are URL-quoted so a
-        crafted id/token in a forwarded payload cannot pivot the request
-        (hazard #12, same guard as :meth:`get_user`).
+        Interactions Endpoint path (discord.js ``deferReply({flags})`` sends
+        the same ``data.flags``). Path segments are URL-quoted so a crafted
+        id/token in a forwarded payload cannot pivot the request (hazard #12,
+        same guard as :meth:`get_user`).
         """
+        body: dict[str, Any] = {"type": response_type}
+        if flags is not None:
+            body["data"] = {"flags": flags}
         await self._discord_fetch(
             f"/interactions/{quote(interaction_id, safe='')}/{quote(interaction_token, safe='')}/callback",
             "POST",
-            {"type": response_type},
+            body,
         )
 
     async def _handle_forwarded_message(
@@ -772,14 +861,23 @@ class DiscordAdapter:
                     },
                 )
 
-        # Check if bot is mentioned
-        mentions = data.get("mentions", [])
-        is_user_mentioned = data.get("is_mention", False) or any(m.get("id") == self._application_id for m in mentions)
-        mention_roles = data.get("mention_roles", [])
+        # Check if bot is mentioned (by user ID or configured role IDs). A
+        # forwarder-supplied ``is_mention`` field is ignored, as upstream does
+        # since chat@4.41 (``61b98fca``): the mention is derived from the
+        # dispatch payload itself.
+        mentions = data.get("mentions") or []
+        is_user_mentioned = any(m.get("id") == self._application_id for m in mentions)
+        mention_roles = data.get("mention_roles") or []
         is_role_mentioned = bool(self._mention_role_ids) and any(
             role_id in self._mention_role_ids for role_id in mention_roles
         )
-        is_mentioned = is_user_mentioned or is_role_mentioned
+        # @everyone/@here only count when opted in (strict ``=== true``).
+        is_everyone_mentioned = self._respond_to_global_mentions and data.get("mention_everyone") is True
+        author_data = data.get("author") or {}
+        # Allowlisted channels: any non-bot message whose *parent* channel is
+        # listed counts, so messages in their threads qualify too.
+        is_channel_allowlisted = not author_data.get("bot", False) and parent_channel_id in self._respond_to_channel_ids
+        is_mentioned = is_user_mentioned or is_role_mentioned or is_everyone_mentioned or is_channel_allowlisted
 
         # If mentioned and not in a thread, create one
         if not discord_thread_id and is_mentioned:
@@ -803,7 +901,6 @@ class DiscordAdapter:
             )
         )
 
-        author_data = data.get("author", {})
         content, attachments_data = _flatten(
             data.get("content", ""),
             cast("list[dict[str, Any]]", data.get("attachments") or []),
@@ -987,36 +1084,8 @@ class DiscordAdapter:
         slash_ctx = req_ctx.slash_command if req_ctx else None
         # Upstream ``tryPostSlashResponse``: only a post to the interaction's
         # own conversation answers it; posts elsewhere go to their channel.
-        if slash_ctx and slash_ctx.channel_id == thread_id and not slash_ctx.initial_response_sent:
-            slash_ctx.initial_response_sent = True
-            self._logger.debug(
-                "Discord API: PATCH deferred interaction response",
-                {
-                    "channelId": channel_id,
-                    "contentLength": len(payload.get("content", "")),
-                    "embedCount": len(embeds),
-                    "componentCount": len(components),
-                    "fileCount": len(files),
-                },
-            )
-
-            result = await self._discord_fetch(
-                f"/webhooks/{self._application_id}/{slash_ctx.interaction_token}/messages/@original",
-                "PATCH",
-                payload,
-                files=files or None,
-            )
-
-            self._logger.debug(
-                "Discord API: PATCH deferred interaction response completed",
-                {"messageId": result.get("id") if result else None},
-            )
-
-            return RawMessage(
-                id=(result or {}).get("id", ""),
-                thread_id=thread_id,
-                raw=result or {},
-            )
+        if slash_ctx and slash_ctx.channel_id == thread_id:
+            return await self._post_slash_command_response(slash_ctx, thread_id, payload, files)
 
         self._logger.debug(
             "Discord API: POST message",
@@ -1047,6 +1116,59 @@ class DiscordAdapter:
             id=result.get("id", ""),
             thread_id=thread_id,
             raw=result,
+        )
+
+    async def _post_slash_command_response(
+        self,
+        slash_ctx: DiscordSlashCommandContext,
+        thread_id: str,
+        payload: dict[str, Any],
+        files: list[FileUpload],
+    ) -> RawMessage:
+        """Answer a slash command through its interaction webhook.
+
+        Port of upstream ``postSlashCommandResponse``: the first response
+        edits the deferred ``@original`` message, later ones are follow-ups
+        (``POST /webhooks/{app}/{token}?wait=true``). The deferral's flags
+        (e.g. ephemeral) are OR'd into every response, so follow-ups stay
+        ephemeral too.
+        """
+        is_initial_response = not slash_ctx.initial_response_sent
+        # Set before awaiting so a concurrent post becomes a follow-up rather
+        # than a second ``@original`` edit.
+        slash_ctx.initial_response_sent = True
+
+        token = quote(slash_ctx.interaction_token, safe="")
+        if is_initial_response:
+            path = f"/webhooks/{self._application_id}/{token}/messages/@original"
+            method = "PATCH"
+        else:
+            path = f"/webhooks/{self._application_id}/{token}?wait=true"
+            method = "POST"
+
+        response_payload = payload
+        if slash_ctx.initial_response_flags is not None:
+            payload_flags = payload.get("flags")
+            response_payload = {
+                **payload,
+                "flags": slash_ctx.initial_response_flags | (payload_flags if payload_flags is not None else 0),
+            }
+
+        self._logger.debug(
+            "Discord interaction webhook: responding to slash command",
+            {
+                "threadId": thread_id,
+                "isInitialResponse": is_initial_response,
+                "hasFiles": len(files) > 0,
+            },
+        )
+
+        result = await self._discord_fetch(path, method, response_payload, files=files or None)
+
+        return RawMessage(
+            id=(result or {}).get("id", ""),
+            thread_id=thread_id,
+            raw=result or {},
         )
 
     async def edit_message(
@@ -1370,6 +1492,24 @@ class DiscordAdapter:
                 "channel_type": channel_type,
                 "raw": channel,
             },
+        )
+
+    async def set_thread_title(self, thread_id: str, title: str) -> None:
+        """Rename a Discord thread channel (upstream ``setThreadTitle``).
+
+        A thread id without a thread segment names a plain channel and is
+        left alone. Otherwise the thread's parent is validated first, then
+        ``PATCH /channels/{thread}`` sets its ``name``.
+        """
+        decoded = self.decode_thread_id(thread_id)
+        if not decoded.thread_id:
+            return
+
+        target_channel_id = await self._resolve_thread_channel_id(decoded.channel_id, decoded.thread_id)
+        await self._discord_fetch(
+            f"/channels/{quote(target_channel_id, safe='')}",
+            "PATCH",
+            {"name": title},
         )
 
     async def open_dm(self, user_id: str) -> str:

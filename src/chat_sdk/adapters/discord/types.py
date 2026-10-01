@@ -6,6 +6,7 @@ See: https://discord.com/developers/docs/intro
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
@@ -45,6 +46,20 @@ class DiscordAdapterConfig:
     public_key: str | None = None
     # Override bot username (optional).
     user_name: str | None = None
+    # 4.41-wave options are appended (not alphabetical) so positional
+    # callers of the fields above are not shifted.
+    # Flags for the initial deferred slash-command response, e.g.
+    # ``DiscordInteractionResponseFlag.EPHEMERAL``. Called synchronously with a
+    # :class:`DiscordInteractionFlagsContext`; ``None`` sends no flags. The
+    # flags also apply to every follow-up response to that command.
+    interaction_flags: Callable[[DiscordInteractionFlagsContext], int | None] | None = None
+    # Parent channel IDs whose non-bot messages, including messages in their
+    # threads, trigger mention handlers without a mention. Defaults to the
+    # DISCORD_RESPOND_TO_CHANNEL_IDS env var (comma-separated), else ``[]``.
+    # An explicit ``[]`` wins over the env var.
+    respond_to_channel_ids: list[str] | None = None
+    # Treat @everyone/@here pings as mentions of the bot. Defaults to False.
+    respond_to_global_mentions: bool | None = None
 
 
 # =============================================================================
@@ -75,12 +90,36 @@ class DiscordThreadId:
 
 
 @dataclass
+class DiscordInteractionFlagsContext:
+    """Context passed to the ``interaction_flags`` callback for slash commands."""
+
+    # Chat SDK channel ID where the command was invoked.
+    channel_id: str
+    # Parsed slash command name, including subcommands ("/project issue create").
+    command: str
+    # Raw Discord interaction payload.
+    interaction: DiscordInteraction
+    # Flattened slash command option text.
+    text: str
+    # User who invoked the command (raw Discord user object).
+    user: DiscordUser
+
+
+class DiscordInteractionResponseFlag:
+    """Flags accepted on the initial deferred interaction response."""
+
+    EPHEMERAL = 64  # MessageFlags.Ephemeral: only the invoking user sees it
+
+
+@dataclass
 class DiscordSlashCommandContext:
     """Per-request slash command context used while resolving deferred responses."""
 
     channel_id: str
     initial_response_sent: bool
     interaction_token: str
+    # Flags sent on the deferred response; OR'd into every response payload.
+    initial_response_flags: int | None = None
 
 
 @dataclass
@@ -210,6 +249,7 @@ class DiscordMessagePayload(TypedDict, total=False):
     components: list[DiscordActionRow]
     content: str
     embeds: list[dict[str, Any]]
+    flags: int
     message_reference: dict[str, Any]
 
 
@@ -283,7 +323,8 @@ class DiscordGatewayMessageData(TypedDict, total=False):
     content: str
     guild_id: str | None
     id: str
-    is_mention: bool
+    # @everyone/@here; only a mention with ``respond_to_global_mentions``.
+    mention_everyone: bool
     mention_roles: list[str]
     mentions: list[DiscordGatewayMention]
     message_snapshots: list[DiscordGatewayMessageSnapshot]
