@@ -229,8 +229,9 @@ async def _take_until_aborted[T](source: AsyncIterable[T], signal: TurnSignal) -
     reschedules that timeout to "now": the pending ``anext()`` is cancelled
     and ``asyncio.timeout`` turns that cancellation into ``TimeoutError``,
     which its own uncancel bookkeeping tells apart from a cancellation aimed
-    at the consumer. The source is then closed; upstream's
-    ``iterator.return()`` is likewise best-effort.
+    at the consumer. Unlike upstream, the source's in-flight ``anext()`` is
+    interrupted rather than left to finish. The source is then closed;
+    upstream's ``iterator.return()`` is likewise best-effort.
     """
     iterator = aiter(source)
     active: asyncio.Timeout | None = None
@@ -251,10 +252,15 @@ async def _take_until_aborted[T](source: AsyncIterable[T], signal: TurnSignal) -
                     value = await anext(iterator)
             except StopAsyncIteration:
                 return
-            except TimeoutError:
+            except Exception:
+                # ``expired()``: our abort ended the wait. Whatever the source
+                # raised in response (``TimeoutError`` from the scope, or its
+                # own error wrapping the cancellation) ends the stream, as
+                # upstream's race ignores the pending ``next()``. Otherwise it
+                # is the source's own error (its own ``TimeoutError`` too).
                 if wait_scope.expired():
                     return
-                raise  # the source's own timeout
+                raise
             finally:
                 active = None
             if wait_scope.expired() or signal.aborted:

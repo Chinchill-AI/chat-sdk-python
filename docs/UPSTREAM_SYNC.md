@@ -2197,8 +2197,10 @@ from `21dc60c3` (#935, chat@4.41.0), and the `messages.test.ts` case of
 
 Core half of `2ce2be00` (vercel/chat#862, chat@4.39.0). The Slack emitter
 (`agents.sessions.*`, native stop, auto titles, `end_typing`) is #214/#215.
-No divergence-table rows; the adaptations below are not observable as
-behavior differences.
+No divergence-table rows. The adaptations below keep upstream's results;
+the one observable difference is that an abort interrupts the source's
+in-flight `anext()` (Python cancels it, upstream leaves its `next()`
+running unobserved), see `_take_until_aborted`.
 
 - **`AbortSignal` → `TurnSignal`** (`chat_sdk.types`, exported). `aborted`,
   `async wait()`, `add_listener(cb)` / `remove_listener(cb)`; `_abort()` is
@@ -2231,8 +2233,11 @@ behavior differences.
   wait runs under `asyncio.timeout(None)` and the abort reschedules that
   timeout to now, so the pending `anext()` is cancelled and
   `asyncio.timeout`'s uncancel bookkeeping keeps a real cancellation of the
-  consumer propagating. A `TimeoutError` raised by the source itself is not
-  mistaken for an abort (`expired()` decides). The source is then closed
+  consumer propagating. `expired()` decides what an exception means: once
+  the abort expired the scope, anything the source raises (`TimeoutError`,
+  or its own error wrapping the cancellation) ends the stream cleanly, as
+  upstream's race ignores the pending `next()`; without an abort, the
+  source's errors (its own `TimeoutError` too) propagate. The source is then closed
   with `aclose()` (errors suppressed, as upstream's `.catch`), so a
   generator's `finally` has run by the time the stream ends.
 - **`from_full_stream` closes its source on early exit.** Upstream's

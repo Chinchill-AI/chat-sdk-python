@@ -20,7 +20,7 @@ import pytest
 import chat_sdk.chat as chat_module
 from chat_sdk._compat import accepts_kwarg
 from chat_sdk.chat import Chat
-from chat_sdk.plan import StreamingPlan, StreamingPlanOptions
+from chat_sdk.plan import Plan, StartPlanOptions, StreamingPlan, StreamingPlanOptions
 from chat_sdk.testing import MockLogger, create_mock_adapter, create_mock_state, create_test_message
 from chat_sdk.thread import ThreadImpl, _take_until_aborted, _ThreadImplConfig
 from chat_sdk.types import ChatConfig, PostableMarkdown, RawMessage, TurnSignal
@@ -170,6 +170,32 @@ class TestTakeUntilAborted:
                 received.append(chunk)
         assert received == ["a"]
 
+    async def test_a_chunk_produced_after_the_abort_is_not_yielded(self):
+        signal = TurnSignal()
+        stalled = asyncio.Event()
+
+        async def source() -> AsyncIterator[str]:
+            yield "a"
+            try:
+                stalled.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass  # swallows the interruption and produces one more chunk
+            yield "b"
+
+        received: list[str] = []
+
+        async def consume() -> None:
+            async for chunk in _take_until_aborted(source(), signal):
+                received.append(chunk)
+
+        consumer = asyncio.ensure_future(consume())
+        await asyncio.wait_for(stalled.wait(), 1)
+        signal._abort()
+        await asyncio.wait_for(consumer, 1)
+
+        assert received == ["a"]
+
     async def test_an_already_aborted_signal_yields_nothing(self):
         signal = TurnSignal()
         signal._abort()
@@ -199,6 +225,44 @@ class TestThreadAbortAndTyping:
         assert adapter._post_calls[0] == (THREAD_ID, "...")
         assert adapter._edit_calls[-1] == (THREAD_ID, "msg-1", PostableMarkdown(markdown="Hello world"))
         assert sent.text == "Hello world"
+
+    async def test_abort_ends_a_source_that_wraps_the_interruption_in_its_own_error(self):
+        class StreamClosedError(Exception):
+            pass
+
+        adapter = create_mock_adapter()
+        adapter.end_typing = AsyncMock()  # type: ignore[attr-defined]
+        signal = TurnSignal()
+        thread = _thread(adapter, signal=signal)
+        stalled = asyncio.Event()
+
+        async def source() -> AsyncIterator[str]:
+            yield "Hello "
+            try:
+                stalled.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as error:  # an SDK translating cancellation
+                raise StreamClosedError("connection closed") from error
+
+        await thread.start_typing()
+        posting = asyncio.ensure_future(thread.post(source()))
+        await asyncio.wait_for(stalled.wait(), 1)
+        signal._abort()
+        sent = await asyncio.wait_for(posting, 1)
+
+        assert sent.text == "Hello "
+        assert adapter._edit_calls[-1] == (THREAD_ID, "msg-1", PostableMarkdown(markdown="Hello "))
+        adapter.end_typing.assert_awaited_once_with(THREAD_ID, "active")
+
+    async def test_source_error_without_an_abort_still_fails_the_post(self):
+        adapter = create_mock_adapter()
+
+        async def source() -> AsyncIterator[str]:
+            yield "Hello "
+            raise ConnectionError("upstream reset")
+
+        with pytest.raises(ConnectionError, match="upstream reset"):
+            await _thread(adapter, signal=TurnSignal()).post(source())
 
     async def test_abort_between_chunks_closes_the_original_source(self):
         adapter = create_mock_adapter()
@@ -304,6 +368,16 @@ class TestThreadAbortAndTyping:
 
         adapter.end_typing.assert_awaited_once_with(THREAD_ID, "suspended")
 
+    async def test_posting_a_postable_object_ends_typing(self):
+        adapter = create_mock_adapter()
+        adapter.end_typing = AsyncMock()  # type: ignore[attr-defined]
+        thread = _thread(adapter)
+
+        await thread.start_typing()
+        await thread.post(Plan(StartPlanOptions(initial_message="Working")))
+
+        adapter.end_typing.assert_awaited_once_with(THREAD_ID, "active")
+
     async def test_end_typing_runs_once_per_start_typing(self):
         adapter = create_mock_adapter()
         adapter.end_typing = AsyncMock()  # type: ignore[attr-defined]
@@ -405,10 +479,10 @@ class TestChatTurnCancellation:
         message = create_test_message("m1", "@testbot go")
         message.is_mention = True
         task = chat.process_message(adapter, "slack:C1:1.1", message)
-        await started.wait()
+        await asyncio.wait_for(started.wait(), 1)
         assert _monitor_tasks() == []
         await chat.abort_turn("slack:C1:1.1")
-        await task
+        await asyncio.wait_for(task, 1)
 
         assert signals[0].aborted is True
         assert not [k for k in state.cache if k.startswith(("active-turn:", "abort-turn:"))]
@@ -438,6 +512,32 @@ class TestChatTurnCancellation:
         assert _monitor_tasks() == []
         assert chat._active_turn_signals == {}
 
+    async def test_an_aborted_turn_clears_its_abort_marker(self, monkeypatch):
+        monkeypatch.setattr(chat_module, "ABORT_POLL_INTERVAL_MS", 1)
+        adapter = create_mock_adapter("slack")
+        adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        state = create_mock_state()
+        chat = _chat(adapter, state)
+        started = asyncio.Event()
+        written: list[Any] = []
+
+        @chat.on_mention
+        async def handler(thread: Any, message: Any, context: Any = None) -> None:
+            started.set()
+            await thread.signal.wait()
+            written.append(state.cache.get("abort-turn:slack:C1:5.5"))
+
+        message = create_test_message("m5", "@testbot go")
+        message.is_mention = True
+        task = chat.process_message(adapter, "slack:C1:5.5", message)
+        await asyncio.wait_for(started.wait(), 1)
+        await chat.abort_turn("slack:C1:5.5")
+        await asyncio.wait_for(task, 1)
+
+        assert isinstance(written[0], str) and written[0]  # the abort was recorded for this turn
+        assert "abort-turn:slack:C1:5.5" not in state.cache
+        assert "active-turn:slack:C1:5.5" not in state.cache
+
     async def test_markers_owned_by_a_newer_turn_are_not_cleared(self):
         adapter = create_mock_adapter("slack")
         adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
@@ -457,7 +557,8 @@ class TestChatTurnCancellation:
         assert state.cache["active-turn:slack:C1:3.3"] == "newer-turn"
         assert state.cache["abort-turn:slack:C1:3.3"] == "newer-turn"
 
-    async def test_poll_error_logs_and_stops_polling_without_failing_the_turn(self):
+    async def test_poll_error_logs_and_stops_polling_without_failing_the_turn(self, monkeypatch):
+        monkeypatch.setattr(chat_module, "ABORT_POLL_INTERVAL_MS", 0)
         adapter = create_mock_adapter("slack")
         adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
         state = create_mock_state()
@@ -465,9 +566,13 @@ class TestChatTurnCancellation:
         chat = _chat(adapter, state, logger)
         original_get = state.get
         handled = asyncio.Event()
+        abort_reads_during_turn: list[int] = []
+        abort_reads = 0
 
         async def flaky_get(key: str) -> Any:
+            nonlocal abort_reads
             if key.startswith("abort-turn:") and not handled.is_set():
+                abort_reads += 1
                 raise ConnectionError("redis down")
             return await original_get(key)
 
@@ -475,14 +580,16 @@ class TestChatTurnCancellation:
 
         @chat.on_mention
         async def handler(thread: Any, message: Any, context: Any = None) -> None:
-            await asyncio.sleep(0)  # let the monitor's first poll run
-            await asyncio.sleep(0)
+            for _ in range(10):  # room for several polls at a zero interval
+                await asyncio.sleep(0)
+            abort_reads_during_turn.append(abort_reads)
             handled.set()
 
         message = create_test_message("m4", "@testbot go")
         message.is_mention = True
         await chat.process_message(adapter, "slack:C1:4.4", message)
 
+        assert abort_reads_during_turn == [1]
         warnings = [c for c in logger.warn.calls if c[0] == "Could not poll turn cancellation state"]
         assert len(warnings) == 1
         assert isinstance(warnings[0][1]["error"], ConnectionError)
