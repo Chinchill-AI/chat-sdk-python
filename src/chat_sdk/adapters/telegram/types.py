@@ -97,6 +97,22 @@ class TelegramAdapterConfig:
     carry no acting user (e.g. anonymous channel posts) are dropped.
     """
 
+    native_streaming: bool | None = None
+    """Stream private chats (DMs) through Telegram's native draft bubble
+    (``sendMessageDraft`` / ``sendRichMessageDraft``). Defaults to ``False``:
+    every chat streams by posting a message and editing it. Groups,
+    supergroups and channels always use post-and-edit (vercel/chat#822).
+    """
+
+    streaming_edit_interval_ms: int | None = None
+    """Minimum interval between edits on the post-and-edit streaming path.
+
+    Defaults to 1100 ms for private chats and 3100 ms for other chats. Acts as
+    a floor: a lower Chat-level ``streaming_update_interval_ms`` is raised to
+    this value. ``0`` edits on every chunk. Negative values clamp to ``0``;
+    non-numeric or non-finite values are ignored (vercel/chat#822).
+    """
+
 
 # =============================================================================
 # Thread ID
