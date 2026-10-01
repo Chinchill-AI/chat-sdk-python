@@ -22,12 +22,12 @@ Each item names the wave issues; their entries under "Wave PRs" below have the d
 
 ### Live validation (2026-10-01)
 
-Run on chinchill's customer-demo Slack app: `oss/agent-framework` plus the 0.4.41 adoption at `@0fd3cc3`, with a test-only 20 s stream-segment cap. Every claim was re-checked independently against Slack and Logfire. Demo was restored afterwards.
+Run on chinchill's customer-demo Slack app: `oss/agent-framework` plus the 0.4.41 adoption at `@0fd3cc3`, with a test-only 20 s stream-segment cap. Every live Slack result below was re-checked independently against Slack and Logfire. The Teams and Agent Sessions items were not run live. Demo was restored afterwards.
 
 - [x] **Slack streamed mentions** (#206): a streamed `@Patrick` became `<@U0917L892RX>` on the native stream path; code spans and URLs were left untouched.
 - [x] **Slack stream rotation** (#208): one reply split into two consecutive messages. Every `startStream`/`appendStream`/`stopStream` call returned 200, with no `message_not_in_streaming_state` and no lost or duplicated text. Rotation is by age only, so a long reply that streams fast can still hit Slack `msg_too_long`. Upstream has the same gap; it's tracked in #310, not a 0.4.41 regression.
 - [x] **Downstream git-ref smoke test (chinchill)**: on both `main` and `oss/agent-framework`, chinchill's chat_sdk boundary suites (743 and 1004 tests) and CI Tests/Lint passed.
-- [x] Basic native streaming, markdown/code rendering, DMs, and a Logfire error sweep: all clean.
+- [x] Basic native streaming, outbound markdown/code rendering, DMs, and a Logfire error sweep: all clean. Inbound mrkdwn normalization was not covered by a dedicated live check; it is covered by the ported tests.
 - **Teams on SDK 2.1** (#262 / #250): **not live-verified**, because no Teams tenant is available. The full suite passes on `microsoft-teams-apps` 2.1.0, and the Teams and fixture-replay suites also pass on 2.0.16 and 2.0.13.4.
 - **Slack Agent Sessions native Stop** (#215): **not live-verified**. It is opt-in and only runs with a Slack app that has the Agent messaging experience enabled and `agent_view=True`; chinchill enables neither. Covered by the ported upstream tests.
 
