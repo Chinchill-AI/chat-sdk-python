@@ -97,6 +97,17 @@ class TelegramAdapterConfig:
     carry no acting user (e.g. anonymous channel posts) are dropped.
     """
 
+    mention_on_reply: bool | None = None
+    """Treat a reply to one of the bot's own messages as a mention.
+
+    Telegram users continue a conversation by replying rather than repeating
+    the handle, so a bot that only reacts to ``@name`` looks unresponsive in a
+    group. Off by default: turning it on changes which messages report
+    ``is_mention``. Defaults to the ``TELEGRAM_MENTION_ON_REPLY`` env var,
+    where only the exact string ``"true"`` opts in. An explicit ``False`` here
+    wins over the env var.
+    """
+
 
 # =============================================================================
 # Thread ID
@@ -810,6 +821,9 @@ class TelegramMessage(TypedDict, total=False):
     message_thread_id: int
     photo: list[TelegramPhotoSize]
     poll: TelegramPoll
+    # The message this one replies to. The Bot API never nests a further
+    # ``reply_to_message`` inside it, so parsing it recursively is bounded.
+    reply_to_message: TelegramMessage
     rich_message: TelegramRichMessage
     sender_chat: TelegramChat
     sticker: TelegramStickerFile
@@ -839,6 +853,16 @@ class TelegramInlineKeyboardMarkup(TypedDict):
     """
 
     inline_keyboard: list[list[TelegramInlineKeyboardButton]]
+
+
+class TelegramReplyParameters(TypedDict):
+    """Bot API ``reply_parameters`` sent with a native reply.
+
+    See https://core.telegram.org/bots/api#replyparameters
+    """
+
+    allow_sending_without_reply: bool
+    message_id: int
 
 
 class TelegramCallbackQuery(TypedDict, total=False):
