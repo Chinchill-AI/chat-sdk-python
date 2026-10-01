@@ -33,7 +33,10 @@ from chat_sdk.types import MarkdownTextChunk, PlanUpdateChunk, TaskUpdateChunk
 
 WEBHOOK_SECRET = "test-webhook-secret"
 
-_SESSION_THREAD = "linear:issue-123:c:comment-root:s:session-789"
+_SESSION_THREAD = "linear:issue-123:s:session-789"
+# Pre-#885 per-comment session thread id. Still decodes (subscriptions and
+# state stored before the change keep working for posting).
+_LEGACY_SESSION_THREAD = "linear:issue-123:c:comment-root:s:session-789"
 
 
 def _make_logger() -> MagicMock:
@@ -173,11 +176,9 @@ class TestPostMessageAgentSession:
 
         # The resolved message is built off the source comment.
         assert result.id == "comment-activity-123"
-        # thread_id is encoded from the source comment's OWN id (NOT its
-        # parentId). Source comment id == "comment-activity-123",
-        # parentId == "comment-root" — the encoded ``:c:`` segment MUST be the
-        # own id. (Old parentId code would emit ``:c:comment-root:``.)
-        assert result.thread_id == "linear:issue-123:c:comment-activity-123:s:session-789"
+        # thread_id is the stable session thread (vercel/chat#885): no
+        # ``:c:{comment}`` segment from the source comment.
+        assert result.thread_id == "linear:issue-123:s:session-789"
         assert result.raw["kind"] == "agent_session_comment"
         assert result.raw["organizationId"] == "org-123"
         assert result.raw["agentSessionId"] == "session-789"
@@ -185,6 +186,24 @@ class TestPostMessageAgentSession:
         # botActor → bot author, matching bot-user-id → is_me semantics.
         assert result.raw["comment"]["user"]["type"] == "bot"
         assert result.raw["comment"]["user"]["id"] == "bot-user-id"
+
+    @pytest.mark.asyncio
+    async def test_legacy_comment_session_thread_id_still_posts(self) -> None:
+        """A stored pre-#885 ``linear:{i}:c:{c}:s:{s}`` thread id still posts.
+
+        It decodes to the same session, so the activity goes to that session,
+        and the returned message carries the new stable thread id.
+        """
+        adapter = _make_adapter()
+        adapter._graphql_query = AsyncMock(return_value=_graphql_return(_activity_payload()))
+
+        result = await adapter.post_message(_LEGACY_SESSION_THREAD, "Agent response")
+
+        query, variables = adapter._graphql_query.call_args[0]
+        assert "agentActivityCreate" in query
+        assert variables["input"]["agentSessionId"] == "session-789"
+        assert variables["input"]["content"] == {"type": "response", "body": "Agent response"}
+        assert result.thread_id == "linear:issue-123:s:session-789"
 
     @pytest.mark.asyncio
     async def test_calls_ensure_valid_token(self) -> None:
@@ -629,13 +648,13 @@ class TestStreamInAgentSession:
             await adapter.stream(_SESSION_THREAD, _astream("Hello world"))
 
     @pytest.mark.asyncio
-    async def test_stream_thread_id_uses_source_comment_own_id(self) -> None:
-        """The streamed result's ``thread_id`` encodes the source comment's OWN id.
+    async def test_stream_result_uses_stable_session_thread_id(self) -> None:
+        """The streamed result's ``thread_id`` is the stable session thread.
 
         The final-flush source comment has ``id="comment-final"`` and
-        ``parentId="comment-root"`` (id != parentId). The encoded ``:c:`` segment
-        MUST be the own id ``comment-final`` — NOT ``comment-root``. This FAILS
-        on the old code that encoded ``comment_id=comment_data["parentId"]``.
+        ``parentId="comment-root"``. Neither may appear in the thread id: since
+        vercel/chat#885 every session message shares
+        ``linear:{issue}:s:{session}``.
         """
         adapter = _make_adapter()
         adapter._graphql_query = AsyncMock(
@@ -644,7 +663,8 @@ class TestStreamInAgentSession:
 
         result = await adapter.stream(_SESSION_THREAD, _astream("Hello world"))
 
-        assert result.thread_id == "linear:issue-123:c:comment-final:s:session-789"
+        assert result.id == "comment-final"
+        assert result.thread_id == "linear:issue-123:s:session-789"
 
     @pytest.mark.asyncio
     async def test_task_update_omits_result_key_when_output_none(self) -> None:
