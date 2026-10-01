@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from chat_sdk.cards import (
     Actions,
     Button,
@@ -268,6 +270,16 @@ class TestEscapedCharacters:
         link_nodes2 = [c for c in children2 if c.get("type") == "link"]
         assert len(link_nodes2) == 1
         assert link_nodes2[0]["url"] == "u*r*l"
+
+    def test_link_url_keeps_escaped_and_balanced_parens(self):
+        # An escaped `(` never needs a partner; a bare one must be balanced.
+        for text, url in [
+            (r"[manual](https://example.com/a\(b)", "https://example.com/a(b"),
+            ("[Foo](https://en.wikipedia.org/wiki/Foo_(bar))", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+        ]:
+            links = [c for c in self._para_children(text) if c.get("type") == "link"]
+            assert [link["url"] for link in links] == [url]
+        assert [c["type"] for c in self._para_children("[x](https://a.com/a(b)")] == ["text"]
 
     def test_inline_code_contents_are_not_unescaped(self):
         # Per CommonMark, backslash inside `code` is literal.
@@ -649,9 +661,12 @@ class TestToPlainText:
         assert ast_to_plain_text(table) == "\x1c\na"
 
     def test_deeply_nested_blockquote_does_not_overflow_the_stack(self):
-        # One frame per nesting level: a 600-deep blockquote (a ~600-byte
-        # inbound comment) parses fine, so extraction must not RecursionError.
-        assert ast_to_plain_text(parse_markdown(">" * 600 + " x")) == "x"
+        # Extraction walks iteratively, so a 600-deep blockquote AST must not
+        # RecursionError. (parse_markdown itself caps quote nesting at 100.)
+        node: Content = {"type": "paragraph", "children": [{"type": "text", "value": "x"}]}
+        for _ in range(600):
+            node = {"type": "blockquote", "children": [node]}
+        assert ast_to_plain_text({"type": "root", "children": [node]}) == "x"
 
     def test_deeply_nested_list_does_not_overflow_the_stack(self):
         text = "\n".join("  " * depth + "- a" for depth in range(300))
@@ -1494,6 +1509,63 @@ class TestParseMarkdownEdgeCases:
         assert len(ast["children"]) >= 3
         types = [c["type"] for c in ast["children"]]
         assert "thematicBreak" in types
+
+
+class TestCommonMarkRulesExposedBySlackText:
+    """Python-only: CommonMark rules the shared parser follows since #283 made
+    Slack's ``message.text`` the plain text of ``parse_markdown``. Expected
+    values are remark-parse + remark-gfm ``toPlainText`` output."""
+
+    @pytest.mark.parametrize(
+        ("markdown", "expected"),
+        [
+            # Links never nest: the inner link wins, outer brackets stay text.
+            ("[[a](https://x.com) b](https://y.com)", "[a b](https://y.com)"),
+            ("[a [b](https://x.com)](https://y.com)", "[a b](https://y.com)"),
+            # Code spans bind tighter than link brackets.
+            ("[`[`](https://example.com)", "["),
+            ("[a `]` b](https://e.com)", "a ] b"),
+            ("[`a` [b] `c`](https://u.com)", "a [b] c"),
+            # A thematic break repeats one marker; mixed markers are text.
+            ("-_-", "-_-"),
+            ("ok\n-_-", "ok\n-_-"),
+            ("*-*", "-"),
+            ("_*_", "*"),
+            ("- - -", ""),
+            ("_ _ _", ""),
+            # ``_`` emphasis is never intraword.
+            ("my_var and snake_case_name", "my_var and snake_case_name"),
+            ("see my_notes: [link](https://e.com/?utm_source=x)", "see my_notes: link"),
+            ("x _y_z", "x _y_z"),
+            ("(_emph_)", "(emph)"),
+            ("_a_b_", "a_b"),
+            # Paragraph lines lose leading spaces, the paragraph its trailing ones.
+            ("  lead\n   b  ", "lead\nb"),
+            ("run \n```\nnpm test\n```\n please", "run\n\nnpm test\n\nplease"),
+        ],
+    )
+    def test_plain_text_matches_remark(self, markdown: str, expected: str):
+        assert ast_to_plain_text(parse_markdown(markdown)) == expected
+
+    def test_code_span_with_a_bracket_stays_inside_its_link(self):
+        para = parse_markdown("[`[`](https://example.com)")["children"][0]
+        assert para["children"] == [
+            {"type": "link", "url": "https://example.com", "children": [{"type": "inlineCode", "value": "["}]}
+        ]
+
+    def test_crlf_thematic_break_is_still_a_break(self):
+        types = [c["type"] for c in parse_markdown("before\r\n***\r\nafter")["children"]]
+        assert types == ["paragraph", "thematicBreak", "paragraph"]
+
+    def test_nested_link_label_keeps_only_the_inner_link(self):
+        para = parse_markdown("[[a](https://x.com) b](https://y.com)")["children"][0]
+        links = [c for c in para["children"] if c.get("type") == "link"]
+        assert [link["url"] for link in links] == ["https://x.com"]
+
+    def test_underscored_url_after_snake_case_stays_one_link(self):
+        para = parse_markdown("my_var see [page](https://example.com/my_page)")["children"][0]
+        assert [c["type"] for c in para["children"]] == ["text", "link"]
+        assert para["children"][1]["url"] == "https://example.com/my_page"
 
 
 # ============================================================================

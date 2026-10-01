@@ -10,6 +10,7 @@ or ``to_response_url_text`` (legacy mrkdwn -- response_url rejects
 from __future__ import annotations
 
 from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
+from chat_sdk.shared.markdown_parser import ast_to_plain_text
 
 # ---------------------------------------------------------------------------
 # toMarkdown (mrkdwn -> markdown)
@@ -19,6 +20,97 @@ from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
 class TestToMarkdown:
     def setup_method(self):
         self.converter = SlackFormatConverter()
+
+    # -- incoming code fences (vercel/chat#843) -----------------------------
+
+    def test_preserves_code_starting_immediately_after_the_opening_fence(self):
+        ast = self.converter.to_ast("```first line\nsecond line\n```")
+        code = ast["children"][0]
+        assert code["type"] == "code"
+        assert code.get("lang") is None
+        assert code.get("meta") is None
+        assert code["value"] == "first line\nsecond line"
+        assert ast_to_plain_text(ast) == "first line\nsecond line"
+
+    def test_parses_a_code_block_pasted_into_a_message(self):
+        ast = self.converter.to_ast("Here you go:\n```first line\nsecond line```")
+        assert ast["children"][0]["type"] == "paragraph"
+        code = ast["children"][1]
+        assert code["type"] == "code"
+        assert code.get("lang") is None
+        assert code["value"] == "first line\nsecond line"
+
+    def test_does_not_swallow_text_after_an_unpaired_fence(self):
+        ast = self.converter.to_ast("use ``` to fence code, *see*?")
+        assert [node["type"] for node in ast["children"]] == ["paragraph"]
+        assert ast_to_plain_text(ast) == "use ``` to fence code, see?"
+
+    def test_keeps_a_quoted_fence_inside_the_blockquote(self):
+        ast = self.converter.to_ast("&gt; a ```c``` b")
+        assert [node["type"] for node in ast["children"]] == ["blockquote"]
+        quote = ast["children"][0]
+        assert [node["type"] for node in quote["children"]] == ["paragraph"]
+        # Upstream also asserts toPlainText == "a c b": remark reads ```c``` as
+        # a triple-backtick code span. The shared Python parser only knows
+        # single-backtick spans (known parser limitation, not Slack-specific),
+        # so assert what the Slack layer controls: the quoted fence stays
+        # inline text inside the blockquote rather than becoming a code block.
+        assert ast_to_plain_text(ast).replace("`", "") == "a c b"
+
+    def test_keeps_a_line_leading_quoted_fence_as_text(self):
+        """Python parser fix: CommonMark forbids a backtick in a backtick
+        fence's info string, so a quote that starts with ```npm test``` is a
+        paragraph (remark: a code span), not an empty code block that drops
+        the command from ``message.text``."""
+        ast = self.converter.to_ast("&gt; ```npm test```")
+        assert [node["type"] for node in ast["children"]] == ["blockquote"]
+        assert [node["type"] for node in ast["children"][0]["children"]] == ["paragraph"]
+        # Upstream: "npm test" (multi-backtick code span, a shared-parser gap).
+        assert ast_to_plain_text(ast).replace("`", "") == "npm test"
+
+    def test_deeply_nested_quotes_do_not_exhaust_the_stack(self):
+        """Python-specific guard: ``&gt;`` now unescapes, so 1,100 quote
+        markers reach the recursive blockquote parser. Past 100 levels the
+        rest stays literal text instead of raising ``RecursionError``."""
+        ast = self.converter.to_ast("&gt;" * 1_100 + " hi")
+        assert ast_to_plain_text(ast) == ">" * (1_100 - 101) + " hi"
+        # A heading inside the quotes must not reset the nesting budget.
+        ast = self.converter.to_ast("&gt;" * 50 + " # h\n" + "&gt;" * 1_100 + " hi")
+        assert ast_to_plain_text(ast) == "h\n" + ">" * (1_100 - 101) + " hi"
+        # Lists inside deep quotes keep their own stack room.
+        ast = self.converter.to_ast("&gt;" * 700 + "- " * 160 + "hi")
+        assert ast_to_plain_text(ast) == ">" * (700 - 101) + "- " * 160 + "hi"
+
+    def test_keeps_labelled_links_with_brackets_or_parens_readable(self):
+        """Shared parser fix: link text may hold balanced brackets and the
+        destination balanced parens (CommonMark), so the converter's
+        ``[label](url)`` output reads as upstream's plain text."""
+        ast = self.converter.to_ast("See <https://example.com|build [failed]>")
+        assert ast_to_plain_text(ast) == "See build [failed]"
+        ast = self.converter.to_ast("See <https://en.wikipedia.org/wiki/Foo_(bar)|Foo>")
+        assert ast_to_plain_text(ast) == "See Foo"
+        link = ast["children"][0]["children"][1]
+        assert (link["type"], link["url"]) == ("link", "https://en.wikipedia.org/wiki/Foo_(bar)")
+
+    def test_keeps_trailing_text_after_a_code_block_as_a_paragraph(self):
+        ast = self.converter.to_ast("```x``` &gt; note")
+        assert ast["children"][0]["type"] == "code"
+        assert ast["children"][0]["value"] == "x"
+        assert ast["children"][1]["type"] == "paragraph"
+        # The escaped ``\>`` reads as text, not a blockquote, and the
+        # paragraph's leading space is stripped (CommonMark).
+        assert ast_to_plain_text(ast) == "x\n\n> note"
+
+    def test_keeps_code_content_verbatim_inside_the_fence(self):
+        ast = self.converter.to_ast("```int *a = *b;```")
+        assert ast["children"][0]["type"] == "code"
+        assert ast["children"][0]["value"] == "int *a = *b;"
+
+    def test_to_ast_unescapes_slack_entities(self):
+        """Python parity fix: the old inline regex copy in ``to_ast`` skipped
+        ``unescape_slack_text``, so ``&lt;`` reached handlers verbatim."""
+        ast = self.converter.to_ast("a &lt;b&gt; &amp; c")
+        assert ast_to_plain_text(ast) == "a <b> & c"
 
     def test_converts_bold(self):
         result = self.converter.to_markdown("Hello *world*!")
@@ -397,7 +489,9 @@ class TestExtractPlainTextAdditional:
         assert self.converter.extract_plain_text("Visit <https://example.com>") == "Visit https://example.com"
 
     def test_extracts_channel_mention_with_name(self):
-        assert self.converter.extract_plain_text("Join <#C123|general>") == "Join #general"
+        # Labeled channel tokens keep the id (vercel/chat#756); extract_plain_text
+        # is the base to_ast + ast_to_plain_text (upstream has no Slack override).
+        assert self.converter.extract_plain_text("Join <#C123|general>") == "Join #general (C123)"
 
     def test_extracts_bare_channel_mention(self):
         assert self.converter.extract_plain_text("Join <#C123>") == "Join #C123"

@@ -201,9 +201,7 @@ class TestPastedTables:
         # Cell tokens are emitted as mrkdwn for the converter that renders body text.
         assert _block_text(cell) == "<#C789> <!subteam^S789> July 11 #ff0000"
         message = _parse(text="", blocks=[_table([cell])])
-        # Upstream expects ``@S789``: rendering ``<!subteam^…>`` belongs to the
-        # mrkdwn converter (``convertSpecialMentions``), ported by #283.
-        assert message.text == "#C789 <!subteam^S789> July 11 #ff0000"
+        assert message.text == "#C789 @S789 July 11 #ff0000"
 
     def test_joins_rich_text_list_items_in_a_cell_with_newlines(self):
         cell = {
@@ -380,10 +378,7 @@ class TestAlertAttachments:
         # The unclosed fence swallows the rest of the body, but the
         # attachment parses in isolation and stays a paragraph.
         assert [child["type"] for child in message.formatted["children"]] == ["paragraph", "code", "paragraph"]
-        # Upstream expects "Deploy failed:\n\nTypeError: boom\n\n…": until #283
-        # the body's plain text keeps the pre-#210 regex rendering (see
-        # ``SlackAdapter._assemble_content``), so the fence stays in ``text``.
-        assert message.text == "Deploy failed:\n```\nTypeError: boom\n\nDeploy status\nEnvironment: production"
+        assert message.text == "Deploy failed:\n\nTypeError: boom\n\nDeploy status\nEnvironment: production"
 
     def test_uses_the_fallback_when_attachment_blocks_carry_nothing_renderable(self):
         message = _parse(
@@ -480,11 +475,9 @@ class TestAlertAttachments:
             "blocks": [_table(cells)],
         }
         message = await adapter._parse_slack_message(event, THREAD_ID)
-        # The channel cell is a Python addition. Upstream's converter renders a
-        # labelled channel as ``#general (C789)`` (adapter-slack format/index.ts
-        # ``convertSlackTokens``); our ``to_ast`` gains that rewrite with #283,
-        # which updates this to "@Test Bot\t#general (C789)".
-        assert message.text == "@Test Bot\t#general"
+        # The channel cell is a Python addition; the converter renders a
+        # labelled channel as ``#general (C789)`` (upstream ``convertSlackTokens``).
+        assert message.text == "@Test Bot\t#general (C789)"
         client.users_info.assert_awaited_once_with(user="U_BOT")
 
     async def test_resolves_mentions_in_trailing_and_attachment_tables_in_one_wave(self):
@@ -569,21 +562,27 @@ class TestPythonContentGuards:
         assert parsed.text == "lead\n\nBody bold\n\ntail\n\npre\n\nline one\n\nline two\n\nx\t2"
 
     @pytest.mark.parametrize(
-        "text",
+        ("text", "expected"),
         [
-            "```npm test```",
-            "run ```npm test``` please",
-            "can you fix this?\n```def foo():\n    return 1```",
-            "- item\n> quoted `code`",
+            ("```npm test```", "npm test"),
+            ("can you fix this?\n```def foo():\n    return 1```", "can you fix this?\n\ndef foo():\n    return 1"),
+            ("- item\n> quoted `code`", "item\n\nquoted code"),
+            (" ", ""),
+            ("hi\n", "hi"),
+            # Values below are upstream's (slackMrkdwnToMarkdown + remark toPlainText).
+            ("run ```npm test``` please", "run\n\nnpm test\n\nplease"),
+            ("  lead and trail  ", "lead and trail"),
+            ("-_-", "-_-"),
+            ("ok\n-_-", "ok\n-_-"),
+            ("see my_notes: <https://example.com/?utm_source=slack|link>", "see my_notes: link"),
+            ("my_var see <https://example.com/my_page|page>", "my_var see page"),
         ],
     )
-    async def test_body_text_keeps_its_pre_283_rendering(self, text: str):
-        """Until #283 ports the fence normalization, the body's plain text keeps
-        ``extract_plain_text``; deriving it from ``to_ast`` would drop code on
-        a fence's opening line. Tables and attachments still append."""
+    async def test_body_text_is_the_plain_text_of_formatted(self, text: str, expected: str):
+        """``message.text`` is ``toPlainText(formatted)`` on both parse paths:
+        a fence keeps its first code line, and list markers, ``>`` and
+        backticks drop. Tables append as further root children."""
         adapter = _adapter()
-        expected = adapter._format_converter.extract_plain_text(text)
-        assert expected == text
         event = {
             "type": "message",
             "user": "U123",
@@ -596,21 +595,7 @@ class TestPythonContentGuards:
         parsed = await adapter._parse_slack_message(event, THREAD_ID)
         assert sync.text == parsed.text == expected
         with_table = adapter.parse_message({**event, "blocks": [{"type": "section"}, _table([_raw("cell")])]})
-        assert with_table.text == f"{expected}\n\ncell"
-
-    @pytest.mark.parametrize(
-        ("text", "blocks", "expected"),
-        [
-            (" ", [], " "),
-            ("hi\n", [], "hi\n"),
-            (" ", [{"type": "section"}, _table([_raw("cell")])], "cell"),
-            ("hi\n", [{"type": "section"}, _table([_raw("cell")])], "hi\n\ncell"),
-        ],
-    )
-    def test_body_whitespace_joins_like_root_children(self, text: str, blocks: list[Any], expected: str):
-        """Alone, the body keeps its pre-#210 text; beside other content its
-        trailing whitespace goes, as ``toPlainText`` joins parsed blocks."""
-        assert _parse(text=text, blocks=blocks).text == expected
+        assert with_table.text == "\n\n".join(piece for piece in (expected, "cell") if piece)
 
     def test_does_not_surface_the_title_link_of_an_unfurl(self):
         message = _parse(

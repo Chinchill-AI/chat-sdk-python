@@ -312,11 +312,28 @@ def _restore_escapes_as_literal_pair(text: str) -> str:
 # future surface ever feeds untrusted markdown with adversarial
 # bracket counts, switch to a character-level walker for link/image
 # content (the rest of `_parse_inline` is bounded by message size).
+_LINK_LABEL_ATOM = r"[^\[\]﷐`]|﷐.|`[^`]*`|`(?![^`]*`)"
+
 _INLINE_PATTERNS = [
     # Images: ![alt](url) or ![alt](url "title")
     ("image", re.compile(r'(?<!﷐)!\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
     # Links: [text](url) or [text](url "title")
-    ("link", re.compile(r'(?<!﷐)\[((?:[^\]﷐]|﷐.)*)\]\((\S+?)(?:\s+"([^"]*)")?\)')),
+    # CommonMark allows balanced brackets in link text and balanced parens in
+    # the destination (one level here): ``[build [failed]](u)``,
+    # ``[Foo](https://en.wikipedia.org/wiki/Foo_(bar))``. Escape-sentinel
+    # pairs (``\(`` / ``\)``) are consumed whole, so they never balance.
+    # A nested ``[...]`` directly followed by ``(`` is an inner link, and links
+    # never nest: ``[[a](u) b](v)`` is the inner link with literal brackets.
+    # Code spans bind tighter than link brackets, so a closed `` `...` `` in
+    # the label is opaque (``[`[`](u)`` is a link); a backtick with no closer
+    # is literal. The alternatives are mutually exclusive (no backtracking).
+    (
+        "link",
+        re.compile(
+            r"(?<!﷐)\[((?:" + _LINK_LABEL_ATOM + r"|\[(?:" + _LINK_LABEL_ATOM + r")*\](?!\())*)\]"
+            r'\(((?:﷐\S|[^\s()﷐]|\((?:﷐\S|[^\s()﷐])*\))+?)(?:\s+"([^"]*)")?\)'
+        ),
+    ),
     # Inline code: `code`
     ("inlineCode", re.compile(r"(?<!﷐)`([^`]+)`")),
     # Bold: **text**
@@ -327,8 +344,11 @@ _INLINE_PATTERNS = [
     ("delete", re.compile(r"(?<!﷐)~~(.+?)~~")),
     # Emphasis: *text*  (not preceded/followed by * or sentinel)
     ("emphasis_star", re.compile(r"(?<![*﷐])\*(?!\*)(.+?)(?<![*﷐])\*(?!\*)")),
-    # Emphasis: _text_  (not preceded/followed by _ or sentinel)
-    ("emphasis_under", re.compile(r"(?<![_﷐])_(?!_)(.+?)(?<![_﷐])_(?!_)")),
+    # Emphasis: _text_  (not preceded/followed by _ or sentinel). CommonMark
+    # forbids intraword ``_`` emphasis: the opener may not follow a word
+    # character and the closer may not precede one, so ``my_var`` and
+    # ``?utm_source=x`` keep their underscores.
+    ("emphasis_under", re.compile(r"(?<![\w﷐])_(?!_)(.+?)(?<![_﷐])_(?!\w)")),
 ]
 
 
@@ -526,8 +546,12 @@ def _parse_inline(text: str, *, _already_protected: bool = False) -> list[Conten
 
 # Patterns used by the block parser
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
-_THEMATIC_BREAK_RE = re.compile(r"^([-*_]\s*){3,}\s*$")
-_FENCED_CODE_START_RE = re.compile(r"^(`{3,}|~{3,})(.*)")
+# CommonMark: three or more of the *same* marker (``-_-`` is text, not a break).
+# Lines are split on ``\n`` only, so a CRLF line keeps a trailing ``\r``.
+_THEMATIC_BREAK_RE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}[ \t]*\r?$")
+# CommonMark: a backtick fence's info string may not contain a backtick, so
+# "```npm test```" on one line is a (code span) paragraph, not a fence.
+_FENCED_CODE_START_RE = re.compile(r"^(`{3,}(?=[^`]*$)|~{3,})(.*)")
 _BLOCKQUOTE_RE = re.compile(r"^>\s?(.*)")
 _ORDERED_LIST_RE = re.compile(r"^(\d+)[.)]\s+(.*)")
 _UNORDERED_LIST_RE = re.compile(r"^[-*+]\s+(.*)")
@@ -685,6 +709,18 @@ def parse_markdown(text: str) -> Root:
 
     Returns a Root dict ``{"type": "root", "children": [...]}``.
     """
+    return _parse_blocks(text, 0)
+
+
+# Divergence from upstream -- see docs/UPSTREAM_SYNC.md. Blockquotes parse
+# recursively; past this depth the rest stays literal text so ``> > > ...``
+# from untrusted input cannot raise ``RecursionError`` (remark has no cap).
+# One frame per level; 100 (markdown-it's default ``maxNesting``) leaves most
+# of Python's default recursion limit (1,000) for nested lists inside the quote.
+_MAX_BLOCKQUOTE_DEPTH = 100
+
+
+def _parse_blocks(text: str, quote_depth: int) -> Root:
     children: list[Content] = []
     lines = text.split("\n")
     i = 0
@@ -761,7 +797,11 @@ def parse_markdown(text: str) -> Root:
                 else:
                     break
             # Recursively parse blockquote content
-            bq_ast = parse_markdown("\n".join(bq_lines))
+            bq_text = "\n".join(bq_lines)
+            if quote_depth >= _MAX_BLOCKQUOTE_DEPTH:
+                children.append(make_blockquote([make_paragraph([make_text(bq_text)])]))
+                continue
+            bq_ast = _parse_blocks(bq_text, quote_depth + 1)
             children.append(make_blockquote(bq_ast.get("children", [])))
             continue
 
@@ -809,7 +849,10 @@ def parse_markdown(text: str) -> Root:
             para_lines.append(next_line)
             i += 1
 
-        children.append(make_paragraph(_parse_inline("\n".join(para_lines))))
+        # CommonMark strips each paragraph line's leading spaces/tabs and the
+        # paragraph's trailing ones (``"run \n```"`` reads ``run``).
+        para_text = "\n".join(para_line.lstrip(" \t") for para_line in para_lines).rstrip(" \t")
+        children.append(make_paragraph(_parse_inline(para_text)))
 
     return make_root(children)
 

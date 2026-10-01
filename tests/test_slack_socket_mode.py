@@ -517,24 +517,81 @@ class TestRouteSocketEvent:
         assert isinstance(body_arg, dict)
         assert body_arg.get("response_action") == "errors"
 
-    async def test_retry_attempt_is_skipped_but_acked(self):
-        adapter = _make_socket_adapter()
+    async def test_processes_retries_like_first_deliveries_dedupe_drops_true_duplicates(self):
+        """Port of upstream "processes retries like first deliveries (dedupe
+        drops true duplicates)" (vercel/chat#667).
+
+        A retry may be the ONLY delivery the app ever sees (the original was
+        sent while no socket was connected during a restart), so it is routed
+        normally; ``Chat.process_message`` dedupes by message id when the
+        original was handled.
+        """
+        logger = MagicMock()
+        adapter = _make_socket_adapter(logger=logger)
         chat = _make_mock_chat()
         adapter._chat = chat
         request = MagicMock()
         request.envelope_id = "env-1"
         request.type = "events_api"
-        request.payload = {"event": {"type": "message"}}
-        request.retry_attempt = 2  # Slack retry — should be skipped.
+        request.payload = {
+            "event": {
+                "type": "message",
+                "channel": "C123",
+                "ts": "1234567890.123456",
+                "text": "retried",
+                "user": "U_USER",
+            }
+        }
+        request.retry_attempt = 1
+        request.retry_reason = "timeout"
 
         client = MagicMock()
         client.send_socket_mode_response = AsyncMock()
 
         await adapter._on_socket_request(client, request)
+        await asyncio.sleep(0)
 
-        # Ack went out (so Slack stops resending), but no dispatch.
         assert client.send_socket_mode_response.await_count == 1
-        assert chat.process_message.called is False
+        chat.process_message.assert_called_once()
+        assert chat.process_message.call_args.args[1] == "slack:C123:1234567890.123456"
+        logger.info.assert_any_call(
+            "Processing socket mode retry",
+            {"retry_attempt": 1, "retry_reason": "timeout", "type": "events_api"},
+        )
+
+    @pytest.mark.parametrize(("marker_seeded", "dispatched"), [(True, False), (False, True)])
+    async def test_socket_retry_consults_the_event_delivered_marker(self, marker_seeded: bool, dispatched: bool):
+        """A live socket retry carries its count to the #268 event-id marker:
+        an already-dispatched ``event_id`` is acked and dropped, while a retry
+        whose first delivery never arrived is still processed."""
+        adapter = _make_socket_adapter()
+        chat = _make_mock_chat()
+        adapter._chat = chat
+        if marker_seeded:
+            chat.get_state()._cache["slack:event-delivered:Ev1"] = True
+        request = MagicMock()
+        request.envelope_id = "env-1"
+        request.type = "events_api"
+        request.payload = {
+            "event_id": "Ev1",
+            "event": {
+                "type": "message",
+                "channel": "C123",
+                "ts": "1234567890.123456",
+                "text": "retried",
+                "user": "U_USER",
+            },
+        }
+        request.retry_attempt = 1
+        request.retry_reason = "timeout"
+        client = MagicMock()
+        client.send_socket_mode_response = AsyncMock()
+
+        await adapter._on_socket_request(client, request)
+        await asyncio.sleep(0)
+
+        assert client.send_socket_mode_response.await_count == 1
+        assert chat.process_message.called is dispatched
 
     async def test_unknown_event_type_acks_and_does_nothing(self):
         adapter = _make_socket_adapter()

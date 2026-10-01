@@ -17,6 +17,8 @@ import re
 from datetime import datetime
 from typing import Literal, NotRequired, TypedDict
 
+from chat_sdk.shared._js_compat import JS_WHITESPACE as _JS_WHITESPACE
+
 
 class SlackPlainTextObject(TypedDict):
     """A Slack ``plain_text`` composition object."""
@@ -40,7 +42,25 @@ _CONTROL_PATTERN = re.compile(r"[<>|]")
 _DATE_CONTROL_PATTERN = re.compile(r"[\^|>]")
 _SLACK_ID_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 _SLACK_USER_TOKEN_PATTERN = re.compile(r"(?<![<\w])@([A-Z][A-Z0-9_]+)")
+# ``\A``/``\Z`` are JS ``^``/``$`` without the ``m`` flag (Python's ``$`` also
+# matches before a trailing newline).
+_SPECIAL_MENTION_PATTERN = re.compile(r"\A<!(here|channel|everyone)(?:\|[^<>]*)?>\Z")
+_LABELED_GROUP_PATTERN = re.compile(r"\A<!subteam\^([A-Z0-9_]+)\|@?([^<>]+)>\Z")
+_GROUP_PATTERN = re.compile(r"\A<!subteam\^([A-Z0-9_]+)>\Z")
 _TEXT_OBJECT_MAX_LENGTH = 3000
+_CODE_FENCE = "```"
+_LEADING_WHITESPACE_PATTERN = re.compile(r"^[ \t]+")
+# Line prefixes CommonMark promotes to a block construct (blockquote,
+# heading, list item, fence, thematic break, HTML) -- in pre-unescape form.
+# ``[0-9]`` is JS ``\d`` (Python's ``\d`` matches every Unicode digit).
+_BLOCK_MARKER_PATTERN = re.compile(
+    r"^(?:&gt;|&lt;|#{1,6}(?=[ \t\n]|\Z)|[-+*](?=[ \t\n]|\Z)|`{3,}|~{3,}|(?:[-*_][ \t]*){3,}(?=\n|\Z))"
+)
+_ORDERED_LIST_MARKER_PATTERN = re.compile(r"^([0-9]{1,9})([.)])(?=[ \t\n]|\Z)")
+# First character that ends a ``<...>`` token scan: its close, or a line break.
+_ANGLE_TOKEN_STOP = re.compile(r"[>\n\r]")
+# What JS ``trimStart`` removes.
+_JS_LEADING_WHITESPACE = re.compile(f"[{re.escape(_JS_WHITESPACE)}]*")
 
 
 def escape_slack_text(text: str) -> str:
@@ -131,25 +151,250 @@ def format_slack_date(
 def slack_mrkdwn_to_markdown(mrkdwn: str) -> str:
     """Normalize Slack mrkdwn to standard Markdown.
 
-    Rewrites user/channel mentions, links, bold, and strikethrough, then
+    Rewrites user, channel and special mentions, links (including the
+    inverted ``<label|https://...>`` form), bold, and strikethrough; puts
+    each paired ```` ``` ```` fence on its own lines (Slack treats text right
+    after an opening fence as code, CommonMark as the info string); then
     unescapes Slack's ``&amp;``/``&lt;``/``&gt;`` entities.
     """
-    markdown = mrkdwn
+    markdown = _convert_mrkdwn_with_code_fences(mrkdwn) if _CODE_FENCE in mrkdwn else _convert_mrkdwn_text(mrkdwn)
+    return unescape_slack_text(markdown)
+
+
+def _convert_slack_tokens(mrkdwn: str) -> str:
     # User mentions: <@U123|name> -> @name or <@U123> -> @U123
-    markdown = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", markdown)
+    markdown = re.sub(r"<@([A-Z0-9_]+)\|([^<>]+)>", r"@\2", mrkdwn)
     markdown = re.sub(r"<@([A-Z0-9_]+)>", r"@\1", markdown)
-    # Channel mentions: <#C123|name> -> #name
-    markdown = re.sub(r"<#[A-Z0-9_]+\|([^<>]+)>", r"#\1", markdown)
+    # Channel mentions keep the id: <#C123|name> -> #name (C123)
+    markdown = re.sub(r"<#([A-Z0-9_]+)\|([^<>]+)>", r"#\2 (\1)", markdown)
     markdown = re.sub(r"<#([A-Z0-9_]+)>", r"#\1", markdown)
+    # Inverted links (frequently hallucinated): <label|https://...> -> <https://...|label>
+    markdown = re.sub(r"<(?!https?://)([^<>|]+)\|(https?://[^|<>]+)>", r"<\2|\1>", markdown)
     # Links: <url|text> -> [text](url)
     markdown = re.sub(r"<(https?://[^|<>]+)\|([^<>]+)>", r"[\2](\1)", markdown)
     # Bare links: <url> -> url
-    markdown = re.sub(r"<(https?://[^<>]+)>", r"\1", markdown)
+    return re.sub(r"<(https?://[^<>]+)>", r"\1", markdown)
+
+
+def _convert_mrkdwn_text(mrkdwn: str) -> str:
+    markdown = _convert_slack_tokens(_convert_special_mentions(mrkdwn))
     # Bold: *text* -> **text** (Slack uses single * for bold)
     markdown = re.sub(r"(?<![_*\\])\*([^*\n]+)\*(?![_*])", r"**\1**", markdown)
     # Strikethrough: ~text~ -> ~~text~~
-    markdown = re.sub(r"(?<!~)~([^~\n]+)~(?!~)", r"~~\1~~", markdown)
-    return unescape_slack_text(markdown)
+    return re.sub(r"(?<!~)~([^~\n]+)~(?!~)", r"~~\1~~", markdown)
+
+
+class _AngleTokenScanner:
+    """Upstream ``findAngleTokenEnd``, remembering the last failed scan.
+
+    A failed scan stops at a line break or the end of the text, and every
+    ``<`` before that stop fails the same way (no ``>`` lies in between).
+    Remembering the stop keeps a run of unclosed ``<`` linear instead of
+    rescanning to the end of the line for each one; results are identical.
+    """
+
+    __slots__ = ("_fail_until", "_text")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._fail_until = -1
+
+    def end(self, index: int) -> int:
+        """Index just past the ``>`` closing the token at *index*, or ``-1``."""
+        if index < self._fail_until:
+            return -1
+        match = _ANGLE_TOKEN_STOP.search(self._text, index + 1)
+        if match is not None and match.group() == ">":
+            return match.end()
+        self._fail_until = match.start() if match is not None else len(self._text)
+        return -1
+
+
+def _convert_special_mentions(mrkdwn: str) -> str:
+    """``<!here>`` -> ``@here``, ``<!subteam^S1|@eng>`` -> ``@eng``; code stays literal."""
+    parts: list[str] = []
+    start = 0
+    cursor = 0
+    length = len(mrkdwn)
+    angle = _AngleTokenScanner(mrkdwn)
+
+    while cursor < length:
+        if mrkdwn.startswith(_CODE_FENCE, cursor):
+            cursor += len(_CODE_FENCE)
+            continue
+        char = mrkdwn[cursor]
+        if char == "`":
+            code_end = _find_inline_code_end(mrkdwn, cursor)
+            cursor = cursor + 1 if code_end == -1 else code_end
+            continue
+        if char != "<":
+            cursor += 1
+            continue
+        end = angle.end(cursor)
+        if end == -1:
+            cursor += 1
+            continue
+        token = mrkdwn[cursor:end]
+        token = _SPECIAL_MENTION_PATTERN.sub(r"@\1", token, count=1)
+        token = _LABELED_GROUP_PATTERN.sub(r"@\2", token, count=1)
+        token = _GROUP_PATTERN.sub(r"@\1", token, count=1)
+        parts.append(mrkdwn[start:cursor])
+        parts.append(token)
+        start = end
+        cursor = end
+
+    parts.append(mrkdwn[start:])
+    return "".join(parts)
+
+
+def _convert_mrkdwn_with_code_fences(mrkdwn: str) -> str:
+    """Rewrite each paired ```` ``` ```` fence onto its own lines.
+
+    Slack treats text immediately after an opening fence as code, while
+    CommonMark treats it as the fence's info string. Everything Slack renders
+    literally -- unpaired fences, fences inside inline code or ``<...>``
+    tokens, and fences on blockquote lines -- stays plain text. Fence content
+    skips the emphasis rewrites so code like ``*a`` survives verbatim.
+
+    Mirrors :func:`chat_sdk.shared.code_fences.normalize_code_fences` with
+    mrkdwn's entity escaping (``&gt;`` blockquotes, ``<...>`` control
+    tokens), as upstream does. Keep the two in sync.
+    """
+    parts: list[str] = []
+    # ``result.length`` / ``result.endsWith("\n")`` without re-joining ``parts``.
+    result_len = 0
+    result_ends_with_newline = False
+    text_start = 0
+    cursor = 0
+    length = len(mrkdwn)
+    angle = _AngleTokenScanner(mrkdwn)
+    quote_lines = _BlockquoteLines(mrkdwn)
+    # Set when the closing fence splits a line: the text after it lands at the
+    # start of a new line, where CommonMark would promote a leading block
+    # marker Slack rendered inline.
+    moved_to_own_line = False
+
+    def append(value: str) -> None:
+        nonlocal result_len, result_ends_with_newline
+        if value:
+            parts.append(value)
+            result_len += len(value)
+            result_ends_with_newline = value.endswith("\n")
+
+    def flush_text_before(end: int) -> None:
+        nonlocal moved_to_own_line
+        text = mrkdwn[text_start:end]
+        if moved_to_own_line:
+            text = _escape_leading_block_marker(text)
+            moved_to_own_line = False
+        append(_convert_mrkdwn_text(text))
+
+    while cursor < length:
+        char = mrkdwn[cursor]
+        if char == "<":
+            token_end = angle.end(cursor)
+            cursor = cursor + 1 if token_end == -1 else token_end
+            continue
+        if char != "`":
+            cursor += 1
+            continue
+        if not mrkdwn.startswith(_CODE_FENCE, cursor):
+            span_end = _find_inline_code_end(mrkdwn, cursor)
+            cursor = cursor + 1 if span_end == -1 else span_end
+            continue
+
+        content_start = cursor + len(_CODE_FENCE)
+        content_end = mrkdwn.find(_CODE_FENCE, content_start)
+        if content_end == -1 or quote_lines.contains(cursor):
+            # Slack renders an unpaired or quoted ``` literally. Upstream-parity
+            # choice: the fence is left as is (adapter-slack format/index.ts
+            # convertMrkdwnWithCodeFences), so a line-leading unpaired
+            # "```npm test" still opens an empty CommonMark code block there
+            # too. A quoted "```c```" is no fence opener (its info string has a
+            # backtick); ``parse_markdown`` follows that rule.
+            cursor = content_start
+            continue
+
+        flush_text_before(cursor)
+        if result_len > 0 and not result_ends_with_newline:
+            append("\n")
+        content = mrkdwn[content_start:content_end]
+        append(_CODE_FENCE)
+        if not content.startswith("\n"):
+            append("\n")
+        append(_convert_slack_tokens(content))
+        if not content.endswith("\n"):
+            append("\n")
+        append(_CODE_FENCE)
+
+        cursor = content_end + len(_CODE_FENCE)
+        text_start = cursor
+        if cursor < length and mrkdwn[cursor] != "\n":
+            append("\n")
+            moved_to_own_line = True
+
+    flush_text_before(length)
+    return "".join(parts)
+
+
+def _find_inline_code_end(mrkdwn: str, index: int) -> int:
+    """End of the inline code span opening at *index*, or ``-1``.
+
+    Slack inline code spans never cross line breaks. The newline search is
+    bounded by the close (same result as upstream's ``newline < close``)
+    so a long line of backticks stays linear.
+    """
+    close = mrkdwn.find("`", index + 1)
+    if close == -1:
+        return -1
+    if mrkdwn.find("\n", index + 1, close) != -1:
+        return -1
+    return close + 1
+
+
+class _BlockquoteLines:
+    """Upstream ``isOnBlockquoteLine``, remembering the current line.
+
+    Upstream computes ``slice(lineStart, index).trimStart().startsWith("&gt;")``
+    per fence. *index* only grows and always sits on a backtick, so the
+    leading-whitespace run (and thus the answer) is fixed per line: the line
+    start is found by scanning only the new text since the last call, and
+    the answer is computed once per line. Results are identical; many fences
+    on one long line stay linear.
+    """
+
+    __slots__ = ("_line_start", "_quoted", "_scanned", "_text")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._scanned = 0
+        self._line_start = 0
+        self._quoted: bool | None = None
+
+    def contains(self, index: int) -> bool:
+        """Whether the line holding *index* starts (after whitespace) with ``&gt;``."""
+        newline = self._text.rfind("\n", self._scanned, index)
+        self._scanned = index
+        if newline != -1:
+            self._line_start = newline + 1
+            self._quoted = None
+        if self._quoted is None:
+            indent = _JS_LEADING_WHITESPACE.match(self._text, self._line_start, index)
+            content_start = indent.end() if indent is not None else self._line_start
+            self._quoted = self._text.startswith("&gt;", content_start, index)
+        return self._quoted
+
+
+def _escape_leading_block_marker(text: str) -> str:
+    match = _LEADING_WHITESPACE_PATTERN.match(text)
+    whitespace = match.group(0) if match else ""
+    # Collapse the leading separator so it cannot become an indented code
+    # block, then defuse any block marker now sitting at the line start.
+    prefix = " " if whitespace else ""
+    rest = text[len(whitespace) :]
+    if _BLOCK_MARKER_PATTERN.match(rest):
+        return f"{prefix}\\{rest}"
+    return prefix + _ORDERED_LIST_MARKER_PATTERN.sub(r"\1\\\2", rest, count=1)
 
 
 def markdown_bold_to_slack_mrkdwn(markdown: str) -> str:
