@@ -5549,10 +5549,15 @@ class SlackAdapter:
                 {"configured": self._native_streaming, "broken": self._native_streaming_broken},
             )
             return None
-        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
-
         token = self._get_token()
         client = self._get_client(token)
+        if not callable(getattr(client, "chat_stream", None)):
+            # Python-specific: slack_sdk releases older than the streaming
+            # helper (the declared floor is 3.27.0) have no ``chat_stream``.
+            # Defer to core's post+edit before the stream is read.
+            self._logger.debug("Slack: using fallback stream - slack_sdk has no chat_stream")
+            return None
+        self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
 
         stream_kwargs: dict[str, Any] = {"channel": channel, "thread_ts": thread_ts}
         if recipient_user_id:

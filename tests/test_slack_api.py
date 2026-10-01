@@ -1600,6 +1600,29 @@ class TestStream:
         assert client.get_calls("chat_postMessage") == []
 
     @pytest.mark.asyncio
+    async def test_delegates_to_fallback_when_slack_sdk_has_no_chat_stream(self):
+        # Python-specific: slack_sdk releases before the streaming helper
+        # (the declared floor is 3.27.0) have no ``chat_stream``. A DM, which
+        # now streams natively without recipient ids, must still defer to
+        # core's post+edit before the stream is read instead of raising.
+        adapter = _make_adapter()
+
+        class _OldClient:
+            pass
+
+        adapter._get_client = lambda token=None: _OldClient()  # type: ignore[assignment]
+        consumed: list[str] = []
+
+        async def text_gen() -> AsyncIterator[str]:
+            consumed.append("Hello")
+            yield "Hello"
+
+        result = await adapter.stream("slack:D123:1234567890.000000", text_gen())
+
+        assert result is None
+        assert consumed == []
+
+    @pytest.mark.asyncio
     async def test_allows_dm_streams_without_recipient_context(self):
         # Upstream "allows DM streams without recipient context" (438f5513):
         # a D… channel streams natively with no recipient ids, and neither

@@ -1910,7 +1910,10 @@ Python-only #94 row is retired.
   iterating `text_stream`, in upstream order: empty `thread_ts` (top-level
   DMs), a non-`D` channel without both recipient ids, then native streaming
   off (`SlackAdapterConfig.native_streaming=False`, upstream `nativeStreaming`)
-  or latched broken. DMs stream natively without recipient ids.
+  or latched broken. DMs stream natively without recipient ids. Python adds
+  one more `None` return before the stream is read: a slack_sdk client with
+  no `chat_stream` (releases older than the streaming helper; the declared
+  floor is 3.27.0), so those DM replies keep using core's post+edit.
 - **Start args.** `recipient_user_id` / `recipient_team_id` are passed to
   `chat_stream` only when truthy. The #95 `team_id` is passed only when
   `recipient_team_id` is (see the #95 row).
