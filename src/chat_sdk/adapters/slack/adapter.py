@@ -6056,7 +6056,11 @@ class SlackAdapter:
                 fence = None
             closer = ("" if sent.endswith("\n") else "\n") + fence.marker if fence is not None else ""
             # ``head`` may be this segment's first text, so it takes any
-            # prefix a previous rotation queued for it.
+            # prefix a previous rotation queued for it. Upstream parity
+            # (chat@4.41.1 index.ts:6281-6282): an empty ``head`` skips the
+            # queued prefix even when a closer is sent, so a segment that got
+            # only a structured-chunk replay before rotating again ends with
+            # a bare fence marker. Kept as upstream: no Python-specific hazard.
             final_text = (with_segment_prefix(head) if head else "") + closer
             age_ms = segment_age_ms()
             stop_kwargs: dict[str, Any] = {"token": token}
