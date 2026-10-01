@@ -102,6 +102,8 @@ def _make_mock_chat(state: MagicMock) -> MagicMock:
     chat.process_modal_close = MagicMock()
     chat.process_slash_command = MagicMock()
     chat.process_member_joined_channel = MagicMock()
+    chat.process_message_updated = MagicMock()
+    chat.process_message_deleted = MagicMock()
     chat.get_state = MagicMock(return_value=state)
     chat.get_user_name = MagicMock(return_value="test-bot")
     chat.get_logger = MagicMock(return_value=MagicMock())
@@ -940,27 +942,345 @@ class TestMessageSubtypes:
         body = json.dumps({"type": "event_callback", "team_id": "T123", "event": event})
         return _make_signed_request(body)
 
-    @pytest.mark.asyncio
-    async def test_message_changed_does_not_route_to_process_message(self):
-        # ``message_changed`` is now routed to the unfurl-cache handler
-        # (see TestUnfurlMetadata) rather than into ``chat.process_message``.
-        # The visible contract from the chat layer's perspective is the
-        # same: message_changed events do not surface as new messages.
-        adapter = _make_adapter(bot_user_id="U_BOT")
-        state = _make_mock_state()
-        chat = _make_mock_chat(state)
+    @staticmethod
+    def _event_req(event: dict[str, Any]) -> _FakeRequest:
+        return _make_signed_request(json.dumps({"type": "event_callback", "team_id": "T123", "event": event}))
+
+    @staticmethod
+    async def _init(**overrides: Any) -> tuple[SlackAdapter, MagicMock]:
+        adapter = _make_adapter(bot_user_id="U_BOT", **overrides)
+        chat = _make_mock_chat(_make_mock_state())
         await adapter.initialize(chat)
-        await adapter.handle_webhook(self._make_subtype_req("message_changed"))
+        return adapter, chat
+
+    # TS: "routes the message, its edit, and its delete to one thread id in %s"
+    # Only the "a flat DM" case; #214 adds "a threaded agent_view DM".
+    @pytest.mark.asyncio
+    async def test_routes_the_message_its_edit_and_its_delete_to_one_thread_id_in_a_flat_dm(self):
+        adapter, chat = await self._init()
+        dm = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "D_DM",
+            "channel_type": "im",
+            "text": "hello",
+            "ts": "1111.0001",
+        }
+        await adapter.handle_webhook(self._event_req(dm))
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1111.0002",
+                    "message": {**dm, "text": "edited", "edited": {"ts": "1111.0002"}},
+                    "previous_message": dm,
+                }
+            )
+        )
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1111.0003",
+                    "deleted_ts": "1111.0001",
+                    "previous_message": dm,
+                }
+            )
+        )
+
+        expected = "slack:D_DM:"
+        assert chat.process_message.call_args.args[1] == expected
+        assert chat.process_message_updated.call_args.args[1] == expected
+        assert chat.process_message_deleted.call_args.args[0].thread_id == expected
+
+    # TS: "dispatches message_changed subtypes as message updates"
+    @pytest.mark.asyncio
+    async def test_dispatches_message_changed_subtypes_as_message_updates(self):
+        adapter, chat = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "channel": "C_CHAN",
+                        "text": "edited text",
+                        "ts": "1234567890.111111",
+                        "edited": {"ts": "1234567891.111111"},
+                    },
+                }
+            )
+        )
+
+        assert not chat.process_message.called
+        chat.process_message_updated.assert_called_once()
+        call = chat.process_message_updated.call_args
+        assert call.args[0] is adapter
+        assert call.args[1] == "slack:C_CHAN:1234567890.111111"
+        assert callable(call.args[2])
+        assert call.kwargs["options"] is None
+        # Edits never reach the delete path either.
+        assert not chat.process_message_deleted.called
+        msg = await call.args[2]()
+        assert msg.id == "1234567890.111111"
+        assert msg.text == "edited text"
+        assert msg.metadata.edited is True
+
+    # TS: "forwards the pre-edit message so handlers can diff the change"
+    @pytest.mark.asyncio
+    async def test_forwards_the_pre_edit_message_so_handlers_can_diff_the_change(self):
+        adapter, chat = await self._init()
+        before = {
+            "type": "message",
+            "user": "U_USER",
+            "username": "user",
+            "channel": "C_CHAN",
+            "text": "before",
+            "ts": "1234567890.111111",
+        }
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**before, "text": "after", "edited": {"ts": "1234567891.111111"}},
+                    "previous_message": before,
+                }
+            )
+        )
+
+        previous_factory = chat.process_message_updated.call_args.kwargs["previous_message"]
+        assert callable(previous_factory)
+        # The pre-edit snapshot parses through the same async path as the new
+        # message so mention rendering matches on both sides of the diff.
+        previous = await previous_factory()
+        assert previous.text == "before"
+        assert previous.thread_id == "slack:C_CHAN:1234567890.111111"
+        assert previous.metadata.edited is False
+
+    # TS: "ignores a message_changed where nothing actually changed"
+    @pytest.mark.asyncio
+    async def test_ignores_a_message_changed_where_nothing_actually_changed(self):
+        adapter, chat = await self._init()
+        # Slack's automatic language detection updates locale metadata and
+        # dispatches message_changed without the message itself changing.
+        unchanged = {
+            "type": "message",
+            "user": "U_USER",
+            "channel": "C_CHAN",
+            "text": "same text",
+            "ts": "1234567890.111111",
+        }
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**unchanged},
+                    "previous_message": {**unchanged},
+                }
+            )
+        )
+
+        assert not chat.process_message_updated.called
         assert not chat.process_message.called
 
+    # TS: "leaves previousMessage undefined when Slack omits it"
     @pytest.mark.asyncio
-    async def test_ignores_message_deleted(self):
-        adapter = _make_adapter(bot_user_id="U_BOT")
-        state = _make_mock_state()
-        chat = _make_mock_chat(state)
-        await adapter.initialize(chat)
-        await adapter.handle_webhook(self._make_subtype_req("message_deleted"))
+    async def test_leaves_previousmessage_undefined_when_slack_omits_it(self):
+        adapter, chat = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "channel": "C_CHAN",
+                        "text": "after",
+                        "ts": "1234567890.111111",
+                        "edited": {"ts": "1234567891.111111"},
+                    },
+                }
+            )
+        )
+
+        chat.process_message_updated.assert_called_once()
+        assert chat.process_message_updated.call_args.kwargs["previous_message"] is None
+
+    # TS: "dispatches hidden message_changed edits as message updates"
+    @pytest.mark.asyncio
+    async def test_dispatches_hidden_message_changed_edits_as_message_updates(self):
+        adapter, chat = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": True,
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1779425554.000100",
+                    "event_ts": "1779425554.000100",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "What do you see in this attachment? Test",
+                        "ts": "1779271807.493869",
+                        "thread_ts": "1779271794.544339",
+                        "edited": {"user": "U_USER", "ts": "1779425554.000000"},
+                    },
+                    "previous_message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "What do you see in this attachment?",
+                        "ts": "1779271807.493869",
+                        "thread_ts": "1779271794.544339",
+                    },
+                }
+            )
+        )
+
         assert not chat.process_message.called
+        chat.process_message_updated.assert_called_once()
+        call = chat.process_message_updated.call_args
+        assert call.args[0] is adapter
+        assert call.args[1] == "slack:D_DM:1779271794.544339"
+        assert callable(call.args[2])
+        assert call.kwargs["options"] is None
+
+    # TS: "ignores hidden message_changed thread metadata updates after deletes"
+    @pytest.mark.asyncio
+    async def test_ignores_hidden_message_changed_thread_metadata_updates_after_deletes(self):
+        adapter, chat = await self._init()
+        snapshot = {
+            "type": "message",
+            "subtype": "assistant_app_thread",
+            "user": "U_BOT",
+            "text": "New Assistant Thread",
+            "ts": "1778127887.294739",
+            "thread_ts": "1778127887.294739",
+            "edited": {"user": "U_BOT", "ts": "1778128187.000000"},
+            "reply_count": 41,
+            "latest_reply": "1779271265.010909",
+        }
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": True,
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1779425682.000300",
+                    "event_ts": "1779425682.000300",
+                    "message": {**snapshot},
+                    "previous_message": {**snapshot},
+                }
+            )
+        )
+
+        assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+
+    # TS: "dispatches message_deleted subtypes as message deletes"
+    @pytest.mark.asyncio
+    async def test_dispatches_message_deleted_subtypes_as_message_deletes(self):
+        from datetime import datetime, timezone
+
+        from chat_sdk.types import MessageDeletedEvent
+
+        adapter, chat = await self._init()
+        event = {
+            "type": "message",
+            "subtype": "message_deleted",
+            "channel": "C_CHAN",
+            "deleted_ts": "1234567890.111111",
+            "event_ts": "1234567891.111111",
+            "previous_message": {
+                "type": "message",
+                "user": "U_USER",
+                "channel": "C_CHAN",
+                "text": "deleted text",
+                "ts": "1234567890.111111",
+            },
+        }
+        await adapter.handle_webhook(self._event_req(event))
+
+        assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+        chat.process_message_deleted.assert_called_once()
+        deleted, options = chat.process_message_deleted.call_args.args
+        assert options is None
+        assert isinstance(deleted, MessageDeletedEvent)
+        assert deleted.adapter is adapter
+        assert deleted.channel_id == "C_CHAN"
+        assert deleted.message_id == "1234567890.111111"
+        assert deleted.thread_id == "slack:C_CHAN:1234567890.111111"
+        assert deleted.deleted_at == datetime.fromtimestamp(1234567891.111111, tz=timezone.utc)
+        # The untouched Slack payload (the webhook copies the envelope team_id
+        # onto it, as upstream does).
+        assert deleted.raw == {**event, "team_id": "T123"}
+        assert deleted.platform is None
+        assert deleted.previous_message is not None
+        assert deleted.previous_message.text == "deleted text"
+        assert deleted.previous_message.id == "1234567890.111111"
+
+    # TS: "ignores message_changed tombstone subtypes"
+    @pytest.mark.asyncio
+    async def test_ignores_message_changed_tombstone_subtypes(self):
+        adapter, chat = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "channel_type": "channel",
+                    "hidden": True,
+                    "ts": "1779426065.000200",
+                    "event_ts": "1779426065.000200",
+                    "message": {
+                        "type": "message",
+                        "subtype": "tombstone",
+                        "user": "USLACKBOT",
+                        "text": "This message was deleted.",
+                        "hidden": True,
+                        "ts": "1778050260.824689",
+                        "thread_ts": "1778050260.824689",
+                    },
+                    "previous_message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "channel": "C_CHAN",
+                        "text": "<@U_BOT> deleted message",
+                        "ts": "1778050260.824689",
+                        "thread_ts": "1778050260.824689",
+                    },
+                }
+            )
+        )
+
+        assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+        assert not chat.process_message_deleted.called
 
     @pytest.mark.asyncio
     async def test_ignores_channel_join(self):
@@ -995,6 +1315,296 @@ class TestMessageSubtypes:
             )
         )
         assert chat.process_message.called
+
+
+class TestMessageLifecyclePythonSpecific:
+    """Python-specific coverage for the Slack edit/delete emitters (#211).
+
+    What to fix if this fails: ``_handle_message_changed`` /
+    ``_handle_message_deleted`` / ``_parse_slack_timestamp`` in
+    ``src/chat_sdk/adapters/slack/adapter.py``.
+    """
+
+    @staticmethod
+    def _event_req(event: dict[str, Any]) -> _FakeRequest:
+        return _make_signed_request(json.dumps({"type": "event_callback", "team_id": "T123", "event": event}))
+
+    @staticmethod
+    async def _init() -> tuple[SlackAdapter, MagicMock, MagicMock]:
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+        client = MagicMock()
+        client.users_info = AsyncMock(
+            return_value={"user": {"name": "alice", "profile": {"display_name": "Alice", "real_name": "Alice A"}}}
+        )
+        adapter._get_client = lambda token=None: client  # type: ignore[method-assign]
+        return adapter, chat, client
+
+    @pytest.mark.asyncio
+    async def test_previous_message_factory_falls_back_to_sync_parse_when_lookup_raises(self):
+        from chat_sdk.testing import MockLogger
+
+        logger = MockLogger()
+        adapter = _make_adapter(bot_user_id="U_BOT", logger=logger)
+        chat = _make_mock_chat(_make_mock_state())
+        await adapter.initialize(chat)
+        adapter._lookup_user = AsyncMock(side_effect=RuntimeError("users.info down"))  # type: ignore[method-assign]
+
+        before = {"type": "message", "user": "U_USER", "text": "before", "ts": "1234567890.111111"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**before, "text": "after", "edited": {"ts": "1234567891.111111"}},
+                    "previous_message": before,
+                }
+            )
+        )
+
+        previous = await chat.process_message_updated.call_args.kwargs["previous_message"]()
+        adapter._lookup_user.assert_awaited_once_with("U_USER")
+        # Sync parse: no lookup, so the author name falls back to the user ID.
+        assert previous.text == "before"
+        assert previous.author.user_name == "U_USER"
+        assert previous.thread_id == "slack:C_CHAN:1234567890.111111"
+        warnings = [c for c in logger.warn.calls if c[0] == "Falling back to sync parse for pre-edit message"]
+        assert len(warnings) == 1
+        assert warnings[0][1]["threadId"] == "slack:C_CHAN:1234567890.111111"
+        assert str(warnings[0][1]["error"]) == "users.info down"
+
+    @pytest.mark.asyncio
+    async def test_previous_message_factory_propagates_cancellation(self):
+        import asyncio as _asyncio
+
+        adapter, chat, _ = await self._init()
+        adapter._lookup_user = AsyncMock(side_effect=_asyncio.CancelledError())  # type: ignore[method-assign]
+        before = {"type": "message", "user": "U_USER", "text": "before", "ts": "1234567890.111111"}
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**before, "text": "after"},
+                    "previous_message": before,
+                }
+            )
+        )
+
+        with pytest.raises(_asyncio.CancelledError):
+            await chat.process_message_updated.call_args.kwargs["previous_message"]()
+
+    @pytest.mark.parametrize("value", [None, "", "abc", "nan", "inf"])
+    def test_parse_slack_timestamp_returns_none_for_missing_or_non_numeric(self, value: str | None):
+        assert SlackAdapter._parse_slack_timestamp(value) is None
+
+    def test_parse_slack_timestamp_returns_utc_datetime(self):
+        from datetime import datetime, timezone
+
+        parsed = SlackAdapter._parse_slack_timestamp("1700000000.123")
+        assert parsed == datetime(2023, 11, 14, 22, 13, 20, 123000, tzinfo=timezone.utc)
+        assert parsed is not None
+        assert parsed.tzinfo is timezone.utc
+
+    @pytest.mark.asyncio
+    async def test_bot_own_edit_skips_user_lookup_and_update_dispatch(self):
+        # Divergence from upstream (docs/UPSTREAM_SYNC.md): the bot's own
+        # edits (post+edit streaming) return before the message is parsed.
+        adapter, chat, client = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {
+                        "type": "message",
+                        "user": "U_BOT",
+                        "text": "streamed reply, more text",
+                        "ts": "1234567890.111111",
+                        "edited": {"ts": "1234567891.111111"},
+                    },
+                    "previous_message": {
+                        "type": "message",
+                        "user": "U_BOT",
+                        "text": "streamed reply",
+                        "ts": "1234567890.111111",
+                    },
+                }
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert not chat.process_message_updated.called
+        assert not chat.process_message.called
+        client.users_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_user_edit_still_dispatches_and_resolves_the_author(self):
+        # Companion to the self-edit short-circuit: a non-bot edit parses with
+        # the async user lookup.
+        adapter, chat, client = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {
+                        "type": "message",
+                        "user": "U_ALICE",
+                        "text": "after",
+                        "ts": "1234567890.111111",
+                        "edited": {"ts": "1234567891.111111"},
+                    },
+                }
+            )
+        )
+
+        msg = await chat.process_message_updated.call_args.args[2]()
+        client.users_info.assert_awaited_once_with(user="U_ALICE")
+        assert msg.author.user_name == "Alice"
+        assert msg.author.is_me is False
+
+    @pytest.mark.asyncio
+    async def test_message_deleted_falls_back_to_previous_ts_and_inherits_the_dm_rule(self):
+        adapter, chat, _ = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "D_DM",
+                    "channel_type": "im",
+                    "ts": "1111.0003",
+                    "previous_message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "reply",
+                        "ts": "1111.0002",
+                        "thread_ts": "1111.0001",
+                    },
+                }
+            )
+        )
+
+        deleted = chat.process_message_deleted.call_args.args[0]
+        assert deleted.message_id == "1111.0002"
+        assert deleted.thread_id == "slack:D_DM:1111.0001"
+        assert deleted.previous_message.raw["channel"] == "D_DM"
+        assert deleted.previous_message.raw["channel_type"] == "im"
+        # No event_ts: deleted_at comes from the outer ts.
+        assert deleted.deleted_at is not None
+        assert deleted.deleted_at.timestamp() == pytest.approx(1111.0003)
+
+    @pytest.mark.asyncio
+    async def test_message_deleted_without_previous_message_uses_deleted_ts(self):
+        adapter, chat, _ = await self._init()
+        await adapter.handle_webhook(
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "C_CHAN",
+                    "deleted_ts": "1234567890.111111",
+                    "event_ts": "not-a-number",
+                }
+            )
+        )
+
+        deleted = chat.process_message_deleted.call_args.args[0]
+        assert deleted.message_id == "1234567890.111111"
+        assert deleted.thread_id == "slack:C_CHAN:1234567890.111111"
+        assert deleted.previous_message is None
+        assert deleted.deleted_at is None
+
+    @pytest.mark.asyncio
+    async def test_real_chat_runs_lifecycle_handlers_for_edit_and_delete(self):
+        # End to end through Chat: the adapter's process_message_updated /
+        # process_message_deleted calls match core's signatures, and edits and
+        # deletes never reach the message handlers.
+        from chat_sdk.chat import Chat
+        from chat_sdk.testing import create_mock_state
+        from chat_sdk.types import ChatConfig, WebhookOptions
+
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        chat = Chat(ChatConfig(user_name="testbot", adapters={"slack": adapter}, state=create_mock_state()))
+        updates: list[tuple[str, str, str | None]] = []
+        deletes: list[tuple[str, str, str, str | None]] = []
+        new_messages: list[str] = []
+
+        @chat.on_message_updated
+        async def _on_update(thread: Any, message: Any, previous: Any) -> None:
+            updates.append((thread.id, message.text, previous.text if previous is not None else None))
+
+        @chat.on_message_deleted
+        async def _on_delete(event: Any) -> None:
+            prev_text = event.previous_message.text if event.previous_message is not None else None
+            deletes.append((event.thread_id, event.message_id, event.platform, prev_text))
+
+        @chat.on_message(r".*")
+        async def _on_message(thread: Any, message: Any) -> None:
+            new_messages.append(message.text)
+
+        tasks: list[Any] = []
+        options = WebhookOptions(wait_until=tasks.append)
+        original = {
+            "type": "message",
+            "user": "U_USER",
+            "username": "alice",
+            "channel": "C_CHAN",
+            "text": "before",
+            "ts": "1234567890.111111",
+        }
+        await chat.webhooks["slack"](
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C_CHAN",
+                    "ts": "1234567891.111111",
+                    "message": {**original, "text": "after", "edited": {"ts": "1234567891.111111"}},
+                    "previous_message": original,
+                }
+            ),
+            options,
+        )
+        await chat.webhooks["slack"](
+            self._event_req(
+                {
+                    "type": "message",
+                    "subtype": "message_deleted",
+                    "channel": "C_CHAN",
+                    "deleted_ts": "1234567890.111111",
+                    "event_ts": "1234567892.111111",
+                    "previous_message": {**original, "text": "after"},
+                }
+            ),
+            options,
+        )
+        await asyncio.gather(*tasks)
+
+        assert len(tasks) == 2
+        assert updates == [("slack:C_CHAN:1234567890.111111", "after", "before")]
+        assert deletes == [("slack:C_CHAN:1234567890.111111", "1234567890.111111", "slack", "after")]
+        assert new_messages == []
+
+    @pytest.mark.asyncio
+    async def test_message_deleted_without_any_ts_is_dropped(self):
+        adapter, chat, _ = await self._init()
+        await adapter.handle_webhook(
+            self._event_req({"type": "message", "subtype": "message_deleted", "channel": "C_CHAN", "ts": "1.2"})
+        )
+
+        assert not chat.process_message_deleted.called
+        assert not chat.process_message.called
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1945,121 @@ class TestUnfurlMetadata:
         assert cached is not None
         assert cached["https://example.com"]["title"] == "Cached Title"
         # And process_message must NOT be called for message_changed.
+        assert not chat.process_message.called
+
+    # TS: "should not re-dispatch message_changed as a new message"
+    @pytest.mark.asyncio
+    async def test_should_not_re_dispatch_message_changed_as_a_new_message(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": True,
+                    "channel": "C123",
+                    "ts": "1234567891.000000",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "https://example.com",
+                        "ts": "1234567890.123456",
+                        "attachments": [
+                            {
+                                "from_url": "https://example.com",
+                                "title": "Example Site",
+                                "text": "Welcome to Example",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        await adapter.handle_webhook(_make_signed_request(body))
+        await asyncio.sleep(0)
+
+        assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+        # The unfurl-only update still feeds the unfurl cache.
+        assert state._cache["slack:unfurls:C123:1234567890.123456"]["https://example.com"]["title"] == "Example Site"
+
+    # TS: "should ignore hidden message_changed without unfurl attachments"
+    @pytest.mark.asyncio
+    async def test_should_ignore_hidden_message_changed_without_unfurl_attachments(self):
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "hidden": True,
+                    "channel": "C123",
+                    "ts": "1234567891.000000",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "edited text",
+                        "ts": "1234567890.123456",
+                        "edited": {"user": "U_USER", "ts": "1234567891.000000"},
+                    },
+                },
+            }
+        )
+        await adapter.handle_webhook(_make_signed_request(body))
+
+        assert not chat.process_message.called
+        assert not chat.process_message_updated.called
+
+    @pytest.mark.asyncio
+    async def test_unfurl_cache_is_written_when_message_changed_also_carries_an_edit(self):
+        # Python-specific: unfurl caching is a side step, so an edit that also
+        # carries unfurl attachments both caches and dispatches the update.
+        adapter = _make_adapter(bot_user_id="U_BOT")
+        state = _make_mock_state()
+        chat = _make_mock_chat(state)
+        await adapter.initialize(chat)
+
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": "C123",
+                    "ts": "1234567891.000000",
+                    "message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "see https://example.com",
+                        "ts": "1234567890.123456",
+                        "edited": {"user": "U_USER", "ts": "1234567891.000000"},
+                        "attachments": [{"from_url": "https://example.com", "title": "Example Site"}],
+                    },
+                    "previous_message": {
+                        "type": "message",
+                        "user": "U_USER",
+                        "text": "https://example.com",
+                        "ts": "1234567890.123456",
+                    },
+                },
+            }
+        )
+        await adapter.handle_webhook(_make_signed_request(body))
+        await asyncio.sleep(0)
+
+        assert state._cache["slack:unfurls:C123:1234567890.123456"]["https://example.com"]["title"] == "Example Site"
+        chat.process_message_updated.assert_called_once()
+        assert chat.process_message_updated.call_args.args[1] == "slack:C123:1234567890.123456"
         assert not chat.process_message.called
 
     @pytest.mark.asyncio
