@@ -767,7 +767,11 @@ class DiscordAdapter:
                 for a in attachments_data
             ],
             raw=data,
-            is_mention=is_mentioned,
+            # ``None`` (not ``False``) when unmentioned: the forwarded payload
+            # only proves a mention, so Chat still falls back to text detection
+            # for a literal ``@botname`` (upstream ``isMentioned || undefined``,
+            # vercel/chat#946).
+            is_mention=True if is_mentioned else None,
         )
 
         try:

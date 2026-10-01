@@ -2776,7 +2776,8 @@ class TestCreateSentMessageFromMessage:
         adapter = create_mock_adapter()
         state = create_mock_state()
         thread = _make_thread(adapter, state)
-        msg = create_test_message("msg-1", "Hello world")
+        reply_to = create_test_message("msg-0", "Original message")
+        msg = create_test_message("msg-1", "Hello world", reply_to=reply_to)
 
         sent = thread.create_sent_message_from_message(msg)
 
@@ -2786,6 +2787,7 @@ class TestCreateSentMessageFromMessage:
         assert sent.author == msg.author
         assert sent.metadata == msg.metadata
         assert sent.attachments == msg.attachments
+        assert sent.reply_to is reply_to
 
     # it("should provide edit capability")
     @pytest.mark.asyncio

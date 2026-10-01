@@ -2765,7 +2765,10 @@ class Chat:
                     await result
             return
 
-        # Backward compat: DMs without handlers treated as mentions
+        # Backward compat: treat DMs as mentions when no DM handlers are
+        # registered. This is a routing rule, not a detection result, so it
+        # deliberately overrides an adapter's ``False``: every DM is addressed
+        # to the bot (upstream chat.ts, vercel/chat#946).
         if is_dm:
             message.is_mention = True
 
@@ -2864,29 +2867,42 @@ class Chat:
         """Fill ``is_mention`` on ``message`` and each ``context.skipped`` in place.
 
         Returns whether any of them mentions the bot. Port of upstream
-        ``setMentionFlags`` (chat@4.32/4.33). Keeps today's ``or`` semantics
-        (a falsy adapter-reported flag is re-derived from text); #192 moves
-        this to upstream's ``??`` tri-state.
+        ``setMentionFlags`` (vercel/chat#946): ``is_mention`` is tri-state. An
+        adapter that reads the platform's own mention metadata reports a
+        definitive ``True``/``False``; text detection runs only when it
+        reported nothing (``None``), so a known non-mention is not re-derived
+        from flattened text (code samples, quoted text). Never collapse this
+        with ``or`` -- that would re-derive an adapter's ``False``.
         """
-        message.is_mention = message.is_mention or self._detect_mention(adapter, message)
+        if message.is_mention is None:
+            message.is_mention = self._detect_mention(adapter, message)
         has_mention = message.is_mention is True
         if context is not None:
             for skipped in context.skipped:
-                skipped.is_mention = skipped.is_mention or self._detect_mention(adapter, skipped)
+                if skipped.is_mention is None:
+                    skipped.is_mention = self._detect_mention(adapter, skipped)
                 has_mention = has_mention or skipped.is_mention is True
         return has_mention
 
     def _detect_mention(self, adapter: Adapter, message: Message) -> bool:
+        """Whether ``message.text`` @-mentions the bot by username or user id.
+
+        Port of upstream ``detectMention`` (vercel/chat#621, #761): the ``@``
+        must not follow a word character, so emails and URL userinfo
+        (``jane@acme.com``) do not mention a bot named ``acme``, and the name
+        must not be followed by a word character or ``-``, so ``@bot-dev`` /
+        ``@botlong`` do not mention ``@bot`` (``mybot[bot]`` still matches).
+        """
         bot_user_name = adapter.user_name or self._user_name
         bot_user_id = adapter.bot_user_id
 
         # @username check
-        username_pattern = self._get_mention_pattern(f"username:{bot_user_name}", rf"@{re.escape(bot_user_name)}\b")
+        username_pattern = self._get_mention_pattern(f"username:{bot_user_name}", _mention_name_pattern(bot_user_name))
         if username_pattern.search(message.text):
             return True
 
         if bot_user_id:
-            user_id_pattern = self._get_mention_pattern(f"userid:{bot_user_id}", rf"@{re.escape(bot_user_id)}\b")
+            user_id_pattern = self._get_mention_pattern(f"userid:{bot_user_id}", _mention_name_pattern(bot_user_id))
             if user_id_pattern.search(message.text):
                 return True
 
@@ -2923,6 +2939,7 @@ class Chat:
         # ``fetch_data`` stripped.  We fall through and apply the
         # rehydrate pass; attachments that still have ``fetch_data``
         # (e.g. in-memory state) are filtered out below.
+        pending_reply_to: Any = None
         if isinstance(raw, Message):
             msg = raw
         elif isinstance(raw, dict):
@@ -2942,6 +2959,7 @@ class Chat:
                     edited_at = _parse_iso(edited_at)
 
                 author_raw = raw.get("author", {})
+                pending_reply_to = raw.get("replyTo") if "replyTo" in raw else raw.get("reply_to")
                 msg = Message(
                     id=raw.get("id", ""),
                     # Drains dispatch each message under its own thread id
@@ -2956,6 +2974,10 @@ class Chat:
                         full_name=author_raw.get("full_name", ""),
                         is_bot=author_raw.get("is_bot", False),
                         is_me=author_raw.get("is_me", False),
+                        email=author_raw.get("email"),
+                        is_system=(
+                            author_raw.get("isSystem") if "isSystem" in author_raw else author_raw.get("is_system")
+                        ),
                     ),
                     metadata=MessageMetadata(
                         date_sent=date_sent,
@@ -2980,6 +3002,12 @@ class Chat:
         )
         if rehydrate_fn is not None and msg.attachments:
             msg.attachments = [att if att.fetch_data is not None else rehydrate_fn(att) for att in msg.attachments]
+
+        # Recurse into the replied-to message (upstream vercel/chat#802) so its
+        # attachments are rehydrated too. The plain-dict fallback above leaves
+        # the raw ``replyTo`` value in ``pending_reply_to``.
+        reply_to: Any = pending_reply_to if pending_reply_to is not None else msg.reply_to
+        msg.reply_to = self._rehydrate_message(reply_to, adapter) if isinstance(reply_to, (Message, dict)) else None
 
         return msg
 
@@ -3037,6 +3065,23 @@ def _modal_conversation_id(event: ModalSubmitEvent | ModalCloseEvent) -> str | N
     return None
 
 
+# Upstream's guards are ``(?<!\w)`` / ``(?![\w-])`` with flag ``i`` (no ``u``),
+# where JS ``\w`` is ASCII-only. Python's ``\w`` is Unicode, so the ASCII
+# class is spelled out; ``é@bot`` stays a mention, as upstream. Not
+# ``re.ASCII``: that would make IGNORECASE ASCII-only, while JS ``i`` folds
+# non-ASCII names. The guards are case-sensitive scoped groups so Python's
+# Unicode case folding cannot widen ``[A-Za-z]`` to the Kelvin sign / long s
+# (JS ``i`` without ``u`` never folds non-ASCII into ASCII). See
+# docs/UPSTREAM_SYNC.md.
+_MENTION_BEFORE_GUARD = r"(?-i:(?<![A-Za-z0-9_]))"
+_MENTION_AFTER_GUARD = r"(?-i:(?![A-Za-z0-9_-]))"
+
+
+def _mention_name_pattern(name: str) -> str:
+    """Regex source for an ``@name`` mention (compiled with ``re.IGNORECASE``)."""
+    return f"{_MENTION_BEFORE_GUARD}@{re.escape(name)}{_MENTION_AFTER_GUARD}"
+
+
 def _coerce_attachments(raw: Any) -> list[Attachment]:
     """Convert a list of attachment dicts (post JSON roundtrip) to ``Attachment`` instances.
 
@@ -3082,6 +3127,7 @@ def _coerce_attachments(raw: Any) -> list[Attachment]:
 def _message_from_json(data: dict[str, Any]) -> Message:
     author_raw = data.get("author", {})
     metadata_raw = data.get("metadata", {})
+    reply_to_raw = data.get("replyTo") if "replyTo" in data else data.get("reply_to")
 
     date_sent = metadata_raw.get("dateSent") or metadata_raw.get("date_sent")
     if isinstance(date_sent, str):
@@ -3105,6 +3151,8 @@ def _message_from_json(data: dict[str, Any]) -> Message:
             full_name=author_raw.get("fullName") or author_raw.get("full_name", ""),
             is_bot=author_raw.get("isBot") if "isBot" in author_raw else author_raw.get("is_bot", False),
             is_me=author_raw.get("isMe") if "isMe" in author_raw else author_raw.get("is_me", False),
+            email=author_raw.get("email"),
+            is_system=author_raw.get("isSystem") if "isSystem" in author_raw else author_raw.get("is_system"),
         ),
         metadata=MessageMetadata(
             date_sent=date_sent,
@@ -3114,6 +3162,15 @@ def _message_from_json(data: dict[str, Any]) -> Message:
         attachments=_coerce_attachments(data.get("attachments", [])),
         is_mention=data.get("isMention") if "isMention" in data else data.get("is_mention"),
         links=data.get("links", []),
+        # The reviver runs bottom-up, so a nested ``replyTo`` may already be a
+        # revived ``Message``; pass it through.
+        reply_to=(
+            reply_to_raw
+            if isinstance(reply_to_raw, Message)
+            else _message_from_json(reply_to_raw)
+            if isinstance(reply_to_raw, dict)
+            else None
+        ),
     )
 
 
@@ -3145,7 +3202,11 @@ class _ThreadHistoryCache:
         # like Slack team_id/user_id, Discord guild IDs — would persist to
         # the state adapter on every reply, inflating storage and PII surface.
         data = message.to_json()
-        data["raw"] = None
+        # Null raw along the whole ``replyTo`` chain (upstream vercel/chat#802).
+        current: dict[str, Any] | None = data
+        while current is not None:
+            current["raw"] = None
+            current = current.get("replyTo")
         await self._state.append_to_list(key, data, max_length=self._max_messages, ttl_ms=self._ttl_ms)
 
     async def get_messages(self, thread_id: str, limit: int | None = None) -> list[Message]:

@@ -857,6 +857,60 @@ Parity with the core halves of upstream `0b63791b` (chat@4.33.0), `f233ffe8`,
   the Teams `handleDialogOpen` parts of `c21ccbc0` / `91683e52` (see the Teams
   dialog-open row in the non-parity table).
 
+### Mentions and message model (chat@4.34–4.41, #192)
+
+Parity with the core halves of `2531a422` (#621, chat@4.34.0), `46681f50`
+(#711) and `80def3ab` (#707, chat@4.35.0), `b547f458` (#761, chat@4.36.0),
+`0f24cc30` (#802, chat@4.38.0) and `fcdc1c9e` (#946, chat@4.41.0).
+
+- **Tri-state `is_mention` (`fcdc1c9e`).** `_set_mention_flags` runs text
+  detection only when `is_mention is None` (upstream `??`), for the dispatched
+  message and each `context.skipped`. An adapter's `False` is now definitive.
+  The DM override (`is_mention = True` when no DM handler is registered) is a
+  routing rule and still overrides an adapter's `False`, as upstream.
+  - Discord forwarded messages report `True if is_mentioned else None`
+    (upstream `isMentioned || undefined`), so a literal `@botname` still routes
+    through text detection.
+  - The Teams adapter only ever sets `True` (from a mention entity), as
+    upstream, so the text fallback is unchanged. The SDK-free webhook primitive
+    keeps `TeamsMessagePayload.is_mention: bool` for parity with upstream
+    `isTeamsMention(): boolean`. Nothing outside `adapters/teams/webhook/` turns
+    that payload into a `Message`, so it does not affect routing.
+  - Telegram passes `is_bot_mentioned(...)` (a `bool`), as upstream, so a
+    Telegram `False` is definitive too. Slack's content-based `is_mention` is #209,
+    and Linear's ordinary comments are #232.
+- **Mention regex (`2531a422`, `b547f458`).** Upstream matches
+  `(?<!\w)@name(?![\w-])` with flag `i` and no `u`, where JS `\w` is ASCII-only.
+  Python's `\w` is Unicode, so the guards spell out `[A-Za-z0-9_]` and
+  `[A-Za-z0-9_-]`. So `é@bot` is a mention, as upstream. `re.ASCII` is not
+  used: it would make `IGNORECASE` ASCII-only, while JS `i` folds non-ASCII
+  names. The guards sit in case-sensitive scoped groups (`(?-i:…)`), so Python's
+  Unicode folding cannot widen `[A-Za-z]` to the Kelvin sign or long s. JS
+  non-`u` canonicalization never maps those onto ASCII either. One residual
+  difference is in the name itself, the same one the Telegram row describes:
+  Python's `IGNORECASE` equates `ſ`/`K` with `s`/`k`, so `@ſlack-bot` mentions
+  `slack-bot` in Python only. The Discord `<@!?id>` pattern is unchanged.
+- **`0701679e` (#706)** has no core change. Its regex cache is Telegram's
+  (#225). The abortable `sleep` does not apply: Python's `stop_polling` cancels
+  the polling task, which interrupts `asyncio.sleep` directly.
+- **`Author.email` / `Author.is_system`** are the last `Author` fields
+  (default `None`). `to_json` emits `email` and `isSystem` only when not
+  `None`. A `False` `isSystem` is still emitted, as upstream. `from_json`,
+  `_message_from_json` and the `_rehydrate_message` dict fallback read
+  `isSystem`, then `is_system`. `from_json_compat` reads snake_case first.
+  Population is per adapter: Teams email is #218, Slack `USLACK` is #209.
+- **`Message.reply_to` (`0f24cc30`)** is the last `Message` field, and is also
+  on `MessageData` and `SentMessage`. `to_json` emits `replyTo` only when set.
+  `from_json` / `from_json_compat` / `_message_from_json` recurse and pass an
+  already-revived `Message` through, because `json.loads(object_hook=…)`
+  revives bottom-up. `set_message_adapter` and `Chat._rehydrate_message`
+  (including `rehydrate_attachment`, and the dict fallback's `replyTo` /
+  `reply_to`) recurse too. Both history caches (`ThreadHistoryCache` and
+  `chat._ThreadHistoryCache`) null `raw` along the whole `replyTo` chain.
+  `create_sent_message_from_message` and the sent-message → history `Message`
+  copy carry `reply_to` (upstream `new Message(sent)`). There is no depth cap,
+  as upstream. Telegram population is #228.
+
 ### Slack data tables, charts and modal inputs (chat@4.34–4.41, #212)
 
 Parity, apart from the length-counting row in the non-parity table. Ports the
