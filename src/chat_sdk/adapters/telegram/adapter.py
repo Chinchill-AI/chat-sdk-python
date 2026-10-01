@@ -1416,6 +1416,9 @@ class TelegramAdapter:
             # message's task settles once it is enqueued, and a queued
             # handler's failure surfaces on the task that drains the queue, so
             # the retry is attributed to that update (same in ``chat.ts``).
+            # Also upstream parity: a handler dispatched here is admitted work
+            # that ``stop_polling`` waits for, even when it starts after
+            # ``Chat.shutdown``'s (Python-only) cancellation sweep.
             await self._await_update_tasks(self.process_update(update, WebhookOptions(deduplicate=False)))
 
         async def run_group(group: list[TelegramUpdate]) -> list[tuple[TelegramUpdate, Exception | None]]:
