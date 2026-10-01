@@ -1298,7 +1298,10 @@ ported; #915 replaced its helpers, and its cases are now covered by the
   stream. Also as upstream: a non-429 failure of the final edit (including
   Telegram's `message is not modified` 400) propagates, and an exception
   raised by the text stream propagates without a final edit. Unlike the core
-  fallback, the loop does not flush partial text first.
+  fallback, the loop does not flush partial text first. The pacing timestamp
+  advances only when an edit succeeds. The placeholder is a plain post, so
+  rich support is first tried on an edit, through `edit_message`'s own
+  rich → MarkdownV2 fallback, as the core fallback already did for groups.
 - **Python-surface adaptations (no behavior change).** Pacing reads
   `_monotonic_ms()` (`time.monotonic()`), not the epoch `_now_ms()` the
   polling checkpoint persists; both it and `_sleep` are overridable for

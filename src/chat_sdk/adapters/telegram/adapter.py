@@ -2709,6 +2709,10 @@ class TelegramAdapter:
             last_edit_content = placeholder_text
             last_edit_at = self._monotonic_ms()
 
+        # Upstream parity (chat@4.41.1 index.ts:2019-2049): the placeholder
+        # is a plain post and edits go through ``edit_message`` with its own
+        # rich -> MarkdownV2 fallback (no separate rich-support probe), and
+        # the pacing timestamp advances only on a successful edit.
         async def apply_edit(content: str) -> None:
             nonlocal posted, edit_thread_id, last_edit_content, last_edit_at, blocked_until, rate_limit_error
             if posted is None:
