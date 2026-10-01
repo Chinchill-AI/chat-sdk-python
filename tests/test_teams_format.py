@@ -98,10 +98,21 @@ class TestFromAst:
         assert "- sub b" in result
         assert "2. second" in result
 
-    def test_mentions_to_at_tag(self, converter: TeamsFormatConverter):
+    def test_should_preserve_mentions_as_text(self, converter: TeamsFormatConverter):
+        """Upstream chat@4.40.0 (#898): outgoing ``@name`` is never rewritten to
+        ``<at>`` markup, which notified no one without a mention entity."""
         ast = converter.to_ast("Hello @someone")
-        result = converter.from_ast(ast)
-        assert "<at>someone</at>" in result
+        assert converter.from_ast(ast) == "Hello @someone"
+
+    def test_should_not_turn_email_addresses_into_mentions(self, converter: TeamsFormatConverter):
+        result = converter.render_postable({"raw": "email user@example.com"})
+        assert result == "email user@example.com"
+        assert "<at>example</at>" not in result
+
+    def test_should_not_mangle_an_handle_inside_a_url(self, converter: TeamsFormatConverter):
+        result = converter.render_postable({"raw": "see https://github.com/@vercel"})
+        assert result == "see https://github.com/@vercel"
+        assert "<at>vercel</at>" not in result
 
     def test_thematic_breaks(self, converter: TeamsFormatConverter):
         ast = converter.to_ast("text\n\n---\n\nmore")
@@ -165,6 +176,15 @@ class TestToAst:
         text = converter.extract_plain_text("<div><span>hello</span></div>")
         assert text == "hello"
 
+    def test_strips_tags_with_the_bounded_stripper(self, converter: TeamsFormatConverter):
+        """Divergence from upstream (see docs/UPSTREAM_SYNC.md): ``to_ast`` uses
+        the bounded ``strip_html_tags`` primitive, where upstream's ``toAst``
+        loops an unbounded ``<[^>]+>``. A "tag" over 2048 characters stays as
+        text; reverting to the unbounded loop would strip it."""
+        too_long = "<" + "x" * 2049 + ">"
+        assert converter.extract_plain_text(f"a{too_long}b") == f"a{too_long}b"
+        assert converter.extract_plain_text("a<span>b</span>c") == "abc"
+
     def test_decodes_html_entities(self, converter: TeamsFormatConverter):
         text = converter.extract_plain_text("&lt;b&gt;not bold&lt;/b&gt; &amp; &quot;quoted&quot;")
         assert "<b>" in text
@@ -178,13 +198,43 @@ class TestToAst:
 
 
 class TestRenderPostable:
-    def test_plain_string_with_mentions(self, converter: TeamsFormatConverter):
-        result = converter.render_postable("Hello @user")
-        assert result == "Hello <at>user</at>"
+    def test_should_preserve_mentions_in_plain_strings(self, converter: TeamsFormatConverter):
+        assert converter.render_postable("Hello @user") == "Hello @user"
 
-    def test_raw_message_with_mentions(self, converter: TeamsFormatConverter):
-        result = converter.render_postable({"raw": "Hello @user"})
-        assert result == "Hello <at>user</at>"
+    def test_should_preserve_mentions_in_raw_messages(self, converter: TeamsFormatConverter):
+        assert converter.render_postable({"raw": "Hello @user"}) == "Hello @user"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Hi @Alex Smith, meet @someone",
+            "[user@example.com](mailto:user@example.com) and [@someone](https://example.com/@someone)",
+            "Use `@someone` or **@Alex Smith**",
+            "```text\n@Alex Smith\n```",
+        ],
+    )
+    def test_preserves_names_and_formatting_in_text(self, converter: TeamsFormatConverter, text: str):
+        """Upstream ``it.each("preserves names and formatting in %j")``: every
+        postable shape (string, raw, markdown, AST) renders the text verbatim."""
+        from chat_sdk.types import PostableRaw
+
+        for message in (
+            text,
+            {"raw": text},
+            PostableRaw(raw=text),
+            {"markdown": text},
+            {"ast": converter.to_ast(text)},
+        ):
+            assert converter.render_postable(message) == text
+
+    def test_preserves_explicit_mention_markup_in_raw_text(self, converter: TeamsFormatConverter):
+        text = "Hi <at>Alex Smith</at>"
+        assert converter.render_postable(text) == text
+        assert converter.render_postable({"raw": text}) == text
+
+    def test_decodes_incoming_full_name_mentions_without_recreating_markup(self, converter: TeamsFormatConverter):
+        ast = converter.to_ast("Hi <at>Alex Smith</at>")
+        assert converter.from_ast(ast) == "Hi @Alex Smith"
 
     def test_markdown_messages(self, converter: TeamsFormatConverter):
         result = converter.render_postable({"markdown": "Hello **world**"})

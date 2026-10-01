@@ -27,6 +27,7 @@ wire-format / throttle-internal assertions from the hand-rolled era are dropped.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -398,7 +399,7 @@ class TestCancellation:
         await _register_streamer(adapter, tid, streamer)
 
         send = AsyncMock(return_value=_SentActivity("fallback-id"))
-        adapter._app.send = send  # type: ignore[method-assign]
+        adapter._app.activity_sender = SimpleNamespace(send=send)
 
         async def gen():
             yield "Hello world"
@@ -506,7 +507,7 @@ class TestBufferedFallback:
         tid = _channel_thread_id(adapter)
 
         send = AsyncMock(return_value=_SentActivity("posted-1"))
-        adapter._app.send = send  # type: ignore[method-assign]
+        adapter._app.activity_sender = SimpleNamespace(send=send)
 
         async def gen():
             yield "Hello "
@@ -515,8 +516,8 @@ class TestBufferedFallback:
         result = await adapter.stream(tid, gen())
 
         send.assert_called_once()
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
         assert activity.text == "Hello world"
         assert result.id == "posted-1"
 
@@ -526,7 +527,7 @@ class TestBufferedFallback:
         tid = _channel_thread_id(adapter)
 
         send = AsyncMock(return_value=_SentActivity("nope"))
-        adapter._app.send = send  # type: ignore[method-assign]
+        adapter._app.activity_sender = SimpleNamespace(send=send)
 
         async def gen():
             yield ""
@@ -618,6 +619,7 @@ class TestHandleMessageActivityLifecycle:
         adapter._chat = chat
 
         activity = _dm_activity(conversation_id="19:abc@thread.tacv2", activity_id="incoming-2")
+        activity["conversation"]["conversationType"] = "channel"
 
         await adapter._handle_message_activity(activity)
 
@@ -851,9 +853,8 @@ class TestCreateStreamer:
         """No stubs: the installed SDK yields an ``HttpStream`` on its own client.
 
         The stream's client must target the inbound activity's service URL and
-        must not be the shared ``App.api``, which ``_point_app_api_at`` retargets
-        in place for every outbound call. If it were shared, an outbound call to
-        another region mid-stream would redirect the stream's chunks.
+        must not be the shared ``App.api``, so outbound calls to another region
+        (which use ``_api_for`` clients) can never redirect the stream's chunks.
         """
         from microsoft_teams.apps import HttpStream
 
@@ -867,8 +868,9 @@ class TestCreateStreamer:
         assert streamer._client is not adapter._app.api
         assert streamer._client.service_url == "https://smba.trafficmanager.net/teams"
 
-        adapter._point_app_api_at(self.SOVEREIGN_URL)
-        assert adapter._app.api.service_url == self.SOVEREIGN_URL.rstrip("/")
+        regional = adapter._api_for(self.SOVEREIGN_URL)
+        assert regional.service_url == self.SOVEREIGN_URL.rstrip("/")
+        assert streamer._client is not regional
         assert streamer._client.service_url == "https://smba.trafficmanager.net/teams"
 
     def test_uses_activity_sender_when_present(self):

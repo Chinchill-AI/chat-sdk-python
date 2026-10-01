@@ -5,10 +5,12 @@ Ported from packages/adapter-teams/src/index.test.ts.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -52,14 +54,16 @@ class _SentActivity:
 
 
 def _mock_app_send(adapter: TeamsAdapter, sent_id: str = "sent-msg-123") -> AsyncMock:
-    """Replace ``adapter._app.send`` with an AsyncMock returning a SentActivity.
+    """Replace the SDK activity sender with an AsyncMock returning a SentActivity.
 
-    Mirrors upstream's ``mockApp.send = vi.fn(async () => ({ id, type }))`` —
-    the migrated outbound send/typing paths delegate to the SDK ``App.send``.
-    Returns the mock so tests can assert call count / arguments.
+    Outbound send/typing paths go through ``TeamsAdapter._send_to``, which hands
+    ``(activity, ConversationReference)`` to ``App.activity_sender.send`` when the
+    App has one (the 2.0.x shape, set here on every SDK line). Mirrors upstream's
+    ``vi.spyOn(app.activitySender, "send")``. Returns the mock so tests can
+    assert call count / arguments.
     """
     send = AsyncMock(return_value=_SentActivity(sent_id))
-    adapter._app.send = send  # type: ignore[method-assign]
+    adapter._app.activity_sender = SimpleNamespace(send=send)
     return send
 
 
@@ -81,6 +85,8 @@ def _mock_app_activities(
     ops.update = update
     ops.delete = delete
     api = MagicMock()
+    # The SDK default service URL: threads on it use ``App.api`` itself.
+    api.service_url = "https://smba.trafficmanager.net/teams"
     api.conversations.activities = MagicMock(return_value=ops)
     adapter._app.api = api  # type: ignore[method-assign]
     return update, delete
@@ -180,6 +186,14 @@ class TestThreadIdEncoding:
             adapter.decode_thread_id("slack:abc:def")
         with pytest.raises(ValidationError):
             adapter.decode_thread_id("teams")
+        valid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:x", service_url="https://smba.trafficmanager.net/teams/")
+        )
+        # A fourth segment must be a known conversation type, and no fifth.
+        with pytest.raises(ValidationError, match="conversation type"):
+            adapter.decode_thread_id(f"{valid}:meeting")
+        with pytest.raises(ValidationError):
+            adapter.decode_thread_id(f"{valid}:groupChat:extra")
 
     def test_special_characters(self):
         adapter = _make_adapter()
@@ -1377,10 +1391,10 @@ class TestPostMessage:
         assert result.id == "sent-msg-123"
         assert result.thread_id == thread_id
         send.assert_called_once()
-        # delegates to the SDK App.send with the conversation ID and a
-        # MessageActivityInput carrying the rendered text + markdown format
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
+        # delegates to the SDK sender with a MessageActivityInput carrying the
+        # rendered text + markdown format and a reference to the conversation
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
         assert activity.text == "Hi there"
         assert activity.text_format == "markdown"
 
@@ -1435,82 +1449,517 @@ class TestEditMessage:
 
 
 class TestOutboundServiceUrlRouting:
-    """Each outbound op must retarget the SDK App's Bot Framework client at the
-    thread's decoded service URL before sending — so different regions / sovereign
-    clouds reach the right endpoint. Exercises the REAL ``ApiClient`` (not a mock)
-    to prove ``_point_app_api_at`` actually walks the service-url chain rather than
-    silently no-opping via its mock-tolerant ``AttributeError`` guard.
+    """Outbound ops address the thread's encoded service URL through a client
+    for that URL (``_api_for`` / ``_send_to``) and never retarget the shared
+    ``App.api`` — so concurrent sends to different regions or sovereign clouds
+    cannot race. Edit/delete run on the REAL ``ApiClient`` with only the HTTP
+    verb stubbed, so the SDK's own URL building stays in the test.
     """
 
     SOVEREIGN_URL = "https://smba.infra.gov.teams.microsoft.us/teams/"
+    DEFAULT_URL = "https://smba.trafficmanager.net/teams"
 
-    @pytest.mark.asyncio
-    async def test_post_message_retargets_real_api_client(self):
-        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        seen: dict[str, str] = {}
-
-        async def fake_send(conversation_id, activity):
-            # captured at call time: the real ApiClient is now on the thread's URL
-            seen["api"] = adapter._app.api.service_url
-            seen["conversations"] = adapter._app.api.conversations.service_url
-            seen["activities"] = adapter._app.api.conversations.activities_client.service_url
-            return _SentActivity("m")
-
-        adapter._app.send = fake_send  # type: ignore[method-assign]
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
+    def _thread(self, adapter: TeamsAdapter, service_url: str | None = None) -> str:
+        return adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=service_url or self.SOVEREIGN_URL)
         )
-        await adapter.post_message(tid, {"markdown": "hi"})
-        # the trailing slash is normalized off, matching ApiClient's own rstrip
-        assert seen["api"] == self.SOVEREIGN_URL.rstrip("/")
-        assert seen["conversations"] == self.SOVEREIGN_URL.rstrip("/")
-        assert seen["activities"] == self.SOVEREIGN_URL.rstrip("/")
 
     @staticmethod
-    def _capture_wire(adapter: TeamsAdapter, method: str) -> list[str]:
-        """Stub the REAL activities client's HTTP ``method`` and record each URL.
+    def _capture_wire(monkeypatch: pytest.MonkeyPatch, method: str) -> list[str]:
+        """Stub the SDK HTTP client's ``method`` (class-wide) and record each URL.
 
-        Patching at the HTTP boundary (not ``activities_client.update``) keeps
-        the SDK's own call chain in the test, so it holds on every supported
-        ``microsoft-teams-apps`` line: 2.0.x calls ``http.put(url, json=...)``;
-        2.1.x routes ``activities(...).update`` through
-        ``conversations.update_activity(..., service_url=None, agentic_identity=None)``
-        and adds a ``_metadata=`` kwarg (#250).
+        Class-wide so it also covers the per-URL client ``_api_for`` builds
+        (2.1 clones share the connection but not the ``Client`` instance).
+        2.1 adds a ``_metadata=`` kwarg (#250), absorbed by ``**_kwargs``.
         """
+        from microsoft_teams.common.http.client import Client
+
         urls: list[str] = []
 
         class _Response:
             def json(self) -> dict[str, str]:
                 return {"id": "edit-1"}
 
-        async def fake_http(url, **_kwargs):
+        async def fake_http(_self, url, **_kwargs):
             urls.append(url)
             return _Response()
 
-        http = adapter._app.api.conversations.activities_client.http
-        setattr(http, method, fake_http)
+        monkeypatch.setattr(Client, method, fake_http)
         return urls
 
     @pytest.mark.asyncio
-    async def test_edit_message_retargets_real_activities_client(self):
+    async def test_post_message_sends_to_the_thread_url_without_retargeting_app_api(self):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        urls = self._capture_wire(adapter, "put")
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
-        )
-        result = await adapter.edit_message(tid, "edit-1", {"markdown": "x"})
-        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/edit-1"]
-        assert result.id == "edit-1"
+        send = _mock_app_send(adapter, "m")
+
+        await adapter.post_message(self._thread(adapter), {"markdown": "hi"})
+
+        _activity, ref = send.call_args.args
+        # the trailing slash is normalized off, matching ApiClient's own rstrip
+        assert ref.service_url == self.SOVEREIGN_URL.rstrip("/")
+        assert adapter._app.api.service_url == self.DEFAULT_URL
 
     @pytest.mark.asyncio
-    async def test_delete_message_retargets_real_activities_client(self):
+    async def test_edit_message_uses_a_client_for_the_thread_url(self, monkeypatch: pytest.MonkeyPatch):
         adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
-        urls = self._capture_wire(adapter, "delete")
-        tid = adapter.encode_thread_id(
-            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.SOVEREIGN_URL)
-        )
-        await adapter.delete_message(tid, "gone-1")
+        urls = self._capture_wire(monkeypatch, "put")
+
+        result = await adapter.edit_message(self._thread(adapter), "edit-1", {"markdown": "x"})
+
+        assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/edit-1"]
+        assert result.id == "edit-1"
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @pytest.mark.asyncio
+    async def test_delete_message_uses_a_client_for_the_thread_url(self, monkeypatch: pytest.MonkeyPatch):
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        urls = self._capture_wire(monkeypatch, "delete")
+
+        await adapter.delete_message(self._thread(adapter), "gone-1")
+
         assert urls == [f"{self.SOVEREIGN_URL.rstrip('/')}/v3/conversations/19:abc@thread.tacv2/activities/gone-1"]
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @pytest.mark.asyncio
+    async def test_concurrent_posts_to_different_service_urls_each_hit_their_own_url(self):
+        """Python-specific: two sends interleaved on the event loop. The old
+        ``_point_app_api_at`` mutated ``App.api`` before awaiting, so the
+        second call could redirect the first."""
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        seen: dict[str, list[str]] = {}
+
+        async def fake_send(activity, ref):
+            seen.setdefault(activity.text, []).append(ref.service_url)
+            await asyncio.sleep(0)  # yield so the other send runs mid-flight
+            seen[activity.text].append(ref.service_url)
+            return _SentActivity(activity.text)
+
+        adapter._app.activity_sender = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+        emea = "https://smba.trafficmanager.net/emea/"
+
+        results = await asyncio.gather(
+            adapter.post_message(self._thread(adapter, emea), "to-emea"),
+            adapter.post_message(self._thread(adapter), "to-gov"),
+        )
+
+        assert [r.id for r in results] == ["to-emea", "to-gov"]
+        assert seen == {
+            "to-emea": [emea.rstrip("/")] * 2,
+            "to-gov": [self.SOVEREIGN_URL.rstrip("/")] * 2,
+        }
+        assert adapter._app.api.service_url == self.DEFAULT_URL
+
+    @staticmethod
+    def _card() -> Any:
+        from chat_sdk.cards import Card
+        from chat_sdk.types import PostableCard
+
+        return PostableCard(card=Card(title="Results"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "post_message_text",
+            "post_message_card",
+            "post_channel_message_text",
+            "post_channel_message_card",
+            "edit_message",
+            "delete_message",
+            "start_typing",
+        ],
+    )
+    async def test_every_outbound_op_rejects_a_disallowed_thread_url_before_sending(
+        self, operation: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The SSRF allow-list check runs at each outbound call site (the
+        per-URL client carries the bot token), so each site is pinned here:
+        a thread ID naming an attacker host never reaches the SDK sender, the
+        HTTP client, or the per-URL client cache."""
+        from microsoft_teams.common.http.client import Client
+
+        from chat_sdk.shared.errors import NetworkError
+
+        adapter = _make_adapter(app_id="test-app-id", logger=_make_logger())
+        send = _mock_app_send(adapter)
+        http_calls: list[str] = []
+
+        async def fake_http(_self, url, **_kwargs):
+            http_calls.append(url)
+            raise AssertionError(f"unexpected HTTP call to {url}")
+
+        for verb in ("post", "put", "delete"):
+            monkeypatch.setattr(Client, verb, fake_http)
+
+        thread_id = self._thread(adapter, "https://evil.example.com/")
+        calls = {
+            "post_message_text": lambda: adapter.post_message(thread_id, "hi"),
+            "post_message_card": lambda: adapter.post_message(thread_id, self._card()),
+            "post_channel_message_text": lambda: adapter.post_channel_message(thread_id, "hi"),
+            "post_channel_message_card": lambda: adapter.post_channel_message(thread_id, self._card()),
+            "edit_message": lambda: adapter.edit_message(thread_id, "m-1", "hi"),
+            "delete_message": lambda: adapter.delete_message(thread_id, "m-1"),
+            "start_typing": lambda: adapter.start_typing(thread_id),
+        }
+
+        if operation == "start_typing":
+            # typing failures are logged, never raised (upstream parity)
+            await calls[operation]()
+            assert "not an allowed Bot Framework endpoint" in str(adapter._logger.error.call_args)
+        else:
+            with pytest.raises(NetworkError, match="not an allowed Bot Framework endpoint"):
+                await calls[operation]()
+        send.assert_not_called()
+        assert http_calls == []
+        assert adapter._api_clients == {}
+
+
+class TestTeamsAppRouting:
+    """Port of upstream ``app.test.ts`` (``TeamsApp.apiFor`` / ``sendTo``,
+    chat@4.41.0) against ``TeamsAdapter._api_for`` / ``_send_to``."""
+
+    APP_ID = "11111111-2222-3333-4444-555555555555"
+    EMEA = "https://smba.trafficmanager.net/emea/"
+    GATEWAY = "https://gateway.example/teams"
+
+    def _adapter(self, **overrides) -> TeamsAdapter:
+        return _make_adapter(app_id=self.APP_ID, app_password="secret", logger=_make_logger(), **overrides)
+
+    def test_reuses_the_app_client_for_the_default_service_url(self):
+        adapter = self._adapter()
+        api = adapter._app.api
+        assert adapter._api_for(api.service_url) is api
+        assert adapter._api_for(f"{api.service_url}/") is api
+        assert adapter._api_for("") is api
+
+    def test_targets_other_service_urls_with_a_dedicated_client(self):
+        adapter = self._adapter()
+        regional = adapter._api_for(self.EMEA)
+        assert regional is not adapter._app.api
+        assert regional.service_url == "https://smba.trafficmanager.net/emea"
+        # Python divergence (docs/UPSTREAM_SYNC.md): one cached client per
+        # normalized URL rather than a new client per call.
+        assert adapter._api_for(self.EMEA.rstrip("/")) is regional
+
+    def test_keeps_every_client_on_the_configured_endpoint(self):
+        adapter = self._adapter(api_url=self.GATEWAY)
+        assert adapter._app.api.service_url == self.GATEWAY
+        assert adapter._api_for(self.EMEA) is adapter._app.api
+
+    def test_teams_api_url_env_pins_every_client(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("TEAMS_API_URL", self.GATEWAY)
+        adapter = self._adapter()
+        assert adapter._api_for(self.EMEA) is adapter._app.api
+
+    @pytest.mark.asyncio
+    async def test_sends_through_the_configured_endpoint_instead_of_the_thread_url(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter(api_url=self.GATEWAY)
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(
+            TeamsThreadId(conversation_id="19:abc@thread.tacv2", service_url=self.EMEA),
+            MessageActivityInput(text="hello"),
+        )
+
+        assert send.call_args.args[1].service_url == self.GATEWAY
+
+    @pytest.mark.asyncio
+    async def test_sends_through_the_sdk_with_the_threads_service_url_and_conversation(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(
+            TeamsThreadId(
+                conversation_id="19:abc@thread.tacv2",
+                service_url=self.EMEA,
+                conversation_type="channel",
+            ),
+            MessageActivityInput(text="hello"),
+        )
+
+        send.assert_called_once()
+        activity, ref = send.call_args.args
+        assert (activity.type, activity.text) == ("message", "hello")
+        assert ref.model_dump(by_alias=True, exclude_none=True) == {
+            "channelId": "msteams",
+            "serviceUrl": "https://smba.trafficmanager.net/emea",
+            "bot": {"id": self.APP_ID},
+            "conversation": {"id": "19:abc@thread.tacv2", "conversationType": "channel"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_default_service_url_when_the_thread_has_none(self):
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        send = _mock_app_send(adapter, "sent")
+
+        await adapter._send_to(TeamsThreadId(conversation_id="a:dm", service_url=""), MessageActivityInput(text="hi"))
+
+        ref = send.call_args.args[1]
+        assert ref.service_url == adapter._app.api.service_url
+        # conversation_type is put on the wire only when the thread ID knows it
+        assert ref.conversation.model_dump(by_alias=True, exclude_none=True) == {"id": "a:dm"}
+
+    @pytest.mark.asyncio
+    async def test_rejects_sends_without_credentials(self, monkeypatch: pytest.MonkeyPatch):
+        from microsoft_teams.api import MessageActivityInput
+
+        for name in ("TEAMS_APP_ID", "CLIENT_ID"):
+            monkeypatch.delenv(name, raising=False)
+        adapter = _make_adapter(app_id="", logger=_make_logger())
+        send = _mock_app_send(adapter)
+
+        with pytest.raises(ValueError, match="credentials"):
+            await adapter._send_to(
+                TeamsThreadId(conversation_id="a:dm", service_url=""), MessageActivityInput(text="hello")
+            )
+        send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sdk_without_activity_sender_sends_on_the_thread_urls_client(self, monkeypatch: pytest.MonkeyPatch):
+        """``microsoft-teams-apps`` 2.1+ removed ``ActivitySender``: the send goes
+        through ``send_or_update_activity`` with the ``_api_for`` client."""
+        activity_send = pytest.importorskip("microsoft_teams.apps.activity_send")
+        from microsoft_teams.api import MessageActivityInput
+
+        adapter = self._adapter()
+        if hasattr(adapter._app, "activity_sender"):
+            del adapter._app.activity_sender
+        calls: list[tuple[Any, Any, Any]] = []
+
+        async def fake_send_or_update(api, activity, ref):
+            calls.append((api, activity, ref))
+            return _SentActivity("sent-21")
+
+        monkeypatch.setattr(activity_send, "send_or_update_activity", fake_send_or_update)
+        activity = MessageActivityInput(text="hello")
+
+        sent = await adapter._send_to(TeamsThreadId(conversation_id="a:dm", service_url=self.EMEA), activity)
+
+        assert sent.id == "sent-21"
+        [(api, sent_activity, ref)] = calls
+        assert api is adapter._api_for(self.EMEA)
+        assert sent_activity is activity
+        assert ref.service_url == "https://smba.trafficmanager.net/emea"
+
+    @pytest.mark.asyncio
+    async def test_real_sdk_puts_the_thread_conversation_on_the_wire(self, monkeypatch: pytest.MonkeyPatch):
+        """Unstubbed SDK send path on whichever SDK line is installed; only the
+        HTTP ``post`` is replaced."""
+        from microsoft_teams.common.http.client import Client
+
+        posts: list[tuple[str, dict[str, Any]]] = []
+
+        class _Response:
+            def json(self) -> dict[str, str]:
+                return {"id": "wire-1"}
+
+        async def fake_post(_self, url, *, json=None, **_kwargs):
+            posts.append((url, json))
+            return _Response()
+
+        monkeypatch.setattr(Client, "post", fake_post)
+        adapter = self._adapter()
+        tid = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group-chat", service_url=self.EMEA, conversation_type="groupChat")
+        )
+
+        result = await adapter.post_message(tid, "hello")
+
+        assert result.id == "wire-1"
+        [(url, body)] = posts
+        assert url == "https://smba.trafficmanager.net/emea/v3/conversations/a:group-chat/activities"
+        assert body["conversation"] == {"id": "a:group-chat", "conversationType": "groupChat"}
+        assert body["from"]["id"] == self.APP_ID
+        assert body["text"] == "hello"
+
+    def test_client_cache_follows_the_app_api_it_was_built_from(self):
+        adapter = self._adapter()
+        first = adapter._api_for(self.EMEA)
+        replacement = MagicMock()
+        replacement.service_url = "https://smba.trafficmanager.net/teams"
+        scoped = object()
+        replacement.from_service_url = MagicMock(return_value=scoped)
+        adapter._app.api = replacement
+
+        assert adapter._api_for(self.EMEA) is scoped
+        assert scoped is not first
+        replacement.from_service_url.assert_called_once_with("https://smba.trafficmanager.net/emea")
+
+    def test_client_cache_is_bounded(self):
+        from chat_sdk.adapters.teams.adapter import _MAX_CACHED_API_CLIENTS
+
+        adapter = self._adapter()
+        urls = [f"https://region{i}.botframework.com" for i in range(_MAX_CACHED_API_CLIENTS + 1)]
+        first = adapter._api_for(urls[0])
+        for url in urls[1:]:
+            adapter._api_for(url)
+
+        assert len(adapter._api_clients) == _MAX_CACHED_API_CLIENTS
+        assert urls[0] not in adapter._api_clients
+        assert adapter._api_for(urls[0]) is not first
+
+
+class TestConversationTypeRouting:
+    """Port of upstream ``index.test.ts`` › "Teams conversation type routing"
+    (chat@4.36.0 / chat@4.40.0)."""
+
+    SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+
+    def test_keeps_the_legacy_id_when_the_conversation_type_agrees_with_its_prefix(self):
+        adapter = _make_adapter()
+        personal = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="a:personal-conversation", service_url=self.SERVICE_URL, conversation_type="personal"
+            )
+        )
+        legacy_personal = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:personal-conversation", service_url=self.SERVICE_URL)
+        )
+        channel = adapter.encode_thread_id(
+            TeamsThreadId(
+                conversation_id="19:channel@thread.tacv2", service_url=self.SERVICE_URL, conversation_type="channel"
+            )
+        )
+        legacy_channel = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="19:channel@thread.tacv2", service_url=self.SERVICE_URL)
+        )
+
+        assert personal == legacy_personal
+        assert channel == legacy_channel
+        assert personal.count(":") == 2
+
+    def _message(self, adapter: TeamsAdapter, conversation: dict[str, Any], **extra: Any):
+        return adapter.parse_message(
+            {
+                "conversation": conversation,
+                "from": {"id": "user-1", "name": "Alice"},
+                "id": "message-1",
+                "serviceUrl": self.SERVICE_URL,
+                "text": "hello",
+                "type": "message",
+                **extra,
+            }
+        )
+
+    def test_falls_back_to_is_group_when_conversation_type_is_missing(self):
+        adapter = _make_adapter()
+        group = self._message(adapter, {"id": "a:group-chat-id", "isGroup": True})
+        channel = self._message(
+            adapter, {"id": "a:channel-id", "isGroup": True}, channelData={"team": {"id": "team-id"}}
+        )
+        personal = self._message(adapter, {"id": "19:personal-id", "isGroup": False})
+
+        assert adapter.decode_thread_id(group.thread_id).conversation_type == "groupChat"
+        assert adapter.is_dm(group.thread_id) is False
+        assert adapter.decode_thread_id(channel.thread_id).conversation_type == "channel"
+        assert adapter.is_dm(channel.thread_id) is False
+        assert adapter.decode_thread_id(personal.thread_id).conversation_type == "personal"
+        assert adapter.is_dm(personal.thread_id) is True
+
+    def test_prefers_an_explicit_conversation_type_over_is_group(self):
+        adapter = _make_adapter()
+        message = self._message(adapter, {"conversationType": "personal", "id": "19:personal-id", "isGroup": True})
+        assert adapter.is_dm(message.thread_id) is True
+
+    def test_is_group_is_checked_by_identity_not_truthiness(self):
+        adapter = _make_adapter()
+        # A non-bool isGroup is "missing": the 19:/a: heuristic decides and
+        # the thread ID keeps its legacy three-segment form.
+        message = self._message(adapter, {"id": "a:conversation", "isGroup": "false"})
+        assert adapter.decode_thread_id(message.thread_id).conversation_type is None
+        assert message.thread_id.count(":") == 2
+        assert adapter.is_dm(message.thread_id) is True
+        # A falsy non-bool is not ``False``: no ``personal`` override.
+        channel = self._message(adapter, {"id": "19:channel@thread.tacv2", "isGroup": 0})
+        assert adapter.decode_thread_id(channel.thread_id).conversation_type is None
+        assert adapter.is_dm(channel.thread_id) is False
+
+    def test_explicit_group_chat_id_round_trips_with_a_fourth_segment(self):
+        adapter = _make_adapter()
+        thread_id = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group", service_url=self.SERVICE_URL, conversation_type="groupChat")
+        )
+        assert thread_id.endswith(":groupChat")
+        assert adapter.decode_thread_id(thread_id) == TeamsThreadId(
+            conversation_id="a:group", service_url=self.SERVICE_URL, conversation_type="groupChat"
+        )
+        # channel IDs keep the type, so a channel-level post stays a group chat
+        assert adapter.channel_id_from_thread_id(thread_id) == thread_id
+
+    def test_encode_rejects_an_unknown_conversation_type(self):
+        adapter = _make_adapter()
+        with pytest.raises(ValidationError, match="conversation type"):
+            adapter.encode_thread_id(
+                TeamsThreadId(conversation_id="a:x", service_url=self.SERVICE_URL, conversation_type="bogus")  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_group_chat_is_not_routed_as_a_dm(self):
+        """An ``a:`` group chat goes to ``process_message`` without a native
+        streamer (Teams streams natively only in 1:1 chats)."""
+        adapter = _make_adapter()
+        adapter._create_streamer = MagicMock(side_effect=AssertionError("group chats must not stream natively"))  # type: ignore[method-assign]
+        chat = MagicMock()
+        chat.process_message = MagicMock(return_value=None)
+        adapter._chat = chat
+
+        await adapter._handle_message_activity(
+            {
+                "type": "message",
+                "id": "m-1",
+                "text": "hi",
+                "from": {"id": "user-1", "name": "Alice"},
+                "conversation": {"id": "a:group-chat", "conversationType": "groupChat"},
+                "serviceUrl": self.SERVICE_URL,
+            }
+        )
+
+        chat.process_message.assert_called_once()
+        thread_id = chat.process_message.call_args.args[1]
+        assert adapter.is_dm(thread_id) is False
+        assert adapter._active_streams == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["message_action", "card_invoke", "reaction"])
+    async def test_actions_and_reactions_in_a_group_chat_get_the_typed_thread_id(self, handler: str):
+        """Button clicks and reactions in an ``a:`` group chat share the
+        message's ``:groupChat`` thread ID (and so its subscription/state
+        keys), not the untyped DM-looking three-segment form."""
+        adapter = _make_adapter()
+        chat = MagicMock()
+        adapter._chat = chat
+        activity: dict[str, Any] = {
+            "id": "m-1",
+            "replyToId": "m-0",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "a:group-chat", "conversationType": "groupChat"},
+            "serviceUrl": self.SERVICE_URL,
+        }
+        expected = adapter.encode_thread_id(
+            TeamsThreadId(conversation_id="a:group-chat", service_url=self.SERVICE_URL, conversation_type="groupChat")
+        )
+
+        if handler == "message_action":
+            adapter._handle_message_action({**activity, "type": "message"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        elif handler == "card_invoke":
+            await adapter._handle_adaptive_card_action({**activity, "type": "invoke"}, {"actionId": "approve"})
+            event = chat.process_action.call_args.args[0]
+        else:
+            adapter._handle_reaction_activity(
+                {**activity, "type": "messageReaction", "reactionsAdded": [{"type": "like"}]}
+            )
+            event = chat.process_reaction.call_args.args[0]
+
+        assert event.thread_id == expected
+        assert event.thread_id.endswith(":groupChat")
+        assert adapter.is_dm(event.thread_id) is False
 
 
 class TestFileAttachments:
@@ -1533,9 +1982,9 @@ class TestFileAttachments:
     @staticmethod
     def _sent_attachments(send: AsyncMock) -> list[dict]:
         """Serialize the attachments off the MessageActivityInput handed to the
-        SDK ``app.send``, back to the camelCase wire dicts — proving the file
+        SDK sender, back to the camelCase wire dicts — proving the file
         attachments actually reached the SDK boundary (not just the raw echo)."""
-        activity = send.call_args.args[1]
+        activity = send.call_args.args[0]
         dumped = activity.model_dump(by_alias=True, exclude_none=True)
         return dumped.get("attachments", [])
 
@@ -1757,9 +2206,9 @@ class TestStartTyping:
         )
         await adapter.start_typing(thread_id)
         assert send.call_count == 1
-        conv_id, activity = send.call_args.args
-        assert conv_id == "19:abc@thread.tacv2"
-        # delegates a TypingActivityInput (type == "typing") to the SDK App.send
+        activity, ref = send.call_args.args
+        assert ref.conversation.id == "19:abc@thread.tacv2"
+        # delegates a TypingActivityInput (type == "typing") to the SDK sender
         assert isinstance(activity, TypingActivityInput)
         assert activity.type == "typing"
 

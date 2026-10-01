@@ -40,6 +40,7 @@ from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
 from chat_sdk.adapters.teams.types import (
     TeamsAdapterConfig,
     TeamsChannelContext,
+    TeamsConversationType,
     TeamsDmContext,
     TeamsGraphContext,
     TeamsThreadId,
@@ -351,6 +352,62 @@ def _validate_service_url(url: str) -> None:
     )
 
 
+_CONVERSATION_TYPES: frozenset[str] = frozenset({"channel", "groupChat", "personal"})
+# Upper bound on cached per-service-URL Bot Framework clients (``_api_for``).
+# Real deployments see a handful of regional hosts; the cap only keeps a long
+# run of distinct (allow-listed) URLs from growing the cache without limit.
+_MAX_CACHED_API_CLIENTS = 32
+
+
+def _parse_conversation_type(value: Any) -> TeamsConversationType | None:
+    """Return ``value`` if it is a Teams conversation type, else ``None``.
+
+    Port of upstream ``parseConversationType`` (``thread-id.ts``).
+    """
+    if isinstance(value, str) and value in _CONVERSATION_TYPES:
+        return cast("TeamsConversationType", value)
+    return None
+
+
+def _conversation_type_from_activity(activity: dict[str, Any]) -> TeamsConversationType | None:
+    """Classify an inbound activity's conversation.
+
+    Port of upstream ``conversationTypeFromActivity`` (chat@4.40.0). An explicit
+    ``conversation.conversationType`` wins. Otherwise ``isGroup`` decides:
+    ``False`` is ``personal``; ``True`` is ``channel`` when
+    ``channelData.team.id`` is set, else ``groupChat``. With neither, returns
+    ``None`` and callers fall back to the ``19:``-prefix heuristic. ``isGroup``
+    is compared by identity, so a non-bool value counts as missing.
+    """
+    conversation = activity.get("conversation")
+    if not isinstance(conversation, dict):
+        return None
+    explicit = _parse_conversation_type(conversation.get("conversationType"))
+    if explicit is not None:
+        return explicit
+    is_group = conversation.get("isGroup")
+    if is_group is False:
+        return "personal"
+    if is_group is True:
+        channel_data = activity.get("channelData")
+        team = channel_data.get("team") if isinstance(channel_data, dict) else None
+        return "channel" if isinstance(team, dict) and team.get("id") else "groupChat"
+    return None
+
+
+def _is_dm_conversation(conversation_id: str, conversation_type: TeamsConversationType | None) -> bool:
+    """Whether a conversation is a 1:1 chat.
+
+    An explicit type decides; without one, the legacy heuristic applies:
+    channel and group-chat IDs start with ``19:``, personal IDs do not (an
+    ``a:`` group chat or ``19:`` personal chat needs the explicit type).
+    Upstream ``isDM`` (``thread-id.ts``).
+    """
+    if conversation_type is not None:
+        return conversation_type == "personal"
+    return not conversation_id.startswith("19:")
+
+
 def _error_field(error: Any, dict_key: str, attr_name: str) -> Any:
     """Read a field from a Teams error that may be a dict or an SDK exception.
 
@@ -533,6 +590,13 @@ class TeamsAdapter:
         # streamer stays alive); consulted by ``stream()`` to decide between
         # native streaming via ``emit()`` and the accumulate-and-post fallback.
         self._active_streams: dict[str, StreamerProtocol] = {}
+
+        # Bot Framework clients for service URLs other than ``App.api``'s,
+        # keyed by normalized URL and built by ``_api_for``. ``_api_clients_owner``
+        # is the ``App.api`` they were derived from; a different one empties
+        # the cache so no client outlives the App it shares a token with.
+        self._api_clients: dict[str, Any] = {}
+        self._api_clients_owner: Any | None = None
 
     def _build_app(self, config: TeamsAdapterConfig) -> Any:
         """Construct the Microsoft Teams SDK ``App`` for this adapter.
@@ -1188,8 +1252,10 @@ class TeamsAdapter:
         # IDs that Graph's ``/chats/{chat-id}/messages`` endpoint rejects;
         # the canonical Graph chat ID for a 1:1 DM is
         # ``19:{userAadId}_{botId}@unq.gbl.spaces``. ``aadObjectId`` is
-        # only present for real Teams users (not bots), and DM conversation
-        # IDs do not start with ``19:`` (channel/group chats do).
+        # only present for real Teams users (not bots). Only personal chats
+        # get DM context: the activity's conversation type decides, falling
+        # back to the ``19:``-prefix heuristic when Teams sent no type
+        # (upstream chat@4.36.0, so an ``a:`` group chat is not cached as a DM).
         #
         # Defense-in-depth: AAD object IDs are GUIDs (8-4-4-4-12 hex). Bot
         # Framework JWT verification authenticates the activity envelope
@@ -1201,7 +1267,7 @@ class TeamsAdapter:
         if (
             isinstance(aad_object_id, str)
             and self._app_id
-            and not base_channel_id.startswith("19:")
+            and _is_dm_conversation(base_channel_id, _conversation_type_from_activity(activity))
             and state
             and _AAD_OBJECT_ID_PATTERN.fullmatch(aad_object_id)
         ):
@@ -1239,16 +1305,7 @@ class TeamsAdapter:
             self._handle_message_action(activity, action_value, options)
             return
 
-        conversation_id = activity.get("conversation", {}).get("id", "")
-        service_url = activity.get("serviceUrl", "")
-
-        thread_id = self.encode_thread_id(
-            TeamsThreadId(
-                conversation_id=conversation_id,
-                service_url=service_url,
-                reply_to_id=activity.get("replyToId"),
-            )
-        )
+        thread_id = self._thread_id_from_activity(activity)
 
         message = self._parse_teams_message(activity, thread_id)
         # Both the group and DM paths wait for the sender lookup before
@@ -1432,8 +1489,7 @@ class TeamsAdapter:
           scopes its own client with ``api.from_service_url(ref.service_url)``.
 
         Either way the stream gets its own client pinned to the inbound
-        activity's service URL, so a later :meth:`_point_app_api_at` (which
-        retargets the shared ``App.api`` in place) cannot move it.
+        activity's service URL, independent of the clients outbound calls use.
 
         Returns ``None`` when the activity lacks the fields the SDK ref
         requires (``serviceUrl``), so the caller can fall back to
@@ -1468,9 +1524,8 @@ class TeamsAdapter:
         ``App.api.from_service_url(ref.service_url)`` rather than the shared
         ``App.api``. 2.1's ``HttpStream`` scopes the client again itself, so
         this costs one extra lightweight clone (the HTTP connection is shared).
-        It keeps the stream off the shared client even if a future
-        ``HttpStream`` stops scoping, because ``_point_app_api_at`` retargets
-        ``App.api`` in place for outbound calls.
+        It keeps the stream on the inbound activity's service URL even if a
+        future ``HttpStream`` stops scoping.
 
         An SDK whose ``ApiClient`` has no ``from_service_url`` raises
         ``AttributeError`` here, which :meth:`_create_streamer` turns into the
@@ -1518,15 +1573,7 @@ class TeamsAdapter:
         if not self._chat:
             return
 
-        conversation_id = activity.get("conversation", {}).get("id", "")
-        service_url = activity.get("serviceUrl", "")
-
-        thread_id = self.encode_thread_id(
-            TeamsThreadId(
-                conversation_id=conversation_id,
-                service_url=service_url,
-            )
-        )
+        thread_id = self._thread_id_from_activity(activity)
 
         # Auto-submit fan-out: fire on_action for each input value.
         if action_value.get("actionId") == AUTO_SUBMIT_ACTION_ID:
@@ -1566,15 +1613,7 @@ class TeamsAdapter:
         if not self._chat:
             return
 
-        conversation_id = activity.get("conversation", {}).get("id", "")
-        service_url = activity.get("serviceUrl", "")
-
-        thread_id = self.encode_thread_id(
-            TeamsThreadId(
-                conversation_id=conversation_id,
-                service_url=service_url,
-            )
-        )
+        thread_id = self._thread_id_from_activity(activity)
 
         # Auto-submit fan-out: fire on_action for each input value.
         if action_data.get("actionId") == AUTO_SUBMIT_ACTION_ID:
@@ -1671,13 +1710,7 @@ class TeamsAdapter:
         message_id_match = MESSAGEID_CAPTURE_PATTERN.search(conversation_id)
         message_id = (message_id_match.group(1) if message_id_match else None) or activity.get("replyToId", "")
 
-        service_url = activity.get("serviceUrl", "")
-        thread_id = self.encode_thread_id(
-            TeamsThreadId(
-                conversation_id=conversation_id,
-                service_url=service_url,
-            )
-        )
+        thread_id = self._thread_id_from_activity(activity)
 
         from_user = activity.get("from", {})
         user = Author(
@@ -1925,44 +1958,108 @@ class TeamsAdapter:
 
         return attachments
 
-    def _point_app_api_at(self, service_url: str) -> None:
-        """Aim the SDK ``App``'s Bot Framework client at ``service_url``.
+    def _api_for(self, service_url: str) -> Any:
+        """Bot Framework client for ``service_url``, sharing the App's bot token.
 
-        The migrated outbound paths call ``self._app.send(...)`` and
-        ``self._app.api.conversations.activities(...)`` directly (parity with
-        upstream ``this.app.send`` / ``this.app.api.conversations``). The SDK
-        binds the App's :class:`ApiClient` to a single service URL at
-        construction, and ``app.send`` reads ``self.api.service_url`` into the
-        outgoing :class:`ConversationReference`. Our thread IDs encode a
-        per-thread service URL, so before each call we retarget the App's API
-        client — validating against the SSRF allow-list first, exactly as the
-        retired hand-rolled senders did.
+        Port of upstream ``TeamsApp.apiFor`` (chat@4.41.0). Thread IDs encode
+        the service URL each conversation lives on (regional hosts, sovereign
+        clouds), so edit/delete address that host instead of mutating the shared
+        ``App.api`` — which raced when concurrent calls targeted different URLs.
 
-        The setter walks the real :class:`ApiClient`'s service-url chain
-        (the client itself, its ``conversations`` sub-client, and that
-        sub-client's ``activities_client``). It is defensive about test doubles
-        that replace ``self._app.api`` with a mock lacking those attributes —
-        an ``AttributeError`` there is harmless because the mock ignores the
-        service URL anyway.
+        Returns ``App.api`` itself when ``service_url`` is empty, when it equals
+        ``App.api``'s URL (trailing slashes ignored), or when an explicit
+        ``api_url`` / ``TEAMS_API_URL`` pins every call to that endpoint.
+        Otherwise returns a client for the normalized URL. Callers validate the
+        URL against the SSRF allow-list first.
 
-        Works on both ``microsoft-teams-apps`` 2.0.x and 2.1.x. On 2.1 the
-        activity methods gained optional ``service_url=`` / ``agentic_identity=``
-        keywords; we pass neither, so they fall back to the client's own (just
-        retargeted) ``service_url``, and ``app.send`` sees
-        ``ref.service_url == api.service_url`` and sends on ``App.api`` itself.
+        Divergence from upstream — see docs/UPSTREAM_SYNC.md: upstream builds a
+        new client per call; this caches one per normalized URL (bounded), all
+        derived from the current ``App.api``. Building one never awaits, so no
+        shared state is held across an ``await``.
         """
-        _validate_service_url(service_url)
-        normalized = service_url.rstrip("/")
         api = self._app.api
-        try:
-            api.service_url = normalized
-            conversations = api.conversations
-            conversations.service_url = normalized
-            conversations.activities_client.service_url = normalized
-        except AttributeError:
-            # ``self._app.api`` is a test double without the real client's
-            # service-url chain; nothing to retarget.
-            pass
+        target = service_url.rstrip("/")
+        if not target or self._service_url_pinned() or target == str(api.service_url).rstrip("/"):
+            return api
+        if self._api_clients_owner is not api:
+            self._api_clients = {}
+            self._api_clients_owner = api
+        client = self._api_clients.get(target)
+        if client is None:
+            client = self._new_api_client(api, target)
+            if len(self._api_clients) >= _MAX_CACHED_API_CLIENTS:
+                self._api_clients.pop(next(iter(self._api_clients)))
+            self._api_clients[target] = client
+        return client
+
+    def _new_api_client(self, api: Any, service_url: str) -> Any:
+        """Build an ``ApiClient`` for ``service_url`` sharing ``api``'s token.
+
+        ``microsoft-teams-api`` 2.1+ has ``ApiClient.from_service_url`` (a
+        clone that shares the HTTP connection and token provider). 2.0.x lacks
+        it, so build ``ApiClient(service_url, api.http, ...)`` the way the
+        2.0.x ``ActivitySender`` does: ``api.http`` carries the bot-token
+        callable, so every request still mints a fresh token.
+        """
+        from_service_url = getattr(api, "from_service_url", None)
+        if callable(from_service_url):
+            return from_service_url(service_url)
+        from microsoft_teams.api import ApiClient
+
+        app = self._app
+        return ApiClient(service_url, api.http, app.options.api_client_settings, cloud=app.cloud)
+
+    def _service_url_pinned(self) -> bool:
+        """Whether ``api_url`` / ``TEAMS_API_URL`` pins every outbound call.
+
+        Upstream ``TeamsApp.hasServiceUrlOverride``: the SDK ``App`` option the
+        adapter set from that config (``_to_app_options``), so it always
+        describes the App actually in use.
+        """
+        return bool(self._app.options.service_url)
+
+    async def _send_to(self, target: TeamsThreadId, activity: Any) -> Any:
+        """Send ``activity`` to the conversation ``target`` points at.
+
+        Port of upstream ``TeamsApp.sendTo`` (chat@4.41.0). Builds the
+        ``ConversationReference`` from the thread ID — the thread's service
+        URL (or ``App.api``'s URL when the thread has none or ``api_url`` is
+        pinned) and ``conversation_type`` only when the thread ID knows it —
+        and hands it to the SDK sender, so ``App.api`` is never retargeted.
+        Callers validate the thread's service URL first.
+
+        The bot account carries only its id, as the SDK's own ``App.send``
+        builds it (upstream adds ``role: "bot"``; ``microsoft-teams-api``
+        2.0.x ``Account`` has no ``role`` field). SDK dispatch is feature
+        detected: 2.0.x ``App.activity_sender.send(activity, ref)`` builds a
+        client for ``ref.service_url``; 2.1+ removed ``ActivitySender`` and
+        ``App.send`` routes through ``send_or_update_activity(api, activity,
+        ref)``, which we call with the client from :meth:`_api_for`.
+        """
+        from microsoft_teams.api import Account, ConversationAccount, ConversationReference
+
+        app = self._app
+        bot_id = app.id
+        if not bot_id:
+            raise ValueError("Teams app has no credentials configured")
+        thread_service_url = "" if self._service_url_pinned() else target.service_url.rstrip("/")
+        service_url = thread_service_url or app.api.service_url
+        ref = ConversationReference(
+            channel_id="msteams",
+            service_url=service_url,
+            bot=Account(id=bot_id),
+            conversation=ConversationAccount(
+                id=target.conversation_id,
+                conversation_type=target.conversation_type,
+            ),
+        )
+        activity_sender = getattr(app, "activity_sender", None)
+        if activity_sender is not None:
+            # microsoft-teams-apps 2.0.x
+            return await activity_sender.send(activity, ref)
+        from microsoft_teams.apps.activity_send import send_or_update_activity
+
+        return await send_or_update_activity(self._api_for(service_url), activity, ref)
 
     @staticmethod
     def _message_activity_input(payload: dict[str, Any]) -> Any:
@@ -1977,7 +2074,7 @@ class TeamsAdapter:
 
         Upstream constructs a ``MessageActivity``; the Python SDK splits input
         (``MessageActivityInput``) from output (``MessageActivity``) models and
-        ``app.send`` / ``activities.update`` accept only the input variant.
+        the SDK sender and ``activities.update`` accept only the input variant.
         """
         from microsoft_teams.api import MessageActivityInput
 
@@ -2017,11 +2114,8 @@ class TeamsAdapter:
             )
 
             try:
-                self._point_app_api_at(decoded.service_url)
-                sent = await self._app.send(
-                    decoded.conversation_id,
-                    self._message_activity_input(activity_payload),
-                )
+                _validate_service_url(decoded.service_url)
+                sent = await self._send_to(decoded, self._message_activity_input(activity_payload))
                 return RawMessage(
                     id=getattr(sent, "id", "") or "",
                     thread_id=thread_id,
@@ -2062,11 +2156,8 @@ class TeamsAdapter:
         )
 
         try:
-            self._point_app_api_at(decoded.service_url)
-            sent = await self._app.send(
-                decoded.conversation_id,
-                self._message_activity_input(activity_payload),
-            )
+            _validate_service_url(decoded.service_url)
+            sent = await self._send_to(decoded, self._message_activity_input(activity_payload))
             self._logger.debug("Teams API: send response", {"messageId": getattr(sent, "id", None)})
             return RawMessage(
                 id=getattr(sent, "id", "") or "",
@@ -2134,8 +2225,9 @@ class TeamsAdapter:
         )
 
         try:
-            self._point_app_api_at(decoded.service_url)
-            await self._app.api.conversations.activities(decoded.conversation_id).update(
+            _validate_service_url(decoded.service_url)
+            api = self._api_for(decoded.service_url)
+            await api.conversations.activities(decoded.conversation_id).update(
                 message_id,
                 self._message_activity_input(activity_payload),
             )
@@ -2166,8 +2258,9 @@ class TeamsAdapter:
         )
 
         try:
-            self._point_app_api_at(decoded.service_url)
-            await self._app.api.conversations.activities(decoded.conversation_id).delete(message_id)
+            _validate_service_url(decoded.service_url)
+            api = self._api_for(decoded.service_url)
+            await api.conversations.activities(decoded.conversation_id).delete(message_id)
         except Exception as error:
             self._logger.error(
                 "Teams API: deleteActivity failed",
@@ -2212,8 +2305,8 @@ class TeamsAdapter:
         )
 
         try:
-            self._point_app_api_at(decoded.service_url)
-            await self._app.send(decoded.conversation_id, TypingActivityInput())
+            _validate_service_url(decoded.service_url)
+            await self._send_to(decoded, TypingActivityInput())
         except Exception as error:
             self._logger.error(
                 "Teams API: send (typing) failed",
@@ -2373,20 +2466,34 @@ class TeamsAdapter:
     def encode_thread_id(self, platform_data: TeamsThreadId) -> str:
         """Encode platform data into a thread ID string.
 
-        Format: teams:{base64url(conversation_id)}:{base64url(service_url)}
+        Format: ``teams:{base64url(conversation_id)}:{base64url(service_url)}``.
+        A ``:{conversation_type}`` segment is appended only when the explicit
+        type disagrees with the ``19:``-prefix heuristic, so IDs (and the
+        subscription / history keys built on them) stay byte-identical
+        whenever the heuristic was already right (upstream chat@4.36.0).
         """
+        conversation_type = platform_data.conversation_type
+        if conversation_type is not None and conversation_type not in _CONVERSATION_TYPES:
+            raise ValidationError("teams", f"Invalid Teams conversation type: {conversation_type}")
         encoded_conversation_id = (
             base64.urlsafe_b64encode(platform_data.conversation_id.encode("utf-8")).decode("ascii").rstrip("=")
         )
         encoded_service_url = (
             base64.urlsafe_b64encode(platform_data.service_url.encode("utf-8")).decode("ascii").rstrip("=")
         )
+        legacy_is_dm = not platform_data.conversation_id.startswith("19:")
+        if conversation_type is not None and (conversation_type == "personal") != legacy_is_dm:
+            return f"teams:{encoded_conversation_id}:{encoded_service_url}:{conversation_type}"
         return f"teams:{encoded_conversation_id}:{encoded_service_url}"
 
     def decode_thread_id(self, thread_id: str) -> TeamsThreadId:
-        """Decode thread ID string back to platform data."""
+        """Decode thread ID string back to platform data.
+
+        Accepts the legacy three-segment form and the four-segment form with
+        a conversation type; an unknown type segment raises ``ValidationError``.
+        """
         parts = thread_id.split(":")
-        if len(parts) != 3 or parts[0] != "teams":
+        if len(parts) not in (3, 4) or parts[0] != "teams":
             raise ValidationError("teams", f"Invalid Teams thread ID: {thread_id}")
 
         # Add padding for base64url decoding
@@ -2398,12 +2505,39 @@ class TeamsAdapter:
 
         conversation_id = _b64_decode(parts[1])
         service_url = _b64_decode(parts[2])
-        return TeamsThreadId(conversation_id=conversation_id, service_url=service_url)
+        # Upstream treats an empty 4th segment like a missing one.
+        raw_conversation_type = parts[3] if len(parts) == 4 else ""
+        if not raw_conversation_type:
+            return TeamsThreadId(conversation_id=conversation_id, service_url=service_url)
+        conversation_type = _parse_conversation_type(raw_conversation_type)
+        if conversation_type is None:
+            raise ValidationError("teams", f"Invalid Teams conversation type: {raw_conversation_type}")
+        return TeamsThreadId(
+            conversation_id=conversation_id,
+            service_url=service_url,
+            conversation_type=conversation_type,
+        )
+
+    def _thread_id_from_activity(self, activity: dict[str, Any]) -> str:
+        """Thread ID for an inbound activity (upstream ``threadIdFromActivity``)."""
+        conversation = activity.get("conversation")
+        conversation_id = conversation.get("id") if isinstance(conversation, dict) else None
+        return self.encode_thread_id(
+            TeamsThreadId(
+                conversation_id=conversation_id or "",
+                service_url=activity.get("serviceUrl") or "",
+                conversation_type=_conversation_type_from_activity(activity),
+            )
+        )
 
     def is_dm(self, thread_id: str) -> bool:
-        """Check if a thread is a DM (not a channel/team conversation)."""
+        """Check if a thread is a DM (not a channel/team conversation).
+
+        An explicit conversation type in the thread ID decides; otherwise any
+        conversation ID not starting with ``19:`` is a DM.
+        """
         decoded = self.decode_thread_id(thread_id)
-        return not decoded.conversation_id.startswith("19:")
+        return _is_dm_conversation(decoded.conversation_id, decoded.conversation_type)
 
     def channel_id_from_thread_id(self, thread_id: str) -> str:
         """Derive channel ID by stripping message ID from thread ID."""
@@ -2413,18 +2547,13 @@ class TeamsAdapter:
             TeamsThreadId(
                 conversation_id=base_conversation_id,
                 service_url=decoded.service_url,
+                conversation_type=decoded.conversation_type,
             )
         )
 
     def parse_message(self, raw: Any) -> Message:
         """Parse a Teams activity into normalized format."""
-        thread_id = self.encode_thread_id(
-            TeamsThreadId(
-                conversation_id=raw.get("conversation", {}).get("id", ""),
-                service_url=raw.get("serviceUrl", ""),
-            )
-        )
-        return self._parse_teams_message(raw, thread_id)
+        return self._parse_teams_message(raw, self._thread_id_from_activity(raw))
 
     def render_formatted(self, content: FormattedContent) -> str:
         """Render formatted content to Teams markdown."""
@@ -2461,8 +2590,8 @@ class TeamsAdapter:
         # channel threads — DMs need it to map the opaque Bot Framework
         # conversation ID to the canonical Graph chat ID
         # (``19:{aadId}_{botId}@unq.gbl.spaces``) that ``/chats/{id}``
-        # accepts.
-        graph_context = await self._get_graph_context(base_conversation_id)
+        # accepts. An explicit group chat skips it (see ``_graph_context_for``).
+        graph_context = await self._graph_context_for(base_conversation_id, decoded.conversation_type)
         context_type: str | None = graph_context.get("type") if graph_context else None
 
         try:
@@ -2543,7 +2672,7 @@ class TeamsAdapter:
         direction = options.direction or "backward"
 
         try:
-            graph_context = await self._get_graph_context(base_conversation_id)
+            graph_context = await self._graph_context_for(base_conversation_id, decoded.conversation_type)
             context_type = graph_context.get("type") if graph_context else None
 
             self._logger.debug(
@@ -2638,7 +2767,7 @@ class TeamsAdapter:
         limit = options.limit if options.limit is not None else 50
 
         try:
-            graph_context = await self._get_graph_context(base_conversation_id)
+            graph_context = await self._graph_context_for(base_conversation_id, decoded.conversation_type)
             context_type = graph_context.get("type") if graph_context else None
 
             self._logger.debug(
@@ -2666,6 +2795,7 @@ class TeamsAdapter:
                         TeamsThreadId(
                             conversation_id=f"{base_conversation_id};messageid={msg['id']}",
                             service_url=service_url,
+                            conversation_type="channel",
                         )
                     )
                     last_modified = msg.get("lastModifiedDateTime")
@@ -2682,6 +2812,11 @@ class TeamsAdapter:
                     chat_id,
                     {"$top": limit, "$orderby": "createdDateTime desc"},
                 )
+                # Child threads keep the parent's explicit type; a DM context
+                # marks them personal.
+                thread_conversation_type: TeamsConversationType | None = decoded.conversation_type
+                if thread_conversation_type is None and context_type == "dm":
+                    thread_conversation_type = "personal"
                 for msg in graph_messages:
                     if not msg.get("id"):
                         continue
@@ -2689,6 +2824,7 @@ class TeamsAdapter:
                         TeamsThreadId(
                             conversation_id=f"{base_conversation_id};messageid={msg['id']}",
                             service_url=service_url,
+                            conversation_type=thread_conversation_type,
                         )
                     )
                     threads.append(
@@ -2720,6 +2856,7 @@ class TeamsAdapter:
         """
         decoded = self.decode_thread_id(channel_id)
         base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", decoded.conversation_id)
+        target = dataclasses.replace(decoded, conversation_id=base_conversation_id)
 
         files = extract_files(message)
         file_attachments = await self._files_to_attachments(files) if files else []
@@ -2739,11 +2876,8 @@ class TeamsAdapter:
             }
 
             try:
-                self._point_app_api_at(decoded.service_url)
-                sent = await self._app.send(
-                    base_conversation_id,
-                    self._message_activity_input(activity_payload),
-                )
+                _validate_service_url(decoded.service_url)
+                sent = await self._send_to(target, self._message_activity_input(activity_payload))
                 return RawMessage(
                     id=getattr(sent, "id", "") or "",
                     thread_id=channel_id,
@@ -2770,11 +2904,8 @@ class TeamsAdapter:
             activity_payload["attachments"] = file_attachments
 
         try:
-            self._point_app_api_at(decoded.service_url)
-            sent = await self._app.send(
-                base_conversation_id,
-                self._message_activity_input(activity_payload),
-            )
+            _validate_service_url(decoded.service_url)
+            sent = await self._send_to(target, self._message_activity_input(activity_payload))
             self._logger.debug("Teams API: postChannelMessage response", {"messageId": getattr(sent, "id", None)})
             return RawMessage(
                 id=getattr(sent, "id", "") or "",
@@ -2807,13 +2938,15 @@ class TeamsAdapter:
         decoded = self.decode_thread_id(channel_id)
         conversation_id = decoded.conversation_id
         base_conversation_id = MESSAGEID_STRIP_PATTERN.sub("", conversation_id)
-        is_dm = not conversation_id.startswith("19:")
+        is_dm = _is_dm_conversation(conversation_id, decoded.conversation_type)
 
         # vercel/chat#403: only call into the Graph teams/channels
         # endpoint for true channel contexts. A cached DM context (now
         # possible when ``aadObjectId`` was present on the activity)
         # must not be treated as a channel.
-        graph_context = await self._get_graph_context(base_conversation_id) if not is_dm else None
+        graph_context = (
+            await self._graph_context_for(base_conversation_id, decoded.conversation_type) if not is_dm else None
+        )
         channel_context: TeamsChannelContext | None = None
         if graph_context and graph_context.get("type") != "dm":
             channel_context = cast(TeamsChannelContext, graph_context)
@@ -2889,10 +3022,13 @@ class TeamsAdapter:
         if tenant_id:
             payload["channelData"]["tenant"] = {"id": tenant_id}
 
-        # Join on a single ``/``: an Emulator serviceUrl (``http://localhost:N``)
-        # has no trailing slash, so plain concatenation would yield
-        # ``http://localhost:Nv3/conversations``.
-        url = f"{service_url.rstrip('/')}/v3/conversations"
+        # An explicit ``api_url`` / ``TEAMS_API_URL`` pins this call too
+        # (upstream ``apiFor`` in ``openDM``, chat@4.41.0); the thread ID still
+        # records the user's service URL. Join on a single ``/``: an Emulator
+        # serviceUrl (``http://localhost:N``) has no trailing slash, so plain
+        # concatenation would yield ``http://localhost:Nv3/conversations``.
+        endpoint = str(self._app.api.service_url) if self._service_url_pinned() else service_url
+        url = f"{endpoint.rstrip('/')}/v3/conversations"
 
         session = await self._get_http_session()
         async with session.post(
@@ -2916,6 +3052,7 @@ class TeamsAdapter:
             TeamsThreadId(
                 conversation_id=conversation_id,
                 service_url=service_url,
+                conversation_type="personal",
             )
         )
 
@@ -2963,6 +3100,22 @@ class TeamsAdapter:
             except (json.JSONDecodeError, ValueError):
                 pass
         return None
+
+    async def _graph_context_for(
+        self,
+        base_conversation_id: str,
+        conversation_type: TeamsConversationType | None,
+    ) -> TeamsGraphContext | None:
+        """Stored Graph context, skipped for an explicit group chat.
+
+        Upstream ``TeamsGraphReader.getGraphContext`` (chat@4.36.0): a group
+        chat's conversation ID works as-is with Graph's ``/chats`` endpoints,
+        and a DM context stored for the same ID (by an adapter that classified
+        an ``a:`` group chat as a DM) must not redirect it.
+        """
+        if conversation_type == "groupChat":
+            return None
+        return await self._get_graph_context(base_conversation_id)
 
     @staticmethod
     def _chat_id_from_context(
