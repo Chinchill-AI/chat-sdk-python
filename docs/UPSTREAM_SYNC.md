@@ -513,11 +513,12 @@ this port the Python adapter indexed `inbound["from"]` and the per-message
   `TestBusinessScopedUserIdsMalformedPayloads`.
 - **Casing:** upstream's `WhatsAppRawMessage.userId` is `user_id` here,
   matching the existing snake_case raw key `phone_number_id`.
-- **Not yet ported here:** the `recipient()` calls in upstream media sends
-  (#238) and `reply` (#239), because those send paths do not exist in the
-  Python adapter yet. `send_template` (#237) resolves its recipient the same
-  way `post_message` does. `mark_as_read` and typing indicators
-  address a `message_id` only, so they need no recipient.
+- **Other send paths:** media sends (#238) and `reply` (#239) resolve the
+  recipient once per logical post, in `_send` (shared by `post_message` and
+  `reply`) and passed on to `_post_message_with_media`, as upstream's
+  `send()`. `send_template` (#237) resolves its recipient the same way
+  `post_message` does. `mark_as_read` and typing indicators address a
+  `message_id` only, so they need no recipient.
 - **Known limitations kept at parity** (upstream behaves the same at
   chat@4.41.1; revisit if upstream changes them):
   - Identity resolution runs before `process_message`, outside the Chat lock,
@@ -2103,8 +2104,9 @@ targeted ephemeral #219, Gmail #241.
   per function, and bound methods are checked through `__func__`. A callable
   that cannot be introspected gets `options=`, as upstream always passes it.
   This is the divergence row. #201 (`start_typing(options=)`) can reuse it.
-- **WhatsApp / Messenger.** Both implement `reply` / `mark_as_read` since
-  #239 (see the WhatsApp and Messenger section below).
+- **WhatsApp / Messenger.** Since #239, WhatsApp implements `reply` and
+  `mark_as_read`, and Messenger implements `mark_as_read` (no `reply`, as
+  upstream). See the WhatsApp and Messenger section above.
 - **Fidelity.** All 16 `[markAsRead]` / `[reply()]` tests are ported under
   their exact names: `thread.test.ts` 15 → 1 missing at `chat@4.41.1`. The
   remaining test, `startTyping`, belongs to #201. The `postEphemeral`

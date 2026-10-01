@@ -1861,6 +1861,21 @@ class TestDownloadMediaPythonSpecific:
         assert transport.authorizations == ["Bearer test-token", "Bearer test-token"]
 
     @pytest.mark.asyncio
+    async def test_redirect_to_a_foreign_host_is_refused_by_the_host_allowlist(self):
+        # The shared downloader's ``hosts=`` allowlist refuses a foreign hop
+        # before ``headers_for`` runs, so the downloader's own message (not
+        # the media-policy one) surfaces and the token is sent only once.
+        adapter, _ = _adapter_with_session(_json_response({"url": "https://lookaside.fbsbx.com/media"}))
+        transport = FakeFileTransport(
+            FakeFileResponse(b"", status=302, headers={"location": "https://attacker.example/x"}),
+        )
+
+        with pytest.raises(NetworkError, match="Refusing to fetch an untrusted attachment URL"):
+            await adapter.download_media("media-123", transport)
+        assert len(transport.calls) == 1
+        assert transport.authorizations == ["Bearer test-token"]
+
+    @pytest.mark.asyncio
     async def test_non_network_failures_are_wrapped(self):
         cause = RuntimeError("socket closed")
 
