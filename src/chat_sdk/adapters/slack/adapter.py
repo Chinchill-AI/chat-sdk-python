@@ -24,7 +24,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, NoReturn, TypedDict, cast
+from typing import Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import parse_qs
 
 from chat_sdk.adapters.slack.api import (
@@ -44,6 +44,7 @@ from chat_sdk.adapters.slack.crypto import (
     encrypt_token,
     is_encrypted_token_data,
 )
+from chat_sdk.adapters.slack.format import escape_slack_text
 from chat_sdk.adapters.slack.format_converter import SlackFormatConverter
 from chat_sdk.adapters.slack.modals import (
     ModalMetadata,
@@ -70,6 +71,7 @@ from chat_sdk.adapters.slack.webhook import (
 from chat_sdk.emoji import emoji_to_slack, resolve_emoji_from_slack
 from chat_sdk.logger import ConsoleLogger, Logger
 from chat_sdk.modals import ModalElement, OptionsLoadGroup, SelectOptionElement
+from chat_sdk.shared._js_compat import JS_WHITESPACE
 from chat_sdk.shared.adapter_utils import (
     extract_card,
     extract_files,
@@ -90,7 +92,7 @@ from chat_sdk.shared.errors import (
     ValidationError,
 )
 from chat_sdk.shared.log_utils import utf8_byte_length
-from chat_sdk.shared.mentions import replace_bare_mentions
+from chat_sdk.shared.mentions import mask_code_spans, replace_bare_mentions
 from chat_sdk.types import (
     ActionEvent,
     AdapterPostableMessage,
@@ -295,6 +297,228 @@ def _find_next_mention(text: str) -> int:
     if hash_idx == -1:
         return at_idx
     return min(at_idx, hash_idx)
+
+
+def _bot_profile_user_id(event: dict[str, Any]) -> str | None:
+    """``event.bot_profile?.user_id`` -- the bot's user (``U…``) id, if any."""
+    profile = event.get("bot_profile")
+    if not isinstance(profile, dict):
+        return None
+    user_id = profile.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+# Slack's reserved user for platform-generated messages (channel archived,
+# reminders, ...). Upstream ``SLACK_SYSTEM_USER_ID``.
+_SLACK_SYSTEM_USER_ID = "USLACK"
+
+# How content refers to the bot: as a mention Slack renders, as a literal
+# token (inside code or display text), or not at all. ``literal`` explains an
+# ``app_mention`` event without making it an invocation; ``none`` leaves the
+# event unexplained. Upstream ``SlackMentionEvidence``.
+_MentionEvidence = Literal["literal", "mention", "none"]
+
+
+def _mention_token_pattern(user_id: str) -> re.Pattern[str]:
+    """The opening ``<@U…`` / ``<@!U…`` of Slack's mention syntax for *user_id*.
+
+    Upstream matches ``/<@!?{id}(?:\\|[^>]*)?>/i`` in one regex. That regex
+    backtracks quadratically on a run of unclosed ``<@id|`` tokens, so
+    :meth:`_MentionMatcher.search` matches this prefix and checks the tail
+    separately; the two accept exactly the same strings. ``re.ASCII`` keeps
+    ``IGNORECASE`` to ASCII case folding, like JS's ``i`` flag without ``u``.
+    """
+    return re.compile(rf"<@!?{re.escape(user_id)}", re.IGNORECASE | re.ASCII)
+
+
+@dataclass(frozen=True)
+class _MentionMatcher:
+    """The bot to look for, compiled once per message (upstream ``mentionMatcher``).
+
+    ``user_id`` is uppercased so a structured ``user`` element compares the
+    way the case-insensitive token pattern matches.
+    """
+
+    prefix: re.Pattern[str]
+    user_id: str
+
+    def search(self, text: str) -> bool:
+        """Whether *text* holds ``<@id>`` or ``<@id|…>`` (upstream ``token.test``).
+
+        ``(?:\\|[^>]*)?>`` after the prefix means: a ``>`` right away, or a
+        ``|`` with any ``>`` later in the text (``[^>]*`` stops at the first).
+        """
+        last_close = text.rfind(">")
+        for match in self.prefix.finditer(text):
+            end = match.end()
+            if end <= last_close and (text[end] == ">" or text[end] == "|"):
+                return True
+        return False
+
+
+def _mention_matcher(user_id: str) -> _MentionMatcher:
+    return _MentionMatcher(prefix=_mention_token_pattern(user_id), user_id=user_id.upper())
+
+
+def _classify_mrkdwn_mention(text: str, matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify a mrkdwn string, where code is carried as backticks."""
+    if not matcher.search(text):
+        return "none"
+    return "mention" if matcher.search(mask_code_spans(text)) else "literal"
+
+
+def _classify_attachment_part(part: _AttachmentPart, matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify one legacy attachment part.
+
+    Literal parts render only Slack control sequences, so a ``<@U…>`` token
+    there is a mention; mrkdwn parts carry code as backticks.
+    """
+    if part.mrkdwn:
+        return _classify_mrkdwn_mention(part.text, matcher)
+    return "mention" if matcher.search(part.text) else "none"
+
+
+def _classify_blocks_mention(blocks: list[Any], matcher: _MentionMatcher) -> _MentionEvidence:
+    """Classify how *blocks* refer to the matched user (upstream ``classifyBlocksMention``).
+
+    Slack renders a mention from a ``user`` element, and from a ``<@U…>``
+    token in a text object explicitly typed ``mrkdwn``. A rich-text ``text``
+    element, a link label, and a ``raw_text`` table cell are display text: a
+    token there stays literal. Inline code (``style.code``) and preformatted
+    elements render literally too, whatever they hold.
+
+    Walks with an explicit stack rather than recursion so a deeply nested
+    payload cannot raise ``RecursionError``; the result does not depend on
+    visit order (any mention wins, otherwise any literal).
+    """
+    literal = False
+    stack: list[tuple[Any, bool]] = [(block, False) for block in blocks]
+    while stack:
+        value, in_code = stack.pop()
+        if isinstance(value, list):
+            stack.extend((item, in_code) for item in value)
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        style = value.get("style")
+        is_code = (
+            in_code
+            or value.get("type") == "rich_text_preformatted"
+            or (isinstance(style, dict) and style.get("code") is True)
+        )
+
+        user_id = value.get("user_id")
+        text = value.get("text")
+        if value.get("type") == "user" and isinstance(user_id, str) and user_id.upper() == matcher.user_id:
+            if not is_code:
+                return "mention"
+            literal = True
+        elif isinstance(text, str) and matcher.search(text):
+            if not is_code and value.get("type") == "mrkdwn" and matcher.search(mask_code_spans(text)):
+                return "mention"
+            literal = True
+
+        for key in ("elements", "rows", "fields", "text"):
+            child = value.get(key)
+            if isinstance(child, (list, dict)):
+                stack.append((child, is_code))
+
+    return "literal" if literal else "none"
+
+
+@dataclass(frozen=True)
+class _AttachmentPart:
+    """One piece of legacy attachment text (upstream ``SlackAttachmentPart``).
+
+    ``mrkdwn`` parts are mrkdwn (formatting characters are markup);
+    literal parts render as plain text where only Slack control sequences
+    (``<@U…>``, ``<url|label>``, entity escapes) are honored.
+    """
+
+    text: str
+    mrkdwn: bool
+
+
+@dataclass(frozen=True)
+class _AttachmentContent:
+    """Mention-relevant content of one attachment.
+
+    Minimal port of upstream ``attachmentContent``: ``blocks`` (when present,
+    Slack renders only the blocks) and the legacy ``parts``. Table rendering
+    (#210) extends this.
+    """
+
+    blocks: list[Any]
+    parts: list[_AttachmentPart]
+
+
+def _is_foreign_attachment(attachment: dict[str, Any]) -> bool:
+    """Unfurls carry content that is not the message author's."""
+    return bool(
+        attachment.get("is_msg_unfurl")
+        or attachment.get("is_app_unfurl")
+        or attachment.get("from_url")
+        or attachment.get("original_url")
+    )
+
+
+def _author_attachments(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attachments authored by the message sender, in order (unfurls excluded)."""
+    attachments = event.get("attachments")
+    if not isinstance(attachments, list):
+        return []
+    return [a for a in attachments if isinstance(a, dict) and not _is_foreign_attachment(a)]
+
+
+def _attachment_content(attachment: dict[str, Any]) -> _AttachmentContent:
+    """Blocks and legacy parts of an attachment (upstream ``attachmentContent``).
+
+    Slack renders ``pretext``/``text``/``fields`` as plain text unless they
+    are named in ``mrkdwn_in``; ``title`` is always plain text and links to
+    ``title_link``. ``fallback`` fills in only when nothing else renders.
+
+    Upstream builds the parts whenever the attachment has no table blocks
+    (``tables.length === 0``). Tables are not extracted yet (#210), so that
+    gate is always open here and the parts are built even beside blocks;
+    ``_detect_self_mention`` ignores the parts of an attachment with blocks,
+    as upstream does.
+    """
+    raw_blocks = attachment.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    parts: list[_AttachmentPart] = []
+
+    raw_mrkdwn_in = attachment.get("mrkdwn_in")
+    # Only string entries name fields (``set()`` of a dict entry would raise).
+    mrkdwn_in = {name for name in raw_mrkdwn_in if isinstance(name, str)} if isinstance(raw_mrkdwn_in, list) else set()
+
+    def push(value: Any, mrkdwn: bool) -> None:
+        trimmed = value.strip(JS_WHITESPACE) if isinstance(value, str) else ""
+        if trimmed:
+            parts.append(_AttachmentPart(text=trimmed, mrkdwn=mrkdwn))
+
+    push(attachment.get("pretext"), "pretext" in mrkdwn_in)
+    raw_title = attachment.get("title")
+    title = raw_title.strip(JS_WHITESPACE) if isinstance(raw_title, str) else ""
+    title_link = attachment.get("title_link")
+    if isinstance(title_link, str) and title_link:
+        push(f"<{title_link}|{escape_slack_text(title)}>" if title else f"<{title_link}>", False)
+    else:
+        push(title, False)
+    push(attachment.get("text"), "text" in mrkdwn_in)
+    fields = attachment.get("fields")
+    for field in fields if isinstance(fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        raw_field_title = field.get("title")
+        raw_value = field.get("value")
+        field_title = raw_field_title.strip(JS_WHITESPACE) if isinstance(raw_field_title, str) else ""
+        value = raw_value.strip(JS_WHITESPACE) if isinstance(raw_value, str) else ""
+        push(f"{field_title}: {value}" if field_title and value else field_title or value, "fields" in mrkdwn_in)
+
+    if not parts:
+        push(attachment.get("fallback"), False)
+    return _AttachmentContent(blocks=blocks, parts=parts)
 
 
 def _normalize_bot_token_provider(
@@ -2773,13 +2997,11 @@ class SlackAdapter:
         # See _thread_id_for_message_event for the DM/channel rule.
         thread_id = self._thread_id_for_message_event(event)
 
-        is_mention = event.get("type") == "app_mention"
-
+        # ``is_mention`` comes from the message content (``_detect_self_mention``):
+        # Slack fires ``app_mention`` even for a bot id inside code, so the
+        # event type alone is not trusted (upstream vercel/chat#947).
         async def factory() -> Message:
-            msg = await self._parse_slack_message(event, thread_id)
-            if is_mention:
-                msg.is_mention = True
-            return msg
+            return await self._parse_slack_message(event, thread_id)
 
         self._chat.process_message(self, thread_id, factory, options)
 
@@ -3090,11 +3312,14 @@ class SlackAdapter:
     # Mention resolution
     # ==================================================================
 
-    async def _resolve_inline_mentions(self, text: str, skip_self_mention: bool) -> str:
+    async def _resolve_inline_mentions(self, text: str) -> str:
         """Resolve inline user/channel mentions to display names.
 
         Converts ``<@U123>`` to ``<@U123|displayName>`` so downstream parsers
-        render them as ``@displayName`` instead of ``@U123``.
+        render them as ``@displayName`` instead of ``@U123``. The bot's own
+        mention is decoded too (upstream vercel/chat#891):
+        :meth:`_detect_self_mention` classifies it from the raw event before
+        the id markup is replaced.
         """
         user_ids: set[str] = set()
         channel_ids: set[str] = set()
@@ -3115,12 +3340,6 @@ class SlackAdapter:
                 pipe_idx = rest.find("|")
                 if pipe_idx == -1 and SLACK_USER_ID_PATTERN.match(rest):
                     channel_ids.add(rest)
-
-        if not user_ids and not channel_ids:
-            return text
-
-        if skip_self_mention and self._bot_user_id:
-            user_ids.discard(self._bot_user_id)
 
         if not user_ids and not channel_ids:
             return text
@@ -3640,24 +3859,96 @@ class SlackAdapter:
     # Message parsing
     # ==================================================================
 
+    def _detect_self_mention(
+        self,
+        event: dict[str, Any],
+        raw_text: str,
+        attachments: list[_AttachmentContent],
+    ) -> bool | None:
+        """Whether the message invokes the bot (upstream ``detectSelfMention``).
+
+        Slack fires ``app_mention`` for a bot id that only appears inside
+        code, so the invocation is classified from the message content: a
+        ``user`` element for the bot outside code, or a ``<@U…>`` token
+        outside code in mrkdwn content, is a mention. Inline (``style.code``)
+        and preformatted content renders literally, so a bot id there is not.
+
+        Returns ``True`` for an invocation and ``False`` when the content
+        refers to the bot only literally, or not at all. An ``app_mention``
+        whose content never shows the known bot id is still trusted (Slack
+        saw a mention under an id the adapter does not know, such as an
+        Enterprise Grid ``W…`` id). Without any bot id, ``app_mention`` is
+        trusted the same way and other messages return ``None`` so the core
+        text-based fallback decides. Never collapse the tri-state with ``or``.
+        """
+        # Request-scoped id first (multi-workspace), then the configured one.
+        bot_user_id = self.bot_user_id
+        if not bot_user_id:
+            return True if event.get("type") == "app_mention" else None
+
+        matcher = _mention_matcher(bot_user_id)
+        literal = False
+
+        def found(evidence: _MentionEvidence) -> bool:
+            nonlocal literal
+            if evidence == "literal":
+                literal = True
+            return evidence == "mention"
+
+        raw_blocks = event.get("blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        # Blocks model the message body. The flattened ``text`` field loses
+        # the code/literal distinction, so it is only consulted without them.
+        body = _classify_blocks_mention(blocks, matcher) if blocks else _classify_mrkdwn_mention(raw_text, matcher)
+        if found(body):
+            return True
+
+        for attachment in attachments:
+            if attachment.blocks:
+                # Structured attachment content is authoritative for that
+                # attachment, so its legacy fallback cannot add evidence.
+                if found(_classify_blocks_mention(attachment.blocks, matcher)):
+                    return True
+                continue
+            for part in attachment.parts:
+                if found(_classify_attachment_part(part, matcher)):
+                    return True
+
+        # An ``app_mention`` no literal token explains still stands. Otherwise
+        # Slack mentions are user-id tokens: with the content inspected, the
+        # absence of one is a definitive non-mention, so a display name in
+        # plain or code-styled text cannot fall through to name matching.
+        return event.get("type") == "app_mention" and not literal
+
+    def _author_fields(self, event: dict[str, Any]) -> tuple[str, bool]:
+        """``(user_id, is_system)`` for a message author (both parse paths).
+
+        Bot messages carry the bot *user* id in ``bot_profile.user_id``;
+        prefer it to the app-level ``bot_id`` (upstream vercel/chat#883).
+        ``USLACK`` is Slack's own system user (upstream vercel/chat#707).
+        """
+        user = event.get("user")
+        user_id = user or _bot_profile_user_id(event) or event.get("bot_id") or "unknown"
+        return user_id, user == _SLACK_SYSTEM_USER_ID
+
     async def _parse_slack_message(
         self,
         event: dict[str, Any],
         thread_id: str,
-        *,
-        skip_self_mention: bool = True,
     ) -> Message:
         """Parse a Slack event into a normalized Message (async with user lookup)."""
         is_me = self._is_message_from_self(event)
-        raw_text = event.get("text", "")
+        raw_text = event.get("text") or ""
 
         user_name = event.get("username", "unknown")
         full_name = event.get("username", "unknown")
+        email: str | None = None
 
         if event.get("user") and not event.get("username"):
             user_info = await self._lookup_user(event["user"])
             user_name = user_info["display_name"]
             full_name = user_info["real_name"]
+            email = user_info.get("email")
 
         # Track thread participants
         if event.get("user") and self._chat:
@@ -3677,7 +3968,14 @@ class SlackAdapter:
                     {"threadId": thread_id, "userId": event.get("user"), "error": exc},
                 )
 
-        text = await self._resolve_inline_mentions(raw_text, skip_self_mention)
+        # Classify the bot's own mention from the raw event before resolution
+        # replaces the id markup with display names.
+        attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        is_mention = self._detect_self_mention(event, raw_text, attachments)
+
+        # Resolve inline @mentions (the bot's own included) to display names.
+        text = await self._resolve_inline_mentions(raw_text)
+        author_id, is_system = self._author_fields(event)
 
         ts_str = event.get("ts", "0")
         try:
@@ -3698,12 +3996,15 @@ class SlackAdapter:
             text=self._format_converter.extract_plain_text(text),
             formatted=self._format_converter.to_ast(text),
             raw=event,
+            is_mention=is_mention,
             author=Author(
-                user_id=event.get("user") or event.get("bot_id") or "unknown",
+                user_id=author_id,
                 user_name=user_name,
                 full_name=full_name,
                 is_bot=bool(event.get("bot_id")),
                 is_me=is_me,
+                email=email,
+                is_system=is_system,
             ),
             metadata=MessageMetadata(
                 date_sent=date_sent,
@@ -3753,7 +4054,12 @@ class SlackAdapter:
     def _parse_slack_message_sync(self, event: dict[str, Any], thread_id: str) -> Message:
         """Synchronous message parsing (no user lookup, falls back to user ID)."""
         is_me = self._is_message_from_self(event)
-        text = event.get("text", "")
+        text = event.get("text") or ""
+        attachments = [_attachment_content(a) for a in _author_attachments(event)]
+        # Classified the same way as the async path, so an edit's pre-edit
+        # snapshot cannot disagree with the edited message about it.
+        is_mention = self._detect_self_mention(event, text, attachments)
+        author_id, is_system = self._author_fields(event)
         user_name = event.get("username") or event.get("user") or "unknown"
         full_name = event.get("username") or event.get("user") or "unknown"
 
@@ -3776,12 +4082,14 @@ class SlackAdapter:
             text=self._format_converter.extract_plain_text(text),
             formatted=self._format_converter.to_ast(text),
             raw=event,
+            is_mention=is_mention,
             author=Author(
-                user_id=event.get("user") or event.get("bot_id") or "unknown",
+                user_id=author_id,
                 user_name=user_name,
                 full_name=full_name,
                 is_bot=bool(event.get("bot_id")),
                 is_me=is_me,
+                is_system=is_system,
             ),
             metadata=MessageMetadata(
                 date_sent=date_sent,
@@ -4038,11 +4346,17 @@ class SlackAdapter:
         )
 
     def _is_message_from_self(self, event: dict[str, Any]) -> bool:
-        """Check if a Slack event is from this bot."""
+        """Check if a Slack event is from this bot.
+
+        The bot user id (``U…``) matches ``event.user`` or, on bot messages,
+        ``event.bot_profile.user_id`` (upstream vercel/chat#883); the app bot
+        id (``B…``) matches ``event.bot_id``.
+        """
+        user_id = event.get("user") or _bot_profile_user_id(event)
         ctx = self._request_context.get()
-        if ctx and ctx.bot_user_id and event.get("user") == ctx.bot_user_id:
+        if ctx and ctx.bot_user_id and user_id == ctx.bot_user_id:
             return True
-        if self._bot_user_id and event.get("user") == self._bot_user_id:
+        if self._bot_user_id and user_id == self._bot_user_id:
             return True
         return bool(self._bot_id and event.get("bot_id") == self._bot_id)
 
@@ -5003,7 +5317,6 @@ class SlackAdapter:
                 self._parse_slack_message(
                     msg,
                     f"slack:{channel}:{msg.get('thread_ts') or msg.get('ts', '')}",
-                    skip_self_mention=False,
                 )
                 for msg in slack_messages
             )
@@ -5035,7 +5348,6 @@ class SlackAdapter:
                 self._parse_slack_message(
                     msg,
                     f"slack:{channel}:{msg.get('thread_ts') or msg.get('ts', '')}",
-                    skip_self_mention=False,
                 )
                 for msg in chronological
             )
@@ -5074,7 +5386,7 @@ class SlackAdapter:
             for msg in selected:
                 thread_ts = msg.get("ts", "")
                 tid = f"slack:{channel}:{thread_ts}"
-                root_message = await self._parse_slack_message(msg, tid, skip_self_mention=False)
+                root_message = await self._parse_slack_message(msg, tid)
 
                 last_reply_at: datetime | None = None
                 if msg.get("latest_reply"):

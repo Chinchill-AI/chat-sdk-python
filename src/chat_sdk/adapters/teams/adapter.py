@@ -17,14 +17,23 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import quote, urlparse
 
 if TYPE_CHECKING:
     from microsoft_teams.api import ConversationReference
     from microsoft_teams.apps import StreamerProtocol
 
-from chat_sdk.adapters.teams.api import _is_loopback_emulator_url
+from chat_sdk.adapters.teams.api import _is_loopback_emulator_url, is_trusted_teams_service_url
+from chat_sdk.adapters.teams.attachments import (
+    BOT_TOKEN_REFUSAL,
+    TeamsAttachmentFetchers,
+    _connector_origin,
+    create_anonymous_attachment_fetch_data,
+    create_teams_attachment,
+    fetch_with_bot_token,
+    rehydrate_teams_attachment,
+)
 from chat_sdk.adapters.teams.bridge import BridgeHttpAdapter
 from chat_sdk.adapters.teams.cards import AUTO_SUBMIT_ACTION_ID, card_to_adaptive_card
 from chat_sdk.adapters.teams.format_converter import TeamsFormatConverter
@@ -45,6 +54,7 @@ from chat_sdk.shared.adapter_utils import (
     maybe_render_thinking,
 )
 from chat_sdk.shared.buffer_utils import buffer_to_data_uri, to_buffer
+from chat_sdk.shared.download import validate_attachment_url
 from chat_sdk.shared.errors import (
     AdapterPermissionError,
     AdapterRateLimitError,
@@ -88,6 +98,75 @@ MESSAGEID_STRIP_PATTERN = re.compile(r";messageid=\d+")
 # ``_chat_id_from_context``.
 _AAD_OBJECT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000  # 30 days
+USER_INFO_CACHE_TTL_MS = 60 * 60 * 1000  # 1 hour
+USER_INFO_NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000  # 5 minutes
+# Cached when a Graph lookup fails, so tenants without Graph consent don't pay
+# a failing network call on every message.
+USER_INFO_NEGATIVE_SENTINEL = "unresolvable"
+# Bound on the sender lookup awaited before dispatch (Python-only; see
+# docs/UPSTREAM_SYNC.md). On expiry the message is dispatched without email.
+INCOMING_USER_TIMEOUT_S = 5.0
+
+# Strong references for fire-and-forget tasks (user-info cache writes) so the
+# GC does not collect them mid-flight.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _pin_task(task: asyncio.Task[Any]) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def _first_present(*values: Any) -> str | None:
+    """First value that is a non-empty string (upstream ``a ?? b``).
+
+    Python-only: ``""`` counts as missing, so an empty ``mail`` still falls
+    back to the user principal name.
+    """
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _user_info_to_json(info: UserInfo) -> str:
+    """Serialize ``info`` in upstream's camelCase ``UserInfo`` wire shape."""
+    data: dict[str, Any] = {
+        "userId": info.user_id,
+        "userName": info.user_name,
+        "fullName": info.full_name,
+        "isBot": info.is_bot,
+    }
+    if info.email is not None:
+        data["email"] = info.email
+    if info.avatar_url is not None:
+        data["avatarUrl"] = info.avatar_url
+    return json.dumps(data)
+
+
+def _user_info_from_json(raw: str, user_id: str) -> UserInfo | None:
+    """Parse a cached ``UserInfo`` (any SDK's write), re-keyed to ``user_id``."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    user_name = data.get("userName")
+    full_name = data.get("fullName")
+    if not isinstance(user_name, str) or not isinstance(full_name, str):
+        return None
+    email = data.get("email")
+    avatar_url = data.get("avatarUrl")
+    return UserInfo(
+        user_id=user_id,
+        user_name=user_name,
+        full_name=full_name,
+        is_bot=data.get("isBot") is True,
+        email=email if isinstance(email, str) else None,
+        avatar_url=avatar_url if isinstance(avatar_url, str) else None,
+    )
+
 
 # Allowed Microsoft Bot Framework service URL patterns (SSRF protection).
 # Covers commercial, GCC, GCCH, DoD, China (21Vianet) and sovereign cloud
@@ -615,17 +694,31 @@ class TeamsAdapter:
         Graph API call fails. Requires the ``User.Read.All`` application
         permission on the bot's app registration.
 
-        Mirrors upstream ``TeamsAdapter.getUser`` (vercel/chat#404).
+        Results are cached under ``teams:userInfo:{aadObjectId}`` for an
+        hour; a failed lookup caches ``"unresolvable"`` for five minutes so
+        tenants without Graph consent don't retry on every message.
+        ``email`` is ``mail``, else ``userPrincipalName``.
+
+        Mirrors upstream ``TeamsAdapter.getUser`` (vercel/chat#404, #711,
+        #708).
         """
         if not self._chat:
             return None
         try:
             aad_object_id = await self._chat.get_state().get(f"teams:aadObjectId:{user_id}")
-        except Exception:
+        except Exception as error:
+            self._logger.warn(
+                "Failed to read cached aadObjectId from state",
+                {"userId": user_id, "error": str(error)},
+            )
             return None
-        if not aad_object_id:
+        if not aad_object_id or not isinstance(aad_object_id, str):
             self._logger.debug("No cached aadObjectId for user", {"userId": user_id})
             return None
+        return await self._get_user_by_aad_object_id(user_id, aad_object_id)
+
+    async def _get_user_by_aad_object_id(self, user_id: str, aad_object_id: str) -> UserInfo | None:
+        """Graph ``GET /users/{id}`` with the shared ``teams:userInfo`` cache."""
         # Defense in depth: aadObjectId came from a webhook so it's already
         # platform-trusted, but reject obvious junk before issuing a Graph
         # call (avoids URL injection if the cache is ever populated from
@@ -634,9 +727,15 @@ class TeamsAdapter:
         # percent-encode the remainder via `quote(safe="")` (matches
         # Discord's pattern) so whitespace, `\\`, `;`, etc. cannot escape
         # the `/users/{id}` path segment.
-        aad_str = str(aad_object_id)
+        aad_str = aad_object_id
         if not aad_str or "/" in aad_str or "?" in aad_str or "#" in aad_str:
             return None
+        cache_key = f"teams:userInfo:{aad_str}"
+        cached = await self._read_cached_user_info(cache_key, user_id)
+        if cached == USER_INFO_NEGATIVE_SENTINEL:
+            return None
+        if isinstance(cached, UserInfo):
+            return cached
         try:
             token = await self._get_graph_token()
             session = await self._get_http_session()
@@ -646,30 +745,154 @@ class TeamsAdapter:
                 headers={"Authorization": f"Bearer {token}"},
             ) as response:
                 if not response.ok:
-                    self._logger.warn(
-                        "Failed to fetch user info from Graph API",
-                        {"userId": user_id, "status": response.status},
-                    )
-                    return None
+                    raise NetworkError("teams", f"Graph user lookup failed: {response.status}")
                 graph_user = await response.json()
+            if not isinstance(graph_user, dict):
+                raise NetworkError("teams", "Graph user lookup returned no user")
         except Exception as error:
             self._logger.warn(
                 "Failed to fetch user info from Graph API",
                 {"userId": user_id, "error": str(error)},
             )
+            self._cache_user_info_later(cache_key, USER_INFO_NEGATIVE_SENTINEL, USER_INFO_NEGATIVE_CACHE_TTL_MS)
             return None
-        if not isinstance(graph_user, dict):
-            return None
-        display_name = graph_user.get("displayName") or aad_str
-        user_principal = graph_user.get("userPrincipalName")
-        return UserInfo(
+        display_name = _first_present(graph_user.get("displayName"))
+        user_principal = _first_present(graph_user.get("userPrincipalName"))
+        user_info = UserInfo(
             user_id=user_id,
-            user_name=user_principal or display_name or user_id,
-            full_name=display_name,
+            user_name=_first_present(user_principal, display_name, user_id) or user_id,
+            full_name=display_name if display_name is not None else aad_str,
             is_bot=False,
-            email=graph_user.get("mail"),
+            email=_first_present(graph_user.get("mail"), user_principal),
             avatar_url=None,
         )
+        self._cache_user_info_later(cache_key, _user_info_to_json(user_info), USER_INFO_CACHE_TTL_MS)
+        return user_info
+
+    async def _get_incoming_user(
+        self,
+        activity: dict[str, Any],
+        user_id: str,
+        aad_object_id: str,
+    ) -> UserInfo | None:
+        """Look up the sender through the Bot Framework conversation-members API.
+
+        Port of upstream ``getIncomingUser`` (vercel/chat#860): no Graph
+        permission needed. Reads the shared ``teams:userInfo`` cache (a
+        negative sentinel left by a failed Graph lookup is ignored), else asks
+        the activity's own connector for the member. A success is cached for
+        an hour; a failure only logs, so the next message retries.
+        """
+        cache_key = f"teams:userInfo:{aad_object_id}"
+        cached = await self._read_cached_user_info(cache_key, user_id)
+        if isinstance(cached, UserInfo):
+            return cached
+        try:
+            member = await self._get_conversation_member(activity, user_id)
+            name = _first_present(getattr(member, "name", None))
+            email = _first_present(getattr(member, "email", None))
+            user_principal = _first_present(getattr(member, "user_principal_name", None))
+            user_info = UserInfo(
+                user_id=user_id,
+                user_name=_first_present(user_principal, email, name, user_id) or user_id,
+                full_name=name if name is not None else aad_object_id,
+                is_bot=False,
+                email=_first_present(email, user_principal),
+                avatar_url=None,
+            )
+        except Exception as error:
+            self._logger.warn(
+                "Failed to fetch user info from Teams conversation members API",
+                {"userId": user_id, "error": str(error)},
+            )
+            return None
+        self._cache_user_info_later(cache_key, _user_info_to_json(user_info), USER_INFO_CACHE_TTL_MS)
+        return user_info
+
+    async def _get_conversation_member(self, activity: dict[str, Any], user_id: str) -> Any:
+        """Fetch ``user_id``'s ``TeamsChannelAccount`` from the activity's connector.
+
+        Upstream calls ``ctx.api.conversations.getMemberById`` on the client
+        the SDK scoped to the activity's service URL. We scope with
+        ``App.api.from_service_url`` (``microsoft-teams-apps`` 2.1+); 2.0.x
+        has no scoping, so the shared ``App.api`` is used (a lookup for
+        another region then fails and the message has no email).
+        """
+        service_url = activity.get("serviceUrl")
+        conversation_id = (activity.get("conversation") or {}).get("id")
+        if not isinstance(service_url, str) or not isinstance(conversation_id, str) or not conversation_id:
+            raise ValidationError("teams", "Activity has no serviceUrl or conversation id")
+        _validate_service_url(service_url)
+        api = self._app.api
+        from_service_url = getattr(api, "from_service_url", None)
+        if callable(from_service_url):
+            api = from_service_url(service_url.rstrip("/"))
+        conversations = api.conversations
+        get_member_by_id: Any = getattr(conversations, "get_member_by_id", None)
+        if get_member_by_id is not None:
+            return await get_member_by_id(conversation_id, user_id)
+        # microsoft-teams-api < 2.0.16 only has the grouped accessor.
+        return await conversations.members(conversation_id).get(user_id)
+
+    async def _read_cached_user_info(self, cache_key: str, user_id: str) -> UserInfo | str | None:
+        """Return the cached ``UserInfo``, the negative sentinel, or ``None``."""
+        if not self._chat:
+            return None
+        try:
+            cached = await self._chat.get_state().get(cache_key)
+        except Exception:
+            return None
+        if not cached or not isinstance(cached, str):
+            return None
+        if cached == USER_INFO_NEGATIVE_SENTINEL:
+            return USER_INFO_NEGATIVE_SENTINEL
+        return _user_info_from_json(cached, user_id)
+
+    def _cache_user_info_later(self, cache_key: str, value: str, ttl_ms: int) -> None:
+        """Write a ``teams:userInfo`` entry without waiting (upstream ``.catch(() => {})``)."""
+        if not self._chat:
+            return
+        state = self._chat.get_state()
+
+        async def write() -> None:
+            try:
+                await state.set(cache_key, value, ttl_ms)
+            except Exception as error:
+                self._logger.debug("Failed to cache Teams user info", {"error": str(error)})
+
+        _pin_task(asyncio.get_running_loop().create_task(write()))
+
+    async def _hydrate_author_email(self, activity: dict[str, Any], message: Message) -> None:
+        """Set ``message.author.email`` from the sender lookup (upstream ``handleMessageActivity``).
+
+        Senders with ``from.aadObjectId`` use the conversation-members API;
+        others fall back to :meth:`get_user`. Never raises: the lookup is
+        bounded by ``INCOMING_USER_TIMEOUT_S`` (Python-only) and on any
+        failure the message is dispatched without email.
+
+        The bound covers awaited I/O only. The SDK resolves the bot token
+        itself; on a cold cache, ``microsoft-teams-apps`` builds its MSAL
+        client synchronously (once per tenant, then cached), on the event
+        loop. Every outbound call (reply, typing, edit) already does this, so
+        the lookup only moves that one-time cost to the first inbound message.
+        Offloading SDK token internals is out of scope here.
+        """
+        aad_object_id = (activity.get("from") or {}).get("aadObjectId")
+        user_id = message.author.user_id
+        try:
+            async with asyncio.timeout(INCOMING_USER_TIMEOUT_S):
+                if isinstance(aad_object_id, str) and aad_object_id:
+                    user = await self._get_incoming_user(activity, user_id, aad_object_id)
+                else:
+                    user = await self.get_user(user_id)
+        except Exception as error:
+            self._logger.warn(
+                "Failed to look up the Teams message sender",
+                {"userId": user_id, "error": str(error) or type(error).__name__},
+            )
+            return
+        if user is not None and user.email:
+            message.author.email = user.email
 
     async def handle_webhook(
         self,
@@ -1028,6 +1251,9 @@ class TeamsAdapter:
         )
 
         message = self._parse_teams_message(activity, thread_id)
+        # Both the group and DM paths wait for the sender lookup before
+        # dispatch, as upstream does.
+        await self._hydrate_author_email(activity, message)
 
         # Detect @mention
         entities = activity.get("entities", [])
@@ -1507,8 +1733,9 @@ class TeamsAdapter:
         from_user = activity.get("from", {})
 
         # Filter out adaptive card and empty HTML attachments
+        service_url = activity.get("serviceUrl")
         attachments = [
-            self._create_attachment(att)
+            self._create_attachment(att, service_url if isinstance(service_url, str) else None)
             for att in activity.get("attachments", [])
             if att.get("contentType") != "application/vnd.microsoft.card.adaptive"
             and not (att.get("contentType") == "text/html" and not att.get("contentUrl"))
@@ -1536,54 +1763,31 @@ class TeamsAdapter:
             attachments=attachments,
         )
 
-    def _create_attachment(self, att: dict[str, Any]) -> Attachment:
-        """Create an Attachment from a Teams attachment dict."""
-        content_type = att.get("contentType", "")
-        att_type: Literal["audio", "file", "image", "video"] = "file"
-        if content_type.startswith("image/"):
-            att_type = "image"
-        elif content_type.startswith("video/"):
-            att_type = "video"
-        elif content_type.startswith("audio/"):
-            att_type = "audio"
+    def _create_attachment(self, att: dict[str, Any], service_url: str | None = None) -> Attachment:
+        """Create an Attachment from a Teams attachment dict (upstream ``createAttachment``).
 
-        # Python-first divergence (upstream reads ``contentUrl`` only; see
-        # adapter-teams/src/index.ts:833 and docs/UPSTREAM_SYNC.md Known
-        # Non-Parity). A SharePoint/OneDrive file shared in a personal or group
-        # chat arrives as a ``application/vnd.microsoft.teams.file.download.info``
-        # attachment that carries BOTH a top-level ``contentUrl`` (pointing at the
-        # SharePoint/OneDrive item, which 403s on an anonymous GET) and a nested
-        # ``content.downloadUrl`` — a short-lived pre-signed link that fetches with
-        # no auth header. For that attachment type the top-level URL is unusable,
-        # so we prefer the pre-signed ``content.downloadUrl``. Every other
-        # attachment (inline images, etc.) keeps the upstream ``contentUrl`` path.
-        content = att.get("content")
-        download_url = content.get("downloadUrl") if isinstance(content, dict) else None
-        if content_type == "application/vnd.microsoft.teams.file.download.info" and download_url:
-            url = download_url
-        else:
-            url = att.get("contentUrl") or download_url
-        return Attachment(
-            type=att_type,
-            url=url,
-            name=att.get("name"),
-            mime_type=content_type or None,
-            fetch_metadata={"url": url} if url else None,
-            fetch_data=self._build_teams_fetch_data(url) if url else None,
+        Inline attachments on the activity's connector origin are fetched with
+        the bot token; everything else (including file cards, via their
+        pre-signed ``content.downloadUrl``) is fetched anonymously. See
+        :mod:`chat_sdk.adapters.teams.attachments`.
+        """
+        return create_teams_attachment(att, service_url, self._attachment_fetchers())
+
+    def _attachment_fetchers(self) -> TeamsAttachmentFetchers:
+        return TeamsAttachmentFetchers(
+            create_anonymous_fetch_data=self._build_teams_fetch_data,
+            fetch_authenticated=self._fetch_authenticated_attachment,
         )
 
     @staticmethod
     def _is_trusted_teams_download_url(url: str) -> bool:
-        """Gate Teams file downloads to Microsoft-owned hosts.
+        """Gate anonymous Teams file downloads to Microsoft-owned hosts.
 
-        After ``rehydrate_attachment`` reconstructs the fetch closure
-        from serialized ``fetch_metadata``, the URL may have been
-        tampered with.  We refuse to issue a direct GET unless the host
-        is a known Microsoft/Graph download host.
+        Checked on the initial URL in front of the shared guarded downloader
+        (which re-validates scheme and internal addresses on every hop).
 
-        This is a Python-first divergence: upstream Teams adapter does
-        not validate the URL.  See ``docs/UPSTREAM_SYNC.md`` Known
-        Non-Parity.
+        This is a Python-first divergence: upstream fetches any public HTTPS
+        URL. See ``docs/UPSTREAM_SYNC.md`` Known Non-Parity.
         """
         try:
             parsed = urlparse(url)
@@ -1615,57 +1819,68 @@ class TeamsAdapter:
         }
 
     def _build_teams_fetch_data(self, url: str) -> Callable[[], Awaitable[bytes]]:
-        """Build a lazy ``fetch_data`` closure for a Teams file URL.
+        """Build the anonymous ``fetch_data`` closure for ``url`` (upstream ``createFetchDataFn``).
 
-        Uses the adapter's shared ``aiohttp.ClientSession`` (via
-        :meth:`_get_http_session`) so downloads reuse the connection
-        pool instead of constructing a throwaway client per request.
+        Subclasses may override it; rehydrated attachments use the override
+        too. The download goes through the shared guarded downloader (HTTPS
+        only, internal addresses refused, every redirect re-validated, 25 MB
+        cap, 30 s deadline).
         """
+        anonymous = create_anonymous_attachment_fetch_data(url)
 
         async def fetch_data() -> bytes:
-            if not self._is_trusted_teams_download_url(url):
+            # Upstream's URL checks run first, so their refusals keep
+            # upstream's messages.
+            target = validate_attachment_url(url, "teams")
+            # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the
+            # Microsoft host allowlist stays in front of the downloader.
+            if not self._is_trusted_teams_download_url(target):
                 raise ValidationError(
                     "teams",
                     f"Refusing to fetch Teams file from untrusted URL: {url}",
                 )
-            session = await self._get_http_session()
-            async with session.get(url) as resp:
-                if resp.status >= 400:
-                    raise NetworkError(
-                        "teams",
-                        f"Failed to fetch file: {resp.status}",
-                    )
-                return await resp.read()
+            return await anonymous()
 
         return fetch_data
+
+    async def _fetch_authenticated_attachment(self, url: str) -> bytes:
+        """GET a protected inline attachment from the connector with the bot token.
+
+        Port of upstream ``fetchAuthenticatedAttachment``: the token comes
+        from the SDK's ``App.api.http`` and redirects are not followed. The
+        caller has already checked that ``url`` is on the activity's connector
+        origin.
+        """
+        # Divergence from upstream — see docs/UPSTREAM_SYNC.md: the token goes
+        # only to an allow-listed Bot Framework connector, so a tampered
+        # ``connectorOrigin`` in rehydrated metadata cannot send it to a
+        # non-Bot-Framework host. Plain-``http`` loopback stays accepted for
+        # the Emulator (upstream parity: ``getConnectorOrigin`` in
+        # ``attachments.ts`` accepts it too). The allowlist is checked on the
+        # normalized origin, so an explicit default port (``:443``) passes.
+        origin = _connector_origin(url)
+        if origin is None or not is_trusted_teams_service_url(origin):
+            raise NetworkError("teams", BOT_TOKEN_REFUSAL)
+        try:
+            return await fetch_with_bot_token(self._app.api.http, url)
+        except NetworkError:
+            raise
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            suffix = f": {status}" if isinstance(status, int) else ""
+            raise NetworkError("teams", f"Failed to fetch authenticated file{suffix}", error) from error
 
     def rehydrate_attachment(self, attachment: Attachment) -> Attachment:
         """Reconstruct ``fetch_data`` on a deserialized Teams attachment.
 
-        Teams uses public file URLs (signed by the Graph API), so all we
-        need to rebuild the download closure is the URL — either from
-        ``fetch_metadata["url"]`` or the attachment's top-level ``url``.
-        Returns the attachment unchanged when no URL is available.
-        The URL host is validated inside the closure, so tampered URLs
-        raise at fetch time.
+        Rebuilds the retrieval recorded in ``fetch_metadata``: anonymous (by
+        URL, falling back to ``attachment.url``) or bot-authenticated
+        (``auth: "bot"`` plus ``connectorOrigin``; without the origin the
+        fetch is refused). URLs are re-validated inside the closure, so a
+        tampered entry fails at fetch time. Returns the attachment unchanged
+        when no URL is available.
         """
-        meta = attachment.fetch_metadata if attachment.fetch_metadata is not None else {}
-        meta_url = meta.get("url")
-        url = meta_url if meta_url is not None else attachment.url
-        if not url:
-            return attachment
-        return Attachment(
-            type=attachment.type,
-            url=attachment.url,
-            name=attachment.name,
-            mime_type=attachment.mime_type,
-            size=attachment.size,
-            width=attachment.width,
-            height=attachment.height,
-            data=attachment.data,
-            fetch_data=self._build_teams_fetch_data(url),
-            fetch_metadata=attachment.fetch_metadata,
-        )
+        return rehydrate_teams_attachment(attachment, self._attachment_fetchers())
 
     def _is_message_from_self(self, activity: dict[str, Any]) -> bool:
         """Check if the activity is from the bot."""
