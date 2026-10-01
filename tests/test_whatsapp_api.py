@@ -1,8 +1,8 @@
 """Tests for WhatsApp adapter API-calling methods.
 
-Covers: post_message (text, long split, interactive card), add_reaction,
-remove_reaction, stream (accumulation), attachment fetch_data presence,
-send_template, and Graph API error mapping.
+Covers: post_message (text, long split, interactive card, files and
+attachments), add_reaction, remove_reaction, stream (accumulation),
+attachment fetch_data presence, send_template, and Graph API error mapping.
 
 Uses a mock for _graph_api_request to intercept all Graph API calls without
 network access; the send_template and error tests go one level lower, to a
@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 
-from chat_sdk.adapters.whatsapp import WhatsAppApiError
+from chat_sdk.adapters.whatsapp import WhatsAppApiError, get_whatsapp_media_type, validate_file_size
 from chat_sdk.adapters.whatsapp.adapter import (
     WHATSAPP_MESSAGE_LIMIT,
     WhatsAppAdapter,
@@ -28,7 +28,7 @@ from chat_sdk.adapters.whatsapp.adapter import (
 from chat_sdk.adapters.whatsapp.types import WhatsAppAdapterConfig
 from chat_sdk.logger import ConsoleLogger
 from chat_sdk.shared.errors import AdapterError, NetworkError, ValidationError
-from chat_sdk.types import MarkdownTextChunk, StreamChunk
+from chat_sdk.types import Attachment, FileUpload, MarkdownTextChunk, PostableCard, PostableMarkdown, StreamChunk
 
 # =============================================================================
 # Helpers
@@ -505,13 +505,20 @@ async def _send_message(adapter: WhatsAppAdapter) -> Any:
     return await adapter.post_message(THREAD_ID, "hello")
 
 
+async def _upload_media(adapter: WhatsAppAdapter) -> Any:
+    return await adapter.post_message(
+        THREAD_ID,
+        {"files": [FileUpload(data=b"report", filename="report.txt", mime_type="text/plain")]},
+    )
+
+
 async def _fetch_media_metadata(adapter: WhatsAppAdapter) -> Any:
     return await adapter.download_media("media123")
 
 
-# The upstream "media uploads" row lands with outbound media uploads (#238).
 _OPERATIONS = [
     pytest.param(_send_message, id="message sends"),
+    pytest.param(_upload_media, id="media uploads"),
     pytest.param(_fetch_media_metadata, id="media metadata requests"),
 ]
 
@@ -702,3 +709,790 @@ class TestGraphFetchJsonPythonSpecific:
             caught = error
 
         assert type(caught) is WhatsAppApiError
+
+
+# =============================================================================
+# Tests — post_message file uploads (port of describe("postMessage - file uploads"))
+# =============================================================================
+
+
+class _MediaGraphSession:
+    """Routes like upstream's ``createMediaFetchMock``: ``/media`` uploads
+    answer ``media-{n}``, every other call answers ``wamid.msg{n}``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.closed = False
+        self._media_counter = 0
+        self._message_counter = 0
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        self.calls.append((method, url, kwargs))
+        if "/media" in url:
+            self._media_counter += 1
+            return _json_response({"id": f"media-{self._media_counter}"})
+        self._message_counter += 1
+        return _json_response({"messages": [{"id": f"wamid.msg{self._message_counter}"}]})
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def media_calls(self) -> list[dict[str, Any]]:
+        return [kwargs for _, url, kwargs in self.calls if "/media" in url]
+
+    def message_bodies(self) -> list[dict[str, Any]]:
+        return [kwargs["json"] for _, url, kwargs in self.calls if url.endswith("/messages")]
+
+
+def _media_adapter() -> tuple[WhatsAppAdapter, _MediaGraphSession]:
+    adapter = _make_adapter()
+    session = _MediaGraphSession()
+    adapter._http_session = session
+    return adapter, session
+
+
+def _form_fields(form: aiohttp.FormData) -> list[dict[str, Any]]:
+    """The fields of an ``aiohttp.FormData`` as ``{name, filename, content_type, value}``."""
+    return [
+        {
+            "name": options.get("name"),
+            "filename": options.get("filename"),
+            "content_type": headers.get("Content-Type"),
+            "value": value,
+        }
+        for options, headers, value in form._fields
+    ]
+
+
+_WHATSAPP_IMAGE_SIZE_LIMIT_PATTERN = r"exceeds WhatsApp image limit"
+
+
+def _link_card(**extra: Any) -> dict[str, Any]:
+    return {
+        "type": "card",
+        "children": [
+            {
+                "type": "actions",
+                "children": [{"type": "link-button", "url": "https://example.com/track", "label": "Track"}],
+            }
+        ],
+        **extra,
+    }
+
+
+class TestPostMessageFileUploads:
+    @pytest.mark.asyncio
+    async def test_single_pdf_with_markdown_caption_uploads_then_sends_document(self):
+        adapter, session = _media_adapter()
+
+        result = await adapter.post_message(
+            THREAD_ID,
+            {
+                "markdown": "Here is the report",
+                "files": [FileUpload(data=b"pdf-content", filename="report.pdf", mime_type="application/pdf")],
+            },
+        )
+
+        assert len(session.media_calls()) == 1
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        sent = bodies[0]
+        assert sent["type"] == "document"
+        assert sent["document"] == {"id": "media-1", "caption": "Here is the report", "filename": "report.pdf"}
+        assert result.id == "wamid.msg1"
+        assert result.raw["message"]["type"] == "document"
+
+    @pytest.mark.asyncio
+    async def test_single_jpeg_maps_to_image_message_type(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {"markdown": "Photo", "files": [FileUpload(data=b"jpeg", filename="photo.jpg", mime_type="image/jpeg")]},
+        )
+
+        sent = session.message_bodies()[0]
+        assert sent["type"] == "image"
+        # ``filename`` is document-only.
+        assert sent["image"] == {"id": "media-1", "caption": "Photo"}
+
+    @pytest.mark.asyncio
+    async def test_sends_media_to_bsuid_recipients(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            f"whatsapp:{PHONE_NUMBER_ID}:US.13491208655302741918",
+            {"files": [FileUpload(data=b"jpeg", filename="photo.jpg", mime_type="image/jpeg")]},
+        )
+
+        sent = session.message_bodies()[0]
+        assert sent["recipient"] == "US.13491208655302741918"
+        assert "to" not in sent
+
+    @pytest.mark.asyncio
+    async def test_audio_with_text_sends_leading_text_message_without_audio_caption(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "markdown": "Listen to this",
+                "files": [FileUpload(data=b"audio", filename="clip.mp3", mime_type="audio/mpeg")],
+            },
+        )
+
+        text_message, audio_message = session.message_bodies()
+        assert text_message["type"] == "text"
+        assert text_message["text"]["body"] == "Listen to this"
+        assert audio_message["type"] == "audio"
+        assert audio_message["audio"] == {"id": "media-1"}
+
+    @pytest.mark.asyncio
+    async def test_long_text_with_image_sends_text_first_then_image_without_caption(self):
+        adapter, session = _media_adapter()
+        long_text = "a" * 1025
+
+        await adapter.post_message(
+            THREAD_ID,
+            {"markdown": long_text, "files": [FileUpload(data=b"jpeg", filename="photo.jpg", mime_type="image/jpeg")]},
+        )
+
+        text_message, image_message = session.message_bodies()
+        assert text_message["type"] == "text"
+        assert text_message["text"]["body"] == long_text
+        assert image_message["type"] == "image"
+        assert "caption" not in image_message["image"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_files_send_sequentially_with_caption_only_on_first(self):
+        adapter, session = _media_adapter()
+
+        result = await adapter.post_message(
+            THREAD_ID,
+            {
+                "markdown": "Two files",
+                "files": [
+                    FileUpload(data=b"a", filename="first.pdf", mime_type="application/pdf"),
+                    FileUpload(data=b"b", filename="second.pdf", mime_type="application/pdf"),
+                ],
+            },
+        )
+
+        assert len(session.media_calls()) == 2
+        first, second = session.message_bodies()
+        assert first["document"] == {"id": "media-1", "caption": "Two files", "filename": "first.pdf"}
+        assert second["document"] == {"id": "media-2", "filename": "second.pdf"}
+        assert result.id == "wamid.msg2"
+
+    @pytest.mark.asyncio
+    async def test_attachment_with_https_url_uses_link_passthrough_without_upload(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "markdown": "Remote doc",
+                "attachments": [
+                    Attachment(type="file", url="https://example.com/report.pdf", mime_type="application/pdf")
+                ],
+            },
+        )
+
+        assert session.media_calls() == []
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["document"] == {
+            "link": "https://example.com/report.pdf",
+            "caption": "Remote doc",
+            "filename": "attachment",
+        }
+
+    @pytest.mark.asyncio
+    async def test_attachment_with_fetch_data_uploads_binary(self):
+        adapter, session = _media_adapter()
+        fetch_data = AsyncMock(return_value=b"png-bytes")
+
+        await adapter.post_message(
+            THREAD_ID,
+            {"markdown": "", "attachments": [Attachment(type="image", mime_type="image/png", fetch_data=fetch_data)]},
+        )
+
+        fetch_data.assert_awaited_once()
+        uploads = session.media_calls()
+        assert len(uploads) == 1
+        file_field = _form_fields(uploads[0]["data"])[1]
+        assert file_field["value"] == b"png-bytes"
+        sent = session.message_bodies()[0]
+        assert sent["type"] == "image"
+        assert sent["image"] == {"id": "media-1"}
+
+    @pytest.mark.asyncio
+    async def test_card_with_files_sends_media_then_interactive_message(self):
+        adapter, session = _media_adapter()
+        card = {
+            "type": "card",
+            "title": "Approve?",
+            "children": [
+                {
+                    "type": "actions",
+                    "children": [
+                        {"type": "button", "id": "yes", "label": "Yes"},
+                        {"type": "button", "id": "no", "label": "No"},
+                    ],
+                }
+            ],
+        }
+
+        result = await adapter.post_message(
+            THREAD_ID,
+            {"card": card, "files": [FileUpload(data=b"png", filename="proof.png", mime_type="image/png")]},
+        )
+
+        assert len(session.media_calls()) == 1
+        media_message, interactive_message = session.message_bodies()
+        assert media_message["type"] == "image"
+        assert "caption" not in media_message["image"]
+        assert interactive_message["type"] == "interactive"
+        assert interactive_message["interactive"]["header"]["text"] == "Approve?"
+        assert len(interactive_message["interactive"]["action"]["buttons"]) == 2
+        assert result.id == "wamid.msg2"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_file_does_not_duplicate_title_across_caption_and_header(self):
+        adapter, session = _media_adapter()
+        title = "Demo image card"
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": title,
+                    "children": [{"type": "actions", "children": [{"type": "button", "id": "ok", "label": "OK"}]}],
+                },
+                "files": [FileUpload(data=b"png", filename="demo.png", mime_type="image/png")],
+            },
+        )
+
+        media_message, interactive_message = session.message_bodies()
+        assert "caption" not in media_message["image"]
+        assert interactive_message["interactive"]["header"]["text"] == title
+        assert json.dumps([media_message, interactive_message]).count(title) == 1
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_file_does_not_duplicate_card_text_fields_in_caption(self):
+        adapter, session = _media_adapter()
+        body_line = "Your order has shipped"
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": "Shipment",
+                    "subtitle": "Status update",
+                    "children": [
+                        {"type": "text", "content": body_line},
+                        {
+                            "type": "fields",
+                            "children": [{"type": "field", "label": "Tracking code", "value": "SHIP-UNIQUE-VALUE"}],
+                        },
+                        {
+                            "type": "actions",
+                            "children": [
+                                {"type": "button", "id": "track", "label": "Track"},
+                                {"type": "button", "id": "help", "label": "Help"},
+                            ],
+                        },
+                    ],
+                },
+                "files": [FileUpload(data=b"png", filename="box.png", mime_type="image/png")],
+            },
+        )
+
+        media_message, interactive_message = session.message_bodies()
+        assert "caption" not in media_message["image"]
+        interactive = interactive_message["interactive"]
+        assert interactive["header"]["text"] == "Shipment"
+        assert interactive["body"]["text"] == f"Status update\n{body_line}\nTracking code: SHIP-UNIQUE-VALUE"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_multiple_files_leaves_all_media_uncaptioned(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": "Review docs",
+                    "children": [
+                        {
+                            "type": "actions",
+                            "children": [
+                                {"type": "button", "id": "approve", "label": "Approve"},
+                                {"type": "button", "id": "reject", "label": "Reject"},
+                            ],
+                        }
+                    ],
+                },
+                "files": [
+                    FileUpload(data=b"a", filename="a.pdf", mime_type="application/pdf"),
+                    FileUpload(data=b"b", filename="b.pdf", mime_type="application/pdf"),
+                ],
+            },
+        )
+
+        assert len(session.media_calls()) == 2
+        first, second, interactive_message = session.message_bodies()
+        assert first["document"] == {"id": "media-1", "filename": "a.pdf"}
+        assert second["document"] == {"id": "media-2", "filename": "b.pdf"}
+        assert interactive_message["type"] == "interactive"
+        assert interactive_message["interactive"]["header"]["text"] == "Review docs"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_audio_sends_audio_then_interactive_with_no_leading_text(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": "Voice note",
+                    "children": [{"type": "actions", "children": [{"type": "button", "id": "ack", "label": "Got it"}]}],
+                },
+                "files": [FileUpload(data=b"audio", filename="note.mp3", mime_type="audio/mpeg")],
+            },
+        )
+
+        bodies = session.message_bodies()
+        assert [body["type"] for body in bodies] == ["audio", "interactive"]
+        assert bodies[0]["audio"] == {"id": "media-1"}
+        assert bodies[1]["interactive"]["header"]["text"] == "Voice note"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_https_attachment_does_not_caption_with_card_title(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": "Remote image card",
+                    "children": [{"type": "actions", "children": [{"type": "button", "id": "open", "label": "Open"}]}],
+                },
+                "attachments": [Attachment(type="image", url="https://example.com/photo.jpg", mime_type="image/jpeg")],
+            },
+        )
+
+        assert session.media_calls() == []
+        media_message, interactive_message = session.message_bodies()
+        assert media_message["type"] == "image"
+        assert media_message["image"] == {"link": "https://example.com/photo.jpg"}
+        assert interactive_message["interactive"]["header"]["text"] == "Remote image card"
+
+    @pytest.mark.asyncio
+    async def test_card_with_single_link_button_and_file_sends_one_captioned_media_message(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": _link_card(title="Order update"),
+                "files": [FileUpload(data=b"png", filename="receipt.png", mime_type="image/png")],
+            },
+        )
+
+        # Media posts keep the single captioned send; the caption carries the
+        # link URL instead of a second cta_url message.
+        assert len(session.media_calls()) == 1
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["type"] == "image"
+        assert bodies[0]["image"]["caption"] == "*Order update*\nTrack: https://example.com/track"
+
+    @pytest.mark.asyncio
+    async def test_text_fallback_card_file_puts_title_and_body_only_in_the_caption_once(self):
+        adapter, session = _media_adapter()
+        title = "Receipt details"
+        body_line = "Thanks for your purchase"
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": title,
+                    "children": [
+                        {"type": "text", "content": body_line},
+                        {
+                            "type": "actions",
+                            "children": [
+                                {"type": "link-button", "url": "https://example.com/receipt", "label": "View"},
+                                {"type": "link-button", "url": "https://example.com/help", "label": "Help"},
+                            ],
+                        },
+                    ],
+                },
+                "files": [FileUpload(data=b"png", filename="receipt.png", mime_type="image/png")],
+            },
+        )
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        caption = bodies[0]["image"]["caption"]
+        assert caption.count(title) == 1
+        assert caption.count(body_line) == 1
+        assert caption == (f"*{title}*\n{body_line}\nView: https://example.com/receipt\nHelp: https://example.com/help")
+
+    @pytest.mark.asyncio
+    async def test_single_link_button_card_posts_cta_url_interactive_payload(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "card": {
+                    "type": "card",
+                    "title": "See dates",
+                    "children": [
+                        {"type": "text", "content": "Tap the button below to see available dates."},
+                        {
+                            "type": "actions",
+                            "children": [
+                                {"type": "link-button", "url": "https://example.com/dates", "label": "See Dates"}
+                            ],
+                        },
+                    ],
+                }
+            },
+        )
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["type"] == "interactive"
+        assert bodies[0]["interactive"] == {
+            "type": "cta_url",
+            "header": {"type": "text", "text": "See dates"},
+            "body": {"text": "Tap the button below to see available dates."},
+            "action": {
+                "name": "cta_url",
+                "parameters": {"display_text": "See Dates", "url": "https://example.com/dates"},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_oversize_image_throws_validation_error_before_upload(self):
+        adapter, session = _media_adapter()
+        oversized = bytes(6 * 1024 * 1024)
+
+        with pytest.raises(ValidationError, match=_WHATSAPP_IMAGE_SIZE_LIMIT_PATTERN):
+            await adapter.post_message(
+                THREAD_ID,
+                {"markdown": "", "files": [FileUpload(data=oversized, filename="huge.png", mime_type="image/png")]},
+            )
+
+        assert session.calls == []
+
+
+class TestGetWhatsAppMediaType:
+    @pytest.mark.parametrize(
+        ("mime_type", "expected"),
+        [
+            ("image/png", "image"),
+            ("image/jpeg", "image"),
+            ("image/gif", "document"),
+            ("video/mp4", "video"),
+            ("video/3gpp", "video"),
+            ("audio/mpeg", "audio"),
+            ("application/pdf", "document"),
+        ],
+    )
+    def test_maps_mime_type_to_media_type(self, mime_type: str, expected: str):
+        assert get_whatsapp_media_type(mime_type) == expected
+
+
+class TestOutboundMediaPythonSpecific:
+    """Wire details and translation hazards of the media port."""
+
+    @pytest.mark.asyncio
+    async def test_upload_is_a_multipart_post_to_the_media_endpoint(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID, {"files": [FileUpload(data=b"%PDF", filename="report.pdf", mime_type="application/pdf")]}
+        )
+
+        method, url, kwargs = session.calls[0]
+        assert method == "POST"
+        assert url == f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/media"
+        # aiohttp sets the multipart Content-Type (with boundary) itself.
+        assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
+        assert "json" not in kwargs
+        assert _form_fields(kwargs["data"]) == [
+            {"name": "messaging_product", "filename": None, "content_type": None, "value": "whatsapp"},
+            {"name": "file", "filename": "report.pdf", "content_type": "application/pdf", "value": b"%PDF"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_upload_errors_use_the_upload_label(self):
+        adapter, _ = _adapter_with_session(_FakeGraphResponse(500, "boom"))
+
+        with pytest.raises(WhatsAppApiError) as excinfo:
+            await adapter.post_message(THREAD_ID, {"files": [FileUpload(data=b"x", filename="x.pdf")]})
+
+        assert str(excinfo.value) == "WhatsApp API upload error: 500 boom"
+
+    @pytest.mark.asyncio
+    async def test_upload_response_without_an_id_raises(self):
+        adapter, _ = _adapter_with_session(_json_response({}))
+
+        with pytest.raises(RuntimeError, match="did not return a media ID for upload"):
+            await adapter.post_message(THREAD_ID, {"files": [FileUpload(data=b"x", filename="x.pdf")]})
+
+    @pytest.mark.asyncio
+    async def test_empty_file_upload_is_still_uploaded(self):
+        # Upstream's Buffer is truthy even when empty; ``b""`` must not read as "no data".
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(THREAD_ID, {"files": [FileUpload(data=b"", filename="empty.pdf")]})
+
+        assert _form_fields(session.media_calls()[0]["data"])[1]["value"] == b""
+        assert session.message_bodies()[0]["document"] == {"id": "media-1", "filename": "empty.pdf"}
+
+    @pytest.mark.asyncio
+    async def test_empty_attachment_data_uploads_instead_of_falling_back_to_the_url(self):
+        adapter, session = _media_adapter()
+        fetch_data = AsyncMock(return_value=b"unused")
+
+        await adapter.post_message(
+            THREAD_ID,
+            {
+                "attachments": [
+                    Attachment(type="file", data=b"", url="https://example.com/x.pdf", fetch_data=fetch_data)
+                ]
+            },
+        )
+
+        fetch_data.assert_not_awaited()
+        assert len(session.media_calls()) == 1
+        assert session.message_bodies()[0]["document"] == {"id": "media-1", "filename": "attachment"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "media_type", "content_type"),
+        [
+            ("PHOTO.JPG", "image", "image/jpeg"),
+            ("clip.ogg", "audio", "audio/ogg"),
+            ("anim.gif", "document", "image/gif"),
+            ("notes", "document", "application/octet-stream"),
+        ],
+    )
+    async def test_mime_type_is_inferred_from_the_extension(self, filename: str, media_type: str, content_type: str):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(THREAD_ID, {"files": [FileUpload(data=b"x", filename=filename)]})
+
+        assert _form_fields(session.media_calls()[0]["data"])[1]["content_type"] == content_type
+        assert session.message_bodies()[0]["type"] == media_type
+
+    @pytest.mark.asyncio
+    async def test_attachment_without_mime_type_uses_its_kind(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID, {"attachments": [Attachment(type="video", url="https://example.com/v", name="v")]}
+        )
+
+        assert session.message_bodies()[0] == {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": USER_WA_ID,
+            "type": "video",
+            "video": {"link": "https://example.com/v"},
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("attachment", "message"),
+        [
+            (Attachment(type="file"), "requires data, fetchData, or a public HTTPS url"),
+            (Attachment(type="file", url=""), "requires data, fetchData, or a public HTTPS url"),
+            (Attachment(type="file", url="http://example.com/x.pdf"), "must use HTTPS"),
+        ],
+    )
+    async def test_attachment_without_a_usable_source_raises_before_any_send(self, attachment: Any, message: str):
+        adapter, session = _media_adapter()
+
+        with pytest.raises(ValidationError, match=message):
+            await adapter.post_message(THREAD_ID, {"markdown": "hi", "attachments": [attachment]})
+
+        assert session.calls == []
+
+    @pytest.mark.asyncio
+    async def test_link_attachment_declared_size_is_checked_before_any_send(self):
+        adapter, session = _media_adapter()
+        too_big = Attachment(type="image", url="https://example.com/a.png", size=5 * 1024 * 1024 + 1)
+
+        with pytest.raises(ValidationError, match=_WHATSAPP_IMAGE_SIZE_LIMIT_PATTERN):
+            await adapter.post_message(THREAD_ID, {"attachments": [too_big]})
+
+        assert session.calls == []
+
+    @pytest.mark.parametrize(
+        ("media_type", "limit"),
+        [
+            ("image", 5 * 1024 * 1024),
+            ("audio", 16 * 1024 * 1024),
+            ("video", 16 * 1024 * 1024),
+            ("document", 100 * 1024 * 1024),
+        ],
+    )
+    def test_validate_file_size_allows_exactly_the_limit(self, media_type: str, limit: int):
+        validate_file_size(media_type, limit)
+        with pytest.raises(ValidationError, match=f"File size {limit + 1} bytes exceeds WhatsApp {media_type} limit"):
+            validate_file_size(media_type, limit + 1)
+
+    @pytest.mark.asyncio
+    async def test_upload_filename_is_serialized_like_whatwg_form_data(self):
+        # Node's FormData escapes only LF, CR and '"'; spaces and non-ASCII stay
+        # raw. aiohttp's default quoting would percent-encode them, and a raw
+        # CR/LF (or other control char) would make it raise a bare ValueError.
+        adapter, session = _media_adapter()
+        filename = 'my réport "q"\r\n\x01.pdf'
+
+        result = await adapter.post_message(
+            THREAD_ID,
+            {"files": [FileUpload(data=b"%PDF", filename=filename, mime_type="application/pdf")]},
+        )
+
+        serialized = session.media_calls()[0]["data"]().decode()
+        assert 'Content-Disposition: form-data; name="file"; filename="my réport %22q%22%0D%0A%01.pdf"' in serialized
+        # The document message carries the original, unescaped name.
+        assert session.message_bodies()[0]["document"] == {"id": "media-1", "filename": filename}
+        assert result.id == "wamid.msg1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mime_type", "part_content_type"),
+        [
+            ("Application/PDF", "application/pdf"),
+            ("application/pdf\r\nX-Injected: 1", "application/octet-stream"),
+            ("application/péf", "application/octet-stream"),
+        ],
+    )
+    async def test_upload_part_content_type_follows_blob_type_rules(self, mime_type: str, part_content_type: str):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID, {"files": [FileUpload(data=b"%PDF", filename="r.pdf", mime_type=mime_type)]}
+        )
+
+        assert _form_fields(session.media_calls()[0]["data"])[1]["content_type"] == part_content_type
+        assert session.message_bodies()[0]["type"] == "document"
+
+    @pytest.mark.asyncio
+    async def test_empty_text_fallback_card_is_sent_as_text_after_uncaptioned_media(self):
+        # A button without an id cannot be a reply button, so the card falls
+        # back to text; its caption fallback is empty, so the card text follows
+        # the media as its own message.
+        adapter, session = _media_adapter()
+        card = {
+            "type": "card",
+            "children": [{"type": "actions", "children": [{"type": "button", "label": "{{emoji:fire}} Go"}]}],
+        }
+
+        result = await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        image_message, text_message = session.message_bodies()
+        assert image_message["image"] == {"id": "media-1"}
+        assert text_message["text"]["body"] == "[\U0001f525 Go]"
+        assert result.id == "wamid.msg2"
+
+    @pytest.mark.asyncio
+    async def test_interactive_card_after_media_converts_emoji_placeholders(self):
+        adapter, session = _media_adapter()
+        card = {
+            "type": "card",
+            "title": "Approve {{emoji:fire}}",
+            "children": [{"type": "actions", "children": [{"type": "button", "id": "yes", "label": "Yes"}]}],
+        }
+
+        await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        interactive_message = session.message_bodies()[1]
+        assert interactive_message["interactive"]["header"]["text"] == "Approve \U0001f525"
+
+    @pytest.mark.asyncio
+    async def test_text_fallback_card_caption_converts_emoji_placeholders(self):
+        adapter, session = _media_adapter()
+        card = _link_card(title="Shipped {{emoji:fire}}")
+
+        await adapter.post_message(
+            THREAD_ID, {"card": card, "files": [FileUpload(data=b"j", filename="a.jpg", mime_type="image/jpeg")]}
+        )
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["image"]["caption"] == "*Shipped \U0001f525*\nTrack: https://example.com/track"
+
+    def test_media_type_ignores_parameters_and_case(self):
+        assert get_whatsapp_media_type(" Image/PNG ; charset=binary") == "image"
+
+    @pytest.mark.asyncio
+    async def test_caption_limit_counts_utf16_code_units_like_upstream(self):
+        # 600 astral emoji: 600 code points, but ``text.length`` is 1200 > 1024.
+        adapter, session = _media_adapter()
+        text = "\U0001f600" * 600
+
+        await adapter.post_message(
+            THREAD_ID, {"raw": text, "files": [FileUpload(data=b"j", filename="p.jpg", mime_type="image/jpeg")]}
+        )
+
+        text_message, image_message = session.message_bodies()
+        assert text_message["text"]["body"] == text
+        assert image_message["image"] == {"id": "media-1"}
+
+    @pytest.mark.asyncio
+    async def test_caption_converts_emoji_placeholders(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableMarkdown(
+                markdown="Done {{emoji:fire}}",
+                files=[FileUpload(data=b"j", filename="p.jpg", mime_type="image/jpeg")],
+            ),
+        )
+
+        assert session.message_bodies()[0]["image"]["caption"] == "Done 🔥"
+
+    @pytest.mark.asyncio
+    async def test_files_only_message_sends_no_text_and_no_caption(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(THREAD_ID, {"files": [FileUpload(data=b"j", filename="p.jpg")]})
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["image"] == {"id": "media-1"}
+
+    @pytest.mark.asyncio
+    async def test_postable_card_dataclass_with_files_uses_the_media_path(self):
+        adapter, session = _media_adapter()
+
+        await adapter.post_message(
+            THREAD_ID,
+            PostableCard(card=_link_card(), files=[FileUpload(data=b"j", filename="p.jpg")]),
+        )
+
+        bodies = session.message_bodies()
+        assert len(bodies) == 1
+        assert bodies[0]["image"]["caption"] == "Track: https://example.com/track"

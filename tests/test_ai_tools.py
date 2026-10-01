@@ -732,6 +732,37 @@ class TestInputSchemas:
 # ---------------------------------------------------------------------------
 
 
+class TestToolNames:
+    """``ChatTool.name`` mirrors upstream's ``ChatToolSpec.name`` (chat@4.41.0)."""
+
+    async def test_every_built_tool_name_equals_its_key(self, harness: _Harness):
+        tools = create_chat_tools(chat=harness.chat)
+        assert len(tools) == 17
+        assert {key: tool.name for key, tool in tools.items()} == {key: key for key in tools}
+
+    async def test_name_override_is_ignored_and_not_stashed_in_extras(self, harness: _Harness):
+        tools = create_chat_tools(
+            chat=harness.chat,
+            overrides={"postMessage": {"name": "x", "description": "Reply here"}},
+        )
+        tool = tools["postMessage"]
+
+        assert tool.name == "postMessage"
+        assert "name" not in tool.extras
+        # The rest of the override still applies.
+        assert tool.description == "Reply here"
+
+    async def test_name_is_last_field_so_positional_construction_keeps_working(self):
+        async def execute(_args: dict[str, Any]) -> None:
+            return None
+
+        legacy = ChatTool("Do a thing", {"type": "object"}, execute, True, {"title": "T"})
+
+        assert legacy.needs_approval is True
+        assert legacy.extras == {"title": "T"}
+        assert legacy.name == ""
+
+
 class TestReexports:
     """The ``chat_sdk.ai`` package re-exports the tool factory surface."""
 
