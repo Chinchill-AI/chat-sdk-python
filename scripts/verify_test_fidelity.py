@@ -83,23 +83,16 @@ MAPPING = {
     # New core test files in chat@4.29.0
     "packages/chat/src/callback-url.test.ts": "tests/test_callback_url.py",
     "packages/chat/src/thread-history.test.ts": "tests/test_thread_history.py",
-    # The pin's transcripts.test.ts is the whole user-history suite; at
+    # Up to chat@4.38 transcripts.test.ts was the whole user-history suite; at
     # chat@4.39.0+ it moved to history/user.test.ts and transcripts.test.ts
     # keeps only the deprecated-alias test. Both live in test_history_user.py
     # so either layout matches without duplicating tests.
     "packages/chat/src/transcripts.test.ts": "tests/test_history_user.py",
     "packages/chat/src/transcripts-wiring.test.ts": "tests/test_transcripts_wiring.py",
     "packages/chat/src/from-full-stream.test.ts": "tests/test_from_full_stream.py",
-}
-
-# Target tier: only checked by --report-target (together with MAPPING).
-# Rows are files that do not exist at the pin, plus files whose Python
-# counterpart is not yet at 0 missing. A row moves into MAPPING once it is
-# at 0 missing at the pin. A Python file that does not exist yet reports
-# every TS test as missing.
-TARGET_MAPPING = {
     # History API (chat@4.39.0, #197). history/user is the renamed
-    # transcripts suite.
+    # transcripts suite. Promoted from TARGET_MAPPING at the chat@4.41.1 pin
+    # (#203), like every row below.
     "packages/chat/src/history/user.test.ts": "tests/test_history_user.py",
     "packages/chat/src/history/thread.test.ts": "tests/test_history_thread.py",
     "packages/chat/src/history/channel.test.ts": "tests/test_history_channel.py",
@@ -111,25 +104,34 @@ TARGET_MAPPING = {
     # Shared guarded downloader (chat@4.39.0, #204). Outside packages/chat,
     # so it is mapped explicitly rather than discovered as a core test file.
     "packages/adapter-shared/src/download.test.ts": "tests/test_shared_download.py",
+}
+
+# Target tier: only checked by --report-target (together with MAPPING).
+# Rows are files whose Python counterpart is not yet at 0 missing at the pin
+# (plus, during a sync wave, files that do not exist at the pin yet). A row
+# moves into MAPPING once it is at 0 missing at the pin. A Python file that
+# does not exist yet reports every TS test as missing. The four rows below
+# stay report-only after the chat@4.41.1 pin bump; closing them is issue #78.
+TARGET_MAPPING = {
     # Present at the pin but with gaps (issue #78)
     "packages/chat/src/cards.test.ts": "tests/test_cards.py",
     "packages/chat/src/modals.test.ts": "tests/test_modals.py",
     "packages/chat/src/emoji.test.ts": "tests/test_emoji.py",
-    # Counterpart not yet settled: no Python file has more than 3 exact name
-    # matches; test_types.py is the closest (8 of 19 at the pin incl. fuzzy).
+    # Counterpart not yet settled: test_types.py is the closest
+    # (6 exact + 5 fuzzy of 22 at the chat@4.41.1 pin).
     "packages/chat/src/message.test.ts": "tests/test_types.py",
 }
 
 # Core test files deliberately not checked, with the reason.
 UNMAPPED = {
     "packages/chat/src/ai/tanstack/messages.test.ts": (
-        "JS-only TanStack AI adapter (chat@4.41.0, 2d0d3bf3); no Python equivalent — non-parity row lands in #203"
+        "JS-only TanStack AI exporter (chat@4.41.0, 2d0d3bf3) — Known Non-Parity row 'TanStack AI'"
     ),
     "packages/chat/src/ai/tanstack/tools.test.ts": (
-        "JS-only TanStack AI adapter (chat@4.41.0, 2d0d3bf3); no Python equivalent — non-parity row lands in #203"
+        "JS-only TanStack AI exporter (chat@4.41.0, 2d0d3bf3) — Known Non-Parity row 'TanStack AI'"
     ),
     "packages/chat/src/workflow/approval.test.ts": (
-        "Vercel Workflow SDK integration (chat@4.35.0, 4cb7e5d5); no Python equivalent"
+        "Vercel Workflow SDK integration (chat@4.35.0, 4cb7e5d5) — Known Non-Parity row 'Workflow `requestApproval`'"
     ),
     "packages/chat/src/jsx-react.test.tsx": "JSX runtime — Known Non-Parity row 'JSX Card/Modal elements'",
     "packages/chat/src/jsx-runtime.test.ts": "JSX runtime — Known Non-Parity row 'JSX Card/Modal elements'",

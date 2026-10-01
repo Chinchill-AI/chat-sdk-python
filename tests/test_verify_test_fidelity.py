@@ -497,7 +497,7 @@ def test_missing_python_file_reports_every_test_missing(vtf, tmp_path):
 
 def test_committed_pin_file_and_parity_agree(vtf):
     pin = vtf.load_pin()
-    assert pin["pin"] == {"tag": "chat@4.31.0", "sha": _PIN_SHA}
+    assert pin["pin"] == {"tag": "chat@4.41.1", "sha": _TARGET_SHA}
     assert pin["target"] == {"tag": "chat@4.41.1", "sha": _TARGET_SHA}
     assert vtf.check_pin_parity(pin["pin"]["tag"], vtf._read_upstream_parity()) is None
 
@@ -671,9 +671,19 @@ def test_mapping_tiers_are_disjoint(vtf):
 # ---------------------------------------------------------------------------
 
 
+def _use_wave_pin(vtf, tmp_path, monkeypatch):
+    """Point the script at a mid-wave pin file (pin != target), independent of
+    the committed ``upstream_pin.json``, with a matching ``UPSTREAM_PARITY``."""
+    pin = {"pin": {"tag": "chat@4.31.0", "sha": _PIN_SHA}, "target": {"tag": "chat@4.41.1", "sha": _TARGET_SHA}}
+    path = _write(tmp_path / "upstream_pin.json", json.dumps(pin))
+    monkeypatch.setattr(vtf, "PIN_PATH", path)
+    monkeypatch.setattr(vtf, "_read_upstream_parity", lambda: "4.31.0")
+
+
 @pytest.fixture
 def fake_upstream(vtf, tmp_path, monkeypatch):
     """A tiny TS tree + Python tree wired into the script's module globals."""
+    _use_wave_pin(vtf, tmp_path, monkeypatch)
     ts_root = tmp_path / "ts"
     py_root = tmp_path / "py"
     _write(
@@ -866,6 +876,7 @@ def test_strict_fails_when_pin_and_upstream_parity_disagree(vtf, fake_upstream, 
     ids=["pin", "stale", "target"],
 )
 def test_check_docs_cli_compares_docs_against_the_pin(vtf, tmp_path, monkeypatch, claude_md, code):
+    _use_wave_pin(vtf, tmp_path, monkeypatch)
     _write(tmp_path / "CLAUDE.md", claude_md)
     _write(tmp_path / "docs" / "UPSTREAM_SYNC.md", "pinned to `chat@4.31.0`\n")
     monkeypatch.setattr(vtf, "REPO_ROOT", tmp_path)
