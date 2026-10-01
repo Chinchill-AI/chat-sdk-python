@@ -49,6 +49,9 @@ def _probe(fn: Callable[..., Any], name: str) -> bool:
     for param in params:
         if param.kind is inspect.Parameter.VAR_KEYWORD:
             return True
-        if param.name == name and param.kind is not inspect.Parameter.POSITIONAL_ONLY:
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
             return True
     return False

@@ -1812,6 +1812,13 @@ behavior differences.
   mistaken for an abort (`expired()` decides). The source is then closed
   with `aclose()` (errors suppressed, as upstream's `.catch`), so a
   generator's `finally` has run by the time the stream ends.
+- **`from_full_stream` closes its source on early exit.** Upstream's
+  `fromFullStream` is an `async function*` whose `for await` calls the
+  source's `return()` when the consumer stops early; Python's `async for`
+  does not. `from_full_stream` now closes the source iterator (`aclose()`,
+  errors suppressed) when it is closed or fails before the source is
+  exhausted, so an abort between chunks also closes the caller's generator.
+  Nothing is closed after normal exhaustion.
 - **Typing lifecycle.** `start_typing` passes
   `TypingOptions(initiator_user_id=…)` when the current message's author
   has a truthy `user_id` (upstream truthiness), then marks typing started.
@@ -1826,8 +1833,9 @@ behavior differences.
   Python raises `TypeError` on a two-argument adapter. `Thread.start_typing`
   passes `options=` (keyword) only when
   `chat_sdk._compat.accepts_kwarg(adapter.start_typing, "options")` is true
-  (the parameter exists and is not positional-only, or the hook takes
-  `**kwargs`; an uninspectable callable counts as not accepting). Results
+  (a positional-or-keyword or keyword-only parameter of that name, or
+  `**kwargs`; `*options` and positional-only do not count, and an
+  uninspectable callable counts as not accepting). Results
   are cached per underlying function in a `WeakKeyDictionary`. All ten
   in-repo adapters and the mock declare `start_typing(self, thread_id,
   status=None, *, options: TypingOptions | None = None)`. The `Adapter`
@@ -1850,12 +1858,14 @@ behavior differences.
   `ABORT_POLL_INTERVAL_MS` (250) and aborts on a match (a state error logs
   "Could not poll turn cancellation state" and ends polling), and afterwards
   `_clear_turn_markers`, which deletes each key only if it still holds this
-  turn's id. Keys are byte-identical to upstream so SDKs can share a state
+  turn's id (a `get` then a `delete`, not atomic, as upstream:
+  `StateAdapter` has no compare-and-delete). Keys are byte-identical to upstream so SDKs can share a state
   backend. Python-specific: registration, publish and monitor start sit
-  inside the `try` whose `finally` cancels and awaits the monitor
-  (`asyncio.gather(..., return_exceptions=True)`, so only the monitor's
-  cancellation is absorbed), unregisters the signal and clears markers;
-  JS cannot be interrupted between those steps, a cancelled Python task can.
+  inside the `try` whose `finally` unregisters the signal, cancels and
+  awaits the monitor (`asyncio.gather(..., return_exceptions=True)`, so
+  only the monitor's cancellation is absorbed) and, in a nested `finally`,
+  clears the markers even if the task is cancelled during that join. JS
+  cannot be interrupted between those steps; a cancelled Python task can.
   Cost for opted-in adapters: one state `get` per 250 ms per running turn.
 - **`chat.abort_turn(thread_id)`** aborts this process's signals for the
   thread, then copies `active-turn:` into `abort-turn:` (same TTL) when a

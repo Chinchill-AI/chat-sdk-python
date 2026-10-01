@@ -3066,16 +3066,19 @@ class Chat:
                 monitor = asyncio.get_running_loop().create_task(self._monitor_turn_abort(thread_id, turn_id, signal))
             await self._dispatch_to_handlers_with_signal(adapter, thread_id, message, signal, context)
         finally:
-            if monitor is not None:
-                monitor.cancel()
-                # Waits for the poll to stop; a cancellation of this task
-                # still propagates (``gather`` only absorbs the monitor's).
-                await asyncio.gather(monitor, return_exceptions=True)
             signals.pop(turn_id, None)
             if not signals and self._active_turn_signals.get(thread_id) is signals:
                 del self._active_turn_signals[thread_id]
-            if cancellable:
-                await self._clear_turn_markers(thread_id, turn_id)
+            try:
+                if monitor is not None:
+                    monitor.cancel()
+                    # Waits for the poll to stop; a cancellation of this task
+                    # still propagates (``gather`` only absorbs the monitor's).
+                    await asyncio.gather(monitor, return_exceptions=True)
+            finally:
+                # Still runs when this task is cancelled during the join.
+                if cancellable:
+                    await self._clear_turn_markers(thread_id, turn_id)
 
     @staticmethod
     def _active_turn_key(thread_id: str) -> str:
@@ -3100,7 +3103,13 @@ class Chat:
             await asyncio.sleep(ABORT_POLL_INTERVAL_MS / 1000)
 
     async def _clear_turn_markers(self, thread_id: str, turn_id: str) -> None:
-        """Delete this turn's markers, leaving any written by a newer turn."""
+        """Delete this turn's markers, leaving any written by a newer turn.
+
+        Upstream parity (chat.ts ``clearTurnMarkers``, chat@4.41.1): the
+        ownership check and the delete are separate state calls, as upstream;
+        ``StateAdapter`` has no compare-and-delete. A newer turn publishing
+        in between loses its marker until it publishes again.
+        """
         try:
             active_key = self._active_turn_key(thread_id)
             if await self._state_adapter.get(active_key) == turn_id:

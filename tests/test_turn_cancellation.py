@@ -200,6 +200,24 @@ class TestThreadAbortAndTyping:
         assert adapter._edit_calls[-1] == (THREAD_ID, "msg-1", PostableMarkdown(markdown="Hello world"))
         assert sent.text == "Hello world"
 
+    async def test_abort_between_chunks_closes_the_original_source(self):
+        adapter = create_mock_adapter()
+        signal = TurnSignal()
+        source = _StallingSource("a", "b", "c")
+        received: list[Any] = []
+
+        async def native_stream(thread_id: str, stream: Any, options: Any = None) -> RawMessage:
+            async for chunk in stream:
+                received.append(chunk)
+                signal._abort()  # the user stops while the adapter handles "a"
+            return RawMessage(id="s1", thread_id=thread_id, raw={})
+
+        adapter.stream = native_stream  # type: ignore[attr-defined]
+        await _thread(adapter, signal=signal).post(source.gen())
+
+        assert received == ["a"]
+        assert source.closed is True  # closed through from_full_stream, not left to GC
+
     async def test_native_stream_receives_the_thread_signal(self):
         adapter = create_mock_adapter()
         signal = TurnSignal()
@@ -304,11 +322,13 @@ class TestAcceptsKwarg:
         async def var_kw(thread_id: str, **kwargs: Any) -> None: ...
         async def positional_only(thread_id: str, options: Any = None, /) -> None: ...
         async def legacy(thread_id: str, status: str | None = None) -> None: ...
+        async def var_positional(thread_id: str, status: str | None = None, *options: Any) -> None: ...
 
         assert accepts_kwarg(kw_only, "options") is True
         assert accepts_kwarg(var_kw, "options") is True
         assert accepts_kwarg(positional_only, "options") is False
         assert accepts_kwarg(legacy, "options") is False
+        assert accepts_kwarg(var_positional, "options") is False  # ``*options`` takes no keyword
         assert accepts_kwarg(create_mock_adapter().start_typing, "options") is True
         assert accepts_kwarg(len, "options") is False  # builtin without kwargs
 
@@ -431,6 +451,51 @@ class TestChatTurnCancellation:
         chat = _chat(create_mock_adapter("slack"), state)
         await chat.abort_turn("slack:C1:none")
         assert "abort-turn:slack:C1:none" not in state.cache
+
+    async def test_cancellation_while_joining_the_monitor_still_cleans_up(self):
+        adapter = create_mock_adapter("slack")
+        adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        state = create_mock_state()
+        chat = _chat(adapter, state)
+        original_get = state.get
+        release = asyncio.Event()
+        monitor_polling = asyncio.Event()
+        stubborn_calls = 0
+
+        async def stubborn_get(key: str) -> Any:
+            nonlocal stubborn_calls
+            if key.startswith("abort-turn:") and stubborn_calls == 0:
+                stubborn_calls += 1
+                monitor_polling.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()  # ignore the monitor's cancellation for now
+                return None
+            return await original_get(key)
+
+        state.get = stubborn_get  # type: ignore[method-assign]
+        handler_done = asyncio.Event()
+
+        @chat.on_mention
+        async def handler(thread: Any, message: Any, context: Any = None) -> None:
+            await monitor_polling.wait()
+            handler_done.set()
+
+        message = create_test_message("m6", "@testbot go")
+        message.is_mention = True
+        task = chat.process_message(adapter, "slack:C1:6.6", message)
+        await handler_done.wait()
+        for _ in range(5):  # let dispatch reach the monitor join
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert chat._active_turn_signals == {}
+        assert "active-turn:slack:C1:6.6" not in state.cache
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_magicmock_adapter_flag_does_not_opt_in(self):
         from unittest.mock import MagicMock
