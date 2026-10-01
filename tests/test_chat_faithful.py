@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import chat_sdk.chat as chat_module
 from chat_sdk.callback_url import CallbackContext, CallbackScope, ResolvedCallback
 from chat_sdk.chat import Chat
 from chat_sdk.context import active_conversation
@@ -529,6 +530,53 @@ class TestSkipSelf:
         )
         await chat.handle_incoming_message(adapter, "slack:C123:1234.5678", msg)
         assert len(calls) == 0
+
+
+class TestTurnCancellation:
+    # TS: "aborts an active thread signal from another Chat instance"
+    async def test_aborts_an_active_thread_signal_from_another_chat_instance(self, monkeypatch):
+        monkeypatch.setattr(chat_module, "ABORT_POLL_INTERVAL_MS", 1)  # no real 250 ms poll
+        shared_state = create_mock_state()
+        cancellable_adapter = create_mock_adapter("slack")
+        cancellable_adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        processing_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"slack": cancellable_adapter},
+                state=shared_state,
+                logger=MockLogger(),
+            )
+        )
+        stopping_adapter = create_mock_adapter("slack")
+        stopping_adapter.supports_turn_cancellation = True  # type: ignore[attr-defined]
+        stopping_chat = Chat(
+            ChatConfig(
+                user_name="testbot",
+                adapters={"slack": stopping_adapter},
+                state=shared_state,
+                logger=MockLogger(),
+            )
+        )
+        thread_id = "slack:C123:agent-stop.1"
+        signals: list[Any] = []
+        started = asyncio.Event()
+
+        @processing_chat.on_mention
+        async def _handler(thread, message, context=None):
+            signals.append(thread.signal)
+            started.set()
+            await thread.signal.wait()
+
+        message = create_test_message("agent-stop-message", "@testbot stop")
+        message.is_mention = True
+        processing = processing_chat.process_message(cancellable_adapter, thread_id, message)
+        await asyncio.wait_for(started.wait(), 1)
+
+        await stopping_chat.abort_turn(thread_id)
+        await asyncio.wait_for(processing, 1)  # fails instead of hanging if the abort is lost
+
+        assert len(signals) == 1
+        assert signals[0].aborted is True
 
 
 class TestMessageLifecycleEvents:

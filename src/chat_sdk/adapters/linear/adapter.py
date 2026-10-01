@@ -79,6 +79,7 @@ from chat_sdk.types import (
     RawMessage,
     StreamOptions,
     ThreadInfo,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -1755,7 +1756,9 @@ class LinearAdapter:
         """Remove a reaction from a comment (limited support)."""
         self._logger.warn("removeReaction is not fully supported on Linear - reaction ID lookup would be required")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Start typing indicator.
 
         Faithful port of upstream ``startTyping`` (index.ts:1517). For

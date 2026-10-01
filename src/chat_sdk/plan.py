@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from chat_sdk.logger import Logger
-from chat_sdk.types import Adapter
+from chat_sdk.types import Adapter, AgentSessionStatus
 
 # =============================================================================
 # Plan Types
@@ -551,11 +551,16 @@ class StreamingPlanOptions:
     update_interval_ms:
         Minimum interval between updates in ms (default: 500).
         Used by post + edit streaming paths.
+    session_status:
+        Slack Agent Session state after streaming stops (default
+        ``"active"``). Use ``"suspended"`` when the agent needs user input
+        or approval.
     """
 
     group_tasks: Literal["plan", "timeline"] | None = None
     end_with: list[Any] | None = None
     update_interval_ms: int | None = None
+    session_status: AgentSessionStatus | None = None
 
 
 @dataclass

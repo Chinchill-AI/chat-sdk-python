@@ -84,6 +84,7 @@ from chat_sdk.types import (
     StreamOptions,
     ThreadInfo,
     ThreadSummary,
+    TypingOptions,
     UserInfo,
     WebhookOptions,
     _parse_iso,
@@ -2132,7 +2133,9 @@ class GoogleChatAdapter:
         except Exception as error:
             self._handle_google_chat_error(error, "removeReaction")
 
-    async def start_typing(self, thread_id: str, status: str | None = None) -> None:
+    async def start_typing(
+        self, thread_id: str, status: str | None = None, *, options: TypingOptions | None = None
+    ) -> None:
         """Start typing indicator (Google Chat doesn't support this for bots)."""
 
     # =========================================================================

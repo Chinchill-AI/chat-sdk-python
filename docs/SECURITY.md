@@ -103,10 +103,12 @@ Requests to arbitrary URLs (which could target internal services) are rejected.
 
 ### WhatsApp Media URL Validation
 
-When downloading media attachments from WhatsApp messages, the adapter validates that media URLs point to Meta's CDN domains before fetching them:
+WhatsApp media downloads go through the shared guarded downloader (`chat_sdk.shared.download`: https only, internal addresses refused after DNS resolution, redirects re-validated, 25 MB / 30 s limits). The access token is attached per request hop, only when that hop's URL is:
 
-- `https://*.whatsapp.net/`
-- `https://scontent*.xx.fbcdn.net/`
+- `https://fbcdn.net/` or `https://fbsbx.com/` or a subdomain of either, on the default port, or
+- the exact configured Graph API origin (scheme, host and port).
+
+Any other media URL is refused before the token is sent. Messenger attachment downloads use the same downloader, restricted to `fbsbx.com` / `fbcdn.net` (and subdomains), with no credentials.
 
 ### Slack `response_url` Validation
 
