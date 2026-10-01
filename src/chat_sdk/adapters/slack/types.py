@@ -262,6 +262,8 @@ class SlackEvent(TypedDict, total=False):
 
     blocks: list[SlackRichTextBlock]
     bot_id: str
+    # Bot messages: ``{"user_id": "U…"}`` -- the bot's user id (vs app ``bot_id``)
+    bot_profile: dict[str, Any]
     channel: str
     # Channel type: "channel", "group", "mpim", or "im" (DM)
     channel_type: str
