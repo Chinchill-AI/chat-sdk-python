@@ -55,8 +55,8 @@ def _setup(segment_count: int = 3, **config: Any) -> _Setup:
     for index in range(segment_count):
         segment = MagicMock()
         # Real ``chat.startStream`` / ``appendStream`` responses carry the
-        # message ts; slack_sdk keeps it only privately, so the adapter
-        # records it from the first response.
+        # message ts; slack_sdk below 3.43.0 keeps it only privately, so the
+        # adapter records it from the first response.
         segment.append = AsyncMock(return_value={"ok": True, "ts": f"1234567890.{index}"})
         segment.stop = AsyncMock(return_value={"ok": True, "ts": f"1234567890.{index}"})
         segments.append(segment)
@@ -442,10 +442,13 @@ class TestNativeStreamRotationPythonSpecific:
             }
 
     @pytest.mark.asyncio
-    async def test_a_resolved_mention_straddling_the_rotation_cut_is_not_duplicated(self, tick):
+    async def test_rotation_cuts_the_mention_resolved_buffer_so_each_mention_is_sent_once(self, tick):
         # Rotation cuts the SL1 resolved buffer, never the raw renderer text:
-        # a mention split across source chunks right where the segment
-        # rotates is sent once, resolved, on exactly one side of the cut.
+        # the resolved ``<@U...>`` form is longer than ``@alice``, so cutting
+        # or tracking offsets in raw-text coordinates would drop or repeat
+        # characters around the cut. (The renderer holds the partial line
+        # ``ping @ali`` until its newline, so the mention split across
+        # source chunks reaches the cut whole.)
         from chat_sdk.state.memory import MemoryStateAdapter
 
         state = MemoryStateAdapter()
@@ -473,21 +476,79 @@ class TestNativeStreamRotationPythonSpecific:
         assert "".join(sent) == "first\nping <@U_ALICE_1>\n\nafter <@U_ALICE_1>\n"
 
     @pytest.mark.asyncio
-    async def test_cancellation_from_the_source_stream_mid_rotation_propagates(self, tick):
+    async def test_cancellation_during_the_rotation_stop_propagates(self, tick):
+        # The rotation ``stop()`` only absorbs Slack's expiry error; a
+        # cancellation landing while it is awaited must not open a successor.
         s = _setup()
+        s.segments[0].stop.side_effect = asyncio.CancelledError()
 
         async def stream() -> AsyncIterator[str]:
             yield "a\n"
             tick(MAX_AGE + 1)
             yield "b\n\nc\n"
-            raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
             await s.adapter.stream(THREAD, stream())
 
-        # The old segment was rotated; the new one is never stopped.
+        assert s.chat_stream.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_the_successor_replay_propagates(self, tick):
+        # A failed replay disables structured chunks and carries on, but a
+        # cancellation while the successor's replay append is awaited must
+        # propagate rather than be logged as a structured-chunk failure.
+        s = _setup()
+        s.segments[1].append.side_effect = [asyncio.CancelledError(), {"ok": True}, {"ok": True}]
+        task = {"type": "task_update", "id": "t1", "title": "One", "status": "in_progress"}
+
+        async def stream() -> AsyncIterator[Any]:
+            yield task
+            tick(MAX_AGE + 1)
+            yield {**task, "status": "complete"}
+
+        with pytest.raises(asyncio.CancelledError):
+            await s.adapter.stream(THREAD, stream())
+
         assert s.chat_stream.await_count == 2
         s.segments[1].stop.assert_not_awaited()
+        warnings = [call.args[0] for call in s.logger.warn.call_args_list]
+        assert not any("structured-chunk append failed" in message for message in warnings)
+
+    @pytest.mark.asyncio
+    async def test_an_expired_final_segment_with_no_recorded_ts_re_raises(self):
+        # Every delta was confirmed but no Slack response carried a ts, so
+        # there is no message to report: re-raise (upstream throws when
+        # ``streamer.ts`` is unset) instead of returning an empty id.
+        s = _setup()
+        s.segments[0].append.return_value = {"ok": True}
+        s.segments[0].stop.side_effect = _ExpiredStreamError()
+
+        async def stream() -> AsyncIterator[str]:
+            yield "first\n"
+
+        with pytest.raises(_ExpiredStreamError):
+            await s.adapter.stream(THREAD, stream())
+
+        assert s.chat_stream.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_structured_chunk_confirms_buffered_text_before_a_final_stop_expiry(self):
+        # A chunks append flushes the streamer's text buffer, so text the
+        # earlier append only buffered is confirmed: a final-stop expiry then
+        # reports the existing message rather than resending that text.
+        s = _setup()
+        s.segments[0].append.side_effect = [None, {"ok": True, "ts": "1234567890.0"}]
+        s.segments[0].stop.side_effect = _ExpiredStreamError()
+
+        async def stream() -> AsyncIterator[Any]:
+            yield "buffered\n"
+            yield {"type": "task_update", "id": "t1", "title": "One", "status": "complete"}
+
+        result = await s.adapter.stream(THREAD, stream())
+
+        assert s.chat_stream.await_count == 1
+        assert result is not None
+        assert result.id == "1234567890.0"
 
 
 class TestFenceTrackerPythonSpecific:
@@ -508,3 +569,11 @@ class TestFenceTrackerPythonSpecific:
         assert _open_fence_in("```a`b```\ntext\n") is None
         # A CRLF line is not a fence line, as with JS ``.`` / ``$``.
         assert _open_fence_in("```ts\r\ncode\n") is None
+
+    def test_the_table_separator_uses_the_js_whitespace_set(self):
+        from chat_sdk.adapters.slack.adapter import _table_continuation
+
+        # JS ``\s`` includes the BOM U+FEFF but not the C0 separators
+        # U+001C..U+001F (Python's ``\s`` is the other way round).
+        assert _table_continuation("| a |\n|﻿---|\n| 1 |\n") == "| a |\n|﻿---|\n"
+        assert _table_continuation("| a |\n|\x1c---|\n| 1 |\n") == ""

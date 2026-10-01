@@ -2121,25 +2121,33 @@ current stream (a "segment") and continues the reply in a new message.
 - **Result.** `RawMessage.id` is the last segment's message; earlier
   segments are not tracked (upstream behaves the same).
 - **Regex semantics.** `_FENCE_LINE_PATTERN` and the table patterns keep
-  JS semantics: `.` is `[^\n\r\u2028\u2029]` and `$` is `\Z` (Python's `$`
-  also matches before a trailing newline), and `trim` / `trimEnd` use the JS
-  whitespace set (`JS_WHITESPACE`).
+  JS semantics: `.` is `[^\n\r\u2028\u2029]`, `$` is `\Z` (Python's `$`
+  also matches before a trailing newline), and `\s` is the JS whitespace
+  set (Python's `\s` also matches U+001C..U+001F and U+0085 but not
+  U+FEFF); `trim` / `trimEnd` use the same set (`JS_WHITESPACE`).
 - **Python-specific.** The segment's message ts comes from the first Slack
-  response that carries one: slack_sdk keeps it only in the private
-  `_stream_ts`, while upstream reads the public `streamer.ts`. A finalized
+  response that carries one. Upstream reads the public `streamer.ts`, which
+  slack_sdk only exposes from 3.43.0 (earlier releases keep it in the
+  private `_stream_ts`), and the floor is 3.40.0; `streamer.ts` can replace
+  the self-tracking once the floor reaches 3.43.0. A finalized
   expired segment with no recorded ts re-raises. The segment clock is
   `_monotonic_ms`, not wall-clock time. Every segment's `chat_stream` gets
   the same kwargs, including the Grid `team_id` (#95).
 - **slack_sdk floor.** The `slack` extras now need `slack-sdk>=3.40.0`, the
   first release whose `AsyncChatStream.append` takes `chunks` (the
   replay and the `chunks=[]` flush need it).
-- **Deferred.** The rotation `stop()` does not send
-  `session_status="processing"` under `agent_view`; that lands with #215.
+- **Deferred (#215).** The rotation `stop()` does not send
+  `session_status="processing"` under `agent_view`, and the return of the
+  finalized message after a final-stop expiry does not call `end_typing`
+  (upstream `index.ts:6508`). Both places carry a `# SL10:` marker.
 - **Tests.** `tests/test_slack_stream_rotation.py` ports 17 of the 18
   "native stream rotation" tests (the `it.each` max-age case is one
-  parametrized test; the `agent_view` one is #215), plus Python
-  tests for the Grid `team_id` on every segment, a mention straddling the
-  cut, cancellation during rotation and the fence tracker's closing rules.
+  parametrized test; the `agent_view` one is #215), plus Python tests for
+  the Grid `team_id` on every segment, rotation cutting the
+  mention-resolved buffer, cancellation during the rotation `stop()` and
+  the successor's replay, the final-stop expiry without a recorded ts, a
+  structured chunk confirming buffered text, the table separator's
+  whitespace set and the fence tracker's closing rules.
 
 ### AI messages without text and tool names (chat@4.35–4.41, #198)
 

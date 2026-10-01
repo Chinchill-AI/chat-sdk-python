@@ -987,12 +987,16 @@ _STREAM_EXPIRED_ERROR = "message_not_in_streaming_state"
 # The patterns below are upstream's, with JS semantics kept: ``.`` excludes
 # every JS line terminator (Python's would match ``\r``, U+2028, U+2029) and
 # ``\Z`` is JS ``$`` without the ``m`` flag (Python's ``$`` also matches before
-# a trailing ``\n``).
+# a trailing ``\n``), and ``_JS_SPACE`` is JS ``\s`` (Python's ``\s`` also
+# matches U+001C..U+001F and U+0085 but not U+FEFF).
+_JS_SPACE = re.escape(JS_WHITESPACE)
 _JS_DOT = "[^\n\r  ]"
 # Fenced code block delimiter: up to three spaces, then 3+ backticks or tildes.
 _FENCE_LINE_PATTERN = re.compile(rf"^ {{0,3}}(`{{3,}}|~{{3,}})({_JS_DOT}*)\Z")
 _TABLE_ROW_PATTERN = re.compile(rf"^\|{_JS_DOT}*\|\Z")
-_TABLE_SEPARATOR_PATTERN = re.compile(r"^\|[\s:]*-+[\s:]*(?:\|[\s:]*-+[\s:]*)*\|\Z")
+_TABLE_SEPARATOR_PATTERN = re.compile(
+    rf"^\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*(?:\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*)*\|\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -1127,8 +1131,10 @@ class _StreamSegment:
     # text if that text continues the table cut by the previous segment.
     table_header: str = ""
     # The message ts from the first response Slack returned. Python-specific:
-    # slack_sdk keeps it only in the private ``_stream_ts`` (upstream reads
-    # the public ``streamer.ts``).
+    # upstream reads the public ``streamer.ts``, which slack_sdk only exposes
+    # from 3.43.0 (earlier releases keep it in the private ``_stream_ts``)
+    # while the floor is 3.40.0. ``streamer.ts`` can replace this once the
+    # floor reaches 3.43.0.
     ts: str | None = None
 
 
@@ -6263,6 +6269,8 @@ class SlackAdapter:
                     "Slack: stream expired before stop, stream-end blocks skipped",
                     {"channel": channel, "messageId": expired_ts, "skippedBlocks": len(stop_blocks)},
                 )
+                # SL10: end_typing(thread_id, session_status) before this
+                # return (upstream index.ts:6508). Wired with #215.
                 return RawMessage(id=expired_ts, thread_id=thread_id, raw={"ts": expired_ts})
             self._logger.warn(
                 "Slack: stream expired before stop, delivering the rest in a new message",
