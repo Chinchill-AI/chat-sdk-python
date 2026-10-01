@@ -660,6 +660,8 @@ class TestFetchMessages:
             assert [(m.text, m.thread_id) for m in result.messages] == [
                 ("Comment content", "linear:issue-public:c:comment-1")
             ]
+            # Fetched ordinary comments leave ``is_mention`` undetermined (vercel/chat#946).
+            assert [m.is_mention for m in result.messages] == [None]
             assert len(http.requests) == 2
         else:
             with pytest.raises(ValidationError) as exc_info:
