@@ -1612,7 +1612,7 @@ class TestStream:
     @pytest.mark.asyncio
     async def test_delegates_to_fallback_when_slack_sdk_has_no_chat_stream(self):
         # Python-specific: slack_sdk releases before the streaming helper
-        # (the declared floor is 3.27.0) have no ``chat_stream``. A DM, which
+        # (3.37.0; the extras' floor is 3.40.0) have no ``chat_stream``. A DM, which
         # now streams natively without recipient ids, must still defer to
         # core's post+edit before the stream is read instead of raising.
         adapter = _make_adapter()

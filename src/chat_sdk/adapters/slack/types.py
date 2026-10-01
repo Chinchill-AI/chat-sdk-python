@@ -251,6 +251,13 @@ class SlackAdapterConfig:
     # ``unknown_method`` also turn native streaming off for the rest of this
     # adapter instance's life. Upstream ``nativeStreaming`` (default ``true``).
     native_streaming: bool = True
+    # Maximum lifetime (ms) of one native Slack stream segment before the
+    # adapter finalizes it and continues the reply in a new message. Slack
+    # expires a native stream about five minutes after it starts, so a reply
+    # that streams longer arrives as several messages. ``None`` (and zero,
+    # negative or NaN values) use the default of 240 000 ms; ``math.inf``
+    # never rotates. Upstream ``streamSegmentMaxAgeMs``.
+    stream_segment_max_age_ms: float | None = None
     # Override bot username (optional)
     user_name: str | None = None
     # Enable Slack's Agent messaging experience (``agent_view`` manifest mode).

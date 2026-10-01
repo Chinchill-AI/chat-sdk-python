@@ -86,7 +86,7 @@ The optional extras are defined in `pyproject.toml`:
 
 ```toml
 [project.optional-dependencies]
-slack = ["slack-sdk>=3.27.0"]
+slack = ["slack-sdk>=3.40.0", "aiohttp>=3.9"]
 discord = ["pynacl>=1.5", "aiohttp>=3.9"]
 teams = ["aiohttp>=3.9"]
 telegram = ["aiohttp>=3.9"]

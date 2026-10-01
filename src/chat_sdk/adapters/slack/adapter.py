@@ -15,6 +15,7 @@ import contextvars
 import hmac
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -962,8 +963,179 @@ def _slack_platform_error_code(error: BaseException) -> str | None:
 
 
 def _monotonic_ms() -> float:
-    """Monotonic clock in ms for stream fallback throttling (patched in tests)."""
+    """Monotonic clock in ms for stream timing (patched in tests).
+
+    Drives the post+edit fallback throttle and the native stream segment age.
+    Monotonic rather than wall-clock (upstream ``Date.now()``) so a system
+    clock change can't trigger or suppress a segment rotation.
+    """
     return time.monotonic() * 1000
+
+
+# Native stream rotation (vercel/chat d4a1f03a, #884). Slack expires a native
+# stream about five minutes after it starts, so a long reply is finalized and
+# continued in a new message once its segment reaches the max age.
+# Default lifetime of one native stream segment before it is rotated.
+_DEFAULT_STREAM_SEGMENT_MAX_AGE_MS = 240_000
+# Once a segment is past its max age, rotation waits up to this long for a
+# paragraph break so a paragraph, list, or table is not split across two
+# messages. The default max age plus this grace stays below Slack's roughly
+# five-minute stream expiry.
+_STREAM_SEGMENT_ROTATION_GRACE_MS = 30_000
+# Slack's error for appending to or stopping a stream it already expired.
+_STREAM_EXPIRED_ERROR = "message_not_in_streaming_state"
+# The patterns below are upstream's, with JS semantics kept: ``.`` excludes
+# every JS line terminator (Python's would match ``\r``, U+2028, U+2029) and
+# ``\Z`` is JS ``$`` without the ``m`` flag (Python's ``$`` also matches before
+# a trailing ``\n``), and ``_JS_SPACE`` is JS ``\s`` (Python's ``\s`` also
+# matches U+001C..U+001F and U+0085 but not U+FEFF).
+_JS_SPACE = re.escape(JS_WHITESPACE)
+_JS_DOT = "[^\n\r  ]"
+# Fenced code block delimiter: up to three spaces, then 3+ backticks or tildes.
+_FENCE_LINE_PATTERN = re.compile(rf"^ {{0,3}}(`{{3,}}|~{{3,}})({_JS_DOT}*)\Z")
+_TABLE_ROW_PATTERN = re.compile(rf"^\|{_JS_DOT}*\|\Z")
+_TABLE_SEPARATOR_PATTERN = re.compile(
+    rf"^\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*(?:\|[{_JS_SPACE}:]*-+[{_JS_SPACE}:]*)*\|\Z"
+)
+
+
+@dataclass(frozen=True)
+class _OpenFence:
+    """An open fenced code block (upstream ``OpenFence``)."""
+
+    # The fence run that opened the block, e.g. "```" or "~~~~".
+    marker: str
+    # The full opening line (marker plus info string), used to reopen it.
+    opening: str
+
+
+class _FenceTracker:
+    """Track fenced code block state line by line, CommonMark style.
+
+    A fence closes only on a run of the same character at least as long as
+    its opener with nothing but whitespace after it; other fence-looking
+    lines inside the block are literal content. Upstream ``FenceTracker``.
+    """
+
+    def __init__(self, open_fence: _OpenFence | None = None) -> None:
+        self.open: _OpenFence | None = open_fence
+
+    def feed(self, line: str) -> bool:
+        """Feed one complete line (without its newline).
+
+        Returns ``True`` when the line opened or closed a fence.
+        """
+        match = _FENCE_LINE_PATTERN.match(line)
+        if match is None:
+            return False
+        marker, info = match.group(1), match.group(2)
+        if self.open is not None:
+            if (
+                marker[0] == self.open.marker[0]
+                and len(marker) >= len(self.open.marker)
+                and info.strip(JS_WHITESPACE) == ""
+            ):
+                self.open = None
+                return True
+            return False
+        # A backtick fence's info string cannot contain backticks.
+        if marker[0] == "`" and "`" in info:
+            return False
+        self.open = _OpenFence(marker=marker, opening=line.rstrip(JS_WHITESPACE))
+        return True
+
+
+def _open_fence_in(text: str) -> _OpenFence | None:
+    """The code fence left open at the end of *text*, if any.
+
+    A trailing partial line is fed too: the streaming renderer only commits
+    partial lines inside a fence, so it is either literal content or a
+    closing delimiter. Upstream ``openFenceIn``.
+    """
+    tracker = _FenceTracker()
+    for line in text.split("\n"):
+        tracker.feed(line)
+    return tracker.open
+
+
+def _closes_fence(fence: _OpenFence, line: str) -> bool:
+    """Whether *line*, appended after a line break, would close *fence*."""
+    return _FenceTracker(fence).feed(line)
+
+
+def _segment_cut_index(text: str) -> int:
+    """Index in *text* to cut a stream segment at.
+
+    After the last paragraph break when there is one, otherwise after the
+    last line break (0 when none). Upstream ``segmentCutIndex``.
+    """
+    paragraph_break = text.rfind("\n\n")
+    if paragraph_break != -1:
+        return paragraph_break + 2
+    return text.rfind("\n") + 1
+
+
+def _table_continuation(text: str) -> str:
+    """The header and separator rows of a GFM table *text* ends inside.
+
+    Each row is newline-terminated, so the rows that follow in a new segment
+    still render as a table. Empty when *text* does not end inside a
+    confirmed table. Upstream ``tableContinuation``.
+    """
+    if not text.endswith("\n"):
+        return ""
+    lines = text.split("\n")
+    lines.pop()
+    rows: list[str] = []
+    for line in reversed(lines):
+        if not _TABLE_ROW_PATTERN.match(line.strip(JS_WHITESPACE)):
+            break
+        rows.insert(0, line)
+    separator_at = next(
+        (index for index, row in enumerate(rows) if _TABLE_SEPARATOR_PATTERN.match(row.strip(JS_WHITESPACE))),
+        -1,
+    )
+    if separator_at < 1:
+        return ""
+    return f"{rows[separator_at - 1]}\n{rows[separator_at]}\n"
+
+
+def _response_ts(response: Any) -> str | None:
+    """The ``ts`` of a Slack Web API response (dict or ``SlackResponse``).
+
+    Read by shape, as ``_slack_platform_error_code`` does: a ``SlackResponse``
+    keeps the parsed body in its ``data`` dict.
+    """
+    body = response if isinstance(response, dict) else getattr(response, "data", None)
+    if not isinstance(body, dict):
+        return None
+    ts = body.get("ts")
+    return ts if isinstance(ts, str) and ts else None
+
+
+@dataclass
+class _StreamSegment:
+    """One native Slack stream (a "segment") of a reply (upstream ``segment``)."""
+
+    streamer: Any
+    # Stamped by the first call Slack accepts on the segment, which is when
+    # Slack's expiry clock starts; until then the streamer only buffers text.
+    started_at: float | None = None
+    # Flush the next text append immediately instead of buffering it, so a
+    # segment opened by rotation becomes visible with its first text.
+    flush_next_append: bool = False
+    # Code fence opening line to send before the segment's first text, when
+    # the previous segment was cut inside a fenced block.
+    reopen_fence: str = ""
+    # Table header and separator rows to send before the segment's first
+    # text if that text continues the table cut by the previous segment.
+    table_header: str = ""
+    # The message ts from the first response Slack returned. Python-specific:
+    # upstream reads the public ``streamer.ts``, which slack_sdk only exposes
+    # from 3.43.0 (earlier releases keep it in the private ``_stream_ts``)
+    # while the floor is 3.40.0. ``streamer.ts`` can replace this once the
+    # floor reaches 3.43.0.
+    ts: str | None = None
 
 
 def _normalize_bot_token_provider(
@@ -1143,6 +1315,14 @@ class SlackAdapter:
         # multi-workspace mode shares across workspaces (as upstream).
         self._native_streaming: bool = config.native_streaming
         self._native_streaming_broken: bool = False
+        # Zero, negative and NaN would make every flush rotate; ``math.inf``
+        # means never rotate (upstream ``streamSegmentMaxAgeMs``).
+        segment_max_age = config.stream_segment_max_age_ms
+        self._stream_segment_max_age_ms: float = (
+            segment_max_age
+            if segment_max_age is not None and not math.isnan(segment_max_age) and segment_max_age > 0
+            else _DEFAULT_STREAM_SEGMENT_MAX_AGE_MS
+        )
         self._signing_secret: str | None = signing_secret
         # ``webhook_verifier`` takes precedence; ``signing_secret`` is only used
         # when no verifier is configured (matches upstream vercel/chat#468).
@@ -3926,8 +4106,8 @@ class SlackAdapter:
             payload["title"] = title
         # Python-specific: go through ``api_call`` (what the generated
         # ``assistant_threads_setSuggestedPrompts`` sends) because that helper
-        # requires ``thread_ts`` before slack-sdk 3.43.0 (and is absent in
-        # older versions our ``slack-sdk>=3.27.0`` floor still allows).
+        # requires ``thread_ts`` before slack-sdk 3.43.0, which is newer than
+        # the ``slack-sdk>=3.40.0`` floor.
         await client.api_call(api_method="assistant.threads.setSuggestedPrompts", json=payload)
 
     def _schedule_configured_suggested_prompts(
@@ -5520,6 +5700,12 @@ class SlackAdapter:
         Consumes an async iterable of text chunks and/or structured
         ``StreamChunk`` objects and streams them to Slack.
 
+        Slack expires a native stream after roughly five minutes, so a reply
+        that streams longer than ``stream_segment_max_age_ms`` is finalized
+        and continued in a new message. The returned ``id`` is the last
+        message of the reply; earlier segments are already final and are not
+        tracked.
+
         Returns ``None`` before consuming *text_stream*, so core's post+edit
         fallback delivers the reply, when the thread has no ``thread_ts``
         (top-level DMs), when a non-DM channel lacks ``recipient_user_id`` /
@@ -5554,8 +5740,10 @@ class SlackAdapter:
         client = self._get_client(token)
         if not callable(getattr(client, "chat_stream", None)):
             # Python-specific: slack_sdk releases older than the streaming
-            # helper (the declared floor is 3.27.0) have no ``chat_stream``.
-            # Defer to core's post+edit before the stream is read.
+            # helper (3.37.0) have no ``chat_stream``. The extras' floor is
+            # 3.40.0 (``append(chunks=...)``), but a slack_sdk installed
+            # outside them may be older. Defer to core's post+edit before
+            # the stream is read.
             self._logger.debug("Slack: using fallback stream - slack_sdk has no chat_stream")
             return None
         self._logger.debug("Slack: starting stream", {"channel": channel, "threadTs": thread_ts})
@@ -5587,35 +5775,44 @@ class SlackAdapter:
         if options and options.task_display_mode:
             stream_kwargs["task_display_mode"] = options.task_display_mode
 
-        streamer = await client.chat_stream(**stream_kwargs)
+        async def create_streamer() -> Any:
+            # Every segment gets the same kwargs, including the Grid
+            # ``team_id`` (#95): each segment opens with its own
+            # ``chat.startStream``.
+            return await client.chat_stream(**stream_kwargs)
 
+        # One native Slack stream (a "segment") is open at a time. Slack
+        # expires streams after roughly five minutes, so a long reply is
+        # finalized and continued in a fresh segment (see rotate_segment).
+        segment = _StreamSegment(streamer=await create_streamer())
+        rotations = 0
+        max_age_ms = self._stream_segment_max_age_ms
+
+        # Prefix of ``resolved_committed`` handed to the current segment's
+        # streamer.
         last_appended = ""
+        # Prefix of ``resolved_committed`` Slack has confirmed. Text between
+        # here and ``last_appended`` sits in the streamer's local buffer and
+        # has to be resent if the segment turns out to have expired.
+        last_flushed = ""
 
         # Use StreamingMarkdownRenderer for safe incremental rendering
         from chat_sdk.shared.streaming_markdown import StreamingMarkdownRenderer
 
         renderer = StreamingMarkdownRenderer(wrap_tables_for_append=False)
-        structured_chunks_supported = True
 
         # Outgoing @name mention resolution for the native streaming path
         # (vercel/chat 6f0d2f02). post_message/edit_message resolve mentions
         # themselves, so the committed renderer text is resolved here before
         # deltas are calculated. ``resolved_source_done`` indexes into the
         # renderer's committable text; ``resolved_committed`` is its resolved
-        # counterpart and the coordinate space ``last_appended`` tracks.
-        # Mixing the two spaces would duplicate or drop text as soon as a
-        # replacement changes length (``@alice`` -> ``<@U123>``).
+        # counterpart and the coordinate space ``last_appended`` and
+        # ``last_flushed`` track. Mixing the two spaces would duplicate or
+        # drop text as soon as a replacement changes length
+        # (``@alice`` -> ``<@U123>``).
         resolved_committed = ""
         resolved_source_done = 0
-        inside_resolved_fence = False
-
-        def is_fence_line(line: str) -> bool:
-            # Python ``lstrip()`` rather than JS ``trimStart()`` (different
-            # whitespace sets, e.g. U+FEFF / U+001C-U+001F) on purpose: it
-            # matches the Python StreamingMarkdownRenderer's own fence
-            # tracking, which decides what gets committed mid-fence.
-            trimmed = line.lstrip()
-            return trimmed.startswith("```") or trimmed.startswith("~~~")
+        fences = _FenceTracker()
 
         async def resolve_committed(committable: str) -> None:
             """Extend ``resolved_committed`` with newly committed renderer text.
@@ -5633,7 +5830,7 @@ class SlackAdapter:
             unclosed marker (``https://x.io/*@alice``) can resolve the
             handle after it. Upstream ``resolveCommitted`` behaves the same.
             """
-            nonlocal resolved_committed, resolved_source_done, inside_resolved_fence
+            nonlocal resolved_committed, resolved_source_done
             while resolved_source_done < len(committable):
                 # JS ``lastIndexOf("\n", done - 1)``: last newline before
                 # ``done``. (At ``done == 0`` JS clamps to index 0; the only
@@ -5641,16 +5838,16 @@ class SlackAdapter:
                 line_start = committable.rfind("\n", 0, resolved_source_done) + 1
                 newline_at = committable.find("\n", resolved_source_done)
                 line_end = len(committable) if newline_at == -1 else newline_at + 1
-                segment = committable[resolved_source_done:line_end]
-                fence_line = is_fence_line(committable[line_start:line_end])
-                if inside_resolved_fence or fence_line:
+                piece = committable[resolved_source_done:line_end]
+                line = committable[line_start : line_end if newline_at == -1 else newline_at]
+                if fences.open is not None or _FENCE_LINE_PATTERN.match(line):
                     # Fence delimiters and fenced content are literal.
-                    resolved_committed += segment
+                    resolved_committed += piece
                 else:
-                    resolved_committed += await self._resolve_outgoing_mentions(segment, thread_id)
-                # Toggle only once the fence line's newline is committed.
-                if newline_at != -1 and fence_line:
-                    inside_resolved_fence = not inside_resolved_fence
+                    resolved_committed += await self._resolve_outgoing_mentions(piece, thread_id)
+                # Fence state changes only once the line's newline is committed.
+                if newline_at != -1:
+                    fences.feed(line)
                 resolved_source_done = line_end
 
         # In-stream fallback (vercel/chat 0f743c9b). If the very first native
@@ -5724,13 +5921,206 @@ class SlackAdapter:
             # so ``None`` would make core post its placeholder for nothing.
             return RawMessage(id="", thread_id=thread_id, raw=None)
 
-        # The resolved bot token is passed on EVERY append and on stop
-        # (vercel/chat#573). Passing it only on the first append left
-        # chat.startStream/chat.stopStream unauthenticated ("not_authed")
+        # The resolved bot token is passed on EVERY append and on stop, on
+        # every segment (vercel/chat#573). Passing it only on the first append
+        # left chat.startStream/chat.stopStream unauthenticated ("not_authed")
         # whenever the stream reached stop() before a token-bearing append
         # had flushed (e.g. fully buffered markdown). In multi-workspace
         # mode `token` is the per-request installation token resolved by
         # _get_token() at stream entry.
+        def is_stream_expired(error: Exception) -> bool:
+            return _slack_platform_error_code(error) == _STREAM_EXPIRED_ERROR
+
+        def mark_segment_started(response: Any) -> None:
+            """Record that Slack accepted a call on the current segment."""
+            nonlocal native_rendered
+            if segment.started_at is None:
+                segment.started_at = _monotonic_ms()
+            if segment.ts is None:
+                segment.ts = _response_ts(response)
+            segment.flush_next_append = False
+            native_rendered = True
+
+        def segment_age_ms() -> float:
+            return 0 if segment.started_at is None else _monotonic_ms() - segment.started_at
+
+        def rotation_due(at_block_boundary: bool) -> bool:
+            """Whether the current segment must be rotated before more content is sent.
+
+            Past the max age, rotation waits for a block boundary (a
+            paragraph break in the pending text, or a structured chunk) for
+            up to the grace window, then happens regardless. A segment Slack
+            has not started yet has no expiry clock and is never rotated.
+            """
+            if segment.started_at is None:
+                return False
+            age = segment_age_ms()
+            if age < max_age_ms:
+                return False
+            return at_block_boundary or age >= max_age_ms + _STREAM_SEGMENT_ROTATION_GRACE_MS
+
+        # Structured chunk state, replayed into every new segment. Task cards
+        # and the plan title belong to one Slack message, so without the
+        # replay an update for a task first shown in an earlier segment would
+        # render as a brand-new card. Structured chunks may fail if the app
+        # lacks the Assistant scopes/features; they are then disabled for the
+        # rest of the stream to avoid repeated failures, and logged once.
+        structured_chunks_supported = True
+        # Keyed by task id; values are the serialized ``chunk_data`` dicts.
+        open_tasks: dict[Any, dict[str, Any]] = {}
+        current_plan: dict[str, Any] | None = None
+
+        def remember_structured_chunk(chunk_data: dict[str, Any]) -> None:
+            nonlocal current_plan
+            if chunk_data["type"] == "plan_update":
+                current_plan = chunk_data
+            elif chunk_data["type"] == "task_update":
+                if chunk_data.get("status") in ("complete", "error"):
+                    open_tasks.pop(chunk_data.get("id"), None)
+                else:
+                    open_tasks[chunk_data.get("id")] = chunk_data
+
+        def disable_structured_chunks(chunk_type: Any, error: Exception) -> None:
+            nonlocal structured_chunks_supported
+            structured_chunks_supported = False
+            self._logger.warn(
+                "Slack stream: structured-chunk append failed, falling back to "
+                "text-only for the rest of this stream. Likely causes: missing "
+                "`assistant_view` / `assistant:write` scope on the app manifest, "
+                "malformed chunk payload, or a transient Slack API error.",
+                {"chunkType": chunk_type, "error": error},
+            )
+
+        async def start_next_segment(sent: str) -> None:
+            """Open a new segment that continues from *sent*.
+
+            *sent* is the resolved text Slack holds so far. Open task cards
+            and the plan title are replayed right away; when *sent* ends
+            inside a code fence or a table, the fence opening or the table
+            header is queued to precede the segment's first text (see
+            ``with_segment_prefix``) rather than sent on its own.
+            """
+            nonlocal segment, rotations
+            segment = _StreamSegment(streamer=await create_streamer(), flush_next_append=True)
+            fence = _open_fence_in(sent)
+            segment.reopen_fence = f"{fence.opening}\n" if fence is not None else ""
+            segment.table_header = "" if fence is not None else _table_continuation(sent)
+            rotations += 1
+            replay = ([current_plan] if current_plan is not None else []) + list(open_tasks.values())
+            if replay and structured_chunks_supported:
+                try:
+                    response = await segment.streamer.append(chunks=replay, token=token)
+                    mark_segment_started(response)
+                except Exception as exc:
+                    disable_structured_chunks("replay", exc)
+
+        def with_segment_prefix(text: str) -> str:
+            """Prepend whatever a rotation queued for the segment's first text.
+
+            The reopened code fence always (fenced content is literal), the
+            repeated table header only when *text* starts with a table row.
+            """
+            first_line = text.split("\n", 1)[0]
+            header = segment.table_header if _TABLE_ROW_PATTERN.match(first_line.strip(JS_WHITESPACE)) else ""
+            prefixed = segment.reopen_fence + header + text
+            segment.reopen_fence = ""
+            segment.table_header = ""
+            return prefixed
+
+        async def rotate_segment(delta: str) -> str:
+            """Finalize the current segment and continue in a new one.
+
+            *delta* is the resolved text about to be sent: the part up to its
+            last paragraph break (or last line break) travels with the old
+            segment's stop call so the cut lands on a block boundary, and a
+            code fence still open there is closed. Returns the text to send
+            on the new segment.
+            """
+            nonlocal last_flushed
+            cut_at = _segment_cut_index(delta)
+            head = delta[:cut_at]
+            tail = delta[cut_at:]
+            sent = last_appended + head
+            fence = _open_fence_in(sent)
+            if fence is not None and sent.endswith("\n") and _closes_fence(fence, tail):
+                # The pending partial line is the closing delimiter: finish
+                # the block in the old segment instead of reopening it in the
+                # new one. Upstream parity (chat@4.41.1 index.ts:6270-6277,
+                # pinned by the ported "treats a pending partial closing fence
+                # as the block's end" test): the partial line is not held for
+                # its newline, so a literal ```js line split right after its
+                # backticks at a forced cut is taken as the closer, as upstream.
+                head += tail
+                sent += tail
+                tail = ""
+                fence = None
+            closer = ("" if sent.endswith("\n") else "\n") + fence.marker if fence is not None else ""
+            # ``head`` may be this segment's first text, so it takes any
+            # prefix a previous rotation queued for it. Upstream parity
+            # (chat@4.41.1 index.ts:6281-6282): an empty ``head`` skips the
+            # queued prefix even when a closer is sent, so a segment that got
+            # only a structured-chunk replay before rotating again ends with
+            # a bare fence marker. Kept as upstream: no Python-specific hazard.
+            final_text = (with_segment_prefix(head) if head else "") + closer
+            age_ms = segment_age_ms()
+            stop_kwargs: dict[str, Any] = {"token": token}
+            if final_text:
+                stop_kwargs["markdown_text"] = final_text
+            # SL10: agent_view keeps the session busy here with
+            # ``session_status="processing"`` (upstream d4a1f03a), since the
+            # reply continues in the next segment. Wired with #215.
+            try:
+                result = await segment.streamer.stop(**stop_kwargs)
+                last_flushed = sent
+                self._logger.debug(
+                    "Slack: rotated stream segment",
+                    {"channel": channel, "messageId": _response_ts(result), "ageMs": age_ms},
+                )
+            except Exception as exc:
+                if not is_stream_expired(exc):
+                    raise
+                # Slack expired the segment during an idle gap. Nothing after
+                # the last confirmed flush reached it, so that text moves to
+                # the new segment instead of failing the reply.
+                self._logger.warn(
+                    "Slack: stream segment expired before rotation, continuing in a new message",
+                    {"channel": channel, "ageMs": age_ms},
+                )
+                tail = last_appended[len(last_flushed) :] + delta
+                sent = last_flushed
+            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6316):
+            # the successor opens even when ``tail`` is empty. If the reply
+            # then ends with nothing more, the final ``stop()`` starts and
+            # stops it (both SDKs' streamer ``stop()`` calls chat.startStream
+            # first), leaving a message holding only the stream-end blocks,
+            # and its ts is returned. Kept as upstream: no Python-specific
+            # hazard, and skipping it would also drop the stop blocks.
+            await start_next_segment(sent)
+            return tail
+
+        async def send_delta(delta: str, at_block_boundary: bool) -> None:
+            """Send a resolved-text delta, rotating the segment first when due.
+
+            Rotation carries the leading part of the delta out with the old
+            segment, so only what it returns goes to the new one.
+            """
+            nonlocal last_appended, last_flushed
+            text = await rotate_segment(delta) if rotation_due(at_block_boundary or "\n\n" in delta) else delta
+            if text:
+                # slack_sdk's ``append`` buffers small deltas and returns
+                # None until it calls the API, so only a non-None response
+                # proves Slack accepted the stream. ``chunks=[]`` (not None)
+                # makes it flush right away, so a segment opened by rotation
+                # is visible immediately.
+                append_kwargs: dict[str, Any] = {"markdown_text": with_segment_prefix(text), "token": token}
+                if segment.flush_next_append:
+                    append_kwargs["chunks"] = []
+                response = await segment.streamer.append(**append_kwargs)
+                if response is not None:
+                    mark_segment_started(response)
+                    last_flushed = resolved_committed
+            last_appended = resolved_committed
+
         async def flush_committed(force: bool = False) -> None:
             """Flush committed renderer text.
 
@@ -5738,7 +6128,6 @@ class SlackAdapter:
             stream, or as a throttled post/edit in fallback mode. A failure
             before any native call succeeded switches to fallback mode.
             """
-            nonlocal last_appended, native_rendered
             if mode == "fallback":
                 await flush_fallback(force)
                 return
@@ -5747,7 +6136,7 @@ class SlackAdapter:
             if not delta:
                 return
             try:
-                response = await streamer.append(markdown_text=delta, token=token)
+                await send_delta(delta, False)
             except Exception as exc:
                 if native_rendered:
                     # Content is already rendering natively; a mid-stream
@@ -5755,17 +6144,13 @@ class SlackAdapter:
                     raise
                 switch_to_fallback(exc)
                 await flush_fallback(force)
-                return
-            if response is not None:
-                native_rendered = True
-            last_appended = resolved_committed
 
         # Accepts the residual stream-input union: ``is_thinking_chunk`` filters
         # ``ThinkingChunk`` out before this runs (it is never reached with one),
         # but it stays in the static type since that runtime guard does not
         # narrow it. The generic ``_read``-based body handles any chunk shape.
         async def send_structured_chunk(chunk: StreamChunk | ThinkingChunk | dict[str, Any]) -> None:
-            nonlocal structured_chunks_supported, native_rendered
+            nonlocal last_flushed
             # Flush buffered markdown first to keep ordering.
             await flush_committed()
 
@@ -5786,26 +6171,26 @@ class SlackAdapter:
                 )
                 return
 
-            try:
-                chunk_data: dict[str, Any] = {"type": chunk_type}
-                for field_name in ("id", "title", "status", "output", "text"):
-                    value = _read(field_name)
-                    if value is not None:
-                        chunk_data[field_name] = value
+            chunk_data: dict[str, Any] = {"type": chunk_type}
+            for field_name in ("id", "title", "status", "output", "text"):
+                value = _read(field_name)
+                if value is not None:
+                    chunk_data[field_name] = value
 
-                await streamer.append(chunks=[chunk_data], token=token)
-                # A chunks append always calls the API, so success means
-                # Slack accepted the stream (upstream ``markSegmentStarted``).
-                native_rendered = True
+            # A structured chunk is a block boundary, so a segment past its
+            # max age rotates here instead of waiting for a paragraph break.
+            await send_delta("", True)
+
+            try:
+                response = await segment.streamer.append(chunks=[chunk_data], token=token)
             except Exception as exc:
-                structured_chunks_supported = False
-                self._logger.warn(
-                    "Slack stream: structured-chunk append failed, falling back to "
-                    "text-only for the rest of this stream. Likely causes: missing "
-                    "`assistant_view` / `assistant:write` scope on the app manifest, "
-                    "malformed chunk payload, or a transient Slack API error.",
-                    {"chunkType": chunk_type, "error": exc},
-                )
+                disable_structured_chunks(chunk_type, exc)
+                return
+            # A chunks append always calls the API, so success means Slack
+            # accepted the stream; it flushes the streamer's text buffer too.
+            mark_segment_started(response)
+            last_flushed = last_appended
+            remember_structured_chunk(chunk_data)
 
         async def push_text_and_flush(text: str) -> None:
             renderer.push(text)
@@ -5857,21 +6242,46 @@ class SlackAdapter:
         if stop_blocks:
             stop_kwargs["blocks"] = stop_blocks
         try:
-            result = await streamer.stop(**stop_kwargs)
+            result = await segment.streamer.stop(**stop_kwargs)
         except Exception as exc:
-            if native_rendered:
+            if not native_rendered:
+                # Short replies can buffer every delta in the streamer, making
+                # stop() the FIRST real API call; on an unsupported workspace
+                # the failure lands here, so the fallback must engage here too.
+                # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6471-6484):
+                # stop() makes chat.startStream then chat.stopStream in both
+                # SDKs, and upstream also falls back on ``!nativeRendered``
+                # without checking whether startStream succeeded before
+                # stopStream failed (it deliberately avoids the streamer's
+                # ``ts`` accessor).
+                switch_to_fallback(exc)
+                await flush_fallback(True)
+                return finish_fallback()
+            if not is_stream_expired(exc):
                 raise
-            # Short replies can buffer every delta in the streamer, making
-            # stop() the FIRST real API call; on an unsupported workspace the
-            # failure lands here, so the fallback must engage here too.
-            # Upstream parity (chat@4.41.1 adapter-slack/src/index.ts:6471-6484):
-            # stop() makes chat.startStream then chat.stopStream in both SDKs,
-            # and upstream also falls back on ``!nativeRendered`` without
-            # checking whether startStream succeeded before stopStream failed
-            # (it deliberately avoids the streamer's ``ts`` accessor).
-            switch_to_fallback(exc)
-            await flush_fallback(True)
-            return finish_fallback()
+            # Slack expired the last segment during a trailing idle gap and
+            # has already finalized that message.
+            unconfirmed = last_appended[len(last_flushed) :]
+            if not unconfirmed:
+                # Every delta was delivered, so the reply is complete; only
+                # the stream-end blocks are lost. Report the finalized message
+                # rather than posting an empty one just to carry the blocks.
+                expired_ts = segment.ts
+                if not expired_ts:
+                    raise
+                self._logger.warn(
+                    "Slack: stream expired before stop, stream-end blocks skipped",
+                    {"channel": channel, "messageId": expired_ts, "skippedBlocks": len(stop_blocks)},
+                )
+                # SL10: end_typing(thread_id, session_status) before this
+                # return (upstream index.ts:6508). Wired with #215.
+                return RawMessage(id=expired_ts, thread_id=thread_id, raw={"ts": expired_ts})
+            self._logger.warn(
+                "Slack: stream expired before stop, delivering the rest in a new message",
+                {"channel": channel},
+            )
+            await start_next_segment(last_flushed)
+            result = await segment.streamer.stop(**stop_kwargs, markdown_text=with_segment_prefix(unconfirmed))
 
         message_ts = ""
         if isinstance(result, dict):
@@ -5880,7 +6290,7 @@ class SlackAdapter:
             data = result.data
             message_ts = (data.get("message") or {}).get("ts") or data.get("ts", "")
 
-        self._logger.debug("Slack: stream complete", {"messageId": message_ts})
+        self._logger.debug("Slack: stream complete", {"messageId": message_ts, "segments": rotations + 1})
         return RawMessage(id=message_ts, thread_id=thread_id, raw=result)
 
     # ==================================================================
