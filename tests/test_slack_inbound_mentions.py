@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chat_sdk.adapters.slack.adapter import SlackAdapter
+from chat_sdk.adapters.slack.adapter import SlackAdapter, _attachment_content, _AttachmentPart
 from chat_sdk.adapters.slack.types import RequestContext, SlackAdapterConfig
 from chat_sdk.chat import Chat
 from chat_sdk.state.memory import create_memory_state
@@ -856,6 +856,123 @@ class TestMentionRouting:
         )
         assert adapter.bot_user_id is None
         mention_handler.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Python-specific: mention classification edges
+# ---------------------------------------------------------------------------
+
+
+def _is_mention(text: str = "", **fields: Any) -> bool | None:
+    """``is_mention`` of a plain channel message for bot ``U_BOT`` (sync path)."""
+    adapter = _make_adapter(_Client(), bot_user_id="U_BOT")
+    event: dict[str, Any] = {"type": "message", "user": "U123", "channel": "C456", "text": text, "ts": "1.1"}
+    return adapter.parse_message({**event, **fields}).is_mention
+
+
+class TestMentionMatcher:
+    """``_MentionMatcher.search`` replaces upstream's ``/<@!?id(?:\\|[^>]*)?>/i``
+    with a prefix match plus a tail check; these pin it to the regex."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<@U_BOT> hi", True),
+            ("<@U_BOT|bot> hi", True),
+            ("<@!U_BOT> hi", True),
+            ("<@u_bot> hi", True),
+            # A different user whose id starts with the bot's id.
+            ("<@U_BOT2> hi", False),
+            ("<@U_BOT hi", False),
+            ("<@U_BOT|bot hi", False),
+            # The only ``>`` comes before the ``|`` form, so nothing closes it.
+            ("a > b <@U_BOT|bot", False),
+        ],
+    )
+    def test_token_forms(self, text: str, expected: bool):
+        assert _is_mention(text) is expected
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<@U_BOT|" * 6000 + ">", True),
+            ("<@U_BOT|" * 6000, False),
+            ("<" * 50000 + "@U_BOT>", True),
+            ("<@U_BOT> " + "`" * 50000, True),
+            ("`<@U_BOT>" + "`x" * 25000, False),
+            ("```" * 16000 + "<@U_BOT>", True),
+        ],
+        ids=[
+            "unclosed-pipe-run-closed",
+            "unclosed-pipe-run",
+            "angle-run",
+            "backtick-run",
+            "alternating-ticks",
+            "fences",
+        ],
+    )
+    def test_classifies_50k_char_adversarial_inputs(self, text: str, expected: bool):
+        """Each input is about 50k chars; the expected value is what upstream's
+        regex (plus code masking) yields for it. Calls the classifier directly:
+        rendering the text (``to_ast``) is not what is under test here."""
+        adapter = _make_adapter(_Client(), bot_user_id="U_BOT")
+        event = {"type": "message", "user": "U123", "channel": "C456", "text": text, "ts": "1.1"}
+        assert adapter._detect_self_mention(event, text, []) is expected
+
+    def test_classifies_deeply_nested_blocks_without_recursion(self):
+        node: dict[str, Any] = {"type": "user", "user_id": "U_BOT"}
+        for _ in range(5000):
+            node = {"type": "rich_text_section", "elements": [node]}
+        assert _is_mention("", blocks=[{"type": "rich_text", "elements": [node]}]) is True
+
+
+class TestBlockMentionRules:
+    def test_does_not_flag_a_code_span_inside_a_mrkdwn_section(self):
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "x `<@U_BOT>`"}}]
+        assert _is_mention("x <@U_BOT>", blocks=blocks) is False
+
+    def test_flags_a_mention_in_section_fields(self):
+        blocks = [{"type": "section", "fields": [{"type": "mrkdwn", "text": "hi <@U_BOT>"}]}]
+        assert _is_mention("", blocks=blocks) is True
+
+    def test_does_not_flag_a_user_element_inside_a_preformatted_block(self):
+        """The ``user`` element inherits code status from its container."""
+        blocks = [
+            {
+                "type": "rich_text",
+                "elements": [{"type": "rich_text_preformatted", "elements": [{"type": "user", "user_id": "U_BOT"}]}],
+            }
+        ]
+        assert _is_mention("<@U_BOT>", blocks=blocks) is False
+
+
+class TestAttachmentPartRules:
+    @pytest.mark.parametrize(
+        ("attachment", "expected"),
+        [
+            ({"pretext": "hey <@U_BOT>"}, True),
+            # ``mrkdwn_in`` makes backticks code; without it they are literal.
+            ({"pretext": "`<@U_BOT>`", "mrkdwn_in": ["pretext"]}, False),
+            ({"pretext": "`<@U_BOT>`"}, True),
+            ({"title": "<@U_BOT>"}, True),
+            # The title is escaped inside the link, so its token is not a mention.
+            ({"title": "<@U_BOT>", "title_link": "https://example.com"}, False),
+            ({"fields": [{"title": "Owner", "value": "<@U_BOT>"}]}, True),
+            ({"fields": [{"value": "`<@U_BOT>`"}], "mrkdwn_in": ["fields"]}, False),
+            ({"fallback": "hi <@U_BOT>"}, True),
+            # ``fallback`` fills in only when nothing else renders.
+            ({"text": "hi", "fallback": "hi <@U_BOT>"}, False),
+            # A whitespace-only field renders nothing, so ``fallback`` fills in.
+            ({"pretext": "   ", "fallback": "hi <@U_BOT>"}, True),
+        ],
+    )
+    def test_classifies_legacy_attachment_parts(self, attachment: dict[str, Any], expected: bool):
+        assert _is_mention("", attachments=[attachment]) is expected
+
+    def test_builds_legacy_parts_beside_blocks_without_tables(self):
+        """Upstream gates the parts on ``tables.length === 0``, not on blocks."""
+        content = _attachment_content({"blocks": [{"type": "divider"}], "fallback": "hi"})
+        assert content.parts == [_AttachmentPart(text="hi", mrkdwn=False)]
 
 
 # ---------------------------------------------------------------------------

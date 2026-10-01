@@ -992,7 +992,10 @@ Parity, with no new divergence. Part (a) of #209 ports the Slack halves of
   collapsed with `or`. The bot id comes from the `bot_user_id` property, so a
   multi-workspace request uses its `RequestContext.bot_user_id`. The attachment
   extractor is a minimal private port of `attachmentContent` (blocks and
-  parts, no tables); #210 extends it for rendering.
+  parts, no tables). Upstream builds the parts when `tables.length === 0`;
+  with no tables extracted that gate is always open, so parts are built even
+  beside blocks (detection ignores them there). #210 extends it for rendering
+  and restores the tables gate.
 - **Author (`c2b6bff0`, `bb7cd124`, `80def3ab`).** `user_id` is `user`, then
   `bot_profile.user_id`, then `bot_id`. `_is_message_from_self` matches the bot
   user id against `user or bot_profile.user_id`. `email` comes from the

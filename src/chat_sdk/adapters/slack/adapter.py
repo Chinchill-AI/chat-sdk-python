@@ -452,13 +452,16 @@ def _attachment_content(attachment: dict[str, Any]) -> _AttachmentContent:
     Slack renders ``pretext``/``text``/``fields`` as plain text unless they
     are named in ``mrkdwn_in``; ``title`` is always plain text and links to
     ``title_link``. ``fallback`` fills in only when nothing else renders.
-    Parts are only read when the attachment has no blocks.
+
+    Upstream builds the parts whenever the attachment has no table blocks
+    (``tables.length === 0``). Tables are not extracted yet (#210), so that
+    gate is always open here and the parts are built even beside blocks;
+    ``_detect_self_mention`` ignores the parts of an attachment with blocks,
+    as upstream does.
     """
     raw_blocks = attachment.get("blocks")
     blocks = raw_blocks if isinstance(raw_blocks, list) else []
     parts: list[_AttachmentPart] = []
-    if blocks:
-        return _AttachmentContent(blocks=blocks, parts=parts)
 
     raw_mrkdwn_in = attachment.get("mrkdwn_in")
     # Only string entries name fields (``set()`` of a dict entry would raise).
