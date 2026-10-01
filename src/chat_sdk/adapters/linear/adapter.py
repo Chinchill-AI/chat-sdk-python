@@ -2321,9 +2321,12 @@ class LinearAdapter:
 
         Agent-session comments delegate to :meth:`_parse_agent_session_message`
         (``is_mention=True``, stable ``linear:{issue}:s:{session}`` thread id),
-        as upstream ``parseMessage`` does. Ordinary comments leave
+        as upstream ``parseMessage`` does for that kind. Ordinary comments leave
         ``is_mention`` unset (``None``) so core ``@mention`` text detection
-        still runs (vercel/chat#946).
+        still runs (vercel/chat#946). The ordinary-comment branch is otherwise
+        NOT at parity: it returns ``thread_id=""`` and an ``"unknown"`` author,
+        where upstream encodes ``linear:{issue}:c:{comment}`` and reads
+        ``comment.user`` (known divergence, tracked in #285).
         """
         if raw.get("kind") == "agent_session_comment":
             return self._parse_agent_session_message(cast("LinearAgentSessionCommentRawMessage", raw))

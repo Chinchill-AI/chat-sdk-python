@@ -334,6 +334,9 @@ class TestModeGating:
 
         assert response["status"] == 200
         chat.process_message.assert_called_once()
+        # Ordinary comments leave ``is_mention`` undetermined (vercel/chat#946)
+        # so core @mention text detection still runs on them.
+        assert chat.process_message.call_args[0][2].is_mention is None
 
     @pytest.mark.asyncio
     async def test_mutation_mode_gate_inversion_would_be_caught(self):
@@ -427,20 +430,31 @@ class TestCreatedAction:
         assert message.author.is_me is False
 
     @pytest.mark.asyncio
-    async def test_dispatches_created_sessions_without_a_root_comment(self):
+    @pytest.mark.parametrize(
+        ("has_prompt_context", "expected_text"),
+        [
+            pytest.param(True, "Issue TEST-1\n\n@get-bot Hello there", id="prompt-context"),
+            # ``payload.promptContext ?? ""``: no prompt context → empty body, not None.
+            pytest.param(False, "", id="no-prompt-context"),
+        ],
+    )
+    async def test_dispatches_created_sessions_without_a_root_comment(self, has_prompt_context, expected_text):
         # Ported: "dispatches created sessions without a root comment". The
         # message is synthesized from the session id and the prompt context.
         adapter = _make_webhook_adapter("agent-sessions")
         chat = _make_chat()
         adapter._chat = chat
 
-        response = await adapter.handle_webhook(_signed_request(_create_agent_session_payload(comment=None)))
+        payload = _create_agent_session_payload(comment=None)
+        if not has_prompt_context:
+            del payload["promptContext"]
+        response = await adapter.handle_webhook(_signed_request(payload))
 
         assert response["status"] == 200
         chat.process_message.assert_called_once()
         message = chat.process_message.call_args[0][2]
         assert message.id == "agent-session-agent-session-1"
-        assert message.text == "Issue TEST-1\n\n@get-bot Hello there"
+        assert message.text == expected_text
         assert message.thread_id == "linear:issue-123:s:agent-session-1"
         assert message.is_mention is True
 

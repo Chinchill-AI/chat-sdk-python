@@ -453,12 +453,13 @@ def _activity(
     content: dict[str, Any],
     user: dict[str, Any] | None = None,
     source_comment_id: str | None = None,
+    updated_at: str | None = None,
 ) -> dict[str, Any]:
     """An ``AgentActivity`` node as the raw activities query returns it."""
     return {
         "id": activity_id,
         "createdAt": created_at,
-        "updatedAt": created_at,
+        "updatedAt": updated_at if updated_at is not None else created_at,
         "sourceComment": {"id": source_comment_id} if source_comment_id is not None else None,
         "user": user,
         "content": content,
@@ -502,8 +503,14 @@ class TestFetchAgentSessionActivities:
                     _activity(
                         activity_id="prompt-activity",
                         created_at="2025-06-01T10:00:00.000Z",
+                        updated_at="2025-06-01T10:05:00.000Z",
                         content={"type": "prompt", "body": "User prompt"},
-                        user={"id": "user-1", "displayName": "Alice", "name": "Alice Smith"},
+                        user={
+                            "id": "user-1",
+                            "displayName": "Alice",
+                            "name": "Alice Smith",
+                            "email": "alice@example.com",
+                        },
                     ),
                     _activity(
                         activity_id="action-activity",
@@ -533,6 +540,11 @@ class TestFetchAgentSessionActivities:
         assert [m.id for m in result.messages] == ["prompt-activity", "action-activity", "response-activity"]
         assert result.messages[0].author.is_bot is False
         assert result.messages[0].author.is_me is False
+        # ``user?.displayName ?? user?.name`` / ``user?.name ?? user?.displayName``.
+        assert (result.messages[0].author.user_name, result.messages[0].author.full_name) == ("Alice", "Alice Smith")
+        assert result.messages[0].raw["comment"]["user"]["email"] == "alice@example.com"
+        # ``updatedAt`` comes from ``activity.updatedAt``, not ``createdAt``.
+        assert [m.metadata.edited for m in result.messages] == [True, False, False]
         assert result.messages[1].author.is_bot is True
         assert result.messages[1].author.is_me is True
         assert all(m.thread_id == "linear:issue-abc:s:session-789" for m in result.messages)
