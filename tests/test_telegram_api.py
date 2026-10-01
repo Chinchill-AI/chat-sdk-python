@@ -2295,6 +2295,54 @@ class TestReply:
         _method, payload = _only_call(adapter)
         assert "reply_parameters" not in payload
 
+    # Python-specific: upstream's ``JSON.stringify`` drops ``undefined``; here the
+    # ``is not None`` guards are what keep ``reply_parameters`` off upload paths.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("message", "expected_method"),
+        [
+            pytest.param(
+                PostableMarkdown(
+                    markdown="picture",
+                    attachments=[
+                        Attachment(
+                            type="image",
+                            mime_type="image/png",
+                            name="pic.png",
+                            url="https://cdn.example.com/pic.png",
+                        )
+                    ],
+                ),
+                "sendPhoto",
+                id="url-attachment",
+            ),
+            pytest.param(
+                PostableMarkdown(
+                    markdown="picture",
+                    attachments=[Attachment(type="image", data=b"payload", mime_type="image/png", name="pic.png")],
+                ),
+                "sendPhoto",
+                id="bytes-attachment",
+            ),
+            pytest.param(
+                PostableRaw(raw="", files=[FileUpload(data=b"doc", filename="doc.txt")]),
+                "sendDocument",
+                id="file-upload",
+            ),
+        ],
+    )
+    async def test_leaves_plain_post_message_uploads_unthreaded(self, message: Any, expected_method: str):
+        adapter = _reply_adapter()
+
+        await adapter.post_message(REPLY_THREAD_ID, message)
+
+        method, body = _only_call(adapter)
+        assert method == expected_method
+        fields = body if isinstance(body, dict) else _form_fields(body)
+        assert "reply_parameters" not in fields
+        # Guard against a vacuous pass: the body really is the upload request.
+        assert fields["chat_id"] in ("123", 123)
+
     @pytest.mark.asyncio
     async def test_refuses_a_target_that_belongs_to_another_chat(self):
         adapter = _reply_adapter()
