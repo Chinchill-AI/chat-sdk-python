@@ -2329,6 +2329,18 @@ def _task_update() -> Any:
 
 
 class TestNativeStreamingFallback:
+    # TS: "finishes agent streams with an active session status" (vercel/chat 2ce2be00)
+    @pytest.mark.asyncio
+    async def test_finishes_agent_streams_with_an_active_session_status(self):
+        adapter, client, _, _ = _fallback_adapter(agent_view=True)
+        stop = AsyncMock(return_value={"ok": True, "ts": "stream-ts"})
+        client.chat_stream = AsyncMock(return_value=_streamer(AsyncMock(return_value={"ok": True}), stop))
+
+        await adapter.stream(_DM_STREAM_THREAD, _text_stream("hello"))
+
+        stop.assert_awaited_once()
+        assert stop.await_args.kwargs["session_status"] == "active"
+
     @pytest.mark.asyncio
     async def test_returns_none_before_consuming_the_stream_when_native_streaming_is_false(self):
         adapter, client, _, _ = _fallback_adapter(native_streaming=False)

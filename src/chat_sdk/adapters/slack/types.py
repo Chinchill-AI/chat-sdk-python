@@ -112,6 +112,28 @@ SlackSuggestedPromptsResolver = Callable[
 ]
 SlackSuggestedPrompts: TypeAlias = SlackSuggestedPromptsOptions | SlackSuggestedPromptsResolver
 
+
+@dataclass
+class SlackSessionTitleContext:
+    """Context passed to a dynamic agent-session title resolver."""
+
+    # The DM channel the agent session lives in.
+    channel_id: str
+    # Text of the session's root user message.
+    text: str
+    # The session's root message ts.
+    thread_ts: str
+    # The user who sent the root message.
+    user_id: str
+
+
+# Automatic agent-session title configuration (upstream ``SlackSessionTitle``):
+# ``True`` uses the first line of the root message, ``False`` disables
+# automatic titles, and a resolver (sync or async) returns a custom title or
+# ``None`` to skip it.
+SlackSessionTitleResolver = Callable[[SlackSessionTitleContext], "str | None | Awaitable[str | None]"]
+SlackSessionTitle: TypeAlias = bool | SlackSessionTitleResolver
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -273,6 +295,15 @@ class SlackAdapterConfig:
     # :class:`SlackSuggestedPromptsOptions` or a sync/async resolver taking a
     # :class:`SlackSuggestedPromptsContext`. Failures are logged, never raised.
     suggested_prompts: SlackSuggestedPrompts | None = None
+    # Automatically title new agent sessions from their root user message
+    # (``agents.sessions.rename``), applied after a top-level human DM is
+    # processed under ``agent_view``. ``None`` (the default) means on when
+    # ``agent_view`` is enabled. ``True`` uses the first line of the message
+    # (trimmed, at most 80 characters), ``False`` disables it, and a sync or
+    # async resolver taking a :class:`SlackSessionTitleContext` returns the
+    # title or ``None`` to skip it. Failures are logged, never raised.
+    # Upstream ``sessionTitle``.
+    session_title: SlackSessionTitle | None = None
     # Default rotating loading messages for the assistant thinking indicator
     # (``assistant.threads.setStatus`` ``loading_messages``). Used by
     # ``start_typing`` and ``set_assistant_status`` when no explicit

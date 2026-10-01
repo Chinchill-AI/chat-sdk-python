@@ -546,6 +546,8 @@ _WITH_TOKEN_CALL_SITES: list[tuple[str, Callable[[SlackAdapter], Awaitable[Any]]
     ("assistant_threads_setStatus", lambda a: a.set_assistant_status("C1", "1.1", "thinking"), False),
     ("assistant_threads_setTitle", lambda a: a.set_assistant_title("C1", "1.1", "title"), False),
     ("api_call", lambda a: a.set_suggested_prompts("C1", None, [{"title": "t", "message": "m"}]), False),
+    ("api_call", lambda a: a.set_session_status("C1", "1.1", "active"), False),
+    ("api_call", lambda a: a._rename_agent_session("C1", "1.1", "title"), False),
 ]
 
 
